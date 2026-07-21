@@ -4,6 +4,7 @@
 #include "l2flow/common/sha256.h"
 
 #include "mdl_api.h"
+#include "mdl_api_msg.h"
 #include "mdl_shl2_msg.h"
 #include "mdl_szl2_msg.h"
 
@@ -32,6 +33,7 @@ namespace l2flow::baseline {
 namespace {
 
 namespace mdl = datayes::mdl;
+namespace api = datayes::mdl::mdl_api_msg;
 namespace sys = datayes::mdl::mdl_sys_msg;
 namespace sh = datayes::mdl::mdl_shl2_msg;
 namespace sz = datayes::mdl::mdl_szl2_msg;
@@ -77,6 +79,49 @@ constexpr std::array<MemberLayout, 2> kControlMessageMembers = {{
 
 constexpr std::array<MemberLayout, 1> kSubscribeResponseMembers = {{
     {"Services", 0},
+}};
+
+constexpr std::array<MemberLayout, 1> kConnectingEventMembers = {{
+    {"Address", 0},
+}};
+
+constexpr std::array<MemberLayout, 2> kConnectionFailureEventMembers = {{
+    {"ErrorMessage", 0},
+    {"Address", 6},
+}};
+
+constexpr std::array<MemberLayout, 10> kServiceStatusMembers = {{
+    {"Version", 0},
+    {"StartDate", 4},
+    {"StartTime", 8},
+    {"MemoryTotal", 12},
+    {"MemoryRSS", 20},
+    {"MemoryPeak", 28},
+    {"ClientCount", 36},
+    {"SendRate", 40},
+    {"Services", 44},
+    {"BytesDelayed", 52},
+}};
+
+constexpr std::array<MemberLayout, 3> kServiceStatusServiceMembers = {{
+    {"ServiceID", 0},
+    {"ReceiveRate", 4},
+    {"IdleTime", 8},
+}};
+
+constexpr std::array<MemberLayout, 1> kSessionStatusMembers = {{
+    {"Clients", 0},
+}};
+
+constexpr std::array<MemberLayout, 8> kSessionStatusClientMembers = {{
+    {"Version", 0},
+    {"Address", 4},
+    {"StartDate", 10},
+    {"StartTime", 14},
+    {"EncodeType", 18},
+    {"DecodeType", 22},
+    {"BytesDelayed", 26},
+    {"SubscriptionList", 30},
 }};
 
 constexpr std::array<MemberLayout, 44> kSh44Members = {{
@@ -264,7 +309,7 @@ constexpr std::array<MemberLayout, 11> kCombinedTickMembers = {{
     {"Qty", 62},
 }};
 
-constexpr std::array<TypeLayout, 24> kAbiTypes = {{
+constexpr std::array<TypeLayout, 31> kAbiTypes = {{
     {"MDLMessageHead", 23, 1, kMessageHeadMembers},
     {"MDLAnsiString", 6, 1, kStringMembers},
     {"MDLUTF8String", 6, 1, kStringMembers},
@@ -325,6 +370,25 @@ constexpr std::array<TypeLayout, 24> kAbiTypes = {{
     {"Order300192_v2", 58, 1, kSz33Members},
     {"Transaction300191_v2", 70, 1, kSz36Members},
     {"CombinedTick", 70, 1, kCombinedTickMembers},
+    {"mdl_api_msg::ConnectingEvent", 6, 1, kConnectingEventMembers},
+    {"mdl_api_msg::ConnectErrorEvent",
+     12,
+     1,
+     kConnectionFailureEventMembers},
+    {"mdl_api_msg::DisconnectedEvent",
+     12,
+     1,
+     kConnectionFailureEventMembers},
+    {"mdl_sys_msg::ServiceStatus", 60, 1, kServiceStatusMembers},
+    {"mdl_sys_msg::ServiceStatus::ServicesItem",
+     12,
+     1,
+     kServiceStatusServiceMembers},
+    {"mdl_sys_msg::SessionStatus", 8, 1, kSessionStatusMembers},
+    {"mdl_sys_msg::SessionStatus::ClientsItem",
+     36,
+     1,
+     kSessionStatusClientMembers},
 }};
 
 constexpr std::array<std::string_view, 7> kElfNeeded = {{
@@ -367,14 +431,20 @@ constexpr std::array<std::string_view, 25> kRequiredSymbolVersions = {{
     "GLIBC_2.9",
 }};
 
-constexpr std::array<NumericConstant, 20> kProtocolConstants = {{
+constexpr std::array<NumericConstant, 26> kProtocolConstants = {{
     {"MDLSID_MDL_API", 1},
     {"MDLSID_MDL_SYS", 2},
     {"MDLSID_MDL_SHL2", 4},
     {"MDLSID_MDL_SZL2", 6},
+    {"MDLVID_MDL_API", 101},
     {"MDLVID_MDL_SYS", 101},
+    {"MDLMID_MDL_API_ConnectingEvent", 1},
+    {"MDLMID_MDL_API_ConnectErrorEvent", 2},
+    {"MDLMID_MDL_API_DisconnectedEvent", 3},
     {"MDLMID_MDL_SYS_Logon", 1},
     {"MDLMID_MDL_SYS_LogonResponse", 2},
+    {"MDLMID_MDL_SYS_ServiceStatus", 5},
+    {"MDLMID_MDL_SYS_SessionStatus", 6},
     {"MDLMID_MDL_SYS_SubscribeRequest", 22},
     {"MDLMID_MDL_SYS_SubscribeResponse", 23},
     {"MDLEC_OK", 0},
@@ -1977,7 +2047,7 @@ std::vector<CheckResult> CheckCompiledVendorAbi() {
                     kApprovedBaseline.sdk_version,
                     mdl::MDL_VERSION);
 
-    const std::array<NumericConstant, 20> actual_constants = {{
+    const std::array<NumericConstant, 26> actual_constants = {{
         {"MDLSID_MDL_API",
          static_cast<std::uint64_t>(mdl::MDLSID_MDL_API)},
         {"MDLSID_MDL_SYS",
@@ -1986,13 +2056,30 @@ std::vector<CheckResult> CheckCompiledVendorAbi() {
          static_cast<std::uint64_t>(mdl::MDLSID_MDL_SHL2)},
         {"MDLSID_MDL_SZL2",
          static_cast<std::uint64_t>(mdl::MDLSID_MDL_SZL2)},
+        {"MDLVID_MDL_API",
+         static_cast<std::uint64_t>(api::MDLVID_MDL_API)},
         {"MDLVID_MDL_SYS",
          static_cast<std::uint64_t>(sys::MDLVID_MDL_SYS)},
+        {"MDLMID_MDL_API_ConnectingEvent",
+         static_cast<std::uint64_t>(
+             api::MDLMID_MDL_API_ConnectingEvent)},
+        {"MDLMID_MDL_API_ConnectErrorEvent",
+         static_cast<std::uint64_t>(
+             api::MDLMID_MDL_API_ConnectErrorEvent)},
+        {"MDLMID_MDL_API_DisconnectedEvent",
+         static_cast<std::uint64_t>(
+             api::MDLMID_MDL_API_DisconnectedEvent)},
         {"MDLMID_MDL_SYS_Logon",
          static_cast<std::uint64_t>(sys::MDLMID_MDL_SYS_Logon)},
         {"MDLMID_MDL_SYS_LogonResponse",
          static_cast<std::uint64_t>(
              sys::MDLMID_MDL_SYS_LogonResponse)},
+        {"MDLMID_MDL_SYS_ServiceStatus",
+         static_cast<std::uint64_t>(
+             sys::MDLMID_MDL_SYS_ServiceStatus)},
+        {"MDLMID_MDL_SYS_SessionStatus",
+         static_cast<std::uint64_t>(
+             sys::MDLMID_MDL_SYS_SessionStatus)},
         {"MDLMID_MDL_SYS_SubscribeRequest",
          static_cast<std::uint64_t>(
              sys::MDLMID_MDL_SYS_SubscribeRequest)},
@@ -2412,6 +2499,78 @@ std::vector<CheckResult> CheckCompiledVendorAbi() {
     }};
     AddTypeChecks<sz::CombinedTick>(
         kAbiTypes[23], combined_tick_members, &checks);
+
+    const std::array<MemberLayout, 1> connecting_event_members = {{
+        {"Address", offsetof(api::ConnectingEvent, Address)},
+    }};
+    AddTypeChecks<api::ConnectingEvent>(
+        kAbiTypes[24], connecting_event_members, &checks);
+    const std::array<MemberLayout, 2> connect_error_event_members = {{
+        {"ErrorMessage",
+         offsetof(api::ConnectErrorEvent, ErrorMessage)},
+        {"Address", offsetof(api::ConnectErrorEvent, Address)},
+    }};
+    AddTypeChecks<api::ConnectErrorEvent>(
+        kAbiTypes[25], connect_error_event_members, &checks);
+    const std::array<MemberLayout, 2> disconnected_event_members = {{
+        {"ErrorMessage",
+         offsetof(api::DisconnectedEvent, ErrorMessage)},
+        {"Address", offsetof(api::DisconnectedEvent, Address)},
+    }};
+    AddTypeChecks<api::DisconnectedEvent>(
+        kAbiTypes[26], disconnected_event_members, &checks);
+
+    const std::array<MemberLayout, 10> service_status_members = {{
+        {"Version", offsetof(sys::ServiceStatus, Version)},
+        {"StartDate", offsetof(sys::ServiceStatus, StartDate)},
+        {"StartTime", offsetof(sys::ServiceStatus, StartTime)},
+        {"MemoryTotal", offsetof(sys::ServiceStatus, MemoryTotal)},
+        {"MemoryRSS", offsetof(sys::ServiceStatus, MemoryRSS)},
+        {"MemoryPeak", offsetof(sys::ServiceStatus, MemoryPeak)},
+        {"ClientCount", offsetof(sys::ServiceStatus, ClientCount)},
+        {"SendRate", offsetof(sys::ServiceStatus, SendRate)},
+        {"Services", offsetof(sys::ServiceStatus, Services)},
+        {"BytesDelayed", offsetof(sys::ServiceStatus, BytesDelayed)},
+    }};
+    AddTypeChecks<sys::ServiceStatus>(
+        kAbiTypes[27], service_status_members, &checks);
+    const std::array<MemberLayout, 3> service_status_service_members = {{
+        {"ServiceID",
+         offsetof(sys::ServiceStatus::ServicesItem, ServiceID)},
+        {"ReceiveRate",
+         offsetof(sys::ServiceStatus::ServicesItem, ReceiveRate)},
+        {"IdleTime",
+         offsetof(sys::ServiceStatus::ServicesItem, IdleTime)},
+    }};
+    AddTypeChecks<sys::ServiceStatus::ServicesItem>(
+        kAbiTypes[28], service_status_service_members, &checks);
+
+    const std::array<MemberLayout, 1> session_status_members = {{
+        {"Clients", offsetof(sys::SessionStatus, Clients)},
+    }};
+    AddTypeChecks<sys::SessionStatus>(
+        kAbiTypes[29], session_status_members, &checks);
+    const std::array<MemberLayout, 8> session_status_client_members = {{
+        {"Version",
+         offsetof(sys::SessionStatus::ClientsItem, Version)},
+        {"Address",
+         offsetof(sys::SessionStatus::ClientsItem, Address)},
+        {"StartDate",
+         offsetof(sys::SessionStatus::ClientsItem, StartDate)},
+        {"StartTime",
+         offsetof(sys::SessionStatus::ClientsItem, StartTime)},
+        {"EncodeType",
+         offsetof(sys::SessionStatus::ClientsItem, EncodeType)},
+        {"DecodeType",
+         offsetof(sys::SessionStatus::ClientsItem, DecodeType)},
+        {"BytesDelayed",
+         offsetof(sys::SessionStatus::ClientsItem, BytesDelayed)},
+        {"SubscriptionList",
+         offsetof(
+             sys::SessionStatus::ClientsItem, SubscriptionList)},
+    }};
+    AddTypeChecks<sys::SessionStatus::ClientsItem>(
+        kAbiTypes[30], session_status_client_members, &checks);
 
     AddMessageCheck<sh::SHL2MarketData>(kMessages[0], &checks);
     AddMessageCheck<sh::NGTSTick>(kMessages[1], &checks);

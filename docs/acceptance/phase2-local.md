@@ -371,3 +371,77 @@ Local verification complete 改为完成。
 这些条件不得用 mock、单元测试、容器临时文件系统、进程 `SIGKILL` 或一次本机
 构建替代。只有三层口径各自的全部条件都有独立制品证据后，才可更新本记录中的
 状态。
+
+## 2026-07-21 addendum：本地代码收尾
+
+本 addendum 记录 2026-07-21 的增量修复与当前回归状态；它不修改本文开头对
+Phase 2 三层口径的判定，前述历史测试表也仍是其记录日期当时的结果。
+
+### recovered cursor + zero new callback clean stop
+
+`RawIngressApp` 的 callback/capture worker 计数是本进程 Connect generation 的
+增量值，而 recovered runtime 的 append/durable/ingress cursor 是 namespace 的
+绝对值。此前，当 recovered cursor 非零且本 generation 没有新 callback 时，
+默认的 `captured_ingress_sequence==0` 会与非零 terminal WAL cursor 冲突，导致
+本应可精确对账的空 generation 无法形成 clean-stop evidence。
+
+当前修复在 callback 已静默后，从以
+`recovered_next_ingress_sequence` 初始化的 handler 取得本 generation 的绝对
+terminal ingress cursor，并写入零 callback 的 terminal evidence；
+`RawIngressCleanStopEvidenceV1::exact()` 对该分支明确要求：
+
+- callback records 和 capture-worker append/durable record counts 保持增量零；
+- callback terminal ingress sequence 等于 started recovered append sequence；
+- final append/durable last ingress sequence 分别保持 started recovered 的绝对
+  append/durable sequence；
+- 其余 writer seal、cursor、byte、queue、callback-quiescence 与 identity 条件不被
+  放宽。
+
+`test_phase2_raw_ingress_app` 新增 recovered nonzero cursor + zero new callback
+场景，验证 clean stop 成功、worker 增量计数仍为零、absolute cursor 不被重置或
+虚增。
+
+### 当前验证与制品阻断
+
+`RawLiveTail` 同时完成了 Phase 3 live bridge 所需的 Phase 2 边界收紧：fresh
+control sample 每次直接读取 source，不复用 READY 缓存；tail 与 POSIX source
+分别串行化其可变 source 操作；attach 与 fresh sample 都拒绝 zero/odd seqlock
+generation、writer/namespace 漂移、append/durable 不同 segment base、未对齐或
+不满足最小 Raw record 算术的 cursor。测试另覆盖奇数 generation fail-closed，
+以及合法偶数 generation 的 attach/fresh sample。
+
+本轮改动的定向 Phase 2 回归：
+
+```text
+test_phase2_raw_ingress_app
+test_phase2_raw_live_tail
+test_phase2_raw_live_tail_posix
+test_phase2_raw_readiness_worker
+```
+
+strict Debug、Release 和 ASan+UBSan Debug 的上述四项定向回归均为
+**4/4 tests passed，0 failed**。ASan+UBSan 使用
+`ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1`，因此不声明
+LeakSanitizer。
+
+当前 strict Debug build 在排除下述唯一不可执行的 Phase 0 vendor artifact gate
+后，full CTest 为 **92/92 tests passed，0 failed**；Phase 3 label 是其中的
+**5/5 passed**。`test_phase0_baseline` 单独执行仍按预期 fail-closed，而不是被
+跳过后宣称整个 93-test suite 全绿。
+
+Full CTest 中的 Phase 0 vendor baseline 仍受外部制品阻断：
+`mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 当前只有 134 bytes，内容是 Git LFS
+pointer（其声明的真实 object size 为 242357680 bytes），不是可加载的 ELF shared
+object。该缺失不能通过放宽 ABI/baseline gate 或把 pointer 当成 SDK library 来
+规避；必须取得与 baseline 匹配的真实 vendor artifact 后重跑。
+
+上述本地修复与定向绿色结果仍不完成以下事项：
+
+- `L2Flow::production` 和 `l2flow_ingress_service` 尚未切换到 Phase 2，生产
+  service/controller、coordinator IPC、monitor、RunManifest 和四 ingress lifecycle
+  仍未接入；
+- 真实四端点/交易时段 data plane、10,000 seeds、目标 NVMe、完整交易日、
+  cold-cache 5×、正常 reboot、deterministic power-loss 与目标环境 power-cut 制品
+  仍不存在；
+- 因此 Phase 2 的 **Implementation complete**、**Local verification complete**
+  和 **Phase 2 exit complete** 仍全部为**未完成**。

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 
@@ -96,6 +97,21 @@ enum class RawLiveTailError : std::uint8_t {
     kResourceExhausted,
 };
 
+// One direct, non-cached read from the attached Raw control source. The
+// source call is serialized with every other source operation performed by
+// this tail, so a service monitor may sample concurrently with Next() even
+// when the source implementation itself is not thread-safe.
+struct RawLiveControlSampleV1 final {
+    RawControlSnapshot snapshot{};
+    std::uint64_t generation = 0U;
+    RawLiveTailError error = RawLiveTailError::kNone;
+    int error_number = 0;
+
+    [[nodiscard]] constexpr bool ok() const noexcept {
+        return error == RawLiveTailError::kNone;
+    }
+};
+
 enum class RawLiveTailStepKind : std::uint8_t {
     kRecord = 0U,
     kSegmentTransition,
@@ -134,6 +150,8 @@ struct RawLiveTailAttachV1 final {
 // kSegmentTransition before records from the new segment. Any writer-instance
 // change invalidates the attach and requires the caller to run the full
 // control/namespace/recovery attach gate again.
+// The source is borrowed and must outlive this tail and every in-flight
+// Next()/SampleControlFresh() call.
 class RawLiveTail final {
 public:
     RawLiveTail(const RawLiveTail&) = delete;
@@ -149,8 +167,16 @@ public:
 
     [[nodiscard]] RawLiveTailStep Next() noexcept;
 
+    // Always reaches the source. A failed read never returns a cached prior
+    // snapshot and therefore cannot be used as READY evidence.
+    [[nodiscard]] RawLiveControlSampleV1
+    SampleControlFresh() const noexcept;
+
     [[nodiscard]] std::uint32_t segment_sequence() const noexcept {
         return segment_sequence_;
+    }
+    [[nodiscard]] RawLiveTailAttachV1 initial_attach() const noexcept {
+        return attach_;
     }
     [[nodiscard]] std::uint64_t
     initial_global_wal_pos() const noexcept {
@@ -196,8 +222,19 @@ private:
         std::uint64_t offset,
         std::span<std::byte> output,
         RawLiveTailStep* failure) noexcept;
+    [[nodiscard]] int ReadControlFromSource(
+        RawControlSnapshot* snapshot,
+        std::uint64_t* generation) const noexcept;
+    [[nodiscard]] int InspectSegmentFromSource(
+        std::uint32_t segment_sequence,
+        RawLiveSegmentInfo* info) const noexcept;
+    [[nodiscard]] RawLiveReadResult ReadSegmentSomeFromSource(
+        std::uint32_t segment_sequence,
+        std::uint64_t offset,
+        std::span<std::byte> output) const noexcept;
 
     RawLiveTailSource* source_ = nullptr;
+    mutable std::mutex source_mutex_;
     RawLiveTailAttachV1 attach_{};
     std::uint32_t segment_sequence_ = 0U;
     std::uint64_t segment_offset_ = 0U;

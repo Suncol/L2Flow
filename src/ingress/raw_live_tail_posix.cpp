@@ -13,6 +13,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <span>
 #include <string>
@@ -974,6 +975,10 @@ struct RawLiveTailPosixSource::Impl final {
         return 0;
     }
 
+    // RawLiveTail::Next() and the service READY monitor both call this source.
+    // The retained descriptor/cache/monotonic-control state is mutable, so
+    // all public source operations serialize through this mutex.
+    mutable std::mutex public_mutex;
     int directory_fd = -1;
     int journal_fd = -1;
     std::uint32_t source_stream_id = 0U;
@@ -1014,6 +1019,7 @@ int RawLiveTailPosixSource::ReadControl(
         generation == nullptr) {
         return EINVAL;
     }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
     if (impl_->identity_fenced) {
         return ESTALE;
     }
@@ -1062,6 +1068,7 @@ int RawLiveTailPosixSource::InspectSegment(
     if (impl_ == nullptr || info == nullptr) {
         return EINVAL;
     }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
     if (impl_->identity_fenced) {
         return ESTALE;
     }
@@ -1123,6 +1130,7 @@ RawLiveReadResult RawLiveTailPosixSource::ReadSegmentSome(
     if (impl_ == nullptr) {
         return {0U, EINVAL};
     }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
     if (impl_->identity_fenced) {
         return {0U, ESTALE};
     }
@@ -1213,14 +1221,22 @@ RawLiveReadResult RawLiveTailPosixSource::ReadSegmentSome(
 
 int RawLiveTailPosixSource::directory_open_flags()
     const noexcept {
-    return impl_ == nullptr || impl_->directory_fd < 0
+    if (impl_ == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
+    return impl_->directory_fd < 0
                ? -1
                : ::fcntl(impl_->directory_fd, F_GETFL);
 }
 
 int RawLiveTailPosixSource::control_open_flags()
     const noexcept {
-    return impl_ == nullptr || impl_->control == nullptr
+    if (impl_ == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
+    return impl_->control == nullptr
                ? -1
                : ::fcntl(
                      impl_->control->descriptor(), F_GETFL);
@@ -1228,7 +1244,11 @@ int RawLiveTailPosixSource::control_open_flags()
 
 int RawLiveTailPosixSource::journal_open_flags()
     const noexcept {
-    return impl_ == nullptr || impl_->journal_fd < 0
+    if (impl_ == nullptr) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
+    return impl_->journal_fd < 0
                ? -1
                : ::fcntl(impl_->journal_fd, F_GETFL);
 }
@@ -1238,6 +1258,7 @@ int RawLiveTailPosixSource::segment_open_flags(
     if (impl_ == nullptr || segment_sequence == 0U) {
         return -1;
     }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
     const std::size_t index =
         static_cast<std::size_t>(
             segment_sequence - 1U);
@@ -1251,9 +1272,11 @@ int RawLiveTailPosixSource::segment_open_flags(
 
 std::size_t RawLiveTailPosixSource::retained_segment_count()
     const noexcept {
-    return impl_ == nullptr
-               ? 0U
-               : impl_->retained_segment_count_value;
+    if (impl_ == nullptr) {
+        return 0U;
+    }
+    std::lock_guard<std::mutex> lock(impl_->public_mutex);
+    return impl_->retained_segment_count_value;
 }
 
 std::unique_ptr<RawLiveTailPosixSource>

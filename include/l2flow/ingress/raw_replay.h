@@ -120,6 +120,16 @@ struct RawReplaySegmentContext final {
     std::uint32_t capture_date = 0U;
     RawV1Identity stream_day_id{};
     std::uint32_t segment_sequence = 0U;
+    // Stream-day WAL coordinate of segment byte zero. Downstream consumers
+    // use this to prove that a validated RawRecordView has not been rebound
+    // to a different segment context with the same day-level namespace.
+    std::uint64_t segment_base_wal_pos = 0U;
+    // Immutable segment identities required by downstream checkpoint and
+    // replay consumers. Carrying these in the validated context prevents a
+    // record locator from being rebound to a different effective config or
+    // Raw schema while retaining the same namespace/cursor tuple.
+    RawV1Digest config_sha256{};
+    RawV1Digest raw_schema_sha256{};
     RawReplayClockIdentity clock_epoch{};
 };
 

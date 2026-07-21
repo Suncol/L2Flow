@@ -65,11 +65,36 @@ elseif(L2FLOW_ENABLE_TSAN)
 endif()
 
 find_package(Threads REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(L2FLOW_VENDOR_LIBRARY_PATH
     "${CMAKE_CURRENT_SOURCE_DIR}/mdl_sdk_2_13_234/libs/linux/libmdl_api.so"
     CACHE FILEPATH
     "DataYes libmdl_api.so used by optional direct-link probes")
+
+# Git LFS leaves a small pointer file at the configured path when the vendor
+# object has not been materialized.  Merely checking EXISTS would then create
+# optional direct-link targets and make the linker consume that text file.
+# Keep those targets optional unless the candidate starts with the ELF magic;
+# the Phase-0 runtime gate still examines the configured repository artifact
+# independently and therefore continues to fail closed for pointers or other
+# malformed files.
+set(L2FLOW_VENDOR_LIBRARY_IS_ELF OFF)
+if(EXISTS "${L2FLOW_VENDOR_LIBRARY_PATH}" AND
+   NOT IS_DIRECTORY "${L2FLOW_VENDOR_LIBRARY_PATH}")
+    file(READ
+        "${L2FLOW_VENDOR_LIBRARY_PATH}"
+        L2FLOW_VENDOR_LIBRARY_MAGIC
+        OFFSET 0
+        LIMIT 4
+        HEX)
+    string(TOLOWER
+        "${L2FLOW_VENDOR_LIBRARY_MAGIC}"
+        L2FLOW_VENDOR_LIBRARY_MAGIC)
+    if(L2FLOW_VENDOR_LIBRARY_MAGIC STREQUAL "7f454c46")
+        set(L2FLOW_VENDOR_LIBRARY_IS_ELF ON)
+    endif()
+endif()
 
 include(cmake/L2FlowBuildManifest.cmake)
 set(L2FLOW_GENERATED_INCLUDE_DIR
@@ -272,8 +297,9 @@ set(L2FLOW_PHASE2_SOURCES
 
 add_library(l2flow_phase2 STATIC ${L2FLOW_PHASE2_SOURCES})
 add_library(L2Flow::phase2 ALIAS l2flow_phase2)
-# The production alias remains on the last complete runtime slice until Raw
-# recovery and service construction are connected later in Phase 2.
+# The production alias remains on the last complete runtime slice until the
+# Phase-2 Raw service/controller construction and its external exit gates are
+# connected and accepted.  Phase 3 is consumable explicitly as L2Flow::phase3.
 add_library(L2Flow::production ALIAS l2flow_phase01)
 set_target_properties(l2flow_phase2 PROPERTIES
     CXX_STANDARD 20
@@ -288,6 +314,57 @@ target_link_libraries(l2flow_phase2
     PUBLIC L2Flow::phase01)
 l2flow_enable_strict_warnings(l2flow_phase2)
 l2flow_enable_sanitizers(l2flow_phase2)
+
+set(L2FLOW_PHASE3_SOURCES
+    src/control/api_decoder.cpp
+    src/control/checked_body_view.cpp
+    src/control/control_checkpoint_posix_store.cpp
+    src/control/control_checkpoint_v1.cpp
+    src/control/control_decoder.cpp
+    src/control/control_hash.cpp
+    src/control/control_live_worker.cpp
+    src/control/control_readiness_gate.cpp
+    src/control/control_record_v1.cpp
+    src/control/resubscribe_guard.cpp
+    src/control/sys_decoder.cpp)
+
+set(L2FLOW_PHASE3_SCHEMA_HEADER
+    "${L2FLOW_GENERATED_INCLUDE_DIR}/l2flow/control/phase3_schema_v1_generated.h")
+add_custom_command(
+    OUTPUT "${L2FLOW_PHASE3_SCHEMA_HEADER}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${L2FLOW_GENERATED_INCLUDE_DIR}/l2flow/control"
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_phase3_control_schema.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/schemas/control_record_v1.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/schemas/control_checkpoint_v1.json"
+        "${L2FLOW_PHASE3_SCHEMA_HEADER}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_phase3_control_schema.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/schemas/control_record_v1.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/schemas/control_checkpoint_v1.json"
+    COMMENT "Validating and generating Phase 3 control schema constants"
+    VERBATIM)
+add_custom_target(l2flow_phase3_schema_codegen
+    DEPENDS "${L2FLOW_PHASE3_SCHEMA_HEADER}")
+
+add_library(l2flow_phase3 STATIC
+    ${L2FLOW_PHASE3_SOURCES}
+    "${L2FLOW_PHASE3_SCHEMA_HEADER}")
+add_library(L2Flow::phase3 ALIAS l2flow_phase3)
+add_dependencies(l2flow_phase3 l2flow_phase3_schema_codegen)
+set_target_properties(l2flow_phase3 PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+target_compile_features(l2flow_phase3 PUBLIC cxx_std_20)
+target_include_directories(l2flow_phase3
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${L2FLOW_GENERATED_INCLUDE_DIR}>)
+target_link_libraries(l2flow_phase3 PUBLIC L2Flow::phase2)
+l2flow_enable_strict_warnings(l2flow_phase3)
+l2flow_enable_sanitizers(l2flow_phase3)
 
 if(L2FLOW_BUILD_RAW_V1_LIBFUZZER)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -417,7 +494,7 @@ l2flow_enable_sanitizers(mdl_phase2_live_probe)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    L2FLOW_SANITIZER_MODE STREQUAL "none" AND
-       EXISTS "${L2FLOW_VENDOR_LIBRARY_PATH}")
+   L2FLOW_VENDOR_LIBRARY_IS_ELF)
     add_executable(
         mdl_vendor_link_probe
         tools/mdl_vendor_link_probe.cpp)
@@ -519,7 +596,7 @@ if(L2MOCK_BUILD_TESTS)
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
        L2FLOW_SANITIZER_MODE STREQUAL "none" AND
-       EXISTS "${L2FLOW_VENDOR_LIBRARY_PATH}")
+       L2FLOW_VENDOR_LIBRARY_IS_ELF)
         add_executable(test_sdk_vendor_isolation
             tests/test_sdk_link_isolation.cpp)
         target_compile_definitions(test_sdk_vendor_isolation
@@ -554,6 +631,32 @@ if(L2FLOW_BUILD_TESTS)
         l2flow_enable_strict_warnings(${target})
         add_test(NAME ${target} COMMAND ${target})
     endfunction()
+
+    function(l2flow_add_phase3_test target source)
+        add_executable(${target} "${source}")
+        target_link_libraries(${target} PRIVATE L2Flow::phase3)
+        l2flow_enable_strict_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "phase3")
+    endfunction()
+
+    l2flow_add_phase3_test(
+        test_phase3_control_decoder
+        tests/test_phase3_control_decoder.cpp)
+    l2flow_add_phase3_test(
+        test_phase3_control_core
+        tests/test_phase3_control_core.cpp)
+    l2flow_add_phase3_test(
+        test_phase3_control_live_worker
+        tests/test_phase3_control_live_worker.cpp)
+    l2flow_add_phase3_test(
+        test_phase3_control_checkpoint_reachability
+        tests/test_phase3_control_checkpoint_reachability.cpp)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        l2flow_add_phase3_test(
+            test_phase3_control_checkpoint_posix_store
+            tests/test_phase3_control_checkpoint_posix_store.cpp)
+    endif()
 
     add_test(
         NAME test_phase2_live_probe_cli_help

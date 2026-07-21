@@ -91,7 +91,10 @@ public:
             return EINVAL;
         }
         *output = control;
-        *generation = 3U;
+        // Raw control generations use an even value for a coherent,
+        // reader-visible seqlock snapshot.  An odd value means the writer is
+        // still publishing and must fail closed.
+        *generation = 4U;
         return 0;
     }
 

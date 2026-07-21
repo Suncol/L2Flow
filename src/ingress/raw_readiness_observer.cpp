@@ -1,5 +1,7 @@
 #include "l2flow/ingress/raw_readiness_observer.h"
 
+#include "l2flow/ingress/required_market_validator.h"
+
 #include "mdl_shl2_msg.h"
 #include "mdl_sys_msg.h"
 #include "mdl_szl2_msg.h"
@@ -580,6 +582,12 @@ bool IsValidConfig(
 
 }  // namespace
 
+bool ValidateRequiredMarketBodyBounds(
+    const l2flow::sdk::MessageKey& key,
+    std::span<const std::byte> body) noexcept {
+    return ValidateRequiredMarketBody(key, body);
+}
+
 class RawReadinessObserver::Impl final {
 public:
     explicit Impl(RawReadinessObserverConfig config)
@@ -1086,7 +1094,7 @@ private:
             if (fixed_body_bytes.has_value() &&
                 record.vendor_body().size() >=
                     *fixed_body_bytes &&
-                ValidateRequiredMarketBody(
+                ValidateRequiredMarketBodyBounds(
                     key, record.vendor_body())) {
                 required_first_seen_mask_ |=
                     std::uint64_t{1U} << index;

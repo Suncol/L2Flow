@@ -1,0 +1,261 @@
+{
+  "byte_order": "little-endian",
+  "crc32c": {
+    "algorithm": "CRC-32C/Castagnoli",
+    "init_hex": "0xffffffff",
+    "polynomial_normal_hex": "0x1edc6f41",
+    "polynomial_reflected_hex": "0x82f63b78",
+    "refin": true,
+    "refout": true,
+    "stored_encoding": "u32-le",
+    "xorout_hex": "0xffffffff"
+  },
+  "enums": {
+    "control_session_phase_v1": {
+      "encoding": "u8",
+      "unknown_values": "reject",
+      "values": {
+        "INITIAL": 0,
+        "CONNECTING": 1,
+        "LOGGED_IN": 2,
+        "CONNECT_ERROR": 3,
+        "DISCONNECTED": 4,
+        "LOGON_FAILED": 5,
+        "POISONED": 6
+      }
+    },
+    "subscription_policy_v1": {
+      "encoding": "u8",
+      "unknown_values": "reject",
+      "values": {
+        "REQUIRED": 1,
+        "OPTIONAL": 2
+      }
+    }
+  },
+  "flags": {
+    "control_checkpoint_flags_v1": {
+      "encoding": "u32-le",
+      "mask_hex": "0x0000003f",
+      "unknown_bits": "reject",
+      "values": {
+        "LOGGED_IN": 1,
+        "DISCONNECTED_WINDOW": 2,
+        "CONNECTION_SWITCHED": 4,
+        "POISONED": 8,
+        "CONTROL_READY": 16,
+        "DECODER_EVIDENCE_READY": 32
+      }
+    },
+    "quality_flags_v1": {
+      "encoding": "u64-le",
+      "mask_hex": "0x0000000fffffffff",
+      "unknown_bits": "reject",
+      "values": {
+        "START_UNKNOWN": 1,
+        "RECOVERING": 2,
+        "SESSION_UNKNOWN": 4,
+        "SUBSCRIPTION_CHANGED": 8,
+        "VENDOR_SEQUENCE_GAP": 16,
+        "VENDOR_SEQUENCE_DUPLICATE": 32,
+        "VENDOR_SEQUENCE_CONFLICT": 64,
+        "EXCHANGE_SEQUENCE_GAP": 128,
+        "EXCHANGE_SEQUENCE_BACKWARD": 256,
+        "EXCHANGE_SEQUENCE_CONFLICT": 512,
+        "CALLBACK_REENTRY": 1024,
+        "RAW_RECOVERED_APPEND_ONLY": 2048,
+        "RAW_CORRUPTION": 4096,
+        "DECODE_TRUNCATED": 8192,
+        "DECODE_OFFSET_INVALID": 16384,
+        "DECODE_TEXT_INVALID": 32768,
+        "NONCANONICAL_EMPTY_OFFSET": 65536,
+        "NULL_VALUE_PRESENT": 131072,
+        "UNKNOWN_ENUM": 262144,
+        "SCHEMA_UNKNOWN": 524288,
+        "NON_INTEGRAL_MATCHED_QTY": 1048576,
+        "AMBIGUOUS_ORDER_REFERENCE": 2097152,
+        "SNAPSHOT_STALE": 4194304,
+        "SNAPSHOT_DEPTH_SHORT": 8388608,
+        "QUEUE_TRUNCATED_TO_50": 16777216,
+        "TICK_RECON_INVALID": 33554432,
+        "UNAUTHORIZED": 67108864,
+        "CONNECTION_SWITCHED": 134217728,
+        "CLOCK_UNSYNCED": 268435456,
+        "CLOCK_EPOCH_CHANGED": 536870912,
+        "SOURCE_DISCONNECTED": 1073741824,
+        "INSTRUMENT_UNKNOWN": 2147483648,
+        "QTY_UNIT_UNKNOWN": 4294967296,
+        "DURABILITY_LAG": 8589934592,
+        "MARKET_CLOSED": 17179869184,
+        "NONDETERMINISTIC_LIVE_LATEST": 34359738368
+      },
+      "zero_semantic": "LIVE_OK"
+    }
+  },
+  "format": "L2Flow ControlCheckpointV1",
+  "limits": {
+    "entry_count_max": 64,
+    "entry_count_min": 1,
+    "entry_size": 16,
+    "file_size_max": 1568,
+    "file_size_min": 560,
+    "header_size": 512,
+    "identity128_size": 16,
+    "sha256_size": 32,
+    "trailer_size": 32,
+    "version": 1
+  },
+  "schema_version": 1,
+  "sha256": {
+    "algorithm": "SHA-256",
+    "digest_size": 32,
+    "stored_encoding": "raw-bytes"
+  },
+  "structures": {
+    "control_checkpoint_header_v1": {
+      "crc": {
+        "algorithm": "CRC-32C/Castagnoli",
+        "domain_length": 512,
+        "domain_offset": 0,
+        "field_offset": 508,
+        "field_width": 4,
+        "field_zeroed_during_calculation": true
+      },
+      "fields": [
+        {"encoding": "u32-le", "name": "magic", "offset": 0, "reserved": false, "value_hex": "0x3150434c", "wire_ascii": "LCP1", "width": 4},
+        {"encoding": "u16-le", "name": "version", "offset": 4, "reserved": false, "value": 1, "width": 2},
+        {"encoding": "u16-le", "name": "header_size", "offset": 6, "reserved": false, "value": 512, "width": 2},
+        {"encoding": "u32-le", "name": "total_size", "offset": 8, "reserved": false, "value_expression": "512 + 16 * entry_count + 32", "width": 4},
+        {"encoding": "u16-le", "name": "entry_size", "offset": 12, "reserved": false, "value": 16, "width": 2},
+        {"encoding": "bytes", "must_be_zero": true, "name": "reserved0", "offset": 14, "reserved": true, "width": 2},
+        {"encoding": "u32-le", "maximum": 64, "minimum": 1, "name": "entry_count", "offset": 16, "reserved": false, "width": 4},
+        {"encoding": "u32-le", "flags": "control_checkpoint_flags_v1", "mask_hex": "0x0000003f", "name": "flags", "offset": 20, "reserved": false, "width": 4},
+        {"encoding": "u32-le", "minimum": 1, "name": "source_stream_id", "offset": 24, "reserved": false, "width": 4},
+        {"encoding": "u32-le", "minimum": 1, "name": "capture_date", "offset": 28, "reserved": false, "width": 4},
+        {"encoding": "bytes", "must_not_be_all_zero": true, "name": "stream_day_id", "offset": 32, "reserved": false, "width": 16},
+        {"codec_recomputes": false, "encoding": "bytes", "must_not_be_all_zero": true, "name": "stable_config_sha256", "offset": 48, "reserved": false, "width": 32},
+        {"codec_recomputes": false, "encoding": "bytes", "must_not_be_all_zero": true, "name": "requested_manifest_sha256", "offset": 80, "reserved": false, "width": 32},
+        {"codec_recomputes": false, "encoding": "bytes", "name": "response_manifest_sha256", "offset": 112, "reserved": false, "width": 32},
+        {"codec_recomputes": false, "encoding": "bytes", "name": "current_address_sha256", "offset": 144, "reserved": false, "width": 32},
+        {"codec_recomputes": false, "encoding": "bytes", "name": "last_success_address_sha256", "offset": 176, "reserved": false, "width": 32},
+        {"codec_recomputes": false, "encoding": "bytes", "must_not_be_all_zero": true, "name": "state_sha256", "offset": 208, "reserved": false, "width": 32},
+        {"encoding": "u32-le", "name": "connection_epoch", "offset": 240, "reserved": false, "width": 4},
+        {"encoding": "u32-le", "name": "subscription_epoch", "offset": 244, "reserved": false, "width": 4},
+        {"encoding": "u8", "enum": "control_session_phase_v1", "name": "session_phase", "offset": 248, "reserved": false, "width": 1},
+        {"encoding": "bytes", "must_be_zero": true, "name": "reserved1", "offset": 249, "reserved": true, "width": 7},
+        {"encoding": "u64-le", "minimum": 1, "name": "next_ingress_sequence", "offset": 256, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "maximum": 18446744073709551614, "name": "processed_ingress_sequence", "offset": 264, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "minimum": 1, "name": "processed_record_start_wal_pos", "offset": 272, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "processed_record_end_wal_pos", "offset": 280, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "latest_response_ingress_sequence", "offset": 288, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "latest_response_record_end_wal_pos", "offset": 296, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "flags": "quality_flags_v1", "mask_hex": "0x0000000fffffffff", "name": "quality_flags", "offset": 304, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "required_first_seen_mask", "offset": 312, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "effective_success_mask", "offset": 320, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "minimum": 1, "name": "processed_records", "offset": 328, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "emitted_control_records", "offset": 336, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "logon_success", "offset": 344, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "logon_failure", "offset": 352, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "disconnect", "offset": 360, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "subscription_responses", "offset": 368, "reserved": false, "width": 8},
+        {"encoding": "u64-le", "name": "control_decode_errors", "offset": 376, "reserved": false, "width": 8},
+        {"encoding": "bytes", "must_be_zero": true, "name": "reserved_tail", "offset": 384, "reserved": true, "width": 124},
+        {"encoding": "u32-le", "name": "header_crc32c", "offset": 508, "reserved": false, "width": 4}
+      ],
+      "size": 512
+    },
+    "control_checkpoint_subscription_entry_v1": {
+      "fields": [
+        {"encoding": "u8", "maximum": 255, "minimum": 3, "name": "service_id", "offset": 0, "reserved": false, "width": 1},
+        {"encoding": "u8", "enum": "subscription_policy_v1", "name": "policy", "offset": 1, "reserved": false, "width": 1},
+        {"allowed_values": [0, 1], "encoding": "u8", "name": "status_known", "offset": 2, "reserved": false, "width": 1},
+        {"encoding": "bytes", "must_be_zero": true, "name": "reserved0", "offset": 3, "reserved": true, "width": 1},
+        {"encoding": "u16-le", "minimum": 1, "name": "service_version", "offset": 4, "reserved": false, "width": 2},
+        {"encoding": "u16-le", "minimum": 1, "name": "message_id", "offset": 6, "reserved": false, "width": 2},
+        {"encoding": "u32-le", "name": "status", "offset": 8, "reserved": false, "width": 4},
+        {"encoding": "bytes", "must_be_zero": true, "name": "reserved_tail", "offset": 12, "reserved": true, "width": 4}
+      ],
+      "size": 16
+    },
+    "control_checkpoint_trailer_v1": {
+      "fields": [
+        {"encoding": "bytes", "name": "checkpoint_sha256", "offset": 0, "reserved": false, "width": 32}
+      ],
+      "size": 32
+    },
+    "control_checkpoint_v1": {
+      "digest": {
+        "algorithm": "SHA-256",
+        "domain_length_expression": "total_size - 32",
+        "domain_offset": 0,
+        "field_offset_expression": "total_size - 32",
+        "field_width": 32,
+        "stored_encoding": "raw-bytes",
+        "trailer_excluded_from_calculation": true
+      },
+      "layout": [
+        {"count": 1, "name": "header", "offset": 0, "structure": "control_checkpoint_header_v1"},
+        {"count_expression": "entry_count", "name": "subscriptions", "offset": 512, "structure": "control_checkpoint_subscription_entry_v1"},
+        {"count": 1, "name": "trailer", "offset_expression": "512 + 16 * entry_count", "structure": "control_checkpoint_trailer_v1"}
+      ],
+      "total_size_expression": "512 + 16 * entry_count + 32",
+      "trailing_bytes": "forbidden"
+    }
+  },
+  "validation": {
+    "cross_field_constraints": [
+      "total_size equals the exact wire length and equals 512 + 16 * entry_count + 32",
+      "next_ingress_sequence equals processed_ingress_sequence + 1; processed_ingress_sequence is not UINT64_MAX",
+      "processed_records equals processed_ingress_sequence and is nonzero",
+      "processed_record_start_wal_pos is at least the 4096-byte Raw segment header; processed_record_end_wal_pos is greater by at least the 112-byte Raw record header-plus-trailer minimum; both processed Raw WAL cursors are 8-byte aligned",
+      "POISONED is set if and only if session_phase is POISONED, and control_decode_errors is nonzero if and only if POISONED is set",
+      "LOGGED_IN is set if and only if session_phase is LOGGED_IN; LOGGED_IN and DISCONNECTED_WINDOW cannot both be set",
+      "if LOGGED_IN is set, connection_epoch is nonzero",
+      "connection_epoch does not exceed logon_success and equals logon_success whenever POISONED is not set",
+      "INITIAL requires connection_epoch zero and DISCONNECTED_WINDOW clear; CONNECT_ERROR and DISCONNECTED require DISCONNECTED_WINDOW set; DISCONNECTED requires disconnect nonzero; LOGON_FAILED requires logon_failure nonzero",
+      "INITIAL requires current_address_sha256 and last_success_address_sha256 both zero; CONNECTING, CONNECT_ERROR, and DISCONNECTED require current_address_sha256 nonzero; DISCONNECTED_WINDOW requires current_address_sha256 nonzero; last_success_address_sha256 nonzero requires connection_epoch and current_address_sha256 nonzero; LOGGED_IN requires current_address_sha256 equal last_success_address_sha256, including the reachable all-zero pair when no API address preceded logon",
+      "the overflow-checked sum typed_event_count of logon_success, logon_failure, disconnect, subscription_responses, and control_decode_errors does not exceed emitted_control_records; untyped_event_count is emitted_control_records minus typed_event_count",
+      "CONNECTING and CONNECT_ERROR require untyped_event_count nonzero; current_address_sha256 nonzero or DISCONNECTED_WINDOW set requires the overflow-checked address-event evidence count disconnect + untyped_event_count to be nonzero",
+      "CONNECTION_SWITCHED requires connection_epoch at least two, both address hashes nonzero, and the overflow-checked address-event evidence count disconnect + untyped_event_count to be at least two",
+      "every session_phase other than INITIAL requires emitted_control_records nonzero",
+      "emitted_control_records does not exceed processed_records",
+      "each of logon_success, logon_failure, disconnect, subscription_responses, and control_decode_errors does not exceed emitted_control_records",
+      "subscription_epoch does not exceed the overflow-checked sum of logon_success and subscription_responses",
+      "checkpoint-persisted quality_flags are limited to SUBSCRIPTION_CHANGED, DECODE_TRUNCATED, DECODE_OFFSET_INVALID, NONCANONICAL_EMPTY_OFFSET, SCHEMA_UNKNOWN, and UNAUTHORIZED (mask 0x0000000004096008); attribution-only and replay-provenance quality bits are forbidden",
+      "nonzero checkpoint-persisted quality_flags require emitted_control_records nonzero; at least one of DECODE_TRUNCATED, DECODE_OFFSET_INVALID, or SCHEMA_UNKNOWN is set if and only if control_decode_errors is nonzero; NONCANONICAL_EMPTY_OFFSET requires emitted_control_records greater than control_decode_errors because only a successfully decoded control event can set it",
+      "SUBSCRIPTION_CHANGED requires connection_epoch and subscription_epoch nonzero and requires either at least two logon successes or at least one logon success plus one subscription response; UNAUTHORIZED requires logon_failure nonzero and LOGGED_IN clear",
+      "latest_response_ingress_sequence, latest_response_record_end_wal_pos, and response_manifest_sha256 are either all zero or all nonzero; they are nonzero if and only if at least one logon success, logon failure, or subscription response was emitted; when nonzero, latest_response_record_end_wal_pos is 8-byte aligned and the response pair either exactly equals the processed ingress/end pair or has an earlier ingress sequence with its WAL end no later than processed_record_start_wal_pos",
+      "subscription entries are in strict ascending lexicographic numeric order by (service_id, service_version, message_id), so duplicate keys are rejected",
+      "status equals zero whenever status_known equals zero; connection_epoch zero requires status_known zero for every entry",
+      "required_mask has bit i set exactly when subscription entry i has REQUIRED policy",
+      "effective_mask has bit i set exactly when subscription entry i has status_known equal to 1 and status equal to zero",
+      "effective_success_mask equals effective_mask",
+      "required_first_seen_mask is a subset of both required_mask and effective_mask",
+      "if connection_epoch equals zero, effective_mask and subscription_epoch both equal zero; a nonzero effective_mask requires a nonzero subscription_epoch",
+      "CONTROL_READY equals (!POISONED && LOGGED_IN && session_phase == LOGGED_IN && ((effective_mask & required_mask) == required_mask))",
+      "DECODER_EVIDENCE_READY equals (CONTROL_READY && ((required_first_seen_mask & required_mask) == required_mask))"
+    ],
+    "decoder_checks": [
+      "wire length is at least 544 before fixed fields are read",
+      "magic, version, header_size, and entry_size equal their fixed values",
+      "entry_count is in [1, 64] and wire length exactly matches total_size",
+      "all header and entry reserved bytes are zero",
+      "header_crc32c matches CRC-32C over exactly the 512-byte header with the CRC field zeroed",
+      "checkpoint_sha256 matches SHA-256 over bytes [0, total_size - 32), including the stored header_crc32c and all entries",
+      "all field and cross-field constraints pass"
+    ],
+    "encoder_behavior": [
+      "the entire output buffer is initialized to zero before fields and entries are stored",
+      "header_crc32c is computed and stored before checkpoint_sha256 is computed",
+      "stable_config_sha256, requested_manifest_sha256, response_manifest_sha256, current_address_sha256, last_success_address_sha256, and state_sha256 are model values; this codec does not recompute them"
+    ]
+  },
+  "unknown_value_policy": {
+    "flag_bits": "reject",
+    "quality_flag_bits": "reject",
+    "reserved_bytes": "reject unless all zero",
+    "session_phase_values": "reject",
+    "status_known_values": "reject unless 0 or 1",
+    "subscription_policy_values": "reject"
+  }
+}

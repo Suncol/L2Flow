@@ -377,15 +377,21 @@ void CheckFrozenBaseline(const std::filesystem::path& root,
             1ULL * 1024ULL * 1024ULL * 1024ULL,
         "candidate shared libraries have a frozen operational size bound");
 
-    constexpr std::array<baseline::NumericConstant, 20>
+    constexpr std::array<baseline::NumericConstant, 26>
         kExpectedProtocolConstants = {{
             {"MDLSID_MDL_API", 1},
             {"MDLSID_MDL_SYS", 2},
             {"MDLSID_MDL_SHL2", 4},
             {"MDLSID_MDL_SZL2", 6},
+            {"MDLVID_MDL_API", 101},
             {"MDLVID_MDL_SYS", 101},
+            {"MDLMID_MDL_API_ConnectingEvent", 1},
+            {"MDLMID_MDL_API_ConnectErrorEvent", 2},
+            {"MDLMID_MDL_API_DisconnectedEvent", 3},
             {"MDLMID_MDL_SYS_Logon", 1},
             {"MDLMID_MDL_SYS_LogonResponse", 2},
+            {"MDLMID_MDL_SYS_ServiceStatus", 5},
+            {"MDLMID_MDL_SYS_SessionStatus", 6},
             {"MDLMID_MDL_SYS_SubscribeRequest", 22},
             {"MDLMID_MDL_SYS_SubscribeResponse", 23},
             {"MDLEC_OK", 0},
@@ -426,7 +432,7 @@ void CheckFrozenBaseline(const std::filesystem::path& root,
         std::size_t size;
         std::size_t member_count;
     };
-    constexpr std::array<ExpectedTypeCoverage, 24>
+    constexpr std::array<ExpectedTypeCoverage, 31>
         kExpectedTypes = {{
             {"MDLMessageHead", 23, 8},
             {"MDLAnsiString", 6, 2},
@@ -452,10 +458,17 @@ void CheckFrozenBaseline(const std::filesystem::path& root,
             {"Order300192_v2", 58, 10},
             {"Transaction300191_v2", 70, 11},
             {"CombinedTick", 70, 11},
+            {"mdl_api_msg::ConnectingEvent", 6, 1},
+            {"mdl_api_msg::ConnectErrorEvent", 12, 2},
+            {"mdl_api_msg::DisconnectedEvent", 12, 2},
+            {"mdl_sys_msg::ServiceStatus", 60, 10},
+            {"mdl_sys_msg::ServiceStatus::ServicesItem", 12, 3},
+            {"mdl_sys_msg::SessionStatus", 8, 1},
+            {"mdl_sys_msg::SessionStatus::ClientsItem", 36, 8},
         }};
     test->Expect(approved_constants.abi_types.size() ==
                      kExpectedTypes.size(),
-                 "baseline freezes exactly 24 ABI structures");
+                 "baseline freezes exactly 31 ABI structures");
     if (approved_constants.abi_types.size() ==
         kExpectedTypes.size()) {
         for (std::size_t index = 0; index < kExpectedTypes.size();
@@ -528,6 +541,41 @@ void CheckFrozenBaseline(const std::filesystem::path& root,
                  "Transaction300191_v2",
                  "ExecType",
                  62,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_api_msg::ConnectingEvent",
+                 "Address",
+                 0,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_api_msg::ConnectErrorEvent",
+                 "Address",
+                 6,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_api_msg::DisconnectedEvent",
+                 "ErrorMessage",
+                 0,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_sys_msg::ServiceStatus",
+                 "Services",
+                 44,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_sys_msg::ServiceStatus",
+                 "BytesDelayed",
+                 52,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_sys_msg::SessionStatus",
+                 "Clients",
+                 0,
+                 test);
+    ExpectMember(approved_constants,
+                 "mdl_sys_msg::SessionStatus::ClientsItem",
+                 "SubscriptionList",
+                 30,
                  test);
 
     std::size_t required = 0;

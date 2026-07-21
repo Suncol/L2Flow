@@ -234,6 +234,12 @@ RawFixture BuildRawFixture() {
         fixture.scan.segment.stream_day_id;
     context.segment_sequence =
         fixture.scan.segment.segment_sequence;
+    context.segment_base_wal_pos =
+        fixture.scan.segment.segment_base_wal_pos;
+    context.config_sha256 =
+        fixture.scan.segment.config_sha256;
+    context.raw_schema_sha256 =
+        fixture.scan.segment.raw_schema_sha256;
     context.clock_epoch.algorithm =
         fixture.scan.segment.clock_epoch_algorithm;
     context.clock_epoch.digest =

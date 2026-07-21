@@ -89,6 +89,9 @@ template <typename Value>
         segment.capture_date,
         segment.stream_day_id,
         segment.segment_sequence,
+        segment.segment_base_wal_pos,
+        segment.config_sha256,
+        segment.raw_schema_sha256,
         ClockIdentity(segment)};
 }
 

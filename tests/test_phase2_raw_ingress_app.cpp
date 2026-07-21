@@ -127,13 +127,19 @@ public:
             runtime.append.segment_offset;
         identity_.first_ingress_sequence = 1U;
         snapshot_.initialized = true;
-        snapshot_.append.global_wal_pos =
-            ingress::kRawV1SegmentHeaderBytes +
-            (cursor_matches ? 0U : 1U);
-        snapshot_.append.segment_offset =
-            ingress::kRawV1SegmentHeaderBytes +
-            (cursor_matches ? 0U : 1U);
-        snapshot_.durable = snapshot_.append;
+        snapshot_.append = {
+            runtime.append.global_wal_pos,
+            runtime.append.ingress_sequence,
+            runtime.append.segment_offset};
+        snapshot_.durable = {
+            runtime.durable.global_wal_pos,
+            runtime.durable.ingress_sequence,
+            runtime.durable.segment_offset};
+        if (!cursor_matches) {
+            ++snapshot_.append.global_wal_pos;
+            ++snapshot_.append.segment_offset;
+            snapshot_.durable = snapshot_.append;
+        }
     }
 
     bool AppendRecord(
@@ -556,6 +562,7 @@ public:
         const ingress::RawIngressCleanStopEvidenceV1&
             evidence) noexcept override {
         ++calls;
+        last_evidence = evidence;
         accepted =
             evidence.exact() &&
             evidence.final_wal.sealed &&
@@ -572,6 +579,8 @@ public:
 
     std::uint64_t calls = 0U;
     bool accepted = false;
+    ingress::RawIngressCleanStopEvidenceV1
+        last_evidence{};
 };
 
 class LifecycleRecorder final
@@ -682,15 +691,22 @@ std::unique_ptr<ingress::RawLiveTail> MakeTail(
         config.recovered.source_stream_id;
     source->control.capture_date =
         config.recovered.capture_date;
-    source->control.segment_sequence = 1U;
+    source->control.segment_sequence =
+        config.recovered.current_segment_sequence;
     source->control.append_global_wal_pos =
-        ingress::kRawV1SegmentHeaderBytes;
+        config.recovered.append.global_wal_pos;
+    source->control.append_ingress_sequence =
+        config.recovered.append.ingress_sequence;
     source->control.append_segment_offset =
-        ingress::kRawV1SegmentHeaderBytes;
+        config.recovered.append.segment_offset;
     source->control.durable_global_wal_pos =
-        ingress::kRawV1SegmentHeaderBytes;
+        config.recovered.durable.global_wal_pos;
+    source->control.durable_ingress_sequence =
+        config.recovered.durable.ingress_sequence;
     source->control.durable_segment_offset =
-        ingress::kRawV1SegmentHeaderBytes;
+        config.recovered.durable.segment_offset;
+    source->control.clock_epoch_label =
+        config.recovered.clock_epoch_label;
     source->control.heartbeat_monotonic_ns = 1U;
 
     source->segment.header.source_stream_id =
@@ -699,10 +715,14 @@ std::unique_ptr<ingress::RawLiveTail> MakeTail(
         config.recovered.capture_date;
     source->segment.header.stream_day_id =
         config.recovered.stream_day_id;
-    source->segment.header.segment_sequence = 1U;
+    source->segment.header.segment_sequence =
+        config.recovered.current_segment_sequence;
+    source->segment.header.segment_base_wal_pos =
+        config.recovered.append.global_wal_pos -
+        config.recovered.append.segment_offset;
     source->segment.header.first_ingress_sequence = 1U;
     source->segment.visible_end_offset =
-        ingress::kRawV1SegmentHeaderBytes;
+        config.recovered.append.segment_offset;
 
     ingress::RawLiveTailAttachV1 attach;
     attach.writer_instance =
@@ -713,12 +733,14 @@ std::unique_ptr<ingress::RawLiveTail> MakeTail(
         config.recovered.source_stream_id;
     attach.capture_date =
         config.recovered.capture_date;
-    attach.segment_sequence = 1U;
+    attach.segment_sequence =
+        config.recovered.current_segment_sequence;
     attach.global_wal_pos =
         config.recovered.append.global_wal_pos;
     attach.segment_offset =
-        ingress::kRawV1SegmentHeaderBytes;
-    attach.next_ingress_sequence = 1U;
+        config.recovered.append.segment_offset;
+    attach.next_ingress_sequence =
+        config.recovered.recovered_next_ingress_sequence;
     std::unique_ptr<ingress::RawLiveTail> tail;
     if (ingress::RawLiveTail::Attach(
             source, attach, &tail) !=
@@ -837,6 +859,79 @@ void TestOrderedEmptyRuntime(TestContext* test) {
                 config.endpoint
                     ->message_encoding(),
         "SDK consumes immutable verified endpoint fields and releases only after ordered Raw shutdown");
+}
+
+void TestRecoveredEmptyRuntimePreservesIngressCursor(
+    TestContext* test) {
+    ingress::RawIngressAppConfigV1 config =
+        MakeConfig();
+    constexpr std::uint64_t kRecoveredRecords = 7U;
+    ingress::RawRecordLayoutV1 recovered_record{};
+    const bool recovered_layout_valid =
+        ingress::ComputeRawRecordLayoutV1(
+            0U, &recovered_record) ==
+        ingress::RawV1Error::kNone;
+    const std::uint64_t recovered_record_bytes =
+        recovered_record.record_size * kRecoveredRecords;
+    config.recovered.append.global_wal_pos +=
+        recovered_record_bytes;
+    config.recovered.append.segment_offset +=
+        recovered_record_bytes;
+    config.recovered.append.ingress_sequence =
+        kRecoveredRecords;
+    config.recovered.durable =
+        config.recovered.append;
+    config.recovered.recovered_next_ingress_sequence =
+        kRecoveredRecords + 1U;
+    test->Expect(
+        recovered_layout_valid &&
+            ingress::ValidateRawIngressRuntimeState(
+            config.stable,
+            config.recovered).empty(),
+        "recovered empty-stop fixture has a valid nonzero Raw cursor");
+
+    EmptyLiveSource live_source;
+    auto tail = MakeTail(config, &live_source);
+    auto clean_gate =
+        std::make_unique<RecordingCleanStopGate>();
+    RecordingCleanStopGate* const clean_gate_view =
+        clean_gate.get();
+    ingress::RawIngressApp app(
+        config,
+        std::make_shared<FakeFactory>(
+            std::make_shared<SdkEvents>()),
+        std::make_unique<FixedClock>(),
+        std::make_unique<EmptyPreparedSink>(
+            config.recovered, true),
+        std::move(tail),
+        std::move(clean_gate));
+    std::string error;
+    test->Expect(
+        app.Initialize(&error) && app.Stop(&error) &&
+            !app.fatal(),
+        "recovered runtime with no new callbacks completes a clean stop");
+    test->Expect(
+        clean_gate_view->calls == 1U &&
+            clean_gate_view->accepted &&
+            clean_gate_view->last_evidence
+                    .callback.captured_records == 0U &&
+            clean_gate_view->last_evidence
+                    .callback.captured_ingress_sequence ==
+                kRecoveredRecords &&
+            clean_gate_view->last_evidence
+                    .capture.append.records == 0U &&
+            clean_gate_view->last_evidence
+                    .capture.durable.records == 0U &&
+            clean_gate_view->last_evidence
+                    .capture.append.last_ingress_sequence ==
+                kRecoveredRecords &&
+            clean_gate_view->last_evidence
+                    .capture.durable.last_ingress_sequence ==
+                kRecoveredRecords &&
+            clean_gate_view->last_evidence
+                    .final_wal.append.ingress_sequence ==
+                kRecoveredRecords,
+        "empty-generation evidence keeps the recovered absolute cursor while worker record counts remain incremental");
 }
 
 void TestStableSyncPolicyReachesCaptureWorker(
@@ -1508,6 +1603,8 @@ void TestEmergencyWriterAckNegativeStates(
 int main() {
     TestContext test;
     TestOrderedEmptyRuntime(&test);
+    TestRecoveredEmptyRuntimePreservesIngressCursor(
+        &test);
     TestStableSyncPolicyReachesCaptureWorker(
         &test);
     TestCursorMismatchBeforeSdk(&test);

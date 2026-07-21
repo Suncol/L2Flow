@@ -216,6 +216,10 @@ std::vector<ingress::RawReplayRecord> MakeReplayRecords(
     context.stream_day_id = scan.segment.stream_day_id;
     context.segment_sequence =
         scan.segment.segment_sequence;
+    context.segment_base_wal_pos =
+        scan.segment.segment_base_wal_pos;
+    context.config_sha256 = scan.segment.config_sha256;
+    context.raw_schema_sha256 = scan.segment.raw_schema_sha256;
     context.clock_epoch.algorithm =
         scan.segment.clock_epoch_algorithm;
     context.clock_epoch.digest =

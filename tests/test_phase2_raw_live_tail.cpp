@@ -249,6 +249,8 @@ void ConfigureControl(
         append_ingress;
     source->control.durable_global_wal_pos =
         durable_global;
+    source->control.durable_segment_offset =
+        durable_global - base;
     source->control.durable_ingress_sequence =
         durable_ingress;
 }
@@ -416,10 +418,10 @@ void TestRotationIdentityAndBaseFailures() {
         &gap,
         attach,
         2U,
-        expected_base + 1U,
+        expected_base,
         ingress::kRawV1SegmentHeaderBytes,
         1U,
-        expected_base + 1U +
+        expected_base +
             ingress::kRawV1SegmentHeaderBytes,
         1U);
     std::unique_ptr<ingress::RawLiveTail> gap_tail;
@@ -497,8 +499,8 @@ void TestPublicationAndCorruptionRejections() {
         attach,
         1U,
         0U,
-        end - 1U,
-        0U,
+        end - ingress::kRawV1RecordAlignment,
+        1U,
         ingress::kRawV1SegmentHeaderBytes,
         0U);
     std::unique_ptr<ingress::RawLiveTail> unpublished;
@@ -543,6 +545,50 @@ void TestPublicationAndCorruptionRejections() {
         "live tail validates trailer before exposing record");
 }
 
+void TestControlGenerationMustBeCoherent() {
+    MemorySource source;
+    const auto attach = MakeAttach();
+    const std::array<std::uint64_t, 0U> no_records{};
+    source.segments.emplace(
+        1U,
+        MakeSegment(1U, 0U, 1U, no_records, false));
+    ConfigureControl(
+        &source,
+        attach,
+        1U,
+        0U,
+        ingress::kRawV1SegmentHeaderBytes,
+        0U,
+        ingress::kRawV1SegmentHeaderBytes,
+        0U);
+
+    source.control_generation = 3U;
+    std::unique_ptr<ingress::RawLiveTail> rejected;
+    Expect(
+        ingress::RawLiveTail::Attach(
+            &source, attach, &rejected) ==
+            ingress::RawLiveTailError::kControlCursorInvalid,
+        "attach rejects an odd in-progress control generation");
+
+    source.control_generation = 4U;
+    std::unique_ptr<ingress::RawLiveTail> tail;
+    Expect(
+        ingress::RawLiveTail::Attach(
+            &source, attach, &tail) ==
+                ingress::RawLiveTailError::kNone &&
+            tail != nullptr,
+        "attach accepts an even coherent control generation");
+    if (tail != nullptr) {
+        source.control_generation = 5U;
+        const auto sample = tail->SampleControlFresh();
+        Expect(
+            !sample.ok() &&
+                sample.error ==
+                    ingress::RawLiveTailError::kControlCursorInvalid,
+            "fresh sampling rejects a subsequently observed odd generation");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -550,6 +596,7 @@ int main() {
     TestRotationAndInstanceFence();
     TestRotationIdentityAndBaseFailures();
     TestPublicationAndCorruptionRejections();
+    TestControlGenerationMustBeCoherent();
     if (failures != 0) {
         std::cerr << failures
                   << " Phase 2 Raw live-tail tests failed\n";

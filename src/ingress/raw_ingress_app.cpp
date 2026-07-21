@@ -249,9 +249,12 @@ bool RawIngressCleanStopEvidenceV1::exact()
         return false;
     }
     if (callback.captured_records == 0U) {
-        return capture.append.last_ingress_sequence == 0U &&
-               capture.durable.last_ingress_sequence == 0U &&
-               callback.captured_ingress_sequence == 0U;
+        return capture.append.last_ingress_sequence ==
+                   started_runtime.append.ingress_sequence &&
+               capture.durable.last_ingress_sequence ==
+                   started_runtime.durable.ingress_sequence &&
+               callback.captured_ingress_sequence ==
+                   started_runtime.append.ingress_sequence;
     }
     return capture.append.last_ingress_sequence ==
                final_wal.append.ingress_sequence &&
@@ -1338,6 +1341,17 @@ bool RawIngressApp::StopLocked() noexcept {
             config_.recovered;
         evidence.callback =
             capture_metrics_.Snapshot();
+        // CaptureMetrics counters are local to this process generation, so an
+        // empty recovered generation still carries the metrics default of
+        // zero. The quiesced handler owns the absolute sequence state: its
+        // next cursor was initialized at recovered_next_ingress_sequence, so
+        // captured_sequence() is the recovered last sequence when no callback
+        // arrived. Publish that value before checking the cross-domain
+        // invariant.
+        if (evidence.callback.captured_records == 0U) {
+            evidence.callback.captured_ingress_sequence =
+                handler_.captured_sequence();
+        }
         evidence.capture =
             capture_worker_->Snapshot();
         evidence.observer =

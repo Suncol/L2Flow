@@ -43,6 +43,61 @@ bool FitsSize(std::uint64_t value) noexcept {
     return true;
 }
 
+bool ControlCursorShapeValid(
+    const RawControlSnapshot& snapshot) noexcept {
+    if (snapshot.segment_sequence == 0U ||
+        snapshot.append_segment_offset < kRawV1SegmentHeaderBytes ||
+        snapshot.durable_segment_offset < kRawV1SegmentHeaderBytes ||
+        (snapshot.append_global_wal_pos %
+         kRawV1RecordAlignment) != 0U ||
+        (snapshot.durable_global_wal_pos %
+         kRawV1RecordAlignment) != 0U ||
+        (snapshot.append_segment_offset %
+         kRawV1RecordAlignment) != 0U ||
+        (snapshot.durable_segment_offset %
+         kRawV1RecordAlignment) != 0U ||
+        snapshot.append_global_wal_pos <
+            snapshot.append_segment_offset ||
+        snapshot.durable_global_wal_pos <
+            snapshot.durable_segment_offset ||
+        snapshot.durable_segment_offset >
+            snapshot.append_segment_offset ||
+        snapshot.durable_global_wal_pos >
+            snapshot.append_global_wal_pos ||
+        snapshot.durable_ingress_sequence >
+            snapshot.append_ingress_sequence) {
+        return false;
+    }
+    const std::uint64_t segment_base_wal_pos =
+        snapshot.append_global_wal_pos -
+        snapshot.append_segment_offset;
+    const std::uint64_t durable_segment_base_wal_pos =
+        snapshot.durable_global_wal_pos -
+        snapshot.durable_segment_offset;
+    const std::uint64_t minimum_segment_base_wal_pos =
+        static_cast<std::uint64_t>(
+            snapshot.segment_sequence - 1U) *
+        kRawV1SegmentHeaderBytes;
+    if (segment_base_wal_pos != durable_segment_base_wal_pos ||
+        segment_base_wal_pos < minimum_segment_base_wal_pos ||
+        (snapshot.segment_sequence == 1U &&
+         segment_base_wal_pos != 0U)) {
+        return false;
+    }
+    const std::uint64_t appended_bytes =
+        snapshot.append_global_wal_pos -
+        snapshot.durable_global_wal_pos;
+    const std::uint64_t appended_records =
+        snapshot.append_ingress_sequence -
+        snapshot.durable_ingress_sequence;
+    constexpr std::uint64_t kMinimumRecordBytes =
+        kRawV1RecordHeaderBytes + kRawV1RecordTrailerBytes;
+    return (appended_bytes == 0U) ==
+               (appended_records == 0U) &&
+           appended_records <=
+               appended_bytes / kMinimumRecordBytes;
+}
+
 }  // namespace
 
 RawLiveTail::RawLiveTail(
@@ -53,6 +108,82 @@ RawLiveTail::RawLiveTail(
       segment_sequence_(attach_.segment_sequence),
       segment_offset_(attach_.segment_offset),
       next_ingress_sequence_(attach_.next_ingress_sequence) {}
+
+int RawLiveTail::ReadControlFromSource(
+    RawControlSnapshot* snapshot,
+    std::uint64_t* generation) const noexcept {
+    if (source_ == nullptr) {
+        return EINVAL;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(source_mutex_);
+        return source_->ReadControl(snapshot, generation);
+    } catch (...) {
+        return EIO;
+    }
+}
+
+int RawLiveTail::InspectSegmentFromSource(
+    std::uint32_t segment_sequence,
+    RawLiveSegmentInfo* info) const noexcept {
+    if (source_ == nullptr) {
+        return EINVAL;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(source_mutex_);
+        return source_->InspectSegment(segment_sequence, info);
+    } catch (...) {
+        return EIO;
+    }
+}
+
+RawLiveReadResult RawLiveTail::ReadSegmentSomeFromSource(
+    std::uint32_t segment_sequence,
+    std::uint64_t offset,
+    std::span<std::byte> output) const noexcept {
+    if (source_ == nullptr) {
+        return {0U, EINVAL};
+    }
+    try {
+        std::lock_guard<std::mutex> lock(source_mutex_);
+        return source_->ReadSegmentSome(
+            segment_sequence, offset, output);
+    } catch (...) {
+        return {0U, EIO};
+    }
+}
+
+RawLiveControlSampleV1 RawLiveTail::SampleControlFresh()
+    const noexcept {
+    RawLiveControlSampleV1 result;
+    result.error_number = ReadControlFromSource(
+        &result.snapshot, &result.generation);
+    if (result.error_number != 0) {
+        result.error = result.error_number == ESTALE
+                           ? RawLiveTailError::kInstanceChanged
+                           : RawLiveTailError::kControlUnavailable;
+        return result;
+    }
+    if (result.snapshot.writer_instance != attach_.writer_instance) {
+        result.error = RawLiveTailError::kInstanceChanged;
+        result.error_number = ESTALE;
+        return result;
+    }
+    if (result.snapshot.stream_day_id != attach_.stream_day_id ||
+        result.snapshot.source_stream_id != attach_.source_stream_id ||
+        result.snapshot.capture_date != attach_.capture_date) {
+        result.error = RawLiveTailError::kControlIdentityMismatch;
+        result.error_number = EINVAL;
+        return result;
+    }
+    if (result.generation == 0U ||
+        (result.generation & 1U) != 0U ||
+        !ControlCursorShapeValid(result.snapshot)) {
+        result.error = RawLiveTailError::kControlCursorInvalid;
+        result.error_number = EINVAL;
+    }
+    return result;
+}
 
 RawLiveTailError RawLiveTail::Attach(
     RawLiveTailSource* source,
@@ -82,7 +213,10 @@ RawLiveTailError RawLiveTail::Attach(
     if (control_error != 0) {
         return RawLiveTailError::kControlUnavailable;
     }
-    static_cast<void>(generation);
+    if (generation == 0U || (generation & 1U) != 0U ||
+        !ControlCursorShapeValid(control)) {
+        return RawLiveTailError::kControlCursorInvalid;
+    }
     if (control.writer_instance != attach.writer_instance) {
         return RawLiveTailError::kInstanceChanged;
     }
@@ -187,7 +321,7 @@ bool RawLiveTail::ReadAll(
             return false;
         }
         const RawLiveReadResult result =
-            source_->ReadSegmentSome(
+            ReadSegmentSomeFromSource(
                 segment_sequence,
                 current_offset,
                 output.subspan(completed));
@@ -222,25 +356,16 @@ RawLiveTailStep RawLiveTail::Next() noexcept {
     }
 
     for (;;) {
-    RawControlSnapshot before;
-    std::uint64_t before_generation = 0U;
-    const int before_error =
-        source_->ReadControl(
-            &before, &before_generation);
-    if (before_error != 0) {
-        if (before_error == ESTALE) {
-            return Fail(
-                RawLiveTailError::kInstanceChanged,
-                ESTALE);
-        }
+    const RawLiveControlSampleV1 before_sample =
+        SampleControlFresh();
+    if (!before_sample.ok()) {
         return Fail(
-            RawLiveTailError::kControlUnavailable,
-            before_error);
+            before_sample.error,
+            before_sample.error_number);
     }
-    if (before.writer_instance !=
-        attach_.writer_instance) {
-        return Fail(RawLiveTailError::kInstanceChanged);
-    }
+    const RawControlSnapshot& before = before_sample.snapshot;
+    const std::uint64_t before_generation =
+        before_sample.generation;
     if (!ValidateControl(before)) {
         return Fail(
             before.stream_day_id != attach_.stream_day_id ||
@@ -253,9 +378,8 @@ RawLiveTailStep RawLiveTail::Next() noexcept {
     }
 
     RawLiveSegmentInfo segment;
-    const int inspect_error =
-        source_->InspectSegment(
-            segment_sequence_, &segment);
+    const int inspect_error = InspectSegmentFromSource(
+        segment_sequence_, &segment);
     if (inspect_error != 0) {
         return Fail(
             RawLiveTailError::kSegmentUnavailable,
@@ -318,9 +442,8 @@ RawLiveTailStep RawLiveTail::Next() noexcept {
             RawLiveSegmentInfo next;
             const std::uint32_t next_sequence =
                 segment_sequence_ + 1U;
-            const int next_error =
-                source_->InspectSegment(
-                    next_sequence, &next);
+            const int next_error = InspectSegmentFromSource(
+                next_sequence, &next);
             std::uint64_t expected_next_base = 0U;
             std::uint64_t next_data_begin_wal_pos = 0U;
             if (next_error != 0 ||
@@ -469,25 +592,16 @@ RawLiveTailStep RawLiveTail::Next() noexcept {
         return read_failure;
     }
 
-    RawControlSnapshot after;
-    std::uint64_t after_generation = 0U;
-    const int after_error =
-        source_->ReadControl(
-            &after, &after_generation);
-    if (after_error != 0) {
-        if (after_error == ESTALE) {
-            return Fail(
-                RawLiveTailError::kInstanceChanged,
-                ESTALE);
-        }
+    const RawLiveControlSampleV1 after_sample =
+        SampleControlFresh();
+    if (!after_sample.ok()) {
         return Fail(
-            RawLiveTailError::kControlUnavailable,
-            after_error);
+            after_sample.error,
+            after_sample.error_number);
     }
-    if (after.writer_instance !=
-        attach_.writer_instance) {
-        return Fail(RawLiveTailError::kInstanceChanged);
-    }
+    const RawControlSnapshot& after = after_sample.snapshot;
+    const std::uint64_t after_generation =
+        after_sample.generation;
     if (!ValidateControl(after)) {
         return Fail(
             RawLiveTailError::kControlCursorInvalid,
