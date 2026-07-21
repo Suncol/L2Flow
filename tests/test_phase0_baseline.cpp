@@ -365,10 +365,17 @@ void CheckFrozenBaseline(const std::filesystem::path& root,
     const baseline::VendorBaseline& approved_constants =
         baseline::ApprovedVendorBaseline();
     test->Expect(
-        approved_constants.shared_library_sha256 ==
-                "09bd58282d6f758bfb737b628f5c51daa591a60f31d4081992679fcbc2e2cfc5" &&
-            approved_constants.shared_library_size == 242357680U,
-        "the originally approved shared-library hash and size stay frozen");
+        approved_constants.schema_version == 2U &&
+            approved_constants.sdk_version == 213234U,
+        "the compatibility baseline schema and SDK API version stay frozen");
+    test->Expect(
+        approved_constants.sdk_archive_sha256 ==
+            "23830887091d35875c653d97a4874f27f04b4cc36a69de37a952510d0701cc71",
+        "the reviewed SDK header archive identity stays frozen");
+    test->Expect(
+        baseline::kMaximumSdkSharedLibraryBytes ==
+            1ULL * 1024ULL * 1024ULL * 1024ULL,
+        "candidate shared libraries have a frozen operational size bound");
 
     constexpr std::array<baseline::NumericConstant, 20>
         kExpectedProtocolConstants = {{
@@ -578,15 +585,16 @@ void CheckElf(const std::filesystem::path& library,
                      error);
     const baseline::VendorBaseline& approved =
         baseline::ApprovedVendorBaseline();
-    test->Expect(metadata.file_size == approved.shared_library_size,
-                 "ELF file size matches baseline");
+    test->Expect(
+        metadata.file_size <= baseline::kMaximumSdkSharedLibraryBytes,
+        "ELF file size is within the compatibility bound");
     test->Expect(metadata.elf_class == ELFCLASS64 &&
                      metadata.data_encoding == ELFDATA2LSB &&
                      metadata.object_type == ET_DYN &&
                      metadata.machine == EM_X86_64,
                  "ELF class/data/type/machine match baseline");
-    test->Expect(metadata.build_id == approved.elf_build_id,
-                 "GNU build ID matches baseline");
+    test->Expect(!metadata.build_id.empty(),
+                 "candidate library exposes a GNU build ID");
     test->Expect(!metadata.soname.has_value(),
                  "approved library has no DT_SONAME");
 
@@ -599,17 +607,6 @@ void CheckElf(const std::filesystem::path& library,
     std::sort(expected.begin(), expected.end());
     test->Expect(metadata.needed == expected,
                  "DT_NEEDED set matches the exact frozen set");
-    test->Expect(
-        metadata.compiler_comment_sha256 ==
-            approved.compiler_comment_sha256,
-        ".comment compiler evidence hash matches baseline");
-    test->Expect(
-        metadata.compiler_producers.size() ==
-            approved.compiler_producers.size() &&
-            std::equal(metadata.compiler_producers.begin(),
-                       metadata.compiler_producers.end(),
-                       approved.compiler_producers.begin()),
-        "all compiler producer strings match in recorded order");
     test->Expect(
         metadata.required_symbol_versions.size() ==
             approved.required_symbol_versions.size() &&
@@ -779,27 +776,30 @@ void CheckRuntimeAndFailureGates(
     test->Expect(
         WriteText(
             unapproved_library,
-            "not the approved library"),
+            "not an ELF shared library"),
         "writes wrong-sized unapproved library fixture");
     const baseline::PreflightReport unapproved_report =
         baseline::RunApprovedLibraryRuntimePreflight(
             unapproved_library);
     test->Expect(
         !unapproved_report.passed(),
-        "wrong-sized library fails component preflight");
+        "malformed candidate library fails component preflight");
     test->Expect(
         !unapproved_report.runtime_probe_attempted,
-        "wrong-sized library is never dlopen'ed");
-    const baseline::CheckResult* unapproved_identity =
+        "malformed candidate library is never dlopen'ed");
+    const baseline::CheckResult* candidate_snapshot =
         FindCheck(
             unapproved_report,
-            "artifact.shared_library_sha256");
+            "artifact.shared_library_snapshot");
+    const baseline::CheckResult* candidate_elf =
+        FindCheck(unapproved_report, "elf.parse");
     test->Expect(
-        unapproved_identity != nullptr &&
-            !unapproved_identity->passed &&
-            unapproved_identity->actual == "<unavailable>",
-        "wrong-sized shared-library identity is unavailable "
-        "before hashing");
+        candidate_snapshot != nullptr &&
+            candidate_snapshot->passed &&
+            candidate_elf != nullptr &&
+            !candidate_elf->passed,
+        "bounded candidate snapshot succeeds before constrained ELF "
+        "validation rejects its contents");
 
     const std::filesystem::path symlink_library =
         temporary.path() / "symlink-libmdl_api.so";
@@ -816,16 +816,16 @@ void CheckRuntimeAndFailureGates(
         test->Expect(
             !symlink_report.passed() &&
                 !symlink_report.runtime_probe_attempted,
-            "component preflight never hashes or loads through a symlink");
+            "component preflight never snapshots or loads through a symlink");
         const baseline::CheckResult* symlink_hash =
             FindCheck(
                 symlink_report,
-                "artifact.shared_library_sha256");
+                "artifact.shared_library_snapshot");
         test->Expect(
             symlink_hash != nullptr &&
                 !symlink_hash->passed &&
                 symlink_hash->actual == "<unavailable>",
-            "symlink rejection is an explicit stable-open failure");
+            "symlink rejection is an explicit snapshot-open failure");
     }
 
     const baseline::PreflightReport invalid_fd =

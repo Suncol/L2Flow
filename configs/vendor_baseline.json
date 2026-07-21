@@ -1,18 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "vendor": "DataYes MDL",
   "sdk_version": 213234,
   "artifacts": {
-    "sdk_archive_sha256": "23830887091d35875c653d97a4874f27f04b4cc36a69de37a952510d0701cc71",
-    "shared_library_sha256": "09bd58282d6f758bfb737b628f5c51daa591a60f31d4081992679fcbc2e2cfc5",
-    "shared_library_size": 242357680
+    "sdk_archive_sha256": "23830887091d35875c653d97a4874f27f04b4cc36a69de37a952510d0701cc71"
   },
   "elf": {
     "class": "ELF64",
     "data": "little-endian",
     "type": "ET_DYN",
     "machine": "EM_X86_64",
-    "build_id": "ed9238d7788c4685f8d45e3b8e2ff1d0b6f0b1e7",
     "soname": null,
     "dt_needed": [
       "ld-linux-x86-64.so.2",
@@ -25,14 +22,6 @@
     ]
   },
   "compiler_abi": {
-    "compiler_comment_sha256": "a436de88a9917eee0253cfae79f292d52ea29987f92da29064e971c6bc031f10",
-    "compiler_producers": [
-      "GCC: (Ubuntu 4.8.5-4ubuntu2) 4.8.5",
-      "GCC: (Ubuntu 4.8.4-2ubuntu1~14.04.3) 4.8.4",
-      "GCC: (Ubuntu/Linaro 4.6.3-1ubuntu5) 4.6.3",
-      "GCC: (Ubuntu/Linaro 4.6.4-6ubuntu2) 4.6.4",
-      "GCC: (Ubuntu 5.4.0-6ubuntu1~16.04.12) 5.4.0 20160609"
-    ],
     "required_symbol_versions": [
       "CXXABI_1.3",
       "CXXABI_1.3.1",

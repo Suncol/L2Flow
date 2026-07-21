@@ -15,32 +15,39 @@ The archive hash uses one `O_NOFOLLOW|O_NONBLOCK` regular-file descriptor and a
 SHA-256, not the cap, is the artifact identity.
 
 Before the slower full gate, startup opens the configured library with
-`O_NOFOLLOW|O_NONBLOCK`, requires the approved exact size on a regular file
-before allocating or populating a memfd, copies its exact bytes into a
-close-on-exec memfd, verifies that source metadata did not change during the
-copy, and applies
+`O_NOFOLLOW|O_NONBLOCK`, requires a regular file no larger than the frozen
+1 GiB operational bound before allocating or populating a memfd, copies its
+exact bytes into a close-on-exec memfd, verifies that source metadata did not
+change during the copy, and applies
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`. The gate then verifies:
 
 1. the baseline file bytes;
 2. the original SDK archive SHA-256;
-3. the shared-library SHA-256 and size;
-4. constrained ELF64 identity, Build ID, dependencies, producer evidence, and
-   exact imported symbol-version set;
+3. the candidate shared library is one bounded, sealed immutable snapshot;
+4. constrained ELF64 class/data/type/machine, a present diagnostic Build ID,
+   absent SONAME, the exact dependency set, and the exact imported
+   symbol-version compatibility set;
 5. C++20 host properties and frozen vendor sizes, alignments, offsets, enum
    literals, and message keys;
 6. only after all previous checks, `dlopen`/`dlsym`, a wrong-version
-   `DllCreateIOManager` call, and the approved-version create/shutdown/release
+   `DllCreateIOManager` call, and the 2.13.234 create/shutdown/release
    call.
+
+Schema v2 deliberately pins the reviewed SDK header archive and ABI contract,
+not one shared-object hash or compiler producer string. A different 2.13.234
+library build is accepted only if every structural ELF, dependency,
+symbol-version, compiled ABI, and runtime lifecycle check passes.
 
 Concretely, service startup performs that full preflight on sealed snapshot A.
 The production loader independently captures fresh sealed snapshot B, repeats
-the approved library hash/ELF/ABI/runtime component gate against B's retained
-descriptor, and performs final `dlopen`/`dlsym` on B. Thus each component gate
-and its load consume one immutable byte identity; A and B are deliberately
-separate captures. Snapshot B and the dynamic handle remain owned for the
-SDK-object lifetime. Path replacement, truncation, mutation, or unlink after
-either capture cannot redirect that capture's checked bytes. Environments
-without Linux memfd sealing or usable `/proc/self/fd` support fail closed.
+the library snapshot/ELF/ABI/runtime component gate against B's retained
+descriptor, and performs final `dlopen`/`dlsym` on B. Thus each component
+gate and its load consume one immutable byte identity; A and B are deliberately
+separate compatibility-checked captures rather than one hash identity.
+Snapshot B and the dynamic handle remain owned for the SDK-object lifetime.
+Path replacement, truncation, mutation, or unlink after either capture cannot
+redirect that capture's checked bytes. Environments without Linux memfd sealing
+or usable `/proc/self/fd` support fail closed.
 
 The build manifest has no generation timestamp. It records compiler identity,
 compiler path/version, target system, build type, C++ standard, exact strict
@@ -53,6 +60,15 @@ There are four compiled executables. Each process constructs one manager and
 one subscriber. Shenzhen messages 6.33 and 6.36 deliberately share the same
 subscriber/ring order. No service exposes `SetPassword` or
 `SetReadBufferSize`; `send_mac_auth` comes from the endpoint contract.
+
+The documented feeder and direct upstream protocol place the account token in
+`SetUserName`; `SetPassword` remains outside the reviewed surface. The local
+feeder probe uses a fixed non-secret label because the cascade publisher is an
+anonymous local boundary. On shutdown, the application's Subscriber reference
+may release to zero or remain positive while IOManager still owns its registry
+reference; a negative count is invalid. The IOManager factory reference must
+still release exactly to zero.
+
 
 The production CLI accepts only an absolute endpoint-contract path and its
 expected lowercase SHA-256. It does not accept address, encoding,

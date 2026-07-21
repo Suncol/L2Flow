@@ -187,6 +187,63 @@ append/durable cursor、durability lag、ring 和 observer lag 指标。
 这些能力目前只是 Phase 2 library/runtime builder；它们尚未被生产 ingress
 service 构造和 monitor 调用。
 
+### 真实 feeder 到 Raw capture path 探针
+
+[`tools/mdl_phase2_live_probe.cpp`](../../tools/mdl_phase2_live_probe.cpp) 已作为
+`mdl_phase2_live_probe` CMake target 接入，输出
+`mdl-phase2-live-probe`。它是显式运行、默认不联网的外部测试入口，不是依赖
+实时网络的默认 CTest。每次调用只选择一个 production `IngressKind`，并把真实
+SDK callback 接入：
+
+```text
+CallbackHandler
+  -> ByteRing
+  -> RawCaptureWorker
+  -> POSIX RawWalWriter
+  -> sealed segment/journal
+  -> Raw validating reader
+  -> Raw recovery analyzer
+```
+
+输出目录必须是尚不存在的绝对路径；探针拒绝覆盖旧目录，对 callback ring 和
+Raw bytes 设置边界，使用固定的非秘密本地 feeder label，并且没有 token 命令行
+参数。Data-plane 成功要求每个 required subscription 都返回 `MDLEC_OK`，且每个
+required key 都至少收到配置数量的 market record。特别是 `sz-tick` 必须分别
+收到 `6.101.33` 和 `6.101.36`，不能只以两者总数判断成功。停机后还必须满足
+callback/append/durable record 与 vendor bytes 精确对账、ring 为空、writer
+clean seal、Raw reader 全量扫描通过，以及 recovery analyzer 接受同一个 sealed
+durable frontier。
+
+2026-07-21 收盘后，在本地 cascade feeder `127.0.0.1:9112` 上对四个 ingress
+kind 分别执行了三秒 control-plane-only 测试，显式使用
+`--minimum-market-messages-per-key 0`。五个 required key 的订阅回执全部为
+`MDLEC_OK`：
+
+```text
+ingress kind   required key(s)       vendor / framed / segment bytes
+sh-snapshot    4.101.4               102 / 216 / 4312
+sh-tick        4.101.24              102 / 216 / 4312
+sz-snapshot    6.101.28              102 / 216 / 4312
+sz-tick        6.101.33, 6.101.36    110 / 224 / 4320
+
+每次 callback / append / durable / reader records: 1 / 1 / 1 / 1
+每次 journal / recovery accepted journal bytes: 4240 / 4240
+每次 segment sealed: true
+每次 append / durable reconciliation exact: true / true
+```
+
+每次唯一记录都是真实 SDK control response。另一次 `sh-snapshot` 使用
+`--minimum-market-messages-per-key 1` 的测试已经连接并完成订阅登录，但由于
+feeder 收盘后停止推送 market record 而按预期失败。因此当前证据只证明真实
+control plane 和 Raw plumbing 接入，**不声明真实行情 data plane 已通过**。
+必须在交易时段用非零 per-key minimum 重跑；四个 ingress kind 仍然是四份独立
+验收证据。
+
+该探针有意不 provision production reserve coordinator、不发布 production
+manifest/certificate、不测试 rotation，也不替换 Phase 0–1 production service。
+它的成功不能关闭 production cutover、完整交易日、crash、power-loss 或 Phase 2
+exit 条件。
+
 ### Incremental SHA-256 修复
 
 [`src/common/sha256.cpp`](../../src/common/sha256.cpp) 修复了 incremental

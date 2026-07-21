@@ -63,15 +63,16 @@ public:
         int io_threads) = 0;
 };
 
-// Opens the supplied path with O_NOFOLLOW, copies the regular file into a
-// write/grow/shrink/seal-sealed memfd, and uses only that immutable snapshot
-// for hash/ELF/runtime preflight and the retained final dlopen()/dlsym().
-// No link-time reference to libmdl_api.so is required.
+// Opens the supplied path with O_NOFOLLOW, enforces the candidate-library size
+// bound, copies the regular file into a write/grow/shrink/seal-sealed memfd,
+// and uses only that immutable snapshot for ELF/dependency/symbol-version,
+// compiled-ABI and runtime-lifecycle preflight plus the retained final
+// dlopen()/dlsym(). No link-time reference to libmdl_api.so is required.
 //
 // Production callers must first pass RunVendorPreflight for the complete
-// baseline+archive+library set. This loader deliberately repeats the
-// library-only component gate on a fresh snapshot so the final mapping cannot
-// be redirected after that complete gate.
+// baseline+archive+compatible-library set. This loader deliberately repeats
+// the library-only compatibility gate on a fresh snapshot so the final mapping
+// cannot be redirected after that complete gate.
 //
 // The returned factory, every manager, and every subscriber share ownership
 // of the retained dynamic-library handle.  A failed vendor ReleaseRef() pins

@@ -67,7 +67,9 @@ endif()
 find_package(Threads REQUIRED)
 
 set(L2FLOW_VENDOR_LIBRARY_PATH
-    "${CMAKE_CURRENT_SOURCE_DIR}/mdl_sdk_2_13_234/libs/linux/libmdl_api.so")
+    "${CMAKE_CURRENT_SOURCE_DIR}/mdl_sdk_2_13_234/libs/linux/libmdl_api.so"
+    CACHE FILEPATH
+    "DataYes libmdl_api.so used by optional direct-link probes")
 
 include(cmake/L2FlowBuildManifest.cmake)
 set(L2FLOW_GENERATED_INCLUDE_DIR
@@ -381,6 +383,38 @@ add_executable(mdl_abi_preflight tools/mdl_abi_preflight.cpp)
 target_link_libraries(mdl_abi_preflight PRIVATE L2Flow::phase01)
 l2flow_enable_strict_warnings(mdl_abi_preflight)
 
+add_executable(
+    mdl_sdk_feeder_probe
+    tools/mdl_sdk_feeder_probe.cpp)
+target_link_libraries(
+    mdl_sdk_feeder_probe
+    PRIVATE L2Flow::phase01)
+set_target_properties(
+    mdl_sdk_feeder_probe
+    PROPERTIES
+        OUTPUT_NAME "mdl-sdk-feeder-probe"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO)
+l2flow_enable_strict_warnings(mdl_sdk_feeder_probe)
+l2flow_enable_sanitizers(mdl_sdk_feeder_probe)
+
+add_executable(
+    mdl_phase2_live_probe
+    tools/mdl_phase2_live_probe.cpp)
+target_link_libraries(
+    mdl_phase2_live_probe
+    PRIVATE L2Flow::phase2)
+set_target_properties(
+    mdl_phase2_live_probe
+    PROPERTIES
+        OUTPUT_NAME "mdl-phase2-live-probe"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO)
+l2flow_enable_strict_warnings(mdl_phase2_live_probe)
+l2flow_enable_sanitizers(mdl_phase2_live_probe)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    L2FLOW_SANITIZER_MODE STREQUAL "none" AND
        EXISTS "${L2FLOW_VENDOR_LIBRARY_PATH}")
@@ -520,6 +554,15 @@ if(L2FLOW_BUILD_TESTS)
         l2flow_enable_strict_warnings(${target})
         add_test(NAME ${target} COMMAND ${target})
     endfunction()
+
+    add_test(
+        NAME test_phase2_live_probe_cli_help
+        COMMAND mdl_phase2_live_probe --help)
+    set_tests_properties(
+        test_phase2_live_probe_cli_help
+        PROPERTIES
+            LABELS "phase2;live-probe-cli"
+            TIMEOUT 10)
 
     l2flow_add_phase2_test(
         test_crc32c

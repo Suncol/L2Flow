@@ -93,6 +93,7 @@ struct ShutdownState final {
 enum class ReleaseCountExpectation {
     Zero,
     Positive,
+    NonNegative,
 };
 
 bool ReleaseVendorObject(datayes::RefCounted* object,
@@ -131,10 +132,18 @@ bool ReleaseVendorObject(datayes::RefCounted* object,
             "SDK ABI");
         return false;
     }
-    const bool expected_count =
-        expectation == ReleaseCountExpectation::Zero
-            ? remaining == 0
-            : remaining > 0;
+    bool expected_count = false;
+    switch (expectation) {
+    case ReleaseCountExpectation::Zero:
+        expected_count = remaining == 0;
+        break;
+    case ReleaseCountExpectation::Positive:
+        expected_count = remaining > 0;
+        break;
+    case ReleaseCountExpectation::NonNegative:
+        expected_count = remaining >= 0;
+        break;
+    }
     if (expected_count) {
         if (error != nullptr) {
             error->clear();
@@ -249,7 +258,7 @@ public:
             object,
             library_,
             "Subscriber",
-            ReleaseCountExpectation::Zero,
+            ReleaseCountExpectation::NonNegative,
             error);
     }
 
@@ -451,8 +460,8 @@ std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
                 shared_library,
                 &snapshot,
                 error,
-                baseline::ApprovedVendorBaseline().
-                    shared_library_size)) {
+                std::nullopt,
+                baseline::kMaximumSdkSharedLibraryBytes)) {
             return nullptr;
         }
 

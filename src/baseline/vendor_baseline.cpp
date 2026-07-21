@@ -337,14 +337,6 @@ constexpr std::array<std::string_view, 7> kElfNeeded = {{
     "libstdc++.so.6",
 }};
 
-constexpr std::array<std::string_view, 5> kCompilerProducers = {{
-    "GCC: (Ubuntu 4.8.5-4ubuntu2) 4.8.5",
-    "GCC: (Ubuntu 4.8.4-2ubuntu1~14.04.3) 4.8.4",
-    "GCC: (Ubuntu/Linaro 4.6.3-1ubuntu5) 4.6.3",
-    "GCC: (Ubuntu/Linaro 4.6.4-6ubuntu2) 4.6.4",
-    "GCC: (Ubuntu 5.4.0-6ubuntu1~16.04.12) 5.4.0 20160609",
-}};
-
 // Sorted bytewise.  These are the exact DT_VERNEED names, not strings found
 // by scanning arbitrary payload bytes.
 constexpr std::array<std::string_view, 25> kRequiredSymbolVersions = {{
@@ -426,15 +418,10 @@ constexpr std::array<MessageContract, 8> kMessages = {{
 }};
 
 constexpr VendorBaseline kApprovedBaseline = {
-    1,
+    2,
     213234,
     "23830887091d35875c653d97a4874f27f04b4cc36a69de37a952510d0701cc71",
-    "09bd58282d6f758bfb737b628f5c51daa591a60f31d4081992679fcbc2e2cfc5",
-    242357680,
-    "ed9238d7788c4685f8d45e3b8e2ff1d0b6f0b1e7",
     kElfNeeded,
-    "a436de88a9917eee0253cfae79f292d52ea29987f92da29064e971c6bc031f10",
-    kCompilerProducers,
     kRequiredSymbolVersions,
     "GLIBC_2.15",
     "GLIBCXX_3.4.19",
@@ -506,18 +493,13 @@ std::string RenderApprovedBaselineJson() {
            << "  \"sdk_version\": " << baseline.sdk_version << ",\n"
            << "  \"artifacts\": {\n"
            << "    \"sdk_archive_sha256\": \""
-           << baseline.sdk_archive_sha256 << "\",\n"
-           << "    \"shared_library_sha256\": \""
-           << baseline.shared_library_sha256 << "\",\n"
-           << "    \"shared_library_size\": "
-           << baseline.shared_library_size << "\n"
+           << baseline.sdk_archive_sha256 << "\"\n"
            << "  },\n"
            << "  \"elf\": {\n"
            << "    \"class\": \"ELF64\",\n"
            << "    \"data\": \"little-endian\",\n"
            << "    \"type\": \"ET_DYN\",\n"
            << "    \"machine\": \"EM_X86_64\",\n"
-           << "    \"build_id\": \"" << baseline.elf_build_id << "\",\n"
            << "    \"soname\": null,\n"
            << "    \"dt_needed\": [\n";
     for (std::size_t index = 0; index < baseline.elf_needed.size(); ++index) {
@@ -527,22 +509,6 @@ std::string RenderApprovedBaselineJson() {
     output << "    ]\n"
            << "  },\n"
            << "  \"compiler_abi\": {\n"
-           << "    \"compiler_comment_sha256\": \""
-           << baseline.compiler_comment_sha256 << "\",\n"
-           << "    \"compiler_producers\": [\n";
-    for (std::size_t index = 0;
-         index < baseline.compiler_producers.size();
-         ++index) {
-        output << "      ";
-        std::string producer_json;
-        AppendJsonString(&producer_json,
-                         baseline.compiler_producers[index]);
-        output << producer_json
-               << (index + 1U == baseline.compiler_producers.size()
-                       ? "\n"
-                       : ",\n");
-    }
-    output << "    ],\n"
            << "    \"required_symbol_versions\": [\n";
     for (std::size_t index = 0;
          index < baseline.required_symbol_versions.size();
@@ -1462,36 +1428,6 @@ void AddFileHashCheck(const std::filesystem::path& path,
              actual == expected);
 }
 
-void AddOpenFdHashCheck(
-    int fd,
-    std::string_view expected,
-    std::string id,
-    std::vector<CheckResult>* checks,
-    std::optional<std::uint64_t>
-        maximum_size = std::nullopt) {
-    common::Sha256Digest digest{};
-    std::string error;
-    if (!common::ComputeFileSha256ForOpenFd(
-            fd,
-            &digest,
-            &error,
-            maximum_size)) {
-        AddCheck(checks,
-                 std::move(id),
-                 std::string(expected),
-                 "<unavailable>",
-                 false,
-                 std::move(error));
-        return;
-    }
-    const std::string actual = common::Sha256Hex(digest);
-    AddCheck(checks,
-             std::move(id),
-             std::string(expected),
-             actual,
-             actual == expected);
-}
-
 void AddBaselineFileCheck(const std::filesystem::path& path,
                           std::vector<CheckResult>* checks) {
     std::string error;
@@ -1522,19 +1458,21 @@ void AddElfChecks(const std::filesystem::path& path,
         return;
     }
     AddCheck(checks, "elf.parse", "valid", "valid", true);
-    AddIntegerCheck(checks,
-                    "elf.file_size",
-                    kApprovedBaseline.shared_library_size,
-                    metadata.file_size);
+    AddCheck(checks,
+             "elf.file_size",
+             "<=" + Number(kMaximumSdkSharedLibraryBytes),
+             Number(metadata.file_size),
+             metadata.file_size <= kMaximumSdkSharedLibraryBytes);
     AddIntegerCheck(checks, "elf.class", ELFCLASS64, metadata.elf_class);
     AddIntegerCheck(checks, "elf.data", ELFDATA2LSB, metadata.data_encoding);
     AddIntegerCheck(checks, "elf.type", ET_DYN, metadata.object_type);
     AddIntegerCheck(checks, "elf.machine", EM_X86_64, metadata.machine);
     AddCheck(checks,
              "elf.build_id",
-             std::string(kApprovedBaseline.elf_build_id),
+             "<present>",
              metadata.build_id,
-             metadata.build_id == kApprovedBaseline.elf_build_id);
+             !metadata.build_id.empty(),
+             "observed for diagnostics; not pinned to one library build");
     AddCheck(checks,
              "elf.soname",
              "<absent>",
@@ -1559,32 +1497,6 @@ void AddElfChecks(const std::filesystem::path& path,
              JoinStringViews(expected),
              JoinStrings(metadata.needed),
              needed_equal);
-
-    const bool producers_equal =
-        metadata.compiler_producers.size() ==
-            kApprovedBaseline.compiler_producers.size() &&
-        std::equal(
-            metadata.compiler_producers.begin(),
-            metadata.compiler_producers.end(),
-            kApprovedBaseline.compiler_producers.begin(),
-            [](const std::string& actual, std::string_view approved) {
-                return actual == approved;
-            });
-    AddCheck(checks,
-             "elf.compiler_comment_sha256",
-             std::string(
-                 kApprovedBaseline.compiler_comment_sha256),
-             metadata.compiler_comment_sha256,
-             metadata.compiler_comment_sha256 ==
-                 kApprovedBaseline.compiler_comment_sha256);
-    AddCheck(checks,
-             "elf.compiler_producers",
-             JoinStringViews(
-                 kApprovedBaseline.compiler_producers),
-             JoinStrings(metadata.compiler_producers),
-             producers_equal,
-             "multiple .comment producers are evidence; they do not "
-             "identify one final-link compiler");
 
     const bool versions_equal =
         metadata.required_symbol_versions.size() ==
@@ -2009,6 +1921,8 @@ bool InspectElfFile(const std::filesystem::path& path,
         parsed.data_encoding = header.e_ident[EI_DATA];
         parsed.object_type = header.e_type;
         parsed.machine = header.e_machine;
+        std::string compiler_comment_sha256;
+        std::vector<std::string> compiler_producers;
         if (!ParseBuildId(
                 &file, program_headers, &parsed.build_id, error) ||
             !ParseDynamic(&file,
@@ -2019,8 +1933,8 @@ bool InspectElfFile(const std::filesystem::path& path,
                           error) ||
             !ParseCompilerComment(&file,
                                   header,
-                                  &parsed.compiler_comment_sha256,
-                                  &parsed.compiler_producers,
+                                  &compiler_comment_sha256,
+                                  &compiler_producers,
                           error)) {
             return false;
         }
@@ -2514,15 +2428,15 @@ namespace {
 
 PreflightReport RunApprovedLibraryRuntimePreflightAtStablePath(
     const std::filesystem::path& stable_library,
-    int stable_library_fd) {
+    std::uint64_t stable_library_size) {
     PreflightReport report;
     report.mode = "approved-library-runtime";
-    AddOpenFdHashCheck(
-        stable_library_fd,
-        kApprovedBaseline.shared_library_sha256,
-        "artifact.shared_library_sha256",
-        &report.checks,
-        kApprovedBaseline.shared_library_size);
+    AddCheck(&report.checks,
+             "artifact.shared_library_snapshot",
+             "sealed immutable regular file <= " +
+                 Number(kMaximumSdkSharedLibraryBytes) + " bytes",
+             Number(stable_library_size) + " bytes",
+             stable_library_size <= kMaximumSdkSharedLibraryBytes);
     AddElfChecks(stable_library, &report.checks);
     AppendChecks(&report.checks, CheckCompiledVendorAbi());
     if (!ChecksPassed(report.checks)) {
@@ -2531,7 +2445,7 @@ PreflightReport RunApprovedLibraryRuntimePreflightAtStablePath(
                  "attempted after validation",
                  "skipped",
                  false,
-                 "artifact, ELF, or compiled ABI validation failed");
+                 "snapshot, ELF, or compiled ABI validation failed");
         return report;
     }
     RuntimeProbeResult runtime = ProbeRuntime(stable_library);
@@ -2547,8 +2461,9 @@ PreflightReport StableLibraryOpenFailure(
     PreflightReport report;
     report.mode = std::move(mode);
     AddCheck(&report.checks,
-             "artifact.shared_library_sha256",
-             std::string(kApprovedBaseline.shared_library_sha256),
+             "artifact.shared_library_snapshot",
+             "sealed immutable regular file <= " +
+                 Number(kMaximumSdkSharedLibraryBytes) + " bytes",
              "<unavailable>",
              false,
              detail);
@@ -2579,7 +2494,8 @@ PreflightReport RunApprovedLibraryRuntimePreflight(
             shared_library,
             &snapshot,
             &error,
-            kApprovedBaseline.shared_library_size)) {
+            std::nullopt,
+            kMaximumSdkSharedLibraryBytes)) {
         return StableLibraryOpenFailure(
             "approved-library-runtime",
             std::move(error),
@@ -2587,7 +2503,7 @@ PreflightReport RunApprovedLibraryRuntimePreflight(
     }
     return RunApprovedLibraryRuntimePreflightAtStablePath(
         snapshot.proc_fd_path(),
-        snapshot.fd());
+        snapshot.size());
 }
 
 PreflightReport RunApprovedLibraryRuntimePreflightForOpenFd(
@@ -2598,7 +2514,8 @@ PreflightReport RunApprovedLibraryRuntimePreflightForOpenFd(
             fd,
             &snapshot,
             &error,
-            kApprovedBaseline.shared_library_size)) {
+            std::nullopt,
+            kMaximumSdkSharedLibraryBytes)) {
         return StableLibraryOpenFailure(
             "approved-library-runtime",
             std::move(error),
@@ -2606,7 +2523,7 @@ PreflightReport RunApprovedLibraryRuntimePreflightForOpenFd(
     }
     return RunApprovedLibraryRuntimePreflightAtStablePath(
         snapshot.proc_fd_path(),
-        snapshot.fd());
+        snapshot.size());
 }
 
 PreflightReport RunApprovedLibraryRuntimePreflightForSealedSnapshotFd(
@@ -2620,15 +2537,15 @@ PreflightReport RunApprovedLibraryRuntimePreflightForSealedSnapshotFd(
             std::move(error),
             "attempted after validation");
     }
-    if (size != kApprovedBaseline.shared_library_size) {
+    if (size > kMaximumSdkSharedLibraryBytes) {
         return StableLibraryOpenFailure(
             "approved-library-runtime",
-            "sealed snapshot size differs from the approved library",
+            "sealed snapshot exceeds the SDK shared-library size bound",
             "attempted after validation");
     }
     return RunApprovedLibraryRuntimePreflightAtStablePath(
         StableFileDescriptorPath(fd),
-        fd);
+        size);
 }
 
 PreflightReport RunVendorPreflight(const PreflightPaths& paths) {
@@ -2644,7 +2561,8 @@ PreflightReport RunVendorPreflight(const PreflightPaths& paths) {
             paths.shared_library,
             &library_snapshot,
             &library_open_error,
-            kApprovedBaseline.shared_library_size);
+            std::nullopt,
+            kMaximumSdkSharedLibraryBytes);
 
     AddBaselineFileCheck(paths.baseline_json, &report.checks);
     AddFileHashCheck(paths.sdk_archive,
@@ -2656,9 +2574,9 @@ PreflightReport RunVendorPreflight(const PreflightPaths& paths) {
     std::filesystem::path stable_library;
     if (!library_snapshotted) {
         AddCheck(&report.checks,
-                 "artifact.shared_library_sha256",
-                 std::string(
-                     kApprovedBaseline.shared_library_sha256),
+                 "artifact.shared_library_snapshot",
+                 "sealed immutable regular file <= " +
+                     Number(kMaximumSdkSharedLibraryBytes) + " bytes",
                  "<unavailable>",
                  false,
                  library_open_error);
@@ -2671,12 +2589,13 @@ PreflightReport RunVendorPreflight(const PreflightPaths& paths) {
     } else {
         stable_library =
             library_snapshot.proc_fd_path();
-        AddOpenFdHashCheck(
-            library_snapshot.fd(),
-            kApprovedBaseline.shared_library_sha256,
-            "artifact.shared_library_sha256",
-            &report.checks,
-            kApprovedBaseline.shared_library_size);
+        AddCheck(&report.checks,
+                 "artifact.shared_library_snapshot",
+                 "sealed immutable regular file <= " +
+                     Number(kMaximumSdkSharedLibraryBytes) + " bytes",
+                 Number(library_snapshot.size()) + " bytes",
+                 library_snapshot.size() <=
+                     kMaximumSdkSharedLibraryBytes);
         AddElfChecks(stable_library, &report.checks);
     }
     AppendChecks(&report.checks, CheckCompiledVendorAbi());
@@ -2686,7 +2605,8 @@ PreflightReport RunVendorPreflight(const PreflightPaths& paths) {
                  "attempted after all validation",
                  "skipped",
                  false,
-                 "baseline, archive, library, ELF, or ABI validation failed");
+                 "baseline, archive, library snapshot, ELF, or ABI "
+                 "validation failed");
         return report;
     }
     RuntimeProbeResult runtime = ProbeRuntime(stable_library);

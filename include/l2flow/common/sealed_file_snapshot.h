@@ -34,11 +34,13 @@ private:
         const std::filesystem::path&,
         SealedFileSnapshot*,
         std::string*,
+        std::optional<std::uint64_t>,
         std::optional<std::uint64_t>) noexcept;
     friend bool CreateSealedFileSnapshotFromOpenFd(
         int,
         SealedFileSnapshot*,
         std::string*,
+        std::optional<std::uint64_t>,
         std::optional<std::uint64_t>) noexcept;
 
     SealedFileSnapshot(int fd, std::uint64_t size) noexcept;
@@ -51,12 +53,15 @@ private:
 // Opens `source` with O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK, requires a regular
 // file, copies its exact bytes to a new memfd, and seals the result.  Error
 // messages deliberately never contain the source pathname. If exact_size is
-// set, a size mismatch is rejected before creating or populating a memfd.
+// set, a size mismatch is rejected before creating or populating a memfd. If
+// maximum_size is set, a larger source is rejected before memfd creation.
 bool CreateSealedFileSnapshot(
     const std::filesystem::path& source,
     SealedFileSnapshot* snapshot,
     std::string* error,
     std::optional<std::uint64_t> exact_size =
+        std::nullopt,
+    std::optional<std::uint64_t> maximum_size =
         std::nullopt) noexcept;
 
 // Copies an already-open regular-file descriptor into a new sealed memfd.
@@ -67,6 +72,8 @@ bool CreateSealedFileSnapshotFromOpenFd(
     SealedFileSnapshot* snapshot,
     std::string* error,
     std::optional<std::uint64_t> exact_size =
+        std::nullopt,
+    std::optional<std::uint64_t> maximum_size =
         std::nullopt) noexcept;
 
 // Validates the invariants required before a descriptor may bypass the copy

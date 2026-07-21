@@ -397,7 +397,7 @@ void CheckRejectionsAndPrivacy(const TemporaryDirectory& temporary,
         const baseline::CheckResult* bypass_hash =
             FindCheck(
                 bypass_attempt,
-                "artifact.shared_library_sha256");
+                "artifact.shared_library_snapshot");
         test->Expect(
             !bypass_attempt.passed() &&
                 !bypass_attempt.runtime_probe_attempted &&
@@ -411,14 +411,14 @@ void CheckRejectionsAndPrivacy(const TemporaryDirectory& temporary,
         const baseline::CheckResult* copied_hash =
             FindCheck(
                 copied_preflight,
-                "artifact.shared_library_sha256");
+                "artifact.shared_library_snapshot");
         test->Expect(
             !copied_preflight.passed() &&
                 !copied_preflight.runtime_probe_attempted &&
                 copied_hash != nullptr &&
-                copied_hash->actual == "<unavailable>",
-            "ordinary open-fd preflight rejects a wrong-sized snapshot "
-            "before hashing or runtime");
+                copied_hash->passed,
+            "ordinary open-fd preflight snapshots bounded bytes before "
+            "ELF validation rejects the non-library contents");
     }
 
     const baseline::PreflightReport sealed_preflight =
@@ -428,21 +428,21 @@ void CheckRejectionsAndPrivacy(const TemporaryDirectory& temporary,
     const baseline::CheckResult* sealed_hash =
         FindCheck(
             sealed_preflight,
-            "artifact.shared_library_sha256");
+            "artifact.shared_library_snapshot");
     test->Expect(
         !sealed_preflight.passed() &&
             !sealed_preflight.runtime_probe_attempted &&
             sealed_hash != nullptr &&
-            sealed_hash->actual == "<unavailable>",
-        "sealed-fd continuation rejects a wrong-sized immutable snapshot "
-        "before hashing or runtime");
+            sealed_hash->passed,
+        "sealed-fd continuation accepts the bounded immutable snapshot "
+        "before ELF validation rejects the non-library contents");
 
     error.clear();
     const std::shared_ptr<sdk::SdkFactory> rejected_factory =
         sdk::LoadApprovedSdkFactory(regular, &error);
     test->Expect(
         rejected_factory == nullptr && !error.empty(),
-        "production loader rejects a sealed but unapproved snapshot");
+        "production loader rejects a sealed but incompatible snapshot");
     test->Expect(
         error.find(secret_name) == std::string::npos &&
             error.find(regular.string()) == std::string::npos,
@@ -496,8 +496,27 @@ void CheckExactSizeAndDescriptorGuards(
             std::chrono::steady_clock::now() - started <
                 std::chrono::seconds(1),
             "exact-size rejection occurs before copying the sparse file");
-    }
 
+        common::SealedFileSnapshot oversized;
+        error.clear();
+        const auto maximum_started =
+            std::chrono::steady_clock::now();
+        test->Expect(
+            !common::CreateSealedFileSnapshot(
+                sparse,
+                &oversized,
+                &error,
+                std::nullopt,
+                static_cast<std::uint64_t>(kSparseSize - 1)) &&
+                !oversized.valid() &&
+                !error.empty(),
+            "maximum-size capture rejects an oversized regular file");
+        test->Expect(
+            std::chrono::steady_clock::now() - maximum_started <
+                std::chrono::seconds(1),
+            "maximum-size rejection occurs before copying the sparse file");
+
+    }
     int partial_fd = ::memfd_create(
         "l2flow-partial-seals",
         MFD_ALLOW_SEALING | MFD_CLOEXEC);
@@ -530,12 +549,12 @@ void CheckExactSizeAndDescriptorGuards(
         const baseline::CheckResult* hash =
             FindCheck(
                 report,
-                "artifact.shared_library_sha256");
+                "artifact.shared_library_snapshot");
         test->Expect(
             !report.runtime_probe_attempted &&
                 hash != nullptr &&
                 hash->actual == "<unavailable>",
-            "partial seals cannot reach hash or vendor runtime");
+            "partial seals cannot reach snapshot approval or vendor runtime");
         static_cast<void>(::close(partial_fd));
     }
 
@@ -577,12 +596,12 @@ void CheckExactSizeAndDescriptorGuards(
         const baseline::CheckResult* hash =
             FindCheck(
                 report,
-                "artifact.shared_library_sha256");
+                "artifact.shared_library_snapshot");
         test->Expect(
             !report.runtime_probe_attempted &&
                 hash != nullptr &&
                 hash->actual == "<unavailable>",
-            "missing close-on-exec cannot reach hash or vendor runtime");
+            "missing close-on-exec cannot reach snapshot approval or runtime");
     }
 }
 

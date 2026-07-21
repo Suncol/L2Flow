@@ -22,9 +22,9 @@ version is `2.13.234` (`MDL_VERSION == 213234`).
 The repository also contains the first two production phases described in
 [`docs/design.md`](docs/design.md):
 
-- an immutable SDK/archive/shared-library baseline, constrained ELF parser,
-  compiled ABI probe, runtime wrong-version probe, and reproducible build
-  manifest;
+- an immutable SDK-header archive baseline, bounded sealed shared-library
+  snapshots, constrained ELF compatibility parser, compiled ABI probe, runtime
+  wrong-version probe, and reproducible build manifest;
 - four independent ingress executables, each owning exactly one SDK manager,
   subscriber, callback gate, preallocated SPSC byte ring, and temporary
   sequential shadow sink;
@@ -44,12 +44,14 @@ mdl-ingress-sz-tick       required 6.33 and 6.36 on one Subscriber
 
 `6.53 CombinedTick` is explicitly forbidden as a core subscription. The
 executables do not have a link-time dependency on `libmdl_api.so`; they open a
-regular file with `O_NOFOLLOW|O_NONBLOCK`, require the approved exact size
-before copying it into a sealed memfd, and run the frozen
-hash/ELF/ABI/runtime gate. Service startup runs the full gate on sealed
-snapshot A. The loader then captures fresh snapshot B, repeats the library
-component gate on B, and performs final `dlopen` on B, which is retained for
-the SDK object lifetime.
+regular file with `O_NOFOLLOW|O_NONBLOCK`, enforce a 1 GiB pre-copy bound,
+copy it into a sealed memfd, and run the ELF dependency/symbol-version,
+compiled ABI, and runtime factory/lifecycle compatibility gate. Service startup
+runs the full gate on sealed snapshot A. The loader then captures fresh
+snapshot B, repeats the library component gate on B, and performs final
+`dlopen` on B, which is retained for the SDK object lifetime. The SDK header
+archive remains hash-pinned; compatible 2.13.234 library builds need not have
+one identical shared-object hash or Build ID.
 
 The original SDK archive is intentionally required for a full startup gate and
 is not synthesized from the extracted directory. Its one-descriptor hash is
@@ -64,7 +66,75 @@ from one sealed descriptor without reopening its path:
   --library /approved/libmdl_api.so
 
 ./build/mdl-ingress-sz-tick --help
+
+# Configure optional direct-link probes against a real local artifact when
+# the checked-in large-file path is still a Git LFS pointer.
+cmake -S . -B build \
+  -DL2FLOW_VENDOR_LIBRARY_PATH=/path/to/libmdl_api.so
+cmake --build build --target mdl_sdk_feeder_probe
+
+# Exercise L2Flow's sealed loader and adapter against a cascade feeder.
+./build/mdl-sdk-feeder-probe \
+  --library /path/to/libmdl_api.so \
+  --address 127.0.0.1:9112 \
+  --timeout-seconds 15 \
+  --market-timeout-seconds 60 \
+  --minimum-market-messages 1 \
+  --monitor-seconds 60 \
+  --capture-csv /new/path/feeder-capture.csv
 ```
+
+`mdl-sdk-feeder-probe` uses binary encoding, a fixed non-secret local client
+label, and exactly the five required subscriptions (`4.101.4`, `4.101.24`,
+`6.101.28`, `6.101.33`, `6.101.36`). It succeeds only after a `LogonResponse`
+reports `MDLEC_OK` for every required subscription, the requested minimum
+number of those market-data messages has reached the callback, and
+`Shutdown`/reference release completes. The success JSON includes every
+subscription status and up to 16 copied `MDLMessageHead` samples. When
+`--monitor-seconds` is present, it observes the full duration before shutdown;
+`--capture-csv` writes normalized business fields without overwriting an
+existing file. Use `--minimum-market-messages 0` only for an explicit
+control-plane-only check.
+The probe does not accept a token on the command line. Port 9112 is the
+deployed cascade publisher used by the current integration; override
+`--address` when the feeder's `TCP_SERVER` publisher uses another port.
+
+For an opt-in live Phase 2 capture-path test, build and run the dedicated
+probe. Each invocation deliberately covers one of the four production stream
+definitions so the real callback topology, source-stream identity, and
+required-subscription set stay explicit:
+
+```bash
+cmake --build build --target mdl_phase2_live_probe
+
+./build/mdl-phase2-live-probe \
+  --library /path/to/libmdl_api.so \
+  --output-dir /new/absolute/path/phase2-live-sh-snapshot \
+  --ingress-kind sh-snapshot \
+  --address 127.0.0.1:9112 \
+  --capture-date 20260722 \
+  --logon-timeout-seconds 15 \
+  --monitor-seconds 60 \
+  --minimum-market-messages-per-key 1
+```
+
+The output directory must not already exist. The probe drives the real SDK
+callback through `CallbackHandler`, `ByteRing`, `RawCaptureWorker`, the POSIX
+`RawWalWriter`, and clean shutdown. It then requires exact
+callback/append/durable reconciliation, validates the sealed
+`segment-00000001.raw` with the Raw reader, and validates
+`durable.journal` plus that segment with the recovery analyzer. For `sz-tick`,
+the minimum applies independently to both `6.101.33` and `6.101.36`; receiving
+only one of them is not a data-plane pass. Use
+`--minimum-market-messages-per-key 0` only for an explicit post-close
+control-plane and Raw-plumbing check. A nonzero minimum during an active
+trading session is required for real market-data evidence.
+
+This probe is intentionally isolated from the production Raw namespace. It
+does not provision the reserve coordinator, publish production manifests or
+certificates, exercise rotation, or change `L2Flow::production` from the
+Phase 0–1 service. Its success is therefore live capture-path evidence, not a
+Phase 2 production cutover or full exit claim.
 
 Tokens are accepted only from a named systemd credential or an explicit
 root-owned `0400` file; there is no token command-line option. Endpoint
@@ -122,11 +192,12 @@ core record, but does not claim business-semantic decoding. See
 ## Build and run
 
 Compilation never connects to the network. The default test configuration
-includes both the mock suite and the Phase 0–1 gate, so an absent or
-non-approved SDK artifact intentionally makes the Phase 0 test fail. To run
-only the self-contained mock tests, disable the Phase 0–1 test suite; the mock
-uses `L2Flow::l2mock_standalone` and does not require the vendor shared
-library:
+includes both the mock suite and the Phase 0–1 gate, so an absent, Git-LFS
+pointer, malformed, or ABI-incompatible SDK artifact intentionally makes the
+Phase 0 test fail. A different compatible 2.13.234 library build is accepted by
+the component gate. To run only the self-contained mock tests, disable the
+Phase 0–1 test suite; the mock uses `L2Flow::l2mock_standalone` and does not
+require the vendor shared library:
 
 ```bash
 cmake -S . -B build \

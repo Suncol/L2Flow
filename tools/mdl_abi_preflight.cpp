@@ -30,8 +30,8 @@ void PrintUsage(std::ostream& output) {
         << "  --diff-only       emit only checks that differ from baseline\n"
         << "  --help            show this help\n\n"
         << "The full preflight intentionally fails if the original SDK archive is\n"
-        << "missing. It never loads libmdl_api.so until every artifact, ELF, and\n"
-        << "compiled ABI check has passed.\n";
+        << "missing. It never loads libmdl_api.so until the archive, sealed library\n"
+        << "compatibility, ELF, dependency, and compiled ABI checks have passed.\n";
 }
 
 bool TakePath(int argc,

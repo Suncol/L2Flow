@@ -113,6 +113,7 @@ bool WriteAll(int fd,
 
 bool CopyAndSeal(int source_fd,
                  std::optional<std::uint64_t> exact_size,
+                 std::optional<std::uint64_t> maximum_size,
                  int* snapshot_fd,
                  std::uint64_t* snapshot_size,
                  std::string* error) {
@@ -137,6 +138,13 @@ bool CopyAndSeal(int source_fd,
         SetErrorLiteral(
             error,
             "snapshot source size differs from the required size");
+        return false;
+    }
+    if (maximum_size.has_value() &&
+        expected_size > *maximum_size) {
+        SetErrorLiteral(
+            error,
+            "snapshot source exceeds size bound");
         return false;
     }
     if (expected_size >
@@ -303,7 +311,8 @@ bool CreateSealedFileSnapshot(
     const std::filesystem::path& source,
     SealedFileSnapshot* snapshot,
     std::string* error,
-    std::optional<std::uint64_t> exact_size) noexcept {
+    std::optional<std::uint64_t> exact_size,
+    std::optional<std::uint64_t> maximum_size) noexcept {
     if (snapshot == nullptr) {
         SetErrorLiteral(error, "sealed snapshot output pointer is null");
         return false;
@@ -332,6 +341,7 @@ bool CreateSealedFileSnapshot(
         if (!CopyAndSeal(
                 source_fd.get(),
                 exact_size,
+                maximum_size,
                 &created_fd,
                 &created_size,
                 error)) {
@@ -355,7 +365,8 @@ bool CreateSealedFileSnapshotFromOpenFd(
     int source_fd,
     SealedFileSnapshot* snapshot,
     std::string* error,
-    std::optional<std::uint64_t> exact_size) noexcept {
+    std::optional<std::uint64_t> exact_size,
+    std::optional<std::uint64_t> maximum_size) noexcept {
     if (snapshot == nullptr) {
         SetErrorLiteral(error, "sealed snapshot output pointer is null");
         return false;
@@ -384,6 +395,7 @@ bool CreateSealedFileSnapshotFromOpenFd(
         if (!CopyAndSeal(
                 stable_source.get(),
                 exact_size,
+                maximum_size,
                 &created_fd,
                 &created_size,
                 error)) {

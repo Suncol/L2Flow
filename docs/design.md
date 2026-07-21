@@ -62,11 +62,11 @@ SZ tick:     6.33 + 6.36  （必须位于同一 Subscriber/TCP 连接）
 | 材料 | 核验内容 | SHA-256 / 标识 |
 |---|---|---|
 | `mdl_sdk_2_13_234.tar.gz` | `mdl_api.h`、`mdl_api_types.h`、沪深消息头文件、C++ demo、Linux 预编译库 | `23830887091d35875c653d97a4874f27f04b4cc36a69de37a952510d0701cc71` |
-| approved archive member `libmdl_api.so` | ELF/动态依赖/导出符号/版本创建行为 | `09bd58282d6f758bfb737b628f5c51daa591a60f31d4081992679fcbc2e2cfc5` |
+| reference archive member `libmdl_api.so` | ELF/动态依赖/导出符号/版本创建行为 | 历史 hash `09bd58282d6f758bfb737b628f5c51daa591a60f31d4081992679fcbc2e2cfc5`（诊断证据，不是 schema v2 的唯一接受身份） |
 | `通联_沪深L2行情数据结构展示V4.0(1).pdf` | 4.4、4.24、6.28、6.33、6.36 字段、单位、业务序列和交易阶段语义 | `0fcfc4eff6a5a74f6b6878ed79e604073aa6809f7fc331dd78d07271cd27db3e` |
 | `全市场数据存储框架设计.txt` | WAL、内存热数据、消费者和历史固化的前序需求 | `d110a1ade8967824f1127fedef435a2926968b8570e44755f888eb885acc3582` |
 
-Linux 动态库核验基线：
+Linux 参考动态库证据：
 
 ```text
 ELF:        x86-64 shared object
@@ -75,11 +75,15 @@ SONAME:     未设置
 MDL_VERSION: 213234
 ```
 
-上述 library hash 指批准 tar archive 内的 member。工作区默认解包副本若与它
-不同，必须由 Phase 0 gate 拒绝；该已知本地差异记录在
-`docs/acceptance/phase01-local.md`，不能把相同 Build ID 当作 hash 等价。
+上述 library hash 和 Build ID 指参考 tar archive 内的 member，只用于诊断和
+历史验收，不代表相同 Build ID 与相同 hash 等价。Schema v2 固定 SDK header
+archive hash、`MDL_VERSION`、依赖集合、imported symbol-version 集合、协议常量
+与结构 ABI；候选 `libmdl_api.so` 可以是不同的 2.13.234 构建，但必须先被限制
+为不超过 1 GiB 的 sealed immutable snapshot，并通过 ELF、编译期 ABI、错误版本
+factory、正确版本 create/shutdown/release 的全部兼容性检查。
 
-启动时必须再次核验归档 hash、动态库 hash、`MDL_VERSION`、结构大小、schema hash 和构建 hash；任一不一致都拒绝进入生产连接。
+启动时必须再次核验归档 hash、候选动态库兼容性、`MDL_VERSION`、结构大小、
+schema hash 和构建 hash；任一不一致都拒绝进入生产连接。
 
 ### 1.2 可见源码与不可见实现
 
@@ -488,14 +492,14 @@ bool IngressService::initialize() {
 ```
 
 Phase 0–1 的生产实现不在这里调用头文件中的 link-time
-`CreateIOManager`。它先把 `libmdl_api.so` 精确复制到
+`CreateIOManager`。它先把不超过 1 GiB 的 regular-file `libmdl_api.so` 精确复制到
 `memfd_create(MFD_ALLOW_SEALING|MFD_CLOEXEC)`，施加并验证
-`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`。复制前必须确认普通
-文件大小精确等于批准值。服务完整 preflight 使用 sealed snapshot A；生产
-loader 随后独立捕获 fresh snapshot B，在 B 上重复 library hash/ELF/ABI/runtime
-component gate，并最终 `dlopen("/proc/self/fd/N")` 加载 B。也就是说每次 gate
-与相应 load 使用同一不可变字节身份，但 A、B 是两次独立捕获，不能混称为同一
-snapshot。
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`。大小上限在 memfd
+创建和复制前执行。服务完整 preflight 使用 sealed snapshot A；生产 loader
+随后独立捕获 fresh snapshot B，在 B 上重复 snapshot/ELF/dependency/
+symbol-version/ABI/runtime component gate，并最终
+`dlopen("/proc/self/fd/N")` 加载 B。也就是说每次 gate 与相应 load 使用同一
+不可变字节身份，但 A、B 是两次独立的兼容性捕获，不能混称为同一 hash 身份。
 SDK 日志目录必须预先创建专用 marker；服务保留目录 fd，并把
 `/proc/self/fd/N/<basename>` 传给 `EnableLog`，防止父目录替换重定向日志；
 同时在 marker 上保留 nonblocking exclusive `flock`，阻止第二个协作 ingress
@@ -3555,15 +3559,16 @@ mdl-platform/
 
 #### 实施
 
-1. 固定 SDK 归档和 `libmdl_api.so` hash；
+1. 固定 SDK header 归档 hash 和 2.13.234 library 兼容性契约；
 2. baseline JSON 按批准精确大小捕获到单一 sealed descriptor 并逐字节核验，
    报告不得二次重开路径；SDK archive 使用单一 `O_NOFOLLOW|O_NONBLOCK`
    regular-file descriptor 哈希，并在读取前施加 1 GiB 运维上限（该上限不是
    制品身份）；
-3. 待执行 library 必须先满足批准精确大小，再复制到 sealed memfd；服务完整
+3. 待执行 library 必须先满足 1 GiB 上限，再复制到 sealed memfd；服务完整
    preflight 使用 snapshot A，loader 独立捕获 snapshot B、在 B 上重复 component
    gate 并最终加载 B；
-4. 记录 ELF Build ID、架构、动态依赖和编译器 ABI 上限；
+4. 核验 ELF 架构、无 SONAME、动态依赖和 imported symbol-version 集合；记录
+   Build ID 仅作诊断；
 5. 编译 `sizeof/alignof/offsetof` 探针；
 6. 核验 `MDL_VERSION==213234`；
 7. 调用 `DllCreateIOManager`/`CreateIOManager` 验证版本匹配和错误路径；
@@ -3575,11 +3580,11 @@ mdl-platform/
 
 - 当前版本创建 IOManager 成功；错误版本返回空或明确失败；
 - `MDLMessageHead==23` 等结构大小全通过；
-- 动态库缺失、hash 错误、依赖不满足时拒绝启动；
+- 动态库缺失、超过大小上限、ELF/依赖/ABI 不兼容时拒绝启动；
 - reviewed vendor surface 可编译，`readelf` 证明预期动态依赖；只有完整制品
   gate 通过后才允许执行；
-- sealed snapshot 精确复制、四项 seal、源文件替换/截断/删除独立性和普通
-  FD 绕过拒绝均通过；
+- sealed snapshot 有界精确复制、四项 seal、源文件替换/截断/删除独立性和
+  普通 FD 绕过拒绝均通过；
 - AddressSanitizer/UBSan 构建使用 mock，不要求预编译库可被 sanitizer 插桩。
 
 #### 退出条件
@@ -7007,7 +7012,8 @@ corrupt durable byte
 
 ### 22.1 供应商与 ABI
 
-- [ ] SDK 归档和动态库 hash 与批准基线一致；
+- [ ] SDK header 归档 hash 与批准基线一致；
+- [ ] 候选动态库通过 sealed snapshot、ELF/依赖/symbol-version/ABI/runtime gate；
 - [ ] `MDL_VERSION==213234`；
 - [ ] 所有 required struct size/offset preflight 通过；
 - [ ] 动态依赖在目标机固定；
@@ -7354,7 +7360,7 @@ Python：批量读取、增量窗口、因子组合、横截面、checkpoint、�
 | 字段过滤 demo | `demo/mdl_subscribe_demo.cpp` | template 订阅、SYS response、消息访问 |
 | 延迟示例 | `demo/mdl_latency_output.cpp` | 延迟采集参考，不能直接替代本设计时钟语义 |
 | 实践建议 | `demo/README.md` | 多 Subscriber/连接拆分/端口和重复订阅注意 |
-| Linux 动态库 | `libs/linux/libmdl_api.so` | 生产运行制品，hash 固定 |
+| Linux 动态库 | `libs/linux/libmdl_api.so` | 候选生产制品；schema v2 按 2.13.234 兼容性门禁验证 |
 
 审计边界：headers/demo 可视，动态库内部实现不可视。文档中所有涉及内部调度的结论都必须由测试确认。
 
