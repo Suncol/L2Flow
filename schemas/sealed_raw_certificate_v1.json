@@ -1,0 +1,138 @@
+{
+  "canonical_encoding": {
+    "byte_encoding": "fixed-width lowercase hexadecimal",
+    "identity128_encoding": "32-character lowercase hexadecimal",
+    "integer_encoding": {
+      "uint32": "JSON integer",
+      "uint64": "quoted canonical unsigned decimal without leading zero"
+    },
+    "json": "RFC 8785 JCS UTF-8",
+    "sha256_encoding": "64-character lowercase hexadecimal",
+    "trailing_newline": false
+  },
+  "format": "L2Flow SealedRawCertificateV1",
+  "limits": {
+    "accepted_marker_bytes": 48,
+    "encoded_maximum_bytes": 8192,
+    "identity128_bytes": 16,
+    "sha256_bytes": 32
+  },
+  "locator": "maintenance/sealed-raw-<32-lowercase-hex-stream-day-id>-<64-lowercase-hex-closed-prefix-sha256>.json",
+  "object": {
+    "additional_properties": false,
+    "properties": {
+      "accepted_segment_sealed_marker": {
+        "additional_properties": false,
+        "properties": {
+          "global_wal_pos": {"encoding": "uint64-decimal-string"},
+          "ingress_sequence": {"encoding": "uint64-decimal-string"},
+          "marker_bytes": {"encoding": "96-character-lowercase-hex"},
+          "marker_flags": {"const": 1, "encoding": "uint32"},
+          "marker_sha256": {"encoding": "64-character-lowercase-hex"},
+          "segment_offset": {"encoding": "uint64-decimal-string"},
+          "segment_sequence": {"encoding": "uint32", "minimum": 1}
+        },
+        "required": [
+          "global_wal_pos",
+          "ingress_sequence",
+          "marker_bytes",
+          "marker_flags",
+          "marker_sha256",
+          "segment_offset",
+          "segment_sequence"
+        ],
+        "type": "object"
+      },
+      "capture_date": {"encoding": "uint32", "minimum": 1},
+      "closed_frontier": {
+        "additional_properties": false,
+        "properties": {
+          "closed_entry_count": {"encoding": "uint64-decimal-string", "minimum": 1},
+          "closed_prefix_sha256": {"encoding": "64-character-lowercase-hex"},
+          "frontier_seal_marker_sha256": {"encoding": "64-character-lowercase-hex"},
+          "frontier_segment_sequence": {"encoding": "uint32", "minimum": 1},
+          "frontier_segment_sha256": {"encoding": "64-character-lowercase-hex"}
+        },
+        "required": [
+          "closed_entry_count",
+          "closed_prefix_sha256",
+          "frontier_seal_marker_sha256",
+          "frontier_segment_sequence",
+          "frontier_segment_sha256"
+        ],
+        "type": "object"
+      },
+      "journal_header_sha256": {"encoding": "64-character-lowercase-hex"},
+      "last_segment": {
+        "additional_properties": false,
+        "properties": {
+          "logical_length": {"encoding": "uint64-decimal-string", "minimum": 4096},
+          "segment_base_wal_pos": {"encoding": "uint64-decimal-string"},
+          "segment_flags": {"encoding": "uint32", "mask": 1},
+          "segment_sequence": {"encoding": "uint32", "minimum": 1},
+          "segment_sha256": {"encoding": "64-character-lowercase-hex"}
+        },
+        "required": [
+          "logical_length",
+          "segment_base_wal_pos",
+          "segment_flags",
+          "segment_sequence",
+          "segment_sha256"
+        ],
+        "type": "object"
+      },
+      "schema_version": {"const": 1, "encoding": "uint32"},
+      "source_stream_id": {"encoding": "uint32", "minimum": 1},
+      "stream_day_id": {"encoding": "32-character-lowercase-hex"},
+      "terminal_append_cursor": {
+        "$ref": "#/types/raw_cursor_v1"
+      },
+      "terminal_durable_cursor": {
+        "$ref": "#/types/raw_cursor_v1"
+      }
+    },
+    "required": [
+      "accepted_segment_sealed_marker",
+      "capture_date",
+      "closed_frontier",
+      "journal_header_sha256",
+      "last_segment",
+      "schema_version",
+      "source_stream_id",
+      "stream_day_id",
+      "terminal_append_cursor",
+      "terminal_durable_cursor"
+    ],
+    "type": "object"
+  },
+  "schema_version": 1,
+  "semantic_invariants": [
+    "terminal_append_cursor equals terminal_durable_cursor",
+    "terminal cursors equal the decoded accepted SEGMENT_SEALED marker",
+    "last_segment.segment_base_wal_pos + last_segment.logical_length equals terminal cursor global_wal_pos",
+    "last_segment.logical_length equals terminal cursor segment_offset",
+    "accepted marker source, sequence, and namespace match the certificate",
+    "marker_sha256 hashes the exact decoded-valid 48-byte marker",
+    "closed_frontier identifies the same terminal segment and seal marker",
+    "journal header hash is over the exact validated 4096-byte namespace anchor",
+    "no writer, recovery-attempt, executor, reserve-cycle, report, archive, or mutable whole-manifest identity is encoded"
+  ],
+  "types": {
+    "raw_cursor_v1": {
+      "additional_properties": false,
+      "properties": {
+        "global_wal_pos": {"encoding": "uint64-decimal-string"},
+        "ingress_sequence": {"encoding": "uint64-decimal-string"},
+        "segment_offset": {"encoding": "uint64-decimal-string", "minimum": 4096},
+        "segment_sequence": {"encoding": "uint32", "minimum": 1}
+      },
+      "required": [
+        "global_wal_pos",
+        "ingress_sequence",
+        "segment_offset",
+        "segment_sequence"
+      ],
+      "type": "object"
+    }
+  }
+}

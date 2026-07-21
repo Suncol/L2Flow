@@ -1,0 +1,298 @@
+{
+  "canonical_encoding": {
+    "identity128_encoding": "32-character lowercase hexadecimal",
+    "integer_encoding": {
+      "uint32": "JSON integer",
+      "uint64": "quoted canonical unsigned decimal without leading zero"
+    },
+    "json": "RFC 8785 JCS UTF-8",
+    "sha256_encoding": "64-character lowercase hexadecimal",
+    "trailing_newline": false
+  },
+  "format": "L2Flow RunManifestV1",
+  "limits": {
+    "encoded_maximum_bytes": 4194304,
+    "maximum_clock_transitions_per_raw_input": 100000,
+    "maximum_continuation_segments_per_finalization_cycle": 1,
+    "maximum_fault_rules": 1024,
+    "maximum_raw_inputs": 16,
+    "maximum_segments_per_raw_input": 100000
+  },
+  "object": {
+    "additional_properties": false,
+    "properties": {
+      "build": {"type_ref": "build_v1"},
+      "capture_date": {"encoding": "uint32-gregorian-yyyymmdd"},
+      "clock_epoch_algorithm": {"encoding": "uint32", "minimum": 1},
+      "clock_epoch_digest": {"encoding": "64-character-lowercase-hex"},
+      "clock_epoch_label": {"encoding": "uint64-decimal-string", "non_authoritative": true},
+      "configuration": {"type_ref": "configuration_v1"},
+      "factor": {"nullable_type_ref": "factor_v1"},
+      "fault_injection": {"type_ref": "fault_injection_v1"},
+      "host_uuid": {"encoding": "32-character-lowercase-hex"},
+      "inputs": {"type_ref": "inputs_v1"},
+      "linux_boot_id": {"encoding": "32-character-lowercase-hex"},
+      "manifest_schema_version": {"const": 1, "encoding": "uint32"},
+      "mode": {"enum": ["live", "replay"]},
+      "run_id": {"encoding": "32-character-lowercase-hex"},
+      "trade_date": {"nullable_encoding": "uint32-gregorian-yyyymmdd"},
+      "vendor": {"type_ref": "vendor_v1"}
+    },
+    "required": [
+      "build",
+      "capture_date",
+      "clock_epoch_algorithm",
+      "clock_epoch_digest",
+      "clock_epoch_label",
+      "configuration",
+      "factor",
+      "fault_injection",
+      "host_uuid",
+      "inputs",
+      "linux_boot_id",
+      "manifest_schema_version",
+      "mode",
+      "run_id",
+      "trade_date",
+      "vendor"
+    ],
+    "type": "object"
+  },
+  "schema_version": 1,
+  "semantic_invariants": [
+    "run_id, host_uuid, linux_boot_id, every stream_day_id, and every present parent/cycle identity are nonzero",
+    "all required SHA-256 fields and every present optional SHA-256 field are nonzero",
+    "clock_epoch_label is the little-endian uint64 value of clock_epoch_digest bytes 0 through 7",
+    "live raw input capture_date equals the top-level capture_date",
+    "live raw inputs use durable_only and every selected clock transition matches the top-level clock epoch identity",
+    "raw input namespace tuples are unique",
+    "durable_marker_bytes decode canonically and exactly equal durable_marker",
+    "durable_only input has null append_only_reason and its selected range does not pass the durable marker",
+    "includes_recovered_append_only has a non-null reason and selected range, and the range ends after the durable marker in both WAL and ingress coordinates",
+    "a selected nonempty Raw range uses half-open WAL bounds and its strictly increasing clock transition list starts exactly at the first selected record; an input without a range has no transitions",
+    "synthetic false requires every synthetic provenance field to be null",
+    "synthetic true is replay-only, requires a non-self parent run, all synthetic provenance fields, the run-level fault seed, and a matching run-level fault rule",
+    "reserve finalization identity and maintenance report reference are either all absent or complete; the report locator is maintenance/finalization-<finalization_cycle_id>.json and the durable marker is sealed",
+    "a reserve finalization cycle has at most one continuation segment and, when present, it is the durable marker segment",
+    "fault injection false has null seed and no rules; true has a seed and at least one rule",
+    "fault rules have unique hashes and rule_sha256 equals SHA-256 over the exact canonical_rule UTF-8 bytes",
+    "canonical_schema_hash and dtype_hash are both null with shard_count zero or both present with nonzero shard_count",
+    "a factor run has trade_date, canonical_schema_hash, dtype_hash, and nonzero shard_count",
+    "source revision status available has a revision; unavailable has null revision"
+  ],
+  "types": {
+    "build_v1": {
+      "additional_properties": false,
+      "properties": {
+        "build_manifest_sha256": {"encoding": "64-character-lowercase-hex"},
+        "compiler": {"encoding": "bounded-utf8-string"},
+        "cxx_flags": {"encoding": "bounded-utf8-string"},
+        "dependency_lock_hash": {"encoding": "64-character-lowercase-hex"},
+        "python_version": {"nullable_encoding": "bounded-utf8-string"},
+        "source_revision": {"nullable_encoding": "bounded-utf8-string"},
+        "source_revision_status": {"enum": ["available", "unavailable"]}
+      },
+      "required": [
+        "build_manifest_sha256",
+        "compiler",
+        "cxx_flags",
+        "dependency_lock_hash",
+        "python_version",
+        "source_revision",
+        "source_revision_status"
+      ],
+      "type": "object"
+    },
+    "clock_transition_v1": {
+      "additional_properties": false,
+      "properties": {
+        "algorithm": {"encoding": "uint32", "minimum": 1},
+        "digest": {"encoding": "64-character-lowercase-hex"},
+        "record_start_wal_pos": {"encoding": "uint64-decimal-string"}
+      },
+      "required": ["algorithm", "digest", "record_start_wal_pos"],
+      "type": "object"
+    },
+    "configuration_v1": {
+      "additional_properties": false,
+      "properties": {
+        "canonical_schema_hash": {"nullable_encoding": "64-character-lowercase-hex"},
+        "config_sha256": {"encoding": "64-character-lowercase-hex"},
+        "dtype_hash": {"nullable_encoding": "64-character-lowercase-hex"},
+        "endpoint_contract_hash": {"encoding": "64-character-lowercase-hex"},
+        "raw_schema_hash": {"encoding": "64-character-lowercase-hex"},
+        "registry_hash": {"encoding": "64-character-lowercase-hex"},
+        "registry_version": {"encoding": "bounded-utf8-string"},
+        "shard_count": {"encoding": "uint32"}
+      },
+      "required": [
+        "canonical_schema_hash",
+        "config_sha256",
+        "dtype_hash",
+        "endpoint_contract_hash",
+        "raw_schema_hash",
+        "registry_hash",
+        "registry_version",
+        "shard_count"
+      ],
+      "type": "object"
+    },
+    "durable_marker_v1": {
+      "additional_properties": false,
+      "properties": {
+        "flags": {"enum": [0, 1], "encoding": "uint32"},
+        "global": {"encoding": "uint64-decimal-string"},
+        "ingress": {"encoding": "uint64-decimal-string"},
+        "offset": {"encoding": "uint64-decimal-string", "minimum": 4096},
+        "segment": {"encoding": "uint32", "minimum": 1}
+      },
+      "required": ["flags", "global", "ingress", "offset", "segment"],
+      "type": "object"
+    },
+    "factor_v1": {
+      "additional_properties": false,
+      "properties": {
+        "factor_code_hash": {"encoding": "64-character-lowercase-hex"},
+        "factor_config_hash": {"encoding": "64-character-lowercase-hex"},
+        "factor_group": {"encoding": "bounded-utf8-string"},
+        "state_schema_hash": {"encoding": "64-character-lowercase-hex"}
+      },
+      "required": [
+        "factor_code_hash",
+        "factor_config_hash",
+        "factor_group",
+        "state_schema_hash"
+      ],
+      "type": "object"
+    },
+    "fault_injection_v1": {
+      "additional_properties": false,
+      "properties": {
+        "enabled": {"encoding": "boolean"},
+        "rules": {"items_type_ref": "fault_rule_v1", "maximum_items": 1024},
+        "seed": {"nullable_encoding": "uint64-decimal-string"}
+      },
+      "required": ["enabled", "rules", "seed"],
+      "type": "object"
+    },
+    "fault_rule_v1": {
+      "additional_properties": false,
+      "properties": {
+        "canonical_rule": {"encoding": "bounded-utf8-string"},
+        "rule_sha256": {"encoding": "64-character-lowercase-hex"}
+      },
+      "required": ["canonical_rule", "rule_sha256"],
+      "type": "object"
+    },
+    "inputs_v1": {
+      "additional_properties": false,
+      "properties": {
+        "raw_streams": {
+          "items_type_ref": "raw_input_v1",
+          "maximum_items": 16,
+          "minimum_items": 1
+        }
+      },
+      "required": ["raw_streams"],
+      "type": "object"
+    },
+    "raw_input_v1": {
+      "additional_properties": false,
+      "properties": {
+        "append_only_reason": {"nullable_encoding": "bounded-utf8-string"},
+        "capture_date": {"encoding": "uint32-gregorian-yyyymmdd"},
+        "clock_epoch_transitions": {
+          "items_type_ref": "clock_transition_v1",
+          "maximum_items": 100000
+        },
+        "durability_policy": {"enum": ["durable_only", "includes_recovered_append_only"]},
+        "durable_journal_header_sha256": {"encoding": "64-character-lowercase-hex"},
+        "durable_marker": {"type_ref": "durable_marker_v1"},
+        "fault_rule_hash": {"nullable_encoding": "64-character-lowercase-hex"},
+        "fault_seed": {"nullable_encoding": "uint64-decimal-string"},
+        "first_ingress_sequence": {"nullable_encoding": "uint64-decimal-string"},
+        "first_record_start_wal_pos": {"nullable_encoding": "uint64-decimal-string"},
+        "last_ingress_sequence": {"nullable_encoding": "uint64-decimal-string"},
+        "last_record_end_wal_pos": {"nullable_encoding": "uint64-decimal-string"},
+        "parent_raw_identity_hash": {"nullable_encoding": "64-character-lowercase-hex"},
+        "parent_run_id": {"nullable_encoding": "32-character-lowercase-hex"},
+        "reserve_finalization": {"type_ref": "reserve_finalization_v1"},
+        "segment_sha256": {
+          "items_encoding": "64-character-lowercase-hex",
+          "maximum_items": 100000,
+          "minimum_items": 1
+        },
+        "source_stream_id": {"encoding": "uint32", "minimum": 1},
+        "stream_day_id": {"encoding": "32-character-lowercase-hex"},
+        "synthetic": {"encoding": "boolean"},
+        "synthetic_schema": {"nullable_encoding": "bounded-utf8-string"}
+      },
+      "required": [
+        "append_only_reason",
+        "capture_date",
+        "clock_epoch_transitions",
+        "durability_policy",
+        "durable_journal_header_sha256",
+        "durable_marker",
+        "fault_rule_hash",
+        "fault_seed",
+        "first_ingress_sequence",
+        "first_record_start_wal_pos",
+        "last_ingress_sequence",
+        "last_record_end_wal_pos",
+        "parent_raw_identity_hash",
+        "parent_run_id",
+        "reserve_finalization",
+        "segment_sha256",
+        "source_stream_id",
+        "stream_day_id",
+        "synthetic",
+        "synthetic_schema"
+      ],
+      "type": "object"
+    },
+    "reserve_finalization_v1": {
+      "additional_properties": false,
+      "properties": {
+        "continuation_segment_sequences": {
+          "items_encoding": "uint32",
+          "maximum_items": 1
+        },
+        "finalization_archive_locator": {"nullable_encoding": "bounded-utf8-locator"},
+        "finalization_archive_manifest_sha256": {"nullable_encoding": "64-character-lowercase-hex"},
+        "finalization_cycle_id": {"nullable_encoding": "32-character-lowercase-hex"},
+        "immutable_grant_sha256": {"nullable_encoding": "64-character-lowercase-hex"},
+        "maintenance_report_locator": {"nullable_encoding": "bounded-utf8-locator"},
+        "maintenance_report_sha256": {"nullable_encoding": "64-character-lowercase-hex"},
+        "reserve_state_uuid": {"nullable_encoding": "32-character-lowercase-hex"}
+      },
+      "required": [
+        "continuation_segment_sequences",
+        "finalization_archive_locator",
+        "finalization_archive_manifest_sha256",
+        "finalization_cycle_id",
+        "immutable_grant_sha256",
+        "maintenance_report_locator",
+        "maintenance_report_sha256",
+        "reserve_state_uuid"
+      ],
+      "type": "object"
+    },
+    "vendor_v1": {
+      "additional_properties": false,
+      "properties": {
+        "elf_build_id": {"encoding": "bounded-utf8-string"},
+        "libmdl_api_sha256": {"encoding": "64-character-lowercase-hex"},
+        "sdk_archive_sha256": {"encoding": "64-character-lowercase-hex"},
+        "sdk_version": {"encoding": "uint32", "minimum": 1}
+      },
+      "required": [
+        "elf_build_id",
+        "libmdl_api_sha256",
+        "sdk_archive_sha256",
+        "sdk_version"
+      ],
+      "type": "object"
+    }
+  }
+}

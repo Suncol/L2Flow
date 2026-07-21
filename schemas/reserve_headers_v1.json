@@ -1,0 +1,282 @@
+{
+  "byte_order": "little-endian",
+  "crc32c": {
+    "algorithm": "CRC-32C/Castagnoli",
+    "domain_length": 4096,
+    "domain_offset": 0,
+    "field_offset": 112,
+    "field_width": 4,
+    "field_zeroed_during_calculation": true,
+    "init_hex": "0xffffffff",
+    "polynomial_normal_hex": "0x1edc6f41",
+    "polynomial_reflected_hex": "0x82f63b78",
+    "refin": true,
+    "refout": true,
+    "stored_encoding": "u32-le",
+    "xorout_hex": "0xffffffff"
+  },
+  "filename_grammars": {
+    "reserve_inode_v1": {
+      "canonical_form": "inode-<reserve_uuid_hex>-<index_decimal>.reserve",
+      "exact_length": 55,
+      "index_decimal": {
+        "digits": 8,
+        "maximum": 99999999,
+        "minimum": 0,
+        "radix": 10,
+        "zero_padded": true
+      },
+      "lexical_order_equals_index_order_for_one_uuid": true,
+      "pattern": "^inode-[0-9a-f]{32}-[0-9]{8}\\.reserve$",
+      "reserve_uuid_hex": {
+        "case": "lowercase",
+        "digits": 32,
+        "nonzero": true,
+        "radix": 16,
+        "wire_byte_order": "identity byte order; no UUID field swapping"
+      }
+    }
+  },
+  "format_identity": {
+    "name": "ReserveAllocationHeadersV1",
+    "scope": "L2Flow repository-private disk formats",
+    "standard": false,
+    "version": 1
+  },
+  "golden_inputs": {
+    "common_pool_identity": {
+      "device_id_hex": "0x0102030405060708",
+      "mount_identity_sha256_bytes": "40,41,...,5f",
+      "quota_identity_sha256_bytes": "20,21,...,3f",
+      "reserve_state_uuid_bytes": "01,02,...,10"
+    },
+    "reserve_file_header_v1": {
+      "declared_bytes_hex": "0x0102030405061000"
+    },
+    "reserve_inode_header_v1": {
+      "declared_inode_reserve_count": 1000,
+      "inode_index": 42
+    }
+  },
+  "layouts": {
+    "reserve_file_header_v1": {
+      "crc": {
+        "domain_length": 4096,
+        "domain_offset": 0,
+        "field_offset": 112,
+        "field_width": 4
+      },
+      "fields": [
+        {
+          "encoding": "bytes",
+          "name": "magic",
+          "offset": 0,
+          "value_hex": "4c32524446310000",
+          "width": 8,
+          "wire_ascii": "L2RDF1\\0\\0"
+        },
+        {
+          "encoding": "u16-le",
+          "name": "version",
+          "offset": 8,
+          "value": 1,
+          "width": 2
+        },
+        {
+          "encoding": "u8",
+          "name": "endian",
+          "offset": 10,
+          "value": 1,
+          "width": 1
+        },
+        {
+          "encoding": "bytes",
+          "must_be_zero": true,
+          "name": "reserved0",
+          "offset": 11,
+          "width": 1
+        },
+        {
+          "encoding": "u32-le",
+          "name": "header_size",
+          "offset": 12,
+          "value": 4096,
+          "width": 4
+        },
+        {
+          "encoding": "bytes",
+          "name": "reserve_state_uuid",
+          "nonzero": true,
+          "offset": 16,
+          "width": 16
+        },
+        {
+          "encoding": "u64-le",
+          "name": "device_id",
+          "nonzero": true,
+          "offset": 32,
+          "width": 8
+        },
+        {
+          "encoding": "bytes",
+          "name": "quota_identity_sha256",
+          "nonzero": true,
+          "offset": 40,
+          "width": 32
+        },
+        {
+          "encoding": "bytes",
+          "name": "mount_identity_sha256",
+          "nonzero": true,
+          "offset": 72,
+          "width": 32
+        },
+        {
+          "encoding": "u64-le",
+          "minimum": 4096,
+          "name": "declared_bytes",
+          "offset": 104,
+          "width": 8
+        },
+        {
+          "encoding": "u32-le",
+          "name": "header_crc32c",
+          "offset": 112,
+          "width": 4
+        },
+        {
+          "encoding": "bytes",
+          "must_be_zero": true,
+          "name": "reserved_tail",
+          "offset": 116,
+          "width": 3980
+        }
+      ],
+      "size": 4096
+    },
+    "reserve_inode_header_v1": {
+      "crc": {
+        "domain_length": 4096,
+        "domain_offset": 0,
+        "field_offset": 112,
+        "field_width": 4
+      },
+      "fields": [
+        {
+          "encoding": "bytes",
+          "name": "magic",
+          "offset": 0,
+          "value_hex": "4c32524946310000",
+          "width": 8,
+          "wire_ascii": "L2RIF1\\0\\0"
+        },
+        {
+          "encoding": "u16-le",
+          "name": "version",
+          "offset": 8,
+          "value": 1,
+          "width": 2
+        },
+        {
+          "encoding": "u8",
+          "name": "endian",
+          "offset": 10,
+          "value": 1,
+          "width": 1
+        },
+        {
+          "encoding": "bytes",
+          "must_be_zero": true,
+          "name": "reserved0",
+          "offset": 11,
+          "width": 1
+        },
+        {
+          "encoding": "u32-le",
+          "name": "header_size",
+          "offset": 12,
+          "value": 4096,
+          "width": 4
+        },
+        {
+          "encoding": "bytes",
+          "name": "reserve_state_uuid",
+          "nonzero": true,
+          "offset": 16,
+          "width": 16
+        },
+        {
+          "encoding": "u64-le",
+          "name": "device_id",
+          "nonzero": true,
+          "offset": 32,
+          "width": 8
+        },
+        {
+          "encoding": "bytes",
+          "name": "quota_identity_sha256",
+          "nonzero": true,
+          "offset": 40,
+          "width": 32
+        },
+        {
+          "encoding": "bytes",
+          "name": "mount_identity_sha256",
+          "nonzero": true,
+          "offset": 72,
+          "width": 32
+        },
+        {
+          "encoding": "u32-le",
+          "maximum": 99999999,
+          "minimum": 0,
+          "name": "inode_index",
+          "offset": 104,
+          "width": 4
+        },
+        {
+          "encoding": "u32-le",
+          "maximum": 100000000,
+          "minimum": 1,
+          "name": "declared_inode_reserve_count",
+          "offset": 108,
+          "width": 4
+        },
+        {
+          "encoding": "u32-le",
+          "name": "header_crc32c",
+          "offset": 112,
+          "width": 4
+        },
+        {
+          "encoding": "bytes",
+          "must_be_zero": true,
+          "name": "reserved_tail",
+          "offset": 116,
+          "width": 3980
+        }
+      ],
+      "size": 4096
+    }
+  },
+  "validation": {
+    "binding_rules": [
+      "Every decoded reserve_state_uuid, device_id, quota_identity_sha256, and mount_identity_sha256 is nonzero.",
+      "Attach compares the complete pool identity tuple exactly with the retained coordinator/state identity; mount paths are not identities.",
+      "ReserveFileHeaderV1 declared_bytes is at least 4096 and attach requires st_size == declared_bytes.",
+      "ReserveInodeHeaderV1 count is in [1,100000000], index is strictly less than count, and attach compares count with the immutable state inventory count.",
+      "The exact retained filename must be the canonical filename derived from the header UUID and index.",
+      "All reserved bytes are zero even when CRC-consistent, and CRC is checked over all 4096 bytes with only the CRC field treated as zero.",
+      "The inode header repeats device and mount identity in addition to the required quota identity so an inode artifact cannot be rebound across allocation pools."
+    ],
+    "filename_rules": [
+      "Uppercase hexadecimal, signs, whitespace, non-decimal index characters, missing zero padding, alternate widths, suffixes, and all-zero UUIDs are rejected.",
+      "For one UUID, bytewise lexical filename order equals numeric index order because the decimal index has fixed width."
+    ],
+    "wire_rules": [
+      "Integers are encoded explicitly little-endian; a host C++ object representation is never a wire encoding.",
+      "Unknown version/endian/header-size values and any byte length other than exactly 4096 are rejected.",
+      "A failed decode does not modify the caller output."
+    ]
+  }
+}

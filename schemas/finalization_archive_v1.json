@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://l2flow.local/schemas/finalization_archive_v1.json",
+  "title": "L2Flow FinalizationArchiveV1",
+  "description": "Manifest for one immutable Phase 2 all-DONE reserve finalization archive. The containing tree also carries the exact 4096-byte reserve-state header, exact 32768-byte highest all-DONE slot, and every listed evidence file. Archive copies are retained audit evidence and do not replace live certificate or tombstone retention.",
+  "x-l2flow-artifact-byte-limits": {
+    "FINALIZATION_REPORT": 65536,
+    "SCAFFOLDING_FINALIZATION_REPORT": 65536,
+    "PREEXISTING_RECOVERY_REPORT": 65536,
+    "RAW_MANIFEST": 16777216,
+    "SEALED_RAW_CERTIFICATE": 8192,
+    "EMPTY_ANCHOR_TOMBSTONE": 4096,
+    "aggregate": 285212672
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "all_done_generation",
+    "all_done_slot_path",
+    "all_done_slot_sha256",
+    "artifact_count",
+    "artifacts",
+    "finalization_cycle_id",
+    "immutable_state_header_path",
+    "immutable_state_header_sha256",
+    "reserve_state_schema_sha256",
+    "reserve_state_uuid",
+    "schema_version",
+    "state_sha256"
+  ],
+  "properties": {
+    "all_done_generation": {
+      "$ref": "#/$defs/uint64String"
+    },
+    "all_done_slot_path": {
+      "const": "state-slot.bin"
+    },
+    "all_done_slot_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "artifact_count": {
+      "$ref": "#/$defs/uint64String"
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "finalization_cycle_id": {
+      "$ref": "#/$defs/identity128"
+    },
+    "immutable_state_header_path": {
+      "const": "state-header.bin"
+    },
+    "immutable_state_header_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "reserve_state_schema_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "reserve_state_uuid": {
+      "$ref": "#/$defs/identity128"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "state_sha256": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive_path",
+        "artifact_type",
+        "byte_count",
+        "capture_date",
+        "sha256",
+        "source_locator",
+        "source_stream_id",
+        "stream_day_id"
+      ],
+      "properties": {
+        "archive_path": {
+          "type": "string",
+          "pattern": "^evidence/[0-9]{3}-(finalization-report|scaffolding-finalization-report|preexisting-recovery-report|raw-manifest|sealed-raw-certificate|empty-anchor-tombstone)\\.json$",
+          "maxLength": 96
+        },
+        "artifact_type": {
+          "enum": [
+            "FINALIZATION_REPORT",
+            "SCAFFOLDING_FINALIZATION_REPORT",
+            "PREEXISTING_RECOVERY_REPORT",
+            "RAW_MANIFEST",
+            "SEALED_RAW_CERTIFICATE",
+            "EMPTY_ANCHOR_TOMBSTONE"
+          ]
+        },
+        "byte_count": {
+          "$ref": "#/$defs/uint64String"
+        },
+        "capture_date": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_.=-]+(?:/[A-Za-z0-9_.=-]+)*$"
+        },
+        "source_stream_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "stream_day_id": {
+          "$ref": "#/$defs/identity128"
+        }
+      }
+    },
+    "identity128": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "uint64String": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    }
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "canonical_encoding": {
+    "identity128_encoding": "32-character lowercase hexadecimal",
+    "integer_encoding": {
+      "uint32": "JSON integer",
+      "uint64": "quoted canonical unsigned decimal without leading zero"
+    },
+    "json": "RFC 8785 JCS UTF-8",
+    "sha256_encoding": "64-character lowercase hexadecimal",
+    "trailing_newline": false
+  },
+  "format": "L2Flow EmptyAnchorTombstoneV1",
+  "limits": {
+    "encoded_maximum_bytes": 4096,
+    "identity128_bytes": 16,
+    "sha256_bytes": 32
+  },
+  "locator": "maintenance/empty-anchor-<32-lowercase-hex-stream-day-id>.json",
+  "object": {
+    "additional_properties": false,
+    "properties": {
+      "capture_date": {
+        "encoding": "uint32",
+        "minimum": 1
+      },
+      "journal_header_sha256": {
+        "encoding": "64-character-lowercase-hex"
+      },
+      "marker_count": {
+        "const": "0",
+        "encoding": "uint64-decimal-string"
+      },
+      "record_count": {
+        "const": "0",
+        "encoding": "uint64-decimal-string"
+      },
+      "schema_version": {
+        "const": 1,
+        "encoding": "uint32"
+      },
+      "segment_count": {
+        "const": "0",
+        "encoding": "uint64-decimal-string"
+      },
+      "source_stream_id": {
+        "encoding": "uint32",
+        "minimum": 1
+      },
+      "stream_day_id": {
+        "encoding": "32-character-lowercase-hex"
+      }
+    },
+    "required": [
+      "capture_date",
+      "journal_header_sha256",
+      "marker_count",
+      "record_count",
+      "schema_version",
+      "segment_count",
+      "source_stream_id",
+      "stream_day_id"
+    ],
+    "type": "object"
+  },
+  "schema_version": 1,
+  "semantic_invariants": [
+    "journal_header_sha256 hashes the exact decoded-valid 4096-byte Raw V1 durable journal header",
+    "journal logical size is exactly 4096 bytes and marker_count is zero at observation",
+    "segment_count and record_count are zero",
+    "namespace fields equal the decoded journal header",
+    "no recovery-attempt, reserve-cycle, executor, report, archive, or future locator is encoded"
+  ]
+}

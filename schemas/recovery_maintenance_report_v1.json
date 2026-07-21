@@ -1,0 +1,924 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://l2flow.local/schemas/recovery_maintenance_report_v1.json",
+  "title": "L2Flow RecoveryMaintenanceReportV1",
+  "description": "Bounded ordinary-PROVISIONED recovery evidence. V1 is a tagged union of SEALED_RAW, EMPTY_ANCHOR_ONLY, and RESUMED_OPEN. It contains no writer/executor identity, reserve-cycle identity, or mutable whole-manifest hash.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capture_date",
+    "closed_frontier",
+    "current_empty_anchor_tombstone_sha256",
+    "current_sealed_raw_certificate_sha256",
+    "fatal_classification",
+    "final_durable_cursor",
+    "intent",
+    "journal_header_sha256",
+    "journal_tail_classification",
+    "marker_count",
+    "open_boundary",
+    "record_count",
+    "recovery_attempt_id",
+    "recovery_range",
+    "result",
+    "schema_version",
+    "sealed_boundary",
+    "segment_count",
+    "segment_tail_classification",
+    "source_stream_id",
+    "stream_day_id"
+  ],
+  "properties": {
+    "capture_date": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "closed_frontier": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/closed_frontier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "current_empty_anchor_tombstone_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "current_sealed_raw_certificate_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fatal_classification": {
+      "const": "NONE"
+    },
+    "final_durable_cursor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "intent": {
+      "enum": [
+        "RECOVER_SEAL_ONLY",
+        "RESUME_CONNECT"
+      ]
+    },
+    "journal_header_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "journal_tail_classification": {
+      "enum": [
+        "NONE",
+        "PARTIAL_MARKER",
+        "TERMINAL_CRC_INVALID_MARKER"
+      ]
+    },
+    "marker_count": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/u64_string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "open_boundary": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/open_boundary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "record_count": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/u64_string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "recovery_attempt_id": {
+      "$ref": "#/$defs/identity"
+    },
+    "recovery_range": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/recovery_range"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "result": {
+      "enum": [
+        "EMPTY_ANCHOR_ONLY",
+        "RESUMED_OPEN",
+        "SEALED_RAW"
+      ]
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sealed_boundary": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sealed_boundary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "segment_count": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/u64_string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "segment_tail_classification": {
+      "oneOf": [
+        {
+          "enum": [
+            "NONE",
+            "PARTIAL_RECORD",
+            "INVALID_RECORD",
+            "ZERO_PREALLOCATION"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source_stream_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "stream_day_id": {
+      "$ref": "#/$defs/identity"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "closed_frontier": {
+          "$ref": "#/$defs/closed_frontier"
+        },
+        "current_empty_anchor_tombstone_sha256": {
+          "type": "null"
+        },
+        "current_sealed_raw_certificate_sha256": {
+          "type": "null"
+        },
+        "final_durable_cursor": {
+          "$ref": "#/$defs/open_cursor"
+        },
+        "intent": {
+          "const": "RESUME_CONNECT"
+        },
+        "marker_count": {
+          "type": "null"
+        },
+        "open_boundary": {
+          "$ref": "#/$defs/open_boundary"
+        },
+        "record_count": {
+          "type": "null"
+        },
+        "recovery_range": {
+          "$ref": "#/$defs/recovery_range"
+        },
+        "result": {
+          "const": "RESUMED_OPEN"
+        },
+        "sealed_boundary": {
+          "type": "null"
+        },
+        "segment_count": {
+          "type": "null"
+        },
+        "segment_tail_classification": {
+          "enum": [
+            "NONE",
+            "PARTIAL_RECORD",
+            "INVALID_RECORD",
+            "ZERO_PREALLOCATION"
+          ]
+        }
+      }
+    },
+    {
+      "properties": {
+        "closed_frontier": {
+          "$ref": "#/$defs/sealed_frontier"
+        },
+        "current_empty_anchor_tombstone_sha256": {
+          "type": "null"
+        },
+        "current_sealed_raw_certificate_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "final_durable_cursor": {
+          "$ref": "#/$defs/sealed_cursor"
+        },
+        "intent": {
+          "const": "RECOVER_SEAL_ONLY"
+        },
+        "marker_count": {
+          "type": "null"
+        },
+        "open_boundary": {
+          "type": "null"
+        },
+        "record_count": {
+          "type": "null"
+        },
+        "recovery_range": {
+          "$ref": "#/$defs/recovery_range"
+        },
+        "result": {
+          "const": "SEALED_RAW"
+        },
+        "sealed_boundary": {
+          "$ref": "#/$defs/sealed_boundary"
+        },
+        "segment_count": {
+          "type": "null"
+        },
+        "segment_tail_classification": {
+          "const": "NONE"
+        }
+      }
+    },
+    {
+      "properties": {
+        "closed_frontier": {
+          "type": "null"
+        },
+        "current_empty_anchor_tombstone_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "current_sealed_raw_certificate_sha256": {
+          "type": "null"
+        },
+        "final_durable_cursor": {
+          "type": "null"
+        },
+        "intent": {
+          "const": "RECOVER_SEAL_ONLY"
+        },
+        "marker_count": {
+          "const": "0"
+        },
+        "open_boundary": {
+          "type": "null"
+        },
+        "record_count": {
+          "const": "0"
+        },
+        "recovery_range": {
+          "type": "null"
+        },
+        "result": {
+          "const": "EMPTY_ANCHOR_ONLY"
+        },
+        "sealed_boundary": {
+          "type": "null"
+        },
+        "segment_count": {
+          "const": "0"
+        },
+        "segment_tail_classification": {
+          "type": "null"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u64_string": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "identity": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "not": {
+        "const": "00000000000000000000000000000000"
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {
+        "const": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "marker_wire": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{96}$"
+    },
+    "cursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "global_wal_pos",
+        "ingress_sequence",
+        "marker_flags",
+        "segment_offset",
+        "segment_sequence"
+      ],
+      "properties": {
+        "global_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "ingress_sequence": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "marker_flags": {
+          "enum": [
+            0,
+            1
+          ]
+        },
+        "segment_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_sequence": {
+          "$ref": "#/$defs/u32"
+        }
+      }
+    },
+    "open_cursor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "properties": {
+            "marker_flags": {
+              "const": 0
+            },
+            "segment_sequence": {
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "sealed_cursor": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "properties": {
+            "marker_flags": {
+              "const": 1
+            },
+            "segment_sequence": {
+              "minimum": 1
+            }
+          }
+        }
+      ]
+    },
+    "closed_frontier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "closed_entry_count",
+        "closed_prefix_sha256",
+        "frontier_seal_marker_sha256",
+        "frontier_segment_sequence",
+        "frontier_segment_sha256"
+      ],
+      "properties": {
+        "closed_entry_count": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "closed_prefix_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_seal_marker_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frontier_segment_sequence": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "frontier_segment_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "closed_entry_count": {
+                "const": "0"
+              }
+            },
+            "required": [
+              "closed_entry_count"
+            ]
+          },
+          "then": {
+            "properties": {
+              "frontier_seal_marker_sha256": {
+                "type": "null"
+              },
+              "frontier_segment_sequence": {
+                "type": "null"
+              },
+              "frontier_segment_sha256": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "frontier_seal_marker_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "frontier_segment_sequence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4294967295
+              },
+              "frontier_segment_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "sealed_frontier": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/closed_frontier"
+        },
+        {
+          "properties": {
+            "closed_entry_count": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,19}$"
+            }
+          }
+        }
+      ]
+    },
+    "endpoint_marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "global_wal_pos",
+        "ingress_sequence",
+        "marker_bytes",
+        "marker_flags",
+        "marker_sha256",
+        "segment_offset",
+        "segment_sequence"
+      ],
+      "properties": {
+        "global_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "ingress_sequence": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "marker_bytes": {
+          "$ref": "#/$defs/marker_wire"
+        },
+        "marker_flags": {
+          "const": 0
+        },
+        "marker_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "segment_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "new_segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_base_wal_pos",
+        "segment_header_sha256",
+        "segment_sequence"
+      ],
+      "properties": {
+        "segment_base_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_header_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "reuse_segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reported_logical_end_offset",
+        "segment_base_wal_pos",
+        "segment_header_sha256",
+        "segment_prefix_sha256",
+        "segment_sequence"
+      ],
+      "properties": {
+        "reported_logical_end_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_base_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_header_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "segment_prefix_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "previous_terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "marker_bytes",
+        "marker_sha256",
+        "segment_sequence",
+        "segment_sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "CANONICAL_ZERO",
+            "SEALED"
+          ]
+        },
+        "marker_bytes": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/marker_wire"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "marker_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "segment_sequence": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "segment_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "CANONICAL_ZERO"
+            },
+            "marker_bytes": {
+              "type": "null"
+            },
+            "marker_sha256": {
+              "type": "null"
+            },
+            "segment_sequence": {
+              "type": "null"
+            },
+            "segment_sha256": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "SEALED"
+            },
+            "marker_bytes": {
+              "$ref": "#/$defs/marker_wire"
+            },
+            "marker_sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "segment_sequence": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "segment_sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "open_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "endpoint_marker",
+        "manifest_entry_commitment_sha256",
+        "manifest_generation",
+        "new_segment",
+        "open_variant",
+        "previous_terminal",
+        "reopens_empty_tombstone_sha256",
+        "reopens_sealed_raw_certificate_sha256",
+        "reuse_segment"
+      ],
+      "properties": {
+        "endpoint_marker": {
+          "$ref": "#/$defs/endpoint_marker"
+        },
+        "manifest_entry_commitment_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "manifest_generation": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "new_segment": {},
+        "open_variant": {
+          "enum": [
+            "REUSE_OPEN",
+            "NEW_OPEN_AFTER_SEALED"
+          ]
+        },
+        "previous_terminal": {},
+        "reopens_empty_tombstone_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reopens_sealed_raw_certificate_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reuse_segment": {}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "open_variant": {
+              "const": "REUSE_OPEN"
+            },
+            "new_segment": {
+              "type": "null"
+            },
+            "previous_terminal": {
+              "type": "null"
+            },
+            "reopens_empty_tombstone_sha256": {
+              "type": "null"
+            },
+            "reopens_sealed_raw_certificate_sha256": {
+              "type": "null"
+            },
+            "reuse_segment": {
+              "$ref": "#/$defs/reuse_segment"
+            }
+          }
+        },
+        {
+          "properties": {
+            "open_variant": {
+              "const": "NEW_OPEN_AFTER_SEALED"
+            },
+            "new_segment": {
+              "$ref": "#/$defs/new_segment"
+            },
+            "previous_terminal": {
+              "$ref": "#/$defs/previous_terminal"
+            },
+            "reuse_segment": {
+              "type": "null"
+            }
+          },
+          "not": {
+            "properties": {
+              "reopens_empty_tombstone_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "reopens_sealed_raw_certificate_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            },
+            "required": [
+              "reopens_empty_tombstone_sha256",
+              "reopens_sealed_raw_certificate_sha256"
+            ]
+          }
+        }
+      ]
+    },
+    "recovery_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analyzed_journal_size",
+        "final_durable_journal_size",
+        "initial_accepted_journal_size",
+        "initial_durable_cursor",
+        "post_repair_journal_size",
+        "range_segment_sequence",
+        "raw_append_begin_offset",
+        "raw_append_end_offset",
+        "raw_repair_begin_offset",
+        "raw_repair_end_offset"
+      ],
+      "properties": {
+        "analyzed_journal_size": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "final_durable_journal_size": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "initial_accepted_journal_size": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "initial_durable_cursor": {
+          "$ref": "#/$defs/cursor"
+        },
+        "post_repair_journal_size": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "range_segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "raw_append_begin_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "raw_append_end_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "raw_repair_begin_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "raw_repair_end_offset": {
+          "$ref": "#/$defs/u64_string"
+        }
+      }
+    },
+    "sealed_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_sealed_marker_bytes",
+        "accepted_sealed_marker_sha256",
+        "last_segment_base_wal_pos",
+        "last_segment_flags",
+        "last_segment_logical_length",
+        "last_segment_sequence",
+        "last_segment_sha256"
+      ],
+      "properties": {
+        "accepted_sealed_marker_bytes": {
+          "$ref": "#/$defs/marker_wire"
+        },
+        "accepted_sealed_marker_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "last_segment_base_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "last_segment_flags": {
+          "enum": [
+            0,
+            1
+          ]
+        },
+        "last_segment_logical_length": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "last_segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "last_segment_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+#pragma once
+
+#include <cstdint>
+#include <string_view>
+
+namespace l2flow::build_manifest {
+
+inline constexpr std::uint32_t kSchemaVersion =
+    @L2FLOW_BUILD_MANIFEST_SCHEMA_VERSION@U;
+inline constexpr std::uint32_t kCxxStandard =
+    @L2FLOW_BUILD_MANIFEST_CXX_STANDARD@U;
+inline constexpr std::string_view kSanitizerMode =
+    "@L2FLOW_BUILD_MANIFEST_SANITIZER_MODE@";
+inline constexpr std::string_view kSha256 =
+    "@L2FLOW_BUILD_MANIFEST_SHA256@";
+inline constexpr std::string_view kSdkBaselineSha256 =
+    "@L2FLOW_SDK_BASELINE_SHA256@";
+inline constexpr std::string_view kSourceRevisionStatus =
+    "@L2FLOW_SOURCE_REVISION_STATUS@";
+inline constexpr std::string_view kSourceRevision =
+    "@L2FLOW_SOURCE_REVISION@";
+inline constexpr std::string_view kJson =
+    R"L2FLOW_MANIFEST(@L2FLOW_BUILD_MANIFEST_JSON@)L2FLOW_MANIFEST";
+
+}  // namespace l2flow::build_manifest

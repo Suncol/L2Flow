@@ -1,0 +1,550 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://l2flow.local/schemas/finalization_report_v1.json",
+  "title": "L2Flow FinalizationReportV1",
+  "description": "Bounded immutable reserve-finalization evidence. It contains no executor identity and no mutable whole-manifest content hash.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ack_status",
+    "ack_writer_instance",
+    "capture_date",
+    "empty_anchor_tombstone_sha256",
+    "final_append_cursor",
+    "final_durable_cursor",
+    "final_seal",
+    "finalization_cycle_id",
+    "gap_classification",
+    "gap_classification_valid",
+    "immutable_grant_sha256",
+    "initial_append_cursor",
+    "initial_durable_cursor",
+    "journal_header_sha256",
+    "manifest_frontier",
+    "marker_count",
+    "preexisting_recovery_report",
+    "raw_allocation_delta_before_report",
+    "reserve_state_uuid",
+    "result",
+    "schema_version",
+    "sealed_raw_certificate_sha256",
+    "segments",
+    "source_stream_id",
+    "stream_day_id",
+    "tail_classification",
+    "tail_classification_valid"
+  ],
+  "properties": {
+    "ack_status": {
+      "enum": [
+        "ACKED",
+        "FENCED_NO_ACK"
+      ]
+    },
+    "ack_writer_instance": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identity"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "capture_date": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "empty_anchor_tombstone_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "final_append_cursor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "final_durable_cursor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "final_seal": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/final_seal"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "finalization_cycle_id": {
+      "$ref": "#/$defs/identity"
+    },
+    "gap_classification": {
+      "enum": [
+        "NONE",
+        "ACKED_RING_DRAINED",
+        "FENCED_RING_LOST_UNKNOWN",
+        "UNKNOWN"
+      ]
+    },
+    "gap_classification_valid": {
+      "type": "boolean"
+    },
+    "immutable_grant_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "initial_append_cursor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "initial_durable_cursor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/cursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "journal_header_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "manifest_frontier": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/manifest_frontier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "marker_count": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/u64_string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "preexisting_recovery_report": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/preexisting_recovery_report"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "raw_allocation_delta_before_report": {
+      "$ref": "#/$defs/raw_allocation_delta"
+    },
+    "reserve_state_uuid": {
+      "$ref": "#/$defs/identity"
+    },
+    "result": {
+      "enum": [
+        "SEALED_RAW",
+        "EMPTY_ANCHOR_ONLY"
+      ]
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sealed_raw_certificate_sha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "segments": {
+      "oneOf": [
+        {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/segment"
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "source_stream_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "stream_day_id": {
+      "$ref": "#/$defs/identity"
+    },
+    "tail_classification": {
+      "enum": [
+        "NONE",
+        "PARTIAL_RECORD_DISCARDED",
+        "INVALID_RECORD_DISCARDED",
+        "UNKNOWN"
+      ]
+    },
+    "tail_classification_valid": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "identity": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "not": {
+        "const": "00000000000000000000000000000000"
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {
+        "const": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u64_string": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "cursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "global_wal_pos",
+        "ingress_sequence",
+        "segment_offset",
+        "segment_sequence"
+      ],
+      "properties": {
+        "global_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "ingress_sequence": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_offset": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "final_seal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_sealed_marker_bytes",
+        "accepted_sealed_marker_sha256",
+        "segment_sequence"
+      ],
+      "properties": {
+        "accepted_sealed_marker_bytes": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{96}$"
+        },
+        "accepted_sealed_marker_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "manifest_frontier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "closed_entry_count",
+        "closed_prefix_sha256",
+        "frontier_accepted_seal_sha256",
+        "frontier_segment_sequence",
+        "frontier_segment_sha256"
+      ],
+      "properties": {
+        "closed_entry_count": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "closed_prefix_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_accepted_seal_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "frontier_segment_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "preexisting_recovery_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recovery_attempt_id",
+        "report_sha256"
+      ],
+      "properties": {
+        "recovery_attempt_id": {
+          "$ref": "#/$defs/identity"
+        },
+        "report_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "raw_allocation_delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allocated_bytes",
+        "allocated_inodes",
+        "released_bytes",
+        "released_inodes"
+      ],
+      "properties": {
+        "allocated_bytes": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "allocated_inodes": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "released_bytes": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "released_inodes": {
+          "$ref": "#/$defs/u64_string"
+        }
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "logical_length",
+        "segment_base_wal_pos",
+        "segment_sequence",
+        "segment_sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "CURRENT",
+            "FINALIZATION_CONTINUATION"
+          ]
+        },
+        "logical_length": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_base_wal_pos": {
+          "$ref": "#/$defs/u64_string"
+        },
+        "segment_sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "segment_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ack_status": {
+            "const": "ACKED"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "ack_writer_instance": {
+            "$ref": "#/$defs/identity"
+          },
+          "initial_append_cursor": {
+            "$ref": "#/$defs/cursor"
+          },
+          "initial_durable_cursor": {
+            "$ref": "#/$defs/cursor"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "ack_writer_instance": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "SEALED_RAW"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "empty_anchor_tombstone_sha256": {
+            "type": "null"
+          },
+          "final_append_cursor": {
+            "$ref": "#/$defs/cursor"
+          },
+          "final_durable_cursor": {
+            "$ref": "#/$defs/cursor"
+          },
+          "final_seal": {
+            "$ref": "#/$defs/final_seal"
+          },
+          "journal_header_sha256": {
+            "type": "null"
+          },
+          "manifest_frontier": {
+            "$ref": "#/$defs/manifest_frontier"
+          },
+          "marker_count": {
+            "type": "null"
+          },
+          "sealed_raw_certificate_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "segments": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 2,
+            "items": {
+              "$ref": "#/$defs/segment"
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "empty_anchor_tombstone_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "final_append_cursor": {
+            "type": "null"
+          },
+          "final_durable_cursor": {
+            "type": "null"
+          },
+          "final_seal": {
+            "type": "null"
+          },
+          "gap_classification": {
+            "const": "NONE"
+          },
+          "gap_classification_valid": {
+            "const": true
+          },
+          "initial_append_cursor": {
+            "type": "null"
+          },
+          "initial_durable_cursor": {
+            "type": "null"
+          },
+          "journal_header_sha256": {
+            "$ref": "#/$defs/sha256"
+          },
+          "manifest_frontier": {
+            "type": "null"
+          },
+          "marker_count": {
+            "const": "0"
+          },
+          "sealed_raw_certificate_sha256": {
+            "type": "null"
+          },
+          "segments": {
+            "type": "null"
+          },
+          "tail_classification": {
+            "const": "NONE"
+          },
+          "tail_classification_valid": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "x-l2flow-invariants": [
+    "Exact RFC 8785-compatible JCS is at most 65536 bytes, contains no BOM or trailing newline, and rejects unknown, reordered, duplicate, missing, noncanonical decimal or non-lowercase-hex fields.",
+    "All uint64 values are quoted canonical decimal strings; identities are 32 lowercase hex characters and SHA-256 values are 64 lowercase hex characters.",
+    "classification_valid=false is represented only with classification UNKNOWN; classification_valid=true forbids UNKNOWN.",
+    "SEALED_RAW final append and durable cursors are equal and match the accepted SEGMENT_SEALED marker, terminal segment and sidecar certificate.",
+    "SEALED_RAW segments contain CURRENT followed by at most one contiguous FINALIZATION_CONTINUATION; the manifest frontier names the terminal segment and accepted seal and never hashes the whole mutable manifest.",
+    "EMPTY_ANCHOR_ONLY is accepted only with a RAW_ANCHOR_ONLY immutable grant and a matching built EmptyAnchorTombstoneV1 capability.",
+    "SEALED_RAW is accepted only with a RAW_FINALIZATION immutable grant and a matching built SealedRawCertificateV1 capability.",
+    "preexisting_recovery_report is either null or binds a nonzero recovery-attempt identity and exact nonzero report SHA-256.",
+    "raw_allocation_delta_before_report accounts only Raw, journal, index and manifest observations before report publication and does not include the report inode or replace the durable debit ledger.",
+    "No executor identity and no mutable whole-manifest content hash is present."
+  ]
+}
