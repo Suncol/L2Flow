@@ -3,22 +3,27 @@
 Date: 2026-07-21
 Host scope: local Linux x86-64 development container
 
+> 2026-07-22 superseded note：本记录保留截至 2026-07-21 的本地验收事实。
+> `L2Flow::production` 后来通过独立授权变更切换到 `l2flow_production`，并把
+> control decoder 接入 fresh live 四源聚合；本文未完成的 replay/recovery 与外部
+> exit 不因此变成通过。
+
 ## 结论
 
 本记录把“可在仓库内验证的 Phase 3 library/live bridge”与“生产 ingress 已完成
-Phase 3 接入”严格分开。当前结论是：Phase 3 的独立 control decoder、固定记录、
+Phase 3 接入”严格分开。本记录当时的结论是：Phase 3 的独立 control decoder、固定记录、
 checkpoint、readiness、`ReSubscribe` guard 和 live worker 本地实现切片及其定向
 测试已完成；生产 service/controller 接入和外部 Exit 证据未完成。
 
-| 口径 | 当前状态 | 判定依据 |
+| 口径 | 本记录时状态 | 判定依据 |
 | --- | --- | --- |
 | **Phase 3 library/local live-bridge implementation slice** | **已完成** | `L2Flow::phase3` 包含安全 API/SYS decoder、authoritative state、固定 codec、checkpoint、READY gate、guard 和单消费者 live worker |
-| **Production implementation complete** | **未完成** | `L2Flow::production` 和 `l2flow_ingress_service` 仍停留在 Phase 0–1；没有生产 controller 组合 Phase 2 recovery、SDK generation lifecycle、Phase 3 worker、derived sink 与 checkpoint restore/publication |
-| **Scoped local verification** | **已完成** | 当前最终代码的 strict Debug、Release 与 ASan+UBSan `phase3` label 定向 CTest 均为 **5/5，0 failed**；该结论只覆盖下列五个仓库内测试 |
+| **Production implementation complete** | **未完成** | 截至本记录日期，`L2Flow::production` 和 `l2flow_ingress_service` 仍停留在 Phase 0–1；没有生产 controller 组合 Phase 2 recovery、SDK generation lifecycle、Phase 3 worker、derived sink 与 checkpoint restore/publication |
+| **Scoped local verification** | **已完成** | 本记录所验代码的 strict Debug、Release 与 ASan+UBSan `phase3` label 定向 CTest 均为 **5/5，0 failed**；该结论只覆盖下列五个仓库内测试 |
 | **Production/external Phase 3 exit** | **未完成** | 没有真实四端点、五次真实断线/重连、生产服务重启、真实 SDK data plane、目标 NVMe 或完整交易日制品；fixture 测试不能替代这些证据 |
 
 因此，本文中的“已完成”只指第一行的独立库/本地 bridge 切片和第三行列明的
-定向验证范围，不授权切换 production alias，也不把 Phase 2 或整个系统的
+定向验证范围；它在当时不构成切换 production alias 的授权，也不把 Phase 2 或整个系统的
 Implementation/Local verification/Exit 状态改为完成。
 
 ## 已实现的本地切片
@@ -140,16 +145,16 @@ ASan+UBSan 运行显式使用
 
 ## Production implementation 与外部 Exit 阻断项
 
-以下条件当前均未完成，且不能由上述 5 个测试替代：
+以下条件截至本记录日期均未完成，且不能由上述 5 个测试替代：
 
-1. `L2Flow::production` alias 仍指向 `l2flow_phase01`，
+1. 截至本记录日期，`L2Flow::production` alias 仍指向 `l2flow_phase01`，
    `l2flow_ingress_service` 仍链接 Phase 0–1；四个 ingress 未构造 Phase 2 Raw
    production runtime + Phase 3 worker。
 2. 没有 service-level controller 串联 startup route/recovery、callback-quiescence、
    Connect generation、derived-record sink、checkpoint restore/publication、READY
    monitor、exact stop/abort 和 restart。
-3. checked-in `mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 当前是 134-byte Git LFS
-   pointer，不是真实 vendor shared object；因此当前仓库状态不能提供真实 SDK
+3. checked-in `mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 当时是 134-byte Git LFS
+pointer，不是真实 vendor shared object；因此本记录时的仓库状态不能提供真实 SDK
    runtime/link 验收。
 4. 没有对真实 endpoint 连续执行五次断线/重连并核对 Raw、ControlRecord、epoch、
    READY 与 service lifecycle。单元 fixture 的五轮状态机测试不是该制品。
@@ -159,5 +164,6 @@ ASan+UBSan 运行显式使用
    deterministic power-loss 和目标环境 power-cut 条件仍未完成；Phase 3 不能绕过
    其上游 durability authority。
 
-在上述条件完成并形成独立、可审计的验收制品前，不声明 Production implementation
-complete 或 Production/external Phase 3 exit complete，也不切换 production alias。
+本记录据此不声明 Production implementation complete 或 Production/external Phase 3
+exit complete，当时也不授权切换 production alias。后来的独立 alias 变更不追溯
+改变这些 exit 判定。

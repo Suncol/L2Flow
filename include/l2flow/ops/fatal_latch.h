@@ -23,6 +23,7 @@ enum class FatalReason : std::uint32_t {
     MALFORMED_CONTROL_MESSAGE,
     RAW_WAL_IO,
     RAW_READINESS_OBSERVER,
+    SOURCE_FRONTIER_FAILURE,
 };
 
 // A process-lifetime, first-writer-wins latch.  The first successful trip is

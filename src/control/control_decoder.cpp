@@ -736,6 +736,21 @@ public:
         return state_;
     }
 
+    [[nodiscard]] ControlDecoderReadinessSummaryV1 ReadinessSummary()
+        const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ControlDecoderReadinessSummaryV1{
+            state_.source_stream_id,
+            state_.capture_date,
+            state_.stream_day_id,
+            state_.processed_ingress_sequence,
+            state_.processed_record_end_wal_pos,
+            state_.disconnected_window,
+            state_.poisoned,
+            state_.control_ready,
+            state_.decoder_evidence_ready};
+    }
+
     [[nodiscard]] ControlDecoderCheckpointV1 Checkpoint() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return ControlDecoderCheckpointV1{
@@ -1344,6 +1359,11 @@ ControlProcessResultV1 ControlDecoderV1::Process(
 
 ControlDecoderSnapshotV1 ControlDecoderV1::Snapshot() const {
     return impl_->Snapshot();
+}
+
+ControlDecoderReadinessSummaryV1
+ControlDecoderV1::ReadinessSummary() const noexcept {
+    return impl_->ReadinessSummary();
 }
 
 ControlDecoderCheckpointV1 ControlDecoderV1::Checkpoint() const {

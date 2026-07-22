@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 namespace ingress = l2flow::ingress;
+namespace canonical = l2flow::canonical;
 namespace sdk = l2flow::sdk;
 namespace mdl = datayes::mdl;
 
@@ -136,6 +137,50 @@ public:
 private:
     std::string path_;
     int descriptor_ = -1;
+};
+
+class RootPathReplacement final {
+public:
+    explicit RootPathReplacement(std::string original)
+        : original_(std::move(original)),
+          retained_(original_ + ".retained") {
+        struct stat status {};
+        if (::lstat(retained_.c_str(), &status) == 0 ||
+            errno != ENOENT ||
+            ::rename(original_.c_str(), retained_.c_str()) != 0) {
+            return;
+        }
+        if (::mkdir(original_.c_str(), 0700) != 0) {
+            static_cast<void>(
+                ::rename(retained_.c_str(), original_.c_str()));
+            return;
+        }
+        active_ = true;
+    }
+
+    ~RootPathReplacement() {
+        if (!active_) {
+            return;
+        }
+        std::error_code ignored;
+        static_cast<void>(
+            std::filesystem::remove_all(original_, ignored));
+        static_cast<void>(
+            ::rename(retained_.c_str(), original_.c_str()));
+    }
+
+    RootPathReplacement(const RootPathReplacement&) = delete;
+    RootPathReplacement& operator=(const RootPathReplacement&) = delete;
+
+    [[nodiscard]] bool ok() const noexcept { return active_; }
+    [[nodiscard]] const std::string& retained_path() const noexcept {
+        return retained_;
+    }
+
+private:
+    std::string original_;
+    std::string retained_;
+    bool active_ = false;
 };
 
 ingress::ReserveCoordinatorStateV1
@@ -666,6 +711,34 @@ void TestFreshRegisteredRuntime(
     auto factory =
         std::make_shared<FakeFactory>(counters);
 
+    canonical::SourceFrontierPageV1 source_frontier{};
+    canonical::SourceFrontierConfigV1 frontier_config{};
+    frontier_config.source_stream_id =
+        fixture.config.recovered.source_stream_id;
+    frontier_config.capture_date = fixture.config.recovered.capture_date;
+    frontier_config.stream_day_id = fixture.config.recovered.stream_day_id;
+    frontier_config.clock_epoch.algorithm =
+        fixture.config.recovered.clock_epoch_algorithm_version;
+    frontier_config.clock_epoch.digest =
+        fixture.config.recovered.clock_epoch_digest;
+    frontier_config.clock_epoch.label =
+        fixture.config.recovered.clock_epoch_label;
+    frontier_config.writer_instance = fixture.registration.writer_instance;
+    frontier_config.generation = 37U;
+    frontier_config.initial_global_wal_pos =
+        ingress::kRawV1SegmentHeaderBytes;
+    frontier_config.initial_state = canonical::SourceStateV1::kHealthy;
+    test->Expect(
+        canonical::InitializeSourceFrontierPageV1(
+            frontier_config, &source_frontier) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "fresh production SourceFrontier fixture initializes");
+    ingress::RawIngressAppOptionsV1 app_options{};
+    app_options.source_frontier = &source_frontier;
+    app_options.frontier_writer_instance =
+        fixture.registration.writer_instance;
+    app_options.frontier_generation = frontier_config.generation;
+
     ingress::RawProductionRuntimeBuildResultV1
         result =
             ingress::
@@ -684,7 +757,7 @@ void TestFreshRegisteredRuntime(
                         std::make_unique<
                             FixedCaptureClock>(),
                         {},
-                        {},
+                        app_options,
                         nullptr,
                         &fixture.error);
     test->Expect(
@@ -710,6 +783,45 @@ void TestFreshRegisteredRuntime(
             << fixture.error << '\n';
         return;
     }
+
+    const auto& binding = result.runtime->capture_binding();
+    test->Expect(
+        binding.source_slot == 3U &&
+            binding.ingress_kind == sdk::IngressKind::SzTick &&
+            binding.source_stream_id ==
+                fixture.config.recovered.source_stream_id &&
+            binding.capture_date == fixture.config.recovered.capture_date &&
+            binding.stream_day_id == fixture.config.recovered.stream_day_id &&
+            binding.writer_instance == fixture.registration.writer_instance &&
+            binding.source_generation == frontier_config.generation &&
+            binding.source_frontier == &source_frontier,
+        "fresh Raw runtime exposes its exact immutable production binding");
+
+    test->Expect(
+        result.runtime->HasFreshPipelineLiveTail(),
+        "fresh runtime retains an independent source-order pipeline tail");
+    std::unique_ptr<ingress::RawLiveTail> pipeline_tail =
+        result.runtime->TakeFreshPipelineLiveTail();
+    test->Expect(
+        pipeline_tail != nullptr &&
+            !result.runtime->HasFreshPipelineLiveTail() &&
+            result.runtime->TakeFreshPipelineLiveTail() == nullptr,
+        "fresh pipeline tail is transferred exactly once");
+    if (pipeline_tail != nullptr) {
+        const ingress::RawLiveControlSampleV1 sample =
+            pipeline_tail->SampleControlFresh();
+        test->Expect(
+            sample.ok() &&
+                pipeline_tail->source_stream_id() ==
+                    fixture.registration.key.route.source_stream_id &&
+                pipeline_tail->capture_date() ==
+                    fixture.registration.key.route.capture_date &&
+                pipeline_tail->writer_instance() ==
+                    fixture.registration.writer_instance &&
+                pipeline_tail->next_ingress_sequence() == 1U,
+            "transferred pipeline tail retains its independent authenticated POSIX source");
+    }
+    pipeline_tail.reset();
 
     ingress::RawReserveCoordinatorErrorV1
         action_error =
@@ -824,6 +936,115 @@ void TestFreshFailureRequiresFailStop(
         "failure after durable INIT is explicitly non-retryable even before ACTIVE publication");
 }
 
+void TestFreshRetainedRootSurvivesPathReplacement(
+    TestContext* test) {
+    FreshRuntimeFixture fixture;
+    test->Expect(
+        fixture.Initialize(),
+        "retained-root fixture is durably registered");
+    if (fixture.coordinator == nullptr) {
+        return;
+    }
+
+    RootPathReplacement replacement(fixture.root.path());
+    test->Expect(
+        replacement.ok(),
+        "Raw root pathname is renamed and replaced after preflight");
+    if (!replacement.ok()) {
+        return;
+    }
+
+    int replacement_fd = -1;
+    do {
+        replacement_fd = ::open(
+            fixture.root.path().c_str(),
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (replacement_fd < 0 && errno == EINTR);
+    test->Expect(
+        replacement_fd >= 0,
+        "replacement Raw root can be opened independently");
+    if (replacement_fd < 0) {
+        return;
+    }
+
+    auto rejected = ingress::
+        RawExistingRouteProductionRuntimeFactoryV1::
+            ActivateFreshRegisteredAt(
+                replacement_fd,
+                fixture.root.path(),
+                "sz-tick",
+                fixture.registration,
+                *fixture.coordinator,
+                fixture.writer_config,
+                fixture.backend_options,
+                fixture.artifact_options,
+                fixture.stream_limits,
+                fixture.config,
+                std::make_shared<FakeFactory>(
+                    std::make_shared<SdkCounters>()),
+                std::make_unique<FixedCaptureClock>(),
+                {},
+                {},
+                nullptr,
+                &fixture.error);
+    static_cast<void>(::close(replacement_fd));
+    test->Expect(
+        !rejected.ok() &&
+            rejected.failure == ingress::
+                RawProductionRuntimeFailureV1::kInvalidInput &&
+            !rejected.fresh_init_publication_attempted &&
+            !rejected.requires_fail_stop(),
+        "retained-root activation rejects a different root inode before mutation");
+
+    auto counters = std::make_shared<SdkCounters>();
+    auto result = ingress::
+        RawExistingRouteProductionRuntimeFactoryV1::
+            ActivateFreshRegisteredAt(
+                fixture.root.descriptor(),
+                fixture.root.path(),
+                "sz-tick",
+                fixture.registration,
+                *fixture.coordinator,
+                fixture.writer_config,
+                fixture.backend_options,
+                fixture.artifact_options,
+                fixture.stream_limits,
+                fixture.config,
+                std::make_shared<FakeFactory>(counters),
+                std::make_unique<FixedCaptureClock>(),
+                {},
+                {},
+                nullptr,
+                &fixture.error);
+    test->Expect(
+        result.ok(),
+        "retained-root activation succeeds after configured pathname replacement");
+    if (!result.ok()) {
+        std::cerr << "retained-root activation: "
+                  << fixture.error << '\n';
+        return;
+    }
+
+    const std::filesystem::path relative =
+        "capture_date=20260718/stream=2002-sz-tick/segment-00000001.raw";
+    test->Expect(
+        std::filesystem::exists(
+            std::filesystem::path(replacement.retained_path()) / relative) &&
+            !std::filesystem::exists(
+                std::filesystem::path(fixture.root.path()) / relative),
+        "all fresh Raw artifacts are created below the retained inode, not the replacement pathname");
+
+    std::unique_ptr<ingress::RawLiveTail> pipeline_tail =
+        result.runtime->TakeFreshPipelineLiveTail();
+    pipeline_tail.reset();
+    test->Expect(
+        result.runtime->Initialize(&fixture.error) &&
+            result.runtime->Stop(&fixture.error) &&
+            counters->connect == 1U &&
+            counters->manager_release == 1U,
+        "retained-root runtime initializes and clean-stops without reopening the replaced pathname");
+}
+
 void TestFreshPreflightRejectsBeforeMutation(
     TestContext* test) {
     FreshRuntimeFixture fixture;
@@ -833,6 +1054,72 @@ void TestFreshPreflightRejectsBeforeMutation(
     if (fixture.coordinator == nullptr) {
         return;
     }
+    ingress::RawReserveFreshScaffoldingV1 wrong_cap =
+        fixture.registration;
+    ++wrong_cap.scaffolding_allocation_cap;
+    auto cap_result = ingress::
+        RawExistingRouteProductionRuntimeFactoryV1::
+            ActivateFreshRegisteredAt(
+                fixture.root.descriptor(),
+                fixture.root.path(),
+                "sz-tick",
+                wrong_cap,
+                *fixture.coordinator,
+                fixture.writer_config,
+                fixture.backend_options,
+                fixture.artifact_options,
+                fixture.stream_limits,
+                fixture.config,
+                std::make_shared<FakeFactory>(
+                    std::make_shared<SdkCounters>()),
+                std::make_unique<FixedCaptureClock>(),
+                {},
+                {},
+                nullptr,
+                &fixture.error);
+    ingress::RawReserveFreshScaffoldingV1 wrong_template =
+        fixture.registration;
+    ++wrong_template.safe_stop_template_id;
+    auto template_result = ingress::
+        RawExistingRouteProductionRuntimeFactoryV1::
+            ActivateFreshRegisteredAt(
+                fixture.root.descriptor(),
+                fixture.root.path(),
+                "sz-tick",
+                wrong_template,
+                *fixture.coordinator,
+                fixture.writer_config,
+                fixture.backend_options,
+                fixture.artifact_options,
+                fixture.stream_limits,
+                fixture.config,
+                std::make_shared<FakeFactory>(
+                    std::make_shared<SdkCounters>()),
+                std::make_unique<FixedCaptureClock>(),
+                {},
+                {},
+                nullptr,
+                &fixture.error);
+    test->Expect(
+        !cap_result.ok() &&
+            cap_result.failure == ingress::
+                RawProductionRuntimeFailureV1::kFreshRouteActivation &&
+            cap_result.fresh_route_failure == ingress::
+                RawFreshRoutePosixFailureV1::
+                    kScaffoldingAuthorization &&
+            !cap_result.fresh_init_publication_attempted &&
+            !cap_result.requires_fail_stop(),
+        "fresh activation rejects a registration whose allocation cap differs from the durable SCAFFOLDING entry");
+    test->Expect(
+        !template_result.ok() &&
+            template_result.failure == ingress::
+                RawProductionRuntimeFailureV1::kFreshRouteActivation &&
+            template_result.fresh_route_failure == ingress::
+                RawFreshRoutePosixFailureV1::
+                    kScaffoldingAuthorization &&
+            !template_result.fresh_init_publication_attempted &&
+            !template_result.requires_fail_stop(),
+        "fresh activation rejects a registration whose safe-stop template differs from the durable SCAFFOLDING entry");
     ingress::RawIngressAppConfigV1 foreign =
         fixture.config;
     foreign.recovered.writer_instance[0U] ^=
@@ -997,6 +1284,8 @@ int main() {
     }
     TestFreshRegisteredRuntime(&test);
     TestFreshFailureRequiresFailStop(&test);
+    TestFreshRetainedRootSurvivesPathReplacement(
+        &test);
     TestFreshPreflightRejectsBeforeMutation(
         &test);
     if (test.failures != 0) {

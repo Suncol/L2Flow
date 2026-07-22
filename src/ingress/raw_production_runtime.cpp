@@ -10,6 +10,10 @@
 #include <string_view>
 #include <utility>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 namespace l2flow::ingress {
 namespace {
 
@@ -25,9 +29,66 @@ void SetError(
     }
 }
 
+class ScopedDescriptor final {
+public:
+    explicit ScopedDescriptor(int value = -1) noexcept : value_(value) {}
+    ~ScopedDescriptor() {
+        if (value_ >= 0) {
+            static_cast<void>(::close(value_));
+        }
+    }
+    ScopedDescriptor(const ScopedDescriptor&) = delete;
+    ScopedDescriptor& operator=(const ScopedDescriptor&) = delete;
+
+    [[nodiscard]] int get() const noexcept { return value_; }
+
+private:
+    int value_ = -1;
+};
+
+[[nodiscard]] bool SameDirectory(
+    int left_fd,
+    int right_fd) noexcept {
+    struct stat left {};
+    struct stat right {};
+    return left_fd >= 0 && right_fd >= 0 &&
+           ::fstat(left_fd, &left) == 0 &&
+           ::fstat(right_fd, &right) == 0 &&
+           S_ISDIR(left.st_mode) && S_ISDIR(right.st_mode) &&
+           left.st_dev == right.st_dev && left.st_ino == right.st_ino;
+}
+
 [[nodiscard]] bool HasNul(
     std::string_view value) noexcept {
     return value.find('\0') != std::string_view::npos;
+}
+
+[[nodiscard]] std::uint8_t SourceSlotForKind(
+    l2flow::sdk::IngressKind kind) noexcept {
+    switch (kind) {
+        case l2flow::sdk::IngressKind::ShSnapshot: return 0U;
+        case l2flow::sdk::IngressKind::ShTick: return 1U;
+        case l2flow::sdk::IngressKind::SzSnapshot: return 2U;
+        case l2flow::sdk::IngressKind::SzTick: return 3U;
+    }
+    return UINT8_MAX;
+}
+
+[[nodiscard]] RawProductionCaptureBindingV1 CaptureBinding(
+    const RawIngressAppConfigV1& config,
+    const RawIngressAppOptionsV1& options) noexcept {
+    RawProductionCaptureBindingV1 result{};
+    result.source_slot = SourceSlotForKind(config.stable.kind);
+    result.ingress_kind = config.stable.kind;
+    result.source_stream_id = config.recovered.source_stream_id;
+    result.capture_date = config.recovered.capture_date;
+    result.stream_day_id = config.recovered.stream_day_id;
+    // These are the credentials actually passed to both the callback and
+    // Raw writer progress publishers, not merely the recovered WAL identity.
+    result.writer_instance = options.frontier_writer_instance;
+    result.source_generation = options.frontier_generation;
+    result.source_frontier = options.source_frontier;
+    return result;
 }
 
 [[nodiscard]] bool ValidRawAppPreflight(
@@ -72,6 +133,10 @@ void SetError(
             options
                     .observer_final_catch_up_timeout_ns ==
                 0U ||
+            (options.source_frontier != nullptr &&
+             (options.frontier_writer_instance !=
+                  config.recovered.writer_instance ||
+              options.frontier_generation == 0U)) ||
             HasNul(
                 options.sdk_log_runtime_prefix)) {
             return false;
@@ -436,10 +501,12 @@ ValidateActiveWriter(
 RawProductionRuntimeV1::RawProductionRuntimeV1(
     std::unique_ptr<RawLiveTailPosixSource>
         live_tail_source,
-    std::unique_ptr<RawIngressApp> app) noexcept
+    std::unique_ptr<RawIngressApp> app,
+    RawProductionCaptureBindingV1 capture_binding) noexcept
     : live_tail_source_(
           std::move(live_tail_source)),
-      app_(std::move(app)) {}
+      app_(std::move(app)),
+      capture_binding_(capture_binding) {}
 
 RawProductionRuntimeV1::~RawProductionRuntimeV1() =
     default;
@@ -452,6 +519,24 @@ bool RawProductionRuntimeV1::Initialize(
 bool RawProductionRuntimeV1::Stop(
     std::string* error) noexcept {
     return app_->Stop(error);
+}
+
+std::unique_ptr<RawLiveTail>
+RawProductionRuntimeV1::TakeFreshPipelineLiveTail() noexcept {
+    return std::move(pipeline_live_tail_);
+}
+
+bool RawProductionRuntimeV1::InstallFreshPipelineLiveTail(
+    std::unique_ptr<RawLiveTailPosixSource> source,
+    std::unique_ptr<RawLiveTail> tail) noexcept {
+    if (source == nullptr || tail == nullptr ||
+        pipeline_live_tail_source_ != nullptr ||
+        pipeline_live_tail_ != nullptr) {
+        return false;
+    }
+    pipeline_live_tail_source_ = std::move(source);
+    pipeline_live_tail_ = std::move(tail);
+    return true;
 }
 
 RawProductionReadinessSampleV1
@@ -511,10 +596,66 @@ ActivateFreshRegistered(
     RawIngressLifecycleObserver*
         lifecycle_observer,
     std::string* error) noexcept {
+    SetError(error, {});
+    int descriptor = -1;
+    do {
+        descriptor = ::open(
+            raw_root.c_str(),
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (descriptor < 0 && errno == EINTR);
+    ScopedDescriptor retained(descriptor);
+    if (retained.get() < 0) {
+        RawProductionRuntimeBuildResultV1 result{};
+        result.failure = RawProductionRuntimeFailureV1::kInvalidInput;
+        SetError(error, "configured Raw root cannot be retained");
+        return result;
+    }
+    return ActivateFreshRegisteredAt(
+        retained.get(),
+        raw_root,
+        stream_slug,
+        registration,
+        coordinator,
+        std::move(logical_writer_config),
+        std::move(backend_options),
+        std::move(artifact_options),
+        std::move(stream_limits),
+        std::move(config),
+        std::move(sdk_factory),
+        std::move(clock),
+        std::move(live_tail_limits),
+        std::move(options),
+        lifecycle_observer,
+        error);
+}
+
+RawProductionRuntimeBuildResultV1
+RawExistingRouteProductionRuntimeFactoryV1::
+ActivateFreshRegisteredAt(
+    int retained_raw_root_fd,
+    const std::string& stable_raw_root,
+    std::string_view stream_slug,
+    const RawReserveFreshScaffoldingV1& registration,
+    RawReserveRegistryCoordinatorV1& coordinator,
+    RawWalWriterConfig logical_writer_config,
+    RawPosixWalStreamBackendOptionsV1 backend_options,
+    RawSegmentArtifactOptionsV1 artifact_options,
+    RawWalStreamLimitsV1 stream_limits,
+    RawIngressAppConfigV1 config,
+    std::shared_ptr<l2flow::sdk::SdkFactory>
+        sdk_factory,
+    std::unique_ptr<CaptureClock> clock,
+    RawLiveTailPosixLimitsV1 live_tail_limits,
+    RawIngressAppOptionsV1 options,
+    RawIngressLifecycleObserver* lifecycle_observer,
+    std::string* error) noexcept {
     RawProductionRuntimeBuildResultV1 result{};
     SetError(error, {});
-    if (!ValidFreshRuntimePreflight(
-            raw_root,
+    if (!SameDirectory(
+            retained_raw_root_fd,
+            coordinator.raw_root_descriptor()) ||
+        !ValidFreshRuntimePreflight(
+            stable_raw_root,
             stream_slug,
             registration,
             logical_writer_config,
@@ -538,8 +679,8 @@ ActivateFreshRegistered(
     const std::size_t maximum_manifest_bytes =
         backend_options.maximum_manifest_bytes;
     RawFreshRoutePosixResultV1 fresh =
-        CompleteRegisteredFreshRawRouteV1(
-            raw_root,
+        CompleteRegisteredFreshRawRouteAtV1(
+            retained_raw_root_fd,
             stream_slug,
             registration,
             coordinator,
@@ -669,6 +810,27 @@ ActivateFreshRegistered(
         return result;
     }
 
+    // RawIngressApp consumes live_tail_source through its readiness worker.
+    // Open a separately retained POSIX source for the authoritative
+    // source-order decoder before the sink capability leaves this scope.
+    std::unique_ptr<RawLiveTailPosixSource>
+        pipeline_live_tail_source =
+            OpenRawLiveTailPosixSource(
+                sink
+                    ->RawReserveMutationTargetDirectoryDescriptorV1(),
+                identity.source_stream_id,
+                identity.capture_date,
+                source_gate,
+                live_tail_limits,
+                error);
+    if (pipeline_live_tail_source == nullptr) {
+        result.failure =
+            RawProductionRuntimeFailureV1::
+                kLiveTailSourceOpen;
+        result.fail_stop_required = true;
+        return result;
+    }
+
     RawLiveTailAttachV1 live_tail_attach{};
     live_tail_attach.writer_instance =
         identity.writer_instance;
@@ -686,6 +848,22 @@ ActivateFreshRegistered(
         snapshot.append.segment_offset;
     live_tail_attach.next_ingress_sequence =
         snapshot.append.ingress_sequence + 1U;
+
+    std::unique_ptr<RawLiveTail> pipeline_live_tail;
+    result.live_tail_error =
+        RawLiveTail::Attach(
+            pipeline_live_tail_source.get(),
+            live_tail_attach,
+            &pipeline_live_tail);
+    if (result.live_tail_error !=
+            RawLiveTailError::kNone ||
+        pipeline_live_tail == nullptr) {
+        result.failure =
+            RawProductionRuntimeFailureV1::
+                kLiveTailAttach;
+        result.fail_stop_required = true;
+        return result;
+    }
 
     std::unique_ptr<RawPosixCleanStopGateV1>
         clean_stop_gate =
@@ -717,6 +895,18 @@ ActivateFreshRegistered(
         std::move(options),
         lifecycle_observer);
     CopyFreshOutcome(fresh, &result);
+    if (result.ok() &&
+        !result.runtime->InstallFreshPipelineLiveTail(
+            std::move(pipeline_live_tail_source),
+            std::move(pipeline_live_tail))) {
+        result.failure =
+            RawProductionRuntimeFailureV1::kLiveTailAttach;
+        result.fail_stop_required = true;
+        result.runtime.reset();
+        SetError(
+            error,
+            "fresh pipeline Raw live tail could not be retained");
+    }
     if (!result.ok()) {
         result.fail_stop_required = true;
         SetError(
@@ -987,6 +1177,9 @@ AdoptAlreadyActive(
         return result;
     }
 
+    const RawProductionCaptureBindingV1 capture_binding =
+        CaptureBinding(config, options);
+
     std::unique_ptr<RawLiveTail> live_tail;
     result.live_tail_error =
         RawLiveTail::Attach(
@@ -1016,7 +1209,8 @@ AdoptAlreadyActive(
             std::unique_ptr<RawProductionRuntimeV1>(
                 new RawProductionRuntimeV1(
                     std::move(live_tail_source),
-                    std::move(app)));
+                    std::move(app),
+                    capture_binding));
     } catch (...) {
         result.failure =
             RawProductionRuntimeFailureV1::

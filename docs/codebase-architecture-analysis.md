@@ -1,38 +1,52 @@
 # L2Flow 代码库架构与端到端流程分析
 
-> 分析范围：当前工作目录中的实际源码、CMake 调用关系、仓库内验收记录与目标设计文档。
-> 分析原则：严格区分“当前默认程序实际执行的路径”“已经存在但尚未接入默认入口的 Phase 2 能力”“设计文档中的后续目标”。
+> 分析范围：当前源码、CMake 调用关系、仓库内验收记录与目标设计文档。
+> 分析原则：严格区分“正式四源聚合入口”“legacy 四个 Shadow ingress”“已经接入
+> live 聚合的 Phase 2–5 能力”“尚未接入的 Phase 6–8 派生服务”和“外部验收目标”。
 
 ## 1. 核心结论
 
-这个仓库当前不是一个已经跑通“Raw → Canonical → Latest State → Python 因子”的完整行情平台。它同时包含三个不同层次：
+这个仓库已经接通 fresh live 的“Raw → control/market decode → Canonical →
+进程内 instrument history → ProductionRoute”，但还不是“Latest State → 数学因子
+→ Parquet”全部上线的平台。当前有四个不同层次：
 
-1. 当前四个默认 ingress 程序实际运行的 Phase 0–1 Shadow Capture；
-2. 已在源码和测试中实现、但尚未接入默认生产入口的 Phase 2 Raw/WAL/Recovery/Replay；
-3. <code>docs/design.md</code> 中 Phase 3–9 的目标架构。
+1. 正式单进程 `mdl-production-router`：四路 SDK/Raw source-order pipeline、固定
+   instrument worker、进程内 history 与 owner-liveness-bound route；
+2. 保留的四个 `mdl-ingress-*`：仍执行 Phase 0–1 Shadow Capture，只是 legacy
+   诊断/过渡入口；
+3. Phase 6–8 Latest State、factor/Python、Parquet/query library slices：源码和
+   定向测试存在，但未接正式聚合入口；
+4. 各阶段完整日、真实语料、目标机性能、crash/power-loss/recovery 与数学因子
+   external exit 目标。
 
-当前默认生产主链仍然是：
+正式 live 主链是：
 
 ~~~text
-MDL SDK callback
-→ CallbackHandler
-→ SPSC ByteRing
-→ ShadowCaptureWriter
+four MDL SDK callbacks
+→ four ByteRing / Raw WAL writers
+→ four source-order ControlDecoder + MarketDecoder + Canonical pipelines
+→ fixed InstrumentHistoryRuntimeV1 workers
+→ one ProductionRoute
 ~~~
 
-当前默认主链不是 Raw WAL。这个判断由以下三处交叉证明：
+这个判断由实际构建和入口交叉约束：
 
-- <code>L2Flow::production</code> 仍指向 <code>l2flow_phase01</code>，Phase 2 是独立静态库：[CMakeLists.txt](../CMakeLists.txt#L271)。
-- 默认 ingress service 仍只链接 <code>L2Flow::phase01</code>：[CMakeLists.txt](../CMakeLists.txt#L334)。
-- Phase 2 验收记录明确把 Implementation、Local verification、Phase 2 exit 都标为“未完成”：[phase2-local.md](acceptance/phase2-local.md#L15)、[明确阻断项](acceptance/phase2-local.md#L240)。
+- <code>L2Flow::production</code> 指向 <code>l2flow_production</code>；
+- <code>mdl-production-router</code> 链接该目标并通过严格 deployment manifest 装配；
+- <code>ProductionServiceV1</code> 在第一个 SDK Connect 前闭合 capture、pipeline、
+  SourceFrontier、registry 与 route identity；
+- Active 只在四路 readiness/history barrier 后发布，并由 owner lease 提供跨进程
+  存活证明。
 
-因此，阅读本仓库时必须使用以下三层视角：
+阅读本仓库时应使用以下视角：
 
 | 层次 | 当前状态 | 代表组件 |
 |---|---|---|
-| 当前默认执行路径 | 已接入四个 ingress | <code>IngressApp</code>、<code>CallbackHandler</code>、<code>ByteRing</code>、<code>ShadowCaptureWriter</code> |
-| Phase 2 库内能力 | 源码和测试存在，但未 production cutover | <code>RawIngressApp</code>、Raw WAL、journal、recovery、live-tail、replay、reserve primitives |
-| 后续目标设计 | 尚未实现为当前物理链路 | control decoder、Canonical、Latest State、Python factor、Parquet |
+| 正式 live 执行路径 | fresh-only，已接入 | <code>ProductionServiceV1</code>、<code>ProductionAggregateRuntimeV1</code>、<code>ProductionSourcePipelineV1</code>、<code>InstrumentHistoryRuntimeV1</code> |
+| Legacy Shadow 路径 | 四个独立程序仍保留 | <code>IngressApp</code>、<code>ShadowCaptureWriter</code> |
+| Phase 2–5 基础设施 | Raw live 与 control/market/Canonical 已被正式入口组合；recovery/replay 仍未接 V1 | Raw WAL、live-tail、decoder、Canonical、SourceFrontier |
+| Phase 6–8 派生切片 | 未接正式聚合 | Latest State、factor/Python、Parquet/query |
+| 外部资格证据 | 未由本次切换宣告完成 | 完整日、真实 corpus、性能、crash/power-loss、recovery、因子数学 |
 
 ## 2. 代码库的总体定位
 
@@ -44,15 +58,16 @@ MDL SDK callback
 4. 为后续可恢复、可重放的 Raw WAL 提供 Phase 2 基础设施；
 5. 提供 SDK-compatible 的合成行情 mock，用于测试和压测。
 
-当前源码树中没有已落地的以下生产模块：
+当前源码树中尚未接入正式聚合主链的模块是：
 
-- Canonical 规范化行情日志；
 - Latest State 共享内存；
 - Python 因子运行时；
-- Parquet 落地链；
+- Parquet/manifest/query/retention/recovery-plan；
 - 模型训练、损失函数或推理流程。
 
-设计文档规划了这些模块，但它们属于后续阶段。相关路线分别见：
+Phase 3 control、Phase 4 market decoder 和 Phase 5 Canonical 已进入正式 fresh
+live 组合；Phase 6–8 仍是独立 slice。所有阶段尚缺的 external exit 证据不会因
+alias 切换自动变成通过。相关路线分别见：
 
 - [Phase 3：Control Decoder](design.md#L6308)
 - [Phase 5：Sequence Guard 与 Canonical](design.md#L6384)
@@ -70,28 +85,43 @@ MDL SDK callback
 | <code>src/ingress/</code>、<code>include/l2flow/ingress/</code> | callback、ByteRing、Shadow、Raw WAL、Recovery、Replay、Reserve 等数据面 |
 | <code>src/ops/</code>、<code>include/l2flow/ops/</code> | credential、metrics、systemd、稳定输出前缀等运维组件 |
 | <code>src/common/</code>、<code>include/l2flow/common/</code> | SHA-256、CRC32C、Identity128、sealed snapshot 等基础组件 |
+| <code>src/control/</code>、<code>include/l2flow/control/</code> | Phase 3 authoritative control decoder/state |
+| <code>src/market/</code>、<code>include/l2flow/market/</code> | Phase 4 safe market decoder、registry 与 full-session history |
+| <code>src/canonical/</code>、<code>include/l2flow/canonical/</code> | Phase 5 schema、sequence guard、mmap segment、frontier/mux 与 bundle runtime |
+| <code>src/state/</code>、<code>include/l2flow/state/</code> | Phase 6 opaque Latest State slot、local query 与 checkpoint codec |
+| <code>src/consumer/</code>、<code>include/l2flow/consumer/</code> | Phase 7 committed batch reader、safe mux/as-of C ABI |
+| <code>src/factor/</code>、<code>include/l2flow/factor/</code> | Phase 7 watermark、Latest Factor slot 与 process-local watermark table |
+| <code>src/runtime/</code>、<code>include/l2flow/runtime/</code> | 四路 source-order pipeline 与 production aggregate |
+| <code>src/route/</code>、<code>include/l2flow/route/</code> | ProductionRoute codec/store/controller、owner lease 与 live guard |
+| <code>python/l2flow_factor/</code> | Phase 7 FactorSpec、leased NumPy view、transaction runtime、windows/checkpoint 与显式占位因子 |
+| <code>python/l2flow_history/</code> | Phase 8 real-Parquet、manifest/sidecar、bounded query/lineage、retention dry-run 与 recovery/rebuild plan |
 | <code>src/baseline/</code>、<code>configs/</code> | 供应商 SDK/library 基线与准入检查 |
 | <code>schemas/</code> | Raw、Manifest、Reserve、Recovery 等 Phase 2 wire schema |
 | <code>tools/</code> | Raw replay、vendor/ABI probe、mock demo 等工具 |
 | <code>include/l2mock/</code>、<code>src/l2_mock.cpp</code> | 独立的 SDK-compatible 合成行情子系统 |
-| <code>tests/</code> | Phase 0、Phase 1、Phase 2 的单元、集成、恢复和故障路径测试 |
+| <code>tests/</code> | Phase 0–8 的单元、集成、恢复和故障路径测试 |
 | <code>docs/design.md</code> | 全平台目标设计，不等于当前全部实现 |
 | <code>docs/acceptance/</code> | 各阶段本地验收事实和未完成项 |
 
 构建依赖关系可以概括为：
 
 ~~~text
-l2flow_phase01
-    ├── 默认生产别名 L2Flow::production
-    ├── l2flow_ingress_service
-    │     └── 四个 mdl-ingress-* 可执行程序
-    └── l2flow_phase2
-          └── l2flow-raw-replay
+l2flow_phase01 → phase2 → phase3 → phase4 → phase5 → phase6 → phase7
+                                                               │
+                                                               └── l2flow_production
+                                                                     ├── L2Flow::production
+                                                                     ├── mdl-production-router
+                                                                     └── l2flow_ingress_service
+                                                                           └── four legacy mdl-ingress-* binaries
+
+l2flow_phase2 → l2flow-raw-replay
 ~~~
 
-这里容易误读的一点是：<code>l2flow_phase2</code> 是在 Phase 1 上增量构建的独立库，但默认 ingress service 并不链接它。Phase 2 库链接 Phase 1 的关系见 [CMakeLists.txt](../CMakeLists.txt#L271)，默认服务链接关系见 [CMakeLists.txt](../CMakeLists.txt#L334)。
+这里容易误读的一点是：四个 legacy `mdl-ingress-*` 的业务代码仍构造
+`IngressApp`/Shadow writer；它们链接 production aggregate 的依赖并不等于执行
+正式 Raw/Canonical 路径。正式入口只有 `mdl-production-router`。
 
-## 4. 当前默认生产拓扑：四个独立 ingress
+## 4. Legacy 四进程 Shadow 拓扑
 
 四个 ingress 共用同一个 <code>apps/mdl_ingress_main.cpp</code>。CMake 通过 <code>L2FLOW_INGRESS_KIND=0..3</code> 编译出四个目标；<code>main()</code> 只把编译期 kind 交给 <code>RunIngressService()</code>：[mdl_ingress_main.cpp](../apps/mdl_ingress_main.cpp#L15)、[CMake 目标生成函数](../CMakeLists.txt#L348)。
 
@@ -127,7 +157,7 @@ ServiceID / ServiceVersion / MessageID
 - Optional 消息只有开启 <code>--include-optional-index=true</code> 时才纳入；
 - 当前只建立每个 source stream 内的 ingress 顺序，没有建立四条流之间的全局权威顺序。
 
-## 5. 当前实际运行链路总图
+## 5. Legacy Shadow 运行链路总图
 
 ~~~text
 systemd / shell
@@ -166,13 +196,14 @@ RunIngressService(kind)
 - callback 不直接写磁盘；
 - callback 不做完整业务字段解码；
 - ByteRing 满不会覆盖旧消息，而是触发 fatal；
-- 当前 sink 是 <code>ShadowCaptureWriter</code>；
-- 当前 readiness 来自 Shadow writer 对已捕获消息的观察；
-- 当前默认路径没有调用 <code>RawIngressApp</code> 或 <code>RawProductionRuntimeV1</code>。
+- 该 legacy sink 是 <code>ShadowCaptureWriter</code>；
+- 该 legacy readiness 来自 Shadow writer 对已捕获消息的观察；
+- 这四个程序没有调用 <code>RawIngressApp</code> 或
+  <code>RawProductionRuntimeV1</code>；正式聚合入口会调用。
 
-## 6. 当前服务启动流程
+## 6. Legacy Shadow 服务启动流程
 
-默认服务入口是 [RunIngressService](../src/apps/ingress_service.cpp#L1042)。
+四个 legacy 程序的入口是 [RunIngressService](../src/apps/ingress_service.cpp#L1042)。
 
 ### 6.1 参数解析
 
@@ -259,7 +290,7 @@ SDK 访问通过 [sdk_runtime.h](../include/l2flow/sdk/sdk_runtime.h) 中的抽�
 - <code>MetricsWorker</code>；
 - <code>IngressApp</code>。
 
-默认服务实际持有的是 <code>std::unique_ptr&lt;IngressApp&gt;</code>，而不是 <code>RawIngressApp</code>：[服务对象构造位置](../src/apps/ingress_service.cpp#L1275)。
+legacy 服务实际持有的是 <code>std::unique_ptr&lt;IngressApp&gt;</code>，而不是 <code>RawIngressApp</code>：[服务对象构造位置](../src/apps/ingress_service.cpp#L1275)。
 
 随后依次进入：
 
@@ -613,7 +644,7 @@ callback 已发布 records == sink 已写 records
 callback 已发布 vendor bytes == sink 已写 vendor bytes
 ~~~
 
-## 15. 当前 Phase 1 线程模型
+## 15. Legacy Phase 1 线程模型
 
 | 线程/执行上下文 | 职责 |
 |---|---|
@@ -643,7 +674,10 @@ callback 线程不承担：
 
 Phase 2 不是只有设计。仓库中已经存在 Raw 数据链、格式、恢复、live-tail、replay 和大量控制面组件。
 
-但是，它们目前是独立库能力，尚未替代默认四个 ingress 的 <code>IngressApp + ShadowCaptureWriter</code>。
+正式 `mdl-production-router` 已组合其中的 fresh Raw writer、live-tail 和
+readiness 能力；四个 legacy `mdl-ingress-*` 仍保持
+<code>IngressApp + ShadowCaptureWriter</code>。recovery/takeover/replay 没有接入
+当前 fresh-only 正式入口。
 
 ~~~text
 SDK callback
@@ -1143,18 +1177,18 @@ ACTIVE
 
 并有 ACK、grant、finalization action、emergency transition 等结构。
 
-### 28.4 当前控制面缺口
+### 28.4 当前控制面边界
 
-这些 primitives 尚未组成默认生产控制器：
+`ProductionServiceV1` 已提供单进程四源 startup、identity gate、Active publication
+与 route-first drain；deployment builder 会 attach 预先 provision 的 reserve
+coordinator，并为 fresh route 注册 exact SCAFFOLDING。以下能力仍不在 V1：
 
-- 没有 coordinator daemon；
-- 没有四个独立 ingress 共用的 AF_UNIX client/server 协议；
-- 当前 coordinator 仍是进程内对象；
-- 没有 service-level startup controller 串起 discovery、registration、recovery、activation；
-- 没有完整 controller 驱动 emergency stop、ACK、continuation、finalization、archive cleanup 和 reprovision；
-- Raw metrics/readiness 尚未接入默认 service monitor。
+- coordinator daemon 或跨进程 AF_UNIX client/server 协议；
+- recovery/takeover 路由装配；
+- 完整 emergency continuation、archive cleanup 和 reprovision controller；
+- 把 legacy 四个独立 ingress 协调成同一个 production generation。
 
-因此不能因为 reserve/coordinator 类存在，就推导出四个默认 ingress 已经具备完整生产控制面。
+因此，正式入口是“单进程 fresh-only 控制器”，不能描述成完整 recovery 控制面。
 
 ## 29. l2mock：独立测试子系统
 
@@ -1276,27 +1310,24 @@ READY 证明当前服务具备所需的观察事实；durable 证明哪些 Raw b
 
 ## 31. 当前实现与目标设计差距矩阵
 
-| 能力 | 源码状态 | 默认四 ingress 是否使用 | 准确结论 |
-|---|---|---:|---|
-| SDK 动态装载与 sealed snapshot | 已实现 | 是 | 当前生产启动链 |
-| CallbackHandler + SPSC ByteRing | 已实现 | 是 | 当前核心热路径 |
-| Shadow capture | 已实现 | 是 | 当前实际 sink |
-| Phase 1 observational readiness | 已实现 | 是 | 当前 READY 来源 |
-| Raw V1 codec/schema/CRC | 已实现为 Phase 2 库 | 否 | 不能说已 production cutover |
-| Raw WAL、journal、rotation | 已实现为 Phase 2 库 | 否 | 库内链存在 |
-| Raw reader/recovery/executor | 已实现为 Phase 2 库 | 否 | 恢复能力存在，但未接默认 service controller |
-| Raw live-tail/readiness | 已实现为 Phase 2 库 | 否 | 未替代默认 monitor |
-| Raw replay CLI/engine | 已实现为独立工具 | 不适用 | 仅到 validated Raw view |
-| Reserve/coordinator typed primitives | 部分实现 | 否 | 缺生产 IPC/controller |
-| RawManifest | 已实现 | 否 | Phase 2 artifact |
-| RunManifest codec/store | 已实现 | 否 | 尚未接默认 service publication |
-| Authoritative control decoder | 目标 Phase 3 | 否 | 当前没有 |
-| 安全业务 decoder | 目标 Phase 4 | 否 | 当前没有 |
-| Sequence guard + Canonical mmap | 目标 Phase 5 | 否 | 当前没有 |
-| Latest State SHM | 目标 Phase 6 | 否 | 当前没有 |
-| Python factor runtime | 目标 Phase 7 | 否 | 当前没有 |
-| Parquet/query | 目标 Phase 8 | 否 | 当前没有 |
-| 完整 production shadow/cutover | 目标 Phase 9 | 否 | 当前没有 |
+| 能力 | 正式聚合是否使用 | 准确结论 |
+|---|---:|---|
+| pinned sealed SDK loader | 是 | baseline 文件与 SDK archive 先做不执行 library 代码的静态校验；随后 SDK library digest、ELF/ABI/runtime gate 与最终 `dlopen` 绑定同一 sealed snapshot |
+| CallbackHandler + SPSC ByteRing | 是 | 四个 source 各一个 callback producer/Raw consumer |
+| Shadow capture | 否 | 只由四个 legacy `mdl-ingress-*` 使用 |
+| Raw WAL/journal/live-tail/readiness | 是 | fresh live 路径已接入；Raw 仍是持久化 authority |
+| Raw recovery/takeover | 否 | primitives 存在，正式 V1 不装配 recovered/adopted runtime |
+| Raw replay CLI | 不适用 | 独立工具只输出 validated Raw view，不是正式 pipeline recovery |
+| reserve coordinator | 是，进程内 attach | 要求外部预先 provision；没有 daemon/IPC/reprovision controller |
+| authoritative control decoder | 是 | 每 source 在 market decode 前按 Raw 顺序推进 |
+| safe market decoder | 是 | 五类 core message；SH 4.24 在拆分前单线程推进状态 |
+| Canonical bundle/SourceFrontier | 是 | fresh fixed-capacity generation；无日中 rotation/checkpoint attach |
+| fixed instrument history workers | 是 | 16 logical shards、1–16 physical workers、进程内查询、无跨源全序 |
+| ProductionRoute + owner liveness | 是 | Active 需 owner lease；跨进程 reader 必须持有 live guard |
+| Latest State | 否 | Phase 6 本地切片，未接正式 writer/endpoint |
+| Native/Python factor runtime | 否 | Phase 7 本地切片；五个命名实现仍是无数学值 placeholder |
+| Parquet/query/retention | 否 | Phase 8 本地 package；retention 只 dry-run，未接正式路由 |
+| external production qualification | 否 | 完整日、真实 corpus、性能、crash/power-loss、recovery 与因子数学证据仍待完成 |
 
 目标架构方向是：
 
@@ -1320,15 +1351,18 @@ Canonical mmap log
 当前真实状态应画成：
 
 ~~~text
-默认程序：
+正式 mdl-production-router：
+MDL → callback → Raw WAL → source-order control/market decode
+    → Canonical → fixed instrument history → live ProductionRoute
+
+Legacy four mdl-ingress-*：
 MDL → callback → ByteRing → Shadow
 
-独立 Phase 2 库：
-callback → ByteRing → Raw WAL → reader/recovery/live-tail/replay
+尚未接正式聚合：
+Latest State writer → factor executor → Parquet/query service
 
-尚未实现的目标：
-Raw → authoritative control → safe decode → Canonical
-    → Latest State → Python factor → Parquet/query
+仍待外部验证/实现：
+完整日资格证据 + recovery/takeover/replay composition + 派生服务 cutover
 ~~~
 
 ## 32. 三层事实模型
@@ -1352,13 +1386,17 @@ capture meta
 
 ### 32.2 Canonical 规范化事件
 
-目标是经过 control epoch、安全字段解码、vendor sequence guard、quality 标注和 normalizer，形成稳定、可比较、可供 C++/Python 共用的规范化结构。
-
-这一层当前尚未实现。
+经过 control epoch、安全字段解码、vendor/exchange sequence guard、quality 标注和
+normalizer，形成稳定、可比较的固定结构。Phase 3–5 已提供这一层的库内 schema、
+normalizer、mmap segment、SourceFrontier 与同 source bundle runtime，并有定向测试；
+它已经接入 fresh-only 的正式四源聚合，但没有完成正式 Phase 5 external exit，
+也没有接入 Python factor consumer。
 
 ### 32.3 Latest/Factor 派生状态
 
-Latest State、因子、Parquet 都应是可从前两层重建的派生物，而不是原始事实。
+Latest State、因子、Parquet 都是可从前两层重建的派生物，而不是原始事实。Phase 8
+本地 package 保存 exact Canonical bytes、factor 输入身份与 scoped Raw receipts，但这不
+改变 Raw 的 authority。
 
 目标恢复链是：
 
@@ -1370,102 +1408,75 @@ Latest State、因子、Parquet 都应是可从前两层重建的派生物，而
 → 对账 hash
 ~~~
 
-这是目标设计，不是当前默认 ingress 已完成的功能。
+这是恢复目标和本地计划契约；当前正式 V1 只实现 fresh live 物理链路，尚未把
+该恢复链装配进入口。
 
 ## 33. 推荐源码阅读顺序
 
-### 33.1 默认入口
+### 33.1 正式入口
 
-1. [apps/mdl_ingress_main.cpp](../apps/mdl_ingress_main.cpp#L15)
-2. [CMakeLists.txt 默认 service/四进程](../CMakeLists.txt#L334)
-3. [subscription_manifest.cpp](../src/sdk/subscription_manifest.cpp#L33)
-4. [RunIngressService](../src/apps/ingress_service.cpp#L1042)
+1. [mdl_production_main.cpp](../apps/mdl_production_main.cpp)
+2. [production_deployment_v1.h](../include/l2flow/apps/production_deployment_v1.h)
+3. [production_service_v1.h](../include/l2flow/apps/production_service_v1.h)
+4. [production_aggregate_runtime_v1.h](../include/l2flow/runtime/production_aggregate_runtime_v1.h)
+5. [production_source_pipeline_v1.h](../include/l2flow/runtime/production_source_pipeline_v1.h)
+6. [instrument_history_v1.h](../include/l2flow/market/instrument_history_v1.h)
+7. [production_route_controller_v1.h](../include/l2flow/route/production_route_controller_v1.h)
+8. [production_route_owner_lease_v1.h](../include/l2flow/route/production_route_owner_lease_v1.h)
 
-### 33.2 当前 Phase 1 数据面
+### 33.2 Legacy Phase 1 数据面
 
-5. [IngressApp 对象结构](../include/l2flow/ingress/ingress_app.h#L126)
-6. [IngressApp 初始化](../src/ingress/ingress_app.cpp#L136)
-7. [CallbackHandler](../src/ingress/callback_handler.cpp#L210)
-8. [ByteRing producer](../src/ingress/byte_ring.cpp#L87)
-9. [ByteRing consumer](../src/ingress/byte_ring.cpp#L166)
-10. [Shadow consumer](../src/ingress/shadow_capture.cpp#L1000)
-11. [Shadow readiness](../src/ingress/shadow_capture.cpp#L1349)
-12. [MonitorIngress](../src/apps/ingress_service.cpp#L388)
-13. [IngressApp 停止](../src/ingress/ingress_app.cpp#L498)
+1. [mdl_ingress_main.cpp](../apps/mdl_ingress_main.cpp)
+2. [IngressApp](../include/l2flow/ingress/ingress_app.h)
+3. [CallbackHandler](../src/ingress/callback_handler.cpp)
+4. [ByteRing](../src/ingress/byte_ring.cpp)
+5. [Shadow consumer](../src/ingress/shadow_capture.cpp)
+6. [RunIngressService](../src/apps/ingress_service.cpp)
 
-### 33.3 Phase 2 库
+### 33.3 Raw/恢复独立能力
 
-14. [RawIngressApp](../include/l2flow/ingress/raw_ingress_app.h#L120)
-15. [RawProductionRuntimeV1](../include/l2flow/ingress/raw_production_runtime.h#L106)
-16. [RawCaptureWorker](../src/ingress/raw_capture_worker.cpp#L52)
-17. [Raw V1 format](../include/l2flow/ingress/raw_v1.h#L17)
-18. [RawWalWriter](../src/ingress/raw_wal_writer.cpp#L397)
-19. [RawWalStreamWriter](../src/ingress/raw_wal_stream.cpp#L154)
-20. [Raw reader](../src/ingress/raw_reader.cpp#L127)
-21. [Raw recovery](../include/l2flow/ingress/raw_recovery.h#L14)
-22. [Raw readiness worker](../src/ingress/raw_readiness_worker.cpp#L91)
-23. [Raw replay engine](../src/ingress/raw_replay.cpp#L299)
+1. [RawIngressApp](../include/l2flow/ingress/raw_ingress_app.h)
+2. [RawProductionRuntimeV1](../include/l2flow/ingress/raw_production_runtime.h)
+3. [RawCaptureWorker](../src/ingress/raw_capture_worker.cpp)
+4. [Raw V1 format](../include/l2flow/ingress/raw_v1.h)
+5. [RawWalWriter](../src/ingress/raw_wal_writer.cpp)
+6. [Raw reader/recovery](../include/l2flow/ingress/raw_recovery.h)
+7. [Raw replay engine](../src/ingress/raw_replay.cpp)
 
-### 33.4 验收和目标设计
+### 33.4 决策、验收和目标设计
 
-24. [Phase 2 本地验收事实](acceptance/phase2-local.md#L15)
-25. [Phase 3–9 路线图](design.md#L6308)
+1. [Production Instrument Runtime V1](decisions/production-instrument-runtime-v1.md)
+2. [各阶段本地验收记录](acceptance/)
+3. [总体路线图](design.md)
 
 按照这一顺序，可以避免先读目标设计，再把尚未落地的组件误判为当前实现。
 
 ## 34. 最终归纳
 
-这个仓库可以理解为“一条正在从 Shadow 接入层演进为可审计 Raw 平台的 C++ 行情基础设施”。
+这个仓库已经从单纯的 Shadow 接入演进出一条正式、fresh-only、可审计的 C++
+live 路由：四路 Raw source 顺序在 instrument 拆分前完整保留，解码与 Canonical
+commit 后由固定 worker 并行追加进程内 history，并通过带 owner 存活证明的 route
+发布。
 
-当前已接通的默认链路：
-
-~~~text
-四个独立 MDL ingress
-→ 安全 SDK 装载
-→ 单 callback producer
-→ CallbackHandler
-→ SPSC ByteRing
-→ ShadowCaptureWriter
-→ observational readiness
-→ systemd monitor
-→ 有序 stop 和精确对账
-~~~
-
-Phase 2 已实现但尚未接默认服务：
+仍需严格区分三件事：
 
 ~~~text
-Raw V1
-→ segment WAL
-→ durable journal
-→ append/durable frontier
-→ rotation/manifest/control page
-→ reader/recovery
-→ live-tail/readiness
-→ replay
-→ reserve/finalization/RunManifest primitives
-~~~
-
-尚未落地：
-
-~~~text
-authoritative control decoder
-→ safe market decoder
-→ vendor sequence guard
-→ Canonical mmap log
-→ Latest State SHM
-→ Python factor runtime
-→ Parquet/query
-→ 完整生产切换
+已接通：Raw live → control/market → Canonical → instrument history → route
+仍保留：four legacy ingress → ShadowCaptureWriter
+尚未接：recovery/takeover/replay composition、Latest State、factor、Parquet/query
 ~~~
 
 最准确的一句话是：
 
-> 仓库已经完成较成熟的 Phase 1 四路 callback 捕获主链，并实现了大量 Phase 2 Raw/WAL/恢复能力；但 Phase 2 尚未 production cutover，Phase 3 之后的 Canonical、Latest State、Python 因子和 Parquet 仍属于目标设计。
+> `mdl-production-router` 已实现 fresh live 的四源 source-order/Canonical/
+> instrument-history 正式组合，`L2Flow::production` 已切换到
+> `l2flow_production`；Phase 6–8 派生服务、recovery 装配以及完整日、真实语料、
+> 性能、crash/power-loss 和数学因子 external exit 仍未完成。五个命名 Python
+> 因子仍是显式 passthrough placeholder。
 
 ## 35. 分析与验证边界
 
 本文依据当前工作目录中的实际源码、CMake 和仓库内验收记录。
 
-当前工作树存在未提交修改，包括 <code>CMakeLists.txt</code>、SDK runtime、baseline 和 sealed snapshot 等文件。因此本文描述的是当前工作树的真实状态，不额外宣称它与干净的 <code>origin/main</code> 完全相同。
-
-本文生成过程中没有修改既有源码，也没有把仓库验收记录中的测试结果冒充为在当前 dirty worktree 上重新独立执行的验证结果。
+Phase 6–8 的本地命令与结果单独记录在对应 acceptance 文档；任何未执行的完整日、
+目标机性能、真实进程 crash/power-loss、恢复装配或派生服务 wiring 均不写成通过。

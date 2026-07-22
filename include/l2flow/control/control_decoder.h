@@ -112,6 +112,21 @@ struct ControlDecoderSnapshotV1 final {
     bool decoder_evidence_ready = false;
 };
 
+// Allocation-free subset used by the production route validity monitor.
+// It is copied under the same decoder mutex as Snapshot(), so identity,
+// cursor and readiness flags belong to one decoder state transition.
+struct ControlDecoderReadinessSummaryV1 final {
+    std::uint32_t source_stream_id = 0U;
+    std::uint32_t capture_date = 0U;
+    l2flow::common::Identity128 stream_day_id{};
+    std::uint64_t processed_ingress_sequence = 0U;
+    std::uint64_t processed_record_end_wal_pos = 0U;
+    bool disconnected_window = false;
+    bool poisoned = false;
+    bool control_ready = false;
+    bool decoder_evidence_ready = false;
+};
+
 struct ControlRecordAttributionV1 final {
     std::uint32_t connection_epoch = 0U;
     std::uint32_t subscription_epoch = 0U;
@@ -192,6 +207,8 @@ public:
         const l2flow::ingress::RawReplayRecord& record) noexcept;
 
     [[nodiscard]] ControlDecoderSnapshotV1 Snapshot() const;
+    [[nodiscard]] ControlDecoderReadinessSummaryV1 ReadinessSummary()
+        const noexcept;
     [[nodiscard]] ControlDecoderCheckpointV1 Checkpoint() const;
 
 private:

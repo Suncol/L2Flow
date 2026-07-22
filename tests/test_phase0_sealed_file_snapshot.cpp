@@ -448,6 +448,32 @@ void CheckRejectionsAndPrivacy(const TemporaryDirectory& temporary,
             error.find(regular.string()) == std::string::npos,
         "production-loader rejection does not disclose source pathname");
 
+    common::Sha256Digest wrong_pin{};
+    wrong_pin.fill(std::byte{0xa5U});
+    error.clear();
+    const std::shared_ptr<sdk::SdkFactory> pin_rejected_factory =
+        sdk::LoadApprovedSdkFactoryPinned(regular, wrong_pin, &error);
+    test->Expect(
+        pin_rejected_factory == nullptr &&
+            error ==
+                "sealed SDK snapshot SHA-256 does not match the deployment pin",
+        "pinned production loader rejects the same sealed snapshot before "
+        "runtime preflight");
+    test->Expect(
+        error.find(secret_name) == std::string::npos &&
+            error.find(regular.string()) == std::string::npos,
+        "pinned production-loader rejection does not disclose source pathname");
+
+    error.clear();
+    const std::shared_ptr<sdk::SdkFactory> zero_pin_rejected_factory =
+        sdk::LoadApprovedSdkFactoryPinned(
+            regular, common::Sha256Digest{}, &error);
+    test->Expect(
+        zero_pin_rejected_factory == nullptr &&
+            error == "sealed SDK snapshot SHA-256 pin is zero",
+        "pinned production loader rejects a zero digest before opening the "
+        "candidate library");
+
     error.clear();
     test->Expect(
         !common::ValidateSealedFileSnapshotFd(

@@ -18,6 +18,8 @@
 #include <vector>
 
 namespace ingress = l2flow::ingress;
+namespace canonical = l2flow::canonical;
+namespace common = l2flow::common;
 
 namespace l2flow::ingress {
 
@@ -187,6 +189,53 @@ public:
 
 private:
     std::shared_ptr<MemoryIoState> state_;
+};
+
+class IdleFlushProbeSink final : public ingress::RawWalSink {
+public:
+    [[nodiscard]] bool AppendRecord(
+        const ingress::RawWalRecordInputV1&) noexcept override {
+        return false;
+    }
+
+    [[nodiscard]] bool FlushDurable() noexcept override {
+        flush_calls_.fetch_add(1U, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] bool SealAndClose() noexcept override {
+        sealed_.store(true, std::memory_order_relaxed);
+        closed_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] ingress::RawWalWriterSnapshot
+    Snapshot() const noexcept override {
+        ingress::RawWalWriterSnapshot snapshot;
+        snapshot.initialized = true;
+        snapshot.sealed = sealed_.load(std::memory_order_acquire);
+        snapshot.closed = closed_.load(std::memory_order_acquire);
+        return snapshot;
+    }
+
+    [[nodiscard]] ingress::RawWalFailure
+    failure() const noexcept override {
+        return {};
+    }
+
+    [[nodiscard]] ingress::RawWalSinkIdentityV1
+    identity() const noexcept override {
+        return {};
+    }
+
+    [[nodiscard]] std::uint64_t flush_calls() const noexcept {
+        return flush_calls_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<std::uint64_t> flush_calls_{0U};
+    std::atomic<bool> sealed_{false};
+    std::atomic<bool> closed_{false};
 };
 
 struct FailureState final {
@@ -360,6 +409,46 @@ ingress::RawWalWriterConfig MakeWriterConfig() {
     return config;
 }
 
+ingress::RawWalWriterConfig MakeWriterConfig(
+    const common::Identity128& writer_instance) {
+    ingress::RawWalWriterConfig config = MakeWriterConfig();
+    config.writer_instance = writer_instance;
+    return config;
+}
+
+canonical::SourceFrontierConfigV1 MakeFrontierConfig(
+    const common::Identity128& writer_instance,
+    std::uint64_t generation = 11U) {
+    canonical::SourceFrontierConfigV1 config;
+    config.source_stream_id = 2002U;
+    config.capture_date = 20260718U;
+    FillIdentity(&config.stream_day_id, 0x10U);
+    config.clock_epoch.algorithm = 1U;
+    FillDigest(&config.clock_epoch.digest, 0x20U);
+    config.clock_epoch.label = 0x1234U;
+    config.writer_instance = writer_instance;
+    config.generation = generation;
+    config.initial_state = canonical::SourceStateV1::kHealthy;
+    return config;
+}
+
+common::Identity128 WriterIdentity(std::uint8_t seed) {
+    common::Identity128 identity{};
+    FillIdentity(&identity, seed);
+    return identity;
+}
+
+canonical::SourceFrontierV1 ReadFrontier(
+    TestContext* test,
+    const canonical::SourceFrontierPageV1& page) {
+    canonical::SourceFrontierV1 frontier;
+    test->Expect(
+        canonical::ReadSourceFrontierV1(page, &frontier) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "Raw worker SourceFrontier reads coherently");
+    return frontier;
+}
+
 struct RecordFixture final {
     ingress::CaptureMetaV1 meta{};
     std::array<
@@ -477,6 +566,53 @@ ingress::RawCaptureWorkerConfig MakeWorkerConfig(
     config.monotonic_now = &ReadClock;
     config.monotonic_clock_context = clock;
     return config;
+}
+
+void TestIdleHeartbeatFlush(TestContext* test) {
+    IdleFlushProbeSink writer;
+    ingress::ByteRing ring(4096U, 512U);
+    FailureState failure;
+    TestClock clock;
+    ingress::RawCaptureWorkerConfig config =
+        MakeWorkerConfig(
+            &failure,
+            &clock,
+            1'000'000U,
+            1'000'000U);
+    config.idle_heartbeat_interval_ns = 10U;
+    ingress::RawCaptureWorker worker(config, ring, writer);
+
+    std::atomic<bool> run_result{false};
+    std::thread consumer([&] {
+        run_result.store(
+            worker.Run(), std::memory_order_release);
+    });
+    test->Expect(
+        WaitUntil([&] { return worker.startup_complete(); }) &&
+            worker.startup_succeeded(),
+        "idle-heartbeat worker starts on an empty stream");
+    test->Expect(
+        writer.flush_calls() == 0U,
+        "empty stream does not flush before the heartbeat interval");
+
+    clock.now_ns.store(110U, std::memory_order_release);
+    test->Expect(
+        WaitUntil([&] { return writer.flush_calls() == 1U; }),
+        "empty stream invokes the sink at the idle-heartbeat interval");
+    test->Expect(
+        worker.Snapshot().append.records == 0U &&
+            worker.Snapshot().durable.records == 0U,
+        "idle heartbeat does not invent market progress");
+
+    worker.StopAndDrain();
+    consumer.join();
+    test->Expect(
+        run_result.load(std::memory_order_acquire) &&
+            worker.finished() &&
+            writer.Snapshot().sealed &&
+            writer.Snapshot().closed &&
+            failure.calls.load(std::memory_order_acquire) == 0U,
+        "idle-heartbeat worker still drains and seals cleanly");
 }
 
 void TestTimeThresholdDrainAndShortWrites(
@@ -874,14 +1010,303 @@ void TestWriterFailures(TestContext* test) {
     }
 }
 
+void TestCapturedFrontierHandoff(TestContext* test) {
+    const common::Identity128 writer_instance =
+        WriterIdentity(0xe0U);
+    const canonical::SourceFrontierConfigV1 frontier_config =
+        MakeFrontierConfig(writer_instance);
+    canonical::SourceFrontierPageV1 frontier_page{};
+    test->Expect(
+        canonical::InitializeSourceFrontierPageV1(
+            frontier_config, &frontier_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "captured-handoff frontier initializes");
+
+    auto io_state = std::make_shared<MemoryIoState>();
+    ingress::RawWalWriter writer(
+        MakeWriterConfig(writer_instance),
+        std::make_unique<MemoryRawWalIo>(io_state));
+    test->Expect(
+        writer.Initialize(),
+        "captured-handoff writer initializes");
+    ingress::ByteRing ring(4096U, 512U);
+    FailureState failure;
+    TestClock clock;
+    ingress::RawCaptureWorkerConfig worker_config =
+        MakeWorkerConfig(
+            &failure,
+            &clock,
+            1'000'000U,
+            1'000'000U);
+    worker_config.source_frontier = &frontier_page;
+    worker_config.frontier_writer_instance = writer_instance;
+    worker_config.frontier_generation = frontier_config.generation;
+    ingress::RawCaptureWorker worker(
+        worker_config, ring, writer);
+
+    canonical::SourceFrontierCallbackGuardV1 callback(
+        &frontier_page,
+        writer_instance,
+        frontier_config.generation);
+    test->Expect(
+        callback.entered(),
+        "callback enters frontier before publishing its ring record");
+    const RecordFixture record = MakeRecord(1U, 19U);
+    test->Expect(
+        Push(&ring, record),
+        "inflight callback publishes its complete ring record");
+    const std::uint64_t published = ring.published_position();
+
+    std::atomic<bool> run_result{false};
+    std::thread consumer([&] {
+        run_result.store(
+            worker.Run(), std::memory_order_release);
+    });
+    test->Expect(
+        WaitUntil([&] {
+            return worker.startup_complete() &&
+                   ring.consumed_position() == published;
+        }) &&
+            worker.startup_succeeded(),
+        "worker consumes the record and reaches the captured frontier wait");
+
+    const canonical::SourceFrontierV1 waiting =
+        ReadFrontier(test, frontier_page);
+    test->Expect(
+        waiting.callback_inflight == 1U &&
+            waiting.captured_ingress_sequence == 0U &&
+            waiting.append_ingress_sequence == 0U &&
+            worker.Snapshot().append.records == 0U &&
+            writer.Snapshot().append.ingress_sequence == 0U,
+        "worker cannot append while callback capture is still inflight");
+
+    test->Expect(
+        callback.CompleteCaptured(1U) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "callback publishes captured after the deterministic race window");
+    test->Expect(
+        WaitUntil([&] {
+            return worker.Snapshot().append.records == 1U;
+        }),
+        "worker appends only after captured publication");
+    const ingress::RawWalWriterSnapshot appended = writer.Snapshot();
+    const canonical::SourceFrontierV1 published_frontier =
+        ReadFrontier(test, frontier_page);
+    test->Expect(
+        published_frontier.callback_inflight == 0U &&
+            published_frontier.captured_ingress_sequence == 1U &&
+            published_frontier.append_ingress_sequence == 1U &&
+            published_frontier.append_global_wal_pos ==
+                appended.append.global_wal_pos &&
+            appended.append.ingress_sequence == 1U,
+        "WAL append completes before matching append frontier publication");
+
+    worker.StopAndDrain();
+    consumer.join();
+    test->Expect(
+        run_result.load(std::memory_order_acquire) &&
+            failure.calls.load(std::memory_order_acquire) == 0U,
+        "captured-frontier handoff drains cleanly");
+}
+
+void TestCapturedFrontierStopIsBounded(TestContext* test) {
+    const common::Identity128 writer_instance =
+        WriterIdentity(0xd0U);
+    const canonical::SourceFrontierConfigV1 frontier_config =
+        MakeFrontierConfig(writer_instance, 13U);
+    canonical::SourceFrontierPageV1 frontier_page{};
+    test->Expect(
+        canonical::InitializeSourceFrontierPageV1(
+            frontier_config, &frontier_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "bounded-stop frontier initializes");
+
+    auto io_state = std::make_shared<MemoryIoState>();
+    ingress::RawWalWriter writer(
+        MakeWriterConfig(writer_instance),
+        std::make_unique<MemoryRawWalIo>(io_state));
+    test->Expect(writer.Initialize(), "bounded-stop writer initializes");
+    ingress::ByteRing ring(4096U, 512U);
+    FailureState failure;
+    TestClock clock;
+    ingress::RawCaptureWorkerConfig worker_config =
+        MakeWorkerConfig(
+            &failure,
+            &clock,
+            1'000'000U,
+            1'000'000U);
+    worker_config.source_frontier = &frontier_page;
+    worker_config.frontier_writer_instance = writer_instance;
+    worker_config.frontier_generation = frontier_config.generation;
+    ingress::RawCaptureWorker worker(worker_config, ring, writer);
+
+    canonical::SourceFrontierCallbackGuardV1 callback(
+        &frontier_page,
+        writer_instance,
+        frontier_config.generation);
+    test->Expect(
+        callback.entered(),
+        "bounded-stop callback enters before ring publication");
+    test->Expect(
+        Push(&ring, MakeRecord(1U, 23U)),
+        "bounded-stop callback publishes a ring record");
+    const std::uint64_t published = ring.published_position();
+
+    std::atomic<bool> run_result{true};
+    std::thread consumer([&] {
+        run_result.store(worker.Run(), std::memory_order_release);
+    });
+    test->Expect(
+        WaitUntil([&] {
+            return worker.startup_complete() &&
+                   ring.consumed_position() == published;
+        }),
+        "bounded-stop worker reaches the captured handoff");
+
+    worker.StopAndDrain();
+    const bool stopped_before_callback_completion =
+        WaitUntil([&] { return worker.finished(); });
+    if (!stopped_before_callback_completion) {
+        // Keep a failed regression test itself bounded: release an old
+        // implementation which ignored stop while waiting for captured.
+        static_cast<void>(callback.CompleteCaptured(1U));
+    }
+    consumer.join();
+
+    const auto snapshot = worker.Snapshot();
+    const auto frontier = ReadFrontier(test, frontier_page);
+    test->Expect(
+        stopped_before_callback_completion &&
+            !run_result.load(std::memory_order_acquire) &&
+            snapshot.failure_kind ==
+                ingress::RawCaptureWorkerFailureKind::kSourceFrontier &&
+            snapshot.append.records == 0U &&
+            writer.Snapshot().append.ingress_sequence == 0U &&
+            failure.calls.load(std::memory_order_acquire) == 1U &&
+            frontier.source_state ==
+                canonical::SourceStateV1::kFatal,
+        "stop cannot hang behind an unfinished captured handoff");
+}
+
+void TestSourceFrontierFailures(TestContext* test) {
+    const common::Identity128 writer_instance =
+        WriterIdentity(0xc0U);
+    const common::Identity128 other_writer =
+        WriterIdentity(0xa0U);
+    {
+        canonical::SourceFrontierPageV1 frontier_page{};
+        const canonical::SourceFrontierConfigV1 frontier_config =
+            MakeFrontierConfig(other_writer);
+        test->Expect(
+            canonical::InitializeSourceFrontierPageV1(
+                frontier_config, &frontier_page) ==
+                canonical::SourceFrontierErrorV1::kNone,
+            "identity-mismatch frontier initializes");
+        auto io_state = std::make_shared<MemoryIoState>();
+        ingress::RawWalWriter writer(
+            MakeWriterConfig(writer_instance),
+            std::make_unique<MemoryRawWalIo>(io_state));
+        test->Expect(
+            writer.Initialize(),
+            "identity-mismatch writer initializes");
+        ingress::ByteRing ring(4096U, 512U);
+        FailureState failure;
+        TestClock clock;
+        ingress::RawCaptureWorkerConfig worker_config =
+            MakeWorkerConfig(
+                &failure,
+                &clock,
+                10U,
+                1024U);
+        worker_config.source_frontier = &frontier_page;
+        worker_config.frontier_writer_instance = other_writer;
+        worker_config.frontier_generation = frontier_config.generation;
+        bool rejected = false;
+        try {
+            ingress::RawCaptureWorker worker(
+                worker_config, ring, writer);
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        test->Expect(
+            rejected &&
+                writer.Snapshot().append.ingress_sequence == 0U,
+            "worker rejects a frontier bound to another writer identity");
+    }
+
+    {
+        canonical::SourceFrontierPageV1 frontier_page{};
+        const canonical::SourceFrontierConfigV1 frontier_config =
+            MakeFrontierConfig(writer_instance, 12U);
+        test->Expect(
+            canonical::InitializeSourceFrontierPageV1(
+                frontier_config, &frontier_page) ==
+                canonical::SourceFrontierErrorV1::kNone,
+            "fatal-source frontier initializes");
+        auto io_state = std::make_shared<MemoryIoState>();
+        ingress::RawWalWriter writer(
+            MakeWriterConfig(writer_instance),
+            std::make_unique<MemoryRawWalIo>(io_state));
+        test->Expect(
+            writer.Initialize(),
+            "fatal-source writer initializes");
+        ingress::ByteRing ring(4096U, 512U);
+        FailureState failure;
+        TestClock clock;
+        ingress::RawCaptureWorkerConfig worker_config =
+            MakeWorkerConfig(
+                &failure,
+                &clock,
+                10U,
+                1024U);
+        worker_config.source_frontier = &frontier_page;
+        worker_config.frontier_writer_instance = writer_instance;
+        worker_config.frontier_generation = frontier_config.generation;
+        ingress::RawCaptureWorker worker(
+            worker_config, ring, writer);
+        test->Expect(
+            canonical::PublishSourceStateV1(
+                &frontier_page,
+                writer_instance,
+                frontier_config.generation,
+                canonical::SourceStateV1::kFatal,
+                0U) == canonical::SourceFrontierErrorV1::kNone,
+            "test publishes fatal before worker observes the record");
+        const RecordFixture record = MakeRecord(1U, 7U);
+        test->Expect(
+            Push(&ring, record),
+            "fatal-source record enters the ring");
+        const bool result = worker.Run();
+        const ingress::RawCaptureWorkerSnapshot snapshot =
+            worker.Snapshot();
+        test->Expect(
+            !result &&
+                snapshot.failure_kind ==
+                    ingress::RawCaptureWorkerFailureKind::kSourceFrontier &&
+                snapshot.append.records == 0U &&
+                writer.Snapshot().append.ingress_sequence == 0U &&
+                failure.calls.load(std::memory_order_acquire) == 1U &&
+                failure.signal.load(std::memory_order_acquire) ==
+                    static_cast<std::uint8_t>(
+                        ingress::RawCaptureFatalSignal::kSourceFrontier) &&
+                ReadFrontier(test, frontier_page).source_state ==
+                    canonical::SourceStateV1::kFatal,
+            "fatal SourceFrontier prevents every WAL append and fails closed");
+    }
+}
+
 }  // namespace
 
 int main() {
     TestContext test;
+    TestIdleHeartbeatFlush(&test);
     TestTimeThresholdDrainAndShortWrites(&test);
     TestByteThreshold(&test);
     TestRingCorruption(&test);
     TestWriterFailures(&test);
+    TestCapturedFrontierHandoff(&test);
+    TestCapturedFrontierStopIsBounded(&test);
+    TestSourceFrontierFailures(&test);
     if (test.failures != 0) {
         std::cerr << test.failures
                   << " Raw capture worker checks failed\n";

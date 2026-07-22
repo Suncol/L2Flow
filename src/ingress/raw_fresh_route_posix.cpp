@@ -7,6 +7,8 @@
 #include <string>
 #include <utility>
 
+#include <sys/stat.h>
+
 namespace l2flow::ingress {
 namespace {
 
@@ -23,13 +25,12 @@ void SetError(
 }
 
 [[nodiscard]] bool ValidInput(
-    std::string_view raw_root,
     std::string_view stream_slug,
     const RawReserveFreshScaffoldingV1& registration,
     const RawWalWriterConfig& writer,
     const RawPosixWalStreamBackendOptionsV1&
         backend) noexcept {
-    if (raw_root.empty() || stream_slug.empty() ||
+    if (stream_slug.empty() ||
         registration.key.route.source_stream_id == 0U ||
         !IsCanonicalRawStreamRouteV1(
             registration.key.route.source_stream_id,
@@ -77,6 +78,81 @@ void SetError(
                segment.raw_schema_sha256;
 }
 
+[[nodiscard]] bool SameDirectory(
+    int left_fd,
+    int right_fd) noexcept {
+    struct stat left {};
+    struct stat right {};
+    return left_fd >= 0 && right_fd >= 0 &&
+           ::fstat(left_fd, &left) == 0 &&
+           ::fstat(right_fd, &right) == 0 &&
+           S_ISDIR(left.st_mode) && S_ISDIR(right.st_mode) &&
+           left.st_dev == right.st_dev &&
+           left.st_ino == right.st_ino;
+}
+
+[[nodiscard]] bool ExactFreshScaffoldingRegistration(
+    RawReserveRegistryCoordinatorV1& coordinator,
+    const RawReserveFreshScaffoldingV1& registration,
+    const RawReserveAuthorizedActionV1& action) noexcept {
+    try {
+        const ReserveCoordinatorStateV1 state = coordinator.state();
+        if (state.selected_slot >= state.slots.size()) {
+            return false;
+        }
+        const ReserveStateSlotV1& slot =
+            state.slots[state.selected_slot];
+        if (slot.coordinator_state !=
+                ReserveCoordinatorPhaseV1::kProvisioned ||
+            slot.entry_count > slot.entries.size() ||
+            slot.generation != action.token().state_generation ||
+            slot.reserve_state_uuid != action.token().reserve_state_uuid ||
+            action.key() != registration.key ||
+            action.required_status() !=
+                ReserveRegistryStatusV1::kScaffolding ||
+            action.recovery_intent() != registration.recovery_intent ||
+            action.token().writer_instance_id !=
+                registration.writer_instance ||
+            action.token().recovery_attempt_id !=
+                registration.key.recovery_attempt_id) {
+            return false;
+        }
+        std::size_t matches = 0U;
+        for (std::size_t index = 0U;
+             index < static_cast<std::size_t>(slot.entry_count);
+             ++index) {
+            const ReserveStateEntryV1& entry = slot.entries[index];
+            if (entry.source_stream_id !=
+                    registration.key.route.source_stream_id ||
+                entry.capture_date !=
+                    registration.key.route.capture_date) {
+                continue;
+            }
+            ++matches;
+            if (entry.stream_day_id != registration.key.stream_day_id ||
+                entry.executor_or_recovery_attempt !=
+                    registration.key.recovery_attempt_id ||
+                entry.registry_status !=
+                    ReserveRegistryStatusV1::kScaffolding ||
+                entry.recovery_origin !=
+                    ReserveRecoveryOriginV1::kFreshInit ||
+                entry.recovery_intent !=
+                    ReserveRecoveryIntentV1::kResumeConnect ||
+                entry.recovery_intent != registration.recovery_intent ||
+                entry.writer_instance != registration.writer_instance ||
+                entry.grant_bytes !=
+                    registration.scaffolding_allocation_cap ||
+                entry.safe_stop_template_id !=
+                    registration.safe_stop_template_id) {
+                return false;
+            }
+        }
+        return matches == 1U;
+    } catch (...) {
+        return false;
+    }
+}
+
 }  // namespace
 
 std::string_view RawFreshRoutePosixFailureV1Name(
@@ -111,9 +187,12 @@ std::string_view RawFreshRoutePosixFailureV1Name(
     return "unknown";
 }
 
+namespace {
+
 RawFreshRoutePosixResultV1
-CompleteRegisteredFreshRawRouteV1(
-    const std::string& raw_root,
+CompleteRegisteredFreshRawRouteImpl(
+    int retained_raw_root_fd,
+    const std::string* raw_root,
     std::string_view stream_slug,
     const RawReserveFreshScaffoldingV1& registration,
     RawReserveRegistryCoordinatorV1& coordinator,
@@ -124,8 +203,15 @@ CompleteRegisteredFreshRawRouteV1(
     std::string* error) noexcept {
     RawFreshRoutePosixResultV1 result{};
     SetError(error, {});
-    if (!ValidInput(
-            raw_root,
+    const bool retained_authority = retained_raw_root_fd >= 0;
+    if ((retained_authority && raw_root != nullptr) ||
+        (!retained_authority &&
+         (raw_root == nullptr || raw_root->empty())) ||
+        (retained_authority &&
+         !SameDirectory(
+             retained_raw_root_fd,
+             coordinator.raw_root_descriptor())) ||
+        !ValidInput(
             stream_slug,
             registration,
             logical_writer_config,
@@ -160,7 +246,9 @@ CompleteRegisteredFreshRawRouteV1(
             ReserveRecoveryIntentV1::kResumeConnect ||
         scaffolding_action->token().writer_instance_id !=
             registration.writer_instance ||
-        !scaffolding_action->ValidateLatest(nullptr)) {
+        !scaffolding_action->ValidateLatest(nullptr) ||
+        !ExactFreshScaffoldingRegistration(
+            coordinator, registration, *scaffolding_action)) {
         result.failure =
             RawFreshRoutePosixFailureV1::
                 kScaffoldingAuthorization;
@@ -186,15 +274,28 @@ CompleteRegisteredFreshRawRouteV1(
     authorization.durable_state_generation =
         scaffolding_action->token().state_generation;
 
-    std::unique_ptr<RawStreamDirectory> stream_directory =
-        OpenOrCreateAuthorizedFreshRawStreamDirectory(
-            raw_root,
-            registration.key.route.source_stream_id,
-            registration.key.route.capture_date,
-            owned_stream_slug,
-            authorization,
-            *scaffolding_action,
-            error);
+    std::unique_ptr<RawStreamDirectory> stream_directory;
+    if (retained_authority) {
+        stream_directory =
+            OpenOrCreateAuthorizedFreshRawStreamDirectoryAt(
+                retained_raw_root_fd,
+                registration.key.route.source_stream_id,
+                registration.key.route.capture_date,
+                owned_stream_slug,
+                authorization,
+                *scaffolding_action,
+                error);
+    } else {
+        stream_directory =
+            OpenOrCreateAuthorizedFreshRawStreamDirectory(
+                *raw_root,
+                registration.key.route.source_stream_id,
+                registration.key.route.capture_date,
+                owned_stream_slug,
+                authorization,
+                *scaffolding_action,
+                error);
+    }
     if (stream_directory == nullptr) {
         result.failure =
             RawFreshRoutePosixFailureV1::
@@ -274,6 +375,56 @@ CompleteRegisteredFreshRawRouteV1(
         return result;
     }
     return result;
+}
+
+}  // namespace
+
+RawFreshRoutePosixResultV1
+CompleteRegisteredFreshRawRouteV1(
+    const std::string& raw_root,
+    std::string_view stream_slug,
+    const RawReserveFreshScaffoldingV1& registration,
+    RawReserveRegistryCoordinatorV1& coordinator,
+    RawWalWriterConfig logical_writer_config,
+    RawPosixWalStreamBackendOptionsV1 backend_options,
+    RawSegmentArtifactOptionsV1 artifact_options,
+    RawWalStreamLimitsV1 stream_limits,
+    std::string* error) noexcept {
+    return CompleteRegisteredFreshRawRouteImpl(
+        -1,
+        &raw_root,
+        stream_slug,
+        registration,
+        coordinator,
+        std::move(logical_writer_config),
+        std::move(backend_options),
+        std::move(artifact_options),
+        std::move(stream_limits),
+        error);
+}
+
+RawFreshRoutePosixResultV1
+CompleteRegisteredFreshRawRouteAtV1(
+    int retained_raw_root_fd,
+    std::string_view stream_slug,
+    const RawReserveFreshScaffoldingV1& registration,
+    RawReserveRegistryCoordinatorV1& coordinator,
+    RawWalWriterConfig logical_writer_config,
+    RawPosixWalStreamBackendOptionsV1 backend_options,
+    RawSegmentArtifactOptionsV1 artifact_options,
+    RawWalStreamLimitsV1 stream_limits,
+    std::string* error) noexcept {
+    return CompleteRegisteredFreshRawRouteImpl(
+        retained_raw_root_fd,
+        nullptr,
+        stream_slug,
+        registration,
+        coordinator,
+        std::move(logical_writer_config),
+        std::move(backend_options),
+        std::move(artifact_options),
+        std::move(stream_limits),
+        error);
 }
 
 }  // namespace l2flow::ingress

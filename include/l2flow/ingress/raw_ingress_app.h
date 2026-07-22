@@ -84,8 +84,17 @@ struct RawIngressAppOptionsV1 final {
         5U * 1'000'000'000U;
     std::uint64_t observer_final_catch_up_timeout_ns =
         5U * 1'000'000'000U;
+    std::uint64_t writer_idle_heartbeat_interval_ns =
+        kRawCaptureDefaultIdleHeartbeatIntervalNs;
     RawCaptureMonotonicNow worker_monotonic_now = nullptr;
     void* worker_monotonic_clock_context = nullptr;
+    // Optional shared SourceFrontier producer binding.  The mapping is
+    // borrowed and must outlive this app and both worker threads.
+    l2flow::canonical::SourceFrontierPageV1* source_frontier = nullptr;
+    l2flow::common::Identity128 frontier_writer_instance{};
+    std::uint64_t frontier_generation = 0U;
+    std::chrono::nanoseconds source_frontier_busy_timeout =
+        l2flow::canonical::kSourceFrontierDefaultBusyTimeoutV1;
 };
 
 struct RawIngressCleanStopEvidenceV1 final {
@@ -186,7 +195,8 @@ private:
         const RawIngressConfig& config);
     static CallbackHandlerConfig MakeHandlerConfig(
         const RawIngressAppConfigV1& config,
-        const l2flow::sdk::IngressSpec& spec);
+        const l2flow::sdk::IngressSpec& spec,
+        const RawIngressAppOptionsV1& options);
     static RawCaptureWorkerConfig MakeCaptureConfig(
         const RawIngressConfig& config,
         const RawIngressAppOptionsV1& options,

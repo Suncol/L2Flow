@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -121,6 +122,7 @@ CallbackHandler::CallbackHandler(CallbackHandlerConfig config,
           config.first_ingress_sequence == 0U
               ? 0U
               : config.first_ingress_sequence - 1U) {
+    const bool frontier_enabled = config_.source_frontier != nullptr;
     if (config_.source_stream_id == 0U ||
         (config_.market_service_id !=
              static_cast<std::uint8_t>(datayes::mdl::MDLSID_MDL_SHL2) &&
@@ -129,8 +131,37 @@ CallbackHandler::CallbackHandler(CallbackHandlerConfig config,
         config_.max_message_bytes < l2flow::sdk::kVendorHeadBytes ||
         config_.max_message_bytes != ring_.max_message_bytes() ||
         config_.capture_date == 0U ||
-        config_.first_ingress_sequence == 0U) {
+        config_.first_ingress_sequence == 0U ||
+        (frontier_enabled &&
+         (l2flow::common::IsZeroIdentity(
+              config_.frontier_writer_instance) ||
+          config_.frontier_generation == 0U ||
+          config_.source_frontier_busy_timeout.count() <= 0 ||
+          config_.source_frontier_busy_timeout > l2flow::canonical::
+              kSourceFrontierMaximumBusyTimeoutV1)) ||
+        (!frontier_enabled &&
+         (!l2flow::common::IsZeroIdentity(
+              config_.frontier_writer_instance) ||
+          config_.frontier_generation != 0U))) {
         throw std::invalid_argument("invalid callback handler configuration");
+    }
+    if (frontier_enabled) {
+        l2flow::canonical::SourceFrontierV1 frontier{};
+        if (l2flow::canonical::ReadSourceFrontierV1(
+                *config_.source_frontier, &frontier) !=
+                l2flow::canonical::SourceFrontierErrorV1::kNone ||
+            frontier.source_stream_id != config_.source_stream_id ||
+            frontier.capture_date != config_.capture_date ||
+            frontier.writer_instance !=
+                config_.frontier_writer_instance ||
+            frontier.generation != config_.frontier_generation ||
+            frontier.captured_ingress_sequence !=
+                config_.first_ingress_sequence - 1U ||
+            frontier.source_state ==
+                l2flow::canonical::SourceStateV1::kFatal) {
+            throw std::invalid_argument(
+                "callback SourceFrontier identity mismatch");
+        }
     }
 }
 
@@ -215,6 +246,14 @@ void CallbackHandler::CaptureMessage(
         metrics_.IncrementReentry();
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::CALLBACK_REENTRY));
+        if (config_.source_frontier != nullptr) {
+            static_cast<void>(l2flow::canonical::PublishSourceStateV1(
+                config_.source_frontier,
+                config_.frontier_writer_instance,
+                config_.frontier_generation,
+                l2flow::canonical::SourceStateV1::kFatal,
+                0U));
+        }
         return;
     }
 
@@ -234,8 +273,41 @@ void CallbackHandler::CaptureMessage(
     }
 
     metrics_.IncrementCallbackInvocations();
+    std::optional<l2flow::canonical::SourceFrontierCallbackGuardV1>
+        frontier_callback;
+    if (config_.source_frontier != nullptr) {
+        frontier_callback.emplace(
+            config_.source_frontier,
+            config_.frontier_writer_instance,
+            config_.frontier_generation,
+            config_.source_frontier_busy_timeout);
+        if (frontier_callback->error() !=
+            l2flow::canonical::SourceFrontierErrorV1::kNone) {
+            static_cast<void>(fatal_.trip(
+                l2flow::ops::FatalReason::SOURCE_FRONTIER_FAILURE));
+            // This may fail when the identity itself changed, but it is safe
+            // to attempt and closes the route-visible page when contention or
+            // a state transition prevented callback admission.
+            static_cast<void>(l2flow::canonical::PublishSourceStateV1(
+                config_.source_frontier,
+                config_.frontier_writer_instance,
+                config_.frontier_generation,
+                l2flow::canonical::SourceStateV1::kFatal,
+                0U));
+            return;
+        }
+    }
     try {
-        CaptureMessageImpl(message);
+        std::uint64_t captured_sequence = 0U;
+        if (!CaptureMessageImpl(message, &captured_sequence)) {
+            return;
+        }
+        if (frontier_callback.has_value() &&
+            frontier_callback->CompleteCaptured(captured_sequence) !=
+                l2flow::canonical::SourceFrontierErrorV1::kNone) {
+            static_cast<void>(fatal_.trip(
+                l2flow::ops::FatalReason::SOURCE_FRONTIER_FAILURE));
+        }
     } catch (...) {
         metrics_.IncrementException();
         static_cast<void>(
@@ -243,13 +315,14 @@ void CallbackHandler::CaptureMessage(
     }
 }
 
-void CallbackHandler::CaptureMessageImpl(
-    const datayes::mdl::MDLMessage* message) {
-    if (message == nullptr) {
+bool CallbackHandler::CaptureMessageImpl(
+    const datayes::mdl::MDLMessage* message,
+    std::uint64_t* captured_sequence) {
+    if (captured_sequence == nullptr || message == nullptr) {
         metrics_.IncrementInvalid(InvalidMessageReason::NullMessage);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::NULL_MESSAGE));
-        return;
+        return false;
     }
 
     const datayes::mdl::MDLMessageHead* vendor_head = message->GetHead();
@@ -257,7 +330,7 @@ void CallbackHandler::CaptureMessageImpl(
         metrics_.IncrementInvalid(InvalidMessageReason::NullHead);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::NULL_VENDOR_HEAD));
-        return;
+        return false;
     }
 
     l2flow::sdk::VendorHeadBytes head_bytes{};
@@ -267,20 +340,20 @@ void CallbackHandler::CaptureMessageImpl(
         metrics_.IncrementInvalid(InvalidMessageReason::WrongHeadSize);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::INVALID_VENDOR_HEADER));
-        return;
+        return false;
     }
     if (head.message_size() < head.head_size()) {
         metrics_.IncrementInvalid(
             InvalidMessageReason::MessageSmallerThanHead);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::INVALID_VENDOR_HEADER));
-        return;
+        return false;
     }
     if (head.message_size() > config_.max_message_bytes) {
         metrics_.IncrementInvalid(InvalidMessageReason::MessageTooLarge);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::MESSAGE_TOO_LARGE));
-        return;
+        return false;
     }
     if (head.service_id() !=
             static_cast<std::uint8_t>(datayes::mdl::MDLSID_MDL_API) &&
@@ -290,7 +363,7 @@ void CallbackHandler::CaptureMessageImpl(
         metrics_.IncrementInvalid(InvalidMessageReason::UnexpectedService);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::UNEXPECTED_SERVICE));
-        return;
+        return false;
     }
 
     // The subtraction is deliberately after both header-size checks.
@@ -303,7 +376,7 @@ void CallbackHandler::CaptureMessageImpl(
             metrics_.IncrementInvalid(InvalidMessageReason::NullBody);
             static_cast<void>(
                 fatal_.trip(l2flow::ops::FatalReason::NULL_VENDOR_BODY));
-            return;
+            return false;
         }
     }
 
@@ -313,7 +386,7 @@ void CallbackHandler::CaptureMessageImpl(
         std::numeric_limits<std::uint64_t>::max()) {
         static_cast<void>(fatal_.trip(
             l2flow::ops::FatalReason::INGRESS_SEQUENCE_EXHAUSTED));
-        return;
+        return false;
     }
 
     CaptureMetaV1 metadata{};
@@ -338,7 +411,7 @@ void CallbackHandler::CaptureMessageImpl(
         framed_record_bytes == 0U) {
         static_cast<void>(fatal_.trip(
             l2flow::ops::FatalReason::RING_CORRUPTION));
-        return;
+        return false;
     }
     const ByteRingPushResult pushed = ring_.try_push_copy(
         metadata,
@@ -357,7 +430,7 @@ void CallbackHandler::CaptureMessageImpl(
             static_cast<void>(
                 fatal_.trip(l2flow::ops::FatalReason::RING_CORRUPTION));
         }
-        return;
+        return false;
     }
 
     // Linearization order: ring commit/release first, then publish the
@@ -369,6 +442,8 @@ void CallbackHandler::CaptureMessageImpl(
         head.message_size(),
         metadata.ingress_sequence,
         framed_record_bytes);
+    *captured_sequence = metadata.ingress_sequence;
+    return true;
 }
 
 }  // namespace l2flow::ingress

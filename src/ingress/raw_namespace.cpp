@@ -238,6 +238,34 @@ bool ValidatePrivateOwnedDirectory(int fd) noexcept {
            (status.st_mode & (S_IWGRP | S_IWOTH)) == 0;
 }
 
+bool SameOpenInode(int left_fd, int right_fd) noexcept;
+
+int RetainPrivateRawRoot(int retained_raw_root_fd) noexcept {
+    if (retained_raw_root_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    ScopedFd retained;
+    for (;;) {
+        retained.Reset(::openat(
+            retained_raw_root_fd,
+            ".",
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        if (retained.get() >= 0 || errno != EINTR) {
+            break;
+        }
+    }
+    if (retained.get() < 0) {
+        return -1;
+    }
+    if (!ValidatePrivateOwnedDirectory(retained.get()) ||
+        !SameOpenInode(retained_raw_root_fd, retained.get())) {
+        errno = EACCES;
+        return -1;
+    }
+    return retained.Release();
+}
+
 bool ValidateAbsoluteRoot(
     std::string_view path) noexcept {
     if (path.size() < 2U ||
@@ -892,6 +920,34 @@ RawStreamDirectory::~RawStreamDirectory() {
     }
 }
 
+namespace {
+
+int CreateRawStreamDirectoryBelowRoot(
+    int root_fd,
+    std::uint32_t source_stream_id,
+    std::uint32_t capture_date,
+    const std::string& stream_slug,
+    std::string* error) noexcept {
+    const std::string date_name =
+        "capture_date=" + std::to_string(capture_date);
+    const std::string stream_name =
+        "stream=" + std::to_string(source_stream_id) +
+        "-" + stream_slug;
+    ScopedFd date;
+    ScopedFd stream;
+    if (!EnsureChildDirectory(root_fd, date_name, &date) ||
+        !EnsureChildDirectory(date.get(), stream_name, &stream)) {
+        SetError(
+            error,
+            std::string("cannot durably create Raw namespace: ") +
+                std::strerror(errno));
+        return -1;
+    }
+    return stream.Release();
+}
+
+}  // namespace
+
 std::unique_ptr<RawStreamDirectory>
 OpenOrCreateRawStreamDirectory(
     const std::string& raw_root,
@@ -915,21 +971,56 @@ OpenOrCreateRawStreamDirectory(
         return nullptr;
     }
 
-    const std::string date_name =
-        "capture_date=" + std::to_string(capture_date);
-    const std::string stream_name =
-        "stream=" + std::to_string(source_stream_id) +
-        "-" + stream_slug;
-    ScopedFd date;
-    ScopedFd stream;
-    if (!EnsureChildDirectory(
-            root.get(), date_name, &date) ||
-        !EnsureChildDirectory(
-            date.get(), stream_name, &stream)) {
+    ScopedFd stream(CreateRawStreamDirectoryBelowRoot(
+        root.get(),
+        source_stream_id,
+        capture_date,
+        stream_slug,
+        error));
+    if (stream.get() < 0) {
+        return nullptr;
+    }
+    try {
+        return std::unique_ptr<RawStreamDirectory>(
+            new RawStreamDirectory(
+                stream.Release(),
+                source_stream_id,
+                capture_date));
+    } catch (...) {
+        SetError(error, "cannot allocate Raw stream directory");
+        return nullptr;
+    }
+}
+
+std::unique_ptr<RawStreamDirectory>
+OpenOrCreateRawStreamDirectoryAt(
+    int retained_raw_root_fd,
+    std::uint32_t source_stream_id,
+    std::uint32_t capture_date,
+    const std::string& stream_slug,
+    std::string* error) noexcept {
+    SetError(error, {});
+    if (source_stream_id == 0U ||
+        !IsGregorianDate(capture_date) ||
+        !IsValidSlug(stream_slug)) {
+        SetError(error, "Raw stream namespace is invalid");
+        return nullptr;
+    }
+    ScopedFd root(RetainPrivateRawRoot(retained_raw_root_fd));
+    if (root.get() < 0) {
         SetError(
             error,
-            std::string("cannot durably create Raw namespace: ") +
+            std::string("cannot retain supplied Raw root: ") +
                 std::strerror(errno));
+        return nullptr;
+    }
+    ScopedFd stream(CreateRawStreamDirectoryBelowRoot(
+        root.get(),
+        source_stream_id,
+        capture_date,
+        stream_slug,
+        error));
+    if (stream.get() < 0) {
         return nullptr;
     }
     try {
@@ -973,6 +1064,34 @@ OpenOrCreateAuthorizedFreshRawStreamDirectory(
     // mkdir/open/fsync operations.
     return OpenOrCreateRawStreamDirectory(
         raw_root,
+        source_stream_id,
+        capture_date,
+        stream_slug,
+        error);
+}
+
+std::unique_ptr<RawStreamDirectory>
+OpenOrCreateAuthorizedFreshRawStreamDirectoryAt(
+    int retained_raw_root_fd,
+    std::uint32_t source_stream_id,
+    std::uint32_t capture_date,
+    const std::string& stream_slug,
+    const RawFreshStateAuthorizationV1& authorization,
+    const RawFreshMutationAuthorizationGateV1& authorization_gate,
+    std::string* error) noexcept {
+    SetError(error, {});
+    if (authorization.source_stream_id != source_stream_id ||
+        authorization.capture_date != capture_date ||
+        authorization.registry_stage !=
+            RawFreshRegistryStageV1::kScaffolding ||
+        !authorization_gate.Authorizes(authorization)) {
+        SetError(
+            error,
+            "fresh Raw namespace mutation lacks exact durable SCAFFOLDING authorization");
+        return nullptr;
+    }
+    return OpenOrCreateRawStreamDirectoryAt(
+        retained_raw_root_fd,
         source_stream_id,
         capture_date,
         stream_slug,

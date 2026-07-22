@@ -82,4 +82,19 @@ CompleteRegisteredFreshRawRouteV1(
     RawWalStreamLimitsV1 stream_limits,
     std::string* error = nullptr) noexcept;
 
+// Retained-authority production variant. retained_raw_root_fd must identify
+// the same directory inode already retained by coordinator. The configured
+// Raw-root pathname is deliberately not accepted or reopened here.
+[[nodiscard]] RawFreshRoutePosixResultV1
+CompleteRegisteredFreshRawRouteAtV1(
+    int retained_raw_root_fd,
+    std::string_view stream_slug,
+    const RawReserveFreshScaffoldingV1& registration,
+    RawReserveRegistryCoordinatorV1& coordinator,
+    RawWalWriterConfig logical_writer_config,
+    RawPosixWalStreamBackendOptionsV1 backend_options,
+    RawSegmentArtifactOptionsV1 artifact_options,
+    RawWalStreamLimitsV1 stream_limits,
+    std::string* error = nullptr) noexcept;
+
 }  // namespace l2flow::ingress

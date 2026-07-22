@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l2flow/common/sha256.h"
 #include "l2flow/sdk/subscription_manifest.h"
 
 #include "mdl_api.h"
@@ -69,16 +70,26 @@ public:
 // compiled-ABI and runtime-lifecycle preflight plus the retained final
 // dlopen()/dlsym(). No link-time reference to libmdl_api.so is required.
 //
-// Production callers must first pass RunVendorPreflight for the complete
-// baseline+archive+compatible-library set. This loader deliberately repeats
-// the library-only compatibility gate on a fresh snapshot so the final mapping
-// cannot be redirected after that complete gate.
+// Callers of the unpinned overload must first pass RunVendorPreflight for the
+// complete baseline+archive+compatible-library set.  A production composition
+// using the pinned overload instead verifies the baseline and archive without
+// loading library code, then lets that overload bind digest verification,
+// ELF/ABI/runtime preflight and final mapping to one sealed snapshot.
 //
 // The returned factory, every manager, and every subscriber share ownership
 // of the retained dynamic-library handle.  A failed vendor ReleaseRef() pins
 // the mapping for process lifetime rather than unloading live vendor code.
 [[nodiscard]] std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
     const std::filesystem::path& shared_library,
+    std::string* error) noexcept;
+
+// Production provenance variant.  The digest is checked against the exact
+// sealed memfd snapshot which subsequently passes runtime preflight and is
+// handed to dlopen(); it is never computed from a separate pathname open.
+// A zero digest is not a wildcard and is rejected like every other mismatch.
+[[nodiscard]] std::shared_ptr<SdkFactory> LoadApprovedSdkFactoryPinned(
+    const std::filesystem::path& shared_library,
+    const l2flow::common::Sha256Digest& expected_sha256,
     std::string* error) noexcept;
 
 }  // namespace l2flow::sdk

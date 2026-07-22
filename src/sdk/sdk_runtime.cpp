@@ -2,7 +2,9 @@
 
 #include "l2flow/baseline/vendor_baseline.h"
 #include "l2flow/common/sealed_file_snapshot.h"
+#include "l2flow/common/sha256.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <dlfcn.h>
@@ -442,8 +444,11 @@ private:
 
 }  // namespace
 
-std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
+namespace {
+
+std::shared_ptr<SdkFactory> LoadApprovedSdkFactoryImpl(
     const std::filesystem::path& shared_library,
+    const l2flow::common::Sha256Digest* expected_sha256,
     std::string* error) noexcept {
     try {
         if (error != nullptr) {
@@ -452,6 +457,15 @@ std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
         if (shared_library.empty() ||
             shared_library.native().find('\0') != std::string::npos) {
             SetError(error, "SDK shared-library path is empty or contains NUL");
+            return nullptr;
+        }
+        if (expected_sha256 != nullptr &&
+            std::none_of(
+                expected_sha256->begin(),
+                expected_sha256->end(),
+                [](std::byte value) { return value != std::byte{0U}; })) {
+            SetErrorLiteral(
+                error, "sealed SDK snapshot SHA-256 pin is zero");
             return nullptr;
         }
 
@@ -463,6 +477,23 @@ std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
                 std::nullopt,
                 baseline::kMaximumSdkSharedLibraryBytes)) {
             return nullptr;
+        }
+
+        if (expected_sha256 != nullptr) {
+            common::Sha256Digest observed_sha256{};
+            if (!common::ComputeFileSha256ForOpenFd(
+                    snapshot.fd(),
+                    &observed_sha256,
+                    error,
+                    baseline::kMaximumSdkSharedLibraryBytes)) {
+                return nullptr;
+            }
+            if (observed_sha256 != *expected_sha256) {
+                SetErrorLiteral(
+                    error,
+                    "sealed SDK snapshot SHA-256 does not match the deployment pin");
+                return nullptr;
+            }
         }
 
         const std::string fixed_path = snapshot.proc_fd_path();
@@ -543,6 +574,22 @@ std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
             "loading approved SDK failed with an unknown exception");
         return nullptr;
     }
+}
+
+}  // namespace
+
+std::shared_ptr<SdkFactory> LoadApprovedSdkFactory(
+    const std::filesystem::path& shared_library,
+    std::string* error) noexcept {
+    return LoadApprovedSdkFactoryImpl(shared_library, nullptr, error);
+}
+
+std::shared_ptr<SdkFactory> LoadApprovedSdkFactoryPinned(
+    const std::filesystem::path& shared_library,
+    const l2flow::common::Sha256Digest& expected_sha256,
+    std::string* error) noexcept {
+    return LoadApprovedSdkFactoryImpl(
+        shared_library, &expected_sha256, error);
 }
 
 }  // namespace l2flow::sdk

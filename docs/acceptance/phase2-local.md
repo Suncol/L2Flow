@@ -3,25 +3,31 @@
 Date: 2026-07-19  
 Host scope: local Linux x86-64 development container
 
+> 2026-07-22 superseded note：本记录保留截至 2026-07-19 的本地验收事实。
+> `L2Flow::production` 后来通过独立授权变更切换到 `l2flow_production`，并接通
+> fresh Raw live 聚合；该变更不追溯性完成本文仍列出的 Phase 2 recovery、完整日、
+> crash/power-loss 与目标机 external exit。
+
 ## 结论
 
 本记录严格采用
 [`docs/design.md`](../design.md#分层完成口径与退出条件)
-中的三层口径。当前源码包含较完整的 Phase 2 Raw 库、POSIX 持久化组件和定向
-测试；三种本机构建/CTest 已通过，但尚未把 Raw runtime 接入四个生产 ingress，
+中的三层口径。截至本记录日期，源码包含较完整的 Phase 2 Raw 库、POSIX 持久化
+组件和定向测试；三种本机构建/CTest 已通过，但尚未把 Raw runtime 接入四个生产
+ingress，
 也没有覆盖 Local verification 合同规定的全部 crash/reconciliation 条件和外部
 验收。因此：
 
-| 口径 | 当前状态 | 判定依据 |
+| 口径 | 本记录时状态 | 判定依据 |
 | --- | --- | --- |
-| **Implementation complete** | **未完成** | `L2Flow::production`、ingress service 和四个 ingress 仍走 Phase 0–1 shadow 路径；Raw coordinator IPC/controller、Raw service monitor 和 RunManifest service publication 尚未接入 |
+| **Implementation complete** | **未完成** | 截至本记录日期，`L2Flow::production`、ingress service 和四个 ingress 仍走 Phase 0–1 shadow 路径；Raw coordinator IPC/controller、Raw service monitor 和 RunManifest service publication 尚未接入 |
 | **Local verification complete** | **未完成** | Debug/Release/ASan+UBSan 全量 CTest 与默认 deterministic corpus/property driver 已通过；但设计规定的全部 crash window、固定 `SIGKILL` 矩阵、精确 clean-stop/crash-range 对账和尚未完成的 power-loss oracle 仍未覆盖 |
 | **Phase 2 exit complete** | **未完成** | Phase 1 外部退出条件、10,000 seeds、目标 NVMe、真实四流完整交易日、cold-cache 5×、真实 reboot/power-cut 等证据均不存在 |
 
-本文中的“存在”或“已实现”只描述可从当前源码和测试入口审计的局部能力，不表示
+本文中的“存在”或“已实现”只描述本记录日期可从源码和测试入口审计的局部能力，不表示
 上述任一层已经完成。
 
-## 当前可审计的实现与定向测试
+## 本记录日期可审计的实现与定向测试
 
 ### Raw V1、WAL、reader、recovery 与持久 sidecar
 
@@ -184,7 +190,7 @@ sync interval/bytes 映射到 Raw capture worker，并暴露 Raw runtime identit
 append/durable cursor、durability lag、ring 和 observer lag 指标。
 `test_phase2_raw_ingress_app` 有 bytes threshold 与 interval 行为测试。
 
-这些能力目前只是 Phase 2 library/runtime builder；它们尚未被生产 ingress
+这些能力在本记录日期只是 Phase 2 library/runtime builder；它们尚未被生产 ingress
 service 构造和 monitor 调用。
 
 ### 真实 feeder 到 Raw capture path 探针
@@ -294,9 +300,9 @@ build 的测试总数少一个，是因为 `mdl_vendor_minimal_link` 只在
 上述绿色全量结果仍需满足下一节的完整 crash/reconciliation 条件，才能把
 Local verification complete 改为完成。
 
-## Implementation complete 的明确阻断项
+## 本记录日期 Implementation complete 的明确阻断项
 
-1. [`CMakeLists.txt`](../../CMakeLists.txt) 仍把
+1. 截至本记录日期，[`CMakeLists.txt`](../../CMakeLists.txt) 仍把
    `L2Flow::production` alias 指向 `l2flow_phase01`；不能把独立
    `L2Flow::phase2` 库的存在等同于生产 cutover。
 2. `l2flow_ingress_service` 仍链接 `L2Flow::phase01`，四个
@@ -330,8 +336,8 @@ Local verification complete 改为完成。
    生成产物或 schema→generated-codec 一致性构建 gate。因此设计要求的
    “schema hash + golden bytes + generated codec 一起冻结”仍未满足。
 
-以上任一项存在时都不能声明 **Implementation complete**，也不能把
-`L2Flow::production` 切换到 Phase 2。
+因此在本记录日期不能声明 **Implementation complete**，当时也不能据此把
+`L2Flow::production` 切换到 Phase 2。后来的独立 alias 变更不改变本节的历史判定。
 
 ## Local verification complete 的明确阻断项
 
@@ -350,7 +356,7 @@ Local verification complete 改为完成。
 
 ## Phase 2 exit 的未执行外部条件
 
-以下条件均无可引用的验收制品，当前状态全部为**未完成**：
+以下条件在本记录日期均无可引用的验收制品，当时状态全部为**未完成**：
 
 - Phase 1 外部退出条件：真实四端点 login、required-subscription OK、首条真实
   required record、八小时 shadow、目标机 callback latency、真实 restart 和
@@ -429,15 +435,15 @@ LeakSanitizer。
 **5/5 passed**。`test_phase0_baseline` 单独执行仍按预期 fail-closed，而不是被
 跳过后宣称整个 93-test suite 全绿。
 
-Full CTest 中的 Phase 0 vendor baseline 仍受外部制品阻断：
-`mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 当前只有 134 bytes，内容是 Git LFS
+本记录执行的 Full CTest 中，Phase 0 vendor baseline 仍受外部制品阻断：
+`mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 当时只有 134 bytes，内容是 Git LFS
 pointer（其声明的真实 object size 为 242357680 bytes），不是可加载的 ELF shared
 object。该缺失不能通过放宽 ABI/baseline gate 或把 pointer 当成 SDK library 来
 规避；必须取得与 baseline 匹配的真实 vendor artifact 后重跑。
 
-上述本地修复与定向绿色结果仍不完成以下事项：
+截至本记录日期，上述本地修复与定向绿色结果仍不完成以下事项：
 
-- `L2Flow::production` 和 `l2flow_ingress_service` 尚未切换到 Phase 2，生产
+- 当时 `L2Flow::production` 和 `l2flow_ingress_service` 尚未切换到 Phase 2，生产
   service/controller、coordinator IPC、monitor、RunManifest 和四 ingress lifecycle
   仍未接入；
 - 真实四端点/交易时段 data plane、10,000 seeds、目标 NVMe、完整交易日、

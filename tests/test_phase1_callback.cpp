@@ -1,6 +1,7 @@
 #include "l2flow/ingress/callback_handler.h"
 #include "l2flow/sdk/vendor_head_view.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -16,6 +17,7 @@
 #include <vector>
 
 namespace ingress = l2flow::ingress;
+namespace canonical = l2flow::canonical;
 namespace ops = l2flow::ops;
 namespace mdl = datayes::mdl;
 
@@ -148,6 +150,41 @@ ingress::CallbackHandlerConfig HandlerConfig(
         20260717U,
         first_sequence,
     };
+}
+
+template <std::size_t Size>
+std::array<std::byte, Size> Pattern(std::uint8_t seed) {
+    std::array<std::byte, Size> value{};
+    for (std::size_t index = 0U; index < Size; ++index) {
+        value[index] = static_cast<std::byte>(
+            static_cast<std::uint8_t>(seed + index));
+    }
+    return value;
+}
+
+canonical::SourceFrontierConfigV1 FrontierConfig() {
+    canonical::SourceFrontierConfigV1 config;
+    config.source_stream_id = 1001U;
+    config.capture_date = 20260717U;
+    config.stream_day_id = Pattern<16U>(0x10U);
+    config.clock_epoch.algorithm = 1U;
+    config.clock_epoch.digest = Pattern<32U>(0x20U);
+    config.clock_epoch.label = 0x1234U;
+    config.writer_instance = Pattern<16U>(0x40U);
+    config.generation = 7U;
+    config.initial_state = canonical::SourceStateV1::kHealthy;
+    return config;
+}
+
+canonical::SourceFrontierV1 ReadFrontier(
+    TestContext* test,
+    const canonical::SourceFrontierPageV1& page) {
+    canonical::SourceFrontierV1 frontier;
+    test->Expect(
+        canonical::ReadSourceFrontierV1(page, &frontier) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "SourceFrontier page remains coherently readable");
+    return frontier;
 }
 
 struct Fixture {
@@ -454,6 +491,119 @@ void CheckStoppingAndQuiescence(TestContext* test) {
                  "quiescence succeeds after in-flight callback returns");
 }
 
+void CheckSourceFrontierCallbackContract(TestContext* test) {
+    const canonical::SourceFrontierConfigV1 frontier_config =
+        FrontierConfig();
+    canonical::SourceFrontierPageV1 success_page{};
+    test->Expect(
+        canonical::InitializeSourceFrontierPageV1(
+            frontier_config, &success_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "callback test initializes a real SourceFrontier page");
+
+    ingress::ByteRing success_ring(4096U, 256U);
+    DeterministicClock success_clock;
+    ops::FatalLatch success_fatal;
+    ingress::CaptureMetrics success_metrics;
+    ingress::CallbackHandlerConfig success_config = HandlerConfig();
+    success_config.source_frontier = &success_page;
+    success_config.frontier_writer_instance =
+        frontier_config.writer_instance;
+    success_config.frontier_generation = frontier_config.generation;
+    ingress::CallbackHandler success_handler(
+        success_config,
+        success_ring,
+        success_clock,
+        success_fatal,
+        success_metrics);
+    FakeMessage valid(
+        static_cast<std::uint8_t>(mdl::MDLSID_MDL_SHL2),
+        4U,
+        5U);
+    success_handler.OnMDLSHL2Message(&valid);
+
+    const canonical::SourceFrontierV1 success =
+        ReadFrontier(test, success_page);
+    test->Expect(
+        !success_fatal.tripped() &&
+            success_handler.captured_sequence() == 1U &&
+            success.captured_ingress_sequence == 1U &&
+            success.callback_inflight == 0U &&
+            success.callback_generation == 2U &&
+            success.source_state ==
+                canonical::SourceStateV1::kHealthy,
+        "successful callback publishes captured before clearing inflight");
+
+    canonical::SourceFrontierPageV1 invalid_page{};
+    test->Expect(
+        canonical::InitializeSourceFrontierPageV1(
+            frontier_config, &invalid_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "invalid-message frontier page initializes");
+    ingress::ByteRing invalid_ring(4096U, 256U);
+    DeterministicClock invalid_clock;
+    ops::FatalLatch invalid_fatal;
+    ingress::CaptureMetrics invalid_metrics;
+    ingress::CallbackHandlerConfig invalid_config = HandlerConfig();
+    invalid_config.source_frontier = &invalid_page;
+    invalid_config.frontier_writer_instance =
+        frontier_config.writer_instance;
+    invalid_config.frontier_generation = frontier_config.generation;
+    ingress::CallbackHandler invalid_handler(
+        invalid_config,
+        invalid_ring,
+        invalid_clock,
+        invalid_fatal,
+        invalid_metrics);
+    invalid_handler.OnMDLSHL2Message(nullptr);
+
+    const canonical::SourceFrontierV1 invalid =
+        ReadFrontier(test, invalid_page);
+    test->Expect(
+        invalid_fatal.reason() == ops::FatalReason::NULL_MESSAGE &&
+            invalid.captured_ingress_sequence == 0U &&
+            invalid.callback_inflight == 0U &&
+            invalid.source_state == canonical::SourceStateV1::kFatal,
+        "invalid callback cannot leave an apparently healthy frontier");
+
+    canonical::SourceFrontierPageV1 exception_page{};
+    test->Expect(
+        canonical::InitializeSourceFrontierPageV1(
+            frontier_config, &exception_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "unfinished-callback frontier page initializes");
+    ingress::ByteRing exception_ring(4096U, 256U);
+    ThrowingClock exception_clock;
+    ops::FatalLatch exception_fatal;
+    ingress::CaptureMetrics exception_metrics;
+    ingress::CallbackHandlerConfig exception_config = HandlerConfig();
+    exception_config.source_frontier = &exception_page;
+    exception_config.frontier_writer_instance =
+        frontier_config.writer_instance;
+    exception_config.frontier_generation = frontier_config.generation;
+    ingress::CallbackHandler exception_handler(
+        exception_config,
+        exception_ring,
+        exception_clock,
+        exception_fatal,
+        exception_metrics);
+    FakeMessage unfinished(
+        static_cast<std::uint8_t>(mdl::MDLSID_MDL_SHL2),
+        4U,
+        0U);
+    exception_handler.OnMDLSHL2Message(&unfinished);
+
+    const canonical::SourceFrontierV1 exception =
+        ReadFrontier(test, exception_page);
+    test->Expect(
+        exception_fatal.reason() ==
+                ops::FatalReason::CALLBACK_EXCEPTION &&
+            exception.captured_ingress_sequence == 0U &&
+            exception.callback_inflight == 0U &&
+            exception.source_state == canonical::SourceStateV1::kFatal,
+        "callback exiting without CompleteCaptured fail-stops the source");
+}
+
 }  // namespace
 
 int main() {
@@ -465,6 +615,7 @@ int main() {
     CheckReentryGate(&test);
     CheckOverflowAndSequenceExhaustion(&test);
     CheckStoppingAndQuiescence(&test);
+    CheckSourceFrontierCallbackContract(&test);
 
     if (test.failures != 0) {
         std::cerr << test.failures << " phase-1 callback test(s) failed\n";

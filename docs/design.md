@@ -1895,7 +1895,8 @@ V1 不公开 SH `queue_order_id/operator`。若以后取得规范，使用 `Snap
 
 ### 11.5 `QualityRecordV1` 与 `ControlRecordV1`
 
-二者均使用固定大小（建议 192 bytes）并带 `CanonicalHeaderV1`。
+二者均为固定大小并带 `CanonicalHeaderV1`：`QualityRecordV1` 为 192
+bytes，`ControlRecordV1` 为 256 bytes。大小是 frozen V1 ABI，不是建议值。
 
 `QualityPayloadV1`：
 
@@ -1969,7 +1970,17 @@ source/provenance
 
 这样每个 `(source_stream, family, shard)` 只有一个 writer。不同 ingress/normalizer 不会并发写同一文件。
 
-同一证券在 snapshot/tick family 中使用相同 shard。跨 family/cross stream 不存在隐式事务；需要组合时使用第 13 节的安全前沿和输入水位。
+同一证券在 snapshot/tick family 中使用相同 shard。对于同一 source 的同一条 Raw，
+Phase 5 bundle coordinator 会把跨 family/shard 输出组成显式逻辑事务，并以该 source
+的 `SourceFrontier.processed_*` 作唯一 commit 点；各 segment 仍是独立文件、独立
+mapping 和独立 writer。不同 source 之间不存在事务或交易所总序，需要组合时使用
+第 13 节的安全前沿和输入水位。
+
+当前 repository-local Canonical V1 是交易日 one-shot generation：coordinator 只允许
+fresh normalizer、zero processed frontier 和同一 generation 的 empty/open sinks 在
+日初 attach。它没有同 generation 的 segment rotation chain 或 normalizer checkpoint
+codec；每个 family/shard 的固定容量必须覆盖完整交易日，不能在中午换一个 segment
+后延续内存中的 sequence/phase 状态。
 
 ### 11.8 Canonical Segment Header
 
@@ -1978,10 +1989,12 @@ source/provenance
 ```text
 magic/version/family/record_size
 source_stream_id/shard/trade_date/origin_capture_date/origin_stream_day_id
+origin_source_writer_instance / origin_source_generation
 clock_epoch_algorithm / clock_epoch_digest / clock_epoch_label
 schema hash / dtype descriptor hash
 registry version/hash
 normalizer build/config hash
+canonical generation / segment sequence / capacity
 first/last shard_event_id
 first/last origin_wal_end_pos
 created/closed times
@@ -2015,30 +2028,72 @@ clock_epoch
 closed
 notify_epoch
 generation
+generation_fatal
 ```
 
-Writer：
+Writer 对一条 record 先校验固定 schema、segment identity、event-ID 和 Raw
+origin 单调性，再复制完整固定 record，最后通过 control-page seqlock/release
+publication 一次发布 `published_records`、last cursors 和 `notify_epoch`。futex
+只作延迟提示，reader 始终 acquire 轮询 control page。
 
-1. 写完整 payload；
-2. 写 header；
-3. release fence；
-4. 更新 `published_records`；
-5. 更新 last cursors；
-6. 增加 `notify_epoch` 并 futex wake。
+同一 source 的一条 Raw 可能跨多个 family/shard 产生 bundle。各配置 sink 是由
+调用方分别持有的独立 segment writer；运行时先对该 source 的全部 configured sink
+做完整预检（包括本条没有 record 的 sink）。`SourceFrontier` 在这里仅证明 append
+high-water prefix；它不能证明中间 `(ingress, WAL)` 是真实 Raw record boundary，也
+不能把 cursor 与传入内容绑定。mandatory market/control envelope verifier 必须先向
+已排序 feeder 或 validated Raw reader 认证 exact next record 和完整 immutable
+`Process*` envelope，重复 frontier 大小比较不构成验证。随后才依 transaction 顺序
+发布全部 routed record，独立重算 publication receipt，提交 normalizer 状态，推进
+全部 configured sink 的 processed Raw cursor，最后推进
+`SourceFrontier.processed_*`。这个
+SourceFrontier 更新是该 source 跨 family/shard 的唯一逻辑提交点；它不构成跨 source
+事务。物理 `published_records` 不能单独作为 factor/mux 可见性证明。进入发布阶段
+后的任一失败先把 SourceFrontier sticky FATAL 作为全局撤销锚点，再 fail-stop
+normalizer 并向所有 configured segments fan-out `generation_fatal`。全局 processed cursor 即使保留旧数值也不继续授权旧
+数据：committed reader/safe mux 拒绝该 generation 的全部记录，包括故障前已提交的
+前缀；fatal segment 也拒绝 Seal。
 
-Reader acquire 读取 published count，只访问已发布范围。通知可以丢失，正确性依赖 cursor 轮询而不是通知次数。
+Coordinator 在日初要求 exact complete route manifest：Snapshot/Tick 每个 configured
+shard 各一个 sink，Quality/Control 各且仅有 shard 0。缺失、重复、越界 route 不能等到
+对应消息第一次出现才发现。safe mux 的每个 required input 还必须持有 borrowed live
+SourceFrontier page 并在决策时复读；saved healthy snapshot 不是 revocation proof。
+committed view/READY 是点时授权，consumer 必须按 generation 标记派生状态并在后续 live
+FATAL 时整代丢弃。
+
+底层 reader acquire 读取 published count，只访问物理已发布范围。供 factor/mux
+使用的 committed reader 还必须校验完整 capture/stream-day/Raw writer/source
+generation/clock identity，并只返回被 SourceFrontier processed ingress+WAL 前缀
+覆盖的 record。通知可以丢失，正确性依赖 cursor 轮询而不是通知次数。
 
 ### 11.10 Canonical 恢复与保留
 
-Canonical 是派生层：
+Canonical 是派生层。当前 repository-local V1 的恢复边界刻意窄于未来完整的
+rotation/checkpoint 设计：
 
-- open segment crash 后丢弃未发布尾部；
-- sealed segment 有 manifest/hash；
-- schema 变更从 Raw 重新生成；
-- 不需要像 Raw 一样每批 `fdatasync`；
-- retention 至少覆盖最慢允许 consumer 的离线时长；
-- 删除前确认 Parquet 已发布、consumer 已越过、Raw 仍在保留期；
-- 任何重建输出写入新 generation，完成 hash 后原子切换 manifest。
+- 任一 open segment crash、任一 generation-fatal latch 或 bundle 部分发布都使整个
+  Canonical generation 不可消费；故障前已 committed 的局部前缀也不保留为可读代；
+- V1 不恢复、截断或续写一个看似连续的局部尾部，也不从 last sealed/processed cursor
+  恢复 normalizer；该 cursor 没有保存 all-day vendor/exchange guard 和 SH phase map；
+- `InspectCanonicalSegmentForRecoveryV1` 只读验证 sealed segment header 与两个 hash
+  （manifest 需调用方另行校验），或对 open segment 返回
+  `kUnsealedDiscardWholeGeneration`；它不执行删除、截断、修复、rotation、重放或
+  generation 切换；
+- crash/fatal 后由上层创建新的 SourceFrontier page 和 Canonical generation；在单一
+  Raw-writer/clock identity 内，以 fresh normalizer/empty sinks 从交易日日初 Raw
+  顺序重放，旧 event ID、segment 和 processed cursor 不能移植到新代；跨 identity/
+  clock 的全天重建需要 Local V1 未实现的 generation-chain/state transition；
+- fixed-capacity sinks 必须按完整交易日 sizing。Local V1 不支持午夜/中午原地
+  rotation，不存在 normalizer checkpoint 快速恢复路径；增加这些能力需要新的、经
+  评审的 generation/manifest/state-checkpoint 协议；
+- clean Seal/只读 inspection 不等于可以在同 generation attach 下一段；
+- 单 segment Seal 只验证本地 header/records/hash，不证明 SourceFrontier caught-up、
+  normalizer idle 或 sibling family/shard cursor 一致，不能充当 generation cutover
+  certificate；
+- 日内 clock epoch/Raw writer generation 变化没有同代连续路径，Local V1 需要新
+  generation 并从交易日日初重放；
+- schema 变更同样从交易日日初 Raw 生成新 generation；
+- Canonical 不需要像 Raw 一样每批 `fdatasync`，retention 仍须覆盖最慢 consumer 的
+  离线时长；删除前确认 Parquet 已发布、consumer 已越过且 Raw 仍在保留期。
 
 ---
 ## 12. Latest State 共享内存
@@ -2265,6 +2320,7 @@ source_stream_id
 capture_date
 stream_day_id
 clock_epoch_algorithm / clock_epoch_digest / clock_epoch_label
+writer_instance
 generation
 captured_ingress_sequence
 append_ingress_sequence
@@ -2273,30 +2329,62 @@ append_global_wal_pos
 processed_global_wal_pos
 last_appended_recv_monotonic_ns
 safe_processed_frontier_ns
-callback_inflight
-source_state                 # HEALTHY/DISCONNECTED/FATAL/RECOVERING
+callback_inflight              # uint64 活跃 callback 计数，不是 bool
+callback_generation            # callback entry/complete 单调变迁计数
+progress_generation            # state/quality/cursor/time 的 seqlock generation
+source_state                   # HEALTHY/DISCONNECTED/FATAL/RECOVERING
 quality_flags
 ```
 
-Normalizer 只有在已处理到一次 acquire 观察到的 append cursor 后，才更新 processed cursor。
+每个 4096-byte page 在全零状态只初始化一次，并永久绑定一个 immutable
+`writer_instance/generation`；不能在原 page 上换代。callback gate、append、processed
+和 source-state mutation 都必须携带 expected writer/generation，旧 owner 的调用会被
+fence。`progress_generation` 使 state/quality 与 cursor/time 成为同一稳定 snapshot；
+FATAL 另有 monotonic latch，即使 seqlock 更新失败也不能丢失，且一旦置位就禁止恢复
+HEALTHY 或继续 append/processed progress。
+
+这里的 append cursor 只证明高水位 prefix，不证明任意中间 `(ingress, WAL)` tuple 是
+真实 record boundary，更不证明某个 decoded object 来自该 Raw。Normalizer runtime
+只有在 mandatory envelope verifier 向 feeder/validated Raw reader 验证 exact next
+record 和完整 immutable content 后才能处理；处理并发布 bundle 后才更新 processed
+cursor。Factor 侧 committed reader 的 coverage 检查是消费 gate，不能替代注入侧的
+envelope 验证。
 
 低流量时使用双读 quiescence 推进 idle frontier：
 
 ```text
-1. acquire 读取 captured1, append1, processed1, inflight1
+1. acquire 读取完整 identity（含 writer_instance/generation）、captured1,
+   append1, processed1, inflight1, callback_generation1
 2. 要求 captured1 == append1 == processed1 且 inflight1 == 0
 3. t = CLOCK_MONOTONIC_RAW now
-4. acquire 再读 captured2, append2, inflight2
-5. 要求 captured2==captured1、append2==append1、inflight2==0
-6. 发布 safe frontier = t
+4. acquire 再读完整 identity、captured2, append2, processed2, inflight2,
+   callback_generation2
+5. 要求 identity 完全相同、captured/append/processed/WAL progress 与
+   last-appended receive time 全部不变、
+   inflight2==0 且 callback_generation2==callback_generation1
+6. 再确认页仍是同一 identity/HEALTHY 后发布 safe frontier = t
 ```
 
-Callback 在取得 gate 后、取接收时间前先置 `callback_inflight=true`。因此：
+`safe frontier` 是 **exclusive 时间边界**：它只证明后续尚未见事件的
+`recv_monotonic_ns >= t`，因此已证明完整的时间区间是 `< t`。由于
+`CLOCK_MONOTONIC_RAW` 不保证相邻读取取得严格递增的纳秒值，不能把
+`safe_frontier == candidate.time` 当作已经越过该候选；否则可能漏掉同时间戳但
+tie-break 更小的后续事件。
+
+Callback 在取得 gate 后、取接收时间前先递增 `callback_inflight`，并在 entry 与
+exit 各递增一次 `callback_generation`（成功 exit 先发布 captured progress）。后者
+使双读能够识别两次观察之间发生的 `inflight: 0→1→0`，避免只看计数首尾相等产生
+ABA。因此：
 
 - 在 t 前开始的 callback 会被第二次检查观察到；
 - 第二次检查后才开始的 callback 取到的 monotonic 时间不小于 t；
 - captured/append/processed 不相等时不能 idle 推进；
-- `DISCONNECTED/FATAL` 不能发布“healthy idle frontier”。严格因子阻塞；允许降级的因子可在超时后输出并带质量位。
+- `DISCONNECTED` 不能发布“healthy idle frontier”；严格因子阻塞，允许降级的因子可按
+  独立策略处理；
+- `FATAL` 不只是阻塞未来推进，而是使相应 Canonical generation 整代不可消费，safe
+  mux 不能继续输出此前 committed 的旧前缀；required mux input 必须复读 live page，
+  不能复用旧 healthy snapshot。已经返回的 view/READY 仍只是点时证明，factor state
+  必须 generation-tag 并在后续 FATAL 时取消。
 
 ### 13.5 Mux 无前视算法
 
@@ -2313,8 +2401,8 @@ Callback 在取得 gate 后、取接收时间前先置 `callback_inflight=true`�
 
 ```text
 对所有其他 required input：
-  已有 next event 且 next.recv_monotonic_ns >= c.time
-  或其 healthy safe frontier >= c.time
+  已有 next event，且按完整候选键参与全局最小值比较
+  或其 healthy safe frontier > c.time
 ```
 
 若 clock epoch 不同：
@@ -2324,7 +2412,10 @@ Callback 在取得 gate 后、取接收时间前先置 `callback_inflight=true`�
 - 禁止比较两个 epoch 的数值大小；
 - 输出带 `CLOCK_EPOCH_CHANGED`。
 
-`SNAPSHOT_ASOF_TICK` 使用相同证明：当 snapshot 输入的 next 时间或 safe frontier 不早于 tick 时，才确认不存在更早未处理 snapshot，然后选择 `snapshot.recv_monotonic_ns <= tick.recv_monotonic_ns` 的最新记录。
+`SNAPSHOT_ASOF_TICK` 使用相同证明：只有 snapshot 输入的 next 时间严格晚于
+tick，或其 exclusive safe frontier 严格大于 tick 时间，才确认不存在时间
+`<= tick.recv_monotonic_ns` 的未处理 snapshot，然后选择其中最新记录。next
+snapshot 与 tick 同时间时必须先消费该 snapshot，不能先放行 tick。
 
 ### 13.6 Worker 拓扑
 
@@ -2337,6 +2428,10 @@ factor-worker-15 -> instrument_id % 16 == 15
 ```
 
 一个 worker 可消费四个 source stream 中属于同一逻辑 shard 的相关 family。同一证券的可变因子状态只由一个 worker 所有，因此无需 per-instrument mutex。
+
+这里描述的是目标 Phase 7 factor worker。正式 live 路由中的
+`InstrumentHistoryRuntimeV1` 也使用 16 个 logical shard，但它的 physical worker
+只追加 decoded history，不执行 FactorSpec/plugin；两类 worker 不得混称。
 
 横截面计算独立进程，按 100 ms/1 s 等截面周期从 Latest Factor/Latest State 批量读取，不能将所有逐笔汇入一个全局 Python 锁。
 
@@ -2788,18 +2883,25 @@ SPSC consumer；它们都从 append-visible Raw live tail 读取。
 
 ### 15.3 Normalizer 恢复
 
+Repository-local Canonical V1 没有 normalizer checkpoint codec、segment rotation chain
+或同 generation 中午 attach。恢复不得从旧 processed cursor 继续，因为它
+不足以重建 all-day vendor/exchange sequence guard 和 SH phase map。当前唯一
+允许的路径是：
+
 ```text
-1. 校验 Canonical manifest/schema/registry
-2. 删除或截断未发布 open segment 尾部
-3. 从 last sealed/processed origin_wal_end_pos 读取 Raw
-4. 顺序重放 API/SYS，恢复 connection/subscription epoch
-5. 顺序重放 market records
-6. 重建 sequence guard 和 quality scope
-7. 追到当前 append cursor
-8. 进入 LIVE tail
+1. 将 crash/unsealed/generation-fatal 的旧 Canonical generation 整代分类为不可消费
+2. 创建新 writer/source generation 的 one-shot SourceFrontier page
+3. 创建新 Canonical generation、fresh normalizer 和全部 empty fixed-capacity sinks
+4. 校验 schema/dtype/registry/normalizer build+config/clock 与 Raw namespace
+5. 从交易日 Raw 起点顺序重放 API/SYS，恢复 authoritative epoch
+6. 从同一日初顺序重放 market，重建 sequence guard、quality scope 和 SH phase
+7. 追到当前 append high-water；每条仍由 mandatory envelope verifier 验 exact record/content
+8. 经新 generation manifest/cutover 的独立评审流程后才能进入 LIVE tail
 ```
 
-Normalizer 必须能够从交易日 Raw 起点完整重建 authoritative epoch；checkpoint 只是加速。Checkpoint 与完整重放的 control/sequence state hash 必须一致。
+Local V1 不能把 checkpoint 宣称为“只是加速”，因为该 codec 尚未存在。未来若
+增加 checkpoint/rotation，必须冻结完整 state identity/hash 并证明与日初全量重放
+一致，不能在 V1 文档中预先宣称已具备。
 
 ### 15.4 Latest State 恢复
 
@@ -2807,14 +2909,18 @@ Normalizer 必须能够从交易日 Raw 起点完整重建 authoritative epoch�
 load latest-state checkpoint
 validate schema/registry/config/hash
 restore per-source cursors
-replay SnapshotRecord to current published cursor
+replay SnapshotRecord from its exclusive cursor to the fixed published cursor
+replay TickQuality from its independent exclusive cursor when that family is in state
 publish RECOVERING slots
-hash verify
+verify the logical hash over authoritative Snapshot state and retained TickQuality lineage
 atomic state generation switch
 mark LIVE
 ```
 
-若 checkpoint 不可用，从当日 Snapshot Canonical 或 Raw 重建。Tick 流不参与权威盘口恢复。
+若 checkpoint 不可用，从当日 Canonical（必要时由 Raw 隔离重建）全量恢复。
+Snapshot 重建权威盘口；Tick 不提供权威盘口值，但 Phase 6 slot 若包含独立的
+TickQuality lineage/cursor/quality，则必须按该独立 cursor 同步重放并纳入最终 logical
+hash，不能因其不是权威盘口而省略。
 
 ### 15.5 Factor 恢复
 
@@ -6388,6 +6494,12 @@ Power-loss/重启证据分开：
 
 ### Phase 5：Sequence Guard、Canonical Log 与 Source Frontier
 
+Repository-local Phase 5 API 本身只是 library/runtime slice，不因单元测试而自动
+成为 production cutover。当前独立授权的 `l2flow_production` 已把其中的
+Canonical runtime 接入 fresh live Raw 链路，`L2Flow::production` 也已指向该组合；
+Raw WAL/journal 仍是唯一持久化与 replay authority。这项组合变更不追溯性满足
+Phase 5 external exit。
+
 #### 实施
 
 1. vendor sequence state；
@@ -6395,25 +6507,47 @@ Power-loss/重启证据分开：
 3. SZ 6.33+6.36 unified ApplSeqNum；
 4. duplicate fingerprint/poison scope；
 5. CanonicalHeader/Tick/Snapshot/Quality/Control；
-6. mmap writer/control page/manifest；
+6. mmap writer/control page/descriptor；generation manifest/cutover 仍是外部 gate；
 7. 16 shard router；
-8. source frontier 和 idle double-read；
+8. 一个 writer/generation 一页、one-shot 初始化、sticky FATAL 的 source frontier
+   和 idle double-read；
 9. clock epoch barrier；
-10. safe mux/snapshot-asof C++ helper。
+10. safe mux/snapshot-asof C++ helper；
+11. market/control 共用的 bundle coordinator、独立 publication receipt；
+12. segment 全 bundle preflight、normalizer/source fail-stop；
+13. SourceFrontier-gated committed reader，阻止跨 family 半 bundle 可见；
+14. mandatory market/control envelope verifier：frontier 只证明 append prefix，exact
+    Raw boundary 与完整 immutable content 由 feeder/validated Raw reader 证明；
+15. 日初 fresh normalizer + empty sinks 的 fixed-capacity one-shot Canonical
+    generation；完整 Snapshot/Tick-per-shard + Quality/Control-shard0 route
+    manifest；Local V1 无原地 rotation/checkpoint/中午续接。
 
 #### 测试
 
-- first/midday start；
+- sequence policy 的 configured-first/unknown-prefix（含中途首次 observation）；这不表示
+  coordinator 可在中午 attach；
 - exact duplicate/conflict/gap/backward；
 - connection epoch 不重置业务 sequence；
 - SZ 两消息交叉序列；
 - Canonical struct size/alignment/dtype hash；
 - single writer enforcement；
-- crash open segment recovery；
+- crash/open segment 的只读 inspection 与整 generation discard classification；
 - callback 在 idle frontier 两次读取之间开始的所有 interleaving；
 - source disconnected/fatal 不发布 healthy frontier；
+- SourceFrontier 中间 cursor 不能伪装 exact Raw boundary，envelope/content mismatch
+  fail-closed；
 - tie-break 稳定；
-- clock epoch 不可比较。
+- clock epoch 不可比较；
+- Quality+Tick 跨 family bundle 在 global processed commit 前均不可见；
+- 容量不足在首个 publish 前可回滚；固定容量必须覆盖整日，不得
+  以未实现的中途 rotation 作为容量策略；
+- 部分 publish 后所有 segment generation-fatal，整代（包括旧 committed
+  prefix）对 committed reader/mux 不可见，且不可 Seal；
+- API/SYS Control 与 market 使用同一 event-ID/segment/frontier transaction；
+- exact Raw writer/generation、stream day、capture day、clock 和 WAL coverage；
+- crash/fatal 后在单一 Raw-writer/clock identity 内使用新 Canonical generation 从
+  交易日 Raw 起点重放，不从旧 processed/sealed cursor 恢复 normalizer state；跨
+  identity/clock 的 generation chain 仍属外部 gate。
 
 #### 性能
 
@@ -6425,9 +6559,14 @@ Power-loss/重启证据分开：
 #### 退出条件
 
 - 完整日 live/replay Canonical hash 一致；
+- 真实进程 crash/SIGKILL 矩阵的整代丢弃+日初新代重放证据；
 - fault injection 的质量 scope 与预期一致；
 - receive-time mux 多次重放顺序 hash 一致；
-- 无 multiwriter segment。
+- 无 multiwriter segment 与 production feeder/envelope-verifier wiring 证据；
+- 目标机 2×/5×、mmap publish→reader p99、RSS/page-fault/NUMA 报告。
+
+上述外部制品尚未完成；本地定向测试不能替代它们。本次 production alias 与正式
+live 路由切换是单独授权的部署变更，不能据此把 Phase 5 external exit 写成完成。
 
 ### Phase 6：Latest State 与当前行情 API
 
@@ -6542,6 +6681,19 @@ trade intensity
 - 随机选取历史 factor 行可回溯全部输入；
 - 24 小时查询/compaction 压力不影响 ingress SLO；
 - 删除 dry-run 清单无活跃引用。
+
+当前工作树提供独立的 repository-local Phase 8 Python 构造切片：真实 PyArrow
+Parquet、immutable manifest/CURRENT CAS、persistent watermark sidecar、bounded
+hot/cold merge、lineage、retention dry-run，以及 cold-start/isolated-rebuild
+计划与证书。它没有接入默认四路 ingress；上述完整日 lineage、24 小时目标机压力和
+生产引用/审批清单仍未完成，不能由本地单元测试替代。具体边界见
+[`decisions/phase8.md`](decisions/phase8.md) 与
+[`acceptance/phase8-local.md`](acceptance/phase8-local.md)。
+
+该本地 V1 的 manifest successor 为 append-only，未实现 root rotation/compaction；
+PyArrow 的标准 row-group statistics 也不等同于 14.4 所要求的完整 typed
+statistics/set-hash/quality-aggregate contract。生产部署还需外部 publication-epoch
+切换与退役协议，并补齐可验证的 pruning metadata 后，才能声称对应设计项完成。
 
 ### Phase 9：生产 Shadow、切换与回滚
 

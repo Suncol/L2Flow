@@ -1,8 +1,10 @@
 # L2Flow
 
-L2Flow provides a local, DataYes C++ SDK-compatible Level-2 market-data mock for
-load, concurrency, and failure-path testing when a real DataYes feed is not
-available.
+L2Flow contains a DataYes C++ SDK-compatible Level-2 market-data mock and a
+Linux production data path for four real market-data sources.  The production
+path captures Raw WAL in source order, performs control/market decoding and
+Canonical commit, then distributes owned decoded events to fixed instrument
+workers for in-process history queries.
 
 The mock deliberately separates two kinds of compatibility:
 
@@ -13,13 +15,13 @@ The mock deliberately separates two kinds of compatibility:
   code-valued fields are synthetic. They are not exchange-certified data and
   must not be used to validate trading decisions or regulatory logic.
 
-The public API is declared in
+The mock public API is declared in
 [`include/l2mock/l2_mock.h`](include/l2mock/l2_mock.h). The supplied DataYes SDK
 version is `2.13.234` (`MDL_VERSION == 213234`).
 
-## Production Phase 0–1 ingress
+## Legacy Phase 0–1 four-process Shadow ingress
 
-The repository also contains the first two production phases described in
+The repository retains the first two ingress phases described in
 [`docs/design.md`](docs/design.md):
 
 - an immutable SDK-header archive baseline, bounded sealed shared-library
@@ -41,6 +43,10 @@ mdl-ingress-sh-tick       required 4.24
 mdl-ingress-sz-snapshot   required 6.28; optional 6.29
 mdl-ingress-sz-tick       required 6.33 and 6.36 on one Subscriber
 ```
+
+These `mdl-ingress-*` programs still execute the legacy
+`IngressApp -> ShadowCaptureWriter` path.  The formal four-source aggregate
+entry is the separate `mdl-production-router` described below.
 
 `6.53 CombinedTick` is explicitly forbidden as a core subscription. The
 executables do not have a link-time dependency on `libmdl_api.so`; they open a
@@ -131,10 +137,9 @@ control-plane and Raw-plumbing check. A nonzero minimum during an active
 trading session is required for real market-data evidence.
 
 This probe is intentionally isolated from the production Raw namespace. It
-does not provision the reserve coordinator, publish production manifests or
-certificates, exercise rotation, or change `L2Flow::production` from the
-Phase 0–1 service. Its success is therefore live capture-path evidence, not a
-Phase 2 production cutover or full exit claim.
+does not provision the reserve coordinator, publish a `ProductionRoute`, or
+exercise the four-source aggregate. Its success is therefore live
+capture-path evidence, not formal production-router or full-exit evidence.
 
 Tokens are accepted only from a named systemd credential or an explicit
 root-owned `0400` file; there is no token command-line option. Endpoint
@@ -188,6 +193,421 @@ the fixed-body minimum and every dynamic string/list range in each required
 core record, but does not claim business-semantic decoding. See
 [`docs/decisions/phase01.md`](docs/decisions/phase01.md) and the current
 [`local acceptance record`](docs/acceptance/phase01-local.md).
+
+## Formal four-source production router
+
+`L2Flow::production` now aliases `l2flow_production`.  The executable
+`mdl-production-router` owns all four fixed sources in one process:
+
+```text
+four SDK callbacks -> four Raw WAL writers
+  -> four source-order control/market/Canonical pipelines
+  -> one fixed-shard InstrumentHistoryRuntimeV1
+  -> one owner-liveness-bound ProductionRoute
+```
+
+Each source is decoded by one thread before instrument fan-out.  This is
+required for the stateful Shanghai 4.24 decoder.  After Canonical commit,
+`instrument_id % 16` selects an immutable logical shard; 1–16 physical workers
+own those shards.  Per-source dense dispatch tickets allow workers to finish
+out of order while queries expose only a continuously acknowledged source
+prefix.  `Latest`, `Tail` and `RangeBySourceSequence` are scoped to one
+instrument, source and snapshot/tick lane.  They do not claim a four-source
+total order.
+
+The in-memory value is the owned Phase-4 decoded event admitted only after its
+Canonical bundle commits; it is not a copy of the Canonical record.  In
+particular, Canonical-only SH phase attribution, sticky sequence-quality flags
+and Canonical event IDs are not injected back into history.  Factors needing
+those fields must consume or join the committed Canonical projection.
+
+The V1 route is deliberately fresh-only.  It requires four exact
+SCAFFOLDING registrations, next Raw sequence 1, genesis control state, empty
+Canonical sinks and empty history.  It does not attach recovered or already
+ACTIVE Raw streams, perform exchange-level replay, rotate Canonical capacity,
+or run Latest State/factor/Parquet services.
+
+The deployment entry reads only the hash-pinned fixed manifest
+`production-v1.tsv` from a private deployment directory:
+
+```bash
+./build/mdl-production-router \
+  --deployment-dir /absolute/private/deployment \
+  --manifest-sha256 <64-lowercase-hex> \
+  --check
+
+./build/mdl-production-router \
+  --deployment-dir /absolute/private/deployment \
+  --manifest-sha256 <64-lowercase-hex>
+```
+
+Start from [`configs/production-v1.example.tsv`](configs/production-v1.example.tsv),
+copy it to the deployment directory as `production-v1.tsv`, replace every
+placeholder and every sample path, name, hash, identity, date, device,
+generation, capacity and timeout, then set the file mode to `0600`.  The checked-in values are a
+parser-valid syntax fixture, not production sizing recommendations.  Compute
+the command-line pin from the final exact bytes with
+`sha256sum production-v1.tsv`; the credential token belongs only in the
+separate `0400` credential file.
+
+`--check` validates the manifest and non-mutating deployment prerequisites; it
+does not load vendor code, acquire SourceFrontier roles, register/mutate Raw
+SCAFFOLDING, create Canonical files or publish a route.  Normal mode performs
+the fresh composition and publishes Active only after all four control,
+durability and history barriers pass.  Cross-process consumers must use
+`ReadLiveProductionRouteV1At()` and retain/revalidate its owner guard; a static
+Active manifest alone is not liveness evidence.
+
+To close the SDK-log path/occupancy race, preflight temporarily takes the
+nonblocking flock on each pre-existing, read-only SDK-log directory marker.
+`--check` releases those four leases on exit; normal mode retains and moves the
+same leases into the four source lifetimes without reopening their paths.
+
+The check also requires the five fixed route/owner artifacts and every
+deterministic target for this generation (four Raw stream directories, four
+SourceFrontier files, and every Canonical segment, manifest and manifest
+temporary) to be absent at that instant.  This is an early read-only
+diagnostic, not an authority claim: each creator still uses its final
+exclusive/identity gate, and route publication repeats its absence proof under
+the process gate and directory lock immediately before creating owner evidence
+and Active.
+
+`history.maximum_records_per_query` is a hard per-call work/output limit for
+`Tail` and `RangeBySourceSequence`; an oversized request is rejected before it
+takes a shard lock or allocates its result.  Full immutable chunks are pinned
+under the lock and traversed after unlocking, so a large permitted query does
+not hold the append worker's shard lock for its complete traversal.
+
+The manifest's four `metrics_path` values currently participate in Raw stable
+configuration hashing and path-separation checks only.  This aggregate entry
+does not start a `MetricsWorker` or publish those textfiles yet.
+
+The same aggregate entry treats `credential_name` as a validated stable
+identity label; the actual SDK token is read from the separately pinned
+`credential_path`.  `raw.ring_stall_budget_seconds`,
+`raw.reserve_domain_id`, `raw.reserve_coordinator_socket`,
+`raw.reserve_ack_timeout_milliseconds`, and `raw.emergency_reserve_bytes` are
+also validated and committed to each source's stable Raw configuration hash,
+but this entry does not start a socket reserve client or a separate ring-stall
+timer from those fields.  Reserve authority is instead attached through the
+already-provisioned coordinator rooted at the retained Raw directory.
+
+The four `scaffolding_allocation_cap` and `safe_stop_template_id` values are
+deployment identity assertions, not knobs which provision or resize the
+reserve coordinator.  Normal startup requires the already-provisioned
+coordinator's four fresh SCAFFOLDING entries to match them exactly, including
+route, stream-day, writer and recovery-attempt identities.
+
+Raw creation and runtime descendants are anchored to the same retained Raw
+root directory fd used by the coordinator; the configured pathname is not
+reopened.  Canonical sink creation and manifest sealing are likewise anchored
+through the retained Canonical directory fd.  Immediately before fresh
+owner/Active publication, the controller
+reopens `route_root` and `canonical_root` and requires their owner, mode,
+device and inode to match the retained directories.  Deployments must still
+prevent later root replacement (normally by stable mounts/service-UID
+isolation); a process cannot make an arbitrary pathname immutable.
+
+`activation_timeout` starts only after all four capture `Start()` calls have
+returned.  The vendor `Connect()`/Shutdown APIs have no cancellation or
+completion bound, so a deployment requiring a hard deadline must use an
+external supervisor and eventually SIGKILL.  A forced exit is not a clean
+stop and requires a recovery/takeover workflow not implemented by this
+fresh-only V1.
+
+SIGINT/SIGTERM received during startup sets the service cancellation latch
+immediately, before waiting for a possibly blocked `Connect()`.  If startup
+does not first return an authoritative Active result, even a successful local
+cleanup does not make the already-created fresh namespace reusable: the
+process exits nonzero and requires reprovision or the separate recovery path.
+
+Normal mode creates fresh frontier/Canonical/Raw generation artifacts.  A
+failure after that mutation is fail-closed but is not rolled back or retried
+in place; the operator must use a newly provisioned generation or the separate
+recovery/takeover procedure.  Run `--check` first.
+
+The full ordering, capacity, route-liveness and real-feed test contract is in
+[`docs/decisions/production-instrument-runtime-v1.md`](docs/decisions/production-instrument-runtime-v1.md).
+
+## Phase 4 safe decoder and in-memory session slice
+
+The repository now also exposes `L2Flow::phase4` for the five core market
+messages.  This is a construction/library slice, not a production-alias
+cutover.  It deliberately does no CSV or WAL I/O: an existing feeder supplies
+one borrowed head/body view to `MarketSessionV1::Inject`, and the call decodes
+and owns all published fields before returning.
+
+The default retention policy keeps the complete configured trading-day
+session, subject to the aggregate `max_records` and `max_payload_bytes` hard
+admission limits across its four configured streams. Reaching either limit
+rejects the new event and poisons the source whose admission failed; old
+history is never silently overwritten. Four source histories remain separate
+because their TCP deliveries do not define a truthful cross-stream total
+order. Immutable snapshots can be read without holding the writer lock, and
+retained ticks use an exact-type compact owner instead of reserving the largest
+snapshot variant for every record.
+
+This Phase 4 injection seam is independent of Phase 5. `ProcessMarket` does
+not populate a `MarketSessionV1`; a feeder that wants both owned decoded
+history and Canonical output must fan out each source's already ordered input
+to `MarketSessionV1::Inject` and `CanonicalBundleCoordinatorV1::ProcessMarket`
+under an explicit caller-owned failure policy.
+
+That statement describes the standalone Phase 4/5 APIs.  The formal
+production path does not decode twice or populate `MarketSessionV1`:
+`ProductionSourcePipelineV1` decodes once in source order, commits Canonical,
+then transfers the owned event to `InstrumentHistoryRuntimeV1`.
+
+```bash
+cmake -S . -B build -DL2FLOW_BUILD_TESTS=ON
+cmake --build build --target l2flow_phase4
+ctest --test-dir build -L phase4 --output-on-failure
+```
+
+The detailed injection, ordering, ownership, retention, validity, and
+Phase-5-boundary rules are in
+[`docs/decisions/phase4.md`](docs/decisions/phase4.md).  The scoped evidence and
+remaining real-corpus/production gates are in
+[`docs/acceptance/phase4-local.md`](docs/acceptance/phase4-local.md).
+
+## Phase 5 canonical injection and committed memory view
+
+`L2Flow::phase5` accepts caller-fed records that are already ordered and covered
+by the feeder's append-visible Raw frontier. A `SourceFrontier` observation is
+only an append high-water proof: it does not prove that an intermediate
+`(ingress_sequence, WAL end)` pair is a real record boundary or that the bytes
+passed to the normalizer are that record. The coordinator therefore requires
+market and control envelope verifiers which authenticate the exact next Raw
+record and the complete immutable `Process*` input against the caller's feeder
+or validated Raw reader. Repeating the frontier comparison is not a valid
+verifier. Phase 5 does not tail Raw itself or create another CSV writer, Raw
+WAL, callback journal, or feeder checkpoint.
+`CanonicalBundleCoordinatorV1::ProcessMarket` decodes a borrowed market view
+into fixed Canonical records; `ProcessControl` puts an already decoded API/SYS
+control record into the same normalizer-owned event-ID transaction. These APIs
+do not implicitly append to Phase 4's independent session store. The caller
+also supplies and retains the distinct fixed-capacity memory-mapped Canonical
+segment sinks. The repository-local V1 coordinator attaches only at the day
+boundary to a fresh normalizer, zero processed frontier and empty sinks; those
+fixed capacities must cover the entire trading day. V1 has no in-place segment
+rotation chain, normalizer checkpoint codec, or midday continuation inside the
+same generation. Owned all-day decoded history, when required, is
+provided separately by Phase 4's `SessionRetentionModeV1::kFullSession`, whose
+aggregate record/logical-payload hard limits must be sized explicitly. Phase 5
+sequence/phase state is also all-day. Neither logical retention nor an mmap
+promises physical DRAM pinning.
+
+Vendor sequence identity is exactly `(capture_date, source_stream_id,
+stream_day_id, ServiceID, MessageID)`; service version, encoding, vendor local
+time and body are duplicate evidence. SH and SZ exchange identities are
+market-kind-specific `(trade_date, source_stream_id, channel)` scopes, with SZ
+6.33 and 6.36 sharing one unified channel guard. Reconnect and subscription
+epochs do not reset these scopes.
+
+Cross-family output uses one bundle protocol: preflight every sink, publish all
+records, independently verify the ordered receipt, commit normalizer state,
+advance every configured segment (including those with no record for this Raw),
+and update `SourceFrontier.processed_*` last.
+Coordinator creation requires a complete route manifest: one Snapshot and Tick
+sink for every configured shard, plus exactly one shard-0 Quality and Control
+sink; missing, duplicate, or illegal routes fail before day-start processing.
+Factor and mux readers use the committed-reader gate; a record that is
+physically present in one mmap but not covered by the exact Raw
+writer/generation processed prefix stays invisible. Any failure after the
+first publication first latches SourceFrontier FATAL as the global revocation
+anchor, then fail-stops the normalizer and every configured segment. The fatal
+latches are sticky: committed readers and safe mux reject the entire Canonical
+generation, including records that were committed before the fault, and a
+fatal segment cannot be sealed for reuse. Required mux inputs borrow and
+re-read the live frontier page; a saved healthy snapshot is not accepted as a
+fresh authorization. Returned mmap views and mux selections are point-in-time
+proofs, so consumers must generation-tag derived state and discard it on a
+later live FATAL.
+Recovery creates a new SourceFrontier page and new Canonical generation and
+replays Raw from the trading-day start when the replay remains inside one Raw
+writer/clock identity. Cross-writer or cross-clock full-day reconstruction
+needs an external generation chain/state transition that this local V1 does
+not implement. The Phase 5 library does not perform that recovery, rotation,
+checkpointing, or generation switch automatically.
+
+Each 4096-byte SourceFrontier page is initialized once for exactly one immutable
+Raw writer instance/generation. Callback, append, processed and state mutations
+carry the expected writer/generation fence; idle publication double-reads and
+rechecks the same immutable identity. A stale owner is rejected, and once FATAL
+is latched the page cannot return to a healthy state.
+
+```bash
+cmake -S . -B build -DL2FLOW_BUILD_TESTS=ON
+cmake --build build --target l2flow_phase5
+ctest --test-dir build -L phase5 --output-on-failure
+```
+
+The frozen schema, transaction boundaries and no-duplicate-persistence rule
+are recorded in [`docs/decisions/phase5.md`](docs/decisions/phase5.md). Local
+evidence and the still-external full-day live/replay, real crash matrix,
+repeated mux hash, target-host performance and single-writer gates are in
+[`docs/acceptance/phase5-local.md`](docs/acceptance/phase5-local.md). The
+`L2Flow::production` alias now selects `l2flow_production`, which connects this
+Canonical runtime to the fresh live path.  This independent deployment change
+does not retroactively complete the Phase 5 formal exit; a local unit-test pass
+is not full production qualification.
+
+## Phase 6–7 Latest State and factor-runtime slices
+
+`L2Flow::phase6` adds an opaque 4096-byte/64-aligned Latest State slot. All
+concurrent slot words are accessed through `__atomic` helpers and a C ABI
+seqlock; a complete validated Canonical Snapshot replaces the full payload in
+one publication, while tick quality keeps separate lineage and never changes
+snapshot quality. Registry/schema/generation identities are pinned, stale
+thresholds are caller-supplied per phase, and single/batch/market local queries
+read caller-owned mappings. The deterministic checkpoint codec restores only
+into an exact all-zero target generation. A durable marker requires a
+writer-quiesced common cut plus exact per-family Raw namespace barriers; both
+are caller assertions, not cryptographic Raw receipts.
+
+`L2Flow::phase7` adds the committed zero-copy Canonical batch reader, a
+C-compatible batch/mux/snapshot-as-of API, stable multi-input watermark
+identity, exact per-Raw-namespace durability checks, an opaque Latest Factor
+slot and a process-local append-only watermark table. `Peek` does not advance
+the exclusive-next cursor; `Commit` rechecks the live Phase 5 frontier so a
+later generation FATAL denies commit.
+
+The installable `python/l2flow_factor` package provides frozen FactorSpec
+hashing, exact Tick/Snapshot NumPy layouts, a leased read-only `MdlBatchView`,
+16-way instrument ownership, transactional plugin rollback/commit,
+incremental windows and bounded atomic checkpoints. Python does not recreate
+safe-mux logic: without a reviewed native adapter its mux seam fails closed.
+
+The five first-batch names exist only as explicit
+`PASSTHROUGH_PLACEHOLDER` implementations:
+
+```text
+book_imbalance
+microprice
+trade_imbalance
+cancel_rate
+trade_intensity
+```
+
+They return the exact original leased records while the batch context is
+active and always expose `factor_value=None` with
+`factor_value_valid=False`. They do not calculate or validate any factor
+formula and therefore do not satisfy the Phase 7 mathematical or full-day
+five-factor exit conditions.
+
+```bash
+cmake -S . -B build \
+  -DL2MOCK_BUILD_TESTS=OFF \
+  -DL2FLOW_BUILD_TESTS=ON
+cmake --build build --target l2flow_phase6 l2flow_phase7
+ctest --test-dir build -L 'phase6|phase7' --output-on-failure
+
+PYTHONPATH=python python3 -m unittest discover \
+  -s tests/python -p 'test_*.py' -v
+```
+
+The precise local contracts are in
+[`docs/decisions/phase6.md`](docs/decisions/phase6.md) and
+[`docs/decisions/phase7.md`](docs/decisions/phase7.md). Scoped evidence and
+the unfulfilled external exit gates are recorded in
+[`docs/acceptance/phase6-local.md`](docs/acceptance/phase6-local.md) and
+[`docs/acceptance/phase7-local.md`](docs/acceptance/phase7-local.md).
+Neither slice is wired into the formal production aggregate.  Its current
+derived-data endpoint is process-local instrument history, not a Latest State
+writer or Phase 7 factor executor.
+
+## Phase 8 historical-storage slice
+
+The optional `python/l2flow_history` package adds a repository-local Phase 8
+storage and orchestration slice. It writes actual Apache Parquet through
+PyArrow with ZSTD compression, preserves each complete Canonical V1 record as
+exact bytes plus checked header projections, and stores float64 factor history
+with explicit validity and implementation status. The five Phase 7 first-batch
+names in the current producer/catalog remain passthrough placeholders: a
+historical placeholder row cannot claim a valid mathematical value. The
+history package does not hard-code those five names as a universal registry;
+factor publication instead requires an explicit caller-validated group/catalog
+binding and persists its content hash. That trust marker is not a signature or
+independent catalog attestation; a production publisher must derive it from an
+authenticated factor registry rather than accepting arbitrary self-assertion.
+Publication indexes receipts once. A factor watermark route must resolve to one
+complete SourceNamespace before its non-overlapping `(begin,end]` cursor range
+is searched; repeated rows reuse one validated sidecar/coverage result. A
+both-zero cursor/WAL input uses receipts from that unique namespace only as
+route identity (and, when VISIBLE, as caller-validated common-cut identity); it
+does not claim positive range coverage.
+
+Final Parquet parts are immutable no-replace publications. Their complete-file
+SHA-256 lives in the external manifest, not recursively in their own footer.
+The manifest is a strict canonical-JSON hash chain with a flock-serialized
+`CURRENT` compare-and-swap. The local publisher validates real Parquet bytes
+and binds visible receipts to one caller-validated upstream common-cut
+identity; it does not itself verify a Phase 5 health/route certificate or a
+signature. Persistent factor lineage uses `(run_id,
+watermark_table_generation, watermark_set_id)` plus the stable input identity
+and a complete sidecar map.
+
+The manifest store accepts only a normalized absolute non-root path, resolves
+it without following any directory symlink, and pins that directory identity.
+Immutable publication requires Linux `renameat2(RENAME_NOREPLACE)` and fails
+closed when it is unavailable; there is no crash-unsafe link/unlink fallback.
+
+This V1 manifest is append-only: a successor retains every prior artifact and
+sidecar reference. The local package has no manifest-root rotation/compaction
+or destructive executor. A deployment must therefore bound each store as one
+publication epoch and perform any root switch, reader/writer fencing and old
+root retirement through a separately reviewed external lifecycle; until an
+old root has no manifest/query/replay/audit reference, retention rejects it.
+
+The query primitives securely read manifest-described files, merge one fixed
+cold snapshot with content-bound hot snapshots, and enforce cumulative
+row/source/logical-byte/result plus lineage-entry/lineage-byte/lineage-work
+budgets during merge. Factor lineage uses prevalidated sidecar maps, exact-route
+indexes and exact-namespace cursor lookup; nested evidence is not allocated
+until its entry and deterministic-byte reservation succeeds. Canonical
+ingress/WAL rectangles may still require a candidate scan, so every inspected
+candidate consumes the explicit work budget and checks the cooperative
+deadline. This is a hard worst-case cutoff, not a claim of pure logarithmic
+Canonical lookup. Each Parquet read also gates that one artifact's physical and
+footer-declared decoded bytes; separate reads do not share a PyArrow
+process-memory budget. Complete-key duplicate rows with conflicting stable
+content fail closed. PyArrow writes ordinary row-group
+statistics, but the local V1 contract neither persists nor validates the
+design's typed pruning summaries, set hashes or quality aggregations; its
+authoritative checks are the exact rows, sort endpoints and logical hash. The
+retention component only emits a deterministic,
+hashed dry-run plan after the six design conditions (seven explicit evidence
+checks, including sidecar reachability); it does not delete data. Recovery and
+schema-upgrade APIs similarly validate and emit plans/certificates for fresh
+isolated generations. They do not repair Raw, switch a deployed route or
+change the production alias.
+
+Retention snapshots are canonicalized and indexed once per plan; exact-scope
+consumer and reference checks are linear in total inventory plus evidence,
+apart from inventory sorting and each artifact's own bounded evidence. The hard
+caps remain rejection bounds, not recommended batch sizes.
+
+Phase 8 tests are opt-in because PyArrow is an optional dependency:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e './python[history]'
+
+cmake -S . -B build-phase8 \
+  -DPython3_EXECUTABLE="$PWD/.venv/bin/python" \
+  -DL2MOCK_BUILD_TESTS=OFF \
+  -DL2FLOW_BUILD_TESTS=ON \
+  -DL2FLOW_BUILD_PHASE8_PYTHON_TESTS=ON
+ctest --test-dir build-phase8 -L phase8 --output-on-failure
+```
+
+The precise contract and local evidence are in
+[`docs/decisions/phase8.md`](docs/decisions/phase8.md) and
+[`docs/acceptance/phase8-local.md`](docs/acceptance/phase8-local.md). The
+formal full-day lineage, 24-hour isolated query/compaction load and approved
+retention dry-run gates remain external evidence.  This Python/Parquet history
+package is distinct from, and not wired into, the C++ process-local
+`InstrumentHistoryRuntimeV1`.
 
 ## Build and run
 

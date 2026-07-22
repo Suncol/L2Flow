@@ -15,6 +15,23 @@
 
 namespace l2flow::ingress {
 
+// Immutable service-composition identity captured before RawIngressApp owns
+// its moved configuration.  The SourceFrontier pointer is an identity only;
+// callers cannot use this accessor to mutate app state.  A null page/zero
+// generation is valid for a standalone Raw runtime but is rejected by the
+// four-source ProductionServiceV1 composition gate.
+struct RawProductionCaptureBindingV1 final {
+    std::uint8_t source_slot = UINT8_MAX;
+    l2flow::sdk::IngressKind ingress_kind =
+        l2flow::sdk::IngressKind::ShSnapshot;
+    std::uint32_t source_stream_id = 0U;
+    std::uint32_t capture_date = 0U;
+    l2flow::common::Identity128 stream_day_id{};
+    l2flow::common::Identity128 writer_instance{};
+    std::uint64_t source_generation = 0U;
+    l2flow::canonical::SourceFrontierPageV1* source_frontier = nullptr;
+};
+
 enum class RawProductionRuntimeBlockerV1
     : std::uint8_t {
     kNone = 0U,
@@ -138,6 +155,27 @@ public:
         return *app_;
     }
 
+    // Fresh production composition needs a second, independent Raw
+    // single-consumer cursor for the source-order decode pipeline.  The
+    // readiness worker owned by RawIngressApp already consumes its own tail;
+    // sharing that cursor would violate RawLiveTail's single-consumer
+    // contract.  ActivateFreshRegistered() prepares this additional tail at
+    // the exact same authenticated header-only boundary.
+    //
+    // This is a one-shot ownership transfer.  The returned tail continues to
+    // borrow pipeline_live_tail_source_, so this runtime must outlive the
+    // ProductionSourcePipelineV1 which receives it.  Recovered/adopted
+    // runtimes do not manufacture this capability and return nullptr.
+    [[nodiscard]] std::unique_ptr<RawLiveTail>
+    TakeFreshPipelineLiveTail() noexcept;
+    [[nodiscard]] bool HasFreshPipelineLiveTail() const noexcept {
+        return pipeline_live_tail_ != nullptr;
+    }
+    [[nodiscard]] const RawProductionCaptureBindingV1& capture_binding()
+        const noexcept {
+        return capture_binding_;
+    }
+
 private:
     friend class
         RawExistingRouteProductionRuntimeFactoryV1;
@@ -145,11 +183,23 @@ private:
     RawProductionRuntimeV1(
         std::unique_ptr<RawLiveTailPosixSource>
             live_tail_source,
-        std::unique_ptr<RawIngressApp> app) noexcept;
+        std::unique_ptr<RawIngressApp> app,
+        RawProductionCaptureBindingV1 capture_binding) noexcept;
+
+    [[nodiscard]] bool InstallFreshPipelineLiveTail(
+        std::unique_ptr<RawLiveTailPosixSource> source,
+        std::unique_ptr<RawLiveTail> tail) noexcept;
 
     std::unique_ptr<RawLiveTailPosixSource>
         live_tail_source_;
+    // source_ is declared before tail_ so the local pending tail is destroyed
+    // first.  After TakeFreshPipelineLiveTail(), the service-level owner must
+    // preserve this runtime until its pipeline has stopped and been destroyed.
+    std::unique_ptr<RawLiveTailPosixSource>
+        pipeline_live_tail_source_;
+    std::unique_ptr<RawLiveTail> pipeline_live_tail_;
     std::unique_ptr<RawIngressApp> app_;
+    const RawProductionCaptureBindingV1 capture_binding_{};
 };
 
 // This is deliberately split into:
@@ -195,6 +245,31 @@ public:
         RawIngressAppOptionsV1 options = {},
         RawIngressLifecycleObserver*
             lifecycle_observer = nullptr,
+        std::string* error = nullptr) noexcept;
+
+    // Formal deployment entry. stable_raw_root is retained only as the
+    // already-hashed configuration identity; no filesystem operation resolves
+    // it. Every Raw mutation is rooted at retained_raw_root_fd, which must be
+    // the same inode retained by coordinator. The descriptor remains owned by
+    // the caller.
+    [[nodiscard]] static
+    RawProductionRuntimeBuildResultV1
+    ActivateFreshRegisteredAt(
+        int retained_raw_root_fd,
+        const std::string& stable_raw_root,
+        std::string_view stream_slug,
+        const RawReserveFreshScaffoldingV1& registration,
+        RawReserveRegistryCoordinatorV1& coordinator,
+        RawWalWriterConfig logical_writer_config,
+        RawPosixWalStreamBackendOptionsV1 backend_options,
+        RawSegmentArtifactOptionsV1 artifact_options,
+        RawWalStreamLimitsV1 stream_limits,
+        RawIngressAppConfigV1 config,
+        std::shared_ptr<l2flow::sdk::SdkFactory> sdk_factory,
+        std::unique_ptr<CaptureClock> clock,
+        RawLiveTailPosixLimitsV1 live_tail_limits = {},
+        RawIngressAppOptionsV1 options = {},
+        RawIngressLifecycleObserver* lifecycle_observer = nullptr,
         std::string* error = nullptr) noexcept;
 
     [[nodiscard]] static

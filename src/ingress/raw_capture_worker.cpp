@@ -39,13 +39,44 @@ RawCaptureWorker::RawCaptureWorker(
       ring_(ring),
       writer_(writer),
       record_(ring.max_body_bytes()) {
+    const bool frontier_enabled = config_.source_frontier != nullptr;
     if (config_.durable_interval_ns == 0U ||
         config_.durable_batch_bytes == 0U ||
+        config_.idle_heartbeat_interval_ns == 0U ||
         config_.failure_sink.callback == nullptr ||
         ring_.max_message_bytes() <
-            kVendorMessageHeadBytes) {
+            kVendorMessageHeadBytes ||
+        (frontier_enabled &&
+         (l2flow::common::IsZeroIdentity(
+              config_.frontier_writer_instance) ||
+          config_.frontier_generation == 0U ||
+          config_.source_frontier_busy_timeout.count() <= 0 ||
+          config_.source_frontier_busy_timeout > l2flow::canonical::
+              kSourceFrontierMaximumBusyTimeoutV1)) ||
+        (!frontier_enabled &&
+         (!l2flow::common::IsZeroIdentity(
+              config_.frontier_writer_instance) ||
+          config_.frontier_generation != 0U))) {
         throw std::invalid_argument(
             "invalid Raw capture worker configuration");
+    }
+    if (frontier_enabled) {
+        l2flow::canonical::SourceFrontierV1 frontier{};
+        const RawWalSinkIdentityV1 writer_identity = writer_.identity();
+        if (l2flow::canonical::ReadSourceFrontierV1(
+                *config_.source_frontier, &frontier) !=
+                l2flow::canonical::SourceFrontierErrorV1::kNone ||
+            frontier.writer_instance !=
+                config_.frontier_writer_instance ||
+            frontier.generation != config_.frontier_generation ||
+            frontier.source_stream_id != writer_identity.source_stream_id ||
+            frontier.capture_date != writer_identity.capture_date ||
+            frontier.stream_day_id != writer_identity.stream_day_id ||
+            writer_identity.writer_instance !=
+                config_.frontier_writer_instance) {
+            throw std::invalid_argument(
+                "Raw capture worker SourceFrontier identity mismatch");
+        }
     }
 }
 
@@ -387,6 +418,9 @@ RawCaptureWorker::MonotonicNowNs() const noexcept {
 }
 
 bool RawCaptureWorker::ConsumeRecord() noexcept {
+    if (!WaitForCapturedFrontier(record_.meta)) {
+        return false;
+    }
     const RawWalWriterSnapshot before = writer_.Snapshot();
     RawRecordLayoutV1 layout{};
     if (ComputeRawRecordLayoutV1(
@@ -450,6 +484,9 @@ bool RawCaptureWorker::ConsumeRecord() noexcept {
             RawCaptureWorkerFailureKind::kWriterAppend);
         return false;
     }
+    if (!PublishAppendFrontier(record_.meta, after.append)) {
+        return false;
+    }
 
     const std::size_t vendor_size =
         record_.head.size() + record_.body.size();
@@ -466,6 +503,135 @@ bool RawCaptureWorker::ConsumeRecord() noexcept {
         static_cast<std::uint64_t>(vendor_size),
         record_bytes,
         record_.meta.ingress_sequence);
+}
+
+bool RawCaptureWorker::WaitForCapturedFrontier(
+    const CaptureMetaV1& metadata) noexcept {
+    if (config_.source_frontier == nullptr) {
+        return true;
+    }
+    auto busy_deadline = std::chrono::steady_clock::now() +
+        config_.source_frontier_busy_timeout;
+    for (;;) {
+        l2flow::canonical::SourceFrontierV1 frontier{};
+        const auto error = l2flow::canonical::ReadSourceFrontierV1(
+            *config_.source_frontier, &frontier);
+        if (error == l2flow::canonical::SourceFrontierErrorV1::kBusy) {
+            if (stop_requested_.load(std::memory_order_acquire) ||
+                emergency_pause_requested_.load(std::memory_order_acquire) ||
+                emergency_abandon_requested_.load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= busy_deadline) {
+                static_cast<void>(l2flow::canonical::PublishSourceStateV1(
+                    config_.source_frontier,
+                    config_.frontier_writer_instance,
+                    config_.frontier_generation,
+                    l2flow::canonical::SourceStateV1::kFatal,
+                    0U));
+                Trip(
+                    RawCaptureWorkerFailureKind::kSourceFrontier,
+                    RawCaptureFatalSignal::kSourceFrontier);
+                return false;
+            }
+            std::this_thread::yield();
+            continue;
+        }
+        busy_deadline = std::chrono::steady_clock::now() +
+            config_.source_frontier_busy_timeout;
+        if (error != l2flow::canonical::SourceFrontierErrorV1::kNone ||
+            frontier.writer_instance !=
+                config_.frontier_writer_instance ||
+            frontier.generation != config_.frontier_generation ||
+            frontier.source_stream_id != metadata.source_stream_id ||
+            frontier.capture_date != metadata.capture_date ||
+            frontier.source_state ==
+                l2flow::canonical::SourceStateV1::kFatal) {
+            Trip(
+                RawCaptureWorkerFailureKind::kSourceFrontier,
+                RawCaptureFatalSignal::kSourceFrontier);
+            return false;
+        }
+        if (frontier.captured_ingress_sequence >=
+            metadata.ingress_sequence) {
+            return true;
+        }
+        if (stop_requested_.load(std::memory_order_acquire) ||
+            emergency_pause_requested_.load(std::memory_order_acquire) ||
+            emergency_abandon_requested_.load(
+                std::memory_order_acquire)) {
+            static_cast<void>(l2flow::canonical::PublishSourceStateV1(
+                config_.source_frontier,
+                config_.frontier_writer_instance,
+                config_.frontier_generation,
+                l2flow::canonical::SourceStateV1::kFatal,
+                frontier.quality_flags));
+            Trip(
+                RawCaptureWorkerFailureKind::kSourceFrontier,
+                RawCaptureFatalSignal::kSourceFrontier);
+            return false;
+        }
+        if (frontier.callback_inflight == 0U) {
+            static_cast<void>(l2flow::canonical::PublishSourceStateV1(
+                config_.source_frontier,
+                config_.frontier_writer_instance,
+                config_.frontier_generation,
+                l2flow::canonical::SourceStateV1::kFatal,
+                frontier.quality_flags));
+            Trip(
+                RawCaptureWorkerFailureKind::kSourceFrontier,
+                RawCaptureFatalSignal::kSourceFrontier);
+            return false;
+        }
+        std::this_thread::yield();
+    }
+}
+
+bool RawCaptureWorker::PublishAppendFrontier(
+    const CaptureMetaV1& metadata,
+    const RawWalCursor& append) noexcept {
+    if (config_.source_frontier == nullptr) {
+        return true;
+    }
+    l2flow::canonical::SourceFrontierErrorV1 frontier_error =
+        l2flow::canonical::SourceFrontierErrorV1::kInvalidConfiguration;
+    if (metadata.recv_monotonic_ns <=
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max()) &&
+        append.ingress_sequence == metadata.ingress_sequence) {
+        const auto deadline = std::chrono::steady_clock::now() +
+            config_.source_frontier_busy_timeout;
+        do {
+            frontier_error = l2flow::canonical::PublishAppendProgressV1(
+                config_.source_frontier,
+                config_.frontier_writer_instance,
+                config_.frontier_generation,
+                metadata.ingress_sequence,
+                append.global_wal_pos,
+                static_cast<std::int64_t>(metadata.recv_monotonic_ns));
+        } while (frontier_error ==
+                     l2flow::canonical::SourceFrontierErrorV1::kBusy &&
+                 std::chrono::steady_clock::now() < deadline);
+    }
+    if (frontier_error !=
+        l2flow::canonical::SourceFrontierErrorV1::kNone) {
+        l2flow::canonical::SourceFrontierV1 frontier{};
+        std::uint64_t quality_flags = 0U;
+        if (l2flow::canonical::ReadSourceFrontierV1(
+                *config_.source_frontier, &frontier) ==
+            l2flow::canonical::SourceFrontierErrorV1::kNone) {
+            quality_flags = frontier.quality_flags;
+        }
+        static_cast<void>(l2flow::canonical::PublishSourceStateV1(
+            config_.source_frontier,
+            config_.frontier_writer_instance,
+            config_.frontier_generation,
+            l2flow::canonical::SourceStateV1::kFatal,
+            quality_flags));
+        Trip(
+            RawCaptureWorkerFailureKind::kSourceFrontier,
+            RawCaptureFatalSignal::kSourceFrontier);
+        return false;
+    }
+    return true;
 }
 
 bool RawCaptureWorker::MaybeFlushDurable(
@@ -502,7 +668,11 @@ bool RawCaptureWorker::MaybeFlushDurable(
             config_.durable_interval_ns;
     const bool bytes_due =
         pending_bytes >= config_.durable_batch_bytes;
-    if (!force && !time_due && !bytes_due) {
+    const bool idle_heartbeat_due =
+        pending_bytes == 0U &&
+        now_ns - last_flush_monotonic_ns_ >=
+            config_.idle_heartbeat_interval_ns;
+    if (!force && !time_due && !bytes_due && !idle_heartbeat_due) {
         return true;
     }
 

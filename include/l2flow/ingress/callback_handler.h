@@ -4,6 +4,7 @@
 #include "l2flow/ingress/capture_clock.h"
 #include "l2flow/ingress/capture_metrics.h"
 #include "l2flow/ops/fatal_latch.h"
+#include "l2flow/canonical/source_frontier_v1.h"
 
 #include "mdl_api.h"
 
@@ -19,6 +20,13 @@ struct CallbackHandlerConfig {
     std::uint32_t max_message_bytes = 0U;
     std::uint32_t capture_date = 0U;
     std::uint64_t first_ingress_sequence = 1U;
+    // Optional producer-side SourceFrontier binding.  When enabled, all
+    // three fields are mandatory and the page must outlive this handler.
+    l2flow::canonical::SourceFrontierPageV1* source_frontier = nullptr;
+    l2flow::common::Identity128 frontier_writer_instance{};
+    std::uint64_t frontier_generation = 0U;
+    std::chrono::nanoseconds source_frontier_busy_timeout =
+        l2flow::canonical::kSourceFrontierDefaultBusyTimeoutV1;
 };
 
 // The four vendor callbacks are intentionally identical entry points into one
@@ -57,7 +65,9 @@ public:
 private:
     void CaptureMessage(
         const datayes::mdl::MDLMessage* message) noexcept;
-    void CaptureMessageImpl(const datayes::mdl::MDLMessage* message);
+    [[nodiscard]] bool CaptureMessageImpl(
+        const datayes::mdl::MDLMessage* message,
+        std::uint64_t* captured_sequence);
 
     CallbackHandlerConfig config_;
     ByteRing& ring_;

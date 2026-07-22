@@ -1,13 +1,25 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(L2Flow VERSION 0.1.0 LANGUAGES CXX)
+project(L2Flow VERSION 0.1.0 LANGUAGES C CXX)
 
 option(L2MOCK_BUILD_TESTS "Build the L2 mock verification suite" ON)
 option(L2MOCK_ENABLE_SANITIZERS "Enable Address/Undefined sanitizers" OFF)
-option(L2FLOW_BUILD_TESTS "Build the Phase 0/1/2 verification suite" ON)
+option(L2FLOW_BUILD_TESTS "Build the L2Flow phase verification suites" ON)
+option(
+    L2FLOW_BUILD_PHASE7_PYTHON_TESTS
+    "Build the NumPy-backed Phase 7 Python verification suite"
+    ON)
+option(
+    L2FLOW_BUILD_PHASE8_PYTHON_TESTS
+    "Register the PyArrow-backed Phase 8 Python verification suite"
+    OFF)
 option(
     L2FLOW_BUILD_RAW_V1_LIBFUZZER
     "Build the optional Clang libFuzzer target for Raw V1 input safety"
+    OFF)
+option(
+    L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER
+    "Build the optional Clang libFuzzer target for Phase 4 market decoding"
     OFF)
 option(
     L2FLOW_ENABLE_ASAN_UBSAN
@@ -188,6 +200,9 @@ l2flow_enable_sanitizers(l2mock)
 l2flow_enable_sanitizers(l2mock_sdk_compat)
 
 set(L2FLOW_PHASE01_SOURCES
+    src/canonical/source_frontier_v1.cpp
+    src/canonical/source_frontier_posix_v1.cpp
+    src/common/identity128.cpp
     src/common/sealed_file_snapshot.cpp
     src/common/sha256.cpp
     src/baseline/vendor_baseline.cpp
@@ -231,7 +246,6 @@ l2flow_enable_sanitizers(l2flow_phase01)
 
 set(L2FLOW_PHASE2_SOURCES
     src/common/crc32c.cpp
-    src/common/identity128.cpp
     src/ingress/empty_anchor_tombstone_store.cpp
     src/ingress/empty_anchor_tombstone_v1.cpp
     src/ingress/finalization_archive_posix_store.cpp
@@ -297,10 +311,6 @@ set(L2FLOW_PHASE2_SOURCES
 
 add_library(l2flow_phase2 STATIC ${L2FLOW_PHASE2_SOURCES})
 add_library(L2Flow::phase2 ALIAS l2flow_phase2)
-# The production alias remains on the last complete runtime slice until the
-# Phase-2 Raw service/controller construction and its external exit gates are
-# connected and accepted.  Phase 3 is consumable explicitly as L2Flow::phase3.
-add_library(L2Flow::production ALIAS l2flow_phase01)
 set_target_properties(l2flow_phase2 PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED YES
@@ -366,6 +376,124 @@ target_link_libraries(l2flow_phase3 PUBLIC L2Flow::phase2)
 l2flow_enable_strict_warnings(l2flow_phase3)
 l2flow_enable_sanitizers(l2flow_phase3)
 
+set(L2FLOW_PHASE4_SOURCES
+    src/market/instrument_history_v1.cpp
+    src/market/instrument_registry.cpp
+    src/market/instrument_registry_loader_v1.cpp
+    src/market/market_decoder.cpp
+    src/market/market_session.cpp
+    src/market/market_types_v1.cpp
+    src/market/session_store.cpp)
+
+add_library(l2flow_phase4 STATIC ${L2FLOW_PHASE4_SOURCES})
+add_library(L2Flow::phase4 ALIAS l2flow_phase4)
+set_target_properties(l2flow_phase4 PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+target_compile_features(l2flow_phase4 PUBLIC cxx_std_20)
+target_include_directories(l2flow_phase4
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${L2FLOW_GENERATED_INCLUDE_DIR}>)
+target_link_libraries(l2flow_phase4 PUBLIC L2Flow::phase3)
+l2flow_enable_strict_warnings(l2flow_phase4)
+l2flow_enable_sanitizers(l2flow_phase4)
+
+set(L2FLOW_PHASE5_SOURCES
+    src/canonical/canonical_bundle_runtime_v1.cpp
+    src/canonical/canonical_control_adapter_v1.cpp
+    src/canonical/canonical_normalizer_v1.cpp
+    src/canonical/canonical_schema_v1.cpp
+    src/canonical/canonical_segment_v1.cpp
+    src/canonical/safe_mux_v1.cpp
+    src/canonical/sequence_guard_v1.cpp)
+
+add_library(l2flow_phase5 STATIC ${L2FLOW_PHASE5_SOURCES})
+add_library(L2Flow::phase5 ALIAS l2flow_phase5)
+set_target_properties(l2flow_phase5 PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+target_compile_features(l2flow_phase5 PUBLIC cxx_std_20)
+target_include_directories(l2flow_phase5
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${L2FLOW_GENERATED_INCLUDE_DIR}>)
+target_link_libraries(l2flow_phase5 PUBLIC L2Flow::phase4)
+l2flow_enable_strict_warnings(l2flow_phase5)
+l2flow_enable_sanitizers(l2flow_phase5)
+
+set(L2FLOW_PHASE6_SOURCES
+    src/state/latest_state_v1.cpp
+    src/state/state_checkpoint_v1.cpp)
+
+add_library(l2flow_phase6 STATIC ${L2FLOW_PHASE6_SOURCES})
+add_library(L2Flow::phase6 ALIAS l2flow_phase6)
+set_target_properties(l2flow_phase6 PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+target_compile_features(l2flow_phase6 PUBLIC cxx_std_20)
+target_include_directories(l2flow_phase6
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${L2FLOW_GENERATED_INCLUDE_DIR}>)
+target_link_libraries(l2flow_phase6 PUBLIC L2Flow::phase5)
+l2flow_enable_strict_warnings(l2flow_phase6)
+l2flow_enable_sanitizers(l2flow_phase6)
+
+set(L2FLOW_PHASE7_SOURCES
+    src/consumer/canonical_batch_reader_v1.cpp
+    src/consumer/consumer_c_api_v1.cpp
+    src/factor/factor_watermark_v1.cpp
+    src/factor/latest_factor_v1.cpp
+    src/factor/watermark_table_v1.cpp)
+
+add_library(l2flow_phase7 STATIC ${L2FLOW_PHASE7_SOURCES})
+add_library(L2Flow::phase7 ALIAS l2flow_phase7)
+set_target_properties(l2flow_phase7 PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+target_compile_features(l2flow_phase7 PUBLIC cxx_std_20)
+target_include_directories(l2flow_phase7
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${L2FLOW_GENERATED_INCLUDE_DIR}>)
+target_link_libraries(l2flow_phase7 PUBLIC L2Flow::phase6)
+l2flow_enable_strict_warnings(l2flow_phase7)
+l2flow_enable_sanitizers(l2flow_phase7)
+
+set(L2FLOW_PRODUCTION_SOURCES
+    src/apps/production_deployment_v1.cpp
+    src/apps/production_service_v1.cpp
+    src/market/raw_market_adapter_v1.cpp
+    src/route/production_route_controller_v1.cpp
+    src/route/production_route_owner_lease_v1.cpp
+    src/route/production_route_posix_store_v1.cpp
+    src/route/production_route_v1.cpp
+    src/runtime/production_aggregate_runtime_v1.cpp
+    src/runtime/production_source_pipeline_v1.cpp)
+
+# Formal aggregate for the source-ordered Raw/control/market/Canonical path,
+# fixed instrument-worker routing, and durable production route publication.
+# The alias does not select the Phase-1-only target as a runtime fallback.
+add_library(l2flow_production STATIC ${L2FLOW_PRODUCTION_SOURCES})
+add_library(L2Flow::production ALIAS l2flow_production)
+set_target_properties(l2flow_production PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+target_compile_features(l2flow_production PUBLIC cxx_std_20)
+target_include_directories(l2flow_production
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${L2FLOW_GENERATED_INCLUDE_DIR}>)
+target_link_libraries(l2flow_production PUBLIC L2Flow::phase5)
+l2flow_enable_strict_warnings(l2flow_production)
+l2flow_enable_sanitizers(l2flow_production)
+
 if(L2FLOW_BUILD_RAW_V1_LIBFUZZER)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR
@@ -392,6 +520,34 @@ if(L2FLOW_BUILD_RAW_V1_LIBFUZZER)
         PRIVATE -fsanitize=fuzzer)
     l2flow_enable_strict_warnings(fuzz_phase2_raw_v1)
     l2flow_enable_sanitizers(fuzz_phase2_raw_v1)
+endif()
+
+if(L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER requires Clang or "
+            "AppleClang")
+    endif()
+    add_executable(
+        fuzz_phase4_market_decoder
+        tests/fuzz/market_decoder_fuzz_target.cpp)
+    target_link_libraries(
+        fuzz_phase4_market_decoder
+        PRIVATE L2Flow::phase4)
+    set_target_properties(
+        fuzz_phase4_market_decoder
+        PROPERTIES
+            CXX_STANDARD 20
+            CXX_STANDARD_REQUIRED YES
+            CXX_EXTENSIONS NO)
+    target_compile_options(
+        fuzz_phase4_market_decoder
+        PRIVATE -fsanitize=fuzzer)
+    target_link_options(
+        fuzz_phase4_market_decoder
+        PRIVATE -fsanitize=fuzzer)
+    l2flow_enable_strict_warnings(fuzz_phase4_market_decoder)
+    l2flow_enable_sanitizers(fuzz_phase4_market_decoder)
 endif()
 
 add_executable(
@@ -455,6 +611,16 @@ l2flow_add_ingress_executable(
     mdl_ingress_sz_tick
     mdl-ingress-sz-tick
     3)
+
+add_executable(mdl_production_router apps/mdl_production_main.cpp)
+target_link_libraries(mdl_production_router PRIVATE L2Flow::production)
+set_target_properties(mdl_production_router PROPERTIES
+    OUTPUT_NAME "mdl-production-router"
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO)
+l2flow_enable_strict_warnings(mdl_production_router)
+l2flow_enable_sanitizers(mdl_production_router)
 
 add_executable(mdl_abi_preflight tools/mdl_abi_preflight.cpp)
 target_link_libraries(mdl_abi_preflight PRIVATE L2Flow::phase01)
@@ -632,6 +798,10 @@ if(L2FLOW_BUILD_TESTS)
         add_test(NAME ${target} COMMAND ${target})
     endfunction()
 
+    l2flow_add_phase_test(
+        test_phase1_source_frontier_posix_v1
+        tests/test_phase1_source_frontier_posix_v1.cpp)
+
     function(l2flow_add_phase3_test target source)
         add_executable(${target} "${source}")
         target_link_libraries(${target} PRIVATE L2Flow::phase3)
@@ -639,6 +809,217 @@ if(L2FLOW_BUILD_TESTS)
         add_test(NAME ${target} COMMAND ${target})
         set_tests_properties(${target} PROPERTIES LABELS "phase3")
     endfunction()
+
+    function(l2flow_add_phase4_test target source)
+        add_executable(${target} "${source}")
+        target_link_libraries(${target} PRIVATE L2Flow::phase4)
+        l2flow_enable_strict_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "phase4")
+    endfunction()
+
+    function(l2flow_add_phase5_test target source)
+        add_executable(${target} "${source}")
+        target_link_libraries(${target} PRIVATE L2Flow::phase5)
+        l2flow_enable_strict_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "phase5")
+    endfunction()
+
+    function(l2flow_add_phase6_test target source)
+        add_executable(${target} "${source}")
+        target_link_libraries(${target} PRIVATE L2Flow::phase6)
+        l2flow_enable_strict_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "phase6")
+    endfunction()
+
+    function(l2flow_add_phase7_test target source)
+        add_executable(${target} "${source}")
+        target_link_libraries(${target} PRIVATE L2Flow::phase7)
+        l2flow_enable_strict_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "phase7")
+    endfunction()
+
+    function(l2flow_add_production_test target source)
+        add_executable(${target} "${source}")
+        target_link_libraries(${target} PRIVATE L2Flow::production)
+        l2flow_enable_strict_warnings(${target})
+        add_test(NAME ${target} COMMAND ${target})
+        set_tests_properties(${target} PROPERTIES LABELS "production")
+    endfunction()
+
+    l2flow_add_phase6_test(
+        test_phase6_latest_state
+        tests/test_phase6_latest_state.cpp)
+    l2flow_add_phase6_test(
+        test_phase6_state_checkpoint
+        tests/test_phase6_state_checkpoint.cpp)
+    l2flow_add_phase6_test(
+        test_phase6_c_abi
+        tests/test_phase6_c_abi.c)
+    set_target_properties(test_phase6_c_abi PROPERTIES
+        C_STANDARD 11
+        C_STANDARD_REQUIRED YES
+        C_EXTENSIONS NO)
+
+    l2flow_add_phase7_test(
+        test_phase7_factor_watermark
+        tests/test_phase7_factor_watermark.cpp)
+    l2flow_add_phase7_test(
+        test_phase7_latest_factor
+        tests/test_phase7_latest_factor.cpp)
+    l2flow_add_phase7_test(
+        test_phase7_consumer_batch
+        tests/test_phase7_consumer_batch.cpp)
+    l2flow_add_phase7_test(
+        test_phase7_consumer_c_api
+        tests/test_phase7_consumer_c_api.cpp)
+    l2flow_add_phase7_test(
+        test_phase7_c_abi
+        tests/test_phase7_c_abi.c)
+
+    if(L2FLOW_BUILD_PHASE7_PYTHON_TESTS)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c "import numpy"
+            RESULT_VARIABLE L2FLOW_PHASE7_NUMPY_IMPORT_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET)
+        if(NOT L2FLOW_PHASE7_NUMPY_IMPORT_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Phase 7 Python tests require NumPy for ${Python3_EXECUTABLE}; "
+                "install the python/pyproject.toml dependencies or configure "
+                "with -DL2FLOW_BUILD_PHASE7_PYTHON_TESTS=OFF")
+        endif()
+        add_test(
+            NAME test_phase7_python_runtime
+            COMMAND
+                "${Python3_EXECUTABLE}" -m unittest discover
+                -s "${CMAKE_CURRENT_SOURCE_DIR}/tests/python"
+                -p "test_*.py" -v)
+        set_tests_properties(
+            test_phase7_python_runtime
+            PROPERTIES
+                ENVIRONMENT
+                    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+                LABELS "phase7;python")
+    endif()
+
+    if(L2FLOW_BUILD_PHASE8_PYTHON_TESTS)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c "import numpy, pyarrow"
+            RESULT_VARIABLE L2FLOW_PHASE8_PYTHON_IMPORT_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET)
+        if(NOT L2FLOW_PHASE8_PYTHON_IMPORT_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Phase 8 Python tests require NumPy and PyArrow for "
+                "${Python3_EXECUTABLE}; install the python/pyproject.toml "
+                "history extra or configure with "
+                "-DL2FLOW_BUILD_PHASE8_PYTHON_TESTS=OFF")
+        endif()
+        add_test(
+            NAME test_phase8_python_history
+            COMMAND
+                "${Python3_EXECUTABLE}" -m unittest discover
+                -s "${CMAKE_CURRENT_SOURCE_DIR}/tests/python_phase8"
+                -p "test_*.py" -v)
+        set_tests_properties(
+            test_phase8_python_history
+            PROPERTIES
+                ENVIRONMENT
+                    "PYTHONDONTWRITEBYTECODE=1;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+                LABELS "phase8;python")
+    endif()
+
+    l2flow_add_phase5_test(
+        test_phase5_canonical_schema
+        tests/test_phase5_canonical_schema.cpp)
+    l2flow_add_phase5_test(
+        test_phase5_sequence_guard
+        tests/test_phase5_sequence_guard.cpp)
+    l2flow_add_phase5_test(
+        test_phase5_frontier_mux
+        tests/test_phase5_frontier_mux.cpp)
+    l2flow_add_phase5_test(
+        test_phase5_canonical_segment
+        tests/test_phase5_canonical_segment.cpp)
+    l2flow_add_phase5_test(
+        test_phase5_canonical_normalizer
+        tests/test_phase5_canonical_normalizer.cpp)
+    l2flow_add_phase5_test(
+        test_phase5_canonical_control_adapter
+        tests/test_phase5_canonical_control_adapter.cpp)
+    l2flow_add_phase5_test(
+        test_phase5_canonical_bundle_runtime
+        tests/test_phase5_canonical_bundle_runtime.cpp)
+
+    l2flow_add_phase4_test(
+        test_phase4_market_decoder
+        tests/test_phase4_market_decoder.cpp)
+    l2flow_add_phase4_test(
+        test_phase4_instrument_registry
+        tests/test_phase4_instrument_registry.cpp)
+    l2flow_add_phase4_test(
+        test_phase4_instrument_registry_loader_v1
+        tests/test_phase4_instrument_registry_loader_v1.cpp)
+    l2flow_add_phase4_test(
+        test_phase4_instrument_history_v1
+        tests/test_phase4_instrument_history_v1.cpp)
+    l2flow_add_phase4_test(
+        test_phase4_session_store
+        tests/test_phase4_session_store.cpp)
+
+    l2flow_add_production_test(
+        test_production_raw_market_adapter
+        tests/test_production_raw_market_adapter.cpp)
+    l2flow_add_production_test(
+        test_production_route_v1
+        tests/test_production_route_v1.cpp)
+    l2flow_add_production_test(
+        test_production_route_owner_lease_v1
+        tests/test_production_route_owner_lease_v1.cpp)
+    l2flow_add_production_test(
+        test_production_source_pipeline_v1
+        tests/test_production_source_pipeline_v1.cpp)
+    l2flow_add_production_test(
+        test_production_aggregate_integration_v1
+        tests/test_production_aggregate_integration_v1.cpp)
+    l2flow_add_production_test(
+        test_production_service_v1
+        tests/test_production_service_v1.cpp)
+    l2flow_add_production_test(
+        test_production_deployment_v1
+        tests/test_production_deployment_v1.cpp)
+    target_compile_definitions(
+        test_production_deployment_v1
+        PRIVATE
+            "L2FLOW_PRODUCTION_EXAMPLE_MANIFEST_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/configs/production-v1.example.tsv\"")
+    set_tests_properties(
+        test_production_aggregate_integration_v1
+        PROPERTIES TIMEOUT 30)
+    add_test(
+        NAME test_mdl_production_router_help
+        COMMAND mdl_production_router --help)
+    set_tests_properties(
+        test_mdl_production_router_help
+        PROPERTIES LABELS "production;cli" TIMEOUT 10)
+    add_executable(
+        test_phase4_market_decoder_fuzz_smoke
+        tests/fuzz/market_decoder_fuzz_harness.cpp
+        tests/fuzz/market_decoder_fuzz_target.cpp)
+    target_link_libraries(
+        test_phase4_market_decoder_fuzz_smoke
+        PRIVATE L2Flow::phase4)
+    l2flow_enable_strict_warnings(
+        test_phase4_market_decoder_fuzz_smoke)
+    add_test(
+        NAME test_phase4_market_decoder_fuzz_smoke
+        COMMAND test_phase4_market_decoder_fuzz_smoke)
+    set_tests_properties(
+        test_phase4_market_decoder_fuzz_smoke
+        PROPERTIES LABELS "phase4;fuzz-smoke")
 
     l2flow_add_phase3_test(
         test_phase3_control_decoder

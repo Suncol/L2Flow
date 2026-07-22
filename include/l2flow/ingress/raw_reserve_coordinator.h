@@ -377,6 +377,15 @@ public:
         RawReserveRegistryCoordinatorV1>
     Retain() noexcept;
 
+    // Identity-only retained authority used by descriptor-based composition
+    // gates. The coordinator keeps ownership; callers must neither close nor
+    // mutate through this descriptor.
+    [[nodiscard]] int raw_root_descriptor() const noexcept {
+        return lease_ != nullptr
+                   ? lease_->root_directory_descriptor()
+                   : -1;
+    }
+
     [[nodiscard]] RawReserveCoordinatorErrorV1
     RegisterFreshScaffolding(
         const RawReserveFreshScaffoldingV1& request,

@@ -73,8 +73,24 @@ private:
         const std::string&,
         std::string*) noexcept;
     friend std::unique_ptr<RawStreamDirectory>
+    OpenOrCreateRawStreamDirectoryAt(
+        int,
+        std::uint32_t,
+        std::uint32_t,
+        const std::string&,
+        std::string*) noexcept;
+    friend std::unique_ptr<RawStreamDirectory>
     OpenOrCreateAuthorizedFreshRawStreamDirectory(
         const std::string&,
+        std::uint32_t,
+        std::uint32_t,
+        const std::string&,
+        const RawFreshStateAuthorizationV1&,
+        const RawFreshMutationAuthorizationGateV1&,
+        std::string*) noexcept;
+    friend std::unique_ptr<RawStreamDirectory>
+    OpenOrCreateAuthorizedFreshRawStreamDirectoryAt(
+        int,
         std::uint32_t,
         std::uint32_t,
         const std::string&,
@@ -105,6 +121,18 @@ private:
 [[nodiscard]] std::unique_ptr<RawStreamDirectory>
 OpenOrCreateRawStreamDirectory(
     const std::string& raw_root,
+    std::uint32_t source_stream_id,
+    std::uint32_t capture_date,
+    const std::string& stream_slug,
+    std::string* error = nullptr) noexcept;
+
+// Retained-authority variant. No pathname component above capture_date is
+// resolved: the function duplicates retained_raw_root_fd with openat(".") and
+// creates every descendant relative to that exact inode. The retained input
+// remains caller-owned.
+[[nodiscard]] std::unique_ptr<RawStreamDirectory>
+OpenOrCreateRawStreamDirectoryAt(
+    int retained_raw_root_fd,
     std::uint32_t source_stream_id,
     std::uint32_t capture_date,
     const std::string& stream_slug,
@@ -153,6 +181,19 @@ OpenOrCreateAuthorizedFreshRawStreamDirectory(
     const RawFreshStateAuthorizationV1& authorization,
     const RawFreshMutationAuthorizationGateV1&
         authorization_gate,
+    std::string* error = nullptr) noexcept;
+
+// Production retained-authority counterpart. Authorization is checked before
+// any mkdir/fsync, and all namespace mutation is anchored beneath the supplied
+// Raw-root inode rather than reopening a configured pathname.
+[[nodiscard]] std::unique_ptr<RawStreamDirectory>
+OpenOrCreateAuthorizedFreshRawStreamDirectoryAt(
+    int retained_raw_root_fd,
+    std::uint32_t source_stream_id,
+    std::uint32_t capture_date,
+    const std::string& stream_slug,
+    const RawFreshStateAuthorizationV1& authorization,
+    const RawFreshMutationAuthorizationGateV1& authorization_gate,
     std::string* error = nullptr) noexcept;
 
 // The first mutation inside a newly authorized stream-day directory. The

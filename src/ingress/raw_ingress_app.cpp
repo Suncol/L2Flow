@@ -326,7 +326,8 @@ std::size_t RawIngressApp::CheckedRingCapacity(
 
 CallbackHandlerConfig RawIngressApp::MakeHandlerConfig(
     const RawIngressAppConfigV1& config,
-    const l2flow::sdk::IngressSpec& spec) {
+    const l2flow::sdk::IngressSpec& spec,
+    const RawIngressAppOptionsV1& options) {
     CallbackHandlerConfig result;
     result.source_stream_id = spec.source_stream_id;
     result.market_service_id =
@@ -338,6 +339,12 @@ CallbackHandlerConfig RawIngressApp::MakeHandlerConfig(
     result.first_ingress_sequence =
         config.recovered
             .recovered_next_ingress_sequence;
+    result.source_frontier = options.source_frontier;
+    result.frontier_writer_instance =
+        options.frontier_writer_instance;
+    result.frontier_generation = options.frontier_generation;
+    result.source_frontier_busy_timeout =
+        options.source_frontier_busy_timeout;
     return result;
 }
 
@@ -353,12 +360,20 @@ RawIngressApp::MakeCaptureConfig(
         UINT64_C(1'000'000);
     result.durable_batch_bytes =
         config.sync_bytes;
+    result.idle_heartbeat_interval_ns =
+        options.writer_idle_heartbeat_interval_ns;
     result.failure_sink = {
         &RawIngressApp::CaptureFailure, app};
     result.monotonic_now =
         options.worker_monotonic_now;
     result.monotonic_clock_context =
         options.worker_monotonic_clock_context;
+    result.source_frontier = options.source_frontier;
+    result.frontier_writer_instance =
+        options.frontier_writer_instance;
+    result.frontier_generation = options.frontier_generation;
+    result.source_frontier_busy_timeout =
+        options.source_frontier_busy_timeout;
     return result;
 }
 
@@ -403,7 +418,7 @@ RawIngressApp::RawIngressApp(
           CheckedRingCapacity(config_.stable),
           config_.stable.max_message_bytes),
       handler_(
-          MakeHandlerConfig(config_, *spec_),
+          MakeHandlerConfig(config_, *spec_, options_),
           ring_,
           RequireClock(clock_),
           capture_fatal_,
@@ -1638,14 +1653,13 @@ void RawIngressApp::CaptureFailure(
     RawCaptureFatalSignal signal) noexcept {
     auto* app =
         static_cast<RawIngressApp*>(context);
-    const l2flow::ops::FatalReason reason =
-        signal ==
-                RawCaptureFatalSignal::
-                    kRingCorruption
-            ? l2flow::ops::FatalReason::
-                  RING_CORRUPTION
-            : l2flow::ops::FatalReason::
-                  RAW_WAL_IO;
+    l2flow::ops::FatalReason reason =
+        l2flow::ops::FatalReason::RAW_WAL_IO;
+    if (signal == RawCaptureFatalSignal::kRingCorruption) {
+        reason = l2flow::ops::FatalReason::RING_CORRUPTION;
+    } else if (signal == RawCaptureFatalSignal::kSourceFrontier) {
+        reason = l2flow::ops::FatalReason::SOURCE_FRONTIER_FAILURE;
+    }
     static_cast<void>(
         app->capture_fatal_.trip(reason));
 }

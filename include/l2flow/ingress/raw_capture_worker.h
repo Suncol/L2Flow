@@ -3,6 +3,7 @@
 #include "l2flow/ingress/byte_ring.h"
 #include "l2flow/ingress/capture_metrics.h"
 #include "l2flow/ingress/raw_wal_writer.h"
+#include "l2flow/canonical/source_frontier_v1.h"
 
 #include <atomic>
 #include <chrono>
@@ -15,10 +16,13 @@ inline constexpr std::uint64_t
     kRawCaptureDefaultDurableIntervalNs = 10'000'000U;
 inline constexpr std::uint64_t
     kRawCaptureDefaultDurableBatchBytes = 4U * 1024U * 1024U;
+inline constexpr std::uint64_t
+    kRawCaptureDefaultIdleHeartbeatIntervalNs = 1'000'000'000U;
 
 enum class RawCaptureFatalSignal : std::uint8_t {
     kRawWalIo = 0U,
     kRingCorruption,
+    kSourceFrontier,
 };
 
 using RawCaptureFailureCallback = void (*)(
@@ -46,12 +50,24 @@ struct RawCaptureWorkerConfig final {
         kRawCaptureDefaultDurableIntervalNs;
     std::uint64_t durable_batch_bytes =
         kRawCaptureDefaultDurableBatchBytes;
+    // With no market records, FlushDurable is still called at this cadence
+    // by the sole writer thread so the production Raw control heartbeat keeps
+    // proving liveness.  It must be shorter than the aggregate writer timeout.
+    std::uint64_t idle_heartbeat_interval_ns =
+        kRawCaptureDefaultIdleHeartbeatIntervalNs;
     RawCaptureFailureSink failure_sink{};
     // A null function selects std::chrono::steady_clock. Tests can inject a
     // deterministic monotonic clock without placing a virtual call in the
     // hot loop.
     RawCaptureMonotonicNow monotonic_now = nullptr;
     void* monotonic_clock_context = nullptr;
+    // Optional producer append frontier.  The callback bound to the same
+    // page must publish captured before this sole writer publishes append.
+    l2flow::canonical::SourceFrontierPageV1* source_frontier = nullptr;
+    l2flow::common::Identity128 frontier_writer_instance{};
+    std::uint64_t frontier_generation = 0U;
+    std::chrono::nanoseconds source_frontier_busy_timeout =
+        l2flow::canonical::kSourceFrontierDefaultBusyTimeoutV1;
 };
 
 struct RawCaptureProgress final {
@@ -75,6 +91,7 @@ enum class RawCaptureWorkerFailureKind : std::uint8_t {
     kWriterSeal,
     kProgressOverflow,
     kClockRegression,
+    kSourceFrontier,
 };
 
 struct RawCaptureWorkerSnapshot final {
@@ -175,6 +192,11 @@ private:
         std::uint64_t vendor_bytes,
         std::uint64_t framed_wal_bytes,
         std::uint64_t ingress_sequence) noexcept;
+    [[nodiscard]] bool WaitForCapturedFrontier(
+        const CaptureMetaV1& metadata) noexcept;
+    [[nodiscard]] bool PublishAppendFrontier(
+        const CaptureMetaV1& metadata,
+        const RawWalCursor& append) noexcept;
     void PublishProgress(
         const RawCaptureProgress& append,
         const RawCaptureProgress& durable) noexcept;
