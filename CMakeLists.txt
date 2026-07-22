@@ -59,6 +59,14 @@ elseif(L2FLOW_ENABLE_TSAN)
     set(L2FLOW_SANITIZER_COMPILE_FLAGS
         -fno-omit-frame-pointer
         -fsanitize=thread)
+    # GCC diagnoses atomic_thread_fence because TSan does not instrument that
+    # primitive. Keep the diagnostic visible, but do not let the project's
+    # global -Werror make the dedicated TSan build unusable; acquire/release
+    # atomic operations and the controller mutex/thread interactions remain
+    # instrumented.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        list(APPEND L2FLOW_SANITIZER_COMPILE_FLAGS -Wno-error=tsan)
+    endif()
     set(L2FLOW_SANITIZER_LINK_FLAGS
         -fno-omit-frame-pointer
         -fsanitize=thread)
@@ -297,9 +305,11 @@ set(L2FLOW_PHASE2_SOURCES
 
 add_library(l2flow_phase2 STATIC ${L2FLOW_PHASE2_SOURCES})
 add_library(L2Flow::phase2 ALIAS l2flow_phase2)
-# The production alias remains on the last complete runtime slice until the
-# Phase-2 Raw service/controller construction and its external exit gates are
-# connected and accepted.  Phase 3 is consumable explicitly as L2Flow::phase3.
+# The Phase-2/3 controller chain is available explicitly through
+# L2Flow::phase3, but the deployed four-stream service, approved vendor
+# artifact gate, and external cutover evidence are still pending. Keep the
+# generic production alias on the last deployed slice until those separate
+# service/cutover gates are accepted.
 add_library(L2Flow::production ALIAS l2flow_phase01)
 set_target_properties(l2flow_phase2 PROPERTIES
     CXX_STANDARD 20
@@ -323,7 +333,9 @@ set(L2FLOW_PHASE3_SOURCES
     src/control/control_decoder.cpp
     src/control/control_hash.cpp
     src/control/control_live_worker.cpp
+    src/control/control_production_controller.cpp
     src/control/control_readiness_gate.cpp
+    src/control/control_record_posix_sink.cpp
     src/control/control_record_v1.cpp
     src/control/resubscribe_guard.cpp
     src/control/sys_decoder.cpp)
@@ -492,9 +504,29 @@ set_target_properties(
 l2flow_enable_strict_warnings(mdl_phase2_live_probe)
 l2flow_enable_sanitizers(mdl_phase2_live_probe)
 
+add_executable(
+    mdl_phase3_live_probe
+    tools/mdl_phase3_live_probe.cpp)
+target_link_libraries(
+    mdl_phase3_live_probe
+    PRIVATE L2Flow::phase3)
+set_target_properties(
+    mdl_phase3_live_probe
+    PROPERTIES
+        OUTPUT_NAME "mdl-phase3-live-probe"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO)
+l2flow_enable_strict_warnings(mdl_phase3_live_probe)
+l2flow_enable_sanitizers(mdl_phase3_live_probe)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    L2FLOW_SANITIZER_MODE STREQUAL "none" AND
    L2FLOW_VENDOR_LIBRARY_IS_ELF)
+    get_filename_component(
+        L2FLOW_VENDOR_LIBRARY_DIRECTORY
+        "${L2FLOW_VENDOR_LIBRARY_PATH}"
+        DIRECTORY)
     add_executable(
         mdl_vendor_link_probe
         tools/mdl_vendor_link_probe.cpp)
@@ -512,7 +544,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
         PROPERTIES
             OUTPUT_NAME "mdl-vendor-link-probe"
             BUILD_RPATH
-                "${CMAKE_CURRENT_SOURCE_DIR}/mdl_sdk_2_13_234/libs/linux"
+                "${L2FLOW_VENDOR_LIBRARY_DIRECTORY}"
             CXX_STANDARD 20
             CXX_STANDARD_REQUIRED YES
             CXX_EXTENSIONS NO)
@@ -650,12 +682,18 @@ if(L2FLOW_BUILD_TESTS)
         test_phase3_control_live_worker
         tests/test_phase3_control_live_worker.cpp)
     l2flow_add_phase3_test(
+        test_phase3_control_production_controller
+        tests/test_phase3_control_production_controller.cpp)
+    l2flow_add_phase3_test(
         test_phase3_control_checkpoint_reachability
         tests/test_phase3_control_checkpoint_reachability.cpp)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         l2flow_add_phase3_test(
             test_phase3_control_checkpoint_posix_store
             tests/test_phase3_control_checkpoint_posix_store.cpp)
+        l2flow_add_phase3_test(
+            test_phase3_control_record_posix_sink
+            tests/test_phase3_control_record_posix_sink.cpp)
     endif()
 
     add_test(
@@ -665,6 +703,14 @@ if(L2FLOW_BUILD_TESTS)
         test_phase2_live_probe_cli_help
         PROPERTIES
             LABELS "phase2;live-probe-cli"
+            TIMEOUT 10)
+    add_test(
+        NAME test_phase3_live_probe_cli_help
+        COMMAND mdl_phase3_live_probe --help)
+    set_tests_properties(
+        test_phase3_live_probe_cli_help
+        PROPERTIES
+            LABELS "phase3;live-probe-cli"
             TIMEOUT 10)
 
     l2flow_add_phase2_test(
@@ -752,6 +798,12 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_phase2_test(
         test_phase2_raw_production_runtime
         tests/test_phase2_raw_production_runtime.cpp)
+    target_link_libraries(
+        test_phase2_raw_production_runtime
+        PRIVATE L2Flow::phase3)
+    set_tests_properties(
+        test_phase2_raw_production_runtime
+        PROPERTIES LABELS "phase2;phase3;production-controller")
     l2flow_add_phase2_test(
         test_phase2_raw_namespace
         tests/test_phase2_raw_namespace.cpp)

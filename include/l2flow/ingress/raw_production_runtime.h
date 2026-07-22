@@ -3,6 +3,7 @@
 #include "l2flow/ingress/raw_fresh_route_posix.h"
 #include "l2flow/ingress/raw_ingress_app.h"
 #include "l2flow/ingress/raw_live_tail_posix.h"
+#include "l2flow/ingress/raw_reader.h"
 #include "l2flow/ingress/raw_recovery_maintenance_report_store.h"
 #include "l2flow/ingress/raw_reserve_authorized_wal.h"
 #include "l2flow/ingress/raw_reserve_coordinator.h"
@@ -12,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace l2flow::ingress {
 
@@ -103,12 +105,103 @@ struct RawProductionReadinessSampleV1 final {
     }
 };
 
+// Bounded, immutable replay input captured before the Raw capture worker and
+// SDK generation start. Every scan owns its exact pread bytes, so a Phase-3
+// replay cannot observe later mutation of the open current segment.
+struct RawProductionReplaySnapshotLimitsV1 final {
+    std::uint32_t max_segments = 100'000U;
+    std::uint64_t max_segment_bytes =
+        UINT64_C(1) * UINT64_C(1024) * UINT64_C(1024) *
+        UINT64_C(1024);
+    std::uint64_t max_total_bytes =
+        UINT64_C(4) * UINT64_C(1024) * UINT64_C(1024) *
+        UINT64_C(1024);
+};
+
+struct RawProductionReplaySnapshotV1 final {
+    RawControlSnapshot control{};
+    std::uint64_t control_generation = 0U;
+    RawLiveTailAttachV1 live_attach{};
+    std::vector<RawSegmentScanResult> scans;
+};
+
+enum class RawProductionReplaySnapshotErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kInvalidState,
+    kInvalidLimits,
+    kControlRead,
+    kControlInvalid,
+    kSegmentInspect,
+    kSegmentLimit,
+    kSegmentRead,
+    kSegmentScan,
+    kSegmentChain,
+    kControlChanged,
+    kAllocationFailure,
+};
+
+struct RawProductionReplaySnapshotResultV1 final {
+    RawProductionReplaySnapshotErrorV1 error =
+        RawProductionReplaySnapshotErrorV1::kNone;
+    RawReaderError reader_error = RawReaderError::kNone;
+    RawV1Error codec_error = RawV1Error::kNone;
+    int error_number = 0;
+    std::uint32_t segment_sequence = 0U;
+    RawProductionReplaySnapshotV1 snapshot{};
+
+    [[nodiscard]] bool ok() const noexcept {
+        return error ==
+            RawProductionReplaySnapshotErrorV1::kNone;
+    }
+};
+
+struct RawProductionControlSampleV1 final {
+    RawControlSnapshot snapshot{};
+    std::uint64_t generation = 0U;
+    int error_number = 0;
+
+    [[nodiscard]] bool ok() const noexcept {
+        return error_number == 0 && generation != 0U;
+    }
+};
+
+// Phase-2-only capability surface used by the Phase-3 production controller.
+// It deliberately exposes neither descriptors nor mutable sink ownership.
+class RawProductionAuthoritativeRuntimeV1 {
+public:
+    virtual ~RawProductionAuthoritativeRuntimeV1() = default;
+
+    [[nodiscard]] virtual RawProductionReplaySnapshotResultV1
+    PrepareAuthoritativeReplay(
+        RawProductionReplaySnapshotLimitsV1 limits = {}) noexcept = 0;
+    [[nodiscard]] virtual RawLiveTailError
+    AttachAuthoritativeTail(
+        const RawLiveTailAttachV1& attach,
+        std::unique_ptr<RawLiveTail>* output) noexcept = 0;
+    [[nodiscard]] virtual bool InstallExternalTailConsumer(
+        RawIngressExternalTailConsumerV1* consumer,
+        std::string* error = nullptr) noexcept = 0;
+    [[nodiscard]] virtual bool Initialize(
+        std::string* error = nullptr) noexcept = 0;
+    [[nodiscard]] virtual bool Stop(
+        std::string* error = nullptr) noexcept = 0;
+    [[nodiscard]] virtual RawProductionControlSampleV1
+    SampleControlFresh() const noexcept = 0;
+    [[nodiscard]] virtual RawIngressAppState app_state()
+        const noexcept = 0;
+    [[nodiscard]] virtual bool app_fatal()
+        const noexcept = 0;
+    [[nodiscard]] virtual std::uint64_t connect_generation()
+        const noexcept = 0;
+};
+
 // Owns the POSIX source which RawLiveTail borrows and the RawIngressApp which
 // owns that tail and its prepared sink. Declaration order makes app teardown
 // (including worker joins and sink close) precede source destruction.
-class RawProductionRuntimeV1 final {
+class RawProductionRuntimeV1 final
+    : public RawProductionAuthoritativeRuntimeV1 {
 public:
-    ~RawProductionRuntimeV1();
+    ~RawProductionRuntimeV1() override;
 
     RawProductionRuntimeV1(
         const RawProductionRuntimeV1&) = delete;
@@ -120,9 +213,27 @@ public:
         RawProductionRuntimeV1&&) = delete;
 
     [[nodiscard]] bool Initialize(
-        std::string* error = nullptr) noexcept;
+        std::string* error = nullptr) noexcept override;
     [[nodiscard]] bool Stop(
-        std::string* error = nullptr) noexcept;
+        std::string* error = nullptr) noexcept override;
+    [[nodiscard]] RawProductionReplaySnapshotResultV1
+    PrepareAuthoritativeReplay(
+        RawProductionReplaySnapshotLimitsV1 limits = {}) noexcept override;
+    [[nodiscard]] RawLiveTailError
+    AttachAuthoritativeTail(
+        const RawLiveTailAttachV1& attach,
+        std::unique_ptr<RawLiveTail>* output) noexcept override;
+    [[nodiscard]] bool InstallExternalTailConsumer(
+        RawIngressExternalTailConsumerV1* consumer,
+        std::string* error = nullptr) noexcept override;
+    [[nodiscard]] RawProductionControlSampleV1
+    SampleControlFresh() const noexcept override;
+    [[nodiscard]] RawIngressAppState app_state()
+        const noexcept override;
+    [[nodiscard]] bool app_fatal()
+        const noexcept override;
+    [[nodiscard]] std::uint64_t connect_generation()
+        const noexcept override;
     // Reads a new coherent control snapshot from the retained POSIX source
     // on every call, then evaluates readiness against that exact snapshot.
     // No cached READY value is returned when the control source is missing,
@@ -145,11 +256,16 @@ private:
     RawProductionRuntimeV1(
         std::unique_ptr<RawLiveTailPosixSource>
             live_tail_source,
-        std::unique_ptr<RawIngressApp> app) noexcept;
+        std::unique_ptr<RawIngressApp> app,
+        RawLiveTailAttachV1 initial_live_attach) noexcept;
 
     std::unique_ptr<RawLiveTailPosixSource>
         live_tail_source_;
     std::unique_ptr<RawIngressApp> app_;
+    RawLiveTailAttachV1 initial_live_attach_{};
+    RawLiveTailAttachV1 authoritative_live_attach_{};
+    bool authoritative_replay_prepared_ = false;
+    bool authoritative_tail_attached_ = false;
 };
 
 // This is deliberately split into:

@@ -406,6 +406,7 @@ struct SdkEvents final {
     std::string server_address;
     mdl::MDLMessageEncoding message_encoding =
         mdl::MDLEID_UNDEFINED;
+    std::string connect_error;
 };
 
 class ShutdownMessage final : public mdl::MDLMessage {
@@ -476,7 +477,7 @@ public:
     }
     std::string Connect() override {
         events_->values.emplace_back("connect");
-        return {};
+        return events_->connect_error;
     }
     bool Release(std::string*) noexcept override {
         events_->values.emplace_back(
@@ -569,11 +570,7 @@ public:
             evidence.final_wal.closed &&
             evidence.final_wal.append ==
                 evidence.final_wal.durable &&
-            evidence.reconciliation.exact() &&
-            evidence.observer
-                    .observer_processed_wal_pos ==
-                evidence.final_wal.append
-                    .global_wal_pos;
+            evidence.reconciliation.exact();
         return accepted;
     }
 
@@ -594,6 +591,93 @@ public:
 
     std::vector<ingress::RawIngressLifecycleEvent>
         events;
+};
+
+class FakeExternalTailConsumer final
+    : public ingress::RawIngressExternalTailConsumerV1 {
+public:
+    explicit FakeExternalTailConsumer(
+        std::shared_ptr<SdkEvents> sdk_events,
+        bool start_succeeds = true,
+        bool stop_succeeds = true) noexcept
+        : sdk_events_(std::move(sdk_events)),
+          start_succeeds_(start_succeeds),
+          stop_succeeds_(stop_succeeds) {}
+
+    bool StartBeforeConnect(std::string* error) noexcept override {
+        ++start_calls;
+        started_before_sdk =
+            sdk_events_ != nullptr && sdk_events_->values.empty();
+        started_ = start_succeeds_;
+        if (!start_succeeds_ && error != nullptr) {
+            try {
+                *error = "injected external startup failure";
+            } catch (...) {
+            }
+        }
+        return start_succeeds_;
+    }
+
+    bool StopAtAndJoin(
+        const ingress::RawReadinessStopCursorV1& final_cursor,
+        ingress::RawIngressTailConsumerEvidenceV1* evidence,
+        std::string* error) noexcept override {
+        ++stop_calls;
+        last_stop_cursor = final_cursor;
+        joined_ = true;
+        if (!started_ || !stop_succeeds_ || evidence == nullptr) {
+            if (error != nullptr) {
+                try {
+                    *error = "injected external stop failure";
+                } catch (...) {
+                }
+            }
+            healthy_ = false;
+            return false;
+        }
+        evidence->kind = ingress::RawIngressTailConsumerKindV1::
+            kPhase3AuthoritativeControl;
+        evidence->writer_instance = final_cursor.writer_instance;
+        evidence->stream_day_id = final_cursor.stream_day_id;
+        evidence->source_stream_id = final_cursor.source_stream_id;
+        evidence->capture_date = final_cursor.capture_date;
+        evidence->processed_segment_sequence =
+            final_cursor.segment_sequence;
+        evidence->processed_global_wal_pos =
+            final_cursor.global_wal_pos;
+        evidence->processed_ingress_sequence =
+            final_cursor.ingress_sequence;
+        evidence->processed_segment_offset =
+            final_cursor.segment_offset;
+        evidence->generation_active = true;
+        evidence->healthy = true;
+        evidence->authoritative_control = true;
+        return true;
+    }
+
+    void AbortAndJoin() noexcept override {
+        ++abort_calls;
+        joined_ = true;
+        healthy_ = false;
+    }
+
+    bool Healthy() const noexcept override {
+        return started_ && healthy_ && !joined_;
+    }
+
+    std::uint64_t start_calls = 0U;
+    std::uint64_t stop_calls = 0U;
+    std::uint64_t abort_calls = 0U;
+    bool started_before_sdk = false;
+    ingress::RawReadinessStopCursorV1 last_stop_cursor{};
+
+private:
+    std::shared_ptr<SdkEvents> sdk_events_;
+    bool start_succeeds_ = true;
+    bool stop_succeeds_ = true;
+    bool started_ = false;
+    bool joined_ = false;
+    bool healthy_ = true;
 };
 
 ingress::RawIngressAppConfigV1 MakeConfig() {
@@ -859,6 +943,162 @@ void TestOrderedEmptyRuntime(TestContext* test) {
                 config.endpoint
                     ->message_encoding(),
         "SDK consumes immutable verified endpoint fields and releases only after ordered Raw shutdown");
+}
+
+void TestExternalAuthoritativeConsumerLifecycle(
+    TestContext* test) {
+    ingress::RawIngressAppConfigV1 config = MakeConfig();
+    auto sdk_events = std::make_shared<SdkEvents>();
+    auto factory = std::make_shared<FakeFactory>(sdk_events);
+    auto clean_gate =
+        std::make_unique<RecordingCleanStopGate>();
+    RecordingCleanStopGate* const clean_gate_view =
+        clean_gate.get();
+    LifecycleRecorder lifecycle;
+    FakeExternalTailConsumer external(sdk_events);
+    ingress::RawIngressAppOptionsV1 options;
+    options.tail_consumer_mode =
+        ingress::RawIngressTailConsumerModeV1::
+            kExternalAuthoritativeConsumer;
+
+    ingress::RawIngressApp app(
+        config,
+        factory,
+        std::make_unique<FixedClock>(),
+        std::make_unique<EmptyPreparedSink>(
+            config.recovered, true),
+        nullptr,
+        std::move(clean_gate),
+        options,
+        &lifecycle);
+    std::string error;
+    test->Expect(
+        app.InstallExternalTailConsumer(&external, &error),
+        "external authoritative consumer installs once before Initialize");
+    test->Expect(
+        app.Initialize(&error) &&
+            external.start_calls == 1U &&
+            external.started_before_sdk &&
+            factory->create_calls == 1U,
+        "external authoritative consumer starts before SDK construction and Connect");
+    const sdk::IngressSpec& spec =
+        sdk::GetIngressSpec(config.stable.kind);
+    ShutdownMessage shutdown_message(
+        spec.required.front());
+    sdk_events->shutdown_message =
+        &shutdown_message;
+    test->Expect(
+        app.Stop(&error) &&
+            external.stop_calls == 1U &&
+            external.abort_calls == 0U &&
+            clean_gate_view->calls == 1U &&
+            clean_gate_view->accepted,
+        "normal shutdown captures callbacks entered during SDK Shutdown, drains and seals Raw, and completes exact external catch-up");
+    test->Expect(
+        clean_gate_view->last_evidence.callback
+                    .captured_records == 1U &&
+            clean_gate_view->last_evidence.callback
+                    .callbacks_after_stop == 0U &&
+            clean_gate_view->last_evidence.final_wal.append
+                    .ingress_sequence == 1U &&
+            clean_gate_view->last_evidence.final_wal.durable
+                    .ingress_sequence == 1U &&
+            clean_gate_view->last_evidence.tail_consumer.kind ==
+                ingress::RawIngressTailConsumerKindV1::
+                    kPhase3AuthoritativeControl &&
+            clean_gate_view->last_evidence.tail_consumer
+                .authoritative_control &&
+            !clean_gate_view->last_evidence.observer
+                 .generation_active &&
+            external.last_stop_cursor.global_wal_pos ==
+                clean_gate_view->last_evidence.final_wal.append
+                    .global_wal_pos &&
+            external.last_stop_cursor.ingress_sequence ==
+                clean_gate_view->last_evidence.final_wal.append
+                    .ingress_sequence &&
+            external.last_stop_cursor.segment_offset ==
+                clean_gate_view->last_evidence.final_wal.append
+                    .segment_offset,
+        "external mode retains the SDK-shutdown suffix in Raw and supplies its exact Phase-3 terminal proof without a compatibility observer");
+
+    const std::vector<ingress::RawIngressLifecycleEvent> expected{
+        ingress::RawIngressLifecycleEvent::kCaptureWorkerStarted,
+        ingress::RawIngressLifecycleEvent::kExternalConsumerStarted,
+        ingress::RawIngressLifecycleEvent::kSdkConnectStarting,
+        ingress::RawIngressLifecycleEvent::kHandlerBeginStopping,
+        ingress::RawIngressLifecycleEvent::kHandlerQuiesced,
+        ingress::RawIngressLifecycleEvent::kCaptureWorkerJoined,
+        ingress::RawIngressLifecycleEvent::kExternalConsumerJoined,
+        ingress::RawIngressLifecycleEvent::kCleanStopBarrierComplete,
+    };
+    test->Expect(
+        lifecycle.events == expected,
+        "external consumer lifecycle is ordered around SDK Connect, callback quiescence, Raw seal, and clean-stop publication");
+}
+
+void TestExternalConsumerStartupAndConnectFailuresAbort(
+    TestContext* test) {
+    const auto RunCase =
+        [test](bool start_succeeds,
+               bool connect_succeeds,
+               std::string_view description) {
+            ingress::RawIngressAppConfigV1 config = MakeConfig();
+            auto sdk_events = std::make_shared<SdkEvents>();
+            if (!connect_succeeds) {
+                sdk_events->connect_error =
+                    "injected SDK Connect failure";
+            }
+            auto factory =
+                std::make_shared<FakeFactory>(sdk_events);
+            auto clean_gate =
+                std::make_unique<RecordingCleanStopGate>();
+            RecordingCleanStopGate* const clean_gate_view =
+                clean_gate.get();
+            FakeExternalTailConsumer external(
+                sdk_events, start_succeeds);
+            ingress::RawIngressAppOptionsV1 options;
+            options.tail_consumer_mode =
+                ingress::RawIngressTailConsumerModeV1::
+                    kExternalAuthoritativeConsumer;
+            ingress::RawIngressApp app(
+                config,
+                factory,
+                std::make_unique<FixedClock>(),
+                std::make_unique<EmptyPreparedSink>(
+                    config.recovered, true),
+                nullptr,
+                std::move(clean_gate),
+                options);
+            std::string error;
+            const bool installed =
+                app.InstallExternalTailConsumer(&external, &error);
+            const bool initialized = app.Initialize(&error);
+            test->Expect(
+                installed && !initialized && app.fatal() &&
+                    app.state() ==
+                        ingress::RawIngressAppState::kStopped &&
+                    external.start_calls == 1U &&
+                    external.stop_calls == 0U &&
+                    external.abort_calls == 1U &&
+                    clean_gate_view->calls == 0U &&
+                    factory->create_calls ==
+                        (start_succeeds ? 1U : 0U) &&
+                    (start_succeeds ==
+                     (std::count(
+                          sdk_events->values.begin(),
+                          sdk_events->values.end(),
+                          "connect") == 1)),
+                description);
+        };
+
+    RunCase(
+        false,
+        true,
+        "external worker startup failure aborts partial state and prevents all SDK construction");
+    RunCase(
+        true,
+        false,
+        "SDK Connect failure aborts the external generation and publishes neither terminal proof nor checkpoint-capable clean stop");
 }
 
 void TestRecoveredEmptyRuntimePreservesIngressCursor(
@@ -1603,6 +1843,9 @@ void TestEmergencyWriterAckNegativeStates(
 int main() {
     TestContext test;
     TestOrderedEmptyRuntime(&test);
+    TestExternalAuthoritativeConsumerLifecycle(&test);
+    TestExternalConsumerStartupAndConnectFailuresAbort(
+        &test);
     TestRecoveredEmptyRuntimePreservesIngressCursor(
         &test);
     TestStableSyncPolicyReachesCaptureWorker(

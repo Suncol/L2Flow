@@ -6323,6 +6323,73 @@ Power-loss/重启证据分开：
 7. 交易时段 ReSubscribe guard；
 8. 输出固定 ControlRecord。
 
+#### 当前 production composition（2026-07-22）
+
+仓库中的 `ControlProductionControllerV1` 组合一个
+`RawProductionAuthoritativeRuntimeV1` generation、一个
+`ControlLiveWorkerV1` 和一个 durable/idempotent `ControlRecordPosixSinkV1`。
+它不改变 Raw authority：checkpoint 只是 replay 加速，任何 restore 都必须先在
+immutable validating Raw replay 中定位 checkpoint 的准确 record boundary，再对其后
+suffix 使用同一 decoder 状态机。
+
+启动顺序固定为：
+
+```text
+Phase 2 route activation/recovery and initialized Raw control
+-> immutable Raw replay snapshot
+-> checkpoint discovery + Raw boundary restore (or full replay)
+-> suffix replay to the append-visible attach frontier
+-> POSIX Raw live-tail attach + replay proof
+-> install Phase 3 as the sole authoritative external Raw consumer
+-> start ControlLiveWorkerV1
+-> SDK Connect
+-> current-generation LogonSuccess + required market evidence
+-> READY
+```
+
+SDK generation `g` 的 READY 不能由 generation `g-1` 的 checkpoint/control 证据
+满足。worker 在 construction 时记录 `generation_first_ingress_sequence`；只有 origin
+不早于该边界且 live control generation 新于 construction sample 的
+`LogonSuccess`，才能设置 `successful_logon_connect_generation=g`。READY 还要求每次
+fresh coherent Raw control、writer/decoder heartbeat、capture health、required-market
+evidence、durability/decoder lag 和 exact catch-up 条件同时成立。
+
+正常停机的 authority 顺序固定为：
+
+```text
+SDK Shutdown while callback handler still accepts tail callbacks
+-> handler BeginStopping + Quiesce
+-> Raw capture StopAndDrain
+-> seal/flush exact terminal Raw cursor
+-> Phase 3 StopAt exact terminal cursor + join
+-> terminal checkpoint publication
+-> sealed Raw certificate + ACTIVE unregister
+```
+
+不得在 SDK `Shutdown()` 前停止 callback handler，否则 Shutdown 内或尾部 callback
+会落入 `callbacks_after_stop` 窗口。Phase 3 worker failure、derived sink
+conflict/timeout、live-tail failure、decoder rejection 或 exact stop failure都使该
+generation fail-stop，且不得发布 terminal checkpoint。
+
+normal recovered restart 使用同一个 Raw namespace/journal 和连续 WAL：旧 generation
+完全 seal/unregister 后，新 writer 先注册 `RECOVERING + RESUME_CONNECT`，对 retained
+journal/segment 做只读分析和受权 recovery；closed manifest、sealed certificate、
+terminal marker/cursor 全部一致后创建严格连续的下一 open segment。只有 durable
+`RESUMED_OPEN` maintenance report 的 receipt 被 coordinator 消费，recovering WAL
+binding 才能晋升 ACTIVE。之后新 controller 执行 checkpoint restore + suffix replay，
+并在第二次 SDK `Connect()` 前启动 worker。
+
+append-visible tail 不能把“sealed current segment 且 control 尚未发布 next segment”
+解释成 whole-stream terminal，因为 Raw control 没有 closed bit。该窗口返回
+`WouldBlock` 且不锁存 terminal；control 指向下一段后产生 `SegmentTransition`。真正
+terminal 只由上述 SDK shutdown、Raw drain 和 exact `StopAt` 证明。
+
+`tools/mdl_phase3_live_probe.cpp` 是显式运行的 production-composition acceptance
+runner，使用真实 POSIX Raw/runtime/controller/sink/checkpoint 和真实 SDK；它不是四个
+production ingress service cutover。2026-07-22 的真实 feeder 两代通过数据与未通过
+短窗记录见 `docs/acceptance/phase2-local.md` 和
+`docs/acceptance/phase3-local.md`。
+
 #### 测试
 
 - 首次成功登录 epoch=1；

@@ -509,13 +509,14 @@ RawLiveTailStep RawLiveTail::Next() noexcept {
             segment_offset_ = kRawV1SegmentHeaderBytes;
             return result;
         }
+        // A sealed segment which is still the current control segment is not
+        // proof of stream termination. Normal rotation seals/truncates the
+        // old segment before the next segment's control publication, so this
+        // exact observation is a transient legal window. Return a retryable
+        // boundary; lifecycle owners establish the real terminal condition
+        // with an exact StopAt cursor after SDK shutdown and Raw drain.
         RawLiveTailStep result;
-        result.kind = segment.sealed
-                          ? RawLiveTailStepKind::kEnd
-                          : RawLiveTailStepKind::kWouldBlock;
-        if (segment.sealed) {
-            terminal_ = true;
-        }
+        result.kind = RawLiveTailStepKind::kWouldBlock;
         return result;
     }
 

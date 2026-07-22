@@ -1061,7 +1061,6 @@ SdkStopResult StopAndReleaseSdk(
     std::unique_ptr<sdk::SdkSubscriber>* subscriber,
     ingress::CallbackHandler* handler,
     std::string* error) noexcept {
-    handler->BeginStopping();
     bool shutdown_complete = false;
     if (*manager != nullptr) {
         try {
@@ -1079,6 +1078,12 @@ SdkStopResult StopAndReleaseSdk(
         shutdown_complete = true;
     }
 
+    // Keep accepting callbacks until the SDK shutdown barrier returns.  A
+    // high-volume vendor generation may still enter the handler while
+    // Shutdown is in progress; closing the gate first would silently discard
+    // that terminal suffix.  Callbacks after Shutdown returns are rejected
+    // and surfaced through callbacks_after_stop as an SDK-contract violation.
+    handler->BeginStopping();
     const bool callback_quiesced =
         handler->Quiesce(std::chrono::seconds(5));
     if (!callback_quiesced) {

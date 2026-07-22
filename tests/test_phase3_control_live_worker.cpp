@@ -507,6 +507,151 @@ bool WaitStartup(const control::ControlLiveWorkerV1& worker) {
     return false;
 }
 
+void TestReplayProofAllowsValidatedHeaderGap(TestContext* test) {
+    const std::vector<RecordSpec> records{
+        {4U,
+         101U,
+         24U,
+         std::vector<std::byte>(sizeof(sh::NGTSTick), std::byte{0U})},
+    };
+    StaticLiveSource source;
+    l2flow::common::Identity128 writer{};
+    const bool built = BuildSource(records, &source, &writer);
+    auto first_bytes =
+        std::make_shared<const std::vector<std::byte>>(source.wire);
+    ingress::RawSegmentScanResult first_scan =
+        ingress::ScanRawSegmentV1(
+            first_bytes,
+            static_cast<std::uint64_t>(first_bytes->size()));
+
+    auto decoder = CreateDecoder(source);
+    ingress::RawReplaySegmentContext first_context;
+    first_context.source_stream_id = source.segment.source_stream_id;
+    first_context.capture_date = source.segment.capture_date;
+    first_context.stream_day_id = source.segment.stream_day_id;
+    first_context.segment_sequence = source.segment.segment_sequence;
+    first_context.segment_base_wal_pos =
+        source.segment.segment_base_wal_pos;
+    first_context.config_sha256 = source.segment.config_sha256;
+    first_context.raw_schema_sha256 = source.segment.raw_schema_sha256;
+    first_context.clock_epoch.algorithm =
+        source.segment.clock_epoch_algorithm;
+    first_context.clock_epoch.digest =
+        source.segment.clock_epoch_digest;
+    first_context.clock_epoch.label = source.segment.clock_epoch_label;
+    bool replayed = false;
+    if (decoder != nullptr && first_scan.ok() &&
+        first_scan.records.size() == 1U) {
+        ingress::RawReplayRecord replay{
+            first_scan.records.front(),
+            first_context,
+            ingress::RawReplayProvenance::kDurable};
+        replayed = decoder->Process(replay).ok();
+    }
+
+    ingress::SegmentHeaderV1 second_segment = source.segment;
+    second_segment.segment_sequence = 2U;
+    second_segment.segment_base_wal_pos =
+        static_cast<std::uint64_t>(source.wire.size());
+    second_segment.first_ingress_sequence = 2U;
+    second_segment.created_realtime_ns += 1U;
+    second_segment.created_monotonic_ns += 1U;
+    ingress::RawV1SegmentHeaderWire second_header{};
+    const bool second_encoded =
+        ingress::EncodeSegmentHeaderV1(
+            second_segment, &second_header) ==
+        ingress::RawV1Error::kNone;
+    auto second_bytes =
+        std::make_shared<const std::vector<std::byte>>(
+            second_header.begin(), second_header.end());
+    ingress::RawSegmentScanResult second_scan =
+        ingress::ScanRawSegmentV1(
+            second_bytes,
+            ingress::kRawV1SegmentHeaderBytes);
+
+    source.segment = second_segment;
+    source.wire.assign(second_header.begin(), second_header.end());
+    source.control.segment_sequence = 2U;
+    source.control.append_global_wal_pos =
+        second_segment.segment_base_wal_pos +
+        ingress::kRawV1SegmentHeaderBytes;
+    source.control.append_ingress_sequence = 1U;
+    source.control.append_segment_offset =
+        ingress::kRawV1SegmentHeaderBytes;
+    source.control.durable_global_wal_pos =
+        source.control.append_global_wal_pos;
+    source.control.durable_ingress_sequence = 1U;
+    source.control.durable_segment_offset =
+        ingress::kRawV1SegmentHeaderBytes;
+
+    ingress::RawLiveTailAttachV1 attach;
+    attach.writer_instance = writer;
+    attach.stream_day_id = second_segment.stream_day_id;
+    attach.source_stream_id = kSourceStreamId;
+    attach.capture_date = kCaptureDate;
+    attach.segment_sequence = 2U;
+    attach.global_wal_pos = source.control.append_global_wal_pos;
+    attach.segment_offset = ingress::kRawV1SegmentHeaderBytes;
+    attach.next_ingress_sequence = 2U;
+    std::array<ingress::RawSegmentScanResult, 2U> scans{
+        std::move(first_scan), std::move(second_scan)};
+    std::unique_ptr<control::ControlLiveWorkerReplayProofV1> proof;
+    const auto proof_error =
+        decoder == nullptr
+            ? control::ControlLiveWorkerReplayProofErrorV1::kInvalidInput
+            : control::ControlLiveWorkerReplayProofV1::Create(
+                  writer,
+                  scans,
+                  attach,
+                  decoder->Snapshot(),
+                  &proof);
+    std::unique_ptr<control::ControlLiveWorkerReplayProofV1>
+        missing_header_proof;
+    const auto missing_header_error =
+        decoder == nullptr
+            ? control::ControlLiveWorkerReplayProofErrorV1::kInvalidInput
+            : control::ControlLiveWorkerReplayProofV1::Create(
+                  writer,
+                  std::span<const ingress::RawSegmentScanResult>(
+                      scans.data(), 1U),
+                  attach,
+                  decoder->Snapshot(),
+                  &missing_header_proof);
+
+    std::unique_ptr<ingress::RawLiveTail> tail;
+    const ingress::RawLiveTailError tail_error =
+        ingress::RawLiveTail::Attach(&source, attach, &tail);
+    FailureState failure;
+    std::unique_ptr<control::ControlLiveWorkerV1> worker;
+    const auto worker_error =
+        proof == nullptr
+            ? control::ControlLiveWorkerCreateErrorV1::kInvalidConfig
+            : control::ControlLiveWorkerV1::CreateWithReplayProof(
+                  WorkerConfig(writer, &failure),
+                  *proof,
+                  std::move(tail),
+                  std::move(decoder),
+                  std::make_unique<RecordingSink>(
+                      std::make_shared<SinkState>()),
+                  &worker);
+    test->Expect(
+        built && second_encoded && replayed &&
+            proof_error ==
+                control::ControlLiveWorkerReplayProofErrorV1::kNone &&
+            proof != nullptr &&
+            proof->decoder_processed_segment_sequence() == 1U &&
+            proof->validated_frontier_global_wal_pos() ==
+                attach.global_wal_pos &&
+            missing_header_error !=
+                control::ControlLiveWorkerReplayProofErrorV1::kNone &&
+            missing_header_proof == nullptr &&
+            tail_error == ingress::RawLiveTailError::kNone &&
+            worker_error ==
+                control::ControlLiveWorkerCreateErrorV1::kNone &&
+            worker != nullptr,
+        "worker accepts a last-record cursor behind the live frontier only when the complete intervening segment-header chain was actually scanned");
+}
+
 void TestLiveReadyAndExactStop(TestContext* test) {
     const std::vector<RecordSpec> records{
         {2U,
@@ -1194,6 +1339,7 @@ void TestLateSinkAcknowledgementFailsClosed(TestContext* test) {
 
 int main() {
     TestContext test;
+    TestReplayProofAllowsValidatedHeaderGap(&test);
     TestLiveReadyAndExactStop(&test);
     TestMalformedPoisonsButDoesNotStopRawConsumption(&test);
     TestSameControlGenerationCannotQualifyLogon(&test);

@@ -1,4 +1,6 @@
 #include "l2flow/common/sha256.h"
+#include "l2flow/control/control_production_controller.h"
+#include "l2flow/control/control_record_posix_sink.h"
 #include "l2flow/ingress/raw_production_runtime.h"
 #include "l2flow/ingress/raw_schema.h"
 #include "l2flow/ingress/raw_v1.h"
@@ -24,6 +26,7 @@
 #include <unistd.h>
 
 namespace ingress = l2flow::ingress;
+namespace control = l2flow::control;
 namespace sdk = l2flow::sdk;
 namespace mdl = datayes::mdl;
 
@@ -298,6 +301,65 @@ public:
 
 private:
     std::shared_ptr<SdkCounters> counters_;
+};
+
+class EmptyAuthoritativeConsumer final
+    : public ingress::RawIngressExternalTailConsumerV1 {
+public:
+    explicit EmptyAuthoritativeConsumer(
+        std::unique_ptr<ingress::RawLiveTail> tail) noexcept
+        : tail_(std::move(tail)) {}
+
+    bool StartBeforeConnect(std::string*) noexcept override {
+        started_ = tail_ != nullptr;
+        return started_;
+    }
+
+    bool StopAtAndJoin(
+        const ingress::RawReadinessStopCursorV1& cursor,
+        ingress::RawIngressTailConsumerEvidenceV1* evidence,
+        std::string*) noexcept override {
+        if (!started_ || evidence == nullptr || tail_ == nullptr ||
+            cursor.writer_instance != tail_->writer_instance() ||
+            cursor.stream_day_id != tail_->stream_day_id() ||
+            cursor.source_stream_id != tail_->source_stream_id() ||
+            cursor.capture_date != tail_->capture_date() ||
+            cursor.segment_sequence != tail_->segment_sequence() ||
+            cursor.global_wal_pos != tail_->initial_global_wal_pos() ||
+            cursor.segment_offset != tail_->segment_offset() ||
+            cursor.ingress_sequence + 1U !=
+                tail_->next_ingress_sequence()) {
+            return false;
+        }
+        evidence->kind = ingress::RawIngressTailConsumerKindV1::
+            kPhase3AuthoritativeControl;
+        evidence->writer_instance = cursor.writer_instance;
+        evidence->stream_day_id = cursor.stream_day_id;
+        evidence->source_stream_id = cursor.source_stream_id;
+        evidence->capture_date = cursor.capture_date;
+        evidence->processed_segment_sequence = cursor.segment_sequence;
+        evidence->processed_global_wal_pos = cursor.global_wal_pos;
+        evidence->processed_ingress_sequence = cursor.ingress_sequence;
+        evidence->processed_segment_offset = cursor.segment_offset;
+        evidence->generation_active = true;
+        evidence->healthy = true;
+        evidence->authoritative_control = true;
+        joined_ = true;
+        return true;
+    }
+
+    void AbortAndJoin() noexcept override {
+        joined_ = true;
+    }
+
+    bool Healthy() const noexcept override {
+        return started_ && !joined_;
+    }
+
+private:
+    std::unique_ptr<ingress::RawLiveTail> tail_;
+    bool started_ = false;
+    bool joined_ = false;
 };
 
 struct BackendClock final {
@@ -771,6 +833,203 @@ void TestFreshRegisteredRuntime(
         "clean stop consumes the sink-owned lease gate and unregisters ACTIVE");
 }
 
+void TestFreshAuthoritativeReplaySnapshot(
+    TestContext* test) {
+    FreshRuntimeFixture fixture;
+    test->Expect(
+        fixture.Initialize(),
+        "authoritative replay fixture is durably registered");
+    if (fixture.coordinator == nullptr) {
+        return;
+    }
+    auto counters = std::make_shared<SdkCounters>();
+    ingress::RawIngressAppOptionsV1 options;
+    options.tail_consumer_mode =
+        ingress::RawIngressTailConsumerModeV1::
+            kExternalAuthoritativeConsumer;
+    ingress::RawProductionRuntimeBuildResultV1 result =
+        ingress::RawExistingRouteProductionRuntimeFactoryV1::
+            ActivateFreshRegistered(
+                fixture.root.path(),
+                "sz-tick",
+                fixture.registration,
+                *fixture.coordinator,
+                fixture.writer_config,
+                fixture.backend_options,
+                fixture.artifact_options,
+                fixture.stream_limits,
+                fixture.config,
+                std::make_shared<FakeFactory>(counters),
+                std::make_unique<FixedCaptureClock>(),
+                {},
+                options,
+                nullptr,
+                &fixture.error);
+    test->Expect(
+        result.ok(),
+        "fresh ACTIVE runtime composes without a Phase-2 observer in external authoritative mode");
+    if (!result.ok()) {
+        return;
+    }
+
+    ingress::RawProductionReplaySnapshotResultV1 replay =
+        result.runtime->PrepareAuthoritativeReplay();
+    test->Expect(
+        replay.ok() &&
+            replay.snapshot.scans.size() == 1U &&
+            replay.snapshot.scans.front().ok() &&
+            replay.snapshot.scans.front().records.empty() &&
+            replay.snapshot.scans.front().validated_end_offset ==
+                ingress::kRawV1SegmentHeaderBytes &&
+            replay.snapshot.live_attach.global_wal_pos ==
+                ingress::kRawV1SegmentHeaderBytes &&
+            replay.snapshot.live_attach.next_ingress_sequence == 1U,
+        "pre-Connect replay snapshot owns and validates the complete header-only Raw chain at the exact live frontier");
+
+    std::unique_ptr<ingress::RawLiveTail> tail;
+    const ingress::RawLiveTailError attach_error =
+        result.runtime->AttachAuthoritativeTail(
+            replay.snapshot.live_attach, &tail);
+    EmptyAuthoritativeConsumer consumer(std::move(tail));
+    test->Expect(
+        attach_error == ingress::RawLiveTailError::kNone &&
+            result.runtime->InstallExternalTailConsumer(
+                &consumer, &fixture.error),
+        "the unique authoritative tail attaches only to the replay-proven frontier");
+    test->Expect(
+        result.runtime->Initialize(&fixture.error) &&
+            counters->connect == 1U &&
+            result.runtime->Stop(&fixture.error),
+        "external authoritative runtime starts before Connect and completes the normal exact stop chain");
+
+    ingress::RawReserveCoordinatorErrorV1 action_error =
+        ingress::RawReserveCoordinatorErrorV1::kNone;
+    auto removed = fixture.coordinator->AcquireActionForExistingRoute(
+        fixture.registration.key,
+        ingress::ReserveRegistryStatusV1::kActive,
+        "sz-tick",
+        &action_error,
+        nullptr);
+    test->Expect(
+        removed == nullptr,
+        "authoritative consumer terminal evidence passes the real POSIX clean-stop gate and unregisters ACTIVE");
+}
+
+void TestFreshPosixRuntimeThroughPhase3Controller(
+    TestContext* test) {
+    FreshRuntimeFixture fixture;
+    TemporaryDirectory derived;
+    test->Expect(
+        fixture.Initialize() && derived.ok(),
+        "POSIX Phase-3 controller fixture is durably registered");
+    if (fixture.coordinator == nullptr || !derived.ok()) {
+        return;
+    }
+    auto counters = std::make_shared<SdkCounters>();
+    ingress::RawIngressAppOptionsV1 options;
+    options.tail_consumer_mode =
+        ingress::RawIngressTailConsumerModeV1::
+            kExternalAuthoritativeConsumer;
+    ingress::RawProductionRuntimeBuildResultV1 result =
+        ingress::RawExistingRouteProductionRuntimeFactoryV1::
+            ActivateFreshRegistered(
+                fixture.root.path(),
+                "sz-tick",
+                fixture.registration,
+                *fixture.coordinator,
+                fixture.writer_config,
+                fixture.backend_options,
+                fixture.artifact_options,
+                fixture.stream_limits,
+                fixture.config,
+                std::make_shared<FakeFactory>(counters),
+                std::make_unique<FixedCaptureClock>(),
+                {},
+                options,
+                nullptr,
+                &fixture.error);
+    test->Expect(
+        result.ok(),
+        "real POSIX Raw runtime activates in external authoritative mode for the Phase-3 controller");
+    if (!result.ok()) {
+        return;
+    }
+
+    std::unique_ptr<control::ControlRecordPosixSinkV1> sink;
+    const control::ControlRecordPosixSinkCreateErrorV1 sink_error =
+        control::CreateControlRecordPosixSinkV1At(
+            derived.descriptor(), {}, &sink, &fixture.error);
+    const sdk::IngressSpec& spec = sdk::GetIngressSpec(
+        fixture.config.stable.kind);
+    control::ControlProductionControllerConfigV1 controller_config;
+    controller_config.decoder.source_stream_id =
+        fixture.segment.source_stream_id;
+    controller_config.decoder.capture_date =
+        fixture.segment.capture_date;
+    controller_config.decoder.stream_day_id =
+        fixture.segment.stream_day_id;
+    controller_config.decoder.stable_config_sha256 =
+        fixture.segment.config_sha256;
+    controller_config.decoder.required = spec.required;
+    if (fixture.config.stable.include_optional_index) {
+        controller_config.decoder.optional = spec.optional;
+    }
+    controller_config.worker.writer_instance =
+        fixture.registration.writer_instance;
+    controller_config.worker.connect_generation =
+        fixture.config.connect_generation;
+    controller_config.worker.record_publish_timeout_ns =
+        UINT64_C(1'000'000'000);
+    controller_config.worker.final_catch_up_timeout_ns =
+        UINT64_C(1'000'000'000);
+    controller_config.startup_timeout_ns =
+        UINT64_C(1'000'000'000);
+
+    std::unique_ptr<control::ControlProductionControllerV1> controller;
+    const control::ControlProductionControllerCreateErrorV1 created =
+        sink == nullptr
+            ? control::ControlProductionControllerCreateErrorV1::
+                  kNullDependency
+            : control::ControlProductionControllerV1::Create(
+                  controller_config,
+                  std::move(result.runtime),
+                  std::move(sink),
+                  &controller,
+                  &fixture.error);
+    const bool initialized = controller != nullptr &&
+        controller->Initialize(&fixture.error);
+    const bool stopped = initialized &&
+        controller->Stop(&fixture.error);
+    const control::ControlProductionControllerSnapshotV1 snapshot =
+        controller == nullptr
+            ? control::ControlProductionControllerSnapshotV1{}
+            : controller->Snapshot();
+    test->Expect(
+        sink_error ==
+                control::ControlRecordPosixSinkCreateErrorV1::kNone &&
+            created ==
+                control::ControlProductionControllerCreateErrorV1::kNone &&
+            initialized && stopped && counters->factory_create == 1U &&
+            counters->connect == 1U && counters->manager_release == 1U &&
+            snapshot.state ==
+                control::ControlProductionControllerStateV1::kStopped &&
+            snapshot.replayed_records == 0U &&
+            !snapshot.checkpoint_publication_attempted,
+        "real POSIX recovery snapshot, authoritative tail, pre-Connect Phase-3 worker, SDK generation, exact terminal catch-up, derived sink ownership, and clean-stop gate complete as one controller lifecycle");
+
+    ingress::RawReserveCoordinatorErrorV1 action_error =
+        ingress::RawReserveCoordinatorErrorV1::kNone;
+    auto removed = fixture.coordinator->AcquireActionForExistingRoute(
+        fixture.registration.key,
+        ingress::ReserveRegistryStatusV1::kActive,
+        "sz-tick",
+        &action_error,
+        nullptr);
+    test->Expect(
+        removed == nullptr,
+        "the Phase-3 controller's exact terminal evidence consumes the real POSIX ACTIVE route through the clean-stop coordinator gate");
+}
+
 void TestFreshFailureRequiresFailStop(
     TestContext* test) {
     FreshRuntimeFixture fixture;
@@ -996,6 +1255,8 @@ int main() {
         return 1;
     }
     TestFreshRegisteredRuntime(&test);
+    TestFreshAuthoritativeReplaySnapshot(&test);
+    TestFreshPosixRuntimeThroughPhase3Controller(&test);
     TestFreshFailureRequiresFailStop(&test);
     TestFreshPreflightRejectsBeforeMutation(
         &test);

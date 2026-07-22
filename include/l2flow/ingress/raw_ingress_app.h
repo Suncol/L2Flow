@@ -49,6 +49,8 @@ enum class RawIngressLifecycleEvent : std::uint8_t {
     kCaptureWorkerJoined,
     kReadinessWorkerJoined,
     kCleanStopBarrierComplete,
+    kExternalConsumerStarted,
+    kExternalConsumerJoined,
 };
 
 class RawIngressLifecycleObserver {
@@ -56,6 +58,57 @@ public:
     virtual ~RawIngressLifecycleObserver() = default;
     virtual void Observe(
         RawIngressLifecycleEvent event) noexcept = 0;
+};
+
+// Phase 2's compatibility observer and Phase 3's authoritative decoder are
+// alternative single consumers of append-visible Raw. They must never run in
+// parallel for one ingress generation.
+enum class RawIngressTailConsumerModeV1 : std::uint8_t {
+    kPhase2CompatibilityObserver = 0U,
+    kExternalAuthoritativeConsumer,
+};
+
+enum class RawIngressTailConsumerKindV1 : std::uint8_t {
+    kNone = 0U,
+    kPhase2CompatibilityObserver,
+    kPhase3AuthoritativeControl,
+};
+
+// Generic terminal proof produced by the selected Raw tail consumer. It uses
+// only Phase-2 Raw identity/cursor facts so this library does not depend on
+// Phase 3.
+struct RawIngressTailConsumerEvidenceV1 final {
+    RawIngressTailConsumerKindV1 kind =
+        RawIngressTailConsumerKindV1::kNone;
+    l2flow::common::Identity128 writer_instance{};
+    l2flow::common::Identity128 stream_day_id{};
+    std::uint32_t source_stream_id = 0U;
+    std::uint32_t capture_date = 0U;
+    std::uint32_t processed_segment_sequence = 0U;
+    std::uint64_t processed_global_wal_pos = 0U;
+    std::uint64_t processed_ingress_sequence = 0U;
+    std::uint64_t processed_segment_offset = 0U;
+    bool generation_active = false;
+    bool healthy = false;
+    bool authoritative_control = false;
+};
+
+// Lifecycle seam implemented by the production Phase-3 controller. Start is
+// called after the Raw capture writer starts but before SDK construction and
+// Connect. StopAtAndJoin is called only after callbacks have quiesced and the
+// Raw writer has drained and sealed the immutable terminal cursor.
+class RawIngressExternalTailConsumerV1 {
+public:
+    virtual ~RawIngressExternalTailConsumerV1() = default;
+
+    [[nodiscard]] virtual bool StartBeforeConnect(
+        std::string* error) noexcept = 0;
+    [[nodiscard]] virtual bool StopAtAndJoin(
+        const RawReadinessStopCursorV1& final_cursor,
+        RawIngressTailConsumerEvidenceV1* evidence,
+        std::string* error) noexcept = 0;
+    virtual void AbortAndJoin() noexcept = 0;
+    [[nodiscard]] virtual bool Healthy() const noexcept = 0;
 };
 
 struct RawIngressAppConfigV1 final {
@@ -86,6 +139,9 @@ struct RawIngressAppOptionsV1 final {
         5U * 1'000'000'000U;
     RawCaptureMonotonicNow worker_monotonic_now = nullptr;
     void* worker_monotonic_clock_context = nullptr;
+    RawIngressTailConsumerModeV1 tail_consumer_mode =
+        RawIngressTailConsumerModeV1::
+            kPhase2CompatibilityObserver;
 };
 
 struct RawIngressCleanStopEvidenceV1 final {
@@ -93,6 +149,10 @@ struct RawIngressCleanStopEvidenceV1 final {
     CaptureMetricsSnapshot callback{};
     RawCaptureWorkerSnapshot capture{};
     RawReadinessObserverSnapshot observer{};
+    // New production paths populate this directly. Legacy Phase-2 callers may
+    // leave kind==kNone; exact() projects the compatibility observer into the
+    // same generic proof without weakening the old invariant.
+    RawIngressTailConsumerEvidenceV1 tail_consumer{};
     RawWalSinkIdentityV1 final_sink_identity{};
     RawWalWriterSnapshot final_wal{};
     RawCaptureReconciliation reconciliation{};
@@ -177,6 +237,19 @@ public:
     EvaluateReadiness(
         const RawControlSnapshot& sampled_control,
         std::uint64_t now_monotonic_ns) const;
+    // Installs the external authoritative consumer exactly once while this app
+    // is Constructed. The caller owns it and keeps it alive through Stop().
+    [[nodiscard]] bool InstallExternalTailConsumer(
+        RawIngressExternalTailConsumerV1* consumer,
+        std::string* error = nullptr) noexcept;
+    [[nodiscard]] RawIngressTailConsumerModeV1
+    tail_consumer_mode() const noexcept {
+        return options_.tail_consumer_mode;
+    }
+    [[nodiscard]] std::uint64_t connect_generation()
+        const noexcept {
+        return config_.connect_generation;
+    }
 
 private:
     static const l2flow::sdk::IngressSpec&
@@ -251,6 +324,8 @@ private:
     std::unique_ptr<RawCaptureWorker> capture_worker_;
     std::unique_ptr<RawReadinessWorker>
         readiness_worker_;
+    RawIngressExternalTailConsumerV1*
+        external_tail_consumer_ = nullptr;
 
     std::thread capture_thread_;
     std::thread readiness_thread_;
@@ -260,6 +335,8 @@ private:
     std::atomic<bool> readiness_result_{false};
     bool capture_start_attempted_ = false;
     bool readiness_start_attempted_ = false;
+    bool external_consumer_start_attempted_ = false;
+    bool external_consumer_joined_ = false;
 
     std::unique_ptr<l2flow::sdk::SdkManager> manager_;
     std::unique_ptr<l2flow::sdk::SdkSubscriber>

@@ -152,6 +152,39 @@ bool SameWalSnapshot(
 
 bool RawIngressCleanStopEvidenceV1::exact()
     const noexcept {
+    RawIngressTailConsumerEvidenceV1 consumer = tail_consumer;
+    if (consumer.kind == RawIngressTailConsumerKindV1::kNone) {
+        consumer.kind = RawIngressTailConsumerKindV1::
+            kPhase2CompatibilityObserver;
+        consumer.writer_instance =
+            observer.generation.writer_instance;
+        consumer.stream_day_id =
+            observer.generation.stream_day_id;
+        consumer.source_stream_id =
+            observer.generation.source_stream_id;
+        consumer.capture_date =
+            observer.generation.capture_date;
+        consumer.processed_segment_sequence =
+            observer.observer_processed_segment_sequence;
+        consumer.processed_global_wal_pos =
+            observer.observer_processed_wal_pos;
+        consumer.processed_ingress_sequence =
+            observer.observer_processed_ingress_sequence;
+        consumer.processed_segment_offset =
+            observer.observer_processed_segment_offset;
+        consumer.generation_active =
+            observer.generation_active;
+        consumer.healthy = observer.observer_healthy;
+        consumer.authoritative_control =
+            observer.authoritative_epoch;
+    }
+    const bool consumer_kind_valid =
+        (consumer.kind == RawIngressTailConsumerKindV1::
+             kPhase2CompatibilityObserver &&
+         !consumer.authoritative_control) ||
+        (consumer.kind == RawIngressTailConsumerKindV1::
+             kPhase3AuthoritativeControl &&
+         consumer.authoritative_control);
     if (!reconciliation.exact() ||
         callback.callback_inflight ||
         ring_used_bytes != 0U ||
@@ -201,23 +234,24 @@ bool RawIngressCleanStopEvidenceV1::exact()
         final_sink_identity.segment_base_wal_pos !=
             final_wal.append.global_wal_pos -
                 final_wal.append.segment_offset ||
-        !observer.generation_active ||
-        !observer.observer_healthy ||
-        observer.generation.writer_instance !=
+        !consumer_kind_valid ||
+        !consumer.generation_active ||
+        !consumer.healthy ||
+        consumer.writer_instance !=
             final_sink_identity.writer_instance ||
-        observer.generation.stream_day_id !=
+        consumer.stream_day_id !=
             final_sink_identity.stream_day_id ||
-        observer.generation.source_stream_id !=
+        consumer.source_stream_id !=
             final_sink_identity.source_stream_id ||
-        observer.generation.capture_date !=
+        consumer.capture_date !=
             final_sink_identity.capture_date ||
-        observer.observer_processed_segment_sequence !=
+        consumer.processed_segment_sequence !=
             final_sink_identity.segment_sequence ||
-        observer.observer_processed_wal_pos !=
+        consumer.processed_global_wal_pos !=
             final_wal.append.global_wal_pos ||
-        observer.observer_processed_ingress_sequence !=
+        consumer.processed_ingress_sequence !=
             final_wal.append.ingress_sequence ||
-        observer.observer_processed_segment_offset !=
+        consumer.processed_segment_offset !=
             final_wal.append.segment_offset) {
         return false;
     }
@@ -412,9 +446,19 @@ RawIngressApp::RawIngressApp(
           std::make_unique<
               RawUnifiedCallbackRouter>(handler_)) {
     static_cast<void>(RequireSink(sink_));
+    const bool phase2_consumer =
+        options_.tail_consumer_mode ==
+        RawIngressTailConsumerModeV1::
+            kPhase2CompatibilityObserver;
+    const bool external_consumer =
+        options_.tail_consumer_mode ==
+        RawIngressTailConsumerModeV1::
+            kExternalAuthoritativeConsumer;
     if (sdk_factory_ == nullptr ||
-        live_tail_ == nullptr ||
-        clean_stop_gate_ == nullptr) {
+        clean_stop_gate_ == nullptr ||
+        (!phase2_consumer && !external_consumer) ||
+        (phase2_consumer && live_tail_ == nullptr) ||
+        (external_consumer && live_tail_ != nullptr)) {
         throw std::invalid_argument(
             "Raw ingress runtime dependency is null");
     }
@@ -431,7 +475,8 @@ RawIngressApp::RawIngressApp(
         throw std::invalid_argument(
             "invalid Raw ingress app options");
     }
-    if (live_tail_->writer_instance() !=
+    if (phase2_consumer &&
+        (live_tail_->writer_instance() !=
             config_.recovered.writer_instance ||
         live_tail_->stream_day_id() !=
             config_.recovered.stream_day_id ||
@@ -447,9 +492,19 @@ RawIngressApp::RawIngressApp(
             config_.recovered.append.segment_offset ||
         live_tail_->next_ingress_sequence() !=
             config_.recovered
-                .recovered_next_ingress_sequence) {
+                .recovered_next_ingress_sequence)) {
         throw std::invalid_argument(
             "live tail does not start at recovered append cursor");
+    }
+
+    if (!phase2_consumer) {
+        capture_worker_ =
+            std::make_unique<RawCaptureWorker>(
+                MakeCaptureConfig(
+                    config_.stable, options_, this),
+                ring_,
+                *sink_);
+        return;
     }
 
     RawReadinessObserverConfig observer_config;
@@ -549,6 +604,16 @@ bool RawIngressApp::Initialize(
         if (!PreparedSinkMatchesRecovery()) {
             SetFailureLiteral(
                 "prepared Raw sink does not match recovered cursor");
+            static_cast<void>(StopLocked());
+            CopyError(error);
+            return false;
+        }
+        if (options_.tail_consumer_mode ==
+                RawIngressTailConsumerModeV1::
+                    kExternalAuthoritativeConsumer &&
+            external_tail_consumer_ == nullptr) {
+            SetFailureLiteral(
+                "external authoritative Raw consumer is not installed");
             static_cast<void>(StopLocked());
             CopyError(error);
             return false;
@@ -980,6 +1045,14 @@ RawObservationalGateResult
 RawIngressApp::EvaluateReadiness(
     const RawControlSnapshot& sampled_control,
     std::uint64_t now_monotonic_ns) const {
+    if (options_.tail_consumer_mode !=
+            RawIngressTailConsumerModeV1::
+                kPhase2CompatibilityObserver ||
+        readiness_observer_ == nullptr) {
+        RawObservationalGateResult result;
+        result.reason = RawObservationalGateReason::kNoGeneration;
+        return result;
+    }
     RawObservationalGateResult result =
         readiness_observer_->Evaluate(
             sampled_control, now_monotonic_ns);
@@ -989,6 +1062,36 @@ RawIngressApp::EvaluateReadiness(
         result.ready = false;
     }
     return result;
+}
+
+bool RawIngressApp::InstallExternalTailConsumer(
+    RawIngressExternalTailConsumerV1* consumer,
+    std::string* error) noexcept {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (options_.tail_consumer_mode !=
+            RawIngressTailConsumerModeV1::
+                kExternalAuthoritativeConsumer ||
+        consumer == nullptr ||
+        external_tail_consumer_ != nullptr ||
+        state_.load(std::memory_order_acquire) !=
+            RawIngressAppState::kConstructed) {
+        if (error != nullptr) {
+            try {
+                *error =
+                    "external Raw tail consumer cannot be installed";
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+    external_tail_consumer_ = consumer;
+    if (error != nullptr) {
+        try {
+            error->clear();
+        } catch (...) {
+        }
+    }
+    return true;
 }
 
 void RawIngressApp::AddSubscriptions() {
@@ -1032,6 +1135,31 @@ void RawIngressApp::StartWorkers() {
     Observe(
         RawIngressLifecycleEvent::
             kCaptureWorkerStarted);
+
+    if (options_.tail_consumer_mode ==
+        RawIngressTailConsumerModeV1::
+            kExternalAuthoritativeConsumer) {
+        if (external_tail_consumer_ == nullptr ||
+            external_consumer_start_attempted_) {
+            throw std::logic_error(
+                "external Raw tail consumer is unavailable");
+        }
+        external_consumer_start_attempted_ = true;
+        std::string external_error;
+        if (!external_tail_consumer_->StartBeforeConnect(
+                &external_error) ||
+            !external_tail_consumer_->Healthy()) {
+            throw std::runtime_error(
+                external_error.empty()
+                    ? "external Raw tail consumer startup failed"
+                    : "external Raw tail consumer startup failed: " +
+                          external_error);
+        }
+        Observe(
+            RawIngressLifecycleEvent::
+                kExternalConsumerStarted);
+        return;
+    }
 
     readiness_start_attempted_ = true;
     readiness_thread_ = std::thread(
@@ -1202,11 +1330,23 @@ bool RawIngressApp::StopLocked() noexcept {
     if (emergency_ack_issued_) {
         return StopEmergencyLocked();
     }
+    // Only an SDK generation that actually reached Running is eligible for
+    // the authoritative consumer's exact terminal catch-up.  A startup or
+    // Connect failure is an abnormal generation: drain/seal Raw as far as the
+    // capture worker safely can, but abort the derived consumer and publish no
+    // clean-stop/checkpoint proof for that generation.
+    const bool external_clean_stop_allowed =
+        current == RawIngressAppState::kRunning && !fatal();
     state_.store(
         RawIngressAppState::kStopping,
         std::memory_order_release);
 
-    if (!ShutdownAndQuiesceLocked(false)) {
+    const bool preserve_callbacks_until_shutdown =
+        options_.tail_consumer_mode ==
+        RawIngressTailConsumerModeV1::
+            kExternalAuthoritativeConsumer;
+    if (!ShutdownAndQuiesceLocked(
+            preserve_callbacks_until_shutdown)) {
         return false;
     }
 
@@ -1248,6 +1388,8 @@ bool RawIngressApp::StopLocked() noexcept {
     const RawWalSinkIdentityV1 final_sink_identity =
         sink_->identity();
     bool readiness_clean = false;
+    RawIngressTailConsumerEvidenceV1
+        terminal_consumer_evidence{};
     if (readiness_start_attempted_) {
         if (!capture_clean ||
             !final_wal.sealed ||
@@ -1324,7 +1466,79 @@ bool RawIngressApp::StopLocked() noexcept {
         }
         Observe(
             RawIngressLifecycleEvent::
-                kReadinessWorkerJoined);
+            kReadinessWorkerJoined);
+    } else if (external_consumer_start_attempted_ &&
+               !external_clean_stop_allowed) {
+        if (external_tail_consumer_ != nullptr) {
+            external_tail_consumer_->AbortAndJoin();
+        }
+        external_consumer_joined_ = true;
+        Observe(
+            RawIngressLifecycleEvent::
+                kExternalConsumerJoined);
+    } else if (external_consumer_start_attempted_) {
+        const bool terminal_cursor_valid =
+            capture_clean &&
+            final_wal.sealed &&
+            final_wal.closed &&
+            !final_wal.fatal &&
+            final_wal.append == final_wal.durable &&
+            final_sink_identity.writer_instance ==
+                config_.recovered.writer_instance &&
+            final_sink_identity.stream_day_id ==
+                config_.recovered.stream_day_id &&
+            final_sink_identity.source_stream_id ==
+                config_.recovered.source_stream_id &&
+            final_sink_identity.capture_date ==
+                config_.recovered.capture_date &&
+            final_wal.append.global_wal_pos >=
+                final_wal.append.segment_offset &&
+            final_sink_identity.segment_base_wal_pos ==
+                final_wal.append.global_wal_pos -
+                    final_wal.append.segment_offset;
+        if (!terminal_cursor_valid ||
+            external_tail_consumer_ == nullptr) {
+            SetFailureLiteral(
+                "cannot arm external Raw consumer final catch-up");
+            if (external_tail_consumer_ != nullptr) {
+                external_tail_consumer_->AbortAndJoin();
+            }
+        } else {
+            RawReadinessStopCursorV1 final_cursor;
+            final_cursor.writer_instance =
+                final_sink_identity.writer_instance;
+            final_cursor.stream_day_id =
+                final_sink_identity.stream_day_id;
+            final_cursor.source_stream_id =
+                final_sink_identity.source_stream_id;
+            final_cursor.capture_date =
+                final_sink_identity.capture_date;
+            final_cursor.segment_sequence =
+                final_sink_identity.segment_sequence;
+            final_cursor.global_wal_pos =
+                final_wal.append.global_wal_pos;
+            final_cursor.ingress_sequence =
+                final_wal.append.ingress_sequence;
+            final_cursor.segment_offset =
+                final_wal.append.segment_offset;
+            std::string external_error;
+            readiness_clean =
+                external_tail_consumer_->StopAtAndJoin(
+                    final_cursor,
+                    &terminal_consumer_evidence,
+                    &external_error);
+            if (!readiness_clean) {
+                SetFailure(
+                    external_error.empty()
+                        ? "external Raw consumer did not catch up cleanly"
+                        : std::move(external_error));
+                external_tail_consumer_->AbortAndJoin();
+            }
+        }
+        external_consumer_joined_ = true;
+        Observe(
+            RawIngressLifecycleEvent::
+                kExternalConsumerJoined);
     }
 
     const RawCaptureReconciliation exact =
@@ -1354,8 +1568,12 @@ bool RawIngressApp::StopLocked() noexcept {
         }
         evidence.capture =
             capture_worker_->Snapshot();
-        evidence.observer =
-            readiness_observer_->Snapshot();
+        if (readiness_observer_ != nullptr) {
+            evidence.observer =
+                readiness_observer_->Snapshot();
+        }
+        evidence.tail_consumer =
+            terminal_consumer_evidence;
         evidence.final_sink_identity =
             final_sink_identity;
         evidence.final_wal = final_wal;
@@ -1440,6 +1658,15 @@ bool RawIngressApp::StopEmergencyLocked() noexcept {
                 RawIngressLifecycleEvent::
                     kReadinessWorkerJoined);
         }
+    }
+    if (external_consumer_start_attempted_ &&
+        !external_consumer_joined_ &&
+        external_tail_consumer_ != nullptr) {
+        external_tail_consumer_->AbortAndJoin();
+        external_consumer_joined_ = true;
+        Observe(
+            RawIngressLifecycleEvent::
+                kExternalConsumerJoined);
     }
 
     if (subscriber_ != nullptr) {

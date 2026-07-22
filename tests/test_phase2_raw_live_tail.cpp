@@ -323,6 +323,24 @@ void TestRotationAndInstanceFence() {
         MakeSegment(1U, 0U, 1U, first_records, true));
     const std::uint64_t base2 =
         source.segments.at(1U).bytes.size();
+    ConfigureControl(
+        &source,
+        attach,
+        1U,
+        0U,
+        base2,
+        1U,
+        base2,
+        1U);
+
+    std::unique_ptr<ingress::RawLiveTail> tail;
+    Expect(
+        ingress::RawLiveTail::Attach(
+            &source, attach, &tail) ==
+            ingress::RawLiveTailError::kNone,
+        "rotation fixture attaches");
+    const auto first = tail->Next();
+    const auto sealed_before_next_control = tail->Next();
     const std::array<std::uint64_t, 1U> second_records{2U};
     source.segments.emplace(
         2U,
@@ -338,19 +356,14 @@ void TestRotationAndInstanceFence() {
         2U,
         base2 + end2,
         2U);
-
-    std::unique_ptr<ingress::RawLiveTail> tail;
-    Expect(
-        ingress::RawLiveTail::Attach(
-            &source, attach, &tail) ==
-            ingress::RawLiveTailError::kNone,
-        "rotation fixture attaches");
-    const auto first = tail->Next();
+    source.control_generation += 2U;
     const auto transition = tail->Next();
     const auto second = tail->Next();
     Expect(
         first.kind ==
                 ingress::RawLiveTailStepKind::kRecord &&
+            sealed_before_next_control.kind ==
+                ingress::RawLiveTailStepKind::kWouldBlock &&
             transition.kind ==
                 ingress::RawLiveTailStepKind::
                     kSegmentTransition &&
@@ -382,7 +395,7 @@ void TestRotationAndInstanceFence() {
             second.record->segment.segment_sequence == 2U &&
             second.record->view.header().ingress_sequence ==
                 2U,
-        "tail emits a validated header-frontier fact before the next segment record");
+        "a sealed-current rotation window stays retryable and the tail later emits a validated header-frontier fact before the next segment record");
 
     source.control.writer_instance =
         Pattern<16U>(0xd0U);

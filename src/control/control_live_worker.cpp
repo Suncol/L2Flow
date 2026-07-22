@@ -75,7 +75,206 @@ bool InitialStateMatches(
                tail.initial_global_wal_pos();
 }
 
+bool SameAttach(
+    const l2flow::ingress::RawLiveTailAttachV1& left,
+    const l2flow::ingress::RawLiveTailAttachV1& right) noexcept {
+    return left.writer_instance == right.writer_instance &&
+           left.stream_day_id == right.stream_day_id &&
+           left.source_stream_id == right.source_stream_id &&
+           left.capture_date == right.capture_date &&
+           left.segment_sequence == right.segment_sequence &&
+           left.global_wal_pos == right.global_wal_pos &&
+           left.segment_offset == right.segment_offset &&
+           left.next_ingress_sequence == right.next_ingress_sequence;
+}
+
 }  // namespace
+
+ControlLiveWorkerReplayProofV1::ControlLiveWorkerReplayProofV1(
+    l2flow::common::Identity128 writer_instance,
+    l2flow::ingress::RawLiveTailAttachV1 validated_frontier,
+    std::uint64_t replay_record_count,
+    std::uint32_t decoder_processed_segment_sequence,
+    std::uint64_t decoder_processed_segment_offset,
+    std::uint64_t decoder_processed_record_start_wal_pos,
+    std::uint64_t decoder_processed_record_end_wal_pos,
+    std::uint64_t decoder_processed_ingress_sequence,
+    l2flow::common::Sha256Digest decoder_state_sha256) noexcept
+    : writer_instance_(writer_instance),
+      validated_frontier_(validated_frontier),
+      replay_record_count_(replay_record_count),
+      decoder_processed_segment_sequence_(
+          decoder_processed_segment_sequence),
+      decoder_processed_segment_offset_(
+          decoder_processed_segment_offset),
+      decoder_processed_record_start_wal_pos_(
+          decoder_processed_record_start_wal_pos),
+      decoder_processed_record_end_wal_pos_(
+          decoder_processed_record_end_wal_pos),
+      decoder_processed_ingress_sequence_(
+          decoder_processed_ingress_sequence),
+      decoder_state_sha256_(decoder_state_sha256) {}
+
+ControlLiveWorkerReplayProofErrorV1
+ControlLiveWorkerReplayProofV1::Create(
+    l2flow::common::Identity128 writer_instance,
+    std::span<const l2flow::ingress::RawSegmentScanResult> scans,
+    const l2flow::ingress::RawLiveTailAttachV1& validated_frontier,
+    const ControlDecoderSnapshotV1& decoder,
+    std::unique_ptr<ControlLiveWorkerReplayProofV1>* output) noexcept {
+    if (output == nullptr) {
+        return ControlLiveWorkerReplayProofErrorV1::kNullOutput;
+    }
+    output->reset();
+    if (l2flow::common::IsZeroIdentity(writer_instance) ||
+        validated_frontier.writer_instance != writer_instance ||
+        validated_frontier.source_stream_id == 0U ||
+        validated_frontier.capture_date == 0U ||
+        validated_frontier.segment_sequence == 0U ||
+        validated_frontier.segment_offset <
+            l2flow::ingress::kRawV1SegmentHeaderBytes ||
+        validated_frontier.global_wal_pos <
+            validated_frontier.segment_offset ||
+        validated_frontier.next_ingress_sequence == 0U ||
+        scans.empty() ||
+        scans.size() != static_cast<std::size_t>(
+            validated_frontier.segment_sequence) ||
+        decoder.source_stream_id !=
+            validated_frontier.source_stream_id ||
+        decoder.capture_date != validated_frontier.capture_date ||
+        decoder.stream_day_id != validated_frontier.stream_day_id) {
+        return ControlLiveWorkerReplayProofErrorV1::kInvalidInput;
+    }
+
+    try {
+        std::uint64_t expected_segment_base = 0U;
+        std::uint64_t expected_next_ingress_sequence = 1U;
+        std::uint64_t replay_record_count = 0U;
+        std::uint32_t last_record_segment_sequence = 0U;
+        std::uint64_t last_record_segment_offset = 0U;
+        std::uint64_t last_record_start_wal_pos = 0U;
+        std::uint64_t last_record_end_wal_pos = 0U;
+        std::uint64_t last_record_ingress_sequence = 0U;
+
+        for (std::size_t index = 0U; index < scans.size(); ++index) {
+            const l2flow::ingress::RawSegmentScanResult& scan =
+                scans[index];
+            const std::uint32_t sequence =
+                static_cast<std::uint32_t>(index + 1U);
+            if (!scan.ok()) {
+                return ControlLiveWorkerReplayProofErrorV1::kInvalidScan;
+            }
+            if (scan.segment.source_stream_id !=
+                    validated_frontier.source_stream_id ||
+                scan.segment.capture_date !=
+                    validated_frontier.capture_date ||
+                scan.segment.stream_day_id !=
+                    validated_frontier.stream_day_id ||
+                scan.segment.segment_sequence != sequence ||
+                scan.segment.segment_base_wal_pos !=
+                    expected_segment_base ||
+                scan.segment.first_ingress_sequence !=
+                    expected_next_ingress_sequence ||
+                scan.validated_end_offset <
+                    l2flow::ingress::kRawV1SegmentHeaderBytes ||
+                expected_segment_base >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        scan.validated_end_offset ||
+                scan.validated_end_wal_pos !=
+                    expected_segment_base +
+                        scan.validated_end_offset) {
+                return ControlLiveWorkerReplayProofErrorV1::
+                    kSegmentChainMismatch;
+            }
+            for (const l2flow::ingress::RawRecordView& record :
+                 scan.records) {
+                if (replay_record_count ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    record.header().ingress_sequence !=
+                        expected_next_ingress_sequence ||
+                    record.record_start_wal_pos() <
+                        expected_segment_base ||
+                    record.record_end_wal_pos() <=
+                        record.record_start_wal_pos() ||
+                    record.record_end_offset() >
+                        scan.validated_end_offset ||
+                    record.record_end_wal_pos() !=
+                        expected_segment_base +
+                            record.record_end_offset()) {
+                    return ControlLiveWorkerReplayProofErrorV1::
+                        kSegmentChainMismatch;
+                }
+                ++replay_record_count;
+                last_record_segment_sequence = sequence;
+                last_record_segment_offset =
+                    record.record_end_offset();
+                last_record_start_wal_pos =
+                    record.record_start_wal_pos();
+                last_record_end_wal_pos =
+                    record.record_end_wal_pos();
+                last_record_ingress_sequence =
+                    record.header().ingress_sequence;
+                if (expected_next_ingress_sequence ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    return ControlLiveWorkerReplayProofErrorV1::
+                        kSegmentChainMismatch;
+                }
+                ++expected_next_ingress_sequence;
+            }
+            expected_segment_base = scan.validated_end_wal_pos;
+        }
+
+        const l2flow::ingress::RawSegmentScanResult& final_scan =
+            scans.back();
+        if (final_scan.segment.segment_sequence !=
+                validated_frontier.segment_sequence ||
+            final_scan.validated_end_offset !=
+                validated_frontier.segment_offset ||
+            final_scan.validated_end_wal_pos !=
+                validated_frontier.global_wal_pos ||
+            expected_next_ingress_sequence !=
+                validated_frontier.next_ingress_sequence ||
+            decoder.counters.processed_records != replay_record_count ||
+            decoder.next_ingress_sequence !=
+                expected_next_ingress_sequence ||
+            decoder.processed_ingress_sequence !=
+                last_record_ingress_sequence ||
+            decoder.processed_record_start_wal_pos !=
+                last_record_start_wal_pos ||
+            decoder.processed_record_end_wal_pos !=
+                last_record_end_wal_pos) {
+            return ControlLiveWorkerReplayProofErrorV1::kDecoderMismatch;
+        }
+        if ((replay_record_count == 0U &&
+             (last_record_segment_sequence != 0U ||
+              last_record_segment_offset != 0U ||
+              decoder.processed_ingress_sequence != 0U ||
+              decoder.processed_record_start_wal_pos != 0U ||
+              decoder.processed_record_end_wal_pos != 0U)) ||
+            (replay_record_count != 0U &&
+             (last_record_segment_sequence == 0U ||
+              last_record_segment_offset <
+                  l2flow::ingress::kRawV1SegmentHeaderBytes))) {
+            return ControlLiveWorkerReplayProofErrorV1::kDecoderMismatch;
+        }
+
+        output->reset(new ControlLiveWorkerReplayProofV1(
+            writer_instance,
+            validated_frontier,
+            replay_record_count,
+            last_record_segment_sequence,
+            last_record_segment_offset,
+            last_record_start_wal_pos,
+            last_record_end_wal_pos,
+            last_record_ingress_sequence,
+            decoder.state_sha256));
+        return ControlLiveWorkerReplayProofErrorV1::kNone;
+    } catch (const std::bad_alloc&) {
+        return ControlLiveWorkerReplayProofErrorV1::kResourceExhausted;
+    } catch (...) {
+        return ControlLiveWorkerReplayProofErrorV1::kInvalidInput;
+    }
+}
 
 ControlLiveWorkerV1::ControlLiveWorkerV1(
     ControlLiveWorkerConfigV1 config,
@@ -102,6 +301,39 @@ ControlLiveWorkerV1::~ControlLiveWorkerV1() = default;
 
 ControlLiveWorkerCreateErrorV1 ControlLiveWorkerV1::Create(
     ControlLiveWorkerConfigV1 config,
+    std::unique_ptr<l2flow::ingress::RawLiveTail> tail,
+    std::unique_ptr<ControlDecoderV1> decoder,
+    std::unique_ptr<ControlRecordSinkV1> record_sink,
+    std::unique_ptr<ControlLiveWorkerV1>* output) noexcept {
+    return CreateImpl(
+        config,
+        nullptr,
+        std::move(tail),
+        std::move(decoder),
+        std::move(record_sink),
+        output);
+}
+
+ControlLiveWorkerCreateErrorV1
+ControlLiveWorkerV1::CreateWithReplayProof(
+    ControlLiveWorkerConfigV1 config,
+    const ControlLiveWorkerReplayProofV1& replay_proof,
+    std::unique_ptr<l2flow::ingress::RawLiveTail> tail,
+    std::unique_ptr<ControlDecoderV1> decoder,
+    std::unique_ptr<ControlRecordSinkV1> record_sink,
+    std::unique_ptr<ControlLiveWorkerV1>* output) noexcept {
+    return CreateImpl(
+        config,
+        &replay_proof,
+        std::move(tail),
+        std::move(decoder),
+        std::move(record_sink),
+        output);
+}
+
+ControlLiveWorkerCreateErrorV1 ControlLiveWorkerV1::CreateImpl(
+    ControlLiveWorkerConfigV1 config,
+    const ControlLiveWorkerReplayProofV1* replay_proof,
     std::unique_ptr<l2flow::ingress::RawLiveTail> tail,
     std::unique_ptr<ControlDecoderV1> decoder,
     std::unique_ptr<ControlRecordSinkV1> record_sink,
@@ -158,7 +390,37 @@ ControlLiveWorkerCreateErrorV1 ControlLiveWorkerV1::Create(
             state.stream_day_id != tail->stream_day_id()) {
             return ControlLiveWorkerCreateErrorV1::kNamespaceMismatch;
         }
-        if (!InitialStateMatches(config, *tail, state)) {
+        bool initial_state_matches =
+            InitialStateMatches(config, *tail, state);
+        if (replay_proof != nullptr) {
+            const l2flow::ingress::RawLiveTailAttachV1 proof_attach =
+                replay_proof->validated_frontier_;
+            initial_state_matches =
+                replay_proof->writer_instance_ == config.writer_instance &&
+                SameAttach(proof_attach, attach) &&
+                replay_proof->replay_record_count_ ==
+                    state.counters.processed_records &&
+                replay_proof->decoder_processed_ingress_sequence_ ==
+                    state.processed_ingress_sequence &&
+                replay_proof->decoder_processed_record_start_wal_pos_ ==
+                    state.processed_record_start_wal_pos &&
+                replay_proof->decoder_processed_record_end_wal_pos_ ==
+                    state.processed_record_end_wal_pos &&
+                replay_proof->decoder_state_sha256_ ==
+                    state.state_sha256 &&
+                state.next_ingress_sequence ==
+                    attach.next_ingress_sequence &&
+                ((replay_proof->replay_record_count_ == 0U &&
+                  replay_proof->decoder_processed_segment_sequence_ == 0U &&
+                  replay_proof->decoder_processed_segment_offset_ == 0U) ||
+                 (replay_proof->replay_record_count_ != 0U &&
+                  replay_proof->decoder_processed_segment_sequence_ != 0U &&
+                  replay_proof->decoder_processed_segment_sequence_ <=
+                      attach.segment_sequence &&
+                  replay_proof->decoder_processed_segment_offset_ >=
+                      l2flow::ingress::kRawV1SegmentHeaderBytes));
+        }
+        if (!initial_state_matches) {
             return ControlLiveWorkerCreateErrorV1::kInitialCursorMismatch;
         }
         const std::uint64_t generation_first_ingress_sequence =
@@ -581,8 +843,20 @@ ControlReadinessResultV1 ControlLiveWorkerV1::EvaluateReadiness(
             kRawControlSampleUnavailable;
         return result;
     }
+    // The Raw sample is acquired inside this call.  A caller timestamp taken
+    // immediately before entry can therefore be older than a writer
+    // heartbeat published concurrently while SampleControlFresh() validates
+    // the control page.  Refresh from the worker's configured monotonic clock
+    // after sampling and use the later timestamp; otherwise a healthy writer
+    // is spuriously classified as clock-regressed.
     try {
         std::lock_guard<std::mutex> lock(state_mutex_);
+        // Hold the same mutex used by PublishHeartbeat while refreshing now.
+        // This closes the second race in which the decoder could publish a
+        // newer heartbeat after our clock read but before its state snapshot.
+        const std::uint64_t sampled_after_monotonic_ns = MonotonicNowNs();
+        const std::uint64_t effective_now_monotonic_ns = std::max(
+            now_monotonic_ns, sampled_after_monotonic_ns);
         const ControlDecoderSnapshotV1 decoder = decoder_->Snapshot();
         const ControlReadinessRuntimeV1 runtime = ReadinessRuntimeLocked(
             sampled_realtime_ns, capture_pipeline_healthy);
@@ -592,7 +866,7 @@ ControlReadinessResultV1 ControlLiveWorkerV1::EvaluateReadiness(
             runtime,
             sampled_raw.snapshot,
             calendar_proof,
-            now_monotonic_ns);
+            effective_now_monotonic_ns);
     } catch (...) {
         ControlReadinessResultV1 result;
         result.reason = ControlReadinessReasonV1::kDecoderUnhealthy;

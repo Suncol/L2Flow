@@ -1,6 +1,6 @@
 # Phase 3 local acceptance record（本地代码范围）
 
-Date: 2026-07-21
+Date: 2026-07-22
 Host scope: local Linux x86-64 development container
 
 ## 结论
@@ -8,14 +8,17 @@ Host scope: local Linux x86-64 development container
 本记录把“可在仓库内验证的 Phase 3 library/live bridge”与“生产 ingress 已完成
 Phase 3 接入”严格分开。当前结论是：Phase 3 的独立 control decoder、固定记录、
 checkpoint、readiness、`ReSubscribe` guard 和 live worker 本地实现切片及其定向
-测试已完成；生产 service/controller 接入和外部 Exit 证据未完成。
+测试已完成。独立 production controller、POSIX derived sink 和显式 live runner 现已
+把 Phase 2 recovery、Raw replay/tail、SDK generation、READY、checkpoint 与两代
+restart 串成真实 feeder 可运行链路；四个 production ingress service 的构造/
+monitor/cutover 和外部 Exit 证据仍未完成。
 
 | 口径 | 当前状态 | 判定依据 |
 | --- | --- | --- |
-| **Phase 3 library/local live-bridge implementation slice** | **已完成** | `L2Flow::phase3` 包含安全 API/SYS decoder、authoritative state、固定 codec、checkpoint、READY gate、guard 和单消费者 live worker |
-| **Production implementation complete** | **未完成** | `L2Flow::production` 和 `l2flow_ingress_service` 仍停留在 Phase 0–1；没有生产 controller 组合 Phase 2 recovery、SDK generation lifecycle、Phase 3 worker、derived sink 与 checkpoint restore/publication |
-| **Scoped local verification** | **已完成** | 当前最终代码的 strict Debug、Release 与 ASan+UBSan `phase3` label 定向 CTest 均为 **5/5，0 failed**；该结论只覆盖下列五个仓库内测试 |
-| **Production/external Phase 3 exit** | **未完成** | 没有真实四端点、五次真实断线/重连、生产服务重启、真实 SDK data plane、目标 NVMe 或完整交易日制品；fixture 测试不能替代这些证据 |
+| **Phase 3 library/controller implementation slice** | **已完成** | `L2Flow::phase3` 包含安全 API/SYS decoder、authoritative state、固定 codec、checkpoint、READY gate、live worker、production controller 和 durable/idempotent POSIX sink |
+| **Production implementation complete** | **未完成** | 显式 runner 已完成真实两代 production composition；但 `L2Flow::production` 和 `l2flow_ingress_service` 仍停留在 Phase 0–1，四个 service 尚未构造/监控/托管该 controller |
+| **Scoped local verification** | **已完成** | Debug/Release 的 Phase 3 label 9/9 通过；ASan+UBSan 选定矩阵 11/11、TSan 2/2 通过；真实 `sh-snapshot` 与 `sh-tick` 两代 SDK 链路通过 |
+| **Production/external Phase 3 exit** | **未完成** | 没有四流完整交易日、五次真实断线/重连、跨进程 service restart、目标 NVMe/reboot/power-cut 或正式 service cutover 制品；短窗 runner 不能替代这些证据 |
 
 因此，本文中的“已完成”只指第一行的独立库/本地 bridge 切片和第三行列明的
 定向验证范围，不授权切换 production alias，也不把 Phase 2 或整个系统的
@@ -98,29 +101,81 @@ Phase-3 V1 的 `ReSubscribe` guard 会验证 maintenance window、durable audit 
 - `StopAt` 只接受精确 terminal cursor 并在 catch-up 后正常退出，`Abort` 用于异常
   退出；service 必须 join `Run` 后再销毁 worker 和 borrowed Raw source。
 
-这些是 production-capable component contract，不是 production service 已经完成
-construction、thread ownership、SDK Connect/Shutdown、monitor 或 restart orchestration
-的声明。
+这些 component contract 现在由下述独立 controller/runner 组合；它仍不是四个
+production service 已完成 cutover 的声明。
+
+### Production controller、POSIX sink 与两代 SDK lifecycle
+
+`ControlProductionControllerV1` 拥有一个 Phase 2 authoritative runtime generation
+及其唯一 Phase 3 Raw consumer。`Create()` 在任何 SDK `Connect()` 前完成：
+
+- immutable Raw replay snapshot；
+- checkpoint discovery、真实 Raw boundary 定位与 decoder restore；
+- checkpoint 后的 Raw suffix replay，或无可用 checkpoint 时 full replay；
+- append-visible POSIX live-tail attach 和 replay proof；
+- durable/idempotent `ControlRecordPosixSinkV1` 安装；
+- `ControlLiveWorkerV1` 作为 external authoritative consumer 的 pre-Connect barrier。
+
+`Initialize()` 先启动 worker，再启动 Phase 2 runtime/SDK generation。正常 `Stop()`
+保持 callback handler 接收直到 SDK `Shutdown()` 返回，然后 quiesce callback、排尽
+Raw、取得 exact terminal cursor、让 Phase 3 `StopAt` catch up/join，最后才允许
+checkpoint publication 和 Raw clean-stop certificate/unregister。异常 worker 由
+failure supervisor fail-stop runtime；失败 generation 不发布 checkpoint。
+
+READY 每次直接读取新的 coherent Raw control snapshot。为避免 caller 采样时间早于
+刚发布的 writer heartbeat，worker 先取得 fresh Raw control，再在持有 decoder state
+mutex 后刷新其 configured monotonic clock，并采用 caller/fresh 中较晚的时间；这修复
+了实盘曾观测的 `kWriterHeartbeatClockRegression` 假阴性，同时没有放宽真实 clock
+regression 的拒绝条件。
+
+[`tools/mdl_phase3_live_probe.cpp`](../../tools/mdl_phase3_live_probe.cpp) 现在执行完整
+的两代 production composition：generation 1 exact stop/checkpoint 后，重新注册
+`RECOVERING + RESUME_CONNECT`，分析 sealed Raw、创建连续的 next segment、发布
+`RESUMED_OPEN` maintenance report 并 receipt-gated 晋升 ACTIVE；generation 2
+controller 从 generation 1 checkpoint 恢复，在第二次真实 SDK `Connect()` 前启动
+worker，要求 current-generation `LogonSuccess` 和新 market evidence 才能 READY，
+最后再次 exact stop/checkpoint。
+
+2026-07-22 使用外部真实
+`/home/sunc/L2Flow/MDL/libmdl_api.so` 和用户后台 feeder
+`127.0.0.1:9112` 的通过证据：
+
+| 流 | 证据目录 | gen1 records | 最终 Raw=Phase3 | WAL | 关键结果 |
+| --- | --- | ---: | ---: | ---: | --- |
+| `sh-snapshot` | `/tmp/l2flow-phase3-live-20260722-sh-snapshot-two-generation-2` | 1713 | 3494 | 4539552 | 两代 READY，2 derived，2 checkpoints，errors=0 |
+| `sh-tick` | `/tmp/l2flow-phase3-live-20260722-sh-tick-two-generation-3sec` | 24503 | 44466 | 9612848 | 两代 READY，2 derived，2 checkpoints，errors=0 |
+
+两次均有 `checkpoint_loaded=true`、`checkpoint_restored=true`、第二次真实
+`LogonSuccess`、generation-2 live suffix、终态 checkpoint Raw boundary restore，且
+append/durable/decoder WAL 精确相等。更完整的 Phase 2/rotation/失败证据记录在
+[`phase2-local.md`](phase2-local.md#2026-07-22-addendum真实-feederproduction-composition-与两代恢复)。
 
 ## 当前定向验证结果
 
-当前最终代码分别在 strict Debug、Release 和 ASan+UBSan Debug build 中执行
-`phase3` label suite。结果如下：
+当前最终代码在 strict Debug/Release 执行 full CTest 和 `phase3` label suite，
+并对 Phase 2/3 production composition 运行选定 sanitizer 矩阵。结果如下：
 
 ```text
-strict Debug:       5/5 passed, 0 failed
-strict Release:     5/5 passed, 0 failed
-ASan+UBSan Debug:   5/5 passed, 0 failed
+strict Debug full CTest:    106/107 passed
+strict Release full CTest:  105/106 passed
+Debug phase3 label:             9/9 passed
+Release phase3 label:           9/9 passed
+ASan+UBSan selected:           11/11 passed
+TSan selected:                   2/2 passed
 ```
 
-测试项为：
+Phase 3 label 测试项为：
 
 ```text
 test_phase3_control_decoder
 test_phase3_control_core
 test_phase3_control_live_worker
+test_phase3_control_production_controller
 test_phase3_control_checkpoint_reachability
 test_phase3_control_checkpoint_posix_store
+test_phase3_control_record_posix_sink
+test_phase2_raw_production_runtime
+test_phase3_live_probe_cli_help
 ```
 
 该组测试覆盖首次/失败登录、旧 epoch disconnect、五轮 fixture 断线重连、
@@ -131,11 +186,15 @@ wire/store/discovery/reachability 拒绝路径。五轮 fixture 的确定性断�
 epoch 1 得到最终 epoch 6、五个 disconnect 且 subscription set 不变时 epoch 不被
 虚增。
 
-ASan+UBSan 运行显式使用
-`ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1` 和
-`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`，且没有 sanitizer 报告。因此该
-结果不声明 LeakSanitizer、ThreadSanitizer、持续 libFuzzer、真实 SDK callback、
-真实 filesystem power loss 或 production service E2E；只有实际执行并保留独立
+ASan+UBSan 运行显式使用 `ASAN_OPTIONS=detect_leaks=0`，且没有 sanitizer 报告；
+因此不声明 LeakSanitizer。TSan 直接通过 `setarch x86_64 -R` 执行
+`test_phase3_control_production_controller` 和
+`test_phase2_raw_production_runtime`，两项均通过。Debug/Release full CTest 的唯一
+失败是既有 `test_phase0_baseline`：仓库 SDK archive/LFS artifact 与 frozen
+baseline 不匹配；Phase 2/3 测试没有失败。
+
+这些结果与上述真实 SDK runner 仍不声明持续 libFuzzer、真实 filesystem power
+loss、四流完整交易日或 production service E2E/cutover；只有实际执行并保留独立
 制品的 suite 才能写入对应声明。
 
 ## Production implementation 与外部 Exit 阻断项
@@ -143,18 +202,22 @@ ASan+UBSan 运行显式使用
 以下条件当前均未完成，且不能由上述 5 个测试替代：
 
 1. `L2Flow::production` alias 仍指向 `l2flow_phase01`，
-   `l2flow_ingress_service` 仍链接 Phase 0–1；四个 ingress 未构造 Phase 2 Raw
-   production runtime + Phase 3 worker。
-2. 没有 service-level controller 串联 startup route/recovery、callback-quiescence、
-   Connect generation、derived-record sink、checkpoint restore/publication、READY
-   monitor、exact stop/abort 和 restart。
+   `l2flow_ingress_service` 仍链接 Phase 0–1；四个 service 未托管现有 Phase 2 Raw
+   production runtime + Phase 3 controller。
+2. 仓库已有独立 controller 与 live runner 串联 route/recovery、callback-quiescence、
+   Connect generation、derived-record sink、checkpoint restore/publication、READY、
+   exact stop 和 recovered restart；但尚无四流 service-level configuration、长期
+   monitor、跨进程 coordinator IPC、supervisor/restart policy 和部署 lifecycle。
 3. checked-in `mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 当前是 134-byte Git LFS
-   pointer，不是真实 vendor shared object；因此当前仓库状态不能提供真实 SDK
-   runtime/link 验收。
+   pointer，不是真实 vendor shared object；本次实盘通过依赖仓库外的只读真实库
+   `/home/sunc/L2Flow/MDL/libmdl_api.so`，因此仓库本身仍不是 self-contained SDK
+   runtime/link 验收制品。
 4. 没有对真实 endpoint 连续执行五次断线/重连并核对 Raw、ControlRecord、epoch、
    READY 与 service lifecycle。单元 fixture 的五轮状态机测试不是该制品。
-5. 没有生产 required-subscription failure 注入、真实 malformed control 隔离、正常
-   service restart/checkpoint suffix replay 或四流完整交易日证据。
+5. 没有生产 required-subscription failure 注入、真实 malformed control 隔离、
+   跨进程正常 service restart 或四流完整交易日证据；同进程销毁/重建两代
+   runtime/controller 的 checkpoint restore + suffix replay 已通过，但不能替代
+   process/service restart。
 6. Phase 2 的 production cutover、10,000 seeds、目标 NVMe、cold-cache 5×、reboot、
    deterministic power-loss 和目标环境 power-cut 条件仍未完成；Phase 3 不能绕过
    其上游 durability authority。

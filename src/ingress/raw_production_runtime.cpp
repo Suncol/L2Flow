@@ -7,8 +7,11 @@
 #include <cerrno>
 #include <cstddef>
 #include <limits>
+#include <memory>
+#include <span>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace l2flow::ingress {
 namespace {
@@ -355,6 +358,48 @@ void CopyFreshOutcome(
                attach.segment_offset;
 }
 
+[[nodiscard]] bool SameLiveAttach(
+    const RawLiveTailAttachV1& left,
+    const RawLiveTailAttachV1& right) noexcept {
+    return left.writer_instance == right.writer_instance &&
+           left.stream_day_id == right.stream_day_id &&
+           left.source_stream_id == right.source_stream_id &&
+           left.capture_date == right.capture_date &&
+           left.segment_sequence == right.segment_sequence &&
+           left.global_wal_pos == right.global_wal_pos &&
+           left.segment_offset == right.segment_offset &&
+           left.next_ingress_sequence ==
+               right.next_ingress_sequence;
+}
+
+[[nodiscard]] bool ControlMatchesAttach(
+    const RawControlSnapshot& control,
+    const RawLiveTailAttachV1& attach) noexcept {
+    return control.fatal_state == 0U &&
+           control.writer_instance == attach.writer_instance &&
+           control.stream_day_id == attach.stream_day_id &&
+           control.source_stream_id == attach.source_stream_id &&
+           control.capture_date == attach.capture_date &&
+           control.segment_sequence == attach.segment_sequence &&
+           control.append_global_wal_pos == attach.global_wal_pos &&
+           control.append_segment_offset == attach.segment_offset &&
+           control.append_ingress_sequence !=
+               std::numeric_limits<std::uint64_t>::max() &&
+           control.append_ingress_sequence + 1U ==
+               attach.next_ingress_sequence &&
+           control.append_global_wal_pos ==
+               control.durable_global_wal_pos &&
+           control.append_ingress_sequence ==
+               control.durable_ingress_sequence &&
+           control.append_segment_offset ==
+               control.durable_segment_offset &&
+           control.segment_sequence != 0U &&
+           control.append_segment_offset >=
+               kRawV1SegmentHeaderBytes &&
+           control.append_global_wal_pos >=
+               control.append_segment_offset;
+}
+
 [[nodiscard]] RawProductionRuntimeFailureV1
 ValidateActiveWriter(
     const RawReserveAuthorizedActionV1& action,
@@ -436,10 +481,12 @@ ValidateActiveWriter(
 RawProductionRuntimeV1::RawProductionRuntimeV1(
     std::unique_ptr<RawLiveTailPosixSource>
         live_tail_source,
-    std::unique_ptr<RawIngressApp> app) noexcept
+    std::unique_ptr<RawIngressApp> app,
+    RawLiveTailAttachV1 initial_live_attach) noexcept
     : live_tail_source_(
           std::move(live_tail_source)),
-      app_(std::move(app)) {}
+      app_(std::move(app)),
+      initial_live_attach_(initial_live_attach) {}
 
 RawProductionRuntimeV1::~RawProductionRuntimeV1() =
     default;
@@ -452,6 +499,282 @@ bool RawProductionRuntimeV1::Initialize(
 bool RawProductionRuntimeV1::Stop(
     std::string* error) noexcept {
     return app_->Stop(error);
+}
+
+RawProductionReplaySnapshotResultV1
+RawProductionRuntimeV1::PrepareAuthoritativeReplay(
+    RawProductionReplaySnapshotLimitsV1 limits) noexcept {
+    RawProductionReplaySnapshotResultV1 result{};
+    if (live_tail_source_ == nullptr || app_ == nullptr ||
+        app_->state() != RawIngressAppState::kConstructed ||
+        app_->tail_consumer_mode() !=
+            RawIngressTailConsumerModeV1::
+                kExternalAuthoritativeConsumer ||
+        authoritative_replay_prepared_ ||
+        authoritative_tail_attached_) {
+        result.error =
+            RawProductionReplaySnapshotErrorV1::kInvalidState;
+        return result;
+    }
+    if (limits.max_segments == 0U ||
+        limits.max_segments >
+            kRawLiveTailPosixAbsoluteMaxSegments ||
+        limits.max_segment_bytes < kRawV1SegmentHeaderBytes ||
+        limits.max_total_bytes < kRawV1SegmentHeaderBytes ||
+        limits.max_segment_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max()) ||
+        limits.max_total_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+        result.error =
+            RawProductionReplaySnapshotErrorV1::kInvalidLimits;
+        return result;
+    }
+
+    try {
+        RawControlSnapshot first{};
+        std::uint64_t first_generation = 0U;
+        result.error_number = live_tail_source_->ReadControl(
+            &first, &first_generation);
+        if (result.error_number != 0) {
+            result.error =
+                RawProductionReplaySnapshotErrorV1::kControlRead;
+            return result;
+        }
+        if (first_generation == 0U ||
+            !ControlMatchesAttach(first, initial_live_attach_) ||
+            first.segment_sequence > limits.max_segments) {
+            result.error =
+                RawProductionReplaySnapshotErrorV1::kControlInvalid;
+            return result;
+        }
+
+        result.snapshot.control = first;
+        result.snapshot.control_generation = first_generation;
+        result.snapshot.live_attach = initial_live_attach_;
+        result.snapshot.scans.reserve(
+            static_cast<std::size_t>(first.segment_sequence));
+
+        std::uint64_t total_bytes = 0U;
+        std::uint64_t expected_segment_base = 0U;
+        std::uint64_t expected_next_ingress_sequence = 1U;
+        for (std::uint32_t sequence = 1U;
+             sequence <= first.segment_sequence;
+             ++sequence) {
+            result.segment_sequence = sequence;
+            RawLiveSegmentInfo info{};
+            result.error_number =
+                live_tail_source_->InspectSegment(sequence, &info);
+            if (result.error_number != 0) {
+                result.error =
+                    RawProductionReplaySnapshotErrorV1::kSegmentInspect;
+                return result;
+            }
+            const bool current = sequence == first.segment_sequence;
+            if (info.header.source_stream_id !=
+                    first.source_stream_id ||
+                info.header.capture_date != first.capture_date ||
+                info.header.stream_day_id != first.stream_day_id ||
+                info.header.segment_sequence != sequence ||
+                info.header.segment_base_wal_pos !=
+                    expected_segment_base ||
+                info.header.first_ingress_sequence !=
+                    expected_next_ingress_sequence ||
+                (!current && !info.sealed) ||
+                (current && info.sealed)) {
+                result.error =
+                    RawProductionReplaySnapshotErrorV1::kSegmentChain;
+                return result;
+            }
+
+            const std::uint64_t end_offset = current
+                ? first.append_segment_offset
+                : info.visible_end_offset;
+            if (end_offset < kRawV1SegmentHeaderBytes ||
+                end_offset > info.visible_end_offset ||
+                end_offset > limits.max_segment_bytes ||
+                end_offset > limits.max_total_bytes ||
+                total_bytes >
+                    limits.max_total_bytes - end_offset ||
+                expected_segment_base >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        end_offset) {
+                result.error =
+                    RawProductionReplaySnapshotErrorV1::kSegmentLimit;
+                return result;
+            }
+            total_bytes += end_offset;
+            auto bytes =
+                std::make_shared<std::vector<std::byte>>(
+                    static_cast<std::size_t>(end_offset));
+            std::size_t offset = 0U;
+            while (offset < bytes->size()) {
+                const RawLiveReadResult read =
+                    live_tail_source_->ReadSegmentSome(
+                        sequence,
+                        static_cast<std::uint64_t>(offset),
+                        std::span<std::byte>(*bytes).subspan(offset));
+                if (read.error_number != 0 ||
+                    read.bytes_read == 0U ||
+                    read.bytes_read > bytes->size() - offset) {
+                    result.error =
+                        RawProductionReplaySnapshotErrorV1::kSegmentRead;
+                    result.error_number =
+                        read.error_number == 0
+                            ? ENODATA
+                            : read.error_number;
+                    return result;
+                }
+                offset += read.bytes_read;
+            }
+
+            RawSegmentScanResult scan = ScanRawSegmentV1(
+                std::shared_ptr<const std::vector<std::byte>>(bytes),
+                end_offset);
+            if (!scan.ok()) {
+                result.error =
+                    RawProductionReplaySnapshotErrorV1::kSegmentScan;
+                result.reader_error = scan.error;
+                result.codec_error = scan.codec_error;
+                return result;
+            }
+            if (scan.segment.source_stream_id !=
+                    info.header.source_stream_id ||
+                scan.segment.capture_date != info.header.capture_date ||
+                scan.segment.stream_day_id != info.header.stream_day_id ||
+                scan.segment.segment_sequence != sequence ||
+                scan.segment.segment_base_wal_pos !=
+                    expected_segment_base ||
+                scan.segment.first_ingress_sequence !=
+                    expected_next_ingress_sequence ||
+                scan.validated_end_offset != end_offset ||
+                scan.validated_end_wal_pos !=
+                    expected_segment_base + end_offset) {
+                result.error =
+                    RawProductionReplaySnapshotErrorV1::kSegmentChain;
+                return result;
+            }
+            if (!scan.records.empty()) {
+                const std::uint64_t last =
+                    scan.records.back().header().ingress_sequence;
+                if (last ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    result.error =
+                        RawProductionReplaySnapshotErrorV1::kSegmentChain;
+                    return result;
+                }
+                expected_next_ingress_sequence = last + 1U;
+            }
+            expected_segment_base = scan.validated_end_wal_pos;
+            result.snapshot.scans.push_back(std::move(scan));
+        }
+
+        if (expected_segment_base != first.append_global_wal_pos ||
+            expected_next_ingress_sequence !=
+                first.append_ingress_sequence + 1U) {
+            result.error =
+                RawProductionReplaySnapshotErrorV1::kSegmentChain;
+            return result;
+        }
+
+        RawControlSnapshot second{};
+        std::uint64_t second_generation = 0U;
+        result.error_number = live_tail_source_->ReadControl(
+            &second, &second_generation);
+        if (result.error_number != 0) {
+            result.error =
+                RawProductionReplaySnapshotErrorV1::kControlRead;
+            return result;
+        }
+        if (second_generation != first_generation || second != first) {
+            result.error =
+                RawProductionReplaySnapshotErrorV1::kControlChanged;
+            return result;
+        }
+
+        authoritative_live_attach_ = result.snapshot.live_attach;
+        authoritative_replay_prepared_ = true;
+        result.error =
+            RawProductionReplaySnapshotErrorV1::kNone;
+        result.error_number = 0;
+        result.segment_sequence = 0U;
+        return result;
+    } catch (const std::bad_alloc&) {
+        result.error =
+            RawProductionReplaySnapshotErrorV1::kAllocationFailure;
+        return result;
+    } catch (...) {
+        result.error =
+            RawProductionReplaySnapshotErrorV1::kSegmentRead;
+        result.error_number = EIO;
+        return result;
+    }
+}
+
+RawLiveTailError RawProductionRuntimeV1::AttachAuthoritativeTail(
+    const RawLiveTailAttachV1& attach,
+    std::unique_ptr<RawLiveTail>* output) noexcept {
+    if (output == nullptr) {
+        return RawLiveTailError::kInvalidAttach;
+    }
+    output->reset();
+    if (live_tail_source_ == nullptr || app_ == nullptr ||
+        app_->state() != RawIngressAppState::kConstructed ||
+        app_->tail_consumer_mode() !=
+            RawIngressTailConsumerModeV1::
+                kExternalAuthoritativeConsumer ||
+        !authoritative_replay_prepared_ ||
+        authoritative_tail_attached_ ||
+        !SameLiveAttach(attach, authoritative_live_attach_)) {
+        return RawLiveTailError::kInvalidAttach;
+    }
+    const RawLiveTailError attach_error = RawLiveTail::Attach(
+        live_tail_source_.get(), attach, output);
+    if (attach_error == RawLiveTailError::kNone &&
+        *output != nullptr) {
+        authoritative_tail_attached_ = true;
+    }
+    return attach_error;
+}
+
+bool RawProductionRuntimeV1::InstallExternalTailConsumer(
+    RawIngressExternalTailConsumerV1* consumer,
+    std::string* error) noexcept {
+    if (app_ == nullptr || !authoritative_tail_attached_) {
+        SetError(error,
+            "authoritative Raw tail must be attached before consumer installation");
+        return false;
+    }
+    return app_->InstallExternalTailConsumer(consumer, error);
+}
+
+RawProductionControlSampleV1
+RawProductionRuntimeV1::SampleControlFresh() const noexcept {
+    RawProductionControlSampleV1 result{};
+    if (live_tail_source_ == nullptr) {
+        result.error_number = EINVAL;
+        return result;
+    }
+    result.error_number = live_tail_source_->ReadControl(
+        &result.snapshot, &result.generation);
+    return result;
+}
+
+RawIngressAppState RawProductionRuntimeV1::app_state()
+    const noexcept {
+    return app_ == nullptr
+        ? RawIngressAppState::kStopped
+        : app_->state();
+}
+
+bool RawProductionRuntimeV1::app_fatal() const noexcept {
+    return app_ == nullptr || app_->fatal();
+}
+
+std::uint64_t RawProductionRuntimeV1::connect_generation()
+    const noexcept {
+    return app_ == nullptr ? 0U : app_->connect_generation();
 }
 
 RawProductionReadinessSampleV1
@@ -988,17 +1311,27 @@ AdoptAlreadyActive(
     }
 
     std::unique_ptr<RawLiveTail> live_tail;
-    result.live_tail_error =
-        RawLiveTail::Attach(
-            live_tail_source.get(),
-            live_tail_attach,
-            &live_tail);
-    if (result.live_tail_error !=
-            RawLiveTailError::kNone ||
-        live_tail == nullptr) {
+    if (options.tail_consumer_mode ==
+        RawIngressTailConsumerModeV1::
+            kPhase2CompatibilityObserver) {
+        result.live_tail_error =
+            RawLiveTail::Attach(
+                live_tail_source.get(),
+                live_tail_attach,
+                &live_tail);
+        if (result.live_tail_error !=
+                RawLiveTailError::kNone ||
+            live_tail == nullptr) {
+            result.failure =
+                RawProductionRuntimeFailureV1::
+                    kLiveTailAttach;
+            return result;
+        }
+    } else if (options.tail_consumer_mode !=
+               RawIngressTailConsumerModeV1::
+                   kExternalAuthoritativeConsumer) {
         result.failure =
-            RawProductionRuntimeFailureV1::
-                kLiveTailAttach;
+            RawProductionRuntimeFailureV1::kInvalidInput;
         return result;
     }
 
@@ -1016,7 +1349,8 @@ AdoptAlreadyActive(
             std::unique_ptr<RawProductionRuntimeV1>(
                 new RawProductionRuntimeV1(
                     std::move(live_tail_source),
-                    std::move(app)));
+                    std::move(app),
+                    live_tail_attach));
     } catch (...) {
         result.failure =
             RawProductionRuntimeFailureV1::

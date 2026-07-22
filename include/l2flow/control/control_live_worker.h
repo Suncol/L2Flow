@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 
 namespace l2flow::control {
 
@@ -113,6 +114,74 @@ enum class ControlLiveWorkerCreateErrorV1 : std::uint8_t {
     kResourceExhausted,
 };
 
+enum class ControlLiveWorkerReplayProofErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kNullOutput,
+    kInvalidInput,
+    kInvalidScan,
+    kSegmentChainMismatch,
+    kDecoderMismatch,
+    kResourceExhausted,
+};
+
+// Non-default-constructible receipt produced by revalidating the complete
+// immutable Raw replay snapshot against the final decoder state. This is what
+// permits a live attach cursor to be ahead of the last decoded record by one
+// or more real, validated segment headers. Numeric WAL distance alone is
+// never accepted as segment-transition proof.
+class ControlLiveWorkerReplayProofV1 final {
+public:
+    ControlLiveWorkerReplayProofV1(
+        const ControlLiveWorkerReplayProofV1&) = delete;
+    ControlLiveWorkerReplayProofV1& operator=(
+        const ControlLiveWorkerReplayProofV1&) = delete;
+    ControlLiveWorkerReplayProofV1(
+        ControlLiveWorkerReplayProofV1&&) = delete;
+    ControlLiveWorkerReplayProofV1& operator=(
+        ControlLiveWorkerReplayProofV1&&) = delete;
+    ~ControlLiveWorkerReplayProofV1() = default;
+
+    [[nodiscard]] static ControlLiveWorkerReplayProofErrorV1 Create(
+        l2flow::common::Identity128 writer_instance,
+        std::span<const l2flow::ingress::RawSegmentScanResult> scans,
+        const l2flow::ingress::RawLiveTailAttachV1& validated_frontier,
+        const ControlDecoderSnapshotV1& decoder,
+        std::unique_ptr<ControlLiveWorkerReplayProofV1>* output) noexcept;
+
+    [[nodiscard]] std::uint32_t
+    decoder_processed_segment_sequence() const noexcept {
+        return decoder_processed_segment_sequence_;
+    }
+    [[nodiscard]] std::uint64_t
+    validated_frontier_global_wal_pos() const noexcept {
+        return validated_frontier_.global_wal_pos;
+    }
+
+private:
+    friend class ControlLiveWorkerV1;
+
+    ControlLiveWorkerReplayProofV1(
+        l2flow::common::Identity128 writer_instance,
+        l2flow::ingress::RawLiveTailAttachV1 validated_frontier,
+        std::uint64_t replay_record_count,
+        std::uint32_t decoder_processed_segment_sequence,
+        std::uint64_t decoder_processed_segment_offset,
+        std::uint64_t decoder_processed_record_start_wal_pos,
+        std::uint64_t decoder_processed_record_end_wal_pos,
+        std::uint64_t decoder_processed_ingress_sequence,
+        l2flow::common::Sha256Digest decoder_state_sha256) noexcept;
+
+    l2flow::common::Identity128 writer_instance_{};
+    l2flow::ingress::RawLiveTailAttachV1 validated_frontier_{};
+    std::uint64_t replay_record_count_ = 0U;
+    std::uint32_t decoder_processed_segment_sequence_ = 0U;
+    std::uint64_t decoder_processed_segment_offset_ = 0U;
+    std::uint64_t decoder_processed_record_start_wal_pos_ = 0U;
+    std::uint64_t decoder_processed_record_end_wal_pos_ = 0U;
+    std::uint64_t decoder_processed_ingress_sequence_ = 0U;
+    l2flow::common::Sha256Digest decoder_state_sha256_{};
+};
+
 struct ControlLiveWorkerSnapshotV1 final {
     ControlLiveWorkerFailureV1 failure =
         ControlLiveWorkerFailureV1::kNone;
@@ -161,6 +230,18 @@ public:
         std::unique_ptr<ControlRecordSinkV1> record_sink,
         std::unique_ptr<ControlLiveWorkerV1>* output) noexcept;
 
+    // Production entry point. The proof is mandatory when the decoder's last
+    // record precedes the attach frontier because validated segment headers
+    // do not mutate decoder state or ingress sequence.
+    [[nodiscard]] static ControlLiveWorkerCreateErrorV1
+    CreateWithReplayProof(
+        ControlLiveWorkerConfigV1 config,
+        const ControlLiveWorkerReplayProofV1& replay_proof,
+        std::unique_ptr<l2flow::ingress::RawLiveTail> tail,
+        std::unique_ptr<ControlDecoderV1> decoder,
+        std::unique_ptr<ControlRecordSinkV1> record_sink,
+        std::unique_ptr<ControlLiveWorkerV1>* output) noexcept;
+
     // Blocking loop; the service owns the thread. Run returns true only after
     // StopAt() and exact catch-up to that immutable terminal cursor.
     [[nodiscard]] bool Run() noexcept;
@@ -190,6 +271,14 @@ public:
         bool capture_pipeline_healthy) const noexcept;
 
 private:
+    [[nodiscard]] static ControlLiveWorkerCreateErrorV1 CreateImpl(
+        ControlLiveWorkerConfigV1 config,
+        const ControlLiveWorkerReplayProofV1* replay_proof,
+        std::unique_ptr<l2flow::ingress::RawLiveTail> tail,
+        std::unique_ptr<ControlDecoderV1> decoder,
+        std::unique_ptr<ControlRecordSinkV1> record_sink,
+        std::unique_ptr<ControlLiveWorkerV1>* output) noexcept;
+
     ControlLiveWorkerV1(
         ControlLiveWorkerConfigV1 config,
         std::uint64_t start_control_generation,

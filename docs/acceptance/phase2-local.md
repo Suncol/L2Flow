@@ -1,6 +1,6 @@
 # Phase 2 local acceptance record（进行中）
 
-Date: 2026-07-19  
+Date: 2026-07-22
 Host scope: local Linux x86-64 development container
 
 ## 结论
@@ -8,13 +8,14 @@ Host scope: local Linux x86-64 development container
 本记录严格采用
 [`docs/design.md`](../design.md#分层完成口径与退出条件)
 中的三层口径。当前源码包含较完整的 Phase 2 Raw 库、POSIX 持久化组件和定向
-测试；三种本机构建/CTest 已通过，但尚未把 Raw runtime 接入四个生产 ingress，
-也没有覆盖 Local verification 合同规定的全部 crash/reconciliation 条件和外部
-验收。因此：
+测试；当前另有一个显式运行的 production-composition live runner，把真实 SDK、
+Raw runtime、Phase 3 controller、checkpoint 与 recovered restart 串在同一条验收
+链路中。它没有替换四个 production ingress service，也没有覆盖 Local
+verification 合同规定的全部 crash/reconciliation 条件和外部验收。因此：
 
 | 口径 | 当前状态 | 判定依据 |
 | --- | --- | --- |
-| **Implementation complete** | **未完成** | `L2Flow::production`、ingress service 和四个 ingress 仍走 Phase 0–1 shadow 路径；Raw coordinator IPC/controller、Raw service monitor 和 RunManifest service publication 尚未接入 |
+| **Implementation complete** | **未完成** | production-composition runner 已存在并完成真实两代 SDK 验收；但 `L2Flow::production`、ingress service 和四个 ingress 仍走 Phase 0–1 shadow 路径，coordinator IPC、Raw service monitor 和 RunManifest service publication 尚未接入 |
 | **Local verification complete** | **未完成** | Debug/Release/ASan+UBSan 全量 CTest 与默认 deterministic corpus/property driver 已通过；但设计规定的全部 crash window、固定 `SIGKILL` 矩阵、精确 clean-stop/crash-range 对账和尚未完成的 power-loss oracle 仍未覆盖 |
 | **Phase 2 exit complete** | **未完成** | Phase 1 外部退出条件、10,000 seeds、目标 NVMe、真实四流完整交易日、cold-cache 5×、真实 reboot/power-cut 等证据均不存在 |
 
@@ -184,8 +185,8 @@ sync interval/bytes 映射到 Raw capture worker，并暴露 Raw runtime identit
 append/durable cursor、durability lag、ring 和 observer lag 指标。
 `test_phase2_raw_ingress_app` 有 bytes threshold 与 interval 行为测试。
 
-这些能力目前只是 Phase 2 library/runtime builder；它们尚未被生产 ingress
-service 构造和 monitor 调用。
+这些能力尚未被四个 production ingress service 构造和 monitor 调用；2026-07-22
+addendum 记录的独立 live runner 已组合这些 builder，但不是 service cutover。
 
 ### 真实 feeder 到 Raw capture path 探针
 
@@ -234,8 +235,9 @@ sz-tick        6.101.33, 6.101.36    110 / 224 / 4320
 
 每次唯一记录都是真实 SDK control response。另一次 `sh-snapshot` 使用
 `--minimum-market-messages-per-key 1` 的测试已经连接并完成订阅登录，但由于
-feeder 收盘后停止推送 market record 而按预期失败。因此当前证据只证明真实
-control plane 和 Raw plumbing 接入，**不声明真实行情 data plane 已通过**。
+feeder 收盘后停止推送 market record 而按预期失败。因此该批 2026-07-21 证据只
+证明真实 control plane 和 Raw plumbing 接入；2026-07-22 addendum 另记录交易时段
+真实行情 data plane 和两代 production composition 的通过证据。
 必须在交易时段用非零 per-key minimum 重跑；四个 ingress kind 仍然是四份独立
 验收证据。
 
@@ -273,16 +275,17 @@ canonical round-trip、validating reader 边界、recovery 输入边界和相同
 
 ## 全量本机验证结果
 
-以下构建都启用 CMake 中的 strict warnings（含 `-Werror`），并在当前最终代码
-状态完成 full CTest：
+以下是 2026-07-19 记录时的历史 full-green 结果；当前最终代码的最新矩阵在本文
+末尾 2026-07-22 addendum 中列出。历史结果保留用于说明当时状态，不覆盖当前
+Phase 0 artifact gate 的 fail-closed 结果：
 
 | Build / suite | 最终结果 |
 | --- | --- |
-| Debug strict build + full CTest | **通过：98/98，0 failed；91.28 s** |
-| Release strict build + full CTest | **通过：98/98，0 failed；28.48 s** |
-| ASan+UBSan Debug build + full CTest | **通过：97/97，0 failed；133.98 s** |
+| Debug strict build + full CTest（2026-07-19） | **通过：98/98，0 failed；91.28 s** |
+| Release strict build + full CTest（2026-07-19） | **通过：98/98，0 failed；28.48 s** |
+| ASan+UBSan Debug full CTest（2026-07-19） | **通过：97/97，0 failed；133.98 s** |
 
-ASan+UBSan 运行使用
+该历史 ASan+UBSan 运行使用
 `ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1` 和
 `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`。因此该结果只声明
 AddressSanitizer/UndefinedBehaviorSanitizer；**不声明 LeakSanitizer**。sanitizer
@@ -291,7 +294,7 @@ build 的测试总数少一个，是因为 `mdl_vendor_minimal_link` 只在
 `L2FLOW_BUILD_RAW_V1_LIBFUZZER` 和 `L2FLOW_ENABLE_TSAN` 均为 `OFF`，所以也不
 声明 libFuzzer campaign 或 ThreadSanitizer 结果。
 
-上述绿色全量结果仍需满足下一节的完整 crash/reconciliation 条件，才能把
+上述历史绿色结果仍需满足下一节的完整 crash/reconciliation 条件，才能把
 Local verification complete 改为完成。
 
 ## Implementation complete 的明确阻断项
@@ -445,3 +448,163 @@ object。该缺失不能通过放宽 ABI/baseline gate 或把 pointer 当成 SDK
   仍不存在；
 - 因此 Phase 2 的 **Implementation complete**、**Local verification complete**
   和 **Phase 2 exit complete** 仍全部为**未完成**。
+
+## 2026-07-22 addendum：真实 feeder、production composition 与两代恢复
+
+本 addendum 更新前述“只有 control-plane plumbing、没有真实行情 data plane”和
+“没有 production controller composition”的历史状态。它仍不改变本文的 service
+cutover、完整交易日、crash/power-loss 和 Phase 2 exit 判定。
+
+### 真实库与测试边界
+
+测试连接用户已运行且未被测试进程修改的 cascade feeder
+`127.0.0.1:9112`，动态加载外部真实库
+`/home/sunc/L2Flow/MDL/libmdl_api.so`。该库的本次只读识别结果为：
+
+```text
+ELF64 x86-64
+size:      245709040 bytes
+Build ID:  f9cd4310b672e83c9f3436972eb73c42680d3117
+SHA-256:   85b69d495e4a9d2e212342c887138599bd913b7d7426f4241d2d12f7c012116a
+```
+
+live runner 只使用固定的非秘密本地 client label，命令行不接受 credential；本文也
+不记录 feeder credential。仓库内
+`mdl_sdk_2_13_234/libs/linux/libmdl_api.so` 仍是 134-byte Git LFS pointer，外部
+真实库不会自动修正 frozen Phase 0 baseline，也没有据此修改 baseline。
+
+### Phase 2 shutdown callback 窗口
+
+external authoritative consumer 的正常停机顺序现在固定为：
+
+```text
+SDK Shutdown（callback handler 仍 accepting）
+-> handler.BeginStopping()
+-> handler.Quiesce()
+-> Raw StopAndDrain / seal
+-> Phase 3 StopAt exact terminal cursor
+```
+
+这样 SDK `Shutdown()` 内同步或尾部触发的 callback 仍可进入 Raw；handler 只在 SDK
+完成 shutdown 后停止接收。`test_phase2_raw_ingress_app` 增加了 Shutdown 内注入
+callback 的场景，并要求最终 `callbacks_after_stop=0`。真实 `sz-tick` Phase 2
+重测目录为：
+
+```text
+/tmp/l2flow-live-20260722-sz-tick-shutdown-fixed-1021
+```
+
+结果为 callback/append/durable/reader records 全部 `125880`，append/durable WAL
+均为 `27671344`，`callbacks_after_stop=0`，recovery sealed 且 reconciliation
+exact。修复前同类测试曾观测到 `callbacks_after_stop=6`；该失败事实不被通过结果
+覆盖。
+
+### append-visible Raw tail 与 rotation
+
+此前 `RawLiveTail::Next()` 在“当前 control 仍指向已 seal 的旧段、下一段 control
+尚未发布”的短窗口把整个 stream 永久标记为 terminal，Phase 3 因而停在旧段尾。
+Raw control 没有 whole-stream closed bit，所以该状态不能证明全流结束。当前行为是
+返回 `WouldBlock` 且不锁存 terminal；下一 control 发布后允许
+`SegmentTransition`。真正终点只由 SDK shutdown、Raw drain 和 controller 的 exact
+`StopAt` 证明。
+
+定向测试覆盖“sealed current -> WouldBlock -> publish next -> transition -> next
+record”。真实 1-second segment-age rotation 重测目录为：
+
+```text
+/tmp/l2flow-phase3-live-20260722-sh-snapshot-rotation-fixed-1100
+```
+
+该 run 产生 7 个 sealed Raw segment，Raw scan 与 Phase 3 都为 `2591` records，
+append/durable/decoder WAL 均为 `3402464`，restart 扫描全部 7 段并找到 checkpoint
+边界，最终 `passed=true`。修复前证据
+`/tmp/l2flow-phase3-live-20260722-sh-snapshot-rotation-1052` 停在第 1 段的
+358 records，最终 `worker_failure=11 (kStopCatchUpTimedOut)`；7 个 Raw 段本身均
+已正确封存。
+
+### production Phase 2 -> Phase 3 live runner 与第二代 recovery
+
+[`tools/mdl_phase3_live_probe.cpp`](../../tools/mdl_phase3_live_probe.cpp) 构建为
+`mdl-phase3-live-probe`。它不是内存 adapter，使用下列生产组件：
+
+```text
+Raw reserve coordinator / registered route
+-> RawProductionRuntimeV1
+-> immutable authoritative replay
+-> append-visible POSIX Raw tail
+-> ControlProductionControllerV1 + durable derived sink
+-> SDK Connect / READY / exact StopAt
+-> sealed Raw + terminal checkpoint
+-> register RECOVERING + RESUME_CONNECT
+-> analyze/execute sealed Raw recovery
+-> create exact next open segment
+-> publish RESUMED_OPEN maintenance report
+-> receipt-gated ACTIVE promotion
+-> checkpoint restore + suffix replay
+-> pre-Connect Phase 3 worker
+-> second real SDK Connect / current-generation READY
+-> second exact stop and checkpoint
+```
+
+第二代不另起伪造 Raw namespace：`stream_day_id`、journal 和全局 WAL 连续，writer
+instance 与 recovery-attempt identity 更新；closed manifest/certificate、terminal
+seal marker、journal cursor、下一 segment base WAL/first ingress、open manifest 和
+control page 必须交叉一致，才允许 `RECOVERING -> ACTIVE`。
+
+2026-07-22 的两条完整两代真实 data-plane 通过证据为：
+
+| 流 | 目录 | generation 1 Raw | 最终 Raw = Phase 3 | 最终 WAL | READY / checkpoints |
+| --- | --- | ---: | ---: | ---: | --- |
+| `sh-snapshot` | `/tmp/l2flow-phase3-live-20260722-sh-snapshot-two-generation-2` | 1713 | 3494 | 4539552 | 两代 READY；2 derived；2 checkpoints |
+| `sh-tick` | `/tmp/l2flow-phase3-live-20260722-sh-tick-two-generation-3sec` | 24503 | 44466 | 9612848 | 两代 READY；2 derived；2 checkpoints |
+
+两次均满足：
+
+- generation 1 checkpoint publication 和只读 Raw boundary restore；
+- clean sealed recovery plan，journal logical size 不被修复或缩短；
+- segment 1 到 segment 2 的 base-WAL/ingress 连续性；
+- generation 2 controller 在第二次 SDK `Connect()` 前完成 checkpoint restore；
+- 新 generation 的 `LogonSuccess` 使累计计数从 1 增为 2，旧 checkpoint 登录证据
+  不能直接满足 current-generation READY；
+- generation 2 有真实新 Raw/derived suffix；
+- 最终 Raw record count、Phase 3 processed count 与 decoder terminal cursor 精确
+  相等，append WAL、durable WAL 和 decoder record-end WAL 精确相等；
+- `worker_failure=0`、`worker_process_error=0`、`worker_live_tail_error=0`。
+
+### 保留的非通过证据
+
+以下目录保留且不解释为通过：
+
+- `/tmp/l2flow-phase3-live-20260722-sz-tick-1033`：修复前长 backlog/rotation
+  run；sealed Raw 离线扫描共 163926 records，Phase 3 当时停在 64320，checkpoint
+  正确未发布；
+- `/tmp/l2flow-phase3-live-20260722-sz-tick-two-generation-1`：generation 1 通过，
+  generation 2 完成真实 recovery、checkpoint restore、Connect、live suffix 和
+  exact stop，但 1-second 窗口只见 required market mask `2`，READY reason 20
+  (`kMarketEvidenceIncomplete`)，所以 `passed=false`；最终 Raw=Phase 3=21911，
+  worker/process/live-tail errors 仍为 0；
+- `/tmp/l2flow-phase3-live-20260722-sz-tick-two-generation-3sec`：该次行情窗口中
+  generation 1 未收齐 required market evidence，随后 controller 在 normal StopAt
+  前已不再是 Running，因而 fail closed 且没有 checkpoint。输出时尚未加入精确
+  worker failure 枚举，不能在没有证据时进一步归因。
+
+### 当前回归口径
+
+当前代码完成：
+
+```text
+strict Debug full CTest:    106/107 passed
+strict Release full CTest:  105/106 passed
+ASan+UBSan selected:         11/11 passed (ASAN_OPTIONS=detect_leaks=0)
+TSan selected:                2/2 passed
+```
+
+Debug/Release 唯一失败均为既有 `test_phase0_baseline`，原因是仓库 SDK archive/LFS
+artifact 与 frozen baseline 不匹配，不是 Phase 2/3 断言失败。ASan/UBSan 不声明
+LeakSanitizer；TSan 定向项为 `test_phase3_control_production_controller` 和
+`test_phase2_raw_production_runtime`。
+
+上述结果证明 production-composition runner 的 Phase 2/3 两代实盘链路，但不证明
+四个 production service cutover、跨进程 coordinator IPC、完整交易日、10,000
+crash seeds、目标 NVMe、cold-cache 5x、正常 OS reboot、deterministic power-loss
+或目标环境 power-cut，因此三层总退出状态仍保持未完成。
