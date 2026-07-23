@@ -46,6 +46,14 @@ class RawWalStreamBackendV1 {
 public:
     virtual ~RawWalStreamBackendV1() = default;
 
+    // Optional bounded scope matching RawWalIo::BeginMutationBatch().
+    // Production authorization wrappers keep their shared generation action
+    // alive only until EndMutationBatch(); ordinary backends remain no-op.
+    [[nodiscard]] virtual bool BeginMutationBatch() noexcept {
+        return true;
+    }
+    virtual void EndMutationBatch() noexcept {}
+
     // R6-R9: bind the no-rescan plan to the sealed inode, publish its index,
     // publish the append-only closed manifest, and complete the directory
     // barrier.
@@ -102,6 +110,9 @@ public:
     // manifest and control identity before it can be handed to the ring
     // consumer.
     [[nodiscard]] bool Initialize() noexcept;
+
+    [[nodiscard]] bool BeginMutationBatch() noexcept override;
+    void EndMutationBatch() noexcept override;
 
     [[nodiscard]] bool AppendRecord(
         const RawWalRecordInputV1& input) noexcept override;
@@ -165,6 +176,7 @@ private:
     bool have_clock_ = false;
     bool initialized_ = false;
     bool closed_ = false;
+    bool mutation_batch_open_ = false;
 
     std::atomic<bool> fatal_{false};
     std::atomic<std::uint8_t> failure_kind_{

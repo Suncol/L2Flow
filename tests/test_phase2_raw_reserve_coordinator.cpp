@@ -673,6 +673,12 @@ void TestDurableRegistryAndActionGates(
                     kActive,
                 "sz-tick",
                 &error);
+    const bool switching_backend_batch =
+        switching_backend != nullptr &&
+        switching_backend->BeginMutationBatch();
+    const bool switching_io_batch =
+        switching_io != nullptr &&
+        switching_io->BeginMutationBatch();
     switching_target.SetDescriptor(
         wrong_stream_directory == nullptr
             ? -1
@@ -681,6 +687,8 @@ void TestDurableRegistryAndActionGates(
         wal_state->syncs +
         wal_state->backend_calls;
     test->Expect(
+            switching_backend_batch &&
+            switching_io_batch &&
             switching_io != nullptr &&
             switching_backend != nullptr &&
             switching_io->Fdatasync(
@@ -695,7 +703,13 @@ void TestDurableRegistryAndActionGates(
             wal_state->syncs +
                     wal_state->backend_calls ==
                 calls_before_switched_target,
-        "WAL wrappers recheck the delegate target before every mutation");
+        "WAL wrappers recheck the delegate target before every mutation inside a retained batch");
+    if (switching_io != nullptr) {
+        switching_io->EndMutationBatch();
+    }
+    if (switching_backend != nullptr) {
+        switching_backend->EndMutationBatch();
+    }
     if (switching_io != nullptr) {
         static_cast<void>(
             switching_io->Close(
@@ -728,6 +742,14 @@ void TestDurableRegistryAndActionGates(
     const ingress::RawWalIoVector vector{one};
     ingress::RawWalNextSegmentBootstrapV1
         next_bootstrap{};
+    const bool backend_batch_started =
+        gated_backend != nullptr &&
+        gated_backend->BeginMutationBatch();
+    const bool io_batch_started =
+        gated_io != nullptr && gated_io->BeginMutationBatch();
+    test->Expect(
+        backend_batch_started && io_batch_started,
+        "ACTIVE WAL backend and I/O acquire one bounded mutation batch");
     test->Expect(
         gated_io != nullptr &&
             gated_backend != nullptr &&
@@ -747,7 +769,7 @@ void TestDurableRegistryAndActionGates(
             next_bootstrap.io != nullptr &&
             next_bootstrap.io->Fdatasync(
                 ingress::RawWalFile::kJournal) == 0,
-        "ACTIVE WAL syscalls and backend transactions acquire short-lived shared gates");
+        "ACTIVE WAL syscalls and backend transactions remain authorized inside one bounded shared-gate batch");
 
     ingress::RawReserveActiveTakeoverV1 takeover;
     takeover.old_key = key;
@@ -758,12 +780,40 @@ void TestDurableRegistryAndActionGates(
     takeover.recovery_intent =
         ingress::ReserveRecoveryIntentV1::
             kResumeConnect;
+    std::atomic<bool> takeover_started{false};
+    std::atomic<bool> takeover_completed{false};
+    ingress::RawReserveCoordinatorErrorV1 takeover_result =
+        ingress::RawReserveCoordinatorErrorV1::kInvalidArgument;
+    std::thread takeover_thread([&]() {
+        takeover_started.store(true, std::memory_order_release);
+        takeover_result = coordinator->TakeoverActive(
+            takeover, &error);
+        takeover_completed.store(true, std::memory_order_release);
+    });
+    const auto takeover_start_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(1);
+    while (!takeover_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < takeover_start_deadline) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool takeover_waited_for_batch =
+        takeover_started.load(std::memory_order_acquire) &&
+        !takeover_completed.load(std::memory_order_acquire);
+    if (gated_io != nullptr) {
+        gated_io->EndMutationBatch();
+    }
+    if (gated_backend != nullptr) {
+        gated_backend->EndMutationBatch();
+    }
+    takeover_thread.join();
     test->Expect(
-        coordinator->TakeoverActive(
-            takeover, &error) ==
+        takeover_waited_for_batch &&
+            takeover_result ==
                 ingress::RawReserveCoordinatorErrorV1::
                     kNone,
-        "ACTIVE restart durably fences old writer into RECOVERING");
+        "ACTIVE takeover waits for the bounded batch release before durably fencing the old writer into RECOVERING");
     const std::uint64_t calls_before_fenced_io =
         wal_state->syncs;
     test->Expect(

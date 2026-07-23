@@ -67,6 +67,9 @@ struct MemoryIoState final {
     std::atomic<int> fail_next_close{0};
     std::atomic<std::uint64_t> segment_syncs{0U};
     std::atomic<std::uint64_t> journal_syncs{0U};
+    std::atomic<std::uint64_t> mutation_batch_begins{0U};
+    std::atomic<std::uint64_t> mutation_batch_ends{0U};
+    std::atomic<bool> mutation_batch_active{false};
 };
 
 class MemoryRawWalIo final : public ingress::RawWalIo {
@@ -74,6 +77,28 @@ public:
     explicit MemoryRawWalIo(
         std::shared_ptr<MemoryIoState> state)
         : state_(std::move(state)) {}
+
+    [[nodiscard]] bool BeginMutationBatch() noexcept override {
+        bool expected = false;
+        if (!state_->mutation_batch_active.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        state_->mutation_batch_begins.fetch_add(
+            1U, std::memory_order_relaxed);
+        return true;
+    }
+
+    void EndMutationBatch() noexcept override {
+        if (state_->mutation_batch_active.exchange(
+                false, std::memory_order_acq_rel)) {
+            state_->mutation_batch_ends.fetch_add(
+                1U, std::memory_order_relaxed);
+        }
+    }
 
     ingress::RawWalWriteResult WritevSome(
         ingress::RawWalFile file,
@@ -758,6 +783,16 @@ void TestTimeThresholdDrainAndShortWrites(
             sealed.append == sealed.durable &&
             sealed.durable.ingress_sequence == 4U,
         "clean drain flushes, seals, and closes the writer");
+    test->Expect(
+        io_state->mutation_batch_begins.load(
+            std::memory_order_acquire) != 0U &&
+            io_state->mutation_batch_begins.load(
+                std::memory_order_acquire) ==
+                io_state->mutation_batch_ends.load(
+                    std::memory_order_acquire) &&
+            !io_state->mutation_batch_active.load(
+                std::memory_order_acquire),
+        "clean drain releases every bounded mutation batch before sealing");
 }
 
 void TestByteThreshold(TestContext* test) {

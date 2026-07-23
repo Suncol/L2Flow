@@ -38,8 +38,31 @@ public:
         return runtime_ != nullptr && runtime_->Initialize(diagnostic);
     }
 
+    [[nodiscard]] bool PrepareStop(
+        std::string* diagnostic) noexcept override {
+        return runtime_ != nullptr &&
+               runtime_->app().PrepareCleanStop(diagnostic);
+    }
+
     [[nodiscard]] bool Stop(std::string* diagnostic) noexcept override {
         return runtime_ != nullptr && runtime_->Stop(diagnostic);
+    }
+
+    [[nodiscard]] SnapshotV1 Snapshot() const noexcept override {
+        SnapshotV1 result{};
+        if (runtime_ == nullptr) {
+            return result;
+        }
+        const auto& app = runtime_->app();
+        result.available = true;
+        result.fatal = app.fatal();
+        result.state = app.state();
+        result.callback = app.capture_metrics();
+        result.capture = app.capture_snapshot();
+        result.reconciliation = app.reconciliation();
+        result.wal = app.wal_snapshot();
+        result.wal_failure = app.wal_failure();
+        return result;
     }
 
 private:
@@ -377,12 +400,28 @@ public:
         }
 
         bool capture_failure = false;
+        // Close all callback admission gates before the first vendor
+        // IOManager::Shutdown.  The selected SDK has process-global
+        // dispatcher state, and one Shutdown can block while the other
+        // managers are still dispatching.  Leaving three producer gates open
+        // during that interval races the intended service-wide drain boundary.
+        for (std::size_t index = 0U; index < captures.size(); ++index) {
+            if (!capture_started[index].load(std::memory_order_acquire)) {
+                continue;
+            }
+            result.capture_prepared[index] =
+                captures[index]->PrepareStop(
+                    &result.capture_diagnostics[index]);
+            capture_failure = capture_failure ||
+                !result.capture_prepared[index];
+        }
         for (std::size_t index = 0U; index < captures.size(); ++index) {
             if (!capture_started[index].load(std::memory_order_acquire)) {
                 continue;
             }
             result.capture_stopped[index] =
                 captures[index]->Stop(&result.capture_diagnostics[index]);
+            result.capture_evidence[index] = captures[index]->Snapshot();
             capture_failure = capture_failure || !result.capture_stopped[index];
             capture_started[index].store(false, std::memory_order_release);
         }

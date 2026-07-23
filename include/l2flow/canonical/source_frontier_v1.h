@@ -50,8 +50,10 @@ struct SourceFrontierV1 final {
     // captured progress is published and before inflight is decremented.
     // Readers compare a before/after value to defeat 0->1->0 ABA.
     std::uint64_t callback_generation = 0U;
-    // Seqlock generation covering source state plus append/processed/time
-    // progress.  Stable snapshots always carry an even value.
+    // Seqlock generation covering source state plus quality and
+    // append/processed/time progress.  Callback fields use an independent
+    // atomic transition domain and never acquire this progress seqlock.
+    // Stable snapshots always carry an even value.
     std::uint64_t progress_generation = 0U;
     SourceStateV1 source_state = SourceStateV1::kRecovering;
     std::uint64_t quality_flags = 0U;
@@ -125,10 +127,13 @@ enum class SourceFrontierErrorV1 : std::uint8_t {
     SourceStateV1 state,
     std::uint64_t quality_flags) noexcept;
 
-// Callback gate.  Construction increments callback_inflight before the caller
-// may sample receive time.  CompleteCaptured publishes the captured Raw
-// ingress sequence and then leaves the gate.  Destruction without completion
-// fail-stops the source, preventing a dropped callback from looking idle.
+// Callback gate.  Construction increments callback_inflight and the callback
+// generation before the caller may sample receive time.  CompleteCaptured
+// publishes the captured Raw ingress sequence, advances the callback
+// generation, and then leaves the gate.  These fields have an independent
+// atomic transition domain and do not take the append/processed progress
+// seqlock.  Destruction without completion fail-stops the source, preventing
+// a dropped callback from looking idle.
 class SourceFrontierCallbackGuardV1 final {
 public:
     SourceFrontierCallbackGuardV1(

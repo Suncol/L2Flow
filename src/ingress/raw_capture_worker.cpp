@@ -124,8 +124,13 @@ bool RawCaptureWorker::Run() noexcept {
     bool emergency_abandoned = false;
     try {
         while (success) {
+            if (mutation_batch_open_ &&
+                MutationBatchLimitReached()) {
+                EndMutationBatch();
+            }
             if (emergency_pause_requested_.load(
                     std::memory_order_acquire)) {
+                EndMutationBatch();
                 emergency_paused_.store(
                     true, std::memory_order_release);
                 for (;;) {
@@ -151,6 +156,9 @@ bool RawCaptureWorker::Run() noexcept {
 
             ByteRingPopResult result = ring_.try_pop(record_);
             if (result == ByteRingPopResult::EMPTY) {
+                // Never retain a generation action while waiting for a
+                // producer or an idle heartbeat deadline.
+                EndMutationBatch();
                 const std::uint64_t now = MonotonicNowNs();
                 if (!MaybeFlushDurable(now, false)) {
                     success = false;
@@ -194,8 +202,14 @@ bool RawCaptureWorker::Run() noexcept {
                 break;
             }
 
-            if (!ConsumeRecord() ||
-                !MaybeFlushDurable(
+            if (!ConsumeRecord()) {
+                success = false;
+                break;
+            }
+            if (MutationBatchLimitReached()) {
+                EndMutationBatch();
+            }
+            if (!MaybeFlushDurable(
                     MonotonicNowNs(), false)) {
                 success = false;
                 break;
@@ -207,6 +221,10 @@ bool RawCaptureWorker::Run() noexcept {
             RawCaptureFatalSignal::kRingCorruption);
         success = false;
     }
+
+    // This is the hard release boundary for every normal, fatal, exceptional,
+    // stop, and emergency-abandon exit from the append loop.
+    EndMutationBatch();
 
     if (success && !emergency_abandoned) {
         if (!drained) {
@@ -417,6 +435,48 @@ RawCaptureWorker::MonotonicNowNs() const noexcept {
     return static_cast<std::uint64_t>(count);
 }
 
+bool RawCaptureWorker::EnsureMutationBatch() noexcept {
+    if (mutation_batch_open_) {
+        return true;
+    }
+    if (!writer_.BeginMutationBatch()) {
+        TripWriter(RawCaptureWorkerFailureKind::kWriterAppend);
+        return false;
+    }
+    mutation_batch_records_ = 0U;
+    mutation_batch_bytes_ = 0U;
+    mutation_batch_started_ns_ = MonotonicNowNs();
+    mutation_batch_open_ = true;
+    return true;
+}
+
+void RawCaptureWorker::EndMutationBatch() noexcept {
+    if (!mutation_batch_open_) {
+        return;
+    }
+    writer_.EndMutationBatch();
+    mutation_batch_open_ = false;
+    mutation_batch_records_ = 0U;
+    mutation_batch_bytes_ = 0U;
+    mutation_batch_started_ns_ = 0U;
+}
+
+bool RawCaptureWorker::MutationBatchLimitReached() const noexcept {
+    if (!mutation_batch_open_) {
+        return false;
+    }
+    const std::uint64_t now_ns = MonotonicNowNs();
+    const bool duration_due =
+        now_ns < mutation_batch_started_ns_ ||
+        now_ns - mutation_batch_started_ns_ >=
+            kRawCaptureMutationBatchMaximumDurationNsV1;
+    return mutation_batch_records_ >=
+               kRawCaptureMutationBatchMaximumRecordsV1 ||
+           mutation_batch_bytes_ >=
+               kRawCaptureMutationBatchMaximumBytesV1 ||
+           duration_due;
+}
+
 bool RawCaptureWorker::ConsumeRecord() noexcept {
     if (!WaitForCapturedFrontier(record_.meta)) {
         return false;
@@ -433,17 +493,41 @@ bool RawCaptureWorker::ConsumeRecord() noexcept {
             RawCaptureFatalSignal::kRawWalIo);
         return false;
     }
+    if (mutation_batch_open_ &&
+        (MutationBatchLimitReached() ||
+         layout.record_size >
+             kRawCaptureMutationBatchMaximumBytesV1 -
+                 mutation_batch_bytes_)) {
+        EndMutationBatch();
+    }
     const RawWalRecordInputV1 input{
         record_.meta,
         std::span<const std::byte>(
             record_.head.data(), record_.head.size()),
         std::span<const std::byte>(
             record_.body.data(), record_.body.size())};
-    if (!writer_.AppendRecord(input)) {
+    if (!EnsureMutationBatch() ||
+        !writer_.AppendRecord(input)) {
         TripWriter(
             RawCaptureWorkerFailureKind::kWriterAppend);
         return false;
     }
+
+    std::uint64_t next_batch_records = 0U;
+    std::uint64_t next_batch_bytes = 0U;
+    if (!CheckedAdd(
+            mutation_batch_records_, 1U, &next_batch_records) ||
+        !CheckedAdd(
+            mutation_batch_bytes_,
+            layout.record_size,
+            &next_batch_bytes)) {
+        Trip(
+            RawCaptureWorkerFailureKind::kProgressOverflow,
+            RawCaptureFatalSignal::kRawWalIo);
+        return false;
+    }
+    mutation_batch_records_ = next_batch_records;
+    mutation_batch_bytes_ = next_batch_bytes;
 
     const RawWalWriterSnapshot after = writer_.Snapshot();
     if (after.fatal ||

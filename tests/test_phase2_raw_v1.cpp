@@ -445,6 +445,22 @@ void TestSegmentGoldenAndNegatives(TestContext* test) {
             decoded.header_crc32c == kGoldenSegmentCrc,
         "segment decode preserves identities and CRC");
 
+    ingress::SegmentHeaderV1 path_only_sdk = MakeSegmentHeader();
+    path_only_sdk.sdk_archive_sha256 = {};
+    path_only_sdk.libmdl_api_sha256 = {};
+    ingress::RawV1SegmentHeaderWire path_only_wire{};
+    test->ExpectError(
+        ingress::EncodeSegmentHeaderV1(path_only_sdk, &path_only_wire),
+        ingress::RawV1Error::kNone,
+        "path-only SDK records both unavailable provenance digests as zero");
+    ingress::SegmentHeaderV1 mixed_sdk_identity = path_only_sdk;
+    mixed_sdk_identity.libmdl_api_sha256 = Pattern<32U>(0x80U);
+    test->ExpectError(
+        ingress::EncodeSegmentHeaderV1(
+            mixed_sdk_identity, &path_only_wire),
+        ingress::RawV1Error::kInvalidIdentity,
+        "SDK archive/library provenance cannot mix unavailable and pinned identities");
+
     ingress::RawV1SegmentHeaderWire corrupted = wire;
     corrupted[300U] ^= std::byte{0x80};
     test->ExpectError(

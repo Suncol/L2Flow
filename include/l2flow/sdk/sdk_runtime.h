@@ -64,6 +64,21 @@ public:
         int io_threads) = 0;
 };
 
+// Adapts one physical SDK factory to the four logical production ingress
+// lanes.  Exactly one physical IOManager and one physical Subscriber are
+// created. API/SYS control messages are delivered to all four logical
+// handlers, while configured market messages are delivered only to the
+// logical handler which owns that subscription key. Unknown market messages
+// are not delivered. The fourth logical Connect() performs the one physical
+// Connect() after all four configurations have been checked for equality.
+//
+// This is public so the lifecycle and routing contract can be tested with an
+// in-process fake physical SDK. A null physical factory is rejected by
+// returning null.
+[[nodiscard]] std::shared_ptr<SdkFactory>
+MakeProductionFanoutSdkFactory(
+    std::shared_ptr<SdkFactory> physical_factory) noexcept;
+
 // Opens the supplied path with O_NOFOLLOW, enforces the candidate-library size
 // bound, copies the regular file into a write/grow/shrink/seal-sealed memfd,
 // and uses only that immutable snapshot for ELF/dependency/symbol-version,
@@ -90,6 +105,19 @@ public:
 [[nodiscard]] std::shared_ptr<SdkFactory> LoadApprovedSdkFactoryPinned(
     const std::filesystem::path& shared_library,
     const l2flow::common::Sha256Digest& expected_sha256,
+    std::string* error) noexcept;
+
+// Loads the path selected by the operator without applying the approved
+// archive/baseline, snapshot, size, digest, ELF/ABI or runtime-lifecycle gates
+// used by LoadApprovedSdkFactory*.  The production manifest's only SDK check
+// is that this path names an existing regular file.  dlopen() of that exact
+// path and DllCreateIOManager resolution are necessary to use the selected
+// library; they are not an SDK approval or identity-validation policy.  A
+// successfully composed production factory retains the DSO mapping until
+// process exit instead of invoking the vendor's unload finalizers via
+// dlclose().
+[[nodiscard]] std::shared_ptr<SdkFactory> LoadOperatorSelectedSdkFactory(
+    const std::filesystem::path& shared_library,
     std::string* error) noexcept;
 
 }  // namespace l2flow::sdk

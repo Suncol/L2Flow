@@ -267,6 +267,92 @@ void CheckPageAndProgress(TestContext* context) {
         "FATAL freezes callback entry as well as append/processed progress");
 }
 
+void CheckCallbackProgressDomainsAreIndependent(TestContext* context) {
+    constexpr std::size_t kProgressGenerationOffset = 192U;
+    const canonical::SourceFrontierConfigV1 config = Config();
+
+    canonical::SourceFrontierPageV1 entry_page;
+    context->Expect(
+        canonical::InitializeSourceFrontierPageV1(config, &entry_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "callback-domain entry page initializes");
+    const std::uint64_t entry_even =
+        LoadPageU64(entry_page, kProgressGenerationOffset);
+    StorePageU64(
+        &entry_page, kProgressGenerationOffset, entry_even + 1U);
+    {
+        canonical::SourceFrontierCallbackGuardV1 callback(
+            &entry_page,
+            config.writer_instance,
+            config.generation);
+        context->Expect(
+            callback.entered(),
+            "callback entry does not acquire a contended progress seqlock");
+        context->Expect(
+            callback.CompleteCaptured(1U) ==
+                canonical::SourceFrontierErrorV1::kNone,
+            "callback completion does not acquire a contended progress seqlock");
+    }
+    StorePageU64(
+        &entry_page, kProgressGenerationOffset, entry_even + 2U);
+    const canonical::SourceFrontierV1 entry_result =
+        Read(context, entry_page);
+    context->Expect(
+        entry_result.captured_ingress_sequence == 1U &&
+            entry_result.callback_generation == 2U &&
+            entry_result.callback_inflight == 0U &&
+            entry_result.source_state ==
+                canonical::SourceStateV1::kHealthy,
+        "independent callback transition remains coherent after progress contention releases");
+
+    canonical::SourceFrontierPageV1 progress_page;
+    context->Expect(
+        canonical::InitializeSourceFrontierPageV1(config, &progress_page) ==
+            canonical::SourceFrontierErrorV1::kNone,
+        "callback-domain progress page initializes");
+    Capture(context, &progress_page, 1U);
+    {
+        canonical::SourceFrontierCallbackGuardV1 callback(
+            &progress_page,
+            config.writer_instance,
+            config.generation);
+        context->Expect(
+            callback.entered() &&
+                Read(context, progress_page).callback_inflight == 1U,
+            "second callback remains registered while earlier Raw progress is published");
+        context->Expect(
+            canonical::PublishAppendProgressV1(
+                &progress_page,
+                config.writer_instance,
+                config.generation,
+                1U,
+                4097U,
+                10U) == canonical::SourceFrontierErrorV1::kNone &&
+                canonical::PublishProcessedProgressV1(
+                    &progress_page,
+                    config.writer_instance,
+                    config.generation,
+                    1U,
+                    4097U,
+                    10U) == canonical::SourceFrontierErrorV1::kNone,
+            "append and processed progress are not blocked by an inflight callback");
+        context->Expect(
+            callback.CompleteCaptured(2U) ==
+                canonical::SourceFrontierErrorV1::kNone,
+            "second callback completes after independent Raw progress publication");
+    }
+    const canonical::SourceFrontierV1 progress_result =
+        Read(context, progress_page);
+    context->Expect(
+        progress_result.captured_ingress_sequence == 2U &&
+            progress_result.append_ingress_sequence == 1U &&
+            progress_result.processed_ingress_sequence == 1U &&
+            progress_result.callback_inflight == 0U &&
+            progress_result.source_state ==
+                canonical::SourceStateV1::kHealthy,
+        "callback and progress domains converge to a valid shared frontier");
+}
+
 void CheckIdleInterleavings(TestContext* context) {
     canonical::SourceFrontierPageV1 page;
     context->Expect(
@@ -469,8 +555,8 @@ void CheckIdleInterleavings(TestContext* context) {
     context->Expect(
         contended_fatal.source_state ==
                 canonical::SourceStateV1::kFatal &&
-            contended_fatal.callback_inflight == 1U,
-        "abandoned callback keeps an unmissable FATAL latch and fail-closed inflight count when the progress lock is unavailable");
+            contended_fatal.callback_inflight == 0U,
+        "abandoned callback keeps an unmissable FATAL latch while closing independent callback accounting");
 }
 
 canonical::SourceFrontierPageV1 MuxPage(
@@ -715,6 +801,7 @@ void CheckSafeMuxAndAsof(TestContext* context) {
 int main() {
     TestContext context;
     CheckPageAndProgress(&context);
+    CheckCallbackProgressDomainsAreIndependent(&context);
     CheckIdleInterleavings(&context);
     CheckSafeMuxAndAsof(&context);
     if (context.failures != 0) {

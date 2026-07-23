@@ -4,9 +4,11 @@
 #include "l2flow/ingress/raw_v1.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <new>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <fcntl.h>
@@ -16,6 +18,9 @@
 
 namespace l2flow::ingress {
 namespace {
+
+constexpr std::chrono::nanoseconds kControlReadBusyTimeout =
+    std::chrono::milliseconds{100};
 
 void SetError(
     std::string* error,
@@ -356,13 +361,23 @@ RawControlFileReader::~RawControlFileReader() {
 bool RawControlFileReader::Read(
     RawControlSnapshot* snapshot,
     std::uint64_t* generation) const noexcept {
-    return mapping_ != nullptr &&
-           mapping_ != MAP_FAILED &&
-           ReadRawControlPage(
-               *static_cast<const RawControlPageV1*>(
-                   mapping_),
-               snapshot,
-               generation);
+    if (mapping_ == nullptr || mapping_ == MAP_FAILED) {
+        return false;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + kControlReadBusyTimeout;
+    for (;;) {
+        if (ReadRawControlPage(
+                *static_cast<const RawControlPageV1*>(mapping_),
+                snapshot,
+                generation)) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
 }
 
 bool RawControlFileReader::PathStillNamesMapping() const noexcept {

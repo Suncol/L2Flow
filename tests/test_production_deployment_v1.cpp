@@ -2,6 +2,7 @@
 
 #include "l2flow/common/sha256.h"
 
+#include <array>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
@@ -66,9 +67,30 @@ void TestValidManifest(TestContext* test, const std::string& manifest) {
     CHECK(test, result.ok());
     if (result.ok()) {
         CHECK(test, result.deployment.sources.size() == 4U);
+        CHECK(test,
+              result.deployment.sdk_library_path ==
+                  "/REPLACE_BEFORE_PRODUCTION/sdk/libmdl_api.so");
         CHECK(test, !result.deployment.raw_include_optional_index);
         CHECK(test,
+              result.deployment
+                      .canonical_snapshot_capacity_records_per_sink ==
+                  200000U);
+        CHECK(test,
+              result.deployment.canonical_tick_capacity_records_per_sink ==
+                  1200000U);
+        CHECK(test,
+              result.deployment
+                      .canonical_quality_capacity_records_per_sink ==
+                  15000000U);
+        CHECK(test,
+              result.deployment
+                      .canonical_control_capacity_records_per_sink ==
+                  1024U);
+        CHECK(test,
               result.deployment.history_maximum_records_per_query == 65536U);
+        CHECK(test,
+              result.deployment.history_maximum_records_per_shard ==
+                  1200000U);
     }
 }
 
@@ -76,6 +98,18 @@ void TestExactFields(TestContext* test, const std::string& manifest) {
     const std::string unknown = manifest + "unknown.field\t1\n";
     CHECK(test,
           Parse(unknown).error ==
+              apps::ProductionDeploymentErrorV1::kUnknownField);
+
+    const std::string retired_sdk_pin =
+        manifest + "sdk_library_sha256\t" + std::string(64U, '1') + "\n";
+    CHECK(test,
+          Parse(retired_sdk_pin).error ==
+              apps::ProductionDeploymentErrorV1::kUnknownField);
+
+    const std::string retired_archive =
+        manifest + "sdk_archive_path\t/unused/sdk.tar.gz\n";
+    CHECK(test,
+          Parse(retired_archive).error ==
               apps::ProductionDeploymentErrorV1::kUnknownField);
 
     const std::string duplicate = manifest + "mode\tfresh\n";
@@ -162,13 +196,56 @@ void TestExactFields(TestContext* test, const std::string& manifest) {
           Parse(excessive_live_segments).error ==
               apps::ProductionDeploymentErrorV1::kInvalidValue);
 
-    const std::string excessive_canonical_capacity = ReplaceOnce(
-        manifest,
-        "canonical.capacity_records_per_sink\t16777216\n",
-        "canonical.capacity_records_per_sink\t18446744073709551615\n");
-    CHECK(test, excessive_canonical_capacity != manifest);
+    const std::array<std::string_view, 4U> canonical_capacity_fields{{
+        "canonical.snapshot_capacity_records_per_sink",
+        "canonical.tick_capacity_records_per_sink",
+        "canonical.quality_capacity_records_per_sink",
+        "canonical.control_capacity_records_per_sink",
+    }};
+    for (std::string_view field : canonical_capacity_fields) {
+        const std::string prefix = std::string(field) + "\t";
+        const std::size_t begin = manifest.find(prefix);
+        CHECK(test, begin != std::string::npos);
+        if (begin == std::string::npos) {
+            continue;
+        }
+        const std::size_t end = manifest.find('\n', begin);
+        CHECK(test, end != std::string::npos);
+        if (end == std::string::npos) {
+            continue;
+        }
+        const std::string excessive_canonical_capacity = ReplaceOnce(
+            manifest,
+            std::string_view(manifest).substr(begin, end + 1U - begin),
+            prefix + "18446744073709551615\n");
+        CHECK(test, excessive_canonical_capacity != manifest);
+        CHECK(test,
+              Parse(excessive_canonical_capacity).error ==
+                  apps::ProductionDeploymentErrorV1::kInvalidValue);
+    }
+
+    const std::string retired_unified_capacity =
+        manifest + "canonical.capacity_records_per_sink\t200000\n";
     CHECK(test,
-          Parse(excessive_canonical_capacity).error ==
+          Parse(retired_unified_capacity).error ==
+              apps::ProductionDeploymentErrorV1::kUnknownField);
+
+    const std::string sparse_index_bytes_too_infrequent = ReplaceOnce(
+        manifest,
+        "raw.sparse_index_every_bytes\t4194304\n",
+        "raw.sparse_index_every_bytes\t4194305\n");
+    CHECK(test, sparse_index_bytes_too_infrequent != manifest);
+    CHECK(test,
+          Parse(sparse_index_bytes_too_infrequent).error ==
+              apps::ProductionDeploymentErrorV1::kInvalidValue);
+
+    const std::string sparse_index_records_too_infrequent = ReplaceOnce(
+        manifest,
+        "raw.sparse_index_every_records\t4096\n",
+        "raw.sparse_index_every_records\t4097\n");
+    CHECK(test, sparse_index_records_too_infrequent != manifest);
+    CHECK(test,
+          Parse(sparse_index_records_too_infrequent).error ==
               apps::ProductionDeploymentErrorV1::kInvalidValue);
 }
 
@@ -193,6 +270,62 @@ void TestCli(TestContext* test) {
     CHECK(test,
           parsed.arguments.deployment_directory ==
               "/run/l2flow/deployment");
+
+    const std::vector<std::string_view> bounded{
+        "--deployment-dir",
+        "/run/l2flow/deployment",
+        "--manifest-sha256",
+        digest,
+        "--run-seconds",
+        "300",
+        "--evidence-json",
+        "/run/l2flow/deployment/formal-router-evidence.json",
+    };
+    const auto bounded_parsed =
+        apps::ParseProductionRouterArgumentsV1(bounded);
+    CHECK(test, bounded_parsed.ok);
+    CHECK(test, bounded_parsed.arguments.run_seconds == 300U);
+    CHECK(test,
+          bounded_parsed.arguments.evidence_json ==
+              "/run/l2flow/deployment/formal-router-evidence.json");
+
+    const std::vector<std::string_view> missing_evidence{
+        "--deployment-dir",
+        "/run/l2flow/deployment",
+        "--manifest-sha256",
+        digest,
+        "--run-seconds",
+        "300",
+    };
+    CHECK(test,
+          !apps::ParseProductionRouterArgumentsV1(missing_evidence).ok);
+
+    const std::vector<std::string_view> zero_seconds{
+        "--deployment-dir",
+        "/run/l2flow/deployment",
+        "--manifest-sha256",
+        digest,
+        "--run-seconds",
+        "0",
+        "--evidence-json",
+        "/run/l2flow/deployment/formal-router-evidence.json",
+    };
+    CHECK(test,
+          !apps::ParseProductionRouterArgumentsV1(zero_seconds).ok);
+
+    const std::vector<std::string_view> check_and_run{
+        "--deployment-dir",
+        "/run/l2flow/deployment",
+        "--manifest-sha256",
+        digest,
+        "--check",
+        "--run-seconds",
+        "300",
+        "--evidence-json",
+        "/run/l2flow/deployment/formal-router-evidence.json",
+    };
+    CHECK(test,
+          !apps::ParseProductionRouterArgumentsV1(check_and_run).ok);
 
     const std::vector<std::string_view> duplicate{
         "--deployment-dir",

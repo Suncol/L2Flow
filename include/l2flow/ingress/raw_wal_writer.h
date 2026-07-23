@@ -44,6 +44,15 @@ class RawWalIo {
 public:
     virtual ~RawWalIo() = default;
 
+    // Optional bounded mutation scope. A fencing wrapper may retain one
+    // already-validated shared generation action across several immediately
+    // adjacent syscalls, but EndMutationBatch() must release it. Plain I/O
+    // implementations need no special handling.
+    [[nodiscard]] virtual bool BeginMutationBatch() noexcept {
+        return true;
+    }
+    virtual void EndMutationBatch() noexcept {}
+
     [[nodiscard]] virtual RawWalWriteResult WritevSome(
         RawWalFile file,
         std::uint64_t offset,
@@ -249,6 +258,14 @@ class RawWalSink {
 public:
     virtual ~RawWalSink() = default;
 
+    // The sole capture writer uses this scope only for a bounded number of
+    // adjacent appends. Implementations without an external generation fence
+    // may keep the default no-op behavior.
+    [[nodiscard]] virtual bool BeginMutationBatch() noexcept {
+        return true;
+    }
+    virtual void EndMutationBatch() noexcept {}
+
     [[nodiscard]] virtual bool AppendRecord(
         const RawWalRecordInputV1& input) noexcept = 0;
     [[nodiscard]] virtual bool FlushDurable() noexcept = 0;
@@ -293,6 +310,9 @@ public:
     // mutation must be SealAndClose(). No append/durable cursor is published
     // until every required barrier succeeds.
     [[nodiscard]] bool Initialize() noexcept;
+
+    [[nodiscard]] bool BeginMutationBatch() noexcept override;
+    void EndMutationBatch() noexcept override;
 
     // Encodes one Raw V1 record. Header/payload/padding are completed before a
     // separate final trailer write. Append advances only after that trailer is
@@ -347,6 +367,7 @@ private:
     std::uint64_t logical_end_offset_ = 0U;
     std::uint64_t last_ingress_sequence_ = 0U;
     std::uint64_t journal_write_offset_ = 0U;
+    bool mutation_batch_open_ = false;
     bool segment_closed_ = false;
     bool journal_closed_ = false;
 

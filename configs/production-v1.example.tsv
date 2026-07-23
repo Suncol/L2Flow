@@ -1,9 +1,6 @@
 L2FLOW_PRODUCTION_DEPLOYMENT_V1
 mode	fresh
-baseline_path	/REPLACE_BEFORE_PRODUCTION/sdk/vendor_baseline.json
-sdk_archive_path	/REPLACE_BEFORE_PRODUCTION/sdk/mdl_sdk_2_13_234.tar.gz
 sdk_library_path	/REPLACE_BEFORE_PRODUCTION/sdk/libmdl_api.so
-sdk_library_sha256	1111111111111111111111111111111111111111111111111111111111111111
 credential_path	/REPLACE_BEFORE_PRODUCTION/secrets/mdl.credential
 credential_name	REPLACE_BEFORE_PRODUCTION_MDL_CREDENTIAL
 raw_root	/REPLACE_BEFORE_PRODUCTION/data/raw
@@ -34,7 +31,7 @@ raw.segment_max_age_seconds	300
 raw.sync_interval_milliseconds	100
 raw.sync_bytes	67108864
 raw.sparse_index_every_records	4096
-raw.sparse_index_every_bytes	67108864
+raw.sparse_index_every_bytes	4194304
 raw.reserve_domain_id	REPLACE_BEFORE_PRODUCTION_RESERVE_DOMAIN
 raw.reserve_coordinator_socket	/REPLACE_BEFORE_PRODUCTION/run/reserve-coordinator.sock
 raw.reserve_ack_timeout_milliseconds	1000
@@ -44,13 +41,16 @@ raw.live.max_segments	8
 raw.live.max_segment_bytes	2147483648
 raw.live.max_journal_markers	1048576
 raw.live.max_control_reattach_attempts	3
-canonical.capacity_records_per_sink	16777216
+canonical.snapshot_capacity_records_per_sink	200000
+canonical.tick_capacity_records_per_sink	1200000
+canonical.quality_capacity_records_per_sink	15000000
+canonical.control_capacity_records_per_sink	1024
 history.physical_workers	16
 history.queue_capacity	65536
 history.maximum_inflight_per_source	16384
 history.chunk_record_capacity	4096
 history.maximum_records_per_query	65536
-history.maximum_records_per_shard	67108864
+history.maximum_records_per_shard	1200000
 history.maximum_instruments_per_shard	131072
 history.maximum_payload_bytes_per_shard	17179869184
 service.activation_timeout_ms	120000

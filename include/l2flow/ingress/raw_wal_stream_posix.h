@@ -365,6 +365,8 @@ public:
 
     [[nodiscard]] bool AppendRecord(
         const RawWalRecordInputV1& input) noexcept override;
+    [[nodiscard]] bool BeginMutationBatch() noexcept override;
+    void EndMutationBatch() noexcept override;
     [[nodiscard]] bool FlushDurable() noexcept override;
     [[nodiscard]] bool SealAndClose() noexcept override;
     [[nodiscard]] RawWalWriterSnapshot

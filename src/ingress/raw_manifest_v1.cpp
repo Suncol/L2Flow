@@ -406,15 +406,20 @@ void EncodeFrontier(
         static_cast<std::uint64_t>(kRawV1SegmentHeaderBytes)) {
         return RawManifestV1Error::kInvalidRecordRange;
     }
+    const bool sdk_archive_unavailable =
+        IsZero(entry.sdk_archive_sha256);
+    const bool sdk_library_unavailable =
+        IsZero(entry.libmdl_api_sha256);
     if (IsZero(entry.segment_sha256) ||
         IsZero(entry.accepted_marker_sha256) ||
         IsZero(entry.clock_epoch_digest) ||
-        IsZero(entry.sdk_archive_sha256) ||
-        IsZero(entry.libmdl_api_sha256) ||
         IsZero(entry.endpoint_contract_sha256) ||
         IsZero(entry.config_sha256) ||
         IsZero(entry.raw_schema_sha256) ||
         IsZero(entry.build_manifest_sha256)) {
+        return RawManifestV1Error::kInvalidDigest;
+    }
+    if (sdk_archive_unavailable != sdk_library_unavailable) {
         return RawManifestV1Error::kInvalidDigest;
     }
     if (l2flow::common::IsZeroIdentity(entry.host_uuid) ||

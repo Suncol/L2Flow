@@ -212,6 +212,9 @@ struct SegmentHeaderV1 final {
     std::uint32_t clock_epoch_algorithm = 0U;
     RawV1Digest clock_epoch_digest{};
     std::uint64_t clock_epoch_label = 0U;
+    // All-zero is the explicit "not computed" value for an operator-selected
+    // path-only SDK.  Nonzero values retain the historical pinned-provenance
+    // meaning.  These fields never authorize the production SDK path.
     RawV1Digest sdk_archive_sha256{};
     RawV1Digest libmdl_api_sha256{};
     RawV1Digest endpoint_contract_sha256{};

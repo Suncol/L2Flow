@@ -39,6 +39,7 @@ struct Options final {
     std::uint32_t market_timeout_seconds = 60U;
     std::uint32_t monitor_seconds = 0U;
     std::uint32_t minimum_market_messages = 1U;
+    std::uint32_t maximum_captured_records = 100000U;
 };
 
 void PrintUsage(std::ostream& output) {
@@ -56,6 +57,8 @@ void PrintUsage(std::ostream& output) {
            " (disabled by default)\n"
         << "  --minimum-market-messages N"
            " required data messages, 0..100000 (default 1)\n"
+        << "  --maximum-captured-records N"
+           " capture capacity, 1..10000000 (default 100000)\n"
         << "  --capture-csv PATH        write normalized captured records after"
            " clean SDK shutdown\n"
         << "  --help                    show this help\n\n"
@@ -110,7 +113,8 @@ bool ParseOptions(int argc,
             option != "--market-timeout-seconds" &&
             option != "--monitor-seconds" &&
             option != "--capture-csv" &&
-            option != "--minimum-market-messages") {
+            option != "--minimum-market-messages" &&
+            option != "--maximum-captured-records") {
             *error = "unknown option: " + std::string(option);
             return false;
         }
@@ -136,7 +140,8 @@ bool ParseOptions(int argc,
             option == "--timeout-seconds" ||
             option == "--market-timeout-seconds" ||
             option == "--monitor-seconds" ||
-            option == "--minimum-market-messages") {
+            option == "--minimum-market-messages" ||
+            option == "--maximum-captured-records") {
             std::uint32_t parsed = 0U;
             const std::from_chars_result result =
                 std::from_chars(
@@ -171,13 +176,21 @@ bool ParseOptions(int argc,
                     return false;
                 }
                 options->monitor_seconds = parsed;
-            } else {
+            } else if (option == "--minimum-market-messages") {
                 if (parsed > 100000U) {
                     *error =
                         "--minimum-market-messages must be at most 100000";
                     return false;
                 }
                 options->minimum_market_messages = parsed;
+            } else {
+                if (parsed == 0U || parsed > 10000000U) {
+                    *error =
+                        "--maximum-captured-records must be from 1 through "
+                        "10000000";
+                    return false;
+                }
+                options->maximum_captured_records = parsed;
             }
         }
     }
@@ -188,6 +201,12 @@ bool ParseOptions(int argc,
     if (!options->capture_csv.empty() &&
         options->capture_csv.native().find('\0') != std::string::npos) {
         *error = "--capture-csv contains NUL";
+        return false;
+    }
+    if (options->minimum_market_messages >
+        options->maximum_captured_records) {
+        *error =
+            "--minimum-market-messages exceeds --maximum-captured-records";
         return false;
     }
     return true;
@@ -545,8 +564,10 @@ struct ProbeSnapshot final {
 class ProbeHandler final : public mdl::MessageHandlerBase {
 public:
     explicit ProbeHandler(
-        std::vector<sdk::MessageKey> expected)
+        std::vector<sdk::MessageKey> expected,
+        std::size_t maximum_captured_records)
         : expected_(std::move(expected)),
+          maximum_captured_records_(maximum_captured_records),
           required_ok_(expected_.size(), false),
           required_failed_(expected_.size(), false) {}
 
@@ -644,8 +665,7 @@ private:
                 if (market_samples_.size() < kMaximumSamples) {
                     market_samples_.push_back(record.head);
                 }
-                constexpr std::size_t kMaximumCapturedRecords = 100000U;
-                if (market_records_.size() < kMaximumCapturedRecords) {
+                if (market_records_.size() < maximum_captured_records_) {
                     market_records_.push_back(std::move(record));
                 } else {
                     ++dropped_market_records_;
@@ -767,6 +787,7 @@ private:
     }
 
     const std::vector<sdk::MessageKey> expected_;
+    const std::size_t maximum_captured_records_;
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::vector<bool> required_ok_;
@@ -967,7 +988,9 @@ bool WriteCaptureCsv(
 int Run(const Options& options) {
     const std::vector<sdk::MessageKey> expected =
         RequiredMessages();
-    ProbeHandler handler(expected);
+    ProbeHandler handler(
+        expected,
+        static_cast<std::size_t>(options.maximum_captured_records));
 
     std::string failure;
     std::string loader_error;
@@ -1056,7 +1079,10 @@ int Run(const Options& options) {
                                 "waiting for market data";
                         } else if (snapshot.capture_overflow) {
                             failure = "market capture capacity exceeded: "
-                                      "maximum=100000 dropped=" +
+                                      "maximum=" +
+                                      std::to_string(
+                                          options.maximum_captured_records) +
+                                      " dropped=" +
                                       std::to_string(
                                           snapshot.dropped_market_records);
                         } else if (
@@ -1096,7 +1122,8 @@ int Run(const Options& options) {
     snapshot = handler.Snapshot();
     if (failure.empty() && snapshot.capture_overflow) {
         failure = "market capture capacity exceeded after wait: maximum="
-                  "100000 dropped=" +
+                  + std::to_string(options.maximum_captured_records) +
+                  " dropped=" +
                   std::to_string(snapshot.dropped_market_records);
     }
     if (failure.empty() && !options.capture_csv.empty()) {
@@ -1151,6 +1178,8 @@ int Run(const Options& options) {
         << snapshot.market_messages
         << ",\"monitor_seconds\":"
         << options.monitor_seconds
+        << ",\"capture_capacity\":"
+        << options.maximum_captured_records
         << ",\"captured_market_records\":"
         << snapshot.market_records.size()
         << ",\"dropped_market_records\":"

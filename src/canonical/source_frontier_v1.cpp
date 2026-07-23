@@ -83,6 +83,48 @@ template <typename Value>
         failure_order);
 }
 
+[[nodiscard]] SourceFrontierErrorV1 AtomicIncrementCounter(
+    SourceFrontierPageV1* page,
+    std::size_t offset) noexcept {
+    std::uint64_t current = AtomicLoad<std::uint64_t>(
+        *page, offset, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (current == std::numeric_limits<std::uint64_t>::max()) {
+            return SourceFrontierErrorV1::kCounterOverflow;
+        }
+        if (AtomicCompareExchange(
+                page,
+                offset,
+                &current,
+                current + 1U,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE)) {
+            return SourceFrontierErrorV1::kNone;
+        }
+    }
+}
+
+[[nodiscard]] SourceFrontierErrorV1 AtomicDecrementCounter(
+    SourceFrontierPageV1* page,
+    std::size_t offset) noexcept {
+    std::uint64_t current = AtomicLoad<std::uint64_t>(
+        *page, offset, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (current == 0U) {
+            return SourceFrontierErrorV1::kCounterOverflow;
+        }
+        if (AtomicCompareExchange(
+                page,
+                offset,
+                &current,
+                current - 1U,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE)) {
+            return SourceFrontierErrorV1::kNone;
+        }
+    }
+}
+
 [[nodiscard]] SourceFrontierErrorV1 AcquireProgressWrite(
     SourceFrontierPageV1* page,
     std::uint64_t* release_generation) noexcept {
@@ -132,24 +174,6 @@ void ReleaseProgressWrite(
     std::chrono::nanoseconds timeout) noexcept {
     return timeout.count() > 0 &&
            timeout <= kSourceFrontierMaximumBusyTimeoutV1;
-}
-
-[[nodiscard]] SourceFrontierErrorV1 AcquireProgressWriteWithRetry(
-    SourceFrontierPageV1* page,
-    std::chrono::nanoseconds timeout,
-    std::uint64_t* release_generation) noexcept {
-    if (!ValidBusyTimeout(timeout)) {
-        return SourceFrontierErrorV1::kInvalidConfiguration;
-    }
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    for (;;) {
-        const SourceFrontierErrorV1 error =
-            AcquireProgressWrite(page, release_generation);
-        if (error != SourceFrontierErrorV1::kBusy ||
-            std::chrono::steady_clock::now() >= deadline) {
-            return error;
-        }
-    }
 }
 
 template <std::size_t Size>
@@ -477,12 +501,12 @@ SourceFrontierErrorV1 ReadSourceFrontierV1(
     if (!HeaderValid(page)) {
         return SourceFrontierErrorV1::kInvalidPage;
     }
-    // Callback entry/completion and append/processed publication are short
-    // seqlock writes, but the writer may be descheduled while it owns the odd
-    // generation.  Use elapsed monotonic time rather than a CPU-iteration
-    // count.  The wait remains bounded so a crashed writer cannot block a
-    // reader forever; expiry is reported as retryable BUSY, never as an
-    // identity change.
+    // Append/processed/state publication uses a short progress seqlock write;
+    // callback fields have their own atomic transition domain.  A progress
+    // writer may still be descheduled while it owns the odd generation, so
+    // use elapsed monotonic time rather than a CPU-iteration count.  The wait
+    // remains bounded so a crashed writer cannot block a reader forever;
+    // expiry is reported as retryable BUSY, never as an identity change.
     const auto deadline =
         std::chrono::steady_clock::now() + kProgressAccessTimeout;
     for (std::size_t attempt = 0U;; ++attempt) {
@@ -708,52 +732,73 @@ SourceFrontierCallbackGuardV1::SourceFrontierCallbackGuardV1(
         error_ = SourceFrontierErrorV1::kInvalidConfiguration;
         return;
     }
-    std::uint64_t release_generation = 0U;
-    error_ = AcquireProgressWriteWithRetry(
-        page_, busy_timeout_, &release_generation);
-    if (error_ != SourceFrontierErrorV1::kNone) {
-        return;
-    }
-    const auto finish = [&](SourceFrontierErrorV1 error) noexcept {
-        error_ = error;
-        ReleaseProgressWrite(page_, release_generation);
-    };
     if (!PageIdentityMatches(
             *page_, expected_writer_instance_, expected_generation_)) {
-        finish(SourceFrontierErrorV1::kIdentityChanged);
+        error_ = SourceFrontierErrorV1::kIdentityChanged;
         return;
     }
     const SourceStateV1 state = static_cast<SourceStateV1>(
         AtomicLoad<std::uint32_t>(*page_, kSourceState));
     if (!ValidState(state)) {
         LatchFatal(page_);
-        finish(SourceFrontierErrorV1::kInvalidPage);
+        error_ = SourceFrontierErrorV1::kInvalidPage;
         return;
     }
     if (FatalLatched(*page_) || state == SourceStateV1::kFatal) {
-        finish(SourceFrontierErrorV1::kInvalidState);
+        error_ = SourceFrontierErrorV1::kInvalidState;
         return;
     }
-    const std::uint64_t callback_generation =
-        AtomicLoad<std::uint64_t>(*page_, kCallbackGeneration);
-    const std::uint64_t callback_inflight =
-        AtomicLoad<std::uint64_t>(*page_, kCallbackInflight);
-    if (callback_generation == std::numeric_limits<std::uint64_t>::max() ||
-        callback_inflight == std::numeric_limits<std::uint64_t>::max()) {
+
+    // The callback domain is deliberately independent from the progress
+    // seqlock.  Publish inflight first: a reader racing before the generation
+    // transition then sees a conservative nonzero inflight count.  Publish
+    // the generation before returning so any reader that raced the entry
+    // must either retry or observe the callback as inflight.
+    error_ = AtomicIncrementCounter(page_, kCallbackInflight);
+    if (error_ != SourceFrontierErrorV1::kNone) {
         LatchFatal(page_);
-        finish(SourceFrontierErrorV1::kCounterOverflow);
         return;
     }
-    // Entry generation is release-published before construction returns, so
-    // it precedes any receive-time sample made by the callback body.
-    AtomicStore(
-        page_, kCallbackGeneration, callback_generation + 1U,
-        __ATOMIC_RELEASE);
-    AtomicStore(
-        page_, kCallbackInflight, callback_inflight + 1U,
-        __ATOMIC_RELEASE);
+    error_ = AtomicIncrementCounter(page_, kCallbackGeneration);
+    if (error_ != SourceFrontierErrorV1::kNone) {
+        LatchFatal(page_);
+        if (AtomicDecrementCounter(page_, kCallbackInflight) !=
+            SourceFrontierErrorV1::kNone) {
+            LatchFatal(page_);
+        }
+        return;
+    }
+
+    const auto reject_registered = [&](SourceFrontierErrorV1 error) noexcept {
+        if (AtomicIncrementCounter(page_, kCallbackGeneration) !=
+            SourceFrontierErrorV1::kNone) {
+            LatchFatal(page_);
+        }
+        if (AtomicDecrementCounter(page_, kCallbackInflight) !=
+            SourceFrontierErrorV1::kNone) {
+            LatchFatal(page_);
+        }
+        error_ = error;
+    };
+
+    // A fail-stop may race the initial admission checks.  Recheck after the
+    // callback accounting is visible, before permitting the caller to sample
+    // receive time or touch the Raw ring.
+    const SourceStateV1 registered_state = static_cast<SourceStateV1>(
+        AtomicLoad<std::uint32_t>(*page_, kSourceState));
+    if (!ValidState(registered_state)) {
+        LatchFatal(page_);
+        reject_registered(SourceFrontierErrorV1::kInvalidPage);
+        return;
+    }
+    if (FatalLatched(*page_) ||
+        registered_state == SourceStateV1::kFatal) {
+        reject_registered(SourceFrontierErrorV1::kInvalidState);
+        return;
+    }
+
     entered_ = true;
-    finish(SourceFrontierErrorV1::kNone);
+    error_ = SourceFrontierErrorV1::kNone;
 }
 
 SourceFrontierCallbackGuardV1::~SourceFrontierCallbackGuardV1() {
@@ -764,34 +809,19 @@ SourceFrontierCallbackGuardV1::~SourceFrontierCallbackGuardV1() {
             *page_, expected_writer_instance_, expected_generation_)) {
         return;
     }
-    // This lock-free latch is the safety boundary.  If the bounded progress
-    // lock below is unavailable, inflight deliberately remains nonzero as a
-    // second fail-closed signal instead of pretending the callback completed.
+    // The monotonic latch is the safety boundary.  Callback accounting is
+    // closed in its independent atomic domain even if a progress writer is
+    // stalled; readers still observe FATAL and cannot infer a healthy idle
+    // source from the abandoned callback.
     LatchFatal(page_);
-    std::uint64_t release_generation = 0U;
-    if (AcquireProgressWrite(page_, &release_generation) !=
+    if (AtomicIncrementCounter(page_, kCallbackGeneration) !=
         SourceFrontierErrorV1::kNone) {
-        return;
+        LatchFatal(page_);
     }
-    if (PageIdentityMatches(
-            *page_, expected_writer_instance_, expected_generation_)) {
-        const std::uint64_t callback_generation =
-            AtomicLoad<std::uint64_t>(*page_, kCallbackGeneration);
-        const std::uint64_t callback_inflight =
-            AtomicLoad<std::uint64_t>(*page_, kCallbackInflight);
-        if (callback_generation !=
-            std::numeric_limits<std::uint64_t>::max()) {
-            AtomicStore(
-                page_, kCallbackGeneration, callback_generation + 1U,
-                __ATOMIC_RELEASE);
-        }
-        if (callback_inflight != 0U) {
-            AtomicStore(
-                page_, kCallbackInflight, callback_inflight - 1U,
-                __ATOMIC_RELEASE);
-        }
+    if (AtomicDecrementCounter(page_, kCallbackInflight) !=
+        SourceFrontierErrorV1::kNone) {
+        LatchFatal(page_);
     }
-    ReleaseProgressWrite(page_, release_generation);
 }
 
 SourceFrontierErrorV1
@@ -800,63 +830,69 @@ SourceFrontierCallbackGuardV1::CompleteCaptured(
     if (!entered_ || completed_ || page_ == nullptr) {
         return SourceFrontierErrorV1::kInvalidState;
     }
-    std::uint64_t release_generation = 0U;
-    const SourceFrontierErrorV1 lock_error =
-        AcquireProgressWriteWithRetry(
-            page_, busy_timeout_, &release_generation);
-    if (lock_error != SourceFrontierErrorV1::kNone) {
-        error_ = lock_error;
-        return error_;
-    }
-    const auto finish = [&](SourceFrontierErrorV1 error) noexcept {
-        error_ = error;
-        ReleaseProgressWrite(page_, release_generation);
-        return error;
-    };
     if (!PageIdentityMatches(
             *page_, expected_writer_instance_, expected_generation_)) {
-        return finish(SourceFrontierErrorV1::kIdentityChanged);
+        error_ = SourceFrontierErrorV1::kIdentityChanged;
+        return error_;
     }
     const SourceStateV1 state = static_cast<SourceStateV1>(
         AtomicLoad<std::uint32_t>(*page_, kSourceState));
     if (!ValidState(state)) {
         LatchFatal(page_);
-        return finish(SourceFrontierErrorV1::kInvalidPage);
+        error_ = SourceFrontierErrorV1::kInvalidPage;
+        return error_;
     }
     if (FatalLatched(*page_) || state == SourceStateV1::kFatal) {
-        return finish(SourceFrontierErrorV1::kInvalidState);
+        error_ = SourceFrontierErrorV1::kInvalidState;
+        return error_;
     }
-    const std::uint64_t current = AtomicLoad<std::uint64_t>(
+    if (AtomicLoad<std::uint64_t>(*page_, kCallbackInflight) == 0U) {
+        LatchFatal(page_);
+        completed_ = true;
+        error_ = SourceFrontierErrorV1::kCounterOverflow;
+        return error_;
+    }
+
+    std::uint64_t current = AtomicLoad<std::uint64_t>(
         *page_, kCapturedSequence);
     if (current == std::numeric_limits<std::uint64_t>::max() ||
         ingress_sequence != current + 1U) {
-        return finish(SourceFrontierErrorV1::kIngressRegression);
+        error_ = SourceFrontierErrorV1::kIngressRegression;
+        return error_;
     }
-    const std::uint64_t callback_generation =
-        AtomicLoad<std::uint64_t>(*page_, kCallbackGeneration);
-    const std::uint64_t callback_inflight =
-        AtomicLoad<std::uint64_t>(*page_, kCallbackInflight);
-    if (callback_generation == std::numeric_limits<std::uint64_t>::max() ||
-        callback_inflight == 0U) {
+    if (!AtomicCompareExchange(
+            page_,
+            kCapturedSequence,
+            &current,
+            ingress_sequence,
+            __ATOMIC_RELEASE,
+            __ATOMIC_ACQUIRE)) {
+        error_ = SourceFrontierErrorV1::kIngressRegression;
+        return error_;
+    }
+
+    // Capture is release-published before the generation transition, and
+    // inflight is removed last.  A reader in either intervening window sees
+    // callback_inflight != 0 and therefore remains conservative.
+    error_ = AtomicIncrementCounter(page_, kCallbackGeneration);
+    if (error_ != SourceFrontierErrorV1::kNone) {
         LatchFatal(page_);
-        if (callback_inflight != 0U) {
-            AtomicStore(
-                page_, kCallbackInflight, callback_inflight - 1U,
-                __ATOMIC_RELEASE);
+        if (AtomicDecrementCounter(page_, kCallbackInflight) !=
+            SourceFrontierErrorV1::kNone) {
+            LatchFatal(page_);
         }
         completed_ = true;
-        return finish(SourceFrontierErrorV1::kCounterOverflow);
+        return error_;
     }
-    AtomicStore(
-        page_, kCapturedSequence, ingress_sequence, __ATOMIC_RELEASE);
-    AtomicStore(
-        page_, kCallbackGeneration, callback_generation + 1U,
-        __ATOMIC_RELEASE);
-    AtomicStore(
-        page_, kCallbackInflight, callback_inflight - 1U,
-        __ATOMIC_RELEASE);
+    error_ = AtomicDecrementCounter(page_, kCallbackInflight);
+    if (error_ != SourceFrontierErrorV1::kNone) {
+        LatchFatal(page_);
+        completed_ = true;
+        return error_;
+    }
     completed_ = true;
-    return finish(SourceFrontierErrorV1::kNone);
+    error_ = SourceFrontierErrorV1::kNone;
+    return error_;
 }
 
 SourceFrontierErrorV1 PublishAppendProgressV1(

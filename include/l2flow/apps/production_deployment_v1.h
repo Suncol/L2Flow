@@ -47,15 +47,15 @@ struct ProductionDeploymentSourceV1 final {
 
 // Every field is read from one exact hash-pinned manifest except values whose
 // provenance is stronger when derived by the executable: build/schema hashes,
-// host/boot identity, SDK archive baseline identity, and the manifest digest
-// itself.  There are no implicit recovery or existing-ACTIVE modes in V1.
+// host/boot identity and the manifest digest itself.  The SDK library path is
+// an operator authorization: V1 checks only that it names an existing regular
+// file, then uses that exact path.  It deliberately does not apply a snapshot,
+// archive, baseline, size, digest, ELF/ABI or runtime-lifecycle approval gate.
+// There are no implicit recovery or existing-ACTIVE modes in V1.
 struct ProductionDeploymentV1 final {
     l2flow::common::Sha256Digest manifest_sha256{};
 
-    std::filesystem::path baseline_path;
-    std::filesystem::path sdk_archive_path;
     std::filesystem::path sdk_library_path;
-    l2flow::common::Sha256Digest sdk_library_sha256{};
     std::string credential_path;
     std::string credential_name;
 
@@ -101,7 +101,15 @@ struct ProductionDeploymentV1 final {
     std::size_t raw_live_max_journal_markers = 0U;
     std::uint32_t raw_live_max_control_reattach_attempts = 0U;
 
-    std::uint64_t canonical_capacity_records_per_sink = 0U;
+    // Canonical families have materially different record sizes and
+    // cardinalities.  In particular, quality/control are unsharded while
+    // snapshot/tick have one sink per logical shard, so a single shared
+    // capacity either exhausts the unsharded quality sink or grossly
+    // over-allocates every snapshot segment.
+    std::uint64_t canonical_snapshot_capacity_records_per_sink = 0U;
+    std::uint64_t canonical_tick_capacity_records_per_sink = 0U;
+    std::uint64_t canonical_quality_capacity_records_per_sink = 0U;
+    std::uint64_t canonical_control_capacity_records_per_sink = 0U;
     std::uint32_t history_physical_workers = 0U;
     std::size_t history_queue_capacity = 0U;
     std::size_t history_maximum_inflight_per_source = 0U;
@@ -175,6 +183,11 @@ LoadProductionDeploymentManifestV1(
 struct ProductionRouterArgumentsV1 final {
     std::filesystem::path deployment_directory;
     l2flow::common::Sha256Digest manifest_sha256{};
+    // Zero preserves the normal supervisor-owned, unbounded service mode.
+    // A nonzero value starts only after Start() returns authoritative Active
+    // and requires evidence_json in the deployment directory.
+    std::uint32_t run_seconds = 0U;
+    std::filesystem::path evidence_json;
     bool check_only = false;
     bool show_help = false;
 };

@@ -62,6 +62,8 @@ struct RawManifestSegmentEntryV1 final {
     std::uint32_t clock_epoch_algorithm = 0U;
     RawV1Digest clock_epoch_digest{};
     std::uint64_t clock_epoch_label = 0U;
+    // Zero is preserved from a path-only SegmentHeaderV1 and means that no
+    // archive/library digest was computed for this generation.
     RawV1Digest sdk_archive_sha256{};
     RawV1Digest libmdl_api_sha256{};
     RawV1Digest endpoint_contract_sha256{};

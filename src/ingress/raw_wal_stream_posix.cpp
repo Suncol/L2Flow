@@ -761,6 +761,12 @@ public:
         const RawWalRecordInputV1& input) noexcept override {
         return stream_->AppendRecord(input);
     }
+    [[nodiscard]] bool BeginMutationBatch() noexcept override {
+        return stream_->BeginMutationBatch();
+    }
+    void EndMutationBatch() noexcept override {
+        stream_->EndMutationBatch();
+    }
     [[nodiscard]] bool FlushDurable() noexcept override {
         return stream_->FlushDurable();
     }
@@ -2240,6 +2246,16 @@ RawRecoveredClosedPosixStreamV1::
 bool RawRecoveredClosedPosixStreamV1::AppendRecord(
     const RawWalRecordInputV1& input) noexcept {
     return stream_->AppendRecord(input);
+}
+
+bool RawRecoveredClosedPosixStreamV1::
+BeginMutationBatch() noexcept {
+    return stream_->BeginMutationBatch();
+}
+
+void RawRecoveredClosedPosixStreamV1::
+EndMutationBatch() noexcept {
+    stream_->EndMutationBatch();
 }
 
 bool RawRecoveredClosedPosixStreamV1::

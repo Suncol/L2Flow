@@ -2,7 +2,9 @@
 #include "l2flow/ingress/raw_writer_lease.h"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -10,8 +12,10 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -146,6 +150,38 @@ void TestPublicationReplacementAndStaleMapping() {
         old_reader->Read(&observed) &&
             observed.append_global_wal_pos == 4224U,
         "mapped reader observes progress");
+
+    void* const writable_mapping = ::mmap(
+        nullptr,
+        ingress::kRawControlPageBytes,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        first->descriptor(),
+        0);
+    Expect(
+        writable_mapping != MAP_FAILED,
+        "control contention fixture maps the writer page");
+    if (writable_mapping != MAP_FAILED) {
+        auto* const page = static_cast<ingress::RawControlPageV1*>(
+            writable_mapping);
+        const std::uint64_t even =
+            page->generation.load(std::memory_order_acquire);
+        page->generation.store(even + 1U, std::memory_order_release);
+        std::thread release_writer([page, even]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            page->generation.store(even + 2U, std::memory_order_release);
+        });
+        std::uint64_t contended_generation = 0U;
+        const bool contended_read = old_reader->Read(
+            &observed, &contended_generation);
+        release_writer.join();
+        Expect(
+            contended_read && contended_generation == even + 2U &&
+                observed.append_global_wal_pos == 4224U,
+            "mapped reader retries a transient odd control generation");
+        static_cast<void>(::munmap(
+            writable_mapping, ingress::kRawControlPageBytes));
+    }
 
     ingress::RawControlSnapshot regressed = progressed;
     regressed.append_global_wal_pos = 4096U;

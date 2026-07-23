@@ -172,6 +172,10 @@ RawV1Error ValidateSegmentLogical(
     if ((header.segment_flags & ~kRawV1SegmentFlagsMask) != 0U) {
         return RawV1Error::kUnknownFlags;
     }
+    const bool sdk_archive_unavailable =
+        IsZero(header.sdk_archive_sha256);
+    const bool sdk_library_unavailable =
+        IsZero(header.libmdl_api_sha256);
     if (header.source_stream_id == 0U ||
         header.capture_date == 0U ||
         header.segment_sequence == 0U ||
@@ -181,12 +185,13 @@ RawV1Error ValidateSegmentLogical(
         IsZero(header.linux_boot_id) ||
         header.clock_epoch_algorithm == 0U ||
         IsZero(header.clock_epoch_digest) ||
-        IsZero(header.sdk_archive_sha256) ||
-        IsZero(header.libmdl_api_sha256) ||
         IsZero(header.endpoint_contract_sha256) ||
         IsZero(header.config_sha256) ||
         IsZero(header.raw_schema_sha256) ||
         IsZero(header.build_manifest_sha256)) {
+        return RawV1Error::kInvalidIdentity;
+    }
+    if (sdk_archive_unavailable != sdk_library_unavailable) {
         return RawV1Error::kInvalidIdentity;
     }
     if ((header.segment_sequence == 1U &&

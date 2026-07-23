@@ -101,6 +101,11 @@ subscription status and up to 16 copied `MDLMessageHead` samples. When
 `--capture-csv` writes normalized business fields without overwriting an
 existing file. Use `--minimum-market-messages 0` only for an explicit
 control-plane-only check.
+The in-memory capture defaults to 100,000 records and fails closed on
+overflow.  Longer explicitly monitored windows can raise that bound with
+`--maximum-captured-records` (at most 10,000,000); the JSON result reports the
+selected capacity, observed records and dropped records so a truncated window
+cannot be reported as complete evidence.
 The probe does not accept a token on the command line. Port 9112 is the
 deployed cascade publisher used by the current integration; override
 `--address` when the feeder's `TCP_SERVER` publisher uses another port.
@@ -250,6 +255,30 @@ the command-line pin from the final exact bytes with
 `sha256sum production-v1.tsv`; the credential token belongs only in the
 separate `0400` credential file.
 
+The production manifest treats `sdk_library_path` as an explicit operator
+authorization.  It has no SDK archive path, baseline path or expected SDK
+library digest field. `--check` only requires that this path name an existing
+regular file. Normal startup passes that exact path directly to `dlopen()` and
+resolves `DllCreateIOManager`, because those operations are required to use the
+library. It does not copy/snapshot or hash the file and does not run automated
+archive, baseline, size, ELF/ABI, lifecycle or expected-digest approval gates.
+After successful production composition, the mapping is intentionally retained
+until process exit; the formal path does not invoke the vendor DSO's unload
+finalizers through an in-process `dlclose()` transition.
+The legacy SDK archive/library digest fields in Raw V1 are all-zero to state
+that no such identity was computed; they are not acceptance pins.
+
+The formal operator path creates one physical SDK `IOManager` and one physical
+`Subscriber`. Four logical ingress facades first prove that their connection
+settings agree; the fourth logical `Connect()` installs the union of the five
+required market subscriptions and performs the only physical `Connect()`.
+API/SYS control callbacks fan out to all four independent Raw handlers. Market
+callbacks route by the exact service/version/message key to one owning lane,
+and unknown or forbidden keys are consumed without entering any Raw stream.
+Shutdown and vendor-object release each occur exactly once, after all four Raw
+callback gates have closed; Raw WALs, sequences, clocks, frontiers and decode
+pipelines remain independent.
+
 `--check` validates the manifest and non-mutating deployment prerequisites; it
 does not load vendor code, acquire SourceFrontier roles, register/mutate Raw
 SCAFFOLDING, create Canonical files or publish a route.  Normal mode performs
@@ -272,11 +301,26 @@ exclusive/identity gate, and route publication repeats its absence proof under
 the process gate and directory lock immediately before creating owner evidence
 and Active.
 
+Canonical capacity is configured independently for the four families with
+`canonical.snapshot_capacity_records_per_sink`,
+`canonical.tick_capacity_records_per_sink`,
+`canonical.quality_capacity_records_per_sink`, and
+`canonical.control_capacity_records_per_sink`. Snapshot and tick each have 16
+sharded sinks per source; quality and control each have one unsharded sink per
+source. Keeping these limits separate is required both for load safety and for
+bounded disk preallocation: increasing a high-rate unsharded quality limit
+must not multiply the allocation of every 2 KiB snapshot segment. Every field
+is a per-sink hard limit, and exhausting any one remains source Fatal.
+
 `history.maximum_records_per_query` is a hard per-call work/output limit for
 `Tail` and `RangeBySourceSequence`; an oversized request is rejected before it
 takes a shard lock or allocates its result.  Full immutable chunks are pinned
 under the lock and traversed after unlocking, so a large permitted query does
 not hold the append worker's shard lock for its complete traversal.
+`history.maximum_records_per_shard` is an append-time hard ceiling, not an
+eager allocation request: each instrument/source/lane store grows lazily in
+`history.chunk_record_capacity` chunks and remains independently bounded by
+`history.maximum_payload_bytes_per_shard`.
 
 The manifest's four `metrics_path` values currently participate in Raw stable
 configuration hashing and path-separation checks only.  This aggregate entry
@@ -324,7 +368,10 @@ process exits nonzero and requires reprovision or the separate recovery path.
 Normal mode creates fresh frontier/Canonical/Raw generation artifacts.  A
 failure after that mutation is fail-closed but is not rolled back or retried
 in place; the operator must use a newly provisioned generation or the separate
-recovery/takeover procedure.  Run `--check` first.
+recovery/takeover procedure.  For a fresh generation, prepare static files,
+run typed coordinator provisioning, then run the full `--check`; startup is
+last. The check requires the already-created coordinator lease marker and
+exact four-entry SCAFFOLDING state.
 
 The full ordering, capacity, route-liveness and real-feed test contract is in
 [`docs/decisions/production-instrument-runtime-v1.md`](docs/decisions/production-instrument-runtime-v1.md).

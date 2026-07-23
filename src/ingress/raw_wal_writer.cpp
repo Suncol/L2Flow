@@ -272,10 +272,38 @@ RawWalWriter::RawWalWriter(
       io_(std::move(io)) {}
 
 RawWalWriter::~RawWalWriter() {
+    EndMutationBatch();
     if (io_ != nullptr &&
         (!segment_closed_ || !journal_closed_)) {
         static_cast<void>(CloseBoth());
     }
+}
+
+bool RawWalWriter::BeginMutationBatch() noexcept {
+    if (mutation_batch_open_ || io_ == nullptr ||
+        !initialized_.load(std::memory_order_acquire) ||
+        sealed_.load(std::memory_order_acquire) ||
+        closed_.load(std::memory_order_acquire) ||
+        fatal_.load(std::memory_order_acquire)) {
+        Trip(RawWalFailureKind::kInvalidState, EBUSY);
+        return false;
+    }
+    if (!io_->BeginMutationBatch()) {
+        Trip(RawWalFailureKind::kSegmentWrite, EIO);
+        return false;
+    }
+    mutation_batch_open_ = true;
+    return true;
+}
+
+void RawWalWriter::EndMutationBatch() noexcept {
+    if (!mutation_batch_open_) {
+        return;
+    }
+    if (io_ != nullptr) {
+        io_->EndMutationBatch();
+    }
+    mutation_batch_open_ = false;
 }
 
 bool RawWalWriter::Initialize() noexcept {

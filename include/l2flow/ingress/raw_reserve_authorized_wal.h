@@ -16,10 +16,12 @@ namespace l2flow::ingress {
 class RawReserveWalAuthorizationBindingV1;
 class RawWriterLease;
 
-// Per-syscall coordinator fence for segment/journal writes. A new independent
-// shared OFD action is acquired for every mutating syscall and is released
-// immediately afterward. Close is deliberately unconditional: fencing must
-// never prevent descriptor cleanup.
+// Coordinator fence for segment/journal writes. Outside an explicit bounded
+// mutation batch, a new independent shared OFD action is acquired for every
+// mutating syscall and released immediately afterward. Inside a batch, the
+// wrapper reuses one still-live shared action while revalidating the target
+// descriptor before every mutation. Close is deliberately unconditional:
+// fencing must never prevent descriptor cleanup.
 //
 // The delegate must expose a retained target-directory descriptor through
 // RawReserveMutationTargetProviderV1. The returned wrapper retains the
@@ -34,9 +36,10 @@ GateRawWalIoWithCoordinatorV1(
     std::string* error = nullptr) noexcept;
 
 // Production writer-bound variant. In addition to key/status/target, every
-// syscall action must observe this exact current registry writer_instance
-// while its shared generation gate is held. A same-key/same-status writer
-// takeover therefore fences the old writer before its next mutation.
+// action must observe this exact current registry writer_instance while its
+// shared generation gate is held. A same-key/same-status writer takeover
+// therefore waits for any bounded batch and fences the old writer before its
+// next action.
 [[nodiscard]] std::unique_ptr<RawWalIo>
 GateRawWalIoWithCoordinatorForWriterV1(
     std::unique_ptr<RawWalIo> delegate,
@@ -87,10 +90,12 @@ public:
     retained_writer_lease() noexcept = 0;
 };
 
-// Transaction fence for R6-R14 backend operations. One shared OFD action is
-// held for each complete delegate method. I/O returned by CreateNextSegment
-// is automatically wrapped by the per-syscall fence above, so rotation cannot
-// accidentally reintroduce an ungated writer.
+// Transaction fence for R6-R14 backend operations. Outside a bounded mutation
+// batch, one shared OFD action is held for each complete delegate method.
+// Inside a batch, the same still-live shared action covers every method until
+// EndMutationBatch(). I/O returned by CreateNextSegment is automatically
+// wrapped by the same policy, so rotation cannot reintroduce an ungated
+// writer.
 //
 // The delegate and every rotated RawWalIo it returns must expose the exact
 // retained target-directory descriptor. The returned wrapper retains the
@@ -113,6 +118,9 @@ public:
     RawReserveAuthorizedWalStreamBackendV1& operator=(
         RawReserveAuthorizedWalStreamBackendV1&&) =
         delete;
+
+    [[nodiscard]] bool BeginMutationBatch() noexcept override;
+    void EndMutationBatch() noexcept override;
 
     [[nodiscard]] bool PublishClosedSegment(
         RawSegmentArtifactPlanV1 plan,
@@ -210,6 +218,11 @@ private:
     [[nodiscard]] std::unique_ptr<
         RawReserveAuthorizedActionV1>
     Acquire() noexcept;
+    [[nodiscard]] bool ValidateAction(
+        const RawReserveAuthorizedActionV1& action) noexcept;
+    [[nodiscard]] RawReserveAuthorizedActionV1*
+    ActionForMutation(
+        std::unique_ptr<RawReserveAuthorizedActionV1>* owned) noexcept;
     void Trip(
         RawReserveAuthorizedWalFailureV1 failure) noexcept;
 
@@ -229,6 +242,8 @@ private:
     bool initial_io_bound_ = false;
     l2flow::common::Identity128
         expected_writer_instance_{};
+    std::unique_ptr<RawReserveAuthorizedActionV1>
+        mutation_batch_action_;
     std::atomic<std::uint8_t> failure_{
         static_cast<std::uint8_t>(
             RawReserveAuthorizedWalFailureV1::kNone)};

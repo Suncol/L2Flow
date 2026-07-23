@@ -18,6 +18,15 @@ inline constexpr std::uint64_t
     kRawCaptureDefaultDurableBatchBytes = 4U * 1024U * 1024U;
 inline constexpr std::uint64_t
     kRawCaptureDefaultIdleHeartbeatIntervalNs = 1'000'000'000U;
+// A production authorization action may cover at most this many adjacent
+// records or framed bytes. The sole consumer releases the batch immediately
+// on either limit, an empty ring, failure, emergency pause, or final drain.
+inline constexpr std::uint64_t
+    kRawCaptureMutationBatchMaximumRecordsV1 = 1024U;
+inline constexpr std::uint64_t
+    kRawCaptureMutationBatchMaximumBytesV1 = 4U * 1024U * 1024U;
+inline constexpr std::uint64_t
+    kRawCaptureMutationBatchMaximumDurationNsV1 = 50'000'000U;
 
 enum class RawCaptureFatalSignal : std::uint8_t {
     kRawWalIo = 0U,
@@ -184,6 +193,9 @@ public:
 private:
     [[nodiscard]] std::uint64_t MonotonicNowNs() const noexcept;
     [[nodiscard]] bool ConsumeRecord() noexcept;
+    [[nodiscard]] bool EnsureMutationBatch() noexcept;
+    void EndMutationBatch() noexcept;
+    [[nodiscard]] bool MutationBatchLimitReached() const noexcept;
     [[nodiscard]] bool MaybeFlushDurable(
         std::uint64_t now_ns,
         bool force) noexcept;
@@ -215,6 +227,10 @@ private:
     RawCaptureProgress durable_progress_{};
     std::uint64_t last_flush_monotonic_ns_ = 0U;
     bool have_flush_clock_ = false;
+    std::uint64_t mutation_batch_records_ = 0U;
+    std::uint64_t mutation_batch_bytes_ = 0U;
+    std::uint64_t mutation_batch_started_ns_ = 0U;
+    bool mutation_batch_open_ = false;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> run_started_{false};

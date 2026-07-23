@@ -78,6 +78,9 @@ public:
     [[nodiscard]] bool Read(
         RawControlSnapshot* snapshot,
         std::uint64_t* generation = nullptr) const noexcept;
+    // A writer may be descheduled while the shared page generation is odd.
+    // Transient contention is retried against a bounded monotonic deadline;
+    // a permanently busy or invalid page still fails closed.
     // False means the final pathname now names a replacement inode (or is
     // unavailable); the caller must unmap and execute the full attach gate.
     [[nodiscard]] bool PathStillNamesMapping() const noexcept;

@@ -130,16 +130,47 @@ V1 是全日 append-only 内存历史，不淘汰旧记录。部署必须显式�
 - 每 logical shard 最大 instrument 数；
 - 每 logical shard owned payload bytes 硬上限。
 
+`history.maximum_records_per_shard` 只是 append 时检查的逻辑硬上限，不会在启动时
+按该数值整块预分配；各 `(instrument, source, lane)` 按
+`history.chunk_record_capacity` 惰性分块增长，并且始终同时受每 shard owned payload
+bytes 上限约束。
+
 任一硬上限耗尽都不会覆盖旧数据或静默降级。history source 被标记 Fatal，聚合
 运行时撤销 Active route。Canonical segment 同样是 fixed-capacity；V1 不在日中
 隐式 rotation，segment full 是 source Fatal。因此容量必须按完整交易日峰值、
 热点证券偏斜、variable-depth payload 和安全余量共同估算，而不能只用平均流量。
 
+Canonical 的四类容量必须分别由
+`canonical.snapshot_capacity_records_per_sink`、
+`canonical.tick_capacity_records_per_sink`、
+`canonical.quality_capacity_records_per_sink` 和
+`canonical.control_capacity_records_per_sink` 指定。snapshot/tick 每 source 各有 16
+个 shard sink，而 quality/control 每 source 各只有一个未分片 sink；四类 record size
+也不同。按 family 拆分既防止高流量 unsharded quality 单点打满，也避免为了 quality
+扩容而把全部 2 KiB snapshot segment 成倍预分配。任一字段仍是单 sink 的确定性硬
+上限，耗尽时保持 fail closed。
+
 ## 6. Fresh 启动与身份闭环
 
 正式入口固定读取 deployment directory 下的 `production-v1.tsv`，并要求调用者
-提供 exact-byte SHA-256 pin。manifest、registry、endpoint contract 与 SDK library
-各自使用独立 pin；credential 不进入稳定配置 hash。
+提供 exact-byte SHA-256 pin。manifest、registry 与 endpoint contract 各自使用独立
+pin；credential 不进入稳定配置 hash。SDK 是显式 operator-authorized path：manifest
+只包含 `sdk_library_path`，不包含 SDK archive、baseline 或预期 library digest。
+`--check` 对 SDK 只检查该路径存在且是普通文件；正常启动将该路径直接交给
+`dlopen()` 并解析 `DllCreateIOManager`，这是实际使用指定 library 所必需的操作，不是
+SDK 审批校验。代码不复制、不建立快照、不计算 SDK hash，也不执行 archive/baseline、
+size、ELF/ABI、runtime-lifecycle 或预期 digest 批准门禁。Raw V1 中遗留的 SDK
+archive/library digest 字段写全零，明确表示本次未计算这些身份，而不是写入虚假来源。
+
+该 SDK 的 dispatcher/worker/logging 状态具有进程全局行为。正式入口因此只创建一个
+物理 `IOManager` 和一个物理 `Subscriber`，把四路逻辑配置先完整收集并核对为同一个
+address、credential、heartbeat、encoding、merge、MAC-auth 与 server-select 配置，
+第四个逻辑 `Connect()` 才执行唯一一次物理 `Connect()`。API/SYS 控制消息复制到四个
+Raw handler；市场消息按 `(ServiceID, ServiceVersion, MessageID)` 只进入拥有该订阅的
+Raw lane；未知或禁止的市场消息 fail closed，不进入任何 Raw。四路 Raw WAL、ingress
+sequence、clock、frontier、ControlDecoder、MarketDecoder 与下游 pipeline 仍各自独立。
+正常停止先关闭四路 callback admission gate，再执行唯一一次物理 Shutdown，最后逐路
+drain/seal；物理 Subscriber 和 IOManager 也各只 release 一次。
 
 V1 的持久时钟来源字符串固定为
 `CLOCK_REALTIME+CLOCK_MONOTONIC_RAW:V1`：接收与 segment-age 的 monotonic
@@ -188,7 +219,9 @@ Canonical-root dirfd。fresh owner/Active 发布前，controller 在发布锁内
 
 正常模式一旦开始创建 fresh frontier/Canonical/Raw generation 制品，就不承诺失败
 回滚或原地重试。后续步骤失败时保持 fail-closed，运维必须切换到重新 provision 的
-新 generation 或显式 recovery/takeover 流程；因此应先运行 `--check`。
+新 generation 或显式 recovery/takeover 流程。准备工具只创建目录和静态文件；随后
+必须先运行 typed coordinator provision，再运行完整 `--check`，因为完整预检会验证
+coordinator lease marker 和四条精确 SCAFFOLDING 状态；通过后才可正常启动。
 
 四路 capture 都返回 Start、control/readiness gate 和 history barrier 全部通过后，
 才允许发布 Active route。任一身份、持久化、解码、Canonical、history 或 route

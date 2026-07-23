@@ -622,6 +622,22 @@ set_target_properties(mdl_production_router PROPERTIES
 l2flow_enable_strict_warnings(mdl_production_router)
 l2flow_enable_sanitizers(mdl_production_router)
 
+add_executable(
+    mdl_production_provision_v1
+    tools/mdl_production_provision_v1.cpp)
+target_link_libraries(
+    mdl_production_provision_v1
+    PRIVATE L2Flow::production)
+set_target_properties(
+    mdl_production_provision_v1
+    PROPERTIES
+        OUTPUT_NAME "mdl-production-provision-v1"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO)
+l2flow_enable_strict_warnings(mdl_production_provision_v1)
+l2flow_enable_sanitizers(mdl_production_provision_v1)
+
 add_executable(mdl_abi_preflight tools/mdl_abi_preflight.cpp)
 target_link_libraries(mdl_abi_preflight PRIVATE L2Flow::phase01)
 l2flow_enable_strict_warnings(mdl_abi_preflight)
@@ -641,6 +657,22 @@ set_target_properties(
         CXX_EXTENSIONS NO)
 l2flow_enable_strict_warnings(mdl_sdk_feeder_probe)
 l2flow_enable_sanitizers(mdl_sdk_feeder_probe)
+
+add_executable(
+    export_raw_feeder_capture
+    tools/export_raw_feeder_capture.cpp)
+target_link_libraries(
+    export_raw_feeder_capture
+    PRIVATE L2Flow::phase2)
+set_target_properties(
+    export_raw_feeder_capture
+    PROPERTIES
+        OUTPUT_NAME "export-raw-feeder-capture"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO)
+l2flow_enable_strict_warnings(export_raw_feeder_capture)
+l2flow_enable_sanitizers(export_raw_feeder_capture)
 
 add_executable(
     mdl_phase2_live_probe
@@ -992,6 +1024,9 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_production_test(
         test_production_deployment_v1
         tests/test_production_deployment_v1.cpp)
+    l2flow_add_production_test(
+        test_production_sdk_fanout
+        tests/test_production_sdk_fanout.cpp)
     target_compile_definitions(
         test_production_deployment_v1
         PRIVATE

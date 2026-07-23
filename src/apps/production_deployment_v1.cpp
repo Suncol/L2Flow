@@ -1,7 +1,6 @@
 #include "l2flow/apps/production_deployment_v1.h"
 
 #include "l2flow/apps/production_service_v1.h"
-#include "l2flow/baseline/vendor_baseline.h"
 #include "l2flow/build_manifest.h"
 #include "l2flow/canonical/canonical_normalizer_v1.h"
 #include "l2flow/canonical/canonical_segment_v1.h"
@@ -206,19 +205,18 @@ template <typename Integer>
 }
 
 [[nodiscard]] constexpr std::uint64_t
-MaximumCanonicalCapacityRecordsPerSink() noexcept {
+MaximumCanonicalCapacityRecordsPerSink(
+    std::uint64_t record_bytes) noexcept {
     constexpr std::uint64_t prefix =
         l2flow::canonical::kCanonicalSegmentDataOffsetV1;
-    constexpr std::uint64_t record_bytes =
-        l2flow::canonical::kCanonicalSnapshotRecordBytesV1;
-    constexpr std::uint64_t uint64_limit =
+    const std::uint64_t uint64_limit =
         (std::numeric_limits<std::uint64_t>::max() - prefix) / record_bytes;
-    constexpr std::uint64_t size_limit =
+    const std::uint64_t size_limit =
         (static_cast<std::uint64_t>(
              std::numeric_limits<std::size_t>::max()) -
          prefix) /
         record_bytes;
-    constexpr std::uint64_t offset_limit =
+    const std::uint64_t offset_limit =
         (static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) -
          prefix) /
         record_bytes;
@@ -244,10 +242,7 @@ MaximumCanonicalCapacityRecordsPerSink() noexcept {
 [[nodiscard]] std::vector<std::string> ExpectedKeys() {
     std::vector<std::string> keys{
         "mode",
-        "baseline_path",
-        "sdk_archive_path",
         "sdk_library_path",
-        "sdk_library_sha256",
         "credential_path",
         "credential_name",
         "raw_root",
@@ -288,7 +283,10 @@ MaximumCanonicalCapacityRecordsPerSink() noexcept {
         "raw.live.max_segment_bytes",
         "raw.live.max_journal_markers",
         "raw.live.max_control_reattach_attempts",
-        "canonical.capacity_records_per_sink",
+        "canonical.snapshot_capacity_records_per_sink",
+        "canonical.tick_capacity_records_per_sink",
+        "canonical.quality_capacity_records_per_sink",
+        "canonical.control_capacity_records_per_sink",
         "history.physical_workers",
         "history.queue_capacity",
         "history.maximum_inflight_per_source",
@@ -516,8 +514,6 @@ ProductionDeploymentLoadResultV1 ParseProductionDeploymentManifestV1(
                 ProductionDeploymentErrorV1::kInvalidValue,
                 "only mode=fresh is supported");
         }
-        deployment.baseline_path = value("baseline_path");
-        deployment.sdk_archive_path = value("sdk_archive_path");
         deployment.sdk_library_path = value("sdk_library_path");
         deployment.credential_path = value("credential_path");
         deployment.credential_name = value("credential_name");
@@ -537,9 +533,6 @@ ProductionDeploymentLoadResultV1 ParseProductionDeploymentManifestV1(
                 std::move(diagnostic));
         };
         if (!ParseDigest(
-                value("sdk_library_sha256"),
-                &deployment.sdk_library_sha256) ||
-            !ParseDigest(
                 value("instrument_registry_sha256"),
                 &deployment.instrument_registry_sha256) ||
             !ParseIdentity(
@@ -612,8 +605,14 @@ ProductionDeploymentLoadResultV1 ParseProductionDeploymentManifestV1(
                                 raw_live_max_journal_markers)
         L2FLOW_PARSE_FIELD("raw.live.max_control_reattach_attempts",
                            raw_live_max_control_reattach_attempts)
-        L2FLOW_PARSE_FIELD("canonical.capacity_records_per_sink",
-                           canonical_capacity_records_per_sink)
+        L2FLOW_PARSE_FIELD("canonical.snapshot_capacity_records_per_sink",
+                           canonical_snapshot_capacity_records_per_sink)
+        L2FLOW_PARSE_FIELD("canonical.tick_capacity_records_per_sink",
+                           canonical_tick_capacity_records_per_sink)
+        L2FLOW_PARSE_FIELD("canonical.quality_capacity_records_per_sink",
+                           canonical_quality_capacity_records_per_sink)
+        L2FLOW_PARSE_FIELD("canonical.control_capacity_records_per_sink",
+                           canonical_control_capacity_records_per_sink)
         L2FLOW_PARSE_FIELD("history.physical_workers", history_physical_workers)
         L2FLOW_PARSE_SIZE_FIELD("history.queue_capacity",
                                 history_queue_capacity)
@@ -687,9 +686,7 @@ ProductionDeploymentLoadResultV1 ParseProductionDeploymentManifestV1(
             }
         }
 
-        const std::array<std::filesystem::path, 11U> absolute_paths{{
-            deployment.baseline_path,
-            deployment.sdk_archive_path,
+        const std::array<std::filesystem::path, 9U> absolute_paths{{
             deployment.sdk_library_path,
             deployment.credential_path,
             deployment.raw_root,
@@ -742,7 +739,11 @@ ProductionDeploymentLoadResultV1 ParseProductionDeploymentManifestV1(
             deployment.raw_sync_interval_milliseconds == 0U ||
             deployment.raw_sync_bytes == 0U ||
             deployment.raw_sparse_index_every_records == 0U ||
+            deployment.raw_sparse_index_every_records >
+                l2flow::ingress::kRawIndexV1DefaultRecordInterval ||
             deployment.raw_sparse_index_every_bytes == 0U ||
+            deployment.raw_sparse_index_every_bytes >
+                l2flow::ingress::kRawIndexV1DefaultRawBytesInterval ||
             deployment.reserve_ack_timeout_milliseconds == 0U ||
             deployment.emergency_reserve_bytes == 0U ||
             deployment.raw_maximum_manifest_bytes == 0U ||
@@ -753,9 +754,22 @@ ProductionDeploymentLoadResultV1 ParseProductionDeploymentManifestV1(
                 deployment.raw_segment_target_bytes ||
             deployment.raw_live_max_journal_markers == 0U ||
             deployment.raw_live_max_control_reattach_attempts == 0U ||
-            deployment.canonical_capacity_records_per_sink == 0U ||
-            deployment.canonical_capacity_records_per_sink >
-                MaximumCanonicalCapacityRecordsPerSink() ||
+            deployment.canonical_snapshot_capacity_records_per_sink == 0U ||
+            deployment.canonical_snapshot_capacity_records_per_sink >
+                MaximumCanonicalCapacityRecordsPerSink(
+                    l2flow::canonical::kCanonicalSnapshotRecordBytesV1) ||
+            deployment.canonical_tick_capacity_records_per_sink == 0U ||
+            deployment.canonical_tick_capacity_records_per_sink >
+                MaximumCanonicalCapacityRecordsPerSink(
+                    l2flow::canonical::kCanonicalTickRecordBytesV1) ||
+            deployment.canonical_quality_capacity_records_per_sink == 0U ||
+            deployment.canonical_quality_capacity_records_per_sink >
+                MaximumCanonicalCapacityRecordsPerSink(
+                    l2flow::canonical::kCanonicalQualityRecordBytesV1) ||
+            deployment.canonical_control_capacity_records_per_sink == 0U ||
+            deployment.canonical_control_capacity_records_per_sink >
+                MaximumCanonicalCapacityRecordsPerSink(
+                    l2flow::canonical::kCanonicalControlRecordBytesV1) ||
             deployment.history_physical_workers == 0U ||
             deployment.history_physical_workers > 16U ||
             deployment.history_queue_capacity == 0U ||
@@ -940,7 +954,9 @@ ProductionRouterArgumentResultV1 ParseProductionRouterArgumentsV1(
                 continue;
             }
             if (option != "--deployment-dir" &&
-                option != "--manifest-sha256") {
+                option != "--manifest-sha256" &&
+                option != "--run-seconds" &&
+                option != "--evidence-json") {
                 result.diagnostic = "unknown option or positional argument";
                 return result;
             }
@@ -957,13 +973,23 @@ ProductionRouterArgumentResultV1 ParseProductionRouterArgumentsV1(
             if (option == "--deployment-dir") {
                 result.arguments.deployment_directory = value;
                 has_directory = true;
-            } else {
+            } else if (option == "--manifest-sha256") {
                 if (!ParseDigest(value, &result.arguments.manifest_sha256)) {
                     result.diagnostic =
                         "--manifest-sha256 must be 64 lowercase hexadecimal digits and nonzero";
                     return result;
                 }
                 has_digest = true;
+            } else if (option == "--run-seconds") {
+                if (!ParseUnsigned(value, &result.arguments.run_seconds) ||
+                    result.arguments.run_seconds == 0U ||
+                    result.arguments.run_seconds > 86400U) {
+                    result.diagnostic =
+                        "--run-seconds must be an integer in [1,86400]";
+                    return result;
+                }
+            } else {
+                result.arguments.evidence_json = value;
             }
         }
         if (!has_directory || !has_digest) {
@@ -975,6 +1001,24 @@ ProductionRouterArgumentResultV1 ParseProductionRouterArgumentsV1(
                 result.arguments.deployment_directory)) {
             result.diagnostic =
                 "--deployment-dir must be a normalized absolute path";
+            return result;
+        }
+        const bool has_run_seconds = result.arguments.run_seconds != 0U;
+        const bool has_evidence = !result.arguments.evidence_json.empty();
+        if (has_run_seconds != has_evidence) {
+            result.diagnostic =
+                "--run-seconds and --evidence-json must be supplied together";
+            return result;
+        }
+        if (result.arguments.check_only && has_run_seconds) {
+            result.diagnostic =
+                "--check cannot be combined with bounded runtime options";
+            return result;
+        }
+        if (has_evidence && !ValidAbsoluteNormalizedPath(
+                                result.arguments.evidence_json)) {
+            result.diagnostic =
+                "--evidence-json must be a normalized absolute path";
             return result;
         }
         result.ok = true;
@@ -991,13 +1035,19 @@ ProductionRouterArgumentResultV1 ParseProductionRouterArgumentsV1(
 std::string ProductionRouterUsageV1() {
     return
         "Usage: mdl-production-router --deployment-dir <absolute-0700-dir> "
-        "--manifest-sha256 <64-lowercase-hex> [--check]\n\n"
+        "--manifest-sha256 <64-lowercase-hex> [--check | "
+        "--run-seconds <1..86400> --evidence-json <absolute-path>]\n\n"
         "Reads the fixed production-v1.tsv file (mode 0600, no symlink) and "
         "starts the fresh-only four-source production route.\n"
         "--check validates the pinned manifest and non-mutating deployment "
         "inputs without loading vendor code or changing Raw/Canonical/route "
         "state. Existing INIT/RECOVERING/ACTIVE routes require the separate "
         "recovery/takeover workflow and are rejected here.\n\n"
+        "Bounded mode starts its CLOCK_MONOTONIC_RAW window only after the "
+        "route is authoritatively ACTIVE, samples the in-process service "
+        "snapshot once per second, and then performs the normal durable "
+        "revocation/drain stop. The evidence path must be a direct child of "
+        "the deployment directory and is created fresh with mode 0600.\n\n"
         "Manifest template: configs/production-v1.example.tsv\n"
         "Copy it as production-v1.tsv into an effective-UID-owned mode-0700 "
         "deployment directory, replace every placeholder and every sample "
@@ -1310,8 +1360,6 @@ struct ProductionStaticInputsV1 final {
         deployment.route_root,
     };
     std::vector<std::filesystem::path> protected_files{
-        deployment.baseline_path,
-        deployment.sdk_archive_path,
         deployment.sdk_library_path,
         deployment.credential_path,
     };
@@ -1446,6 +1494,25 @@ struct ProductionStaticInputsV1 final {
     const auto& source_config = deployment.sources[source];
     l2flow::ingress::RawIngressConfig stable =
         l2flow::ingress::DefaultRawIngressConfig(source_config.kind);
+    // This vendor SDK owns one process-global MessageDispatcher even when
+    // DllCreateIOManager returns multiple managers.  Its latency-report path
+    // computes a dispatcher index globally and then applies that index to the
+    // receiving manager's local work-thread vector.  Different vector sizes
+    // therefore permit an out-of-bounds _WorkThreadItem selection.  The
+    // Formal production creates one physical manager and one physical
+    // Subscriber, followed by an in-process four-lane callback fanout. Select
+    // the maximum work/IO thread counts required by any source so every Raw
+    // callback lane is valid in that single vendor dispatcher.
+    stable.work_threads = 0;
+    stable.io_threads = 0;
+    for (const l2flow::sdk::IngressKind kind : kSourceKinds) {
+        stable.work_threads = std::max(
+            stable.work_threads,
+            l2flow::sdk::GetIngressSpec(kind).default_work_threads);
+        stable.io_threads = std::max(
+            stable.io_threads,
+            l2flow::sdk::GetIngressSpec(kind).default_io_threads);
+    }
     stable.endpoint_contract_sha256 =
         l2flow::common::Sha256Hex(source_config.endpoint_sha256);
     stable.credential_name = deployment.credential_name;
@@ -1667,37 +1734,14 @@ struct ProductionStaticInputsV1 final {
         candidate.clock_epoch =
             l2flow::ingress::ComputeClockEpoch(candidate.clock_inputs);
 
-        if (!l2flow::baseline::VerifyApprovedBaselineFile(
-                deployment.baseline_path, diagnostic)) {
-            return false;
-        }
-        l2flow::common::Sha256Digest archive_sha256{};
-        l2flow::common::Sha256Digest approved_archive_sha256{};
-        std::string parse_error;
-        if (!l2flow::common::ParseSha256Hex(
-                l2flow::baseline::ApprovedVendorBaseline().sdk_archive_sha256,
-                &approved_archive_sha256,
-                &parse_error) ||
-            !l2flow::common::ComputeFileSha256(
-                deployment.sdk_archive_path,
-                &archive_sha256,
-                diagnostic,
-                l2flow::baseline::kMaximumSdkSharedLibraryBytes) ||
-            archive_sha256 != approved_archive_sha256) {
-            if (diagnostic != nullptr && diagnostic->empty()) {
-                *diagnostic = "SDK archive does not match the approved baseline";
-            }
-            return false;
-        }
-        l2flow::common::Sha256Digest library_sha256{};
-        if (!l2flow::common::ComputeFileSha256(
-                deployment.sdk_library_path,
-                &library_sha256,
-                diagnostic,
-                l2flow::baseline::kMaximumSdkSharedLibraryBytes) ||
-            library_sha256 != deployment.sdk_library_sha256) {
-            if (diagnostic != nullptr && diagnostic->empty()) {
-                *diagnostic = "SDK library does not match the deployment pin";
+        std::error_code sdk_status_error;
+        if (!std::filesystem::is_regular_file(
+                deployment.sdk_library_path, sdk_status_error) ||
+            sdk_status_error) {
+            if (diagnostic != nullptr) {
+                *diagnostic =
+                    "operator-selected SDK library path does not name an "
+                    "existing regular file";
             }
             return false;
         }
@@ -1943,22 +1987,27 @@ struct SourceAssemblyV1 final {
     descriptor.normalizer_config_sha256 = normalizer_config_sha256;
     descriptor.generation = source_config.canonical_generation;
     descriptor.segment_sequence = 1U;
-    descriptor.capacity_records =
-        deployment.canonical_capacity_records_per_sink;
-
     std::string family_name;
     switch (family) {
         case l2flow::canonical::CanonicalFamilyV1::kSnapshot:
             family_name = "snapshot";
+            descriptor.capacity_records =
+                deployment.canonical_snapshot_capacity_records_per_sink;
             break;
         case l2flow::canonical::CanonicalFamilyV1::kTick:
             family_name = "tick";
+            descriptor.capacity_records =
+                deployment.canonical_tick_capacity_records_per_sink;
             break;
         case l2flow::canonical::CanonicalFamilyV1::kQuality:
             family_name = "quality";
+            descriptor.capacity_records =
+                deployment.canonical_quality_capacity_records_per_sink;
             break;
         case l2flow::canonical::CanonicalFamilyV1::kControl:
             family_name = "control";
+            descriptor.capacity_records =
+                deployment.canonical_control_capacity_records_per_sink;
             break;
     }
     const std::string stem = source_config.stream_slug + "-g" +
@@ -2003,7 +2052,6 @@ struct SourceAssemblyV1 final {
     const std::shared_ptr<l2flow::ingress::RawReserveRegistryCoordinatorV1>&
         coordinator,
     const l2flow::common::Sha256Digest& build_sha256,
-    const l2flow::common::Sha256Digest& archive_sha256,
     std::size_t source,
     SourceAssemblyV1* output,
     std::string* diagnostic) {
@@ -2258,8 +2306,12 @@ struct SourceAssemblyV1 final {
     segment.clock_epoch_algorithm = stable.clock_epoch_algorithm_version;
     segment.clock_epoch_digest = static_inputs.clock_epoch.digest;
     segment.clock_epoch_label = static_inputs.clock_epoch.value;
-    segment.sdk_archive_sha256 = archive_sha256;
-    segment.libmdl_api_sha256 = deployment.sdk_library_sha256;
+    // The production SDK policy is deliberately path-only.  No archive is
+    // used and no library digest is computed, so both legacy fixed-width Raw
+    // provenance fields are zero (unavailable) rather than carrying a false
+    // baseline archive or a value that could be mistaken for an approval pin.
+    segment.sdk_archive_sha256 = {};
+    segment.libmdl_api_sha256 = {};
     segment.endpoint_contract_sha256 = source_config.endpoint_sha256;
     segment.config_sha256 = stable_config_sha256;
     segment.raw_schema_sha256 = l2flow::ingress::RawSchemaSha256Digest();
@@ -2404,27 +2456,19 @@ struct SourceAssemblyV1 final {
     *fail_stop_required = false;
 
     l2flow::common::Sha256Digest build_sha256{};
-    l2flow::common::Sha256Digest archive_sha256{};
-    if (!BuildDigest(l2flow::build_manifest::kSha256, &build_sha256) ||
-        !BuildDigest(
-            l2flow::baseline::ApprovedVendorBaseline().sdk_archive_sha256,
-            &archive_sha256)) {
+    if (!BuildDigest(l2flow::build_manifest::kSha256, &build_sha256)) {
         if (diagnostic != nullptr) {
-            *diagnostic = "compiled build/vendor digest is invalid";
+            *diagnostic = "compiled build digest is invalid";
         }
         return false;
     }
 
-    // PrepareStaticInputs() has already checked the immutable baseline file
-    // and SDK archive.  Do not run the path-based full preflight here: it
-    // would runtime-load a separately opened pathname snapshot before proving
-    // the deployment's library pin.  The pinned loader below first hashes one
-    // sealed snapshot, then performs ELF/ABI/runtime preflight and the retained
-    // final dlopen on exactly that same snapshot.
+    // The manifest path is the complete operator SDK selection.  Static
+    // preflight checked only that it names an existing regular file.  Startup
+    // uses that exact path and applies no SDK identity/approval validation.
     std::shared_ptr<l2flow::sdk::SdkFactory> sdk_factory =
-        l2flow::sdk::LoadApprovedSdkFactoryPinned(
+        l2flow::sdk::LoadOperatorSelectedSdkFactory(
             deployment.sdk_library_path,
-            deployment.sdk_library_sha256,
             diagnostic);
     if (sdk_factory == nullptr) {
         return false;
@@ -2577,7 +2621,6 @@ struct SourceAssemblyV1 final {
                 *static_inputs,
                 coordinator,
                 build_sha256,
-                archive_sha256,
                 source,
                 &assemblies[source],
                 diagnostic)) {
@@ -2808,6 +2851,705 @@ private:
     return 0;
 }
 
+[[nodiscard]] std::string_view ProductionServiceStateText(
+    ProductionServiceStateV1 state) noexcept {
+    switch (state) {
+        case ProductionServiceStateV1::kReady: return "ready";
+        case ProductionServiceStateV1::kStarting: return "starting";
+        case ProductionServiceStateV1::kActive: return "active";
+        case ProductionServiceStateV1::kStopping: return "stopping";
+        case ProductionServiceStateV1::kStopped: return "stopped";
+        case ProductionServiceStateV1::kFailed: return "failed";
+    }
+    return "invalid";
+}
+
+[[nodiscard]] std::string_view ProductionAggregateStateText(
+    l2flow::runtime::ProductionAggregateStateV1 state) noexcept {
+    using State = l2flow::runtime::ProductionAggregateStateV1;
+    switch (state) {
+        case State::kRunning: return "running";
+        case State::kDraining: return "draining";
+        case State::kStopping: return "stopping";
+        case State::kStopped: return "stopped";
+        case State::kFatal: return "fatal";
+    }
+    return "invalid";
+}
+
+[[nodiscard]] std::string_view RawIngressAppStateText(
+    l2flow::ingress::RawIngressAppState state) noexcept {
+    using State = l2flow::ingress::RawIngressAppState;
+    switch (state) {
+        case State::kConstructed: return "constructed";
+        case State::kInitializing: return "initializing";
+        case State::kRunning: return "running";
+        case State::kStopping: return "stopping";
+        case State::kStopped: return "stopped";
+    }
+    return "invalid";
+}
+
+[[nodiscard]] std::string_view RawCaptureFailureText(
+    l2flow::ingress::RawCaptureWorkerFailureKind kind) noexcept {
+    using Kind = l2flow::ingress::RawCaptureWorkerFailureKind;
+    switch (kind) {
+        case Kind::kNone: return "none";
+        case Kind::kRunAlreadyStarted: return "run_already_started";
+        case Kind::kWriterNotReady: return "writer_not_ready";
+        case Kind::kRingCorruption: return "ring_corruption";
+        case Kind::kWriterAppend: return "writer_append";
+        case Kind::kWriterFlush: return "writer_flush";
+        case Kind::kWriterSeal: return "writer_seal";
+        case Kind::kProgressOverflow: return "progress_overflow";
+        case Kind::kClockRegression: return "clock_regression";
+        case Kind::kSourceFrontier: return "source_frontier";
+    }
+    return "invalid";
+}
+
+[[nodiscard]] std::string_view RawWalFailureText(
+    l2flow::ingress::RawWalFailureKind kind) noexcept {
+    using Kind = l2flow::ingress::RawWalFailureKind;
+    switch (kind) {
+        case Kind::kNone: return "none";
+        case Kind::kInvalidState: return "invalid_state";
+        case Kind::kInvalidConfiguration: return "invalid_configuration";
+        case Kind::kInvalidRecord: return "invalid_record";
+        case Kind::kCursorOverflow: return "cursor_overflow";
+        case Kind::kSegmentWrite: return "segment_write";
+        case Kind::kSegmentSync: return "segment_sync";
+        case Kind::kSegmentTruncate: return "segment_truncate";
+        case Kind::kJournalWrite: return "journal_write";
+        case Kind::kJournalSync: return "journal_sync";
+        case Kind::kClose: return "close";
+        case Kind::kCommitObserver: return "commit_observer";
+        case Kind::kRotationPolicy: return "rotation_policy";
+        case Kind::kRotationArtifact: return "rotation_artifact";
+        case Kind::kRotationFactory: return "rotation_factory";
+        case Kind::kManifestPublish: return "manifest_publish";
+        case Kind::kControlPublish: return "control_publish";
+    }
+    return "invalid";
+}
+
+void WriteJsonString(std::ostream& output, std::string_view value) {
+    constexpr char kHex[] = "0123456789abcdef";
+    output.put('"');
+    for (const unsigned char character : value) {
+        switch (character) {
+            case '"': output << "\\\""; break;
+            case '\\': output << "\\\\"; break;
+            case '\b': output << "\\b"; break;
+            case '\f': output << "\\f"; break;
+            case '\n': output << "\\n"; break;
+            case '\r': output << "\\r"; break;
+            case '\t': output << "\\t"; break;
+            default:
+                if (character < 0x20U) {
+                    output << "\\u00" << kHex[character >> 4U]
+                           << kHex[character & 0x0FU];
+                } else {
+                    output.put(static_cast<char>(character));
+                }
+                break;
+        }
+    }
+    output.put('"');
+}
+
+void WriteRouteControllerResult(
+    std::ostream& output,
+    const l2flow::route::ProductionRouteControllerResultV1& result) {
+    output << "{\"error\":";
+    WriteJsonString(
+        output,
+        l2flow::route::ProductionRouteControllerErrorNameV1(result.error));
+    output << ",\"system_error_number\":" << result.system_error_number
+           << ",\"already_complete\":"
+           << (result.already_complete ? "true" : "false")
+           << ",\"owner_lease_error\":"
+           << static_cast<unsigned int>(result.owner_lease_error)
+           << ",\"publish\":{\"error\":";
+    WriteJsonString(
+        output,
+        l2flow::route::ProductionRouteStoreErrorNameV1(
+            result.publish_result.error));
+    output << ",\"manifest_error\":"
+           << static_cast<unsigned int>(result.publish_result.manifest_error)
+           << ",\"disposition\":"
+           << static_cast<unsigned int>(result.publish_result.disposition)
+           << ",\"generation\":" << result.publish_result.generation
+           << ",\"state\":"
+           << static_cast<unsigned int>(result.publish_result.state)
+           << ",\"encoded_sha256\":";
+    WriteJsonString(
+        output,
+        l2flow::common::Sha256Hex(result.publish_result.encoded_sha256));
+    output << ",\"file_synced\":"
+           << (result.publish_result.file_synced ? "true" : "false")
+           << ",\"renamed\":"
+           << (result.publish_result.renamed ? "true" : "false")
+           << ",\"directory_synced\":"
+           << (result.publish_result.directory_synced ? "true" : "false")
+           << "}}";
+}
+
+void WriteCaptureStopEvidence(
+    std::ostream& output,
+    const ProductionCaptureRuntimeV1::SnapshotV1& evidence) {
+    const auto& callback = evidence.callback;
+    const auto& capture = evidence.capture;
+    const auto& reconciliation = evidence.reconciliation;
+    const auto& wal = evidence.wal;
+    output << "{\"available\":"
+           << (evidence.available ? "true" : "false")
+           << ",\"fatal\":" << (evidence.fatal ? "true" : "false")
+           << ",\"state\":";
+    WriteJsonString(output, RawIngressAppStateText(evidence.state));
+    output << ",\"callback\":{\"invocations\":"
+           << callback.callback_invocations
+           << ",\"captured_records\":" << callback.captured_records
+           << ",\"captured_vendor_bytes\":"
+           << callback.captured_vendor_bytes
+           << ",\"captured_framed_wal_bytes\":"
+           << callback.captured_framed_wal_bytes
+           << ",\"captured_ingress_sequence\":"
+           << callback.captured_ingress_sequence
+           << ",\"callback_reentry\":" << callback.callback_reentry
+           << ",\"callback_exceptions\":"
+           << callback.callback_exceptions
+           << ",\"callbacks_after_stop\":"
+           << callback.callbacks_after_stop
+           << ",\"callbacks_after_fatal\":"
+           << callback.callbacks_after_fatal
+           << ",\"ring_overflow\":" << callback.ring_overflow
+           << ",\"callback_inflight\":"
+           << (callback.callback_inflight ? "true" : "false")
+           << "},\"capture\":{\"failure_kind\":";
+    WriteJsonString(output, RawCaptureFailureText(capture.failure_kind));
+    output << ",\"writer_failure_kind\":";
+    WriteJsonString(output, RawWalFailureText(capture.writer_failure.kind));
+    output << ",\"writer_failure_errno\":"
+           << capture.writer_failure.error_number
+           << ",\"stop_requested\":"
+           << (capture.stop_requested ? "true" : "false")
+           << ",\"startup_complete\":"
+           << (capture.startup_complete ? "true" : "false")
+           << ",\"startup_succeeded\":"
+           << (capture.startup_succeeded ? "true" : "false")
+           << ",\"finished\":"
+           << (capture.finished ? "true" : "false")
+           << ",\"append\":{\"records\":" << capture.append.records
+           << ",\"vendor_bytes\":" << capture.append.vendor_bytes
+           << ",\"framed_wal_bytes\":"
+           << capture.append.framed_wal_bytes
+           << ",\"last_ingress_sequence\":"
+           << capture.append.last_ingress_sequence
+           << "},\"durable\":{\"records\":"
+           << capture.durable.records
+           << ",\"vendor_bytes\":" << capture.durable.vendor_bytes
+           << ",\"framed_wal_bytes\":"
+           << capture.durable.framed_wal_bytes
+           << ",\"last_ingress_sequence\":"
+           << capture.durable.last_ingress_sequence
+           << "}},\"reconciliation\":{\"callback_records\":"
+           << reconciliation.callback_records
+           << ",\"append_records\":" << reconciliation.append_records
+           << ",\"durable_records\":" << reconciliation.durable_records
+           << ",\"callback_vendor_bytes\":"
+           << reconciliation.callback_vendor_bytes
+           << ",\"append_vendor_bytes\":"
+           << reconciliation.append_vendor_bytes
+           << ",\"durable_vendor_bytes\":"
+           << reconciliation.durable_vendor_bytes
+           << ",\"exact\":"
+           << (reconciliation.exact() ? "true" : "false")
+           << "},\"wal\":{\"append\":{\"global_wal_pos\":"
+           << wal.append.global_wal_pos
+           << ",\"ingress_sequence\":" << wal.append.ingress_sequence
+           << ",\"segment_offset\":" << wal.append.segment_offset
+           << "},\"durable\":{\"global_wal_pos\":"
+           << wal.durable.global_wal_pos
+           << ",\"ingress_sequence\":" << wal.durable.ingress_sequence
+           << ",\"segment_offset\":" << wal.durable.segment_offset
+           << "},\"journal_logical_size\":"
+           << wal.journal_logical_size
+           << ",\"initialized\":"
+           << (wal.initialized ? "true" : "false")
+           << ",\"sealed\":" << (wal.sealed ? "true" : "false")
+           << ",\"closed\":" << (wal.closed ? "true" : "false")
+           << ",\"fatal\":" << (wal.fatal ? "true" : "false")
+           << "},\"wal_failure\":{\"kind\":";
+    WriteJsonString(output, RawWalFailureText(evidence.wal_failure.kind));
+    output << ",\"errno\":" << evidence.wal_failure.error_number
+           << "}}";
+}
+
+void WriteProductionSnapshot(
+    std::ostream& output,
+    const ProductionServiceSnapshotV1& snapshot) {
+    output << "{\"service_state\":";
+    WriteJsonString(output, ProductionServiceStateText(snapshot.state));
+    output << ",\"capture_started\":[";
+    for (std::size_t source = 0U;
+         source < snapshot.capture_started.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        output << (snapshot.capture_started[source] ? "true" : "false");
+    }
+    const auto& aggregate = snapshot.aggregate;
+    output << "],\"aggregate\":{\"state\":";
+    WriteJsonString(output, ProductionAggregateStateText(aggregate.state));
+    output << ",\"worker_exited\":[";
+    for (std::size_t source = 0U;
+         source < aggregate.worker_exited.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        output << (aggregate.worker_exited[source] ? "true" : "false");
+    }
+    output << "],\"active_route_published\":"
+           << (aggregate.active_route_published ? "true" : "false")
+           << ",\"active_route_publication_uncertain\":"
+           << (aggregate.active_route_publication_uncertain ? "true" : "false")
+           << ",\"fatal_route_published\":"
+           << (aggregate.fatal_route_published ? "true" : "false")
+           << ",\"drain_route_revoked\":"
+           << (aggregate.drain_route_revoked ? "true" : "false")
+           << ",\"route_operation_hook_active\":"
+           << (aggregate.route_operation_hook_active ? "true" : "false")
+           << ",\"source_frontier_busy\":[";
+    for (std::size_t source = 0U;
+         source < aggregate.source_frontier_busy.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        output << (aggregate.source_frontier_busy[source] ? "true" : "false");
+    }
+    output << "],\"fatal_reason_code\":"
+           << aggregate.fatal_reason_code
+           << ",\"last_active_publish\":";
+    WriteRouteControllerResult(output, aggregate.last_active_publish);
+    output << ",\"last_fatal_publish\":";
+    WriteRouteControllerResult(output, aggregate.last_fatal_publish);
+    output << ",\"sources\":[";
+    for (std::size_t source = 0U; source < aggregate.sources.size();
+         ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        const auto& value = aggregate.sources[source];
+        const auto& history = value.history_frontier;
+        output << "{\"source_slot\":" << source
+               << ",\"source_slug\":";
+        WriteJsonString(output, kSourceSlugs[source]);
+        output << ",\"raw_records\":" << value.raw_records
+               << ",\"market_records\":" << value.market_records
+               << ",\"control_records\":" << value.control_records
+               << ",\"no_output_records\":" << value.no_output_records
+               << ",\"decode_quality_records\":"
+               << value.decode_quality_records
+               << ",\"segment_transitions\":"
+               << value.segment_transitions
+               << ",\"history_submissions\":"
+               << value.history_submissions
+               << ",\"history_frontier\":{\"submitted_ticket\":"
+               << history.submitted_ticket
+               << ",\"acknowledged_ticket\":"
+               << history.acknowledged_ticket
+               << ",\"submitted_source_sequence\":"
+               << history.submitted_source_sequence
+               << ",\"acknowledged_source_sequence\":"
+               << history.acknowledged_source_sequence
+               << ",\"completed_out_of_order\":"
+               << history.completed_out_of_order
+               << ",\"fatal\":"
+               << (history.fatal ? "true" : "false")
+               << "},\"history_pending\":"
+               << (value.history_pending ? "true" : "false")
+               << ",\"history_draining\":"
+               << (value.history_draining ? "true" : "false")
+               << ",\"ended\":" << (value.ended ? "true" : "false")
+               << ",\"fatal\":" << (value.fatal ? "true" : "false")
+               << ",\"terminal\":{\"kind\":"
+               << static_cast<unsigned int>(value.terminal.kind)
+               << ",\"failure\":";
+        WriteJsonString(
+            output,
+            l2flow::runtime::ProductionSourceFailureNameV1(
+                value.terminal.failure));
+        output << ",\"raw_tail_error\":"
+               << static_cast<unsigned int>(value.terminal.raw_tail_error)
+               << ",\"raw_adapter_error\":"
+               << static_cast<unsigned int>(value.terminal.raw_adapter_error)
+               << ",\"frontier_error\":"
+               << static_cast<unsigned int>(value.terminal.frontier_error)
+               << ",\"control_error\":"
+               << static_cast<unsigned int>(value.terminal.control_error)
+               << ",\"decode_error\":"
+               << static_cast<unsigned int>(value.terminal.decode_error)
+               << ",\"retain_error\":"
+               << static_cast<unsigned int>(value.terminal.retain_error)
+               << ",\"canonical_error\":"
+               << static_cast<unsigned int>(value.terminal.canonical_error)
+               << ",\"history_create_error\":"
+               << static_cast<unsigned int>(value.terminal.history_create_error)
+               << ",\"history_submit_error\":"
+               << static_cast<unsigned int>(value.terminal.history_submit_error)
+               << ",\"history_barrier_error\":"
+               << static_cast<unsigned int>(value.terminal.history_barrier_error)
+               << ",\"ingress_sequence\":"
+               << value.terminal.ingress_sequence
+               << ",\"wal_pos\":" << value.terminal.wal_pos << "}}";
+    }
+    output << "]}}";
+}
+
+struct ProductionMonitorSampleV1 final {
+    std::uint64_t elapsed_monotonic_raw_ns = 0U;
+    std::uint64_t realtime_ns = 0U;
+    ProductionServiceSnapshotV1 snapshot{};
+};
+
+struct ProductionMonitorEvidenceV1 final {
+    std::uint32_t requested_run_seconds = 0U;
+    std::string deployment_directory;
+    std::string evidence_path;
+    std::string manifest_sha256;
+    std::string sdk_library_path;
+    std::uint64_t active_start_monotonic_raw_ns = 0U;
+    std::uint64_t active_start_realtime_ns = 0U;
+    std::uint64_t monitor_end_monotonic_raw_ns = 0U;
+    std::uint64_t monitor_end_realtime_ns = 0U;
+    bool completed_window = false;
+    bool fatal_observed = false;
+    bool left_active = false;
+    bool signal_wait_failed = false;
+    bool clock_failed = false;
+    int termination_signal = 0;
+    std::string_view outcome = "not_started";
+    ProductionServiceStartResultV1 start{};
+    std::vector<ProductionMonitorSampleV1> samples;
+    bool final_active_snapshot_valid = false;
+    ProductionServiceSnapshotV1 final_active_snapshot{};
+    ProductionServiceStopResultV1 stop{};
+    ProductionServiceSnapshotV1 post_stop_snapshot{};
+};
+
+[[nodiscard]] bool SnapshotIsAuthoritativelyActive(
+    const ProductionServiceSnapshotV1& snapshot) noexcept {
+    if (snapshot.state != ProductionServiceStateV1::kActive ||
+        snapshot.aggregate.state !=
+            l2flow::runtime::ProductionAggregateStateV1::kRunning ||
+        !snapshot.aggregate.active_route_published ||
+        snapshot.aggregate.active_route_publication_uncertain ||
+        snapshot.aggregate.fatal_route_published ||
+        snapshot.aggregate.drain_route_revoked ||
+        AggregateFatal(snapshot)) {
+        return false;
+    }
+    for (std::size_t source = 0U;
+         source < kProductionDeploymentSourceCountV1; ++source) {
+        if (!snapshot.capture_started[source] ||
+            snapshot.aggregate.worker_exited[source] ||
+            snapshot.aggregate.sources[source].ended ||
+            snapshot.aggregate.sources[source].fatal ||
+            snapshot.aggregate.sources[source].history_frontier.fatal) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool ReserveEvidenceFile(
+    int deployment_directory_fd,
+    const std::filesystem::path& deployment_directory,
+    const std::filesystem::path& evidence_path,
+    OwnedFd* output,
+    std::string* diagnostic) noexcept {
+    if (output == nullptr || deployment_directory_fd < 0 ||
+        evidence_path.parent_path() != deployment_directory ||
+        evidence_path.filename().empty()) {
+        if (diagnostic != nullptr) {
+            try {
+                *diagnostic =
+                    "evidence path must be a direct child of the deployment directory";
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+    try {
+        const std::string filename = evidence_path.filename().string();
+        const int descriptor = ::openat(
+            deployment_directory_fd,
+            filename.c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR);
+        if (descriptor < 0) {
+            if (diagnostic != nullptr) {
+                *diagnostic = "fresh evidence file creation failed (errno " +
+                    std::to_string(errno) + ")";
+            }
+            return false;
+        }
+        struct stat metadata {};
+        const bool safe = ::fstat(descriptor, &metadata) == 0 &&
+            S_ISREG(metadata.st_mode) && metadata.st_uid == ::geteuid() &&
+            metadata.st_nlink == 1 &&
+            (metadata.st_mode & 07777U) == (S_IRUSR | S_IWUSR) &&
+            metadata.st_size == 0;
+        if (!safe || ::fsync(deployment_directory_fd) != 0) {
+            const int saved_errno = errno;
+            static_cast<void>(::close(descriptor));
+            static_cast<void>(::unlinkat(
+                deployment_directory_fd, filename.c_str(), 0));
+            if (diagnostic != nullptr) {
+                *diagnostic =
+                    "fresh evidence file did not satisfy the secure creation contract (errno " +
+                    std::to_string(saved_errno) + ")";
+            }
+            return false;
+        }
+        *output = OwnedFd(descriptor);
+        if (diagnostic != nullptr) {
+            diagnostic->clear();
+        }
+        return true;
+    } catch (...) {
+        if (diagnostic != nullptr) {
+            try {
+                *diagnostic = "fresh evidence file creation failed unexpectedly";
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+}
+
+[[nodiscard]] std::string EncodeMonitorEvidence(
+    const ProductionMonitorEvidenceV1& evidence) {
+    std::ostringstream output;
+    output << "{\"schema\":\"l2flow.production-router-monitor.v1\""
+           << ",\"requested_run_seconds\":"
+           << evidence.requested_run_seconds
+           << ",\"sample_clock\":\"CLOCK_MONOTONIC_RAW\""
+           << ",\"sample_interval_seconds\":1"
+           << ",\"deployment_directory\":";
+    WriteJsonString(output, evidence.deployment_directory);
+    output << ",\"evidence_path\":";
+    WriteJsonString(output, evidence.evidence_path);
+    output << ",\"manifest_sha256\":";
+    WriteJsonString(output, evidence.manifest_sha256);
+    output << ",\"sdk_library_path\":";
+    WriteJsonString(output, evidence.sdk_library_path);
+    output << ",\"sdk_acceptance_policy\":"
+              "\"operator_path_exists_and_is_regular_file_only\""
+           << ",\"sdk_digest_is_acceptance_gate\":false"
+           << ",\"history_access\":\"in_process_only\""
+           << ",\"latest_state_v1_wired\":false"
+           << ",\"factor_runtime_wired\":false"
+           << ",\"parquet_publication_wired\":false"
+           << ",\"external_history_state_factor_endpoint\":false"
+           << ",\"active_start_monotonic_raw_ns\":"
+           << evidence.active_start_monotonic_raw_ns
+           << ",\"active_start_realtime_ns\":"
+           << evidence.active_start_realtime_ns
+           << ",\"monitor_end_monotonic_raw_ns\":"
+           << evidence.monitor_end_monotonic_raw_ns
+           << ",\"monitor_end_realtime_ns\":"
+           << evidence.monitor_end_realtime_ns
+           << ",\"observed_monotonic_raw_ns\":"
+           << (evidence.monitor_end_monotonic_raw_ns >=
+                       evidence.active_start_monotonic_raw_ns
+                   ? evidence.monitor_end_monotonic_raw_ns -
+                         evidence.active_start_monotonic_raw_ns
+                   : 0U)
+           << ",\"completed_window\":"
+           << (evidence.completed_window ? "true" : "false")
+           << ",\"fatal_observed\":"
+           << (evidence.fatal_observed ? "true" : "false")
+           << ",\"left_active\":"
+           << (evidence.left_active ? "true" : "false")
+           << ",\"signal_wait_failed\":"
+           << (evidence.signal_wait_failed ? "true" : "false")
+           << ",\"clock_failed\":"
+           << (evidence.clock_failed ? "true" : "false")
+           << ",\"termination_signal\":"
+           << evidence.termination_signal << ",\"outcome\":";
+    WriteJsonString(output, evidence.outcome);
+    output << ",\"start\":{\"error\":";
+    WriteJsonString(
+        output, ProductionServiceStartErrorNameV1(evidence.start.error));
+    output << ",\"source_slot\":"
+           << static_cast<unsigned int>(evidence.start.source_slot)
+           << ",\"already_active\":"
+           << (evidence.start.already_active ? "true" : "false")
+           << ",\"diagnostic\":";
+    WriteJsonString(output, evidence.start.diagnostic);
+    output << ",\"barrier_error\":";
+    WriteJsonString(
+        output,
+        l2flow::runtime::ProductionAggregateBarrierErrorNameV1(
+            evidence.start.barrier.error));
+    output << ",\"barrier_source_slot\":"
+           << static_cast<unsigned int>(evidence.start.barrier.source_slot)
+           << ",\"publication_error\":";
+    WriteJsonString(
+        output,
+        l2flow::runtime::ProductionAggregatePublishErrorNameV1(
+            evidence.start.publication.error));
+    output << ",\"publication_source_slot\":"
+           << static_cast<unsigned int>(
+                  evidence.start.publication.source_slot)
+           << ",\"route\":";
+    WriteRouteControllerResult(output, evidence.start.publication.route);
+    output << "},\"samples\":[";
+    for (std::size_t index = 0U; index < evidence.samples.size(); ++index) {
+        if (index != 0U) {
+            output.put(',');
+        }
+        const auto& sample = evidence.samples[index];
+        output << "{\"sample_index\":" << index
+               << ",\"elapsed_monotonic_raw_ns\":"
+               << sample.elapsed_monotonic_raw_ns
+               << ",\"realtime_ns\":" << sample.realtime_ns
+               << ",\"snapshot\":";
+        WriteProductionSnapshot(output, sample.snapshot);
+        output.put('}');
+    }
+    output << "],\"final_active_snapshot_valid\":"
+           << (evidence.final_active_snapshot_valid ? "true" : "false")
+           << ",\"final_active_snapshot\":";
+    WriteProductionSnapshot(output, evidence.final_active_snapshot);
+    output << ",\"stop\":{\"error\":";
+    WriteJsonString(
+        output, ProductionServiceStopErrorNameV1(evidence.stop.error));
+    output << ",\"already_stopped\":"
+           << (evidence.stop.already_stopped ? "true" : "false")
+           << ",\"begin_drain_error\":";
+    WriteJsonString(
+        output,
+        l2flow::runtime::ProductionAggregateBeginDrainErrorNameV1(
+            evidence.stop.begin_drain.error));
+    output << ",\"route_revocation_required\":"
+           << (evidence.stop.begin_drain.route_revocation_required
+                   ? "true" : "false")
+           << ",\"begin_drain_route\":";
+    WriteRouteControllerResult(output, evidence.stop.begin_drain.route);
+    output << ",\"drain_error\":";
+    WriteJsonString(
+        output,
+        l2flow::runtime::ProductionAggregateDrainWaitErrorNameV1(
+            evidence.stop.drain.error));
+    output << ",\"drain_source_slot\":"
+           << static_cast<unsigned int>(evidence.stop.drain.source_slot)
+           << ",\"capture_prepared\":[";
+    for (std::size_t source = 0U;
+         source < evidence.stop.capture_prepared.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        output << (evidence.stop.capture_prepared[source]
+                       ? "true"
+                       : "false");
+    }
+    output << "]"
+           << ",\"capture_stopped\":[";
+    for (std::size_t source = 0U;
+         source < evidence.stop.capture_stopped.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        output << (evidence.stop.capture_stopped[source] ? "true" : "false");
+    }
+    output << "],\"capture_diagnostics\":[";
+    for (std::size_t source = 0U;
+         source < evidence.stop.capture_diagnostics.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        WriteJsonString(output, evidence.stop.capture_diagnostics[source]);
+    }
+    output << "],\"capture_evidence\":[";
+    for (std::size_t source = 0U;
+         source < evidence.stop.capture_evidence.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        WriteCaptureStopEvidence(
+            output, evidence.stop.capture_evidence[source]);
+    }
+    output << "]},\"post_stop_snapshot\":";
+    WriteProductionSnapshot(output, evidence.post_stop_snapshot);
+    output << "}\n";
+    return output.str();
+}
+
+[[nodiscard]] bool WriteEvidenceFile(
+    int descriptor,
+    std::string_view bytes,
+    std::string* diagnostic) noexcept {
+    if (descriptor < 0 || bytes.empty()) {
+        if (diagnostic != nullptr) {
+            try {
+                *diagnostic = "evidence bytes or descriptor are invalid";
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+    std::size_t written = 0U;
+    while (written < bytes.size()) {
+        const ssize_t count = ::pwrite(
+            descriptor,
+            bytes.data() + written,
+            bytes.size() - written,
+            static_cast<off_t>(written));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            if (diagnostic != nullptr) {
+                try {
+                    *diagnostic = "evidence write failed (errno " +
+                        std::to_string(count < 0 ? errno : 0) + ")";
+                } catch (...) {
+                }
+            }
+            return false;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    if (::fsync(descriptor) != 0) {
+        if (diagnostic != nullptr) {
+            try {
+                *diagnostic = "evidence fsync failed (errno " +
+                    std::to_string(errno) + ")";
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+    struct stat metadata {};
+    if (::fstat(descriptor, &metadata) != 0 || metadata.st_size < 0 ||
+        static_cast<std::uint64_t>(metadata.st_size) != bytes.size()) {
+        if (diagnostic != nullptr) {
+            try {
+                *diagnostic = "evidence durable size verification failed";
+            } catch (...) {
+            }
+        }
+        return false;
+    }
+    if (diagnostic != nullptr) {
+        diagnostic->clear();
+    }
+    return true;
+}
+
 }  // namespace
 
 int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
@@ -2873,6 +3615,38 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                    "at this check instant (normal startup revalidates at "
                    "each exclusive creator gate)\n";
             return 0;
+        }
+
+        const bool bounded_run = parsed.arguments.run_seconds != 0U;
+        OwnedFd evidence_file;
+        ProductionMonitorEvidenceV1 monitor_evidence{};
+        if (bounded_run) {
+            std::string evidence_diagnostic;
+            if (!ReserveEvidenceFile(
+                    static_inputs.deployment_directory.get(),
+                    parsed.arguments.deployment_directory,
+                    parsed.arguments.evidence_json,
+                    &evidence_file,
+                    &evidence_diagnostic)) {
+                std::cerr << "production monitor evidence reservation failed";
+                if (!evidence_diagnostic.empty()) {
+                    std::cerr << ": " << evidence_diagnostic;
+                }
+                std::cerr << "; no production generation was created\n";
+                return 78;
+            }
+            monitor_evidence.requested_run_seconds =
+                parsed.arguments.run_seconds;
+            monitor_evidence.deployment_directory =
+                parsed.arguments.deployment_directory.string();
+            monitor_evidence.evidence_path =
+                parsed.arguments.evidence_json.string();
+            monitor_evidence.manifest_sha256 = l2flow::common::Sha256Hex(
+                parsed.arguments.manifest_sha256);
+            monitor_evidence.sdk_library_path =
+                loaded.deployment.sdk_library_path.string();
+            monitor_evidence.samples.reserve(
+                static_cast<std::size_t>(parsed.arguments.run_seconds) + 1U);
         }
 
         ScopedTerminationSignalBlock termination_signals;
@@ -3076,9 +3850,175 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                 service.get(), false, signal_wait_failed);
         }
 
+        if (bounded_run) {
+            monitor_evidence.start = start_result;
+        }
+
         // Active is already authoritative on disk at this point.  Flush the
         // operator-visible handoff before entering the long-running loop.
         std::cout << "production four-source route is ACTIVE\n" << std::flush;
+        if (bounded_run) {
+            constexpr std::uint64_t kNanosecondsPerSecond =
+                UINT64_C(1'000'000'000);
+            const std::uint64_t requested_duration_ns =
+                static_cast<std::uint64_t>(
+                    parsed.arguments.run_seconds) * kNanosecondsPerSecond;
+            monitor_evidence.active_start_monotonic_raw_ns =
+                PosixClockNow(CLOCK_MONOTONIC_RAW);
+            monitor_evidence.active_start_realtime_ns =
+                PosixClockNow(CLOCK_REALTIME);
+            std::uint64_t next_sample_elapsed_ns = kNanosecondsPerSecond;
+
+            ProductionServiceSnapshotV1 snapshot = service->Snapshot();
+            if (monitor_evidence.active_start_monotonic_raw_ns == 0U) {
+                monitor_evidence.clock_failed = true;
+                monitor_evidence.outcome = "clock_failed_before_window";
+            } else {
+                monitor_evidence.samples.push_back(ProductionMonitorSampleV1{
+                    0U,
+                    monitor_evidence.active_start_realtime_ns,
+                    snapshot,
+                });
+                if (AggregateFatal(snapshot)) {
+                    monitor_evidence.fatal_observed = true;
+                    monitor_evidence.outcome = "fatal_at_window_start";
+                } else if (!SnapshotIsAuthoritativelyActive(snapshot)) {
+                    monitor_evidence.left_active = true;
+                    monitor_evidence.outcome =
+                        "not_authoritatively_active_at_window_start";
+                }
+            }
+
+            while (!monitor_evidence.clock_failed &&
+                   !monitor_evidence.fatal_observed &&
+                   !monitor_evidence.left_active &&
+                   monitor_evidence.termination_signal == 0 &&
+                   !monitor_evidence.signal_wait_failed &&
+                   !monitor_evidence.completed_window) {
+                snapshot = service->Snapshot();
+                const std::uint64_t now =
+                    PosixClockNow(CLOCK_MONOTONIC_RAW);
+                const std::uint64_t realtime_now =
+                    PosixClockNow(CLOCK_REALTIME);
+                if (now == 0U ||
+                    now < monitor_evidence.active_start_monotonic_raw_ns) {
+                    monitor_evidence.clock_failed = true;
+                    monitor_evidence.outcome =
+                        "monotonic_raw_clock_failed_or_regressed";
+                    break;
+                }
+                const std::uint64_t elapsed =
+                    now - monitor_evidence.active_start_monotonic_raw_ns;
+                if (AggregateFatal(snapshot)) {
+                    monitor_evidence.fatal_observed = true;
+                    monitor_evidence.outcome = "fatal_during_window";
+                    monitor_evidence.samples.push_back(
+                        ProductionMonitorSampleV1{
+                            elapsed, realtime_now, snapshot});
+                    monitor_evidence.monitor_end_monotonic_raw_ns = now;
+                    monitor_evidence.monitor_end_realtime_ns = realtime_now;
+                    break;
+                }
+                if (!SnapshotIsAuthoritativelyActive(snapshot)) {
+                    monitor_evidence.left_active = true;
+                    monitor_evidence.outcome =
+                        "authoritative_active_contract_lost_during_window";
+                    monitor_evidence.samples.push_back(
+                        ProductionMonitorSampleV1{
+                            elapsed, realtime_now, snapshot});
+                    monitor_evidence.monitor_end_monotonic_raw_ns = now;
+                    monitor_evidence.monitor_end_realtime_ns = realtime_now;
+                    break;
+                }
+                if (elapsed >= requested_duration_ns) {
+                    monitor_evidence.completed_window = true;
+                    monitor_evidence.final_active_snapshot_valid = true;
+                    monitor_evidence.final_active_snapshot = snapshot;
+                    monitor_evidence.monitor_end_monotonic_raw_ns = now;
+                    monitor_evidence.monitor_end_realtime_ns = realtime_now;
+                    monitor_evidence.outcome = "window_completed";
+                    break;
+                }
+                if (elapsed >= next_sample_elapsed_ns) {
+                    monitor_evidence.samples.push_back(
+                        ProductionMonitorSampleV1{
+                            elapsed, realtime_now, snapshot});
+                    const std::uint64_t completed_seconds =
+                        elapsed / kNanosecondsPerSecond;
+                    next_sample_elapsed_ns =
+                        (completed_seconds + 1U) * kNanosecondsPerSecond;
+                }
+
+                signal_wait_error = 0;
+                const int received = termination_signals.Wait(
+                    100U, &signal_wait_error);
+                if (received == SIGINT || received == SIGTERM) {
+                    monitor_evidence.termination_signal = received;
+                    monitor_evidence.outcome =
+                        "termination_signal_before_window_completed";
+                } else if (received < 0 || signal_wait_error != 0) {
+                    monitor_evidence.signal_wait_failed = true;
+                    monitor_evidence.outcome =
+                        "signal_wait_failed_during_window";
+                }
+            }
+
+            if (monitor_evidence.monitor_end_monotonic_raw_ns == 0U) {
+                monitor_evidence.monitor_end_monotonic_raw_ns =
+                    PosixClockNow(CLOCK_MONOTONIC_RAW);
+                monitor_evidence.monitor_end_realtime_ns =
+                    PosixClockNow(CLOCK_REALTIME);
+            }
+            monitor_evidence.stop = service->Stop();
+            monitor_evidence.post_stop_snapshot = service->Snapshot();
+            if (monitor_evidence.completed_window &&
+                monitor_evidence.stop.ok()) {
+                monitor_evidence.outcome =
+                    "window_completed_and_route_stopped_cleanly";
+            } else if (!monitor_evidence.stop.ok()) {
+                monitor_evidence.outcome =
+                    "monitor_ended_but_production_stop_failed";
+            }
+
+            bool evidence_written = false;
+            std::string evidence_diagnostic;
+            try {
+                const std::string evidence_bytes =
+                    EncodeMonitorEvidence(monitor_evidence);
+                evidence_written = WriteEvidenceFile(
+                    evidence_file.get(),
+                    evidence_bytes,
+                    &evidence_diagnostic);
+            } catch (...) {
+                evidence_diagnostic =
+                    "monitor evidence encoding failed unexpectedly";
+            }
+            if (!evidence_written) {
+                std::cerr << "production monitor evidence write failed";
+                if (!evidence_diagnostic.empty()) {
+                    std::cerr << ": " << evidence_diagnostic;
+                }
+                std::cerr << '\n';
+            }
+            if (monitor_evidence.completed_window &&
+                monitor_evidence.stop.ok() && evidence_written) {
+                std::cout << "production route completed "
+                          << parsed.arguments.run_seconds
+                          << " seconds of authoritative ACTIVE monitoring, "
+                             "stopped cleanly, and persisted evidence\n";
+                return 0;
+            }
+            if (monitor_evidence.fatal_observed ||
+                monitor_evidence.left_active ||
+                !monitor_evidence.stop.ok()) {
+                std::cerr << "production bounded monitor failed: "
+                          << monitor_evidence.outcome << '\n';
+                return 1;
+            }
+            std::cerr << "production bounded monitor did not complete: "
+                      << monitor_evidence.outcome << '\n';
+            return 70;
+        }
         for (;;) {
             const ProductionServiceSnapshotV1 snapshot = service->Snapshot();
             if (AggregateFatal(snapshot)) {

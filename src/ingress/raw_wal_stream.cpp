@@ -101,7 +101,45 @@ RawWalStreamWriter::RawWalStreamWriter(
     }
 }
 
-RawWalStreamWriter::~RawWalStreamWriter() = default;
+RawWalStreamWriter::~RawWalStreamWriter() {
+    EndMutationBatch();
+}
+
+bool RawWalStreamWriter::BeginMutationBatch() noexcept {
+    if (mutation_batch_open_ || !initialized_ || closed_ ||
+        current_ == nullptr ||
+        fatal_.load(std::memory_order_acquire)) {
+        Trip(RawWalFailureKind::kInvalidState, EBUSY);
+        return false;
+    }
+    if (!backend_.BeginMutationBatch()) {
+        Trip(RawWalFailureKind::kControlPublish, EIO);
+        return false;
+    }
+    if (!current_->writer->BeginMutationBatch()) {
+        backend_.EndMutationBatch();
+        const RawWalFailure failure = current_->writer->failure();
+        Trip(
+            failure.kind == RawWalFailureKind::kNone
+                ? RawWalFailureKind::kSegmentWrite
+                : failure.kind,
+            failure.error_number == 0 ? EIO : failure.error_number);
+        return false;
+    }
+    mutation_batch_open_ = true;
+    return true;
+}
+
+void RawWalStreamWriter::EndMutationBatch() noexcept {
+    if (!mutation_batch_open_) {
+        return;
+    }
+    if (current_ != nullptr) {
+        current_->writer->EndMutationBatch();
+    }
+    backend_.EndMutationBatch();
+    mutation_batch_open_ = false;
+}
 
 bool RawWalStreamWriter::Initialize() noexcept {
     if (initialized_ || closed_ ||
@@ -187,8 +225,17 @@ bool RawWalStreamWriter::AppendRecord(
             &rotation_due)) {
         return false;
     }
-    if (rotation_due && !Rotate(now_ns)) {
-        return false;
+    if (rotation_due) {
+        const bool reopen_batch = mutation_batch_open_;
+        if (reopen_batch) {
+            EndMutationBatch();
+        }
+        if (!Rotate(now_ns)) {
+            return false;
+        }
+        if (reopen_batch && !BeginMutationBatch()) {
+            return false;
+        }
     }
     if (current_ == nullptr ||
         !current_->writer->AppendRecord(input)) {
@@ -255,6 +302,7 @@ bool RawWalStreamWriter::SealAndClose() noexcept {
         }
         return false;
     }
+    EndMutationBatch();
     if (!FinalizeCurrentSegment()) {
         return false;
     }

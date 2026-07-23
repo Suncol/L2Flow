@@ -688,6 +688,31 @@ bool RawIngressApp::Stop(
     return result;
 }
 
+bool RawIngressApp::PrepareCleanStop(
+    std::string* error) noexcept {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    const RawIngressAppState current =
+        state_.load(std::memory_order_acquire);
+    if (current == RawIngressAppState::kStopped) {
+        CopyError(error);
+        return !fatal();
+    }
+    if (current != RawIngressAppState::kRunning &&
+        current != RawIngressAppState::kStopping) {
+        SetFailureLiteral(
+            "RawIngressApp cannot prepare a clean stop outside Running/Stopping");
+        CopyError(error);
+        return false;
+    }
+    if (!handler_stopping_begun_) {
+        handler_.BeginStopping();
+        handler_stopping_begun_ = true;
+        Observe(RawIngressLifecycleEvent::kHandlerBeginStopping);
+    }
+    CopyError(error);
+    return !fatal();
+}
+
 std::unique_ptr<RawEmergencyWriterAckV1>
 RawIngressApp::BeginEmergencyStop(
     std::string* error) noexcept {
@@ -873,6 +898,15 @@ RawCaptureReconciliation
 RawIngressApp::reconciliation() const noexcept {
     return capture_worker_->Reconcile(
         capture_metrics_.Snapshot());
+}
+
+RawWalWriterSnapshot
+RawIngressApp::wal_snapshot() const noexcept {
+    return sink_->Snapshot();
+}
+
+RawWalFailure RawIngressApp::wal_failure() const noexcept {
+    return sink_->failure();
 }
 
 std::string RawIngressApp::prometheus_metrics() const {

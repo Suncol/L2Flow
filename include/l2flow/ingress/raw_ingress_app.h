@@ -155,6 +155,13 @@ public:
 
     [[nodiscard]] bool Initialize(
         std::string* error) noexcept;
+    // First half of a normal multi-source stop.  It closes the callback
+    // admission gate without waiting in the vendor SDK, so a service can
+    // quiesce all four producers before the first potentially blocking
+    // IOManager::Shutdown call.  Stop() remains responsible for SDK shutdown,
+    // callback quiescence, ring drain, Raw seal and the final clean-stop gate.
+    [[nodiscard]] bool PrepareCleanStop(
+        std::string* error) noexcept;
     [[nodiscard]] bool Stop(
         std::string* error) noexcept;
     // Permanently revokes this app's Running/READY lifecycle, shuts the SDK
@@ -178,6 +185,10 @@ public:
     observer_snapshot() const;
     [[nodiscard]] RawCaptureReconciliation
     reconciliation() const noexcept;
+    [[nodiscard]] RawWalWriterSnapshot
+    wal_snapshot() const noexcept;
+    [[nodiscard]] RawWalFailure
+    wal_failure() const noexcept;
     // Bounded Prometheus exposition containing only Raw progress, health and
     // exact-reconciliation facts. It never renders credential bytes,
     // endpoint addresses or filesystem paths.

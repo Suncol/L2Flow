@@ -64,7 +64,36 @@ public:
     [[nodiscard]] virtual const ProductionCaptureBindingV1& binding()
         const noexcept = 0;
     [[nodiscard]] virtual bool Start(std::string* diagnostic) noexcept = 0;
+    // The service invokes this for every started source before invoking the
+    // first Stop().  Implementations which do not need a two-phase producer
+    // gate may use this default no-op.
+    [[nodiscard]] virtual bool PrepareStop(
+        std::string* diagnostic) noexcept {
+        if (diagnostic != nullptr) {
+            try {
+                diagnostic->clear();
+            } catch (...) {
+            }
+        }
+        return true;
+    }
     [[nodiscard]] virtual bool Stop(std::string* diagnostic) noexcept = 0;
+
+    struct SnapshotV1 final {
+        bool available = false;
+        bool fatal = false;
+        l2flow::ingress::RawIngressAppState state =
+            l2flow::ingress::RawIngressAppState::kConstructed;
+        l2flow::ingress::CaptureMetricsSnapshot callback{};
+        l2flow::ingress::RawCaptureWorkerSnapshot capture{};
+        l2flow::ingress::RawCaptureReconciliation reconciliation{};
+        l2flow::ingress::RawWalWriterSnapshot wal{};
+        l2flow::ingress::RawWalFailure wal_failure{};
+    };
+
+    [[nodiscard]] virtual SnapshotV1 Snapshot() const noexcept {
+        return {};
+    }
 };
 
 // Takes ownership of one concrete Raw runtime.  The adapter preserves it
@@ -208,9 +237,13 @@ struct ProductionServiceStopResultV1 final {
         ProductionServiceStopErrorV1::kNone;
     l2flow::runtime::ProductionAggregateBeginDrainResultV1 begin_drain{};
     l2flow::runtime::ProductionAggregateDrainWaitResultV1 drain{};
+    std::array<bool, kProductionServiceSourceCountV1> capture_prepared{};
     std::array<bool, kProductionServiceSourceCountV1> capture_stopped{};
     std::array<std::string, kProductionServiceSourceCountV1>
         capture_diagnostics{};
+    std::array<ProductionCaptureRuntimeV1::SnapshotV1,
+               kProductionServiceSourceCountV1>
+        capture_evidence{};
     bool already_stopped = false;
 
     [[nodiscard]] bool ok() const noexcept {

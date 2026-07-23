@@ -103,54 +103,21 @@ void SetError(
 
 [[nodiscard]] bool CurrentWriterMatches(
     const RawReserveAuthorizedActionV1& action,
-    RawReserveRegistryCoordinatorV1& coordinator,
     const RawReserveRegistryEntryKeyV1& key,
     ReserveRegistryStatusV1 required_status,
     const l2flow::common::Identity128&
         expected_writer_instance) noexcept {
-    if (l2flow::common::IsZeroIdentity(
-            expected_writer_instance) ||
-        action.key() != key ||
-        action.required_status() != required_status ||
-        !action.ValidateLatest(nullptr)) {
-        return false;
-    }
-    try {
-        const ReserveCoordinatorStateV1 state =
-            coordinator.state();
-        if (state.selected_slot >= state.slots.size()) {
-            return false;
-        }
-        const ReserveStateSlotV1& slot =
-            state.slots[state.selected_slot];
-        if (slot.coordinator_state !=
-                ReserveCoordinatorPhaseV1::kProvisioned ||
-            slot.entry_count > slot.entries.size()) {
-            return false;
-        }
-        for (std::size_t index = 0U;
-             index <
-             static_cast<std::size_t>(slot.entry_count);
-             ++index) {
-            const ReserveStateEntryV1& entry =
-                slot.entries[index];
-            if (entry.source_stream_id ==
-                    key.route.source_stream_id &&
-                entry.capture_date ==
-                    key.route.capture_date &&
-                entry.stream_day_id ==
-                    key.stream_day_id &&
-                entry.executor_or_recovery_attempt ==
-                    key.recovery_attempt_id &&
-                entry.registry_status ==
-                    required_status) {
-                return entry.writer_instance ==
-                       expected_writer_instance;
-            }
-        }
-    } catch (...) {
-    }
-    return false;
+    // AcquireActionForExistingRoute constructs this immutable token from the
+    // latest durable selected slot only after its independent shared OFD
+    // generation gate is held. An exclusive transition cannot change that
+    // slot while the action lives, so comparing the bound token is both the
+    // exact writer check and avoids redundantly decoding the same 69 KiB
+    // reserve state a second time.
+    return !l2flow::common::IsZeroIdentity(expected_writer_instance) &&
+           action.key() == key &&
+           action.required_status() == required_status &&
+           action.token().writer_instance_id == expected_writer_instance &&
+           action.token().recovery_attempt_id == key.recovery_attempt_id;
 }
 
 class RawReserveAuthorizedWalIoV1 final
@@ -185,14 +152,27 @@ public:
           expected_writer_instance_(
               expected_writer_instance) {}
 
+    [[nodiscard]] bool BeginMutationBatch() noexcept override {
+        if (mutation_batch_action_ != nullptr) {
+            return false;
+        }
+        int gate_error = 0;
+        mutation_batch_action_ = Acquire(&gate_error);
+        return mutation_batch_action_ != nullptr;
+    }
+
+    void EndMutationBatch() noexcept override {
+        mutation_batch_action_.reset();
+    }
+
     RawWalWriteResult WritevSome(
         RawWalFile file,
         std::uint64_t offset,
         std::span<const RawWalIoVector>
             vectors) noexcept override {
         int gate_error = 0;
-        auto action = Acquire(&gate_error);
-        if (action == nullptr) {
+        std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+        if (ActionForMutation(&owned, &gate_error) == nullptr) {
             return {
                 0U, gate_error == 0 ? EIO : gate_error};
         }
@@ -203,8 +183,8 @@ public:
     int Fdatasync(
         RawWalFile file) noexcept override {
         int gate_error = 0;
-        auto action = Acquire(&gate_error);
-        if (action == nullptr) {
+        std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+        if (ActionForMutation(&owned, &gate_error) == nullptr) {
             return gate_error == 0 ? EIO : gate_error;
         }
         return delegate_->Fdatasync(file);
@@ -214,8 +194,8 @@ public:
         RawWalFile file,
         std::uint64_t logical_size) noexcept override {
         int gate_error = 0;
-        auto action = Acquire(&gate_error);
-        if (action == nullptr) {
+        std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+        if (ActionForMutation(&owned, &gate_error) == nullptr) {
             return gate_error == 0 ? EIO : gate_error;
         }
         return delegate_->Truncate(
@@ -236,6 +216,57 @@ public:
     }
 
 private:
+    [[nodiscard]] bool ValidateAction(
+        const RawReserveAuthorizedActionV1& action,
+        int* error_number) noexcept {
+        const ReserveRegistryStatusV1 required_status =
+            authorization_binding_ == nullptr
+                ? ReserveRegistryStatusV1::kUnused
+                : authorization_binding_->required_status();
+        if (action.target() == nullptr ||
+            target_provider_ == nullptr ||
+            !ValidateRawReserveMutationTargetProviderV1(
+                *target_provider_, *action.target())) {
+            if (error_number != nullptr) {
+                *error_number = EPERM;
+            }
+            return false;
+        }
+        if (require_writer_binding_ &&
+            !CurrentWriterMatches(
+                action,
+                key_,
+                required_status,
+                expected_writer_instance_)) {
+            if (error_number != nullptr) {
+                *error_number = ESTALE;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] RawReserveAuthorizedActionV1*
+    ActionForMutation(
+        std::unique_ptr<RawReserveAuthorizedActionV1>* owned,
+        int* error_number) noexcept {
+        if (owned == nullptr) {
+            if (error_number != nullptr) {
+                *error_number = EINVAL;
+            }
+            return nullptr;
+        }
+        owned->reset();
+        if (mutation_batch_action_ != nullptr) {
+            return ValidateAction(
+                       *mutation_batch_action_, error_number)
+                       ? mutation_batch_action_.get()
+                       : nullptr;
+        }
+        *owned = Acquire(error_number);
+        return owned->get();
+    }
+
     [[nodiscard]] std::unique_ptr<
         RawReserveAuthorizedActionV1>
     Acquire(int* error_number) noexcept {
@@ -262,26 +293,7 @@ private:
             }
             return nullptr;
         }
-        if (action->target() == nullptr ||
-            target_provider_ == nullptr ||
-            !ValidateRawReserveMutationTargetProviderV1(
-                *target_provider_,
-                *action->target())) {
-            if (error_number != nullptr) {
-                *error_number = EPERM;
-            }
-            return nullptr;
-        }
-        if (require_writer_binding_ &&
-            !CurrentWriterMatches(
-                *action,
-                *coordinator_,
-                key_,
-                required_status,
-                expected_writer_instance_)) {
-            if (error_number != nullptr) {
-                *error_number = ESTALE;
-            }
+        if (!ValidateAction(*action, error_number)) {
             return nullptr;
         }
         return action;
@@ -302,6 +314,8 @@ private:
     bool require_writer_binding_ = false;
     l2flow::common::Identity128
         expected_writer_instance_{};
+    std::unique_ptr<RawReserveAuthorizedActionV1>
+        mutation_batch_action_;
 };
 
 [[nodiscard]] bool ValidStatus(
@@ -370,7 +384,6 @@ GateRawWalIoImpl(
     if (require_writer_binding &&
         !CurrentWriterMatches(
             *action,
-            coordinator,
             key,
             required_status,
             expected_writer_instance)) {
@@ -519,6 +532,22 @@ RawReserveAuthorizedWalStreamBackendV1::
     ~RawReserveAuthorizedWalStreamBackendV1() = default;
 
 bool RawReserveAuthorizedWalStreamBackendV1::
+BeginMutationBatch() noexcept {
+    if (mutation_batch_action_ != nullptr ||
+        failure() != RawReserveAuthorizedWalFailureV1::kNone) {
+        Trip(RawReserveAuthorizedWalFailureV1::kInvalidArgument);
+        return false;
+    }
+    mutation_batch_action_ = Acquire();
+    return mutation_batch_action_ != nullptr;
+}
+
+void RawReserveAuthorizedWalStreamBackendV1::
+EndMutationBatch() noexcept {
+    mutation_batch_action_.reset();
+}
+
+bool RawReserveAuthorizedWalStreamBackendV1::
 active_binding_validated() const noexcept {
     return require_writer_binding_ &&
            authorization_binding_ != nullptr &&
@@ -665,7 +694,6 @@ PromoteToActive(
     }
     if (!CurrentWriterMatches(
             *active_action,
-            *coordinator_,
             key_,
             ReserveRegistryStatusV1::kActive,
             expected_writer_instance_)) {
@@ -713,28 +741,51 @@ RawReserveAuthorizedWalStreamBackendV1::Acquire() noexcept {
         Trip(
             RawReserveAuthorizedWalFailureV1::
                 kActionGate);
-    } else if (action->target() == nullptr ||
-               target_provider_ == nullptr ||
-               !ValidateRawReserveMutationTargetProviderV1(
-                   *target_provider_,
-                   *action->target())) {
-        Trip(
-            RawReserveAuthorizedWalFailureV1::
-                kTargetMismatch);
-        action.reset();
-    } else if (require_writer_binding_ &&
-               !CurrentWriterMatches(
-                   *action,
-                   *coordinator_,
-                   key_,
-                   required_status,
-                   expected_writer_instance_)) {
-        Trip(
-            RawReserveAuthorizedWalFailureV1::
-                kWriterMismatch);
+    } else if (!ValidateAction(*action)) {
         action.reset();
     }
     return action;
+}
+
+bool RawReserveAuthorizedWalStreamBackendV1::ValidateAction(
+    const RawReserveAuthorizedActionV1& action) noexcept {
+    const ReserveRegistryStatusV1 required_status =
+        authorization_binding_ == nullptr
+            ? ReserveRegistryStatusV1::kUnused
+            : authorization_binding_->required_status();
+    if (action.target() == nullptr || target_provider_ == nullptr ||
+        !ValidateRawReserveMutationTargetProviderV1(
+            *target_provider_, *action.target())) {
+        Trip(RawReserveAuthorizedWalFailureV1::kTargetMismatch);
+        return false;
+    }
+    if (require_writer_binding_ &&
+        !CurrentWriterMatches(
+            action,
+            key_,
+            required_status,
+            expected_writer_instance_)) {
+        Trip(RawReserveAuthorizedWalFailureV1::kWriterMismatch);
+        return false;
+    }
+    return true;
+}
+
+RawReserveAuthorizedActionV1*
+RawReserveAuthorizedWalStreamBackendV1::ActionForMutation(
+    std::unique_ptr<RawReserveAuthorizedActionV1>* owned) noexcept {
+    if (owned == nullptr) {
+        Trip(RawReserveAuthorizedWalFailureV1::kInvalidArgument);
+        return nullptr;
+    }
+    owned->reset();
+    if (mutation_batch_action_ != nullptr) {
+        return ValidateAction(*mutation_batch_action_)
+                   ? mutation_batch_action_.get()
+                   : nullptr;
+    }
+    *owned = Acquire();
+    return owned->get();
 }
 
 void RawReserveAuthorizedWalStreamBackendV1::Trip(
@@ -754,8 +805,8 @@ bool RawReserveAuthorizedWalStreamBackendV1::
         RawSegmentArtifactPlanV1 plan,
         const RawWalWriterSnapshot&
             sealed_snapshot) noexcept {
-    auto action = Acquire();
-    if (action == nullptr) {
+    std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+    if (ActionForMutation(&owned) == nullptr) {
         return false;
     }
     if (!delegate_->PublishClosedSegment(
@@ -781,7 +832,9 @@ bool RawReserveAuthorizedWalStreamBackendV1::
                 kInvalidArgument);
         return false;
     }
-    auto action = Acquire();
+    std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+    RawReserveAuthorizedActionV1* const action =
+        ActionForMutation(&owned);
     if (action == nullptr) {
         return false;
     }
@@ -842,8 +895,8 @@ bool RawReserveAuthorizedWalStreamBackendV1::
         const SegmentHeaderV1& segment,
         const RawWalWriterSnapshot&
             initialized_snapshot) noexcept {
-    auto action = Acquire();
-    if (action == nullptr) {
+    std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+    if (ActionForMutation(&owned) == nullptr) {
         return false;
     }
     if (!delegate_->PublishOpenManifest(
@@ -861,8 +914,8 @@ bool RawReserveAuthorizedWalStreamBackendV1::
         const SegmentHeaderV1& segment,
         const RawWalWriterSnapshot&
             snapshot) noexcept {
-    auto action = Acquire();
-    if (action == nullptr) {
+    std::unique_ptr<RawReserveAuthorizedActionV1> owned;
+    if (ActionForMutation(&owned) == nullptr) {
         return false;
     }
     if (!delegate_->PublishControl(
@@ -1019,7 +1072,6 @@ GateRawWalStreamBackendWithCoordinatorForWriterV1(
     }
     if (!CurrentWriterMatches(
             *action,
-            coordinator,
             key,
             required_status,
             expected_writer_instance)) {
