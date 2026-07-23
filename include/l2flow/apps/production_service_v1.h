@@ -305,18 +305,22 @@ public:
     [[nodiscard]] const l2flow::market::InstrumentHistoryRuntimeV1& history()
         const noexcept;
     // Provisional Fast Plane data after exact Vendor/exchange duplicate
-    // suppression. SH phase is the per-security last accepted 4.101.24
-    // Type=S STATUS publication, without wall-clock inference; it remains
-    // Unknown before a recognized STATUS, and an unknown STATUS does not
-    // overwrite known state. Deduplication is sequence/evidence based, never
-    // price/quantity based; gap, conflict, backward or runtime sequence
-    // capacity failure revokes the whole Fast generation. This is not the
-    // complete Canonical quality/business projection: each new scope starts
-    // from an unknown prior prefix, and publication attribution need not be a
-    // delayed event's original economic phase. The facade binds every query
-    // to a healthy Fast generation and an ACTIVE legacy route. It returns
-    // NotFound when Fast Plane is disabled and SourceFatal when the serving
-    // generation is no longer usable.
+    // suppression. SH phase uses a separate 4.101.24 Type=S STATUS watermark
+    // for each (security, channel), without wall-clock inference. A lower
+    // first-seen late STATUS is retained without rolling state back; a newer
+    // unknown STATUS advances the watermark without overwriting the last known
+    // phase.
+    // Phase remains Unknown until that channel has a recognized STATUS.
+    // Deduplication is sequence/evidence based, never price/quantity based.
+    // Every first-seen sequence is accepted regardless of gaps or arrival
+    // order; exact repeats and same-sequence conflicts are dropped, with
+    // conflicts resolved first-seen-wins. There is no policy capacity or
+    // sequence-continuity fail-closed path. This is not the complete Canonical
+    // quality/business projection, and publication attribution need not be a
+    // delayed event's original economic phase.
+    // The facade binds every query to a healthy Fast generation and an ACTIVE
+    // legacy route. It returns NotFound when Fast Plane is disabled and
+    // SourceFatal when the serving generation is no longer usable.
     [[nodiscard]] l2flow::market::InstrumentHistoryQueryErrorV1 FastLatest(
         std::uint32_t instrument_id,
         std::uint8_t source_slot,

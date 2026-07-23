@@ -3212,30 +3212,28 @@ void WriteProductionSnapshot(
                << value.vendor_duplicate_records
                << ",\"exchange_duplicate_records\":"
                << value.exchange_duplicate_records
-               << ",\"vendor_sequence_gaps\":"
-               << value.vendor_sequence_gaps
-               << ",\"exchange_sequence_gaps\":"
-               << value.exchange_sequence_gaps
-               << ",\"vendor_sequence_conflicts\":"
-               << value.vendor_sequence_conflicts
-               << ",\"exchange_sequence_conflicts\":"
-               << value.exchange_sequence_conflicts
+               << ",\"vendor_conflict_dropped_records\":"
+               << value.vendor_conflict_dropped_records
+               << ",\"exchange_conflict_dropped_records\":"
+               << value.exchange_conflict_dropped_records
                << ",\"phase_status_commits\":"
                << value.phase_status_commits
+               << ",\"phase_stale_status_records\":"
+               << value.phase_stale_status_records
                << ",\"phase_attributed_records\":"
                << value.phase_attributed_records
                << ",\"phase_unknown_records\":"
                << value.phase_unknown_records
                << ",\"phase_product_count\":"
                << value.phase_product_count
-               << ",\"vendor_guard_entries\":"
-               << value.vendor_guard_entries
-               << ",\"exchange_guard_entries\":"
-               << value.exchange_guard_entries
-               << ",\"vendor_guard_payload_bytes\":"
-               << value.vendor_guard_payload_bytes
-               << ",\"exchange_guard_payload_bytes\":"
-               << value.exchange_guard_payload_bytes
+               << ",\"vendor_dedup_entries\":"
+               << value.vendor_dedup_entries
+               << ",\"exchange_dedup_entries\":"
+               << value.exchange_dedup_entries
+               << ",\"vendor_dedup_evidence_bytes\":"
+               << value.vendor_dedup_evidence_bytes
+               << ",\"exchange_dedup_evidence_bytes\":"
+               << value.exchange_dedup_evidence_bytes
                << ",\"history_submissions\":"
                << value.history_submissions
                << ",\"history_backpressure_retries\":"

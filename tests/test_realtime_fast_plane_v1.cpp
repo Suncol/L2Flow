@@ -486,6 +486,10 @@ void TestParallelDecodeIntoPrivateHistory(TestContext* test) {
         return snapshot.sources[1U].history_frontier.acknowledged_ticket ==
                    kRecordsPerSource &&
                snapshot.sources[3U].history_frontier.acknowledged_ticket ==
+                   kRecordsPerSource &&
+               snapshot.sources[1U].last_processed_sequence ==
+                   kRecordsPerSource &&
+               snapshot.sources[3U].last_processed_sequence ==
                    kRecordsPerSource;
     });
     test->Expect(history_ready, "both Fast histories become query-visible");
@@ -1223,6 +1227,8 @@ void TestShenzhenUnifiedSequenceScope(TestContext* test) {
         ShenzhenTransactionSpec transaction{};
         transaction.channel = 12U;
         transaction.business_sequence = 1U;
+        ShenzhenTransactionSpec next = transaction;
+        next.business_sequence = 2U;
 
         test->Expect(
             PublishShenzhenOrder(
@@ -1230,25 +1236,34 @@ void TestShenzhenUnifiedSequenceScope(TestContext* test) {
                     ingress::FastCapturePublishResultV1::kPublished &&
                 PublishShenzhenTransaction(
                     sink, 2U, 930'001U, transaction) ==
+                    ingress::FastCapturePublishResultV1::kPublished &&
+                PublishShenzhenTransaction(
+                    sink, 3U, 930'002U, next) ==
                     ingress::FastCapturePublishResultV1::kPublished,
             "same-channel SZ cross-family sequence collision enters capture");
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
+        const bool visible = WaitUntil([&fast_plane]() {
+            const auto snapshot = fast_plane->Snapshot();
+            return snapshot.sources[3U]
+                       .history_frontier.acknowledged_ticket == 2U &&
+                   snapshot.sources[3U]
+                       .last_processed_sequence == 3U;
         });
         const auto snapshot = fast_plane->Snapshot();
         const auto& source = snapshot.sources[3U];
         test->Expect(
-            failed &&
-                source.exchange_sequence_conflicts == 1U &&
-                source.failure_business_sequence == 1U &&
-                source.failure_channel == 12U &&
-                source.history_submissions == 1U,
-            "SZ 6.33 and 6.36 share one ChannelNo sequence guard");
+            visible && !snapshot.fatal &&
+                source.exchange_conflict_dropped_records == 1U &&
+                source.history_submissions == 2U &&
+                source.decoded_records == 3U,
+            "SZ 6.33 and 6.36 share one first-seen ChannelNo index");
         fast_plane->StopAndDrain();
+        test->Expect(
+            fast_plane->Snapshot().clean_drain,
+            "SZ cross-family conflict is local and drains cleanly");
     }
 }
 
-void TestSequenceConflictsFailClosed(TestContext* test) {
+void TestSequenceConflictsAreDroppedLocally(TestContext* test) {
     {
         auto registry = MakeRegistry(test);
         if (registry == nullptr) {
@@ -1271,26 +1286,31 @@ void TestSequenceConflictsFailClosed(TestContext* test) {
             PublishShanghai(sink, 2U, 500'001U, tick) ==
                 ingress::FastCapturePublishResultV1::kPublished,
             "same vendor sequence with changed body enters capture");
-
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
-        });
+        tick.business_sequence = 2U;
         test->Expect(
-            failed,
-            "vendor sequence conflict fails the complete Fast generation");
+            PublishShanghai(sink, 3U, 500'002U, tick) ==
+                ingress::FastCapturePublishResultV1::kPublished,
+            "a new vendor sequence continues after the conflict");
+
+        const bool visible = WaitUntil([&fast_plane]() {
+            const auto snapshot = fast_plane->Snapshot();
+            const auto& source = snapshot.sources[1U];
+            return source.history_frontier.acknowledged_ticket == 2U &&
+                   source.last_processed_sequence == 3U;
+        });
         const auto snapshot = fast_plane->Snapshot();
         const auto& source = snapshot.sources[1U];
         test->Expect(
-            source.failure ==
-                    runtime::RealtimeFastPlaneFailureV1::kSequenceFailed &&
-                source.failure_sequence == 2U &&
-                source.failure_vendor_sequence == 500'001U &&
-                source.failure_business_sequence == 0U &&
-                source.vendor_sequence_conflicts == 1U &&
-                source.decoded_records == 1U &&
-                source.history_submissions == 1U,
-            "vendor conflict reports the exact failing delivery before decode");
+            visible && !snapshot.fatal &&
+                source.vendor_conflict_dropped_records == 1U &&
+                source.vendor_dedup_entries == 2U &&
+                source.decoded_records == 2U &&
+                source.history_submissions == 2U,
+            "vendor conflict is first-seen-wins and never stops Fast");
         fast_plane->StopAndDrain();
+        test->Expect(
+            fast_plane->Snapshot().clean_drain,
+            "vendor conflict drop reconciles in a clean drain");
     }
 
     {
@@ -1317,216 +1337,276 @@ void TestSequenceConflictsFailClosed(TestContext* test) {
             PublishShanghai(sink, 2U, 600'002U, tick) ==
                 ingress::FastCapturePublishResultV1::kPublished,
             "same BizIndex with a different status enters capture");
-
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
-        });
+        tick.business_sequence = 2U;
+        tick.type = "A";
+        tick.tick_flag = "B";
         test->Expect(
-            failed,
-            "exchange sequence conflict fails the complete Fast generation");
+            PublishShanghai(sink, 3U, 600'003U, tick) ==
+                ingress::FastCapturePublishResultV1::kPublished,
+            "ordinary tick continues after the exchange conflict");
+
+        const bool visible = WaitUntil([&fast_plane]() {
+            const auto snapshot = fast_plane->Snapshot();
+            const auto& source = snapshot.sources[1U];
+            return source.history_frontier.acknowledged_ticket == 2U &&
+                   source.last_processed_sequence == 3U;
+        });
         const auto snapshot = fast_plane->Snapshot();
         const auto& source = snapshot.sources[1U];
         test->Expect(
-            source.failure ==
-                    runtime::RealtimeFastPlaneFailureV1::kSequenceFailed &&
-                source.failure_sequence == 2U &&
-                source.failure_vendor_sequence == 600'002U &&
-                source.failure_business_sequence == 1U &&
-                source.failure_channel == 1U &&
-                source.exchange_sequence_conflicts == 1U &&
-                source.decoded_records == 2U &&
-                source.history_submissions == 1U &&
+            visible && !snapshot.fatal &&
+                source.exchange_conflict_dropped_records == 1U &&
+                source.decoded_records == 3U &&
+                source.history_submissions == 2U &&
                 source.phase_status_commits == 1U &&
                 source.phase_product_count == 1U,
-            "conflicting status reports its scope and cannot mutate phase");
+            "exchange conflict is dropped without mutating phase");
+
+        std::vector<market::InstrumentHistoryRecordHandleV1> records;
+        test->Expect(
+            fast_plane->Tail(
+                kShanghaiInstrument,
+                1U,
+                market::InstrumentHistoryLaneV1::kTick,
+                2U,
+                &records) ==
+                    market::InstrumentHistoryQueryErrorV1::kNone &&
+                records.size() == 2U,
+            "only first-seen status and following tick reach history");
+        const market::ShanghaiTickV1* const following =
+            records.size() == 2U
+            ? market::RetainedMarketEventGetV1<
+                  market::ShanghaiTickV1>(
+                  records[1U]->event())
+            : nullptr;
+        test->Expect(
+            following != nullptr &&
+                following->fields.phase ==
+                    market::TradingPhaseV1::kContinuous,
+            "conflicting SUSP status cannot overwrite accepted TRADE");
         fast_plane->StopAndDrain();
+        test->Expect(
+            fast_plane->Snapshot().clean_drain,
+            "exchange conflict drop reconciles in a clean drain");
     }
 }
 
-void TestSequenceGapsFailClosed(TestContext* test) {
-    {
-        auto registry = MakeRegistry(test);
-        if (registry == nullptr) {
-            return;
-        }
-        auto fast_plane = MakeRuntime(test, registry.get());
-        if (fast_plane == nullptr) {
-            return;
-        }
-        const ingress::FastCaptureSinkRefV1 sink =
-            fast_plane->capture_sink();
-        ShanghaiTickSpec tick{};
-        tick.business_sequence = 1U;
-        test->Expect(
-            PublishShanghai(sink, 1U, 700'001U, tick) ==
-                    ingress::FastCapturePublishResultV1::kPublished &&
-                PublishShanghai(sink, 2U, 700'003U, tick) ==
-                    ingress::FastCapturePublishResultV1::kPublished,
-            "vendor sequence gap enters the contiguous capture prefix");
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
-        });
-        test->Expect(
-            failed,
-            "vendor sequence gap fails Fast closed");
-        const auto snapshot = fast_plane->Snapshot();
-        const auto& source = snapshot.sources[1U];
-        test->Expect(
-            source.vendor_sequence_gaps == 1U &&
-                source.failure ==
-                    runtime::RealtimeFastPlaneFailureV1::kSequenceFailed &&
-                source.failure_vendor_sequence == 700'003U &&
-                source.decoded_records == 1U,
-            "vendor gap is diagnosed before decoding the missing prefix");
-        fast_plane->StopAndDrain();
+void TestUnorderedFirstSeenSequences(TestContext* test) {
+    auto registry = MakeRegistry(test);
+    if (registry == nullptr) {
+        return;
     }
+    auto fast_plane = MakeRuntime(test, registry.get());
+    if (fast_plane == nullptr) {
+        return;
+    }
+    const ingress::FastCaptureSinkRefV1 sink =
+        fast_plane->capture_sink();
+    ShanghaiTickSpec tick{};
+    tick.business_sequence = 1U;
+    const bool first =
+        PublishShanghai(sink, 1U, 700'001U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.business_sequence = 3U;
+    const bool forward_gap =
+        PublishShanghai(sink, 2U, 700'003U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.business_sequence = 2U;
+    const bool late_fill =
+        PublishShanghai(sink, 3U, 700'002U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    const bool vendor_duplicate =
+        PublishShanghai(sink, 4U, 700'002U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    const bool exchange_duplicate =
+        PublishShanghai(sink, 5U, 700'004U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.quantity = 999U;
+    const bool vendor_late_conflict =
+        PublishShanghai(sink, 6U, 700'002U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    const bool exchange_late_conflict =
+        PublishShanghai(sink, 7U, 700'005U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    test->Expect(
+        first && forward_gap && late_fill &&
+            vendor_duplicate && exchange_duplicate &&
+            vendor_late_conflict && exchange_late_conflict,
+        "gap, late fill, retransmissions and conflicts enter Fast capture");
 
-    {
-        auto registry = MakeRegistry(test);
-        if (registry == nullptr) {
-            return;
-        }
-        auto fast_plane = MakeRuntime(test, registry.get());
-        if (fast_plane == nullptr) {
-            return;
-        }
-        const ingress::FastCaptureSinkRefV1 sink =
-            fast_plane->capture_sink();
-        ShanghaiTickSpec tick{};
-        tick.business_sequence = 1U;
-        const bool first =
-            PublishShanghai(sink, 1U, 800'001U, tick) ==
-            ingress::FastCapturePublishResultV1::kPublished;
-        tick.business_sequence = 3U;
-        const bool gap =
-            PublishShanghai(sink, 2U, 800'002U, tick) ==
-            ingress::FastCapturePublishResultV1::kPublished;
-        test->Expect(
-            first && gap,
-            "exchange BizIndex gap enters the contiguous capture prefix");
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
-        });
-        test->Expect(
-            failed,
-            "exchange BizIndex gap fails Fast closed");
+    const bool visible = WaitUntil([&fast_plane]() {
         const auto snapshot = fast_plane->Snapshot();
         const auto& source = snapshot.sources[1U];
-        test->Expect(
-            source.exchange_sequence_gaps == 1U &&
-                source.failure ==
-                    runtime::RealtimeFastPlaneFailureV1::kSequenceFailed &&
-                source.failure_vendor_sequence == 800'002U &&
-                source.failure_business_sequence == 3U &&
-                source.failure_channel == 1U &&
-                source.decoded_records == 2U &&
-                source.history_submissions == 1U,
-            "exchange gap reports the exact channel and withholds its row");
-        fast_plane->StopAndDrain();
-    }
+        return source.history_frontier.acknowledged_ticket == 3U &&
+               source.last_processed_sequence == 7U;
+    });
+    const auto snapshot = fast_plane->Snapshot();
+    const auto& source = snapshot.sources[1U];
+    test->Expect(
+        visible && !snapshot.fatal &&
+            source.vendor_duplicate_records == 1U &&
+            source.exchange_duplicate_records == 1U &&
+            source.vendor_conflict_dropped_records == 1U &&
+            source.exchange_conflict_dropped_records == 1U &&
+            source.vendor_dedup_entries == 5U &&
+            source.exchange_dedup_entries == 3U &&
+            source.decoded_records == 5U &&
+            source.history_submissions == 3U,
+        "late duplicate/conflict keys drop locally while unseen gaps and "
+        "backward keys append");
+
+    std::vector<market::InstrumentHistoryRecordHandleV1> records;
+    test->Expect(
+        fast_plane->Tail(
+            kShanghaiInstrument,
+            1U,
+            market::InstrumentHistoryLaneV1::kTick,
+            3U,
+            &records) ==
+                market::InstrumentHistoryQueryErrorV1::kNone &&
+            records.size() == 3U,
+        "unordered first-seen events are query-visible");
+    const auto business_at = [&records](std::size_t index) {
+        const market::ShanghaiTickV1* const event =
+            index < records.size()
+            ? market::RetainedMarketEventGetV1<
+                  market::ShanghaiTickV1>(
+                  records[index]->event())
+            : nullptr;
+        return event == nullptr ? 0 : event->business_index;
+    };
+    test->Expect(
+        business_at(0U) == 1 &&
+            business_at(1U) == 3 &&
+            business_at(2U) == 2,
+        "history preserves arrival order 1,3,2 without a continuity gate");
+    fast_plane->StopAndDrain();
+    test->Expect(
+        fast_plane->Snapshot().clean_drain,
+        "unordered exact-dedup generation drains cleanly");
 }
 
-void TestSequenceAndPhaseLimitsFailClosed(TestContext* test) {
-    {
-        auto registry = MakeRegistry(test);
-        if (registry == nullptr) {
-            return;
-        }
-        auto fast_plane = MakeRuntime(test, registry.get());
-        if (fast_plane == nullptr) {
-            return;
-        }
-        const ingress::FastCaptureSinkRefV1 sink =
-            fast_plane->capture_sink();
-        ShanghaiTickSpec tick{};
-        tick.business_sequence = 2U;
-        const bool first =
-            PublishShanghai(sink, 1U, 940'001U, tick) ==
-            ingress::FastCapturePublishResultV1::kPublished;
-        tick.business_sequence = 1U;
-        const bool backward =
-            PublishShanghai(sink, 2U, 940'002U, tick) ==
-            ingress::FastCapturePublishResultV1::kPublished;
-        test->Expect(
-            first && backward,
-            "unseen lower BizIndex enters the contiguous capture prefix");
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
-        });
-        const auto snapshot = fast_plane->Snapshot();
-        const auto& source = snapshot.sources[1U];
-        test->Expect(
-            failed &&
-                source.failure ==
-                    runtime::RealtimeFastPlaneFailureV1::kSequenceFailed &&
-                source.failure_business_sequence == 1U &&
-                source.exchange_sequence_gaps == 0U &&
-                source.exchange_sequence_conflicts == 0U &&
-                source.history_submissions == 1U,
-            "unseen backward business sequence fails Fast closed");
-        fast_plane->StopAndDrain();
+void TestStaleStatusCannotRollbackPhase(TestContext* test) {
+    auto registry = MakeRegistry(test);
+    if (registry == nullptr) {
+        return;
     }
+    auto fast_plane = MakeRuntime(test, registry.get());
+    if (fast_plane == nullptr) {
+        return;
+    }
+    const ingress::FastCaptureSinkRefV1 sink =
+        fast_plane->capture_sink();
+    ShanghaiTickSpec tick{};
+    tick.business_sequence = 10U;
+    tick.type = "S";
+    tick.tick_flag = "OCALL";
+    const bool opening =
+        PublishShanghai(sink, 1U, 960'001U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.business_sequence = 12U;
+    tick.tick_flag = "TRADE";
+    const bool continuous =
+        PublishShanghai(sink, 2U, 960'002U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.channel = 2U;
+    tick.business_sequence = 5U;
+    tick.tick_flag = "SUSP";
+    const bool other_channel_suspended =
+        PublishShanghai(sink, 3U, 960'003U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.channel = 1U;
+    tick.business_sequence = 9U;
+    tick.tick_flag = "SUSP";
+    const bool stale =
+        PublishShanghai(sink, 4U, 960'004U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.business_sequence = 13U;
+    tick.type = "A";
+    tick.tick_flag = "B";
+    const bool following =
+        PublishShanghai(sink, 5U, 960'005U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    tick.channel = 2U;
+    tick.business_sequence = 6U;
+    const bool following_other_channel =
+        PublishShanghai(sink, 6U, 960'006U, tick) ==
+        ingress::FastCapturePublishResultV1::kPublished;
+    test->Expect(
+        opening && continuous && other_channel_suspended &&
+            stale && following && following_other_channel,
+        "interleaved-channel and late first-seen statuses enter history");
 
-    {
-        auto registry = MakeRegistry(test);
-        if (registry == nullptr) {
-            return;
-        }
-        auto config = FastConfig();
-        config.maximum_seen_entries_per_scope = 1U;
-        auto fast_plane = MakeRuntime(test, registry.get(), config);
-        if (fast_plane == nullptr) {
-            return;
-        }
-        const ingress::FastCaptureSinkRefV1 sink =
-            fast_plane->capture_sink();
-        ShanghaiTickSpec tick{};
-        tick.business_sequence = 1U;
-        const bool first =
-            PublishShanghai(sink, 1U, 950'001U, tick) ==
-            ingress::FastCapturePublishResultV1::kPublished;
-        tick.business_sequence = 2U;
-        const bool over_capacity =
-            PublishShanghai(sink, 2U, 950'002U, tick) ==
-            ingress::FastCapturePublishResultV1::kPublished;
-        test->Expect(
-            first && over_capacity,
-            "entry-capacity boundary enters the capture prefix");
-        const bool failed = WaitUntil([&fast_plane]() {
-            return fast_plane->Snapshot().fatal;
-        });
-        const auto snapshot = fast_plane->Snapshot();
-        const auto& source = snapshot.sources[1U];
-        test->Expect(
-            failed &&
-                source.failure ==
-                    runtime::RealtimeFastPlaneFailureV1::kSequenceFailed &&
-                source.failure_vendor_sequence == 950'002U &&
-                source.vendor_guard_entries == 1U &&
-                source.vendor_sequence_conflicts == 0U &&
-                source.decoded_records == 1U &&
-                source.history_submissions == 1U,
-            "next unique Vendor entry beyond the hard bound fails closed");
-        fast_plane->StopAndDrain();
-    }
+    const bool visible = WaitUntil([&fast_plane]() {
+        const auto source =
+            fast_plane->Snapshot().sources[1U];
+        return source.history_frontier.acknowledged_ticket == 6U &&
+               source.last_processed_sequence == 6U;
+    });
+    std::vector<market::InstrumentHistoryRecordHandleV1> records;
+    test->Expect(
+        visible &&
+            fast_plane->Tail(
+                kShanghaiInstrument,
+                1U,
+                market::InstrumentHistoryLaneV1::kTick,
+                6U,
+                &records) ==
+                    market::InstrumentHistoryQueryErrorV1::kNone &&
+            records.size() == 6U,
+        "late status remains visible as provisional decoded data");
+    const market::ShanghaiTickV1* const channel_one_tick =
+        records.size() == 6U
+        ? market::RetainedMarketEventGetV1<
+              market::ShanghaiTickV1>(
+              records[4U]->event())
+        : nullptr;
+    const market::ShanghaiTickV1* const channel_two_tick =
+        records.size() == 6U
+        ? market::RetainedMarketEventGetV1<
+              market::ShanghaiTickV1>(
+              records[5U]->event())
+        : nullptr;
+    const auto snapshot = fast_plane->Snapshot();
+    const auto& source = snapshot.sources[1U];
+    test->Expect(
+        !snapshot.fatal &&
+            source.phase_status_commits == 3U &&
+            source.phase_stale_status_records == 1U &&
+            source.phase_product_count == 1U &&
+            source.history_submissions == 6U &&
+            channel_one_tick != nullptr &&
+            channel_one_tick->channel == 1 &&
+            channel_one_tick->fields.phase ==
+                market::TradingPhaseV1::kContinuous &&
+            channel_two_tick != nullptr &&
+            channel_two_tick->channel == 2 &&
+            channel_two_tick->fields.phase ==
+                market::TradingPhaseV1::kSuspended,
+        "each channel retains its own phase and late channel-one STATUS "
+        "cannot roll it back");
+    fast_plane->StopAndDrain();
+    test->Expect(
+        fast_plane->Snapshot().clean_drain,
+        "stale-status generation drains cleanly");
+}
 
-    {
-        auto registry = MakeRegistry(test);
-        if (registry == nullptr) {
-            return;
-        }
-        auto config = FastConfig();
-        config.maximum_phase_products = 1U;
-        std::unique_ptr<runtime::RealtimeFastPlaneRuntimeV1> fast_plane;
-        const auto error = runtime::RealtimeFastPlaneRuntimeV1::Create(
-            config, registry.get(), &fast_plane);
-        test->Expect(
-            error ==
-                    runtime::RealtimeFastPlaneCreateErrorV1::
-                        kInvalidConfiguration &&
-                fast_plane == nullptr,
-            "Shanghai registry beyond phase-slot bound fails at creation");
+void TestPhaseLimitAtCreation(TestContext* test) {
+    auto registry = MakeRegistry(test);
+    if (registry == nullptr) {
+        return;
     }
+    auto config = FastConfig();
+    config.maximum_phase_products = 1U;
+    std::unique_ptr<runtime::RealtimeFastPlaneRuntimeV1> fast_plane;
+    const auto error = runtime::RealtimeFastPlaneRuntimeV1::Create(
+        config, registry.get(), &fast_plane);
+    test->Expect(
+        error ==
+                runtime::RealtimeFastPlaneCreateErrorV1::
+                    kInvalidConfiguration &&
+            fast_plane == nullptr,
+        "Shanghai registry beyond phase-slot bound fails at creation");
 }
 
 void TestQueueFullFailsAtCapturedPrefix(TestContext* test) {
@@ -1668,9 +1748,10 @@ int main() {
     TestShanghaiStatusPhaseAttribution(&test);
     TestExactDuplicatesAndBusinessIdentity(&test);
     TestShenzhenUnifiedSequenceScope(&test);
-    TestSequenceConflictsFailClosed(&test);
-    TestSequenceGapsFailClosed(&test);
-    TestSequenceAndPhaseLimitsFailClosed(&test);
+    TestSequenceConflictsAreDroppedLocally(&test);
+    TestUnorderedFirstSeenSequences(&test);
+    TestStaleStatusCannotRollbackPhase(&test);
+    TestPhaseLimitAtCreation(&test);
     TestQueueFullFailsAtCapturedPrefix(&test);
     if (test.failures() != 0) {
         std::cerr << test.failures()

@@ -249,21 +249,25 @@ The deployment entry reads only the hash-pinned fixed manifest
 For an opt-in in-memory callback-to-instrument canary, add
 `--fast-plane-shadow`. It runs four source-order decoder workers and a private
 multi-worker history without waiting for WAL/Canonical, while a Fast failure
-remains isolated from the formal route. Shanghai phase is driven per security
-only by the last accepted `4.101.24` `Type="S"` STATUS publication, never by
-wall-clock inference; ticks remain `Unknown` before a recognized STATUS.
-An unrecognized STATUS is stored as `Unknown` and does not overwrite a known
-phase. Vendor-sequence and SH/SZ business-sequence exact evidence suppresses
-exact duplicates, while events with equal price/quantity but distinct business
-sequences remain distinct when the sequence transition is accepted; a gap
-instead revokes the generation. A conflict, backward transition or runtime
-evidence-capacity exhaustion also revokes the complete Fast generation; an
-oversized Shanghai phase registry is rejected at Fast creation. The result
-remains provisional because it is not equivalent to the complete Canonical
-quality/business gates. Each new sequence scope accepts its first positive
-sequence with an unknown prior prefix, so Fast cannot prove day-start
-completeness. Its phase is publication-order attribution rather than
-reconstruction of a delayed event's original economic phase. See
+remains isolated from the formal route. Shanghai phase is driven separately
+for each `(security, channel)` only by accepted `4.101.24` `Type="S"` STATUS
+publications, never by wall-clock inference. A tick remains `Unknown` until
+its own channel has a recognized STATUS. A lower late-arriving STATUS is
+retained but cannot roll that channel's phase back. An unrecognized STATUS is
+stored as `Unknown`, advances that channel's STATUS watermark when newer, and
+does not overwrite its last known phase.
+
+Vendor-sequence and SH/SZ business-sequence exact evidence suppresses exact
+duplicates. Every unseen sequence is accepted without a continuity,
+forward-gap or backward gate. A same-sequence conflict is dropped locally with
+stable first-seen-wins behavior and never revokes the Fast generation. The
+dedup index has no policy scope/entry/evidence capacity and retains first-seen
+evidence for the generation; a real allocation failure is still a runtime
+fault. An oversized Shanghai phase registry is rejected at Fast creation.
+The result remains provisional because it is not equivalent to the complete
+Canonical quality/business gates. Fast does not prove sequence-prefix or
+day-start completeness. Its phase is current STATUS-watermark attribution
+rather than reconstruction of a delayed event's original economic phase. See
 [`Realtime Fast Plane V1`](docs/decisions/realtime-fast-plane-v1.md) for its
 provisional query contract, resource budget, live-test command and evidence
 criteria.

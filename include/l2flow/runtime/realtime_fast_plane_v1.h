@@ -39,7 +39,7 @@ enum class RealtimeFastPlaneFailureV1 : std::uint8_t {
     kCaptureInvalid,
     kRingCorrupt,
     kDecodeFailed,
-    kSequenceFailed,
+    kDedupFailed,
     kPhaseFailed,
     kRetainFailed,
     kEnvelopeFailed,
@@ -69,12 +69,8 @@ struct RealtimeFastPlaneConfigV1 final {
                kRealtimeFastPlaneSourceCountV1>
         stream_day_ids{};
     // Exact duplicate evidence is retained for the complete Fast generation.
-    // Scope count is bounded per source; seen-entry/payload limits are per
-    // scope. Guards grow lazily and never evict evidence.
-    std::uint64_t maximum_sequence_scopes_per_source = 65'536U;
-    std::uint64_t maximum_seen_entries_per_scope = 10'000'000U;
-    std::uint64_t maximum_seen_payload_bytes_per_scope =
-        2U * 1024U * 1024U * 1024U;
+    // Fast dedup state grows lazily, has no policy capacity, and never evicts
+    // first-seen evidence. A real allocation failure remains a runtime fault.
     // Hard bound for the prebuilt Shanghai per-instrument phase slots.
     std::uint64_t maximum_phase_products = 100'000U;
     l2flow::market::InstrumentHistoryRuntimeConfigV1 history{};
@@ -89,18 +85,17 @@ struct RealtimeFastPlaneSourceSnapshotV1 final {
     std::uint64_t ignored_records = 0U;
     std::uint64_t vendor_duplicate_records = 0U;
     std::uint64_t exchange_duplicate_records = 0U;
-    std::uint64_t vendor_sequence_gaps = 0U;
-    std::uint64_t exchange_sequence_gaps = 0U;
-    std::uint64_t vendor_sequence_conflicts = 0U;
-    std::uint64_t exchange_sequence_conflicts = 0U;
+    std::uint64_t vendor_conflict_dropped_records = 0U;
+    std::uint64_t exchange_conflict_dropped_records = 0U;
     std::uint64_t phase_status_commits = 0U;
+    std::uint64_t phase_stale_status_records = 0U;
     std::uint64_t phase_attributed_records = 0U;
     std::uint64_t phase_unknown_records = 0U;
     std::uint64_t phase_product_count = 0U;
-    std::uint64_t vendor_guard_entries = 0U;
-    std::uint64_t exchange_guard_entries = 0U;
-    std::uint64_t vendor_guard_payload_bytes = 0U;
-    std::uint64_t exchange_guard_payload_bytes = 0U;
+    std::uint64_t vendor_dedup_entries = 0U;
+    std::uint64_t exchange_dedup_entries = 0U;
+    std::uint64_t vendor_dedup_evidence_bytes = 0U;
+    std::uint64_t exchange_dedup_evidence_bytes = 0U;
     std::uint64_t history_submissions = 0U;
     std::uint64_t history_backpressure_retries = 0U;
     std::uint64_t last_captured_sequence = 0U;
