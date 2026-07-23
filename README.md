@@ -249,7 +249,21 @@ The deployment entry reads only the hash-pinned fixed manifest
 For an opt-in in-memory callback-to-instrument canary, add
 `--fast-plane-shadow`. It runs four source-order decoder workers and a private
 multi-worker history without waiting for WAL/Canonical, while a Fast failure
-remains isolated from the formal route. See
+remains isolated from the formal route. Shanghai phase is driven per security
+only by the last accepted `4.101.24` `Type="S"` STATUS publication, never by
+wall-clock inference; ticks remain `Unknown` before a recognized STATUS.
+An unrecognized STATUS is stored as `Unknown` and does not overwrite a known
+phase. Vendor-sequence and SH/SZ business-sequence exact evidence suppresses
+exact duplicates, while events with equal price/quantity but distinct business
+sequences remain distinct when the sequence transition is accepted; a gap
+instead revokes the generation. A conflict, backward transition or runtime
+evidence-capacity exhaustion also revokes the complete Fast generation; an
+oversized Shanghai phase registry is rejected at Fast creation. The result
+remains provisional because it is not equivalent to the complete Canonical
+quality/business gates. Each new sequence scope accepts its first positive
+sequence with an unknown prior prefix, so Fast cannot prove day-start
+completeness. Its phase is publication-order attribution rather than
+reconstruction of a delayed event's original economic phase. See
 [`Realtime Fast Plane V1`](docs/decisions/realtime-fast-plane-v1.md) for its
 provisional query contract, resource budget, live-test command and evidence
 criteria.

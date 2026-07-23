@@ -30,13 +30,49 @@ Raw/WAL/Canonical 路径继续运行，作为正式路径和回退依据。Fast 
   source 上无关 instrument 补齐全局 ACK prefix，从而避免跨 instrument 的
   head-of-line blocking。
 
-Fast history 是“已成功 decode 并留存”的 provisional 数据，不是 Canonical 投影。
-只有 manifest 中该 source 的 exact-required message tuple 会进入 decode；其他消息
-不会进入 Fast history。上海 tick 使用 deferred phase attribution，因此依赖交易阶段
-归属、Canonical 去重/冲突判定或 Canonical quality gate 的因子不能把 V1 Fast history
-视为正式 history 的等价替代。任一 Fast fatal 会撤销整个 Fast generation，之后所有 Fast
-查询统一失败；此前返回的 handle 仍然内存安全，但在逻辑上已经失效，不得继续驱动
-因子或交易决策。
+Fast history 是已通过 Fast 顺序门、成功 decode 并追加的 provisional 数据，不是
+Canonical 投影。只有 manifest 中该 source 的 exact-required message tuple 会进入
+decode；其他消息不会进入 Fast history。
+
+上海阶段不根据本地墙钟、tick 时间或 SYS/control 消息推断。只有
+`4.101.24 NGTSTick` 中 `Type="S"`、且已通过 Vendor 与上海业务序列门的 STATUS
+发布，才会按 `TickBSFlag` 更新对应证券的阶段。普通 tick 继承该证券最后一条已接受且
+可识别的 STATUS 阶段；首次出现可识别 STATUS 前保持 `Unknown`。无法识别的 STATUS
+自身以 `Unknown` 留存，但不会覆盖该证券此前的已知阶段。这里的 phase 是处理点上的
+“最后已接受 STATUS 发布归属”，不是对延迟或批量送达事件的原始经济阶段进行重建。
+可识别映射为 `START/OCALL/TRADE/SUSP/CCALL/CLOSE/ENDTR` 对应
+`Start/OpeningCall/Continuous/Suspended/ClosingCall/Closed/End`。
+
+Fast 顺序门保留完整 evidence 并进行精确比较：
+
+- Vendor scope 为 `(capture_date, source_stream_id, stream_day_id, ServiceID,
+  MessageID)`，以 Vendor `SequenceID` 为序号；
+- 上海 scope 为 `(trade_date, source_stream_id, Channel)`，以正值 `BizIndex`
+  为业务序号；
+- 深圳同一 channel 的 `6.101.33` Order 与 `6.101.36` Transaction 共用一个 scope，
+  以正值 `ApplSeqNum` 为业务序号；snapshot 只有 Vendor 顺序门。
+
+Vendor evidence 是 `ServiceVersion`、encoding、Vendor `LocalTime` 与完整 body；
+接收时间和 ingress sequence 不参与比较。exchange evidence 是 phase 继承前的 decoded
+业务语义，避免 phase 状态变化把同一业务事件误判为 conflict。
+
+同一 scope、同一序号且 exact evidence 相同才是 duplicate，并在写 history 前抑制；
+摘要只用于加速，最终仍比较 evidence 字节。去重键不使用价格或数量，因此价格、数量
+相同但拥有不同且连续业务序号的两笔事件都会保留。同一序号 evidence 不同是
+conflict；gap、conflict、backward 或运行时 evidence/scope capacity 耗尽都会使
+整个 Fast generation fail-closed，而不是继续提供部分可信的 history。phase slot
+capacity 是启动边界：注册上海证券数超限时直接拒绝创建 Fast runtime。
+
+Fast 没有各 scope 的权威 `expected_first`。每个新 scope 看见的第一个正序号会以
+`First/start_unknown` 接受；因此 gap fail-closed 只能证明该首条之后的观测前缀，
+不能证明 Fast 启动前或交易日开头的序列完整，也不能去重本 generation 从未观察过的
+更早消息。这是 Fast history 继续保持 provisional 的独立原因。
+
+完成阶段归属和这些精确顺序门后，Fast history 仍然是 provisional：它不等价于完整
+Canonical quality/business gates，也不携带完整 Canonical 投影语义。依赖这些语义的
+因子不能把 Fast history 视为正式 history 的等价替代。任一 Fast fatal 会撤销整个
+Fast generation，之后所有 Fast 查询统一失败；此前返回的 handle 仍然内存安全，但在
+逻辑上已经失效，不得继续驱动因子或交易决策。
 
 生产内的查询必须经由 `ProductionServiceV1::FastLatest` 或 `FastTail`。该 facade
 同时检查 Fast generation 与正式 route 是否仍为 ACTIVE，避免绕过 route/fatal
@@ -71,8 +107,9 @@ Production builder 不为 Fast history 安装测试/telemetry hook。Fast runtim
 最终 snapshot 中 `clean_drain=true` 表示每个 source 都满足：
 
 - `last_processed_sequence == last_captured_sequence`；
-- `decoded_records + ignored_records == captured_records`；
-- `history_submissions == decoded_records`；
+- `captured_records == ignored_records + history_submissions +
+  vendor_duplicate_records + exchange_duplicate_records`；
+- `decoded_records == history_submissions + exchange_duplicate_records`；
 - history submitted ticket 已全部 ACK；
 - worker 已退出且 source 未 fatal。
 
@@ -99,8 +136,14 @@ Fast Plane 测试应同时满足：
   `fast_plane.clean_drain=true`；
 - 四个 source 的 `terminal_prefix_complete=true`；
 - `fast_plane_fatal_observed=false`；
-- `fast_plane_terminal_parity=true`（Fast 与四个 Raw callback 的最终 record count
-  及 ingress sequence 完全一致）。
+- `fast_plane_terminal_parity=true`（Fast capture 与四个 Raw callback 的最终
+  record count 及 ingress sequence 完全一致；duplicate 被抑制后，history 行数可以
+  小于该 count）。
+
+任意 300 秒窗口若没有真实的上海 STATUS transition，只能验证 Fast 管线和延迟，不能
+验证阶段切换。phase shadow 验证窗口必须覆盖实际收到的、可识别的 `Type="S"`
+transition，并检查同一证券切换前后的 history 与 phase counters；不得用墙钟推定一个
+期望阶段来代替 STATUS evidence。
 
 若 Fast Plane 中途 fatal，正式 route 仍保持 ACTIVE 到测试窗口结束；evidence 会将
 `fast_plane_fatal_observed` 置为 true，bounded run 最终返回非零，便于自动化判定
@@ -109,13 +152,26 @@ Fast 测试失败而不把 shadow 故障冒充成正式 route 故障。未传
 
 ## 资源预算
 
-V1 复用现有 manifest 的 ring/history sizing，不增加新配置项。启用后会额外分配：
+V1 不增加 production manifest 字段；ring/history 继续复用现有 sizing，顺序 evidence
+和阶段状态使用 Fast runtime 的独立硬上限。启用后会额外分配：
 
 - 四个 `raw.ring_capacity_bytes` 大小的 Fast input ring；
 - 一套独立、受既有 history 上限约束的内存 history；
 - 四个 decoder worker；
-- `history.physical_workers` 个 Fast history worker。
+- `history.physical_workers` 个 Fast history worker；
+- 每个已注册上海证券一个 phase slot；
+- Vendor 与 exchange sequence scope、摘要及完整 evidence。
+
+每个 Fast generation 会保留每条唯一 Vendor observation，以及每条唯一、带业务序号
+的上海/深圳 observation 的完整 evidence，不做淘汰。因此 sequence state 的空间复杂度
+为 `O(U_vendor + U_exchange)` 个 entry，加
+`O(P_vendor + P_exchange)` evidence bytes，另有摘要和容器开销。默认硬上限为每个
+source 合计 `65,536` 个 sequence scope、每个 scope `10,000,000` 个唯一 entry 和
+`2 GiB` evidence bytes；它们按需增长而非启动时一次预分配。运行时需要新增
+scope/entry/evidence、但相应上限已无法再容纳时，整个 Fast generation fail-closed；
+注册上海证券数超过默认 `100,000` 个 phase slot 上限则在创建时失败。
 
 例如示例 manifest 的 Raw ring 为 256 MiB，则四个 Fast ring 本身额外占用约 1 GiB，
-尚未包含 private history。实盘前必须据此核对 NUMA、内存和 CPU 预算；如需绑核，可
-由部署层使用 `taskset`/cpuset，不需要改变 SDK 配置。
+尚未包含 private history、phase slots 和 exact evidence。实盘前必须按预期全天唯一
+消息数与 evidence payload 总量核对 NUMA、内存和 CPU 预算；如需绑核，可由部署层
+使用 `taskset`/cpuset，不需要改变 SDK 配置。

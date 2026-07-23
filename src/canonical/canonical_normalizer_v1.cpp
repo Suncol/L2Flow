@@ -1,6 +1,7 @@
 #include "l2flow/canonical/canonical_normalizer_v1.h"
 
 #include "l2flow/canonical/canonical_control_adapter_v1.h"
+#include "l2flow/canonical/market_sequence_evidence_v1.h"
 #include "l2flow/control/quality_flags_v1.h"
 #include "l2flow/market/instrument_registry.h"
 
@@ -1132,45 +1133,13 @@ using VendorScopeMap = std::map<VendorScopeKey, GuardSlot>;
 using ExchangeScopeMap = std::map<ExchangeScopeKey, GuardSlot>;
 using PhaseMap = std::map<std::string, TradingPhaseV1>;
 
-struct BusinessSequenceIdentity final {
-    bool present = false;
-    SequenceScopeKindV1 kind = SequenceScopeKindV1::kShanghaiChannel;
-    std::uint32_t channel = 0U;
-    std::uint64_t sequence = 0U;
-    bool sequence_valid = false;
-};
+using BusinessSequenceIdentity = MarketBusinessSequenceIdentityV1;
 
 BusinessSequenceIdentity BusinessSequenceOf(
     const BorrowedDecodedMarketEventV1& event) noexcept {
     return std::visit(
         [](const auto* pointer) noexcept {
-            using Event = std::remove_cv_t<
-                std::remove_pointer_t<decltype(pointer)>>;
-            const Event& value = *pointer;
-            BusinessSequenceIdentity result{};
-            if constexpr (std::is_same_v<Event, ShanghaiTickV1>) {
-                result.present = true;
-                result.kind = SequenceScopeKindV1::kShanghaiChannel;
-                result.channel = std::bit_cast<std::uint32_t>(value.channel);
-                result.sequence_valid = value.business_index > 0;
-                if (result.sequence_valid) {
-                    result.sequence = static_cast<std::uint64_t>(
-                        value.business_index);
-                }
-            } else if constexpr (
-                std::is_same_v<Event, ShenzhenOrderV1> ||
-                std::is_same_v<Event, ShenzhenTransactionV1>) {
-                result.present = true;
-                result.kind =
-                    SequenceScopeKindV1::kShenzhenUnifiedChannel;
-                result.channel = value.channel;
-                result.sequence_valid = value.application_sequence > 0;
-                if (result.sequence_valid) {
-                    result.sequence = static_cast<std::uint64_t>(
-                        value.application_sequence);
-                }
-            }
-            return result;
+            return MarketBusinessSequenceIdentityOfV1(*pointer);
         },
         event);
 }
@@ -1214,166 +1183,49 @@ bool SnapshotQueueCountsValid(
         event);
 }
 
-class ExchangeEvidenceBuilder final {
-public:
-    ExchangeEvidenceBuilder() {
-        bytes_.reserve(256U);
-        Text("L2FLOW_EXCHANGE_BUSINESS_EVIDENCE_V1");
+[[noreturn]] void ThrowSequenceEvidenceFailure(
+    MarketSequenceEvidenceErrorV1 error) {
+    if (error == MarketSequenceEvidenceErrorV1::kResourceExhausted) {
+        throw std::bad_alloc();
     }
-
-    void U8(std::uint8_t value) {
-        bytes_.push_back(static_cast<std::byte>(value));
+    if (error == MarketSequenceEvidenceErrorV1::kValueTooLarge) {
+        throw std::length_error("sequence evidence too large");
     }
-
-    void U32(std::uint32_t value) {
-        for (std::size_t index = 0U; index < 4U; ++index) {
-            U8(static_cast<std::uint8_t>(
-                (value >> (index * 8U)) & 0xffU));
-        }
-    }
-
-    void U64(std::uint64_t value) {
-        for (std::size_t index = 0U; index < 8U; ++index) {
-            U8(static_cast<std::uint8_t>(
-                (value >> (index * 8U)) & 0xffU));
-        }
-    }
-
-    void I32(std::int32_t value) {
-        U32(static_cast<std::uint32_t>(value));
-    }
-
-    void I64(std::int64_t value) {
-        U64(static_cast<std::uint64_t>(value));
-    }
-
-    void Bool(bool value) {
-        U8(value ? 1U : 0U);
-    }
-
-    void Text(std::string_view value) {
-        U32(static_cast<std::uint32_t>(value.size()));
-        const auto bytes = std::as_bytes(std::span(
-            value.data(), value.size()));
-        bytes_.insert(bytes_.end(), bytes.begin(), bytes.end());
-    }
-
-    void Decimal(const l2flow::market::DecimalValueV1& value) {
-        I64(value.raw);
-        I64(value.normalized_p6);
-        U8(value.scale);
-        Bool(value.valid);
-        Bool(value.is_null);
-    }
-
-    void Quantity(const l2flow::market::QuantityValueV1& value) {
-        I64(value.raw);
-        U8(value.scale);
-        Bool(value.valid);
-        Bool(value.is_null);
-    }
-
-    void Common(const DecodedMarketCommonV1& value) {
-        U8(static_cast<std::uint8_t>(value.kind));
-        U8(static_cast<std::uint8_t>(value.market));
-        U32(value.exchange_time.raw_hhmmssmmm);
-        U64(value.exchange_time.nanoseconds_since_midnight);
-        I64(value.exchange_time.unix_nanoseconds);
-        Bool(value.exchange_time.valid);
-        Bool(value.exchange_time.is_null);
-        Bool(value.exchange_time.unix_nanoseconds_valid);
-        Text(value.security_id);
-        Text(value.security_id_source);
-        Text(value.md_stream_id);
-        Bool(value.security_id_valid);
-        Bool(value.security_id_source_valid);
-        Bool(value.md_stream_id_valid);
-    }
-
-    void Fields(const TickFieldsV1& value) {
-        U8(static_cast<std::uint8_t>(value.action));
-        U8(static_cast<std::uint8_t>(value.side));
-        U8(static_cast<std::uint8_t>(value.order_type));
-        U8(static_cast<std::uint8_t>(value.aggressor));
-        U8(static_cast<std::uint8_t>(value.phase));
-        Decimal(value.price);
-        Quantity(value.quantity);
-        Decimal(value.trade_amount);
-        Quantity(value.matched_quantity);
-        I64(value.primary_order_id);
-        I64(value.buy_order_id);
-        I64(value.sell_order_id);
-        U32(value.validity_bitmap);
-    }
-
-    std::vector<std::byte> Finish() && {
-        return std::move(bytes_);
-    }
-
-private:
-    std::vector<std::byte> bytes_;
-};
+    throw std::logic_error("sequence evidence construction failed");
+}
 
 std::vector<std::byte> MakeExchangeEvidence(
     const BorrowedDecodedMarketEventV1& event) {
-    ExchangeEvidenceBuilder evidence;
-    std::visit(
-        [&](const auto* pointer) {
+    std::vector<std::byte> evidence;
+    const MarketSequenceEvidenceErrorV1 error = std::visit(
+        [&evidence](const auto* pointer) {
             using Event = std::remove_cv_t<
                 std::remove_pointer_t<decltype(pointer)>>;
-            const Event& value = *pointer;
-            evidence.Common(value.common);
-            if constexpr (std::is_same_v<Event, ShanghaiTickV1>) {
-                evidence.U8(1U);
-                evidence.I64(value.business_index);
-                evidence.I32(value.channel);
-                evidence.Text(value.raw_type);
-                evidence.Text(value.raw_tick_flag);
-                evidence.Bool(value.raw_type_valid);
-                evidence.Bool(value.raw_tick_flag_valid);
-                evidence.Fields(value.fields);
-            } else if constexpr (std::is_same_v<Event, ShenzhenOrderV1>) {
-                evidence.U8(2U);
-                evidence.U32(value.channel);
-                evidence.I64(value.application_sequence);
-                evidence.I32(value.raw_side);
-                evidence.I32(value.raw_order_type);
-                evidence.Fields(value.fields);
-            } else if constexpr (
+            if constexpr (
+                std::is_same_v<Event, ShanghaiTickV1> ||
+                std::is_same_v<Event, ShenzhenOrderV1> ||
                 std::is_same_v<Event, ShenzhenTransactionV1>) {
-                evidence.U8(3U);
-                evidence.U32(value.channel);
-                evidence.I64(value.application_sequence);
-                evidence.I32(value.raw_execution_type);
-                evidence.Fields(value.fields);
-            } else {
-                // Snapshot variants never enter an exchange sequence guard.
-                evidence.U8(0U);
+                return BuildExchangeSequenceEvidenceV1(
+                    *pointer, &evidence);
             }
+            return MarketSequenceEvidenceErrorV1::
+                kNoBusinessSequence;
         },
         event);
-    return std::move(evidence).Finish();
+    if (error != MarketSequenceEvidenceErrorV1::kNone) {
+        ThrowSequenceEvidenceFailure(error);
+    }
+    return evidence;
 }
 
 std::vector<std::byte> MakeVendorEvidence(
     const MarketMessageViewV1& message) {
-    // ServiceID/MessageID/SequenceID are the scope/key.  The remaining
-    // vendor-head semantics participate in exact duplicate evidence so a
-    // version, encoding or LocalTime change cannot be mistaken for a replay
-    // of the same message merely because its body bytes happen to match.
     std::vector<std::byte> evidence;
-    evidence.reserve(7U + message.body.size());
-    evidence.push_back(static_cast<std::byte>(
-        message.service_version & 0xffU));
-    evidence.push_back(static_cast<std::byte>(
-        (message.service_version >> 8U) & 0xffU));
-    evidence.push_back(static_cast<std::byte>(message.message_encoding));
-    for (std::size_t index = 0U; index < 4U; ++index) {
-        evidence.push_back(static_cast<std::byte>(
-            (message.vendor_local_time_raw >> (index * 8U)) & 0xffU));
+    const MarketSequenceEvidenceErrorV1 error =
+        BuildVendorSequenceEvidenceV1(message, &evidence);
+    if (error != MarketSequenceEvidenceErrorV1::kNone) {
+        ThrowSequenceEvidenceFailure(error);
     }
-    evidence.insert(
-        evidence.end(), message.body.begin(), message.body.end());
     return evidence;
 }
 

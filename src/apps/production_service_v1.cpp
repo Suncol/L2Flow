@@ -563,13 +563,23 @@ ProductionServiceCreateErrorV1 ProductionServiceV1::Create(
     }
     if (inputs.fast_plane != nullptr) {
         const auto& fast_config = inputs.fast_plane->config();
+        bool source_days_match = true;
+        for (std::size_t index = 0U;
+             index < manifest.sources.size(); ++index) {
+            if (fast_config.capture_date !=
+                    manifest.sources[index].capture_date ||
+                fast_config.stream_day_ids[index] !=
+                    manifest.sources[index].stream_day_id) {
+                source_days_match = false;
+                break;
+            }
+        }
         if (inputs.fast_plane->registry() != inputs.registry.get() ||
-            fast_config.capture_date !=
-                manifest.sources.front().capture_date ||
             fast_config.trade_date != manifest.trade_date ||
             fast_config.first_ingress_sequence != 1U ||
             fast_config.history.source_stream_ids !=
-                l2flow::route::kProductionRouteSourceStreamIdsV1) {
+                l2flow::route::kProductionRouteSourceStreamIdsV1 ||
+            !source_days_match) {
             return ProductionServiceCreateErrorV1::
                 kFastPlaneBindingMismatch;
         }

@@ -982,7 +982,9 @@ Prepared MakePrepared(
 
 Prepared MakeStartablePrepared(
     TestContext* test,
-    TemporaryDirectory* directory) {
+    TemporaryDirectory* directory,
+    bool matching_fast_stream_days = true,
+    bool matching_fast_capture_dates = true) {
     Prepared result{};
     result.inputs.registry = MakeRegistry(7U);
     result.inputs.history = MakeHistory(true);
@@ -994,8 +996,11 @@ Prepared MakeStartablePrepared(
         result.inputs.history == nullptr) {
         return result;
     }
-    const route::ProductionRouteManifestV1 manifest =
+    route::ProductionRouteManifestV1 manifest =
         MakeManifest(*result.inputs.registry, directory->path());
+    if (!matching_fast_capture_dates) {
+        ++manifest.sources.back().capture_date;
+    }
 
     runtime::RealtimeFastPlaneConfigV1 fast_config{};
     fast_config.capture_date = manifest.sources.front().capture_date;
@@ -1003,6 +1008,13 @@ Prepared MakeStartablePrepared(
     fast_config.max_message_bytes = 4096U;
     fast_config.input_ring_capacity_bytes_per_source = 64U * 1024U;
     fast_config.history = MakeHistoryConfig();
+    for (std::size_t index = 0U; index < manifest.sources.size(); ++index) {
+        fast_config.stream_day_ids[index] =
+            manifest.sources[index].stream_day_id;
+    }
+    if (!matching_fast_stream_days) {
+        fast_config.stream_day_ids.back()[0U] ^= std::byte{0x01U};
+    }
     const auto fast_error = runtime::RealtimeFastPlaneRuntimeV1::Create(
         fast_config,
         result.inputs.registry.get(),
@@ -1209,6 +1221,38 @@ void TestIdentityFailuresPrecedeRuntimeStart(TestContext* test) {
                         kHistorySourceSetMismatch &&
                 prepared.counters->starts.load(std::memory_order_relaxed) == 0U,
             "noncanonical four-source history set fails before SDK lifecycle");
+    }
+    {
+        TemporaryDirectory directory;
+        Prepared prepared =
+            MakeStartablePrepared(test, &directory, false);
+        std::unique_ptr<apps::ProductionServiceV1> service;
+        const auto error = apps::ProductionServiceV1::Create(
+            {}, std::move(prepared.inputs), &service);
+        test->Expect(
+            error ==
+                    apps::ProductionServiceCreateErrorV1::
+                        kFastPlaneBindingMismatch &&
+                service == nullptr &&
+                prepared.counters->starts.load(
+                    std::memory_order_relaxed) == 0U,
+            "Fast stream-day mismatch fails before SDK lifecycle");
+    }
+    {
+        TemporaryDirectory directory;
+        Prepared prepared =
+            MakeStartablePrepared(test, &directory, true, false);
+        std::unique_ptr<apps::ProductionServiceV1> service;
+        const auto error = apps::ProductionServiceV1::Create(
+            {}, std::move(prepared.inputs), &service);
+        test->Expect(
+            error ==
+                    apps::ProductionServiceCreateErrorV1::
+                        kFastPlaneBindingMismatch &&
+                service == nullptr &&
+                prepared.counters->starts.load(
+                    std::memory_order_relaxed) == 0U,
+            "Fast per-source capture-date mismatch fails before SDK lifecycle");
     }
 }
 

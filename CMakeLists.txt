@@ -406,6 +406,7 @@ set(L2FLOW_PHASE5_SOURCES
     src/canonical/canonical_normalizer_v1.cpp
     src/canonical/canonical_schema_v1.cpp
     src/canonical/canonical_segment_v1.cpp
+    src/canonical/market_sequence_evidence_v1.cpp
     src/canonical/safe_mux_v1.cpp
     src/canonical/sequence_guard_v1.cpp)
 

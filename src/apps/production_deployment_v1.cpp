@@ -2605,6 +2605,8 @@ struct SourceAssemblyV1 final {
              source < deployment.sources.size(); ++source) {
             fast_config.source_kinds[source] =
                 deployment.sources[source].kind;
+            fast_config.stream_day_ids[source] =
+                deployment.sources[source].stream_day_id;
         }
         const auto fast_error =
             l2flow::runtime::RealtimeFastPlaneRuntimeV1::Create(
@@ -3206,6 +3208,34 @@ void WriteProductionSnapshot(
                << ",\"captured_records\":" << value.captured_records
                << ",\"decoded_records\":" << value.decoded_records
                << ",\"ignored_records\":" << value.ignored_records
+               << ",\"vendor_duplicate_records\":"
+               << value.vendor_duplicate_records
+               << ",\"exchange_duplicate_records\":"
+               << value.exchange_duplicate_records
+               << ",\"vendor_sequence_gaps\":"
+               << value.vendor_sequence_gaps
+               << ",\"exchange_sequence_gaps\":"
+               << value.exchange_sequence_gaps
+               << ",\"vendor_sequence_conflicts\":"
+               << value.vendor_sequence_conflicts
+               << ",\"exchange_sequence_conflicts\":"
+               << value.exchange_sequence_conflicts
+               << ",\"phase_status_commits\":"
+               << value.phase_status_commits
+               << ",\"phase_attributed_records\":"
+               << value.phase_attributed_records
+               << ",\"phase_unknown_records\":"
+               << value.phase_unknown_records
+               << ",\"phase_product_count\":"
+               << value.phase_product_count
+               << ",\"vendor_guard_entries\":"
+               << value.vendor_guard_entries
+               << ",\"exchange_guard_entries\":"
+               << value.exchange_guard_entries
+               << ",\"vendor_guard_payload_bytes\":"
+               << value.vendor_guard_payload_bytes
+               << ",\"exchange_guard_payload_bytes\":"
+               << value.exchange_guard_payload_bytes
                << ",\"history_submissions\":"
                << value.history_submissions
                << ",\"history_backpressure_retries\":"
@@ -3225,6 +3255,12 @@ void WriteProductionSnapshot(
             l2flow::runtime::RealtimeFastPlaneFailureNameV1(
                 value.failure));
         output << ",\"failure_sequence\":" << value.failure_sequence
+               << ",\"failure_vendor_sequence\":"
+               << value.failure_vendor_sequence
+               << ",\"failure_business_sequence\":"
+               << value.failure_business_sequence
+               << ",\"failure_channel\":"
+               << value.failure_channel
                << ",\"worker_exited\":"
                << (value.worker_exited ? "true" : "false")
                << ",\"terminal_prefix_complete\":"
