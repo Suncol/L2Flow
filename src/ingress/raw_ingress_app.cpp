@@ -345,6 +345,7 @@ CallbackHandlerConfig RawIngressApp::MakeHandlerConfig(
     result.frontier_generation = options.frontier_generation;
     result.source_frontier_busy_timeout =
         options.source_frontier_busy_timeout;
+    result.fast_capture_sink = options.fast_capture_sink;
     return result;
 }
 

@@ -95,6 +95,9 @@ struct RawIngressAppOptionsV1 final {
     std::uint64_t frontier_generation = 0U;
     std::chrono::nanoseconds source_frontier_busy_timeout =
         l2flow::canonical::kSourceFrontierDefaultBusyTimeoutV1;
+    // Runtime-only shadow Fast Plane hook. Not part of Raw stable config or
+    // any persisted Raw identity.
+    FastCaptureSinkRefV1 fast_capture_sink{};
 };
 
 struct RawIngressCleanStopEvidenceV1 final {

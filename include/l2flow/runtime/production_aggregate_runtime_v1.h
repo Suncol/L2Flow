@@ -420,6 +420,10 @@ public:
         std::unique_ptr<ProductionAggregateRuntimeV1>* output) noexcept;
 
     [[nodiscard]] ProductionAggregateSnapshotV1 Snapshot() const noexcept;
+    // Allocation-free serving guard for latency-sensitive in-process reads.
+    // V1 is fresh-only, so a generation never returns to serving after this
+    // predicate becomes false.
+    [[nodiscard]] bool AuthoritativeRouteServing() const noexcept;
 
     // Phase 1 of clean shutdown.  It atomically closes the Active-publication
     // gate, transitions Running -> Draining, and (when Active may exist)

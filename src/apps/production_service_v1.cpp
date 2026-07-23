@@ -78,6 +78,7 @@ private:
         result.writer_instance = raw.writer_instance;
         result.source_generation = raw.source_generation;
         result.source_frontier = raw.source_frontier;
+        result.fast_capture_context = raw.fast_capture_context;
         return result;
     }
 
@@ -178,6 +179,7 @@ public:
           source_lifetimes(std::move(inputs.source_lifetimes)),
           registry(std::move(inputs.registry)),
           history(std::move(inputs.history)),
+          fast_plane(std::move(inputs.fast_plane)),
           route_controller(std::move(inputs.route_controller)),
           captures(std::move(inputs.captures)),
           aggregate(std::move(aggregate_value)) {}
@@ -386,6 +388,9 @@ public:
             // The aggregate's documented emergency path is the only bounded
             // teardown; waiting for a drain here would manufacture a timeout.
             aggregate->Stop();
+            if (fast_plane != nullptr) {
+                fast_plane->StopAndDrain();
+            }
             history->StopAndDrain();
             state.store(ProductionServiceStateV1::kStopped,
                         std::memory_order_release);
@@ -438,6 +443,12 @@ public:
             }
         }
         aggregate->Stop();
+        // Every callback is quiescent, and the authoritative Raw/Canonical
+        // drain has already been given priority. The borrowed shadow sink can
+        // now be sealed and drained without delaying durable route teardown.
+        if (fast_plane != nullptr) {
+            fast_plane->StopAndDrain();
+        }
         history->StopAndDrain();
         state.store(ProductionServiceStateV1::kStopped,
                     std::memory_order_release);
@@ -447,6 +458,10 @@ public:
     [[nodiscard]] ProductionServiceSnapshotV1 Snapshot() const noexcept {
         ProductionServiceSnapshotV1 result{};
         result.state = state.load(std::memory_order_acquire);
+        result.fast_plane_enabled = fast_plane != nullptr;
+        if (fast_plane != nullptr) {
+            result.fast_plane = fast_plane->Snapshot();
+        }
         for (std::size_t index = 0U; index < captures.size(); ++index) {
             result.capture_started[index] =
                 capture_started[index].load(std::memory_order_acquire);
@@ -469,6 +484,9 @@ public:
                 static_cast<void>(captures[index]->Stop(&ignored));
             }
         }
+        if (fast_plane != nullptr) {
+            fast_plane->StopAndDrain();
+        }
         history->StopAndDrain();
         state.store(ProductionServiceStateV1::kFailed,
                     std::memory_order_release);
@@ -480,6 +498,9 @@ public:
         source_lifetimes{};
     std::unique_ptr<l2flow::market::InstrumentRegistryV1> registry;
     std::unique_ptr<l2flow::market::InstrumentHistoryRuntimeV1> history;
+    // Declared before captures so reverse destruction releases callback
+    // owners before the borrowed Fast Plane sink.
+    std::unique_ptr<l2flow::runtime::RealtimeFastPlaneRuntimeV1> fast_plane;
     std::unique_ptr<l2flow::route::ProductionRouteControllerV1>
         route_controller;
     std::array<std::unique_ptr<ProductionCaptureRuntimeV1>,
@@ -540,6 +561,19 @@ ProductionServiceCreateErrorV1 ProductionServiceV1::Create(
         l2flow::route::kProductionRouteSourceStreamIdsV1) {
         return ProductionServiceCreateErrorV1::kHistorySourceSetMismatch;
     }
+    if (inputs.fast_plane != nullptr) {
+        const auto& fast_config = inputs.fast_plane->config();
+        if (inputs.fast_plane->registry() != inputs.registry.get() ||
+            fast_config.capture_date !=
+                manifest.sources.front().capture_date ||
+            fast_config.trade_date != manifest.trade_date ||
+            fast_config.first_ingress_sequence != 1U ||
+            fast_config.history.source_stream_ids !=
+                l2flow::route::kProductionRouteSourceStreamIdsV1) {
+            return ProductionServiceCreateErrorV1::
+                kFastPlaneBindingMismatch;
+        }
+    }
     for (std::size_t index = 0U; index < kProductionServiceSourceCountV1;
          ++index) {
         if (inputs.source_lifetimes[index] == nullptr) {
@@ -593,6 +627,11 @@ ProductionServiceCreateErrorV1 ProductionServiceV1::Create(
             }
 
             const auto& capture = inputs.captures[index]->binding();
+            if (capture.fast_capture_context !=
+                inputs.fast_plane.get()) {
+                return ProductionServiceCreateErrorV1::
+                    kFastPlaneBindingMismatch;
+            }
             if (!ProductionCaptureBindingMatchesV1(
                     capture,
                     static_cast<std::uint8_t>(index),
@@ -652,6 +691,68 @@ ProductionServiceV1::history() const noexcept {
     return *impl_->history;
 }
 
+l2flow::market::InstrumentHistoryQueryErrorV1
+ProductionServiceV1::FastLatest(
+    std::uint32_t instrument_id,
+    std::uint8_t source_slot,
+    l2flow::market::InstrumentHistoryLaneV1 lane,
+    l2flow::market::InstrumentHistoryRecordHandleV1* output) const noexcept {
+    if (output == nullptr) {
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kNullOutput;
+    }
+    *output = {};
+    if (impl_->fast_plane == nullptr) {
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kNotFound;
+    }
+    const auto route_healthy = [this]() noexcept {
+        return impl_->state.load(std::memory_order_acquire) ==
+                   ProductionServiceStateV1::kActive &&
+               impl_->aggregate->AuthoritativeRouteServing();
+    };
+    if (!route_healthy()) {
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    const auto error = impl_->fast_plane->Latest(
+        instrument_id, source_slot, lane, output);
+    if (!route_healthy()) {
+        *output = {};
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    return error;
+}
+
+l2flow::market::InstrumentHistoryQueryErrorV1
+ProductionServiceV1::FastTail(
+    std::uint32_t instrument_id,
+    std::uint8_t source_slot,
+    l2flow::market::InstrumentHistoryLaneV1 lane,
+    std::size_t count,
+    std::vector<l2flow::market::InstrumentHistoryRecordHandleV1>* output)
+    const noexcept {
+    if (output == nullptr) {
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kNullOutput;
+    }
+    output->clear();
+    if (impl_->fast_plane == nullptr) {
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kNotFound;
+    }
+    const auto route_healthy = [this]() noexcept {
+        return impl_->state.load(std::memory_order_acquire) ==
+                   ProductionServiceStateV1::kActive &&
+               impl_->aggregate->AuthoritativeRouteServing();
+    };
+    if (!route_healthy()) {
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    const auto error = impl_->fast_plane->Tail(
+        instrument_id, source_slot, lane, count, output);
+    if (!route_healthy()) {
+        output->clear();
+        return l2flow::market::InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    return error;
+}
+
 const l2flow::market::InstrumentRegistryV1& ProductionServiceV1::registry()
     const noexcept {
     return *impl_->registry;
@@ -672,6 +773,7 @@ std::string_view ProductionServiceCreateErrorNameV1(
         case ProductionServiceCreateErrorV1::kInvalidRouteManifest: return "invalid_route_manifest";
         case ProductionServiceCreateErrorV1::kRegistryIdentityMismatch: return "registry_identity_mismatch";
         case ProductionServiceCreateErrorV1::kHistorySourceSetMismatch: return "history_source_set_mismatch";
+        case ProductionServiceCreateErrorV1::kFastPlaneBindingMismatch: return "fast_plane_binding_mismatch";
         case ProductionServiceCreateErrorV1::kPipelineSourceMismatch: return "pipeline_source_mismatch";
         case ProductionServiceCreateErrorV1::kCaptureBindingMismatch: return "capture_binding_mismatch";
         case ProductionServiceCreateErrorV1::kAggregateCreateFailed: return "aggregate_create_failed";

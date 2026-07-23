@@ -945,12 +945,17 @@ ProductionRouterArgumentResultV1 ParseProductionRouterArgumentsV1(
         bool has_digest = false;
         for (std::size_t index = 0U; index < arguments.size(); ++index) {
             const std::string_view option = arguments[index];
-            if (option == "--check") {
+            if (option == "--check" ||
+                option == "--fast-plane-shadow") {
                 if (!seen.insert(option).second) {
-                    result.diagnostic = "duplicate option: --check";
+                    result.diagnostic = "duplicate flag option";
                     return result;
                 }
-                result.arguments.check_only = true;
+                if (option == "--check") {
+                    result.arguments.check_only = true;
+                } else {
+                    result.arguments.fast_plane_shadow = true;
+                }
                 continue;
             }
             if (option != "--deployment-dir" &&
@@ -1035,10 +1040,13 @@ ProductionRouterArgumentResultV1 ParseProductionRouterArgumentsV1(
 std::string ProductionRouterUsageV1() {
     return
         "Usage: mdl-production-router --deployment-dir <absolute-0700-dir> "
-        "--manifest-sha256 <64-lowercase-hex> [--check | "
+        "--manifest-sha256 <64-lowercase-hex> [--fast-plane-shadow] "
+        "[--check | "
         "--run-seconds <1..86400> --evidence-json <absolute-path>]\n\n"
         "Reads the fixed production-v1.tsv file (mode 0600, no symlink) and "
         "starts the fresh-only four-source production route.\n"
+        "--fast-plane-shadow additionally starts the in-memory decode/history "
+        "canary; omitting it preserves the existing production path.\n"
         "--check validates the pinned manifest and non-mutating deployment "
         "inputs without loading vendor code or changing Raw/Canonical/route "
         "state. Existing INIT/RECOVERING/ACTIVE routes require the separate "
@@ -2444,6 +2452,7 @@ struct SourceAssemblyV1 final {
 
 [[nodiscard]] bool BuildProductionService(
     const ProductionDeploymentV1& deployment,
+    bool enable_fast_plane,
     ProductionStaticInputsV1* static_inputs,
     std::unique_ptr<l2flow::apps::ProductionServiceV1>* output,
     bool* fail_stop_required,
@@ -2571,6 +2580,50 @@ struct SourceAssemblyV1 final {
         return false;
     }
 
+    std::unique_ptr<l2flow::runtime::RealtimeFastPlaneRuntimeV1> fast_plane;
+    l2flow::ingress::FastCaptureSinkRefV1 fast_capture_sink{};
+    if (enable_fast_plane) {
+        if (deployment.raw_ring_capacity_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+            if (diagnostic != nullptr) {
+                *diagnostic =
+                    "Fast Plane input ring exceeds host size_t";
+            }
+            return false;
+        }
+        l2flow::runtime::RealtimeFastPlaneConfigV1 fast_config{};
+        fast_config.capture_date = deployment.capture_date;
+        fast_config.trade_date = deployment.trade_date;
+        fast_config.max_message_bytes =
+            deployment.raw_max_message_bytes;
+        fast_config.input_ring_capacity_bytes_per_source =
+            static_cast<std::size_t>(
+                deployment.raw_ring_capacity_bytes);
+        fast_config.history = history_config;
+        for (std::size_t source = 0U;
+             source < deployment.sources.size(); ++source) {
+            fast_config.source_kinds[source] =
+                deployment.sources[source].kind;
+        }
+        const auto fast_error =
+            l2flow::runtime::RealtimeFastPlaneRuntimeV1::Create(
+                std::move(fast_config),
+                static_inputs->registry.get(),
+                &fast_plane);
+        if (fast_error != l2flow::runtime::
+                RealtimeFastPlaneCreateErrorV1::kNone ||
+            fast_plane == nullptr) {
+            if (diagnostic != nullptr) {
+                *diagnostic = "Fast Plane creation failed: " +
+                    std::string(l2flow::runtime::
+                        RealtimeFastPlaneCreateErrorNameV1(fast_error));
+            }
+            return false;
+        }
+        fast_capture_sink = fast_plane->capture_sink();
+    }
+
     l2flow::canonical::ClockEpochIdentityV1 clock_epoch{};
     clock_epoch.algorithm = 1U;
     clock_epoch.digest = static_inputs->clock_epoch.digest;
@@ -2638,9 +2691,12 @@ struct SourceAssemblyV1 final {
     l2flow::apps::ProductionServiceInputsV1 service_inputs{};
     service_inputs.registry = std::move(static_inputs->registry);
     service_inputs.history = std::move(history);
+    service_inputs.fast_plane = std::move(fast_plane);
     service_inputs.route_controller = std::move(route_controller);
     for (std::size_t source = 0U; source < assemblies.size(); ++source) {
         SourceAssemblyV1& assembly = assemblies[source];
+        assembly.raw_app_options.fast_capture_sink =
+            fast_capture_sink;
         auto raw_result = l2flow::ingress::
             RawExistingRouteProductionRuntimeFactoryV1::
                 ActivateFreshRegisteredAt(
@@ -2805,11 +2861,42 @@ private:
     bool blocked_ = false;
 };
 
-[[nodiscard]] bool AggregateFatal(
+[[nodiscard]] bool ServiceFatal(
     const ProductionServiceSnapshotV1& snapshot) noexcept {
     return snapshot.aggregate.state ==
                l2flow::runtime::ProductionAggregateStateV1::kFatal ||
            snapshot.aggregate.fatal_reason_code != 0U;
+}
+
+[[nodiscard]] bool FastPlaneShadowFatal(
+    const ProductionServiceSnapshotV1& snapshot) noexcept {
+    return snapshot.fast_plane_enabled && snapshot.fast_plane.fatal;
+}
+
+[[nodiscard]] bool FastPlaneTerminalParity(
+    const ProductionServiceSnapshotV1& snapshot,
+    const ProductionServiceStopResultV1& stop) noexcept {
+    if (!snapshot.fast_plane_enabled) {
+        return true;
+    }
+    if (!snapshot.fast_plane.stopped ||
+        !snapshot.fast_plane.clean_drain) {
+        return false;
+    }
+    for (std::size_t source = 0U;
+         source < snapshot.fast_plane.sources.size(); ++source) {
+        const auto& fast = snapshot.fast_plane.sources[source];
+        const auto& capture = stop.capture_evidence[source];
+        if (!capture.available ||
+            !fast.terminal_prefix_complete ||
+            fast.captured_records !=
+                capture.callback.captured_records ||
+            fast.last_captured_sequence !=
+                capture.callback.captured_ingress_sequence) {
+            return false;
+        }
+    }
+    return true;
 }
 
 [[nodiscard]] int StopForTermination(
@@ -3099,8 +3186,65 @@ void WriteProductionSnapshot(
         }
         output << (snapshot.capture_started[source] ? "true" : "false");
     }
+    const auto& fast = snapshot.fast_plane;
+    output << "],\"fast_plane\":{\"enabled\":"
+           << (snapshot.fast_plane_enabled ? "true" : "false")
+           << ",\"accepting\":" << (fast.accepting ? "true" : "false")
+           << ",\"stopped\":" << (fast.stopped ? "true" : "false")
+           << ",\"fatal\":" << (fast.fatal ? "true" : "false")
+           << ",\"clean_drain\":"
+           << (fast.clean_drain ? "true" : "false")
+           << ",\"sources\":[";
+    for (std::size_t source = 0U; source < fast.sources.size(); ++source) {
+        if (source != 0U) {
+            output.put(',');
+        }
+        const auto& value = fast.sources[source];
+        const auto& history = value.history_frontier;
+        output << "{\"source_slot\":" << source
+               << ",\"source_stream_id\":" << value.source_stream_id
+               << ",\"captured_records\":" << value.captured_records
+               << ",\"decoded_records\":" << value.decoded_records
+               << ",\"ignored_records\":" << value.ignored_records
+               << ",\"history_submissions\":"
+               << value.history_submissions
+               << ",\"history_backpressure_retries\":"
+               << value.history_backpressure_retries
+               << ",\"last_captured_sequence\":"
+               << value.last_captured_sequence
+               << ",\"last_processed_sequence\":"
+               << value.last_processed_sequence
+               << ",\"last_submitted_sequence\":"
+               << value.last_submitted_sequence
+               << ",\"ring_used_bytes\":" << value.ring_used_bytes
+               << ",\"ring_capacity_bytes\":"
+               << value.ring_capacity_bytes
+               << ",\"failure\":";
+        WriteJsonString(
+            output,
+            l2flow::runtime::RealtimeFastPlaneFailureNameV1(
+                value.failure));
+        output << ",\"failure_sequence\":" << value.failure_sequence
+               << ",\"worker_exited\":"
+               << (value.worker_exited ? "true" : "false")
+               << ",\"terminal_prefix_complete\":"
+               << (value.terminal_prefix_complete ? "true" : "false")
+               << ",\"history_frontier\":{\"submitted_ticket\":"
+               << history.submitted_ticket
+               << ",\"acknowledged_ticket\":"
+               << history.acknowledged_ticket
+               << ",\"submitted_source_sequence\":"
+               << history.submitted_source_sequence
+               << ",\"acknowledged_source_sequence\":"
+               << history.acknowledged_source_sequence
+               << ",\"completed_out_of_order\":"
+               << history.completed_out_of_order
+               << ",\"fatal\":"
+               << (history.fatal ? "true" : "false") << "}}";
+    }
+    output << "]}";
     const auto& aggregate = snapshot.aggregate;
-    output << "],\"aggregate\":{\"state\":";
+    output << ",\"aggregate\":{\"state\":";
     WriteJsonString(output, ProductionAggregateStateText(aggregate.state));
     output << ",\"worker_exited\":[";
     for (std::size_t source = 0U;
@@ -3219,12 +3363,15 @@ struct ProductionMonitorEvidenceV1 final {
     std::string evidence_path;
     std::string manifest_sha256;
     std::string sdk_library_path;
+    bool fast_plane_shadow = false;
     std::uint64_t active_start_monotonic_raw_ns = 0U;
     std::uint64_t active_start_realtime_ns = 0U;
     std::uint64_t monitor_end_monotonic_raw_ns = 0U;
     std::uint64_t monitor_end_realtime_ns = 0U;
     bool completed_window = false;
     bool fatal_observed = false;
+    bool fast_plane_fatal_observed = false;
+    bool fast_plane_terminal_parity = true;
     bool left_active = false;
     bool signal_wait_failed = false;
     bool clock_failed = false;
@@ -3247,7 +3394,7 @@ struct ProductionMonitorEvidenceV1 final {
         snapshot.aggregate.active_route_publication_uncertain ||
         snapshot.aggregate.fatal_route_published ||
         snapshot.aggregate.drain_route_revoked ||
-        AggregateFatal(snapshot)) {
+        ServiceFatal(snapshot)) {
         return false;
     }
     for (std::size_t source = 0U;
@@ -3348,6 +3495,8 @@ struct ProductionMonitorEvidenceV1 final {
     output << ",\"sdk_acceptance_policy\":"
               "\"operator_path_exists_and_is_regular_file_only\""
            << ",\"sdk_digest_is_acceptance_gate\":false"
+           << ",\"fast_plane_shadow\":"
+           << (evidence.fast_plane_shadow ? "true" : "false")
            << ",\"history_access\":\"in_process_only\""
            << ",\"latest_state_v1_wired\":false"
            << ",\"factor_runtime_wired\":false"
@@ -3371,6 +3520,10 @@ struct ProductionMonitorEvidenceV1 final {
            << (evidence.completed_window ? "true" : "false")
            << ",\"fatal_observed\":"
            << (evidence.fatal_observed ? "true" : "false")
+           << ",\"fast_plane_fatal_observed\":"
+           << (evidence.fast_plane_fatal_observed ? "true" : "false")
+           << ",\"fast_plane_terminal_parity\":"
+           << (evidence.fast_plane_terminal_parity ? "true" : "false")
            << ",\"left_active\":"
            << (evidence.left_active ? "true" : "false")
            << ",\"signal_wait_failed\":"
@@ -3645,6 +3798,8 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                 parsed.arguments.manifest_sha256);
             monitor_evidence.sdk_library_path =
                 loaded.deployment.sdk_library_path.string();
+            monitor_evidence.fast_plane_shadow =
+                parsed.arguments.fast_plane_shadow;
             monitor_evidence.samples.reserve(
                 static_cast<std::size_t>(parsed.arguments.run_seconds) + 1U);
         }
@@ -3672,6 +3827,7 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
         try {
             service_built = BuildProductionService(
                 loaded.deployment,
+                parsed.arguments.fast_plane_shadow,
                 &static_inputs,
                 &service,
                 &fail_stop_required,
@@ -3764,7 +3920,7 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
         ProductionServiceStopResultV1 concurrent_stop{};
         while (!start_done.load(std::memory_order_acquire)) {
             const ProductionServiceSnapshotV1 snapshot = service->Snapshot();
-            if (AggregateFatal(snapshot)) {
+            if (ServiceFatal(snapshot)) {
                 fatal_observed = true;
                 concurrent_stop = service->Stop();
                 stop_called = true;
@@ -3879,7 +4035,9 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                     monitor_evidence.active_start_realtime_ns,
                     snapshot,
                 });
-                if (AggregateFatal(snapshot)) {
+                monitor_evidence.fast_plane_fatal_observed =
+                    FastPlaneShadowFatal(snapshot);
+                if (ServiceFatal(snapshot)) {
                     monitor_evidence.fatal_observed = true;
                     monitor_evidence.outcome = "fatal_at_window_start";
                 } else if (!SnapshotIsAuthoritativelyActive(snapshot)) {
@@ -3896,6 +4054,9 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                    !monitor_evidence.signal_wait_failed &&
                    !monitor_evidence.completed_window) {
                 snapshot = service->Snapshot();
+                monitor_evidence.fast_plane_fatal_observed =
+                    monitor_evidence.fast_plane_fatal_observed ||
+                    FastPlaneShadowFatal(snapshot);
                 const std::uint64_t now =
                     PosixClockNow(CLOCK_MONOTONIC_RAW);
                 const std::uint64_t realtime_now =
@@ -3909,7 +4070,7 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                 }
                 const std::uint64_t elapsed =
                     now - monitor_evidence.active_start_monotonic_raw_ns;
-                if (AggregateFatal(snapshot)) {
+                if (ServiceFatal(snapshot)) {
                     monitor_evidence.fatal_observed = true;
                     monitor_evidence.outcome = "fatal_during_window";
                     monitor_evidence.samples.push_back(
@@ -3971,10 +4132,22 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
             }
             monitor_evidence.stop = service->Stop();
             monitor_evidence.post_stop_snapshot = service->Snapshot();
+            monitor_evidence.fast_plane_fatal_observed =
+                monitor_evidence.fast_plane_fatal_observed ||
+                FastPlaneShadowFatal(
+                    monitor_evidence.post_stop_snapshot);
+            monitor_evidence.fast_plane_terminal_parity =
+                FastPlaneTerminalParity(
+                    monitor_evidence.post_stop_snapshot,
+                    monitor_evidence.stop);
             if (monitor_evidence.completed_window &&
                 monitor_evidence.stop.ok()) {
                 monitor_evidence.outcome =
-                    "window_completed_and_route_stopped_cleanly";
+                    monitor_evidence.fast_plane_fatal_observed
+                        ? "window_completed_with_fast_plane_degraded_and_route_stopped_cleanly"
+                        : !monitor_evidence.fast_plane_terminal_parity
+                            ? "window_completed_with_fast_plane_terminal_mismatch"
+                            : "window_completed_and_route_stopped_cleanly";
             } else if (!monitor_evidence.stop.ok()) {
                 monitor_evidence.outcome =
                     "monitor_ended_but_production_stop_failed";
@@ -4001,7 +4174,9 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                 std::cerr << '\n';
             }
             if (monitor_evidence.completed_window &&
-                monitor_evidence.stop.ok() && evidence_written) {
+                monitor_evidence.stop.ok() && evidence_written &&
+                !monitor_evidence.fast_plane_fatal_observed &&
+                monitor_evidence.fast_plane_terminal_parity) {
                 std::cout << "production route completed "
                           << parsed.arguments.run_seconds
                           << " seconds of authoritative ACTIVE monitoring, "
@@ -4009,6 +4184,8 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                 return 0;
             }
             if (monitor_evidence.fatal_observed ||
+                monitor_evidence.fast_plane_fatal_observed ||
+                !monitor_evidence.fast_plane_terminal_parity ||
                 monitor_evidence.left_active ||
                 !monitor_evidence.stop.ok()) {
                 std::cerr << "production bounded monitor failed: "
@@ -4019,10 +4196,17 @@ int RunProductionRouterV1(int argc, const char* const argv[]) noexcept {
                       << monitor_evidence.outcome << '\n';
             return 70;
         }
+        bool fast_plane_degraded_reported = false;
         for (;;) {
             const ProductionServiceSnapshotV1 snapshot = service->Snapshot();
-            if (AggregateFatal(snapshot)) {
+            if (ServiceFatal(snapshot)) {
                 return StopForTermination(service.get(), true, false);
+            }
+            if (!fast_plane_degraded_reported &&
+                FastPlaneShadowFatal(snapshot)) {
+                fast_plane_degraded_reported = true;
+                std::cerr << "Fast Plane shadow degraded; the legacy "
+                             "production route remains ACTIVE\n";
             }
             if (snapshot.state != ProductionServiceStateV1::kActive) {
                 const ProductionServiceStopResultV1 stopped = service->Stop();

@@ -1176,6 +1176,8 @@ public:
                         stores[shard]->Append(std::move(*envelope));
                     if (append_error != StoreAppendError::kNone ||
                         !trackers[source]->Acknowledge(ticket, sequence)) {
+                        any_source_fatal.store(
+                            true, std::memory_order_release);
                         trackers[source]->MarkFatal();
                     }
                 }
@@ -1243,6 +1245,7 @@ public:
     std::array<std::atomic<bool>, kInstrumentHistorySourceCountV1>
         source_admission_open{true, true, true, true};
     std::atomic<bool> accepting{true};
+    std::atomic<bool> any_source_fatal{false};
     bool stopped = false;
 };
 
@@ -1389,9 +1392,14 @@ void InstrumentHistoryRuntimeV1::MarkSourceFatal(
     }
     std::lock_guard<std::mutex> admission_lock(
         impl_->admission_mutexes[source_slot]);
+    impl_->any_source_fatal.store(true, std::memory_order_release);
     impl_->source_admission_open[source_slot].store(
         false, std::memory_order_release);
     impl_->trackers[source_slot]->MarkFatal();
+}
+
+bool InstrumentHistoryRuntimeV1::AnySourceFatal() const noexcept {
+    return impl_->any_source_fatal.load(std::memory_order_acquire);
 }
 
 InstrumentHistoryQueryErrorV1 InstrumentHistoryRuntimeV1::Latest(
@@ -1421,6 +1429,40 @@ InstrumentHistoryQueryErrorV1 InstrumentHistoryRuntimeV1::Latest(
     const auto error = impl_->stores[shard]->Latest(
         instrument_id, source_slot, lane,
         frontier.acknowledged_source_sequence, &handle);
+    if (impl_->trackers[source_slot]->Snapshot().fatal) {
+        return InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    if (error == InstrumentHistoryQueryErrorV1::kNone) {
+        *output = InstrumentHistoryRecordHandleV1(
+            std::move(handle.owner), handle.record);
+    }
+    return error;
+}
+
+InstrumentHistoryQueryErrorV1
+InstrumentHistoryRuntimeV1::LatestProvisional(
+    std::uint32_t instrument_id,
+    std::uint8_t source_slot,
+    InstrumentHistoryLaneV1 lane,
+    InstrumentHistoryRecordHandleV1* output) const noexcept {
+    if (output == nullptr) {
+        return InstrumentHistoryQueryErrorV1::kNullOutput;
+    }
+    *output = InstrumentHistoryRecordHandleV1{};
+    if (instrument_id == 0U ||
+        source_slot >= kInstrumentHistorySourceCountV1 ||
+        !ValidLane(lane)) {
+        return InstrumentHistoryQueryErrorV1::kInvalidArgument;
+    }
+    const std::uint8_t shard = static_cast<std::uint8_t>(
+        instrument_id % kInstrumentHistoryLogicalShardCountV1);
+    if (impl_->trackers[source_slot]->Snapshot().fatal) {
+        return InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    InstrumentShardStore::StoredHandle handle;
+    const auto error = impl_->stores[shard]->Latest(
+        instrument_id, source_slot, lane,
+        std::numeric_limits<std::uint64_t>::max(), &handle);
     if (impl_->trackers[source_slot]->Snapshot().fatal) {
         return InstrumentHistoryQueryErrorV1::kSourceFatal;
     }
@@ -1462,6 +1504,53 @@ InstrumentHistoryQueryErrorV1 InstrumentHistoryRuntimeV1::Tail(
     const auto error = impl_->stores[shard]->Tail(
         instrument_id, source_slot, lane,
         frontier.acknowledged_source_sequence, count, &handles);
+    if (impl_->trackers[source_slot]->Snapshot().fatal) {
+        return InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    if (error != InstrumentHistoryQueryErrorV1::kNone) {
+        return error;
+    }
+    try {
+        output->reserve(handles.size());
+        for (auto& handle : handles) {
+            output->push_back(InstrumentHistoryRecordHandleV1(
+                std::move(handle.owner), handle.record));
+        }
+        return InstrumentHistoryQueryErrorV1::kNone;
+    } catch (...) {
+        output->clear();
+        return InstrumentHistoryQueryErrorV1::kResourceExhausted;
+    }
+}
+
+InstrumentHistoryQueryErrorV1
+InstrumentHistoryRuntimeV1::TailProvisional(
+    std::uint32_t instrument_id,
+    std::uint8_t source_slot,
+    InstrumentHistoryLaneV1 lane,
+    std::size_t count,
+    std::vector<InstrumentHistoryRecordHandleV1>* output) const noexcept {
+    if (output == nullptr) {
+        return InstrumentHistoryQueryErrorV1::kNullOutput;
+    }
+    output->clear();
+    if (instrument_id == 0U ||
+        source_slot >= kInstrumentHistorySourceCountV1 ||
+        !ValidLane(lane) || count == 0U) {
+        return InstrumentHistoryQueryErrorV1::kInvalidArgument;
+    }
+    if (count > impl_->config.maximum_records_per_query) {
+        return InstrumentHistoryQueryErrorV1::kQueryLimitExceeded;
+    }
+    const std::uint8_t shard = static_cast<std::uint8_t>(
+        instrument_id % kInstrumentHistoryLogicalShardCountV1);
+    if (impl_->trackers[source_slot]->Snapshot().fatal) {
+        return InstrumentHistoryQueryErrorV1::kSourceFatal;
+    }
+    std::vector<InstrumentShardStore::StoredHandle> handles;
+    const auto error = impl_->stores[shard]->Tail(
+        instrument_id, source_slot, lane,
+        std::numeric_limits<std::uint64_t>::max(), count, &handles);
     if (impl_->trackers[source_slot]->Snapshot().fatal) {
         return InstrumentHistoryQueryErrorV1::kSourceFatal;
     }

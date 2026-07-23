@@ -30,6 +30,8 @@ struct RawProductionCaptureBindingV1 final {
     l2flow::common::Identity128 writer_instance{};
     std::uint64_t source_generation = 0U;
     l2flow::canonical::SourceFrontierPageV1* source_frontier = nullptr;
+    // Runtime-only composition identity. It is never persisted or hashed.
+    void* fast_capture_context = nullptr;
 };
 
 enum class RawProductionRuntimeBlockerV1

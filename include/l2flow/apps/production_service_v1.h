@@ -5,6 +5,7 @@
 #include "l2flow/market/instrument_registry.h"
 #include "l2flow/route/production_route_controller_v1.h"
 #include "l2flow/runtime/production_aggregate_runtime_v1.h"
+#include "l2flow/runtime/realtime_fast_plane_v1.h"
 
 #include <array>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace l2flow::apps {
 
@@ -35,6 +37,7 @@ struct ProductionCaptureBindingV1 final {
     l2flow::common::Identity128 writer_instance{};
     std::uint64_t source_generation = 0U;
     const l2flow::canonical::SourceFrontierPageV1* source_frontier = nullptr;
+    const void* fast_capture_context = nullptr;
 
     [[nodiscard]] friend constexpr bool operator==(
         const ProductionCaptureBindingV1&,
@@ -143,6 +146,9 @@ struct ProductionServiceConfigV1 final {
 struct ProductionServiceInputsV1 final {
     std::unique_ptr<l2flow::market::InstrumentRegistryV1> registry;
     std::unique_ptr<l2flow::market::InstrumentHistoryRuntimeV1> history;
+    // Optional independent shadow/canary history. It never submits into the
+    // authoritative history above.
+    std::unique_ptr<l2flow::runtime::RealtimeFastPlaneRuntimeV1> fast_plane;
     std::unique_ptr<l2flow::route::ProductionRouteControllerV1>
         route_controller;
     std::array<std::unique_ptr<ProductionSourceLifetimeV1>,
@@ -170,6 +176,7 @@ enum class ProductionServiceCreateErrorV1 : std::uint8_t {
     kInvalidRouteManifest,
     kRegistryIdentityMismatch,
     kHistorySourceSetMismatch,
+    kFastPlaneBindingMismatch,
     kPipelineSourceMismatch,
     kCaptureBindingMismatch,
     kAggregateCreateFailed,
@@ -254,6 +261,8 @@ struct ProductionServiceStopResultV1 final {
 struct ProductionServiceSnapshotV1 final {
     ProductionServiceStateV1 state = ProductionServiceStateV1::kFailed;
     std::array<bool, kProductionServiceSourceCountV1> capture_started{};
+    bool fast_plane_enabled = false;
+    l2flow::runtime::RealtimeFastPlaneSnapshotV1 fast_plane{};
     l2flow::runtime::ProductionAggregateSnapshotV1 aggregate{};
 };
 
@@ -294,6 +303,23 @@ public:
     // revocation and worker shutdown remain exclusively owned by this
     // service; factor code cannot become a second SPSC producer.
     [[nodiscard]] const l2flow::market::InstrumentHistoryRuntimeV1& history()
+        const noexcept;
+    // Provisional decoded Fast Plane data. The service facade binds every
+    // query to a healthy Fast generation and an ACTIVE legacy route. It
+    // returns NotFound when Fast Plane is disabled and SourceFatal when the
+    // serving generation is no longer usable.
+    [[nodiscard]] l2flow::market::InstrumentHistoryQueryErrorV1 FastLatest(
+        std::uint32_t instrument_id,
+        std::uint8_t source_slot,
+        l2flow::market::InstrumentHistoryLaneV1 lane,
+        l2flow::market::InstrumentHistoryRecordHandleV1* output)
+        const noexcept;
+    [[nodiscard]] l2flow::market::InstrumentHistoryQueryErrorV1 FastTail(
+        std::uint32_t instrument_id,
+        std::uint8_t source_slot,
+        l2flow::market::InstrumentHistoryLaneV1 lane,
+        std::size_t count,
+        std::vector<l2flow::market::InstrumentHistoryRecordHandleV1>* output)
         const noexcept;
     [[nodiscard]] const l2flow::market::InstrumentRegistryV1& registry()
         const noexcept;

@@ -189,6 +189,7 @@ struct ProductionRouterArgumentsV1 final {
     std::uint32_t run_seconds = 0U;
     std::filesystem::path evidence_json;
     bool check_only = false;
+    bool fast_plane_shadow = false;
     bool show_help = false;
 };
 

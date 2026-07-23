@@ -473,6 +473,7 @@ set(L2FLOW_PRODUCTION_SOURCES
     src/route/production_route_owner_lease_v1.cpp
     src/route/production_route_posix_store_v1.cpp
     src/route/production_route_v1.cpp
+    src/runtime/realtime_fast_plane_v1.cpp
     src/runtime/production_aggregate_runtime_v1.cpp
     src/runtime/production_source_pipeline_v1.cpp)
 
@@ -1027,6 +1028,9 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_production_test(
         test_production_sdk_fanout
         tests/test_production_sdk_fanout.cpp)
+    l2flow_add_production_test(
+        test_realtime_fast_plane_v1
+        tests/test_realtime_fast_plane_v1.cpp)
     target_compile_definitions(
         test_production_deployment_v1
         PRIVATE
@@ -1367,6 +1371,9 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_phase_test(
         test_phase1_callback
         tests/test_phase1_callback.cpp)
+    l2flow_add_phase_test(
+        test_phase1_fast_capture_hook_v1
+        tests/test_phase1_fast_capture_hook_v1.cpp)
     l2flow_add_phase_test(
         test_phase1_callback_stress
         tests/test_phase1_callback_stress.cpp)

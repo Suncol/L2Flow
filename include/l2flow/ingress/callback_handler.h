@@ -2,6 +2,7 @@
 
 #include "l2flow/ingress/byte_ring.h"
 #include "l2flow/ingress/capture_clock.h"
+#include "l2flow/ingress/fast_capture_sink_v1.h"
 #include "l2flow/ingress/capture_metrics.h"
 #include "l2flow/ops/fatal_latch.h"
 #include "l2flow/canonical/source_frontier_v1.h"
@@ -27,6 +28,10 @@ struct CallbackHandlerConfig {
     std::uint64_t frontier_generation = 0U;
     std::chrono::nanoseconds source_frontier_busy_timeout =
         l2flow::canonical::kSourceFrontierDefaultBusyTimeoutV1;
+    // Runtime-only shadow Fast Plane hook. It is invoked only after the Raw
+    // ring and, when configured, the matching SourceFrontier capture have
+    // committed successfully.
+    FastCaptureSinkRefV1 fast_capture_sink{};
 };
 
 // The four vendor callbacks are intentionally identical entry points into one
@@ -67,7 +72,8 @@ private:
         const datayes::mdl::MDLMessage* message) noexcept;
     [[nodiscard]] bool CaptureMessageImpl(
         const datayes::mdl::MDLMessage* message,
-        std::uint64_t* captured_sequence);
+        l2flow::canonical::SourceFrontierCallbackGuardV1*
+            frontier_callback);
 
     CallbackHandlerConfig config_;
     ByteRing& ring_;

@@ -142,7 +142,8 @@ CallbackHandler::CallbackHandler(CallbackHandlerConfig config,
         (!frontier_enabled &&
          (!l2flow::common::IsZeroIdentity(
               config_.frontier_writer_instance) ||
-          config_.frontier_generation != 0U))) {
+          config_.frontier_generation != 0U)) ||
+        !config_.fast_capture_sink.valid()) {
         throw std::invalid_argument("invalid callback handler configuration");
     }
     if (frontier_enabled) {
@@ -244,6 +245,9 @@ void CallbackHandler::CaptureMessage(
     // particular, a losing callback must not read the sequence or ring.
     if (callback_gate_.test_and_set(std::memory_order_acquire)) {
         metrics_.IncrementReentry();
+        config_.fast_capture_sink.Invalidate(
+            config_.source_stream_id,
+            captured_sequence_.load(std::memory_order_acquire));
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::CALLBACK_REENTRY));
         if (config_.source_frontier != nullptr) {
@@ -268,6 +272,9 @@ void CallbackHandler::CaptureMessage(
         return;
     }
     if (fatal_.tripped()) {
+        config_.fast_capture_sink.Invalidate(
+            config_.source_stream_id,
+            captured_sequence_.load(std::memory_order_acquire));
         metrics_.IncrementAfterFatal();
         return;
     }
@@ -283,6 +290,9 @@ void CallbackHandler::CaptureMessage(
             config_.source_frontier_busy_timeout);
         if (frontier_callback->error() !=
             l2flow::canonical::SourceFrontierErrorV1::kNone) {
+            config_.fast_capture_sink.Invalidate(
+                config_.source_stream_id,
+                captured_sequence_.load(std::memory_order_acquire));
             static_cast<void>(fatal_.trip(
                 l2flow::ops::FatalReason::SOURCE_FRONTIER_FAILURE));
             // This may fail when the identity itself changed, but it is safe
@@ -298,18 +308,21 @@ void CallbackHandler::CaptureMessage(
         }
     }
     try {
-        std::uint64_t captured_sequence = 0U;
-        if (!CaptureMessageImpl(message, &captured_sequence)) {
-            return;
-        }
-        if (frontier_callback.has_value() &&
-            frontier_callback->CompleteCaptured(captured_sequence) !=
-                l2flow::canonical::SourceFrontierErrorV1::kNone) {
-            static_cast<void>(fatal_.trip(
-                l2flow::ops::FatalReason::SOURCE_FRONTIER_FAILURE));
+        const bool captured = CaptureMessageImpl(
+            message,
+            frontier_callback.has_value()
+                ? &*frontier_callback
+                : nullptr);
+        if (!captured && fatal_.tripped()) {
+            config_.fast_capture_sink.Invalidate(
+                config_.source_stream_id,
+                captured_sequence_.load(std::memory_order_acquire));
         }
     } catch (...) {
         metrics_.IncrementException();
+        config_.fast_capture_sink.Invalidate(
+            config_.source_stream_id,
+            captured_sequence_.load(std::memory_order_acquire));
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::CALLBACK_EXCEPTION));
     }
@@ -317,8 +330,9 @@ void CallbackHandler::CaptureMessage(
 
 bool CallbackHandler::CaptureMessageImpl(
     const datayes::mdl::MDLMessage* message,
-    std::uint64_t* captured_sequence) {
-    if (captured_sequence == nullptr || message == nullptr) {
+    l2flow::canonical::SourceFrontierCallbackGuardV1*
+        frontier_callback) {
+    if (message == nullptr) {
         metrics_.IncrementInvalid(InvalidMessageReason::NullMessage);
         static_cast<void>(
             fatal_.trip(l2flow::ops::FatalReason::NULL_MESSAGE));
@@ -442,7 +456,26 @@ bool CallbackHandler::CaptureMessageImpl(
         head.message_size(),
         metadata.ingress_sequence,
         framed_record_bytes);
-    *captured_sequence = metadata.ingress_sequence;
+    if (frontier_callback != nullptr &&
+        frontier_callback->CompleteCaptured(metadata.ingress_sequence) !=
+            l2flow::canonical::SourceFrontierErrorV1::kNone) {
+        config_.fast_capture_sink.Invalidate(
+            config_.source_stream_id,
+            metadata.ingress_sequence);
+        static_cast<void>(fatal_.trip(
+            l2flow::ops::FatalReason::SOURCE_FRONTIER_FAILURE));
+        return false;
+    }
+    if (config_.fast_capture_sink.enabled()) {
+        // Canary-only publication. The Raw ring, SourceFrontier, sequence and
+        // capture metrics above remain authoritative even when the
+        // independent Fast Plane queue rejects this copy.
+        static_cast<void>(config_.fast_capture_sink.PublishCopy(
+            metadata,
+            std::span<const std::byte, l2flow::sdk::kVendorHeadBytes>(
+                head_bytes),
+            body));
+    }
     return true;
 }
 

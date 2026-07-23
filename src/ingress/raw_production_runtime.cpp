@@ -88,6 +88,7 @@ private:
     result.writer_instance = options.frontier_writer_instance;
     result.source_generation = options.frontier_generation;
     result.source_frontier = options.source_frontier;
+    result.fast_capture_context = options.fast_capture_sink.context;
     return result;
 }
 

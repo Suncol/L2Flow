@@ -13,6 +13,10 @@
 #include <type_traits>
 #include <vector>
 
+namespace l2flow::runtime {
+class RealtimeFastPlaneRuntimeV1;
+}
+
 namespace l2flow::market {
 
 inline constexpr std::size_t kInstrumentHistorySourceCountV1 = 4U;
@@ -327,6 +331,7 @@ public:
 
     [[nodiscard]] InstrumentHistorySourceFrontierV1 Frontier(
         std::uint8_t source_slot) const noexcept;
+    [[nodiscard]] bool AnySourceFatal() const noexcept;
 
     // Captures all successful submissions preceding this call for one source.
     // WaitForBarrier succeeds only after that dense ticket and every earlier
@@ -390,6 +395,22 @@ public:
         const noexcept;
 
 private:
+    friend class l2flow::runtime::RealtimeFastPlaneRuntimeV1;
+
+    // Provisional append-local visibility reserved for the Fast Plane
+    // generation-guarded facade. The authoritative history API above cannot
+    // bypass its source-global acknowledged prefix.
+    [[nodiscard]] InstrumentHistoryQueryErrorV1 LatestProvisional(
+        std::uint32_t instrument_id,
+        std::uint8_t source_slot,
+        InstrumentHistoryLaneV1 lane,
+        InstrumentHistoryRecordHandleV1* output) const noexcept;
+    [[nodiscard]] InstrumentHistoryQueryErrorV1 TailProvisional(
+        std::uint32_t instrument_id,
+        std::uint8_t source_slot,
+        InstrumentHistoryLaneV1 lane,
+        std::size_t count,
+        std::vector<InstrumentHistoryRecordHandleV1>* output) const noexcept;
     class Impl;
     explicit InstrumentHistoryRuntimeV1(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;

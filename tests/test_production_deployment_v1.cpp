@@ -262,11 +262,13 @@ void TestCli(TestContext* test) {
         "/run/l2flow/deployment",
         "--manifest-sha256",
         digest,
+        "--fast-plane-shadow",
         "--check",
     };
     const auto parsed = apps::ParseProductionRouterArgumentsV1(valid);
     CHECK(test, parsed.ok);
     CHECK(test, parsed.arguments.check_only);
+    CHECK(test, parsed.arguments.fast_plane_shadow);
     CHECK(test,
           parsed.arguments.deployment_directory ==
               "/run/l2flow/deployment");
@@ -350,6 +352,7 @@ void TestCli(TestContext* test) {
           usage.find("configs/production-v1.example.tsv") !=
               std::string::npos);
     CHECK(test, usage.find("not deployment sizing") != std::string::npos);
+    CHECK(test, usage.find("--fast-plane-shadow") != std::string::npos);
     CHECK(test, usage.find("sha256sum production-v1.tsv") !=
                     std::string::npos);
 }

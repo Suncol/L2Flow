@@ -246,6 +246,14 @@ The deployment entry reads only the hash-pinned fixed manifest
   --manifest-sha256 <64-lowercase-hex>
 ```
 
+For an opt-in in-memory callback-to-instrument canary, add
+`--fast-plane-shadow`. It runs four source-order decoder workers and a private
+multi-worker history without waiting for WAL/Canonical, while a Fast failure
+remains isolated from the formal route. See
+[`Realtime Fast Plane V1`](docs/decisions/realtime-fast-plane-v1.md) for its
+provisional query contract, resource budget, live-test command and evidence
+criteria.
+
 Start from [`configs/production-v1.example.tsv`](configs/production-v1.example.tsv),
 copy it to the deployment directory as `production-v1.tsv`, replace every
 placeholder and every sample path, name, hash, identity, date, device,

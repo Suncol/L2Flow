@@ -1121,6 +1121,18 @@ public:
         return result;
     }
 
+    [[nodiscard]] bool AuthoritativeRouteServing() const noexcept {
+        return state.load(std::memory_order_acquire) ==
+                   ProductionAggregateStateV1::kRunning &&
+               active_route_published.load(std::memory_order_acquire) &&
+               !active_route_publication_uncertain.load(
+                   std::memory_order_acquire) &&
+               !global_fatal.load(std::memory_order_acquire) &&
+               !fatal_route_published.load(std::memory_order_acquire) &&
+               !drain_route_revoked.load(std::memory_order_acquire) &&
+               !stop_requested.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] ProductionAggregateBeginDrainResultV1
     BeginDrain() noexcept {
         ProductionAggregateBeginDrainResultV1 result{};
@@ -2148,6 +2160,11 @@ ProductionAggregateCreateErrorV1 ProductionAggregateRuntimeV1::Create(
 ProductionAggregateSnapshotV1 ProductionAggregateRuntimeV1::Snapshot()
     const noexcept {
     return impl_->Snapshot();
+}
+
+bool ProductionAggregateRuntimeV1::AuthoritativeRouteServing()
+    const noexcept {
+    return impl_->AuthoritativeRouteServing();
 }
 
 ProductionAggregateBeginDrainResultV1
