@@ -128,7 +128,13 @@ for the cursor lifetime.
   terminal; reversed or out-of-universe ranges are rejected.
 
 `ReadBatch` writes into caller-owned pointer storage and rejects a batch above
-`maximum_records_per_batch`, whose absolute limit is 1,048,576.
+`maximum_records_per_batch`, whose absolute limit is 1,048,576. That value is
+an API/work upper bound, not a request to fill every call. Historical readers
+should use a smaller working page and consume it immediately; the acceptance
+probe defaults its actual span to 1,024 records while retaining a 65,536-record
+Store upper bound. If an existing deployment configures a lower Store upper
+bound and omits the new scan-page option, the caller page is capped to that
+lower value.
 
 For N visible records, a full universe drain performs O(N) record work and
 uses O(batch) caller storage. It does not allocate a second N-record result.
@@ -218,8 +224,47 @@ coverage is part of the service contract. A same-day restart cannot restore
 that claim.
 
 `accept-realtime-pipeline` uses the same capacities, rejects lost or partial
-coverage, drains the final universe cursor in caller-owned batches, validates
-record ordering and the complete four-source watermark, and reports
-`full_scan_records`, `full_scan_ns`, and scan records per second. Promotion
+coverage, drains the final universe in caller-owned batches, validates record
+ordering and the complete four-source watermark, and reports
+`full_scan_records`, `full_scan_ns`, scan records per second, the actual scan
+page, CPU placement, per-range timing, event-kind counts, and ingress
+sum/xor fingerprints. `scan_partition_ns` reports the O(instrument-count)
+record-balancing pass separately; `full_scan_ns` covers reader launch through
+join, and `scan_total_ns` is their end-to-end sum. These fields measure
+full-universe throughput; per-Instrument full-history p99/p99.9 must be
+collected in a separate fresh-process run and must not be inferred from
+per-shard elapsed time.
+
+The Store limit and caller working page are deliberately separate:
+
+```bash
+taskset -c 0-31,64-95 ./build/accept-realtime-pipeline \
+  ... \
+  --instrument-store-workers 4 \
+  --intraday-store-chunk-records 1024 \
+  --intraday-store-batch-records 65536 \
+  --intraday-scan-batch-records 1024 \
+  --intraday-scan-workers 1 \
+  --intraday-reader-cpus 0
+```
+
+Affinity is applied inside the final reader thread, after the pipeline has
+stopped. It therefore cannot be inherited by SDK, decoder, or Store workers.
+The outer `taskset` mask should stay within one NUMA node; select one logical
+CPU from each intended physical core and exclude its SMT sibling when strict
+physical-core isolation is required. If `--intraday-reader-cpus` is omitted,
+the probe uses the first distinct CPUs in its inherited mask.
+
+For total-universe wall time, use 4--8 readers over record-balanced,
+non-overlapping ordinal ranges, with one CPU per reader:
+
+```bash
+--intraday-scan-workers 4 --intraday-reader-cpus 0,4,8,12
+```
+
+Run each A/B point in a fresh process. First compare actual scan pages
+`512/1024/4096/8192` with Store maximum batch unchanged, then compare chunk
+capacity `1024/4096`, and finally Store workers `4/8`. Keep the feed window,
+registry, hard caps, CPU/NUMA mask, and reader CPUs identical. Promotion
 requires an actual full-session run; an earlier short run that measured a
 different retention contract is not sufficient evidence.

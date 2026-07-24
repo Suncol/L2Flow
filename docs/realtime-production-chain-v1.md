@@ -366,11 +366,15 @@ policy, numeric bounds, and execution-time bound.
 `SummaryAt` is the O(I) latest-only path for factor work. Record cursors are
 the historical path: a full drain over N records is O(N), while each
 `ReadBatch` uses O(batch) caller-owned pointer storage. Cursor construction and
-draining must never materialize a second N-record result. Large drains can use
-independent `OpenUniverseRangeCursor` instances over non-overlapping half-open
+draining must never materialize a second N-record result. The configured Store
+batch value is an upper bound; the acceptance consumer uses 1,024-record pages
+by default and consumes them immediately. Large drains can use independent
+`OpenUniverseRangeCursor` instances over non-overlapping half-open
 instrument-ordinal ranges. If no range is truncated by its per-cursor
 `maximum_records` setting, joining their outputs in ordinal order reproduces
-the full-universe ordering exactly.
+the full-universe ordering exactly. Acceptance reader affinity is applied only
+inside post-stop scan threads; 4--8 range readers each require a distinct CPU
+from the inherited, operator-selected NUMA-local mask.
 
 A factor retains its exact input store generation, and a cursor retains its
 generation. Those handles can pin the session, chunks, and decoded record

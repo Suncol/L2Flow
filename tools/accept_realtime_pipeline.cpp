@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -63,6 +64,11 @@ struct Options final {
     std::uint64_t intraday_store_memory_bytes = 0U;
     std::uint32_t intraday_store_chunk_records = 1024U;
     std::uint32_t intraday_store_batch_records = 64U * 1024U;
+    std::uint32_t intraday_scan_batch_records = 1024U;
+    std::uint32_t intraday_scan_workers = 1U;
+    std::vector<std::uint32_t> intraday_reader_cpus;
+    bool intraday_scan_batch_records_set = false;
+    bool intraday_reader_cpus_set = false;
     bool intraday_store_from_open = false;
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
@@ -108,6 +114,23 @@ struct AcceptanceState final {
     std::uint64_t universe_rows_checked = 0U;
     std::uint64_t intraday_full_scan_records = 0U;
     std::uint64_t intraday_full_scan_ns = 0U;
+    std::uint64_t intraday_scan_partition_ns = 0U;
+    std::uint64_t intraday_scan_total_ns = 0U;
+    std::uint64_t intraday_scan_ingress_sum = 0U;
+    std::uint64_t intraday_scan_ingress_xor = 0U;
+    std::uint32_t intraday_scan_last_instrument_id = 0U;
+    std::uint64_t intraday_scan_last_ingress_sequence = 0U;
+    std::array<std::uint64_t, kEventKindCount>
+        intraday_scan_kind_counts{};
+    std::vector<std::uint32_t> intraday_reader_cpus;
+    std::vector<std::size_t> intraday_scan_ordinal_begins;
+    std::vector<std::size_t> intraday_scan_ordinal_ends;
+    std::vector<std::uint64_t> intraday_scan_shard_records;
+    std::vector<std::uint64_t> intraday_scan_shard_ns;
+    std::vector<std::uint32_t>
+        intraday_scan_shard_last_instrument_ids;
+    std::vector<std::uint64_t>
+        intraday_scan_shard_last_ingress_sequences;
     std::uint64_t updated_heads = 0U;
     std::uint64_t event_time_samples = 0U;
     std::array<bool, kEventKindCount> event_kinds_seen{};
@@ -201,6 +224,46 @@ void Fail(AcceptanceState* state, std::string message) {
     return true;
 }
 
+[[nodiscard]] bool ParseCpuList(
+    std::string_view text,
+    std::vector<std::uint32_t>* output,
+    std::string* error) {
+    if (output == nullptr || error == nullptr || text.empty()) {
+        return false;
+    }
+    std::vector<std::uint32_t> parsed;
+    std::size_t begin = 0U;
+    for (;;) {
+        const std::size_t comma = text.find(',', begin);
+        const std::size_t end =
+            comma == std::string_view::npos ? text.size() : comma;
+        const std::string_view token = text.substr(begin, end - begin);
+        std::uint32_t cpu = 0U;
+        if (token.empty() || !ParseU32(token, &cpu) ||
+            cpu >= static_cast<std::uint32_t>(CPU_SETSIZE)) {
+            *error =
+                "--intraday-reader-cpus must be a comma-separated list "
+                "of CPU IDs below CPU_SETSIZE";
+            return false;
+        }
+        if (std::find(parsed.begin(), parsed.end(), cpu) != parsed.end()) {
+            *error = "--intraday-reader-cpus rejects duplicate CPU IDs";
+            return false;
+        }
+        parsed.push_back(cpu);
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        begin = comma + 1U;
+        if (begin == text.size()) {
+            *error = "--intraday-reader-cpus rejects an empty CPU ID";
+            return false;
+        }
+    }
+    *output = std::move(parsed);
+    return true;
+}
+
 [[nodiscard]] bool SafeFileName(std::string_view value) noexcept {
     return !value.empty() && value != "." && value != ".." &&
            value.find('/') == std::string_view::npos &&
@@ -236,7 +299,15 @@ void PrintUsage(std::ostream& output) {
         << "  --intraday-store-chunk-records N\n"
         << "                                1..65536, default 1024\n"
         << "  --intraday-store-batch-records N\n"
-        << "                                1..1048576, default 65536\n";
+        << "                                Store ReadBatch upper bound; "
+           "1..1048576, default 65536\n"
+        << "  --intraday-scan-batch-records N\n"
+        << "                                actual final-scan page; "
+           "1..Store upper bound, default min(1024, Store upper bound)\n"
+        << "  --intraday-scan-workers N     independent ordinal-range readers; "
+           "1..256, default 1\n"
+        << "  --intraday-reader-cpus LIST   one allowed CPU per scan worker; "
+           "default first allowed CPUs\n";
 }
 
 [[nodiscard]] bool TakeValue(
@@ -378,6 +449,25 @@ void PrintUsage(std::ostream& output) {
                     "--intraday-store-batch-records must be 1..1048576";
                 return false;
             }
+        } else if (option == "--intraday-scan-batch-records") {
+            if (!ParseU32(
+                    value, &parsed.intraday_scan_batch_records) ||
+                parsed.intraday_scan_batch_records == 0U ||
+                static_cast<std::size_t>(
+                    parsed.intraday_scan_batch_records) >
+                    market::
+                        kIntradayInstrumentStoreMaximumBatchRecordsV1) {
+                *error =
+                    "--intraday-scan-batch-records must be 1..1048576";
+                return false;
+            }
+            parsed.intraday_scan_batch_records_set = true;
+        } else if (option == "--intraday-reader-cpus") {
+            if (!ParseCpuList(
+                    value, &parsed.intraday_reader_cpus, error)) {
+                return false;
+            }
+            parsed.intraday_reader_cpus_set = true;
         } else {
             std::uint32_t number = 0U;
             if (!ParseU32(value, &number) || number == 0U) {
@@ -394,6 +484,8 @@ void PrintUsage(std::ostream& output) {
                 parsed.instrument_store_workers = number;
             } else if (option == "--acquire-repetitions") {
                 parsed.acquire_repetitions = number;
+            } else if (option == "--intraday-scan-workers") {
+                parsed.intraday_scan_workers = number;
             } else {
                 *error = "unknown option: " + std::string(option);
                 return false;
@@ -416,8 +508,30 @@ void PrintUsage(std::ostream& output) {
         parsed.generation_interval_ms > 60'000U ||
         parsed.generation_timeout_ms > 600'000U ||
         parsed.instrument_store_workers > 256U ||
-        parsed.acquire_repetitions > 10'000U) {
+        parsed.acquire_repetitions > 10'000U ||
+        parsed.intraday_scan_workers > 256U) {
         *error = "required option missing or option is out of range";
+        return false;
+    }
+    if (!parsed.intraday_scan_batch_records_set &&
+        parsed.intraday_scan_batch_records >
+            parsed.intraday_store_batch_records) {
+        parsed.intraday_scan_batch_records =
+            parsed.intraday_store_batch_records;
+    } else if (parsed.intraday_scan_batch_records >
+               parsed.intraday_store_batch_records) {
+        *error =
+            "--intraday-scan-batch-records cannot exceed "
+            "--intraday-store-batch-records";
+        return false;
+    }
+    if (parsed.intraday_reader_cpus_set &&
+        parsed.intraday_reader_cpus.size() !=
+            static_cast<std::size_t>(
+                parsed.intraday_scan_workers)) {
+        *error =
+            "--intraday-reader-cpus must contain exactly one CPU per "
+            "--intraday-scan-workers";
         return false;
     }
     if (!parsed.intraday_store_maximum_records_set ||
@@ -471,6 +585,81 @@ void PrintUsage(std::ostream& output) {
         return false;
     }
     *output = std::move(value);
+    return true;
+}
+
+[[nodiscard]] bool ResolveReaderCpus(
+    const Options& options,
+    std::vector<std::uint32_t>* output,
+    std::string* error) {
+    if (output == nullptr || error == nullptr) {
+        return false;
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        *error =
+            "cannot read inherited CPU affinity for final scan: errno=" +
+            std::to_string(errno);
+        return false;
+    }
+
+    std::vector<std::uint32_t> resolved;
+    resolved.reserve(options.intraday_scan_workers);
+    if (options.intraday_reader_cpus_set) {
+        for (const std::uint32_t cpu : options.intraday_reader_cpus) {
+            if (cpu >= static_cast<std::uint32_t>(CPU_SETSIZE) ||
+                CPU_ISSET(static_cast<int>(cpu), &allowed) == 0) {
+                *error =
+                    "--intraday-reader-cpus includes a CPU outside the "
+                    "process inherited affinity mask";
+                return false;
+            }
+            resolved.push_back(cpu);
+        }
+    } else {
+        for (int cpu = 0;
+             cpu < CPU_SETSIZE &&
+             resolved.size() <
+                 static_cast<std::size_t>(
+                     options.intraday_scan_workers);
+             ++cpu) {
+            if (CPU_ISSET(cpu, &allowed) != 0) {
+                resolved.push_back(static_cast<std::uint32_t>(cpu));
+            }
+        }
+    }
+    if (resolved.size() !=
+        static_cast<std::size_t>(options.intraday_scan_workers)) {
+        *error =
+            "final scan requires one distinct allowed CPU per scan worker";
+        return false;
+    }
+    *output = std::move(resolved);
+    return true;
+}
+
+[[nodiscard]] bool PinCurrentThread(
+    std::uint32_t cpu,
+    int* error_number) noexcept {
+    if (error_number != nullptr) {
+        *error_number = 0;
+    }
+    if (cpu >= static_cast<std::uint32_t>(CPU_SETSIZE)) {
+        if (error_number != nullptr) {
+            *error_number = EINVAL;
+        }
+        return false;
+    }
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    CPU_SET(static_cast<int>(cpu), &requested);
+    if (::sched_setaffinity(0, sizeof(requested), &requested) != 0) {
+        if (error_number != nullptr) {
+            *error_number = errno;
+        }
+        return false;
+    }
     return true;
 }
 
@@ -555,6 +744,395 @@ void WriteDistributionJson(
 [[nodiscard]] bool SnapshotKind(market::MarketEventKindV1 kind) noexcept {
     return kind == market::MarketEventKindV1::kShanghaiSnapshot ||
            kind == market::MarketEventKindV1::kShenzhenSnapshot;
+}
+
+struct IntradayScanOrdinalRange final {
+    std::size_t begin = 0U;
+    std::size_t end = 0U;
+    std::uint64_t expected_records = 0U;
+};
+
+enum class IntradayScanFailure : std::uint8_t {
+    kNone = 0U,
+    kNotStarted,
+    kAffinity,
+    kClock,
+    kSummary,
+    kOpenCursor,
+    kReadCursor,
+    kInvalidTerminalPage,
+    kInvalidRecord,
+    kInvalidOrder,
+    kInvalidBoundary,
+    kInvalidWatermark,
+    kCounterOverflow,
+    kAllocation,
+    kUnexpected,
+};
+
+struct IntradayScanShardResult final {
+    IntradayScanFailure failure = IntradayScanFailure::kNotStarted;
+    market::IntradayInstrumentStoreQueryErrorV1 query_error =
+        market::IntradayInstrumentStoreQueryErrorV1::kNone;
+    int affinity_error_number = 0;
+    std::uint64_t elapsed_ns = 0U;
+    std::uint64_t record_count = 0U;
+    std::array<
+        std::uint64_t,
+        market::kIntradayInstrumentStoreSourceCountV1>
+        source_counts{};
+    std::array<std::uint64_t, kEventKindCount> kind_counts{};
+    std::uint64_t ingress_sequence_sum = 0U;
+    std::uint64_t ingress_sequence_xor = 0U;
+    std::uint32_t first_instrument_id = 0U;
+    std::uint64_t first_ingress_sequence = 0U;
+    std::uint32_t last_instrument_id = 0U;
+    std::uint64_t last_ingress_sequence = 0U;
+    bool have_record = false;
+    bool observed_terminal_page = false;
+};
+
+[[nodiscard]] std::string_view IntradayScanFailureName(
+    IntradayScanFailure failure) noexcept {
+    switch (failure) {
+        case IntradayScanFailure::kNone: return "none";
+        case IntradayScanFailure::kNotStarted: return "not_started";
+        case IntradayScanFailure::kAffinity: return "affinity";
+        case IntradayScanFailure::kClock: return "clock";
+        case IntradayScanFailure::kSummary: return "summary";
+        case IntradayScanFailure::kOpenCursor: return "open_cursor";
+        case IntradayScanFailure::kReadCursor: return "read_cursor";
+        case IntradayScanFailure::kInvalidTerminalPage:
+            return "invalid_terminal_page";
+        case IntradayScanFailure::kInvalidRecord:
+            return "invalid_record";
+        case IntradayScanFailure::kInvalidOrder:
+            return "invalid_order";
+        case IntradayScanFailure::kInvalidBoundary:
+            return "invalid_boundary";
+        case IntradayScanFailure::kInvalidWatermark:
+            return "invalid_watermark";
+        case IntradayScanFailure::kCounterOverflow:
+            return "counter_overflow";
+        case IntradayScanFailure::kAllocation: return "allocation";
+        case IntradayScanFailure::kUnexpected: return "unexpected";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] std::uint64_t DenseSequenceSumModuloU64(
+    std::uint64_t count) noexcept {
+    std::uint64_t left = count;
+    std::uint64_t right = count + 1U;
+    if ((left & 1U) == 0U) {
+        left /= 2U;
+    } else {
+        right /= 2U;
+    }
+    return left * right;
+}
+
+[[nodiscard]] std::uint64_t DenseSequenceXor(
+    std::uint64_t count) noexcept {
+    switch (count & 3U) {
+        case 0U: return count;
+        case 1U: return 1U;
+        case 2U: return count + 1U;
+        case 3U: return 0U;
+    }
+    return 0U;
+}
+
+[[nodiscard]] bool BuildIntradayScanRanges(
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    std::uint32_t worker_count,
+    std::vector<IntradayScanOrdinalRange>* output,
+    std::string* error) {
+    if (output == nullptr || error == nullptr || worker_count == 0U) {
+        return false;
+    }
+    output->clear();
+    output->reserve(worker_count);
+    const std::size_t instrument_count = generation.instrument_count();
+    if (worker_count == 1U) {
+        output->push_back(IntradayScanOrdinalRange{
+            0U, instrument_count, generation.record_count()});
+        return true;
+    }
+
+    std::vector<std::uint64_t> prefix(instrument_count + 1U, 0U);
+    for (std::size_t ordinal = 0U;
+         ordinal < instrument_count;
+         ++ordinal) {
+        market::IntradayInstrumentSummaryV1 summary{};
+        const auto query_error =
+            generation.SummaryAt(ordinal, &summary);
+        if (query_error !=
+            market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+            *error =
+                "cannot build record-balanced ordinal scan ranges: " +
+                std::string(
+                    market::IntradayInstrumentStoreQueryErrorNameV1(
+                        query_error));
+            return false;
+        }
+        if (prefix[ordinal] >
+            std::numeric_limits<std::uint64_t>::max() -
+                summary.record_count) {
+            *error = "ordinal scan range record prefix overflow";
+            return false;
+        }
+        prefix[ordinal + 1U] =
+            prefix[ordinal] + summary.record_count;
+    }
+    if (prefix.back() != generation.record_count()) {
+        *error = "ordinal scan range summary total mismatch";
+        return false;
+    }
+
+    std::vector<std::size_t> boundaries(
+        static_cast<std::size_t>(worker_count) + 1U, 0U);
+    boundaries.back() = instrument_count;
+    const std::uint64_t quotient =
+        generation.record_count() / worker_count;
+    const std::uint64_t remainder =
+        generation.record_count() % worker_count;
+    for (std::uint32_t worker = 1U;
+         worker < worker_count;
+         ++worker) {
+        const std::uint64_t worker_u64 =
+            static_cast<std::uint64_t>(worker);
+        const std::uint64_t target =
+            quotient * worker_u64 +
+            std::min(worker_u64, remainder);
+        const auto boundary =
+            std::lower_bound(prefix.begin(), prefix.end(), target);
+        boundaries[worker] = static_cast<std::size_t>(
+            boundary - prefix.begin());
+    }
+    for (std::uint32_t worker = 0U;
+         worker < worker_count;
+         ++worker) {
+        const std::size_t begin = boundaries[worker];
+        const std::size_t end = boundaries[worker + 1U];
+        if (begin > end || end > instrument_count) {
+            *error = "ordinal scan range partition is invalid";
+            return false;
+        }
+        output->push_back(IntradayScanOrdinalRange{
+            begin, end, prefix[end] - prefix[begin]});
+    }
+    return true;
+}
+
+void ScanIntradayOrdinalRange(
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    const IntradayScanOrdinalRange& range,
+    std::size_t batch_capacity,
+    std::uint32_t reader_cpu,
+    IntradayScanShardResult* result) noexcept {
+    if (result == nullptr) {
+        return;
+    }
+    *result = IntradayScanShardResult{};
+    try {
+        if (!PinCurrentThread(
+                reader_cpu, &result->affinity_error_number)) {
+            result->failure = IntradayScanFailure::kAffinity;
+            return;
+        }
+        std::vector<const market::RealtimeHistoryRecordV1*> batch(
+            batch_capacity);
+
+        std::uint64_t start_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &start_ns)) {
+            result->failure = IntradayScanFailure::kClock;
+            return;
+        }
+
+        std::uint32_t minimum_instrument_id = 0U;
+        std::uint32_t maximum_instrument_id = 0U;
+        if (range.begin != range.end) {
+            market::IntradayInstrumentSummaryV1 first{};
+            market::IntradayInstrumentSummaryV1 last{};
+            const auto first_error =
+                generation.SummaryAt(range.begin, &first);
+            const auto last_error =
+                generation.SummaryAt(range.end - 1U, &last);
+            if (first_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+                last_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+                first.instrument_id == 0U ||
+                last.instrument_id < first.instrument_id) {
+                result->query_error =
+                    first_error !=
+                            market::IntradayInstrumentStoreQueryErrorV1::
+                                kNone
+                        ? first_error
+                        : last_error;
+                result->failure = IntradayScanFailure::kSummary;
+                return;
+            }
+            minimum_instrument_id = first.instrument_id;
+            maximum_instrument_id = last.instrument_id;
+        }
+
+        market::IntradayInstrumentScanOptionsV1 scan_options{};
+        scan_options.ingress_sequence_end_exclusive =
+            generation.watermark().ingress_sequence_exclusive;
+        std::unique_ptr<market::IntradayUniverseCursorV1> cursor;
+        result->query_error = generation.OpenUniverseRangeCursor(
+            range.begin, range.end, scan_options, &cursor);
+        if (result->query_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            cursor == nullptr) {
+            result->failure = IntradayScanFailure::kOpenCursor;
+            return;
+        }
+
+        std::uint32_t previous_instrument_id = 0U;
+        std::uint64_t previous_instrument_ingress = 0U;
+        bool have_previous_record = false;
+        for (;;) {
+            std::size_t written =
+                std::numeric_limits<std::size_t>::max();
+            result->query_error = cursor->ReadBatch(
+                std::span<
+                    const market::RealtimeHistoryRecordV1*>(
+                    batch.data(), batch.size()),
+                &written);
+            if (result->query_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+                result->failure = IntradayScanFailure::kReadCursor;
+                return;
+            }
+            if (written > batch.size()) {
+                result->failure =
+                    IntradayScanFailure::kInvalidTerminalPage;
+                return;
+            }
+            if (written == 0U) {
+                if (!cursor->done()) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidTerminalPage;
+                    return;
+                }
+                result->observed_terminal_page = true;
+                break;
+            }
+
+            for (std::size_t index = 0U; index < written; ++index) {
+                const market::RealtimeHistoryRecordV1* const record =
+                    batch[index];
+                if (record == nullptr ||
+                    record->instrument_id() == 0U) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidRecord;
+                    return;
+                }
+                if (have_previous_record &&
+                    (record->instrument_id() <
+                         previous_instrument_id ||
+                     (record->instrument_id() ==
+                          previous_instrument_id &&
+                      record->ingress_sequence() <=
+                          previous_instrument_ingress))) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidOrder;
+                    return;
+                }
+                if (range.begin == range.end ||
+                    record->instrument_id() <
+                        minimum_instrument_id ||
+                    record->instrument_id() >
+                        maximum_instrument_id) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidBoundary;
+                    return;
+                }
+                if (record->ingress_sequence() == 0U ||
+                    record->ingress_sequence() >=
+                        generation.watermark()
+                            .ingress_sequence_exclusive ||
+                    static_cast<std::size_t>(
+                        record->source_slot()) >=
+                        generation.watermark().sources.size()) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidWatermark;
+                    return;
+                }
+                const std::size_t source =
+                    static_cast<std::size_t>(
+                        record->source_slot());
+                const market::RealtimeSourceWatermarkV1&
+                    source_watermark =
+                        generation.watermark().sources[source];
+                if (record->source_stream_id() !=
+                        source_watermark.source_stream_id ||
+                    record->source_sequence() == 0U ||
+                    record->source_sequence() >=
+                        source_watermark.sequence_exclusive) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidWatermark;
+                    return;
+                }
+                const std::size_t kind_index =
+                    EventKindIndex(record->kind());
+                if (kind_index >= result->kind_counts.size()) {
+                    result->failure =
+                        IntradayScanFailure::kInvalidRecord;
+                    return;
+                }
+                if (result->source_counts[source] ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    result->kind_counts[kind_index] ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    result->record_count ==
+                        std::numeric_limits<std::uint64_t>::max()) {
+                    result->failure =
+                        IntradayScanFailure::kCounterOverflow;
+                    return;
+                }
+                ++result->source_counts[source];
+                ++result->kind_counts[kind_index];
+                ++result->record_count;
+                result->ingress_sequence_sum +=
+                    record->ingress_sequence();
+                result->ingress_sequence_xor ^=
+                    record->ingress_sequence();
+                if (!result->have_record) {
+                    result->first_instrument_id =
+                        record->instrument_id();
+                    result->first_ingress_sequence =
+                        record->ingress_sequence();
+                    result->have_record = true;
+                }
+                result->last_instrument_id =
+                    record->instrument_id();
+                result->last_ingress_sequence =
+                    record->ingress_sequence();
+                previous_instrument_id =
+                    record->instrument_id();
+                previous_instrument_ingress =
+                    record->ingress_sequence();
+                have_previous_record = true;
+            }
+        }
+
+        std::uint64_t end_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &end_ns) ||
+            end_ns < start_ns) {
+            result->failure = IntradayScanFailure::kClock;
+            return;
+        }
+        result->elapsed_ns = end_ns - start_ns;
+        result->failure = IntradayScanFailure::kNone;
+    } catch (const std::bad_alloc&) {
+        result->failure = IntradayScanFailure::kAllocation;
+    } catch (...) {
+        result->failure = IntradayScanFailure::kUnexpected;
+    }
 }
 
 void ValidateWatermark(
@@ -811,27 +1389,75 @@ void ValidateFinalStore(
         return;
     }
     ValidateWatermark(generation.watermark(), registry, state);
+    if (!state->valid) {
+        return;
+    }
 
     try {
-        std::vector<const market::RealtimeHistoryRecordV1*> batch(
-            static_cast<std::size_t>(
-                options.intraday_store_batch_records));
+        std::vector<std::uint32_t> reader_cpus;
+        std::string scan_error;
+        if (!ResolveReaderCpus(
+                options, &reader_cpus, &scan_error)) {
+            Fail(state, std::move(scan_error));
+            return;
+        }
+
+        std::uint64_t partition_start_ns = 0U;
+        std::uint64_t partition_end_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &partition_start_ns)) {
+            Fail(state, "cannot read intraday scan partition start clock");
+            return;
+        }
+        std::vector<IntradayScanOrdinalRange> ranges;
+        if (!BuildIntradayScanRanges(
+                generation,
+                options.intraday_scan_workers,
+                &ranges,
+                &scan_error)) {
+            Fail(state, std::move(scan_error));
+            return;
+        }
+        if (!ClockNs(CLOCK_MONOTONIC, &partition_end_ns) ||
+            partition_end_ns < partition_start_ns) {
+            Fail(state, "cannot read intraday scan partition end clock");
+            return;
+        }
+        state->intraday_scan_partition_ns =
+            partition_end_ns - partition_start_ns;
+        state->intraday_reader_cpus = reader_cpus;
+
+        std::vector<IntradayScanShardResult> results(ranges.size());
+        std::vector<std::jthread> readers;
+        readers.reserve(ranges.size());
         std::uint64_t scan_start_ns = 0U;
         if (!ClockNs(CLOCK_MONOTONIC, &scan_start_ns)) {
             Fail(state, "cannot read intraday full-scan start clock");
             return;
         }
-
-        market::IntradayInstrumentScanOptionsV1 scan_options{};
-        scan_options.ingress_sequence_end_exclusive =
-            generation.watermark().ingress_sequence_exclusive;
-        std::unique_ptr<market::IntradayUniverseCursorV1> cursor;
-        const market::IntradayInstrumentStoreQueryErrorV1 open_error =
-            generation.OpenUniverseCursor(scan_options, &cursor);
-        if (open_error !=
-                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
-            cursor == nullptr) {
-            Fail(state, "cannot open final intraday universe cursor");
+        for (std::size_t index = 0U; index < ranges.size(); ++index) {
+            readers.emplace_back(
+                [&generation,
+                 &ranges,
+                 &reader_cpus,
+                 &results,
+                 &options,
+                 index]() noexcept {
+                    IntradayScanShardResult local;
+                    ScanIntradayOrdinalRange(
+                        generation,
+                        ranges[index],
+                        static_cast<std::size_t>(
+                            options.intraday_scan_batch_records),
+                        reader_cpus[index],
+                        &local);
+                    results[index] = std::move(local);
+                });
+        }
+        readers.clear();
+        std::uint64_t scan_end_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &scan_end_ns) ||
+            scan_end_ns < scan_start_ns) {
+            Fail(state, "cannot read intraday full-scan end clock");
             return;
         }
 
@@ -839,108 +1465,122 @@ void ValidateFinalStore(
             std::uint64_t,
             market::kIntradayInstrumentStoreSourceCountV1>
             source_counts{};
+        std::array<std::uint64_t, kEventKindCount> kind_counts{};
         std::uint64_t scanned_records = 0U;
-        std::uint32_t previous_instrument_id = 0U;
-        std::uint64_t previous_instrument_ingress = 0U;
-        bool have_previous_record = false;
-        bool observed_terminal_page = false;
-        for (;;) {
-            std::size_t written =
-                std::numeric_limits<std::size_t>::max();
-            const market::IntradayInstrumentStoreQueryErrorV1 read_error =
-                cursor->ReadBatch(
-                    std::span<
-                        const market::RealtimeHistoryRecordV1*>(
-                        batch.data(), batch.size()),
-                    &written);
-            if (read_error !=
-                market::IntradayInstrumentStoreQueryErrorV1::kNone) {
-                Fail(state, "final intraday universe cursor read failed");
+        std::uint64_t ingress_sequence_sum = 0U;
+        std::uint64_t ingress_sequence_xor = 0U;
+        std::uint32_t previous_shard_last_instrument_id = 0U;
+        bool have_previous_nonempty_shard = false;
+        state->intraday_scan_ordinal_begins.clear();
+        state->intraday_scan_ordinal_ends.clear();
+        state->intraday_scan_shard_records.clear();
+        state->intraday_scan_shard_ns.clear();
+        state->intraday_scan_shard_last_instrument_ids.clear();
+        state->intraday_scan_shard_last_ingress_sequences.clear();
+        state->intraday_scan_ordinal_begins.reserve(ranges.size());
+        state->intraday_scan_ordinal_ends.reserve(ranges.size());
+        state->intraday_scan_shard_records.reserve(ranges.size());
+        state->intraday_scan_shard_ns.reserve(ranges.size());
+        state->intraday_scan_shard_last_instrument_ids.reserve(
+            ranges.size());
+        state->intraday_scan_shard_last_ingress_sequences.reserve(
+            ranges.size());
+        for (std::size_t index = 0U; index < results.size(); ++index) {
+            const IntradayScanShardResult& result = results[index];
+            if (result.failure != IntradayScanFailure::kNone ||
+                !result.observed_terminal_page) {
+                std::string message =
+                    "intraday full-scan shard " +
+                    std::to_string(index) + " failed: " +
+                    std::string(
+                        IntradayScanFailureName(result.failure));
+                if (result.query_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+                    message += " query=";
+                    message +=
+                        market::IntradayInstrumentStoreQueryErrorNameV1(
+                            result.query_error);
+                }
+                if (result.affinity_error_number != 0) {
+                    message += " errno=" +
+                        std::to_string(
+                            result.affinity_error_number);
+                }
+                Fail(state, std::move(message));
                 return;
             }
-            if (written > batch.size()) {
-                Fail(state, "intraday cursor exceeded caller batch");
+            if (result.record_count !=
+                ranges[index].expected_records) {
+                Fail(
+                    state,
+                    "intraday full-scan shard record total mismatch");
                 return;
             }
-            if (written == 0U) {
-                if (!cursor->done()) {
-                    Fail(
-                        state,
-                        "intraday cursor returned empty nonterminal page");
-                    return;
-                }
-                observed_terminal_page = true;
-                break;
+            if (result.have_record &&
+                have_previous_nonempty_shard &&
+                result.first_instrument_id <=
+                    previous_shard_last_instrument_id) {
+                Fail(
+                    state,
+                    "intraday ordinal-range shard ordering invariant "
+                    "failed");
+                return;
             }
-            for (std::size_t index = 0U; index < written; ++index) {
-                const market::RealtimeHistoryRecordV1* const record =
-                    batch[index];
-                if (record == nullptr || record->instrument_id() == 0U) {
-                    Fail(state, "intraday cursor returned invalid record");
-                    return;
-                }
-                if (have_previous_record &&
-                    (record->instrument_id() < previous_instrument_id ||
-                     (record->instrument_id() ==
-                          previous_instrument_id &&
-                      record->ingress_sequence() <=
-                          previous_instrument_ingress))) {
-                    Fail(
-                        state,
-                        "intraday universe ordering invariant failed");
-                    return;
-                }
-                if (record->ingress_sequence() == 0U ||
-                    record->ingress_sequence() >=
-                        generation.watermark()
-                            .ingress_sequence_exclusive ||
-                    static_cast<std::size_t>(record->source_slot()) >=
-                        generation.watermark().sources.size()) {
-                    Fail(
-                        state,
-                        "intraday record global/source boundary failed");
-                    return;
-                }
-                const std::size_t source =
-                    static_cast<std::size_t>(record->source_slot());
-                const market::RealtimeSourceWatermarkV1&
-                    source_watermark =
-                        generation.watermark().sources[source];
-                if (record->source_stream_id() !=
-                        source_watermark.source_stream_id ||
-                    record->source_sequence() == 0U ||
-                    record->source_sequence() >=
-                        source_watermark.sequence_exclusive) {
-                    Fail(
-                        state,
-                        "intraday record source watermark failed");
-                    return;
-                }
-                if (source_counts[source] ==
-                        std::numeric_limits<std::uint64_t>::max() ||
-                    scanned_records ==
-                        std::numeric_limits<std::uint64_t>::max()) {
-                    Fail(state, "intraday full-scan count overflow");
-                    return;
-                }
-                ++source_counts[source];
-                ++scanned_records;
-                const std::size_t kind_index =
-                    EventKindIndex(record->kind());
-                if (kind_index >= state->event_kinds_seen.size()) {
-                    Fail(state, "intraday cursor returned invalid event kind");
-                    return;
-                }
-                state->event_kinds_seen[kind_index] = true;
-                previous_instrument_id = record->instrument_id();
-                previous_instrument_ingress =
-                    record->ingress_sequence();
-                have_previous_record = true;
+            if (result.have_record) {
+                previous_shard_last_instrument_id =
+                    result.last_instrument_id;
+                have_previous_nonempty_shard = true;
             }
+            if (scanned_records >
+                std::numeric_limits<std::uint64_t>::max() -
+                    result.record_count) {
+                Fail(state, "intraday full-scan record count overflow");
+                return;
+            }
+            scanned_records += result.record_count;
+            ingress_sequence_sum += result.ingress_sequence_sum;
+            ingress_sequence_xor ^= result.ingress_sequence_xor;
+            for (std::size_t source = 0U;
+                 source < source_counts.size();
+                 ++source) {
+                if (source_counts[source] >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        result.source_counts[source]) {
+                    Fail(state, "intraday source count overflow");
+                    return;
+                }
+                source_counts[source] +=
+                    result.source_counts[source];
+            }
+            for (std::size_t kind = 0U;
+                 kind < kind_counts.size();
+                 ++kind) {
+                if (kind_counts[kind] >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        result.kind_counts[kind]) {
+                    Fail(state, "intraday event-kind count overflow");
+                    return;
+                }
+                kind_counts[kind] += result.kind_counts[kind];
+                if (result.kind_counts[kind] != 0U) {
+                    state->event_kinds_seen[kind] = true;
+                }
+            }
+            state->intraday_scan_ordinal_begins.push_back(
+                ranges[index].begin);
+            state->intraday_scan_ordinal_ends.push_back(
+                ranges[index].end);
+            state->intraday_scan_shard_records.push_back(
+                result.record_count);
+            state->intraday_scan_shard_ns.push_back(
+                result.elapsed_ns);
+            state->intraday_scan_shard_last_instrument_ids.push_back(
+                result.last_instrument_id);
+            state->intraday_scan_shard_last_ingress_sequences.push_back(
+                result.last_ingress_sequence);
         }
 
-        if (!observed_terminal_page || !cursor->done() ||
-            scanned_records == 0U) {
+        if (scanned_records == 0U) {
             Fail(state, "intraday full scan did not terminate nonempty");
             return;
         }
@@ -970,15 +1610,40 @@ void ValidateFinalStore(
             Fail(state, "intraday full-scan total mismatch");
             return;
         }
-
-        std::uint64_t scan_end_ns = 0U;
-        if (!ClockNs(CLOCK_MONOTONIC, &scan_end_ns) ||
-            scan_end_ns < scan_start_ns) {
-            Fail(state, "cannot read intraday full-scan end clock");
+        if (ingress_sequence_sum !=
+                DenseSequenceSumModuloU64(scanned_records) ||
+            ingress_sequence_xor !=
+                DenseSequenceXor(scanned_records)) {
+            Fail(state, "intraday full-scan dense ingress fingerprint mismatch");
             return;
         }
         state->intraday_full_scan_records = scanned_records;
         state->intraday_full_scan_ns = scan_end_ns - scan_start_ns;
+        if (state->intraday_scan_partition_ns >
+            std::numeric_limits<std::uint64_t>::max() -
+                state->intraday_full_scan_ns) {
+            Fail(state, "intraday full-scan total duration overflow");
+            return;
+        }
+        state->intraday_scan_total_ns =
+            state->intraday_scan_partition_ns +
+            state->intraday_full_scan_ns;
+        state->intraday_scan_ingress_sum =
+            ingress_sequence_sum;
+        state->intraday_scan_ingress_xor =
+            ingress_sequence_xor;
+        state->intraday_scan_kind_counts = kind_counts;
+        state->intraday_scan_last_instrument_id =
+            previous_shard_last_instrument_id;
+        for (auto iterator = results.rbegin();
+             iterator != results.rend();
+             ++iterator) {
+            if (iterator->have_record) {
+                state->intraday_scan_last_ingress_sequence =
+                    iterator->last_ingress_sequence;
+                break;
+            }
+        }
     } catch (const std::bad_alloc&) {
         Fail(state, "intraday full-scan allocation failed");
     } catch (const std::exception&) {
@@ -1037,8 +1702,15 @@ void ValidateFinalStore(
 }
 
 [[nodiscard]] int Run(const Options& options) {
-    std::string user_name;
+    std::vector<std::uint32_t> validated_reader_cpus;
     std::string error;
+    if (!ResolveReaderCpus(
+            options, &validated_reader_cpus, &error)) {
+        std::cerr << "accept-realtime-pipeline: " << error << '\n';
+        return 2;
+    }
+
+    std::string user_name;
     if (!ReadSecret(options.user_name_file, &user_name, &error)) {
         std::cerr << "accept-realtime-pipeline: " << error << '\n';
         return 2;
@@ -1303,6 +1975,8 @@ void ValidateFinalStore(
     if (measured_window_ns < required_window_ns ||
         final_snapshot.accepted_messages == 0U ||
         final_snapshot.accepted_messages != final_snapshot.decoded_messages ||
+        final_snapshot.accepted_messages !=
+            final_snapshot.store.appended_records ||
         final_snapshot.rejected_messages != 0U || final_snapshot.fatal ||
         !final_snapshot.stopped || last_store == nullptr ||
         !AllKindsSeen(state.event_kinds_seen)) {
@@ -1338,6 +2012,14 @@ void ValidateFinalStore(
                   static_cast<long double>(
                       state.intraday_full_scan_ns)
             : 0.0L;
+    const std::size_t reported_scan_shards = std::min({
+        state.intraday_reader_cpus.size(),
+        state.intraday_scan_ordinal_begins.size(),
+        state.intraday_scan_ordinal_ends.size(),
+        state.intraday_scan_shard_records.size(),
+        state.intraday_scan_shard_ns.size(),
+        state.intraday_scan_shard_last_instrument_ids.size(),
+        state.intraday_scan_shard_last_ingress_sequences.size()});
     report << "{\n  \"schema_version\":1,\n"
            << "  \"passed\":" << (state.valid ? "true" : "false")
            << ",\n  \"first_error\":";
@@ -1384,6 +2066,71 @@ void ValidateFinalStore(
            << std::fixed << std::setprecision(3)
            << intraday_full_scan_records_per_second
            << std::defaultfloat
+           << ",\"chunk_records\":"
+           << options.intraday_store_chunk_records
+           << ",\"maximum_batch_records\":"
+           << options.intraday_store_batch_records
+           << ",\"scan_batch_records\":"
+           << options.intraday_scan_batch_records
+           << ",\"scan_workers\":"
+           << options.intraday_scan_workers
+           << ",\"scan_partition_ns\":"
+           << state.intraday_scan_partition_ns
+           << ",\"scan_total_ns\":"
+           << state.intraday_scan_total_ns
+           << ",\"ingress_sequence_sum_modulo_u64\":\""
+           << state.intraday_scan_ingress_sum
+           << "\",\"ingress_sequence_xor\":\""
+           << state.intraday_scan_ingress_xor
+           << "\",\"last_instrument_id\":"
+           << state.intraday_scan_last_instrument_id
+           << ",\"last_ingress_sequence\":\""
+           << state.intraday_scan_last_ingress_sequence
+           << '"'
+           << ",\"reader_cpus\":[";
+    for (std::size_t index = 0U;
+         index < state.intraday_reader_cpus.size();
+         ++index) {
+        if (index != 0U) {
+            report.put(',');
+        }
+        report << state.intraday_reader_cpus[index];
+    }
+    report << "],\"event_kind_counts\":[";
+    for (std::size_t kind = 0U;
+         kind < state.intraday_scan_kind_counts.size();
+         ++kind) {
+        if (kind != 0U) {
+            report.put(',');
+        }
+        report << state.intraday_scan_kind_counts[kind];
+    }
+    report << "],\"scan_shards\":[";
+    for (std::size_t index = 0U;
+         index < reported_scan_shards;
+         ++index) {
+        if (index != 0U) {
+            report.put(',');
+        }
+        report << "{\"cpu\":"
+               << state.intraday_reader_cpus[index]
+               << ",\"ordinal_begin\":"
+               << state.intraday_scan_ordinal_begins[index]
+               << ",\"ordinal_end\":"
+               << state.intraday_scan_ordinal_ends[index]
+               << ",\"records\":"
+               << state.intraday_scan_shard_records[index]
+               << ",\"elapsed_ns\":"
+               << state.intraday_scan_shard_ns[index]
+               << ",\"last_instrument_id\":"
+               << state.intraday_scan_shard_last_instrument_ids[index]
+               << ",\"last_ingress_sequence\":\""
+               << state
+                      .intraday_scan_shard_last_ingress_sequences[index]
+               << '"'
+               << '}';
+    }
+    report << ']'
            << ",\"coverage_from_open\":"
            << (final_snapshot.store.coverage_from_open
                    ? "true"
@@ -1395,6 +2142,8 @@ void ValidateFinalStore(
            << "},\n  \"counts\":{\"accepted\":"
            << final_snapshot.accepted_messages
            << ",\"decoded\":" << final_snapshot.decoded_messages
+           << ",\"appended\":"
+           << final_snapshot.store.appended_records
            << ",\"ignored\":" << final_snapshot.ignored_messages
            << ",\"rejected\":" << final_snapshot.rejected_messages
            << ",\"generations_sampled\":" << state.generations
@@ -1484,8 +2233,14 @@ void ValidateFinalStore(
               << state.intraday_full_scan_records
               << ",\"full_scan_ns\":"
               << state.intraday_full_scan_ns
+              << ",\"scan_total_ns\":"
+              << state.intraday_scan_total_ns
               << ",\"records_per_second\":"
               << intraday_full_scan_records_per_second
+              << ",\"scan_batch_records\":"
+              << options.intraday_scan_batch_records
+              << ",\"scan_workers\":"
+              << options.intraday_scan_workers
               << ",\"coverage_from_open\":"
               << (final_snapshot.store.coverage_from_open
                       ? "true"

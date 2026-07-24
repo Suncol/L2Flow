@@ -188,10 +188,21 @@ different generations.
 
 Full-session consumers use store cursors: draining N records is O(N) and each
 `ReadBatch` uses O(batch) caller-owned pointer storage rather than allocating a
-second full-session result. Large drains can be split into independent
-half-open instrument-ordinal ranges with `OpenUniverseRangeCursor`. With an
-untruncated `maximum_records` setting, concatenating non-overlapping ranges in
-ordinal order is identical to one full-universe cursor.
+second full-session result. `maximum_records_per_batch` is only an upper bound;
+the acceptance reader keeps that Store limit at 65,536 but defaults the actual
+`ReadBatch` span to 1,024 and consumes each page immediately. Large drains can
+be split into independent half-open instrument-ordinal ranges with
+`OpenUniverseRangeCursor`. With an untruncated `maximum_records` setting,
+concatenating non-overlapping ranges in ordinal order is identical to one
+full-universe cursor.
+
+The acceptance probe exposes `--intraday-scan-batch-records`,
+`--intraday-scan-workers`, and `--intraday-reader-cpus`. Single-reader scans
+are pinned to one allowed CPU; 4--8 reader scans use record-balanced,
+non-overlapping ordinal ranges and one CPU per reader. Store worker count and
+chunk capacity remain separately configurable for 4/8 and 1024/4096 A/B
+runs. CPU affinity is applied only in the post-stop reader threads, so the
+live SDK, decoder, and Store workers do not inherit a single-core mask.
 
 The default `SnapshotLastPriceProjectionV1` is deliberately literal:
 

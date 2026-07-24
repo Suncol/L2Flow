@@ -4,11 +4,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -357,6 +359,179 @@ std::vector<std::uint64_t> IngressSequences(
             record == nullptr ? 0U : record->ingress_sequence());
     }
     return result;
+}
+
+struct CursorFingerprint final {
+    std::uint64_t count = 0U;
+    std::uint64_t ingress_sum = 0U;
+    std::uint64_t ingress_xor = 0U;
+    std::array<std::uint64_t, 4U> source_counts{};
+    std::array<std::uint64_t, 5U> kind_counts{};
+    std::uint32_t last_instrument_id = 0U;
+    std::uint64_t last_ingress_sequence = 0U;
+
+    bool operator==(const CursorFingerprint&) const = default;
+};
+
+CursorFingerprint Fingerprint(
+    const std::vector<const market::RealtimeHistoryRecordV1*>& records) {
+    CursorFingerprint result{};
+    for (const market::RealtimeHistoryRecordV1* record : records) {
+        if (record == nullptr) {
+            continue;
+        }
+        ++result.count;
+        result.ingress_sum += record->ingress_sequence();
+        result.ingress_xor ^= record->ingress_sequence();
+        const std::size_t source =
+            static_cast<std::size_t>(record->source_slot());
+        if (source < result.source_counts.size()) {
+            ++result.source_counts[source];
+        }
+        const std::uint8_t raw_kind =
+            static_cast<std::uint8_t>(record->kind());
+        if (raw_kind != 0U &&
+            static_cast<std::size_t>(raw_kind) <=
+                result.kind_counts.size()) {
+            ++result.kind_counts[
+                static_cast<std::size_t>(raw_kind - 1U)];
+        }
+        result.last_instrument_id = record->instrument_id();
+        result.last_ingress_sequence =
+            record->ingress_sequence();
+    }
+    return result;
+}
+
+struct ConcurrentRangeDrainResult final {
+    market::IntradayInstrumentStoreQueryErrorV1 error =
+        market::IntradayInstrumentStoreQueryErrorV1::kNone;
+    std::vector<const market::RealtimeHistoryRecordV1*> records;
+    bool terminal_page = false;
+    bool unexpected_failure = false;
+};
+
+std::vector<ConcurrentRangeDrainResult> DrainRangesConcurrently(
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    std::size_t range_count,
+    std::size_t batch_capacity) {
+    std::vector<ConcurrentRangeDrainResult> results(range_count);
+    if (range_count == 0U || batch_capacity == 0U) {
+        return results;
+    }
+    std::vector<std::array<std::size_t, 2U>> ranges(range_count);
+    const std::size_t quotient =
+        generation.instrument_count() / range_count;
+    const std::size_t remainder =
+        generation.instrument_count() % range_count;
+    std::size_t next_ordinal = 0U;
+    for (std::size_t index = 0U; index < range_count; ++index) {
+        const std::size_t width =
+            quotient + (index < remainder ? 1U : 0U);
+        ranges[index] = {next_ordinal, next_ordinal + width};
+        next_ordinal += width;
+    }
+
+    std::vector<std::jthread> readers;
+    readers.reserve(range_count);
+    std::mutex start_mutex;
+    std::condition_variable start_cv;
+    std::size_t ready_readers = 0U;
+    bool start_readers = false;
+    try {
+        for (std::size_t index = 0U; index < range_count; ++index) {
+            readers.emplace_back(
+                [&generation,
+                 &ranges,
+                 &results,
+                 &start_mutex,
+                 &start_cv,
+                 &ready_readers,
+                 &start_readers,
+                 batch_capacity,
+                 index]() noexcept {
+                    {
+                        std::unique_lock<std::mutex> lock(start_mutex);
+                        ++ready_readers;
+                        start_cv.notify_all();
+                        start_cv.wait(lock, [&start_readers]() {
+                            return start_readers;
+                        });
+                    }
+                    ConcurrentRangeDrainResult& result =
+                        results[index];
+                    try {
+                        std::unique_ptr<
+                            market::IntradayUniverseCursorV1>
+                            cursor;
+                        result.error =
+                            generation.OpenUniverseRangeCursor(
+                                ranges[index][0U],
+                                ranges[index][1U],
+                                {},
+                                &cursor);
+                        if (result.error !=
+                                market::
+                                    IntradayInstrumentStoreQueryErrorV1::
+                                        kNone ||
+                            cursor == nullptr) {
+                            return;
+                        }
+                        std::vector<
+                            const market::RealtimeHistoryRecordV1*>
+                            batch(batch_capacity);
+                        std::uint64_t remaining_pages =
+                            generation.record_count();
+                        if (remaining_pages !=
+                            std::numeric_limits<std::uint64_t>::max()) {
+                            ++remaining_pages;
+                        }
+                        while (remaining_pages != 0U) {
+                            --remaining_pages;
+                            std::size_t written =
+                                std::numeric_limits<std::size_t>::max();
+                            result.error =
+                                cursor->ReadBatch(batch, &written);
+                            if (result.error !=
+                                    market::
+                                        IntradayInstrumentStoreQueryErrorV1::
+                                            kNone ||
+                                written > batch.size()) {
+                                return;
+                            }
+                            result.records.insert(
+                                result.records.end(),
+                                batch.begin(),
+                                batch.begin() + written);
+                            if (written == 0U) {
+                                result.terminal_page = cursor->done();
+                                return;
+                            }
+                        }
+                        result.unexpected_failure = true;
+                    } catch (...) {
+                        result.unexpected_failure = true;
+                    }
+                });
+        }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(start_mutex);
+            start_readers = true;
+        }
+        start_cv.notify_all();
+        throw;
+    }
+    {
+        std::unique_lock<std::mutex> lock(start_mutex);
+        start_cv.wait(lock, [&ready_readers, range_count]() {
+            return ready_readers == range_count;
+        });
+        start_readers = true;
+    }
+    start_cv.notify_all();
+    readers.clear();
+    return results;
 }
 
 std::vector<std::uint32_t> InstrumentIds(
@@ -744,6 +919,40 @@ bool CheckGenerationQueriesAndLifetime(
             ranged_universe_records.size() ==
                 static_cast<std::size_t>(first->record_count()),
         "concatenated disjoint ranges exactly equal the full universe cursor");
+
+    for (const std::size_t concurrent_ranges : {4U, 8U}) {
+        const auto concurrent =
+            DrainRangesConcurrently(*first, concurrent_ranges, 1U);
+        std::vector<const market::RealtimeHistoryRecordV1*>
+            concurrent_records;
+        bool concurrent_ok =
+            concurrent.size() == concurrent_ranges;
+        for (const ConcurrentRangeDrainResult& result : concurrent) {
+            concurrent_ok =
+                concurrent_ok &&
+                result.error ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                result.terminal_page &&
+                !result.unexpected_failure;
+            concurrent_records.insert(
+                concurrent_records.end(),
+                result.records.begin(),
+                result.records.end());
+        }
+        ok &= Expect(
+            concurrent_ok &&
+                concurrent_records == full_universe_records,
+            concurrent_ranges == 4U
+                ? "four concurrent ordinal ranges equal the full cursor"
+                : "eight concurrent ordinal ranges, including empty "
+                  "ranges, equal the full cursor");
+        ok &= Expect(
+            Fingerprint(concurrent_records) ==
+                Fingerprint(full_universe_records),
+            concurrent_ranges == 4U
+                ? "four-range count/source/kind/sum/xor/last fingerprint"
+                : "eight-range count/source/kind/sum/xor/last fingerprint");
+    }
 
     market::IntradayInstrumentScanOptionsV1 limited_options{};
     limited_options.maximum_records = 1U;
