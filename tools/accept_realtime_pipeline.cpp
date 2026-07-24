@@ -57,10 +57,8 @@ struct Options final {
     std::uint32_t duration_seconds = 600U;
     std::uint32_t generation_interval_ms = 1000U;
     std::uint32_t generation_timeout_ms = 10'000U;
-    std::uint32_t history_workers = 4U;
+    std::uint32_t instrument_store_workers = 4U;
     std::uint32_t acquire_repetitions = 32U;
-    market::IntradayInstrumentStoreModeV1 intraday_store_mode =
-        market::IntradayInstrumentStoreModeV1::kDisabled;
     std::uint64_t intraday_store_maximum_records = 0U;
     std::uint64_t intraday_store_memory_bytes = 0U;
     std::uint32_t intraday_store_chunk_records = 1024U;
@@ -68,8 +66,6 @@ struct Options final {
     bool intraday_store_from_open = false;
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
-    bool intraday_store_chunk_records_set = false;
-    bool intraday_store_batch_records_set = false;
 };
 
 struct UnsignedDistribution final {
@@ -110,7 +106,6 @@ struct AcceptanceState final {
     std::string first_error;
     std::uint64_t generations = 0U;
     std::uint64_t universe_rows_checked = 0U;
-    std::uint64_t retained_records_checked = 0U;
     std::uint64_t intraday_full_scan_records = 0U;
     std::uint64_t intraday_full_scan_ns = 0U;
     std::uint64_t updated_heads = 0U;
@@ -206,31 +201,6 @@ void Fail(AcceptanceState* state, std::string message) {
     return true;
 }
 
-[[nodiscard]] bool ParseIntradayStoreMode(
-    std::string_view text,
-    market::IntradayInstrumentStoreModeV1* output) noexcept {
-    if (output == nullptr) {
-        return false;
-    }
-    if (text == "disabled") {
-        *output = market::IntradayInstrumentStoreModeV1::kDisabled;
-        return true;
-    }
-    if (text == "shadow") {
-        *output = market::IntradayInstrumentStoreModeV1::kShadow;
-        return true;
-    }
-    if (text == "required") {
-        *output = market::IntradayInstrumentStoreModeV1::kRequired;
-        return true;
-    }
-    if (text == "primary") {
-        *output = market::IntradayInstrumentStoreModeV1::kPrimary;
-        return true;
-    }
-    return false;
-}
-
 [[nodiscard]] bool SafeFileName(std::string_view value) noexcept {
     return !value.empty() && value != "." && value != ".." &&
            value.find('/') == std::string_view::npos &&
@@ -252,24 +222,21 @@ void PrintUsage(std::ostream& output) {
         << "  --sdk-log-prefix ABS\n"
         << "  --report-json ABS\n"
         << "  --samples-csv ABS\n"
+        << "  --intraday-store-max-records N\n"
+        << "                                positive u64 session record cap\n"
+        << "  --intraday-store-memory-gib N positive u64 logical total GiB cap\n"
+        << "  --intraday-store-from-open    require continuous coverage from "
+           "market open\n"
         << "Optional:\n"
         << "  --duration-seconds N          default 600\n"
         << "  --generation-interval-ms N    default 1000\n"
         << "  --generation-timeout-ms N     default 10000\n"
-        << "  --history-workers N           default 4\n"
+        << "  --instrument-store-workers N  default 4\n"
         << "  --acquire-repetitions N       default 32\n"
-        << "  --intraday-store-mode MODE    disabled|shadow|required|primary; "
-           "default disabled\n"
-        << "  --intraday-store-max-records N\n"
-        << "                                positive u64; required when enabled\n"
-        << "  --intraday-store-memory-gib N positive u64 logical total GiB; "
-           "required when enabled\n"
         << "  --intraday-store-chunk-records N\n"
         << "                                1..65536, default 1024\n"
         << "  --intraday-store-batch-records N\n"
-        << "                                1..1048576, default 65536\n"
-        << "  --intraday-store-from-open    assert continuous coverage from "
-           "market open\n";
+        << "                                1..1048576, default 65536\n";
 }
 
 [[nodiscard]] bool TakeValue(
@@ -364,14 +331,6 @@ void PrintUsage(std::ostream& output) {
             parsed.report_json = value;
         } else if (option == "--samples-csv") {
             parsed.samples_csv = value;
-        } else if (option == "--intraday-store-mode") {
-            if (!ParseIntradayStoreMode(
-                    value, &parsed.intraday_store_mode)) {
-                *error =
-                    "--intraday-store-mode must be "
-                    "disabled|shadow|required|primary";
-                return false;
-            }
         } else if (option == "--intraday-store-max-records") {
             if (!ParseU64(
                     value, &parsed.intraday_store_maximum_records) ||
@@ -407,7 +366,6 @@ void PrintUsage(std::ostream& output) {
                     "--intraday-store-chunk-records must be 1..65536";
                 return false;
             }
-            parsed.intraday_store_chunk_records_set = true;
         } else if (option == "--intraday-store-batch-records") {
             if (!ParseU32(
                     value, &parsed.intraday_store_batch_records) ||
@@ -420,7 +378,6 @@ void PrintUsage(std::ostream& output) {
                     "--intraday-store-batch-records must be 1..1048576";
                 return false;
             }
-            parsed.intraday_store_batch_records_set = true;
         } else {
             std::uint32_t number = 0U;
             if (!ParseU32(value, &number) || number == 0U) {
@@ -433,8 +390,8 @@ void PrintUsage(std::ostream& output) {
                 parsed.generation_interval_ms = number;
             } else if (option == "--generation-timeout-ms") {
                 parsed.generation_timeout_ms = number;
-            } else if (option == "--history-workers") {
-                parsed.history_workers = number;
+            } else if (option == "--instrument-store-workers") {
+                parsed.instrument_store_workers = number;
             } else if (option == "--acquire-repetitions") {
                 parsed.acquire_repetitions = number;
             } else {
@@ -458,31 +415,18 @@ void PrintUsage(std::ostream& output) {
         parsed.duration_seconds > 86'400U ||
         parsed.generation_interval_ms > 60'000U ||
         parsed.generation_timeout_ms > 600'000U ||
-        parsed.history_workers > 256U ||
+        parsed.instrument_store_workers > 256U ||
         parsed.acquire_repetitions > 10'000U) {
         *error = "required option missing or option is out of range";
         return false;
     }
-    const bool intraday_store_enabled =
-        parsed.intraday_store_mode !=
-        market::IntradayInstrumentStoreModeV1::kDisabled;
-    if (intraday_store_enabled) {
-        if (!parsed.intraday_store_maximum_records_set ||
-            !parsed.intraday_store_memory_set) {
-            *error =
-                "enabled --intraday-store-mode requires explicit positive "
-                "--intraday-store-max-records and "
-                "--intraday-store-memory-gib";
-            return false;
-        }
-    } else if (parsed.intraday_store_from_open ||
-               parsed.intraday_store_maximum_records_set ||
-               parsed.intraday_store_memory_set ||
-               parsed.intraday_store_chunk_records_set ||
-               parsed.intraday_store_batch_records_set) {
+    if (!parsed.intraday_store_maximum_records_set ||
+        !parsed.intraday_store_memory_set ||
+        !parsed.intraday_store_from_open) {
         *error =
-            "disabled intraday store rejects --intraday-store-from-open "
-            "and all intraday store capacity options";
+            "store-only acceptance requires explicit positive "
+            "--intraday-store-max-records, --intraday-store-memory-gib, "
+            "and --intraday-store-from-open";
         return false;
     }
     *output = std::move(parsed);
@@ -614,11 +558,9 @@ void WriteDistributionJson(
 }
 
 void ValidateWatermark(
-    const market::RealtimeHistoryGenerationV1& generation,
+    const market::RealtimeHistoryWatermarkV1& watermark,
     const market::InstrumentRegistryV1& registry,
     AcceptanceState* state) {
-    const market::RealtimeHistoryWatermarkV1& watermark =
-        generation.watermark();
     std::uint64_t sum = 0U;
     for (const market::RealtimeSourceWatermarkV1& source :
          watermark.sources) {
@@ -634,59 +576,129 @@ void ValidateWatermark(
         watermark.ingress_sequence_exclusive - 1U != sum ||
         watermark.registry_version != registry.registry_version() ||
         watermark.registry_sha256 != registry.registry_sha256()) {
-        Fail(state, "history watermark identity/prefix invariant failed");
+        Fail(state, "store watermark identity/prefix invariant failed");
     }
 }
 
 void ValidateGenerationAndCollect(
-    const std::shared_ptr<const market::RealtimeHistoryGenerationV1>& generation,
+    const std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>& generation,
     const market::InstrumentRegistryV1& registry,
     std::uint64_t read_realtime_ns,
     std::uint64_t read_monotonic_ns,
     AcceptanceState* state,
     SampleRow* sample) {
     if (generation == nullptr) {
-        Fail(state, "published history handle is null");
+        Fail(state, "published store handle is null");
         return;
     }
-    ValidateWatermark(*generation, registry, state);
-    const auto rows = generation->instruments();
+    ValidateWatermark(generation->watermark(), registry, state);
+    if (!state->valid) {
+        return;
+    }
     const auto entries = registry.entries();
-    if (rows.size() != entries.size() ||
-        state->last_seen_head_by_universe_index.size() != rows.size()) {
-        Fail(state, "history generation does not contain exact registry universe");
+    if (!generation->coverage_from_open() ||
+        generation->instrument_count() != entries.size() ||
+        state->last_seen_head_by_universe_index.size() != entries.size()) {
+        Fail(
+            state,
+            "store generation does not contain the exact from-open universe");
         return;
     }
     if (generation->watermark().recv_monotonic_cut_ns > read_monotonic_ns) {
-        Fail(state, "history generation cut is in the monotonic-clock future");
+        Fail(state, "store generation cut is in the monotonic-clock future");
         return;
     }
     sample->generation_age_ns =
         read_monotonic_ns - generation->watermark().recv_monotonic_cut_ns;
     state->generation_age_ns.Add(sample->generation_age_ns);
 
-    market::RealtimeHistoryRecordHandleV1 global_head;
+    const market::RealtimeHistoryRecordV1* global_head = nullptr;
     std::vector<std::uint64_t> local_recv_ages;
     std::vector<std::int64_t> local_event_ages;
-    for (std::size_t index = 0U; index < rows.size(); ++index) {
-        const market::RealtimeInstrumentGenerationV1& row = rows[index];
-        if (row.instrument_id != entries[index].instrument_id) {
-            Fail(state, "history universe ordering/identity mismatch");
+    std::uint64_t summary_record_count = 0U;
+    for (std::size_t index = 0U; index < entries.size(); ++index) {
+        market::IntradayInstrumentSummaryV1 row{};
+        const market::IntradayInstrumentStoreQueryErrorV1 query_error =
+            generation->SummaryAt(index, &row);
+        if (query_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            row.instrument_id != entries[index].instrument_id) {
+            Fail(state, "store universe ordering/identity mismatch");
             return;
         }
+        std::uint64_t source_record_count = 0U;
+        for (const std::uint64_t count : row.source_record_counts) {
+            if (source_record_count >
+                std::numeric_limits<std::uint64_t>::max() - count) {
+                Fail(state, "store summary source count overflow");
+                return;
+            }
+            source_record_count += count;
+        }
+        if (source_record_count != row.record_count ||
+            summary_record_count >
+                std::numeric_limits<std::uint64_t>::max() -
+                    row.record_count) {
+            Fail(state, "store summary record count invariant failed");
+            return;
+        }
+        summary_record_count += row.record_count;
         ++state->universe_rows_checked;
-        if (row.history.empty()) {
-            continue;
-        }
-        const market::RealtimeHistoryRecordHandleV1& head = row.history.back();
-        if (head == nullptr || head->instrument_id() != row.instrument_id ||
-            head->ingress_sequence() >=
-                generation->watermark().ingress_sequence_exclusive ||
-            head->recv_monotonic_ns() < 0 ||
-            static_cast<std::uint64_t>(head->recv_monotonic_ns()) >
-                read_monotonic_ns) {
-            Fail(state, "history head metadata/timestamp invariant failed");
+
+        const auto valid_latest =
+            [&generation, read_monotonic_ns, &row](
+                const market::RealtimeHistoryRecordV1* record,
+                bool expect_snapshot) {
+                if (record == nullptr) {
+                    return true;
+                }
+                const std::size_t source =
+                    static_cast<std::size_t>(record->source_slot());
+                return record->instrument_id() == row.instrument_id &&
+                       EventKindIndex(record->kind()) <
+                           kEventKindCount &&
+                       SnapshotKind(record->kind()) == expect_snapshot &&
+                       record->ingress_sequence() != 0U &&
+                       record->ingress_sequence() <
+                           generation->watermark()
+                               .ingress_sequence_exclusive &&
+                       source < generation->watermark().sources.size() &&
+                       record->source_sequence() != 0U &&
+                       record->source_sequence() <
+                           generation->watermark()
+                               .sources[source]
+                               .sequence_exclusive &&
+                       record->source_stream_id() ==
+                           generation->watermark()
+                               .sources[source]
+                               .source_stream_id &&
+                       record->recv_monotonic_ns() >= 0 &&
+                       static_cast<std::uint64_t>(
+                           record->recv_monotonic_ns()) <=
+                           read_monotonic_ns;
+            };
+        if (!valid_latest(row.latest_snapshot, true) ||
+            !valid_latest(row.latest_tick, false) ||
+            (row.record_count == 0U &&
+             (row.latest_snapshot != nullptr ||
+              row.latest_tick != nullptr)) ||
+            (row.record_count != 0U &&
+             row.latest_snapshot == nullptr &&
+             row.latest_tick == nullptr)) {
+            Fail(state, "store latest-record metadata invariant failed");
             return;
+        }
+        const market::RealtimeHistoryRecordV1* head =
+            row.latest_snapshot;
+        if (head == nullptr ||
+            (row.latest_tick != nullptr &&
+             head->ingress_sequence() <
+                 row.latest_tick->ingress_sequence())) {
+            head = row.latest_tick;
+        }
+        if (head == nullptr) {
+            continue;
         }
         if (global_head == nullptr ||
             global_head->ingress_sequence() < head->ingress_sequence()) {
@@ -718,8 +730,15 @@ void ValidateGenerationAndCollect(
             }
         }
     }
+    if (summary_record_count != generation->record_count() ||
+        generation->watermark().ingress_sequence_exclusive == 0U ||
+        summary_record_count !=
+            generation->watermark().ingress_sequence_exclusive - 1U) {
+        Fail(state, "store generation summary total invariant failed");
+        return;
+    }
     if (global_head == nullptr) {
-        Fail(state, "published generation contains no market history head");
+        Fail(state, "published store generation contains no market head");
         return;
     }
     sample->global_head_recv_age_ns = read_monotonic_ns -
@@ -748,107 +767,50 @@ void ValidateGenerationAndCollect(
     }
 }
 
-void ValidateFinalRetainedHistory(
-    const market::RealtimeHistoryGenerationV1& generation,
-    std::size_t maximum_records_per_instrument,
-    AcceptanceState* state) {
-    const market::RealtimeHistoryWatermarkV1& watermark =
-        generation.watermark();
-    for (const market::RealtimeInstrumentGenerationV1& row :
-         generation.instruments()) {
-        if (row.history.size() > maximum_records_per_instrument) {
-            Fail(state, "bounded history capacity was exceeded");
-            return;
-        }
-        std::uint64_t previous = 0U;
-        for (const market::RealtimeHistoryRecordHandleV1& record : row.history) {
-            if (record == nullptr || record->instrument_id() != row.instrument_id ||
-                record->ingress_sequence() <= previous ||
-                record->ingress_sequence() >=
-                    watermark.ingress_sequence_exclusive ||
-                record->source_slot() >= watermark.sources.size() ||
-                record->source_sequence() >=
-                    watermark.sources[record->source_slot()].sequence_exclusive) {
-                Fail(state, "final retained history ordering/content invariant failed");
-                return;
-            }
-            previous = record->ingress_sequence();
-            ++state->retained_records_checked;
-            const std::size_t kind_index = EventKindIndex(record->kind());
-            if (kind_index < state->event_kinds_seen.size()) {
-                state->event_kinds_seen[kind_index] = true;
-            }
-        }
-        if (row.latest_snapshot != nullptr &&
-            (!SnapshotKind(row.latest_snapshot->kind()) ||
-             row.latest_snapshot->instrument_id() != row.instrument_id)) {
-            Fail(state, "latest_snapshot has invalid kind/instrument");
-            return;
-        }
-        if (row.latest_tick != nullptr &&
-            (SnapshotKind(row.latest_tick->kind()) ||
-             row.latest_tick->instrument_id() != row.instrument_id)) {
-            Fail(state, "latest_tick has invalid kind/instrument");
-            return;
-        }
-    }
-}
-
-void ValidateFinalIntradayStore(
+void ValidateFinalStore(
     const Options& options,
     const runtime::RealtimePipelineCutResultV1& cut,
     const runtime::RealtimePipelineSnapshotV1& snapshot,
     const market::InstrumentRegistryV1& registry,
     AcceptanceState* state) {
-    if (snapshot.intraday_store.mode != options.intraday_store_mode ||
-        snapshot.intraday_store.maximum_session_records !=
+    if (snapshot.store.maximum_session_records !=
             options.intraday_store_maximum_records ||
-        snapshot.intraday_store.maximum_session_accounted_bytes !=
+        snapshot.store.maximum_session_accounted_bytes !=
             options.intraday_store_memory_bytes) {
         Fail(state, "intraday store snapshot configuration mismatch");
         return;
     }
-    const bool enabled =
-        options.intraday_store_mode !=
-        market::IntradayInstrumentStoreModeV1::kDisabled;
-    if (!enabled) {
-        if (cut.intraday_store_generation != nullptr) {
-            Fail(state, "disabled intraday store published a generation");
-        }
+    if (snapshot.store.coverage_lost ||
+        !snapshot.store.coverage_from_open ||
+        !options.intraday_store_from_open) {
+        Fail(state, "required intraday store lost from-open coverage");
         return;
     }
-    if (snapshot.intraday_store.coverage_lost) {
-        Fail(state, "enabled intraday store lost coverage");
-        return;
-    }
-    if (cut.intraday_store_generation == nullptr) {
-        Fail(state, "enabled intraday store omitted final generation");
+    if (cut.store_generation == nullptr) {
+        Fail(state, "required intraday store omitted final generation");
         return;
     }
     const market::IntradayInstrumentStoreGenerationV1& generation =
-        *cut.intraday_store_generation;
-    if (cut.history_generation == nullptr ||
-        cut.factor_generation == nullptr ||
-        cut.history_generation->intraday_store_generation().get() !=
-            cut.intraday_store_generation.get() ||
-        cut.factor_generation->input_intraday_store().get() !=
-            cut.intraday_store_generation.get() ||
-        generation.mode() != options.intraday_store_mode ||
+        *cut.store_generation;
+    if (cut.factor_generation == nullptr ||
+        cut.factor_generation->input_store().get() !=
+            cut.store_generation.get() ||
         generation.instrument_count() != registry.size() ||
-        generation.record_count() != snapshot.intraday_store.appended_records ||
+        generation.record_count() != snapshot.store.appended_records ||
         generation.accounted_record_bytes() !=
-            snapshot.intraday_store.accounted_record_bytes ||
+            snapshot.store.accounted_record_bytes ||
         generation.allocated_index_bytes() !=
-            snapshot.intraday_store.allocated_index_bytes ||
+            snapshot.store.allocated_index_bytes ||
         generation.coverage_from_open() !=
-            snapshot.intraday_store.coverage_from_open ||
-        snapshot.intraday_store.coverage_from_open !=
+            snapshot.store.coverage_from_open ||
+        snapshot.store.coverage_from_open !=
             options.intraday_store_from_open ||
         generation.watermark().generation !=
-            snapshot.intraday_store.latest_generation) {
+            snapshot.store.latest_generation) {
         Fail(state, "final intraday store generation/snapshot contract failed");
         return;
     }
+    ValidateWatermark(generation.watermark(), registry, state);
 
     try {
         std::vector<const market::RealtimeHistoryRecordV1*> batch(
@@ -963,6 +925,13 @@ void ValidateFinalIntradayStore(
                 }
                 ++source_counts[source];
                 ++scanned_records;
+                const std::size_t kind_index =
+                    EventKindIndex(record->kind());
+                if (kind_index >= state->event_kinds_seen.size()) {
+                    Fail(state, "intraday cursor returned invalid event kind");
+                    return;
+                }
+                state->event_kinds_seen[kind_index] = true;
                 previous_instrument_id = record->instrument_id();
                 previous_instrument_ingress =
                     record->ingress_sequence();
@@ -1113,8 +1082,7 @@ void ValidateFinalIntradayStore(
     config.trade_date = options.trade_date;
     config.registry = registry_result.registry.get();
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
-    config.history_worker_count = options.history_workers;
-    config.intraday_store.mode = options.intraday_store_mode;
+    config.store_worker_count = options.instrument_store_workers;
     config.intraday_store.chunk_record_capacity =
         static_cast<std::size_t>(options.intraday_store_chunk_records);
     config.intraday_store.maximum_session_records =
@@ -1166,7 +1134,8 @@ void ValidateFinalIntradayStore(
     const auto timeout =
         std::chrono::milliseconds(options.generation_timeout_ms);
     auto next = start + interval;
-    std::shared_ptr<const market::RealtimeHistoryGenerationV1> last_history;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1> last_store;
 
     while (next <= deadline) {
         std::this_thread::sleep_until(next);
@@ -1201,19 +1170,20 @@ void ValidateFinalIntradayStore(
 
         std::vector<std::uint64_t> local_acquire;
         local_acquire.reserve(options.acquire_repetitions);
-        std::shared_ptr<const market::RealtimeHistoryGenerationV1> acquired;
+        std::shared_ptr<
+            const market::IntradayInstrumentStoreGenerationV1> acquired;
         for (std::uint32_t repetition = 0U;
              repetition < options.acquire_repetitions;
              ++repetition) {
             std::uint64_t before_ns = 0U;
             std::uint64_t after_ns = 0U;
             if (!ClockNs(CLOCK_MONOTONIC, &before_ns)) {
-                Fail(&state, "cannot read history acquire start clock");
+                Fail(&state, "cannot read store acquire start clock");
                 break;
             }
-            acquired = pipeline->AcquireLatestHistoryGeneration();
+            acquired = pipeline->AcquireLatestStoreGeneration();
             if (!ClockNs(CLOCK_MONOTONIC, &after_ns)) {
-                Fail(&state, "cannot read history acquire end clock");
+                Fail(&state, "cannot read store acquire end clock");
                 break;
             }
             const std::uint64_t latency = after_ns - before_ns;
@@ -1223,8 +1193,10 @@ void ValidateFinalIntradayStore(
         if (!state.valid) {
             break;
         }
-        if (acquired.get() != cut.history_generation.get()) {
-            Fail(&state, "AcquireLatestHistoryGeneration returned wrong handle");
+        if (acquired.get() != cut.store_generation.get()) {
+            Fail(
+                &state,
+                "AcquireLatestStoreGeneration returned wrong handle");
             break;
         }
         sample.acquire_p50_ns = Quantile(local_acquire, 0.50L);
@@ -1234,9 +1206,9 @@ void ValidateFinalIntradayStore(
             pipeline->AcquireLatestFactorGeneration();
         if (factor == nullptr ||
             factor.get() != cut.factor_generation.get() ||
-            factor->input_history().get() != cut.history_generation.get() ||
+            factor->input_store().get() != cut.store_generation.get() ||
             factor->points().size() != registry_result.registry->size()) {
-            Fail(&state, "factor/history atomic generation contract failed");
+            Fail(&state, "factor/store atomic generation contract failed");
             break;
         }
 
@@ -1244,11 +1216,11 @@ void ValidateFinalIntradayStore(
         std::uint64_t read_monotonic_ns = 0U;
         if (!ClockNs(CLOCK_REALTIME, &read_realtime_ns) ||
             !ClockNs(CLOCK_MONOTONIC, &read_monotonic_ns)) {
-            Fail(&state, "cannot read history observation clocks");
+            Fail(&state, "cannot read store observation clocks");
             break;
         }
         ValidateGenerationAndCollect(
-            cut.history_generation,
+            cut.store_generation,
             *registry_result.registry,
             read_realtime_ns,
             read_monotonic_ns,
@@ -1273,16 +1245,16 @@ void ValidateFinalIntradayStore(
             sample.source_delta[source] = snapshot.source_sequences[source] -
                 previous.source_sequences[source];
         }
-        sample.generation = cut.history_generation->watermark().generation;
+        sample.generation = cut.store_generation->watermark().generation;
         sample.ingress_prefix =
-            cut.history_generation->watermark().ingress_sequence_exclusive - 1U;
+            cut.store_generation->watermark().ingress_sequence_exclusive - 1U;
         if (sample.ingress_prefix > snapshot.decoded_messages ||
             snapshot.rejected_messages != 0U || snapshot.fatal) {
             Fail(&state, "snapshot prefix/rejection/fatal invariant failed");
             break;
         }
         previous = snapshot;
-        last_history = cut.history_generation;
+        last_store = cut.store_generation;
         state.samples.push_back(sample);
         next += interval;
     }
@@ -1306,11 +1278,7 @@ void ValidateFinalIntradayStore(
                 std::string(runtime::RealtimePipelineCutErrorNameV1(
                     final_cut.error)));
     } else {
-        last_history = final_cut.history_generation;
-        ValidateFinalRetainedHistory(
-            *final_cut.history_generation,
-            config.maximum_history_records_per_instrument,
-            &state);
+        last_store = final_cut.store_generation;
     }
     const runtime::RealtimePipelineSnapshotV1 final_snapshot =
         pipeline->Snapshot();
@@ -1318,7 +1286,7 @@ void ValidateFinalIntradayStore(
         end_monotonic_ns = final_end_ns;
     }
     if (final_cut.published()) {
-        ValidateFinalIntradayStore(
+        ValidateFinalStore(
             options,
             final_cut,
             final_snapshot,
@@ -1336,7 +1304,7 @@ void ValidateFinalIntradayStore(
         final_snapshot.accepted_messages == 0U ||
         final_snapshot.accepted_messages != final_snapshot.decoded_messages ||
         final_snapshot.rejected_messages != 0U || final_snapshot.fatal ||
-        !final_snapshot.stopped || last_history == nullptr ||
+        !final_snapshot.stopped || last_store == nullptr ||
         !AllKindsSeen(state.event_kinds_seen)) {
         Fail(&state, "final duration/count/state/five-kind acceptance gate failed");
     }
@@ -1379,7 +1347,8 @@ void ValidateFinalIntradayStore(
            << ",\n  \"measured_window_ns\":" << measured_window_ns
            << ",\n  \"generation_interval_ms\":"
            << options.generation_interval_ms
-           << ",\n  \"history_workers\":" << options.history_workers
+           << ",\n  \"store_workers\":"
+           << options.instrument_store_workers
            << ",\n  \"registry_version\":"
            << registry_result.registry->registry_version()
            << ",\n  \"registry_sha256\":\""
@@ -1390,26 +1359,23 @@ void ValidateFinalIntradayStore(
     WriteJsonString(report, options.sdk_library.string());
     report << ",\n  \"server_address\":";
     WriteJsonString(report, options.server_address);
-    report << ",\n  \"intraday_store\":{\"mode\":\""
-           << market::IntradayInstrumentStoreModeNameV1(
-                  final_snapshot.intraday_store.mode)
-           << "\",\"record_limit\":"
-           << final_snapshot.intraday_store.maximum_session_records
+    report << ",\n  \"intraday_store\":{\"record_limit\":"
+           << final_snapshot.store.maximum_session_records
            << ",\"byte_limit\":"
-           << final_snapshot.intraday_store
+           << final_snapshot.store
                   .maximum_session_accounted_bytes
            << ",\"records\":"
-           << final_snapshot.intraday_store.appended_records
+           << final_snapshot.store.appended_records
            << ",\"record_bytes\":"
-           << final_snapshot.intraday_store.accounted_record_bytes
+           << final_snapshot.store.accounted_record_bytes
            << ",\"index_bytes\":"
-           << final_snapshot.intraday_store.allocated_index_bytes
+           << final_snapshot.store.allocated_index_bytes
            << ",\"allocated_chunks\":"
-           << final_snapshot.intraday_store.allocated_chunks
+           << final_snapshot.store.allocated_chunks
            << ",\"failed_appends\":"
-           << final_snapshot.intraday_store.failed_appends
+           << final_snapshot.store.failed_appends
            << ",\"latest_generation\":"
-           << final_snapshot.intraday_store.latest_generation
+           << final_snapshot.store.latest_generation
            << ",\"full_scan_records\":"
            << state.intraday_full_scan_records
            << ",\"full_scan_ns\":"
@@ -1419,11 +1385,11 @@ void ValidateFinalIntradayStore(
            << intraday_full_scan_records_per_second
            << std::defaultfloat
            << ",\"coverage_from_open\":"
-           << (final_snapshot.intraday_store.coverage_from_open
+           << (final_snapshot.store.coverage_from_open
                    ? "true"
                    : "false")
            << ",\"coverage_lost\":"
-           << (final_snapshot.intraday_store.coverage_lost
+           << (final_snapshot.store.coverage_lost
                    ? "true"
                    : "false")
            << "},\n  \"counts\":{\"accepted\":"
@@ -1437,9 +1403,7 @@ void ValidateFinalIntradayStore(
            << ",\"updated_instrument_heads\":" << state.updated_heads
            << ",\"event_time_samples\":" << state.event_time_samples
            << ",\"universe_rows_checked\":"
-           << state.universe_rows_checked
-           << ",\"final_retained_records_checked\":"
-           << state.retained_records_checked << "},\n"
+           << state.universe_rows_checked << "},\n"
            << "  \"source_sequences\":[";
     for (std::size_t source = 0U;
          source < final_snapshot.source_sequences.size();
@@ -1463,7 +1427,7 @@ void ValidateFinalIntradayStore(
            << "  \"latency_ns\":{\n"
            << "    \"generation_cut_and_factor\":";
     WriteDistributionJson(report, state.cut_latency_ns.values);
-    report << ",\n    \"history_acquire_call\":";
+    report << ",\n    \"store_acquire_call\":";
     WriteDistributionJson(report, state.acquire_latency_ns.values);
     report << ",\n    \"generation_cut_to_read\":";
     WriteDistributionJson(report, state.generation_age_ns.values);
@@ -1476,10 +1440,10 @@ void ValidateFinalIntradayStore(
     report << ",\n    \"updated_instrument_head_event_to_read\":";
     WriteDistributionJson(report, state.updated_head_event_age_ns.values);
     report << "\n  },\n  \"latency_semantics\":{\n"
-           << "    \"history_acquire_call\":"
-              "\"CLOCK_MONOTONIC around atomic shared history acquisition\",\n"
+           << "    \"store_acquire_call\":"
+              "\"CLOCK_MONOTONIC around atomic shared store acquisition\",\n"
            << "    \"recv_to_read\":"
-              "\"read CLOCK_MONOTONIC minus record recv_monotonic_ns; local process freshness including queue, decode, history barrier and publication interval\",\n"
+              "\"read CLOCK_MONOTONIC minus record recv_monotonic_ns; local process freshness including queue, decode, store barrier and publication interval\",\n"
            << "    \"event_to_read\":"
               "\"read CLOCK_REALTIME minus decoded exchange event_time_ns; end-to-end market freshness including upstream/feed/network/process/publication\"\n"
            << "  }\n}\n";
@@ -1507,17 +1471,14 @@ void ValidateFinalIntradayStore(
               << ",\"accepted_per_second\":" << std::fixed
               << std::setprecision(3) << accepted_per_second
               << ",\"generations\":" << state.generations
-              << ",\"intraday_store\":{\"mode\":\""
-              << market::IntradayInstrumentStoreModeNameV1(
-                     final_snapshot.intraday_store.mode)
-              << "\",\"records\":"
-              << final_snapshot.intraday_store.appended_records
+              << ",\"intraday_store\":{\"records\":"
+              << final_snapshot.store.appended_records
               << ",\"record_bytes\":"
-              << final_snapshot.intraday_store.accounted_record_bytes
+              << final_snapshot.store.accounted_record_bytes
               << ",\"index_bytes\":"
-              << final_snapshot.intraday_store.allocated_index_bytes
+              << final_snapshot.store.allocated_index_bytes
               << ",\"byte_limit\":"
-              << final_snapshot.intraday_store
+              << final_snapshot.store
                      .maximum_session_accounted_bytes
               << ",\"full_scan_records\":"
               << state.intraday_full_scan_records
@@ -1526,11 +1487,11 @@ void ValidateFinalIntradayStore(
               << ",\"records_per_second\":"
               << intraday_full_scan_records_per_second
               << ",\"coverage_from_open\":"
-              << (final_snapshot.intraday_store.coverage_from_open
+              << (final_snapshot.store.coverage_from_open
                       ? "true"
                       : "false")
               << ",\"coverage_lost\":"
-              << (final_snapshot.intraday_store.coverage_lost
+              << (final_snapshot.store.coverage_lost
                       ? "true"
                       : "false")
               << "}}\n";

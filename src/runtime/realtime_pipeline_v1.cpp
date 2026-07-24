@@ -191,8 +191,8 @@ std::string_view RealtimePipelineCreateErrorNameV1(
             return "null_output";
         case RealtimePipelineCreateErrorV1::kInvalidConfiguration:
             return "invalid_configuration";
-        case RealtimePipelineCreateErrorV1::kHistoryCreateFailed:
-            return "history_create_failed";
+        case RealtimePipelineCreateErrorV1::kStoreRuntimeCreateFailed:
+            return "store_runtime_create_failed";
         case RealtimePipelineCreateErrorV1::kWalCreateFailed:
             return "wal_create_failed";
         case RealtimePipelineCreateErrorV1::kFactorCreateFailed:
@@ -265,12 +265,12 @@ std::string_view RealtimePipelineCutErrorNameV1(
             return "clock_failure";
         case RealtimePipelineCutErrorV1::kWatermarkFailed:
             return "watermark_failed";
-        case RealtimePipelineCutErrorV1::kHistoryBeginFailed:
-            return "history_begin_failed";
+        case RealtimePipelineCutErrorV1::kGenerationBeginFailed:
+            return "generation_begin_failed";
         case RealtimePipelineCutErrorV1::kMarkerAdmissionFailed:
             return "marker_admission_failed";
-        case RealtimePipelineCutErrorV1::kHistoryWaitFailed:
-            return "history_wait_failed";
+        case RealtimePipelineCutErrorV1::kGenerationWaitFailed:
+            return "generation_wait_failed";
         case RealtimePipelineCutErrorV1::kFactorPublishFailed:
             return "factor_publish_failed";
         case RealtimePipelineCutErrorV1::kUnexpectedFailure:
@@ -414,24 +414,25 @@ public:
         try {
             market::RealtimeHistoryRuntimeConfigV1 history_config{};
             history_config.source_stream_ids = config_.source_stream_ids;
-            history_config.worker_count = config_.history_worker_count;
+            history_config.worker_count = config_.store_worker_count;
             history_config.queue_capacity_per_source_worker =
-                config_.history_queue_capacity_per_source_worker;
-            history_config.maximum_records_per_instrument =
-                config_.maximum_history_records_per_instrument;
+                config_.store_queue_capacity_per_source_worker;
             history_config.intraday_store = config_.intraday_store;
             history_config.registry = config_.registry;
-            const market::RealtimeHistoryCreateErrorV1 history_error =
+            const market::RealtimeHistoryCreateErrorV1
+                store_runtime_error =
                 market::RealtimeHistoryRuntimeV1::Create(
                     history_config, &history_);
-            if (history_error != market::RealtimeHistoryCreateErrorV1::kNone) {
+            if (store_runtime_error !=
+                market::RealtimeHistoryCreateErrorV1::kNone) {
                 SetDetail(
                     detail,
-                    "history create failed: " +
+                    "store runtime create failed: " +
                         std::string(
                             market::RealtimeHistoryCreateErrorNameV1(
-                                history_error)));
-                return RealtimePipelineCreateErrorV1::kHistoryCreateFailed;
+                                store_runtime_error)));
+                return RealtimePipelineCreateErrorV1::
+                    kStoreRuntimeCreateFailed;
             }
 
             const realtime::OptionalWalCreateErrorV1 wal_error =
@@ -452,7 +453,7 @@ public:
             }
             factor::RealtimeFactorEngineConfigV1 factor_config{};
             factor_config.registry = config_.registry;
-            factor_config.history_runtime = history_.get();
+            factor_config.generation_runtime = history_.get();
             factor_config.calculator = config_.factor_calculator;
             const factor::RealtimeFactorEngineCreateErrorV1 factor_error =
                 factor::RealtimeFactorEngineV1::Create(
@@ -712,7 +713,6 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 Cut(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
-        result.intraday_store_required = IntradayStoreRequired();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -732,7 +732,6 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 StopAndPublishFinal(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
-        result.intraday_store_required = IntradayStoreRequired();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -789,7 +788,6 @@ public:
         bool admission_is_quiesced,
         std::optional<std::uint64_t> preclosed_monotonic_cut_ns) noexcept {
         RealtimePipelineCutResultV1 result{};
-        result.intraday_store_required = IntradayStoreRequired();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -805,11 +803,10 @@ public:
                 if (fatal_.load(std::memory_order_acquire) ||
                     history_fatal) {
                     if (history_fatal &&
-                        result.intraday_store_required &&
-                        history_->IntradayStoreSnapshot().coverage_lost) {
-                        result.history_error =
+                        history_->StoreSnapshot().coverage_lost) {
+                        result.generation_error =
                             market::RealtimeHistoryGenerationErrorV1::
-                                kIntradayStoreFailed;
+                                kStoreFailed;
                     }
                     result.error = RealtimePipelineCutErrorV1::kFatal;
                     TripFatalWithAdmissionLockHeld();
@@ -878,11 +875,13 @@ public:
                     return result;
                 }
 
-                result.history_error = history_->BeginGeneration(watermark);
-                if (result.history_error !=
+                result.generation_error =
+                    history_->BeginGeneration(watermark);
+                if (result.generation_error !=
                     market::RealtimeHistoryGenerationErrorV1::kNone) {
                     result.error =
-                        RealtimePipelineCutErrorV1::kHistoryBeginFailed;
+                        RealtimePipelineCutErrorV1::
+                            kGenerationBeginFailed;
                     TripFatalWithAdmissionLockHeld();
                     return result;
                 }
@@ -906,31 +905,27 @@ public:
                 }
             }
 
-            result.history_error = history_->WaitForGeneration(
-                generation, Remaining(deadline), &result.history_generation);
-            if (result.history_error !=
+            result.generation_error = history_->WaitForGeneration(
+                generation, Remaining(deadline), &result.store_generation);
+            if (result.generation_error !=
                 market::RealtimeHistoryGenerationErrorV1::kNone) {
                 result.error =
-                    RealtimePipelineCutErrorV1::kHistoryWaitFailed;
+                    RealtimePipelineCutErrorV1::kGenerationWaitFailed;
                 TripFatal();
                 return result;
             }
-            result.intraday_store_generation =
-                result.history_generation->
-                    intraday_store_generation();
-            if (result.intraday_store_required &&
-                result.intraday_store_generation == nullptr) {
-                result.history_error =
+            if (result.store_generation == nullptr) {
+                result.generation_error =
                     market::RealtimeHistoryGenerationErrorV1::
-                        kIntradayStoreFailed;
+                        kStoreFailed;
                 result.error =
-                    RealtimePipelineCutErrorV1::kHistoryWaitFailed;
+                    RealtimePipelineCutErrorV1::kGenerationWaitFailed;
                 TripFatal();
                 return result;
             }
 
             result.factor_result =
-                factor_->CalculateAndPublish(result.history_generation);
+                factor_->CalculateAndPublish(result.store_generation);
             if (!result.factor_result.published()) {
                 result.error =
                     RealtimePipelineCutErrorV1::kFactorPublishFailed;
@@ -948,28 +943,12 @@ public:
         }
     }
 
-    [[nodiscard]] bool IntradayStoreRequired() const noexcept {
-        return config_.intraday_store.mode ==
-                   market::IntradayInstrumentStoreModeV1::kRequired ||
-               config_.intraday_store.mode ==
-                   market::IntradayInstrumentStoreModeV1::kPrimary;
-    }
-
     [[nodiscard]] std::shared_ptr<
-        const market::RealtimeHistoryGenerationV1>
-    AcquireHistory() const noexcept {
+        const market::IntradayInstrumentStoreGenerationV1>
+    AcquireStore() const noexcept {
         return history_ == nullptr
                    ? nullptr
                    : history_->AcquireLatestGeneration();
-    }
-
-    [[nodiscard]] std::shared_ptr<
-        const market::IntradayInstrumentStoreGenerationV1>
-    AcquireIntradayStore() const noexcept {
-        return history_ == nullptr
-                   ? nullptr
-                   : history_->
-                         AcquireLatestIntradayStoreGeneration();
     }
 
     [[nodiscard]] std::shared_ptr<
@@ -1002,8 +981,7 @@ public:
             result.wal = wal_->Snapshot();
         }
         if (history_ != nullptr) {
-            result.intraday_store =
-                history_->IntradayStoreSnapshot();
+            result.store = history_->StoreSnapshot();
         }
         result.accepting = accepting_.load(std::memory_order_acquire);
         result.fatal = fatal_.load(std::memory_order_acquire) ||
@@ -1055,9 +1033,16 @@ private:
             config_.trade_date == 0U ||
             config_.maximum_sdk_message_bytes < sdk::kVendorHeadBytes ||
             config_.decoder_queue_capacity_per_source == 0U ||
-            config_.history_worker_count == 0U ||
-            config_.history_queue_capacity_per_source_worker == 0U ||
-            config_.maximum_history_records_per_instrument == 0U) {
+            config_.store_worker_count == 0U ||
+            config_.store_queue_capacity_per_source_worker == 0U ||
+            config_.intraday_store.chunk_record_capacity == 0U ||
+            config_.intraday_store.chunk_record_capacity >
+                market::kIntradayInstrumentStoreMaximumChunkRecordsV1 ||
+            config_.intraday_store.maximum_session_records == 0U ||
+            config_.intraday_store.maximum_session_accounted_bytes == 0U ||
+            config_.intraday_store.maximum_records_per_batch == 0U ||
+            config_.intraday_store.maximum_records_per_batch >
+                market::kIntradayInstrumentStoreMaximumBatchRecordsV1) {
             return false;
         }
         const std::size_t maximum_body =
@@ -1488,15 +1473,9 @@ RealtimePipelineV1::StopAndPublishFinalGeneration(
     return impl_->StopAndPublishFinal(timeout);
 }
 
-std::shared_ptr<const market::RealtimeHistoryGenerationV1>
-RealtimePipelineV1::AcquireLatestHistoryGeneration() const noexcept {
-    return impl_->AcquireHistory();
-}
-
 std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
-RealtimePipelineV1::AcquireLatestIntradayStoreGeneration()
-    const noexcept {
-    return impl_->AcquireIntradayStore();
+RealtimePipelineV1::AcquireLatestStoreGeneration() const noexcept {
+    return impl_->AcquireStore();
 }
 
 std::shared_ptr<const factor::RealtimeFactorGenerationV1>

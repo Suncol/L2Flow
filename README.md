@@ -10,8 +10,7 @@ operator-selected Vendor SDK shared library
        |-> optional best-effort audit WAL
        `-> source decoder
             -> instrument_id % worker_count router
-            -> bounded per-instrument history
-            -> optional complete intraday instrument store
+            -> mandatory complete intraday instrument store
             -> generation barrier and ingress-prefix watermark
             -> full-universe factor calculation
             -> one atomic factor-generation publication
@@ -75,14 +74,14 @@ released immediately after the callback returns.
 The decoder queue and optional WAL receive the same immutable owner. WAL is a
 side sink only:
 
-- WAL status never grants or rejects realtime history admission.
+- WAL status never grants or rejects instrument-store admission.
 - Queue pressure, open/write/sync/close failure, or a stopped writer causes
   sticky audit `coverage_lost` and an operational warning.
-- WAL offsets and durability are not part of a history watermark.
-- A WAL failure cannot make an otherwise valid history or factor generation
+- WAL offsets and durability are not part of a store watermark.
+- A WAL failure cannot make an otherwise valid store or factor generation
   incomplete.
 
-### Routing and history
+### Routing and mandatory intraday storage
 
 The callback owns one dense process-wide ingress sequence and four dense
 per-source sequences. Rejected and ignored callbacks consume no sequence.
@@ -111,34 +110,41 @@ sentinel and no unit guessed.
 After decode and registry lookup, a record is routed permanently by:
 
 ```text
-worker = instrument_id % history_worker_count
+worker = instrument_id % store_worker_count
 ```
 
-Each instrument keeps the greatest configured number of global ingress
-sequences. Cross-source decoder arrival may be out of order, so history rows
-are explicitly sorted by the process-wide ingress sequence rather than worker
-arrival time. The fixed instrument registry is the generation universe;
-unseen instruments remain present as empty rows.
+The production chain always retains every accepted record for the process
+trade date in four append-only source lanes per instrument. Cross-source
+decoder arrival may be out of order; generation queries merge the captured
+lanes by the dense process-wide ingress sequence. The fixed instrument
+registry is the generation universe, including instruments with no records.
 
-When enabled, the intraday instrument store also retains every accepted record
-for the process trade date in append-only per-source chunks. It shares the
-decoded record owner with bounded history and reuses the same worker and
-four-source generation fence. Generation cuts capture chunk endpoints rather
-than copying the accumulated record handles, so periodic cut cost does not grow
-with the retained session record count. The store has explicit record and
-accounted-byte hard limits and never evicts old records.
+The store owns the decoded record exactly once. Generation cuts capture chunk
+endpoints and latest-record locators rather than copying the accumulated
+record handles, so publication remains O(the fixed instrument universe) as the
+session grows. Record and logical-byte limits are mandatory, and reaching
+either limit fails the production pipeline closed; old records are never
+evicted to regain capacity.
 
 The store is memory-only. It does not replay the optional WAL or feeder CSV;
-after a mid-session process start or restart its coverage is partial.
+the feeder's append-only CSV is outside this project's recovery path. After a
+mid-session process start or restart, the new process can cover only records
+accepted after that start and must not claim `coverage_from_open`.
+
+On a 1 TiB host, the initial envelope is a 600--620 GiB logical store limit,
+an 800 GiB process high-water alert, and an 850--860 GiB termination boundary.
+Old factors, store generations, and cursors pin their session and record
+owners, so consumers must enforce a small fixed limit on retained handles.
 
 ### Generation barrier and watermark
 
 A generation cut is serialized with callback admission. The runtime captures
 one exclusive global prefix and one exclusive prefix for each source, then
 places a marker behind all pre-cut messages in every serial decoder queue.
-Every history worker receives all four source fences before it freezes its
+Every store worker receives all four source fences before it captures its
 slice. Only after every worker slice is present and the complete registry
-universe has been verified is one immutable history generation published.
+universe and source counts have been verified is one immutable store
+generation published.
 
 For every valid watermark:
 
@@ -155,30 +161,37 @@ not make the prefix appear fresher.
 
 ### Factor publication and reader rule
 
-A calculator receives one immutable, barrier-complete, full-universe history
-generation. Its output must contain exactly one row per registry instrument in
-the same order, with the exact fixed factor schema. The engine rejects missing
-or reordered rows, wrong column counts, NaN/infinity, and non-canonical invalid
-values.
+A calculator receives one immutable, barrier-complete store generation. It
+uses the latest-only `SummaryAt(index)` view to transform the fixed universe in
+O(instrument count), without scanning the session record stream. Its output
+must contain exactly one row per registry instrument in the same order, with
+the exact fixed factor schema. The engine rejects missing or reordered rows,
+wrong column counts, NaN/infinity, and non-canonical invalid values.
 
 The published factor generation is one atomic shared handle. It retains the
-exact input history handle and copies the exact same watermark. Readers that
-need a consistent history/factor pair must acquire the factor once and derive
-the matching history from it:
+exact input store handle and copies the exact same watermark. Readers that
+need a consistent store/factor pair must acquire the factor once and derive
+the matching store from it:
 
 ```cpp
 auto factor = pipeline->AcquireLatestFactorGeneration();
 if (factor != nullptr) {
-    const auto& matching_history = factor->input_history();
-    const auto& matching_intraday = factor->input_intraday_store();
-    // Use all three as one generation-consistent set.
+    const auto& matching_store = factor->input_store();
+    // factor and matching_store describe the exact same ingress prefix.
 }
 ```
 
-Do not independently acquire the latest history and latest factor and assume
-they have the same generation: history generation `N` is necessarily
-published before factor generation `N`, so a reader may briefly see history
-`N` and factor `N-1` through two independent latest slots.
+Do not independently acquire the latest store and latest factor and assume
+they have the same generation: store generation `N` is necessarily published
+before factor generation `N`, so two latest-slot reads may briefly observe
+different generations.
+
+Full-session consumers use store cursors: draining N records is O(N) and each
+`ReadBatch` uses O(batch) caller-owned pointer storage rather than allocating a
+second full-session result. Large drains can be split into independent
+half-open instrument-ordinal ranges with `OpenUniverseRangeCursor`. With an
+untruncated `maximum_records` setting, concatenating non-overlapping ranges in
+ordinal order is identical to one full-universe cursor.
 
 The default `SnapshotLastPriceProjectionV1` is deliberately literal:
 
@@ -192,7 +205,7 @@ published as `{value=+0.0, valid=false}`; a pre-trade zero is not presented as
 a formed market price. A production-specific calculator may be injected,
 but it must be a pure, non-reentrant full-generation transformation and must
 enforce a strict execution-time bound. The generation timeout is only a shared
-wait budget for decoder-marker queue backpressure and the history condition
+wait budget for decoder-marker queue backpressure and the store condition
 wait; it is not a wall-clock completion deadline and cannot preempt arbitrary
 calculator code.
 
@@ -210,8 +223,8 @@ SIGINT, SIGTERM, or the date boundary uses the terminal publication path:
 close admission and capture the final prefix cut
 -> quiesce SDK callbacks
 -> inject final decoder markers
--> publish final complete history and factor generations
--> join decoder/history workers
+-> publish final complete store and factor generations
+-> join decoder/store workers
 -> drain and optionally fdatasync the WAL
 -> stopped
 ```
@@ -267,6 +280,12 @@ Requirements:
 - pthreads;
 - vendor SDK headers containing `mdl_api.h`.
 
+This cutover deliberately changes the existing V1 config layouts and
+calculator virtual interface in place; there is no binary compatibility
+adapter for the retired retention path. Deployment must use a clean rebuild
+of the executable, static libraries, tests, and any injected calculator.
+Previously compiled objects or plugins must not be mixed with this build.
+
 The repository header location is the default. A different header directory
 can be selected without changing runtime SDK selection:
 
@@ -287,8 +306,8 @@ cmake --build build-probe -j --target mdl_sdk_feeder_probe
 ```
 
 It creates its own SDK objects for an operator-invoked feeder check and does
-not publish production history or factors. It is not a second production data
-chain.
+not publish production store or factor generations. It is not a second
+production data chain.
 
 The isolated vendor mock suite is also opt-in:
 
@@ -329,8 +348,7 @@ into a production target.
   --server-address 127.0.0.1:9112 \
   --user-name runtime-token \
   --sdk-log-prefix /var/log/l2flow/mdl \
-  --history-workers 4 \
-  --intraday-store-mode required \
+  --instrument-store-workers 4 \
   --intraday-store-max-records 1000000000 \
   --intraday-store-memory-gib 600 \
   --intraday-store-from-open \
@@ -343,7 +361,7 @@ into a production target.
 existing path is refused by the optional WAL sink and reported as audit
 coverage loss while realtime publication continues.
 
-The process exits nonzero on a fatal decode, routing, history, barrier, factor,
+The process exits nonzero on a fatal decode, routing, store, barrier, factor,
 or SDK lifecycle error. A clean signal or civil-date boundary attempts one
 final complete generation before stopping.
 
@@ -357,7 +375,7 @@ include/l2flow/realtime, src/realtime
   immutable ingress ownership and optional WAL side sink
 
 include/l2flow/market, src/market
-  decoder, fixed instrument registry, router, history, barrier, watermark
+  decoder, fixed instrument registry, router, intraday store, barrier, watermark
 
 include/l2flow/factor, src/factor
   calculator contract and atomic full-generation factor publication

@@ -51,7 +51,7 @@ struct RealtimeFactorPointV1 final {
 enum class RealtimeFactorCalculatorErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
-    kInvalidHistory,
+    kInvalidStore,
     kResourceExhausted,
     kCalculationFailed,
 };
@@ -59,13 +59,14 @@ enum class RealtimeFactorCalculatorErrorV1 : std::uint8_t {
 [[nodiscard]] std::string_view RealtimeFactorCalculatorErrorNameV1(
     RealtimeFactorCalculatorErrorV1 error) noexcept;
 
-// A calculator is a pure, non-reentrant full-generation transformation. It receives one
-// immutable, generation-barrier-complete history view and must return exactly
-// one row for every input instrument in the same order.  The engine validates
-// that contract and owns publication; a calculator cannot publish a partial
-// result or choose its own watermark. Calculate must not call the owning
-// pipeline's cut/stop/publication APIs or the history lifecycle APIs, and a
-// production implementation must enforce a strict execution-time bound.
+// A calculator is a pure, non-reentrant full-generation transformation. It
+// receives one immutable, generation-barrier-complete intraday store view and
+// must return exactly one row for every input instrument in the same order.
+// The engine validates that contract and owns publication; a calculator
+// cannot publish a partial result or choose its own watermark. Calculate must
+// not call the owning pipeline's cut/stop/publication APIs or generation
+// lifecycle APIs, and a production implementation must enforce a strict
+// execution-time bound.
 class RealtimeFactorCalculatorV1 {
 public:
     virtual ~RealtimeFactorCalculatorV1() = default;
@@ -78,7 +79,7 @@ public:
     // On success output contains a complete candidate batch.  On failure its
     // contents are ignored.  Implementations must not throw across noexcept.
     [[nodiscard]] virtual RealtimeFactorCalculatorErrorV1 Calculate(
-        const l2flow::market::RealtimeHistoryGenerationV1& history,
+        const l2flow::market::IntradayInstrumentStoreGenerationV1& store,
         std::vector<RealtimeFactorPointV1>* output) const noexcept = 0;
 };
 
@@ -97,18 +98,18 @@ public:
     [[nodiscard]] std::span<const RealtimeFactorDefinitionV1>
     definitions() const noexcept override;
     [[nodiscard]] RealtimeFactorCalculatorErrorV1 Calculate(
-        const l2flow::market::RealtimeHistoryGenerationV1& history,
+        const l2flow::market::IntradayInstrumentStoreGenerationV1& store,
         std::vector<RealtimeFactorPointV1>* output) const noexcept override;
 
 private:
     std::array<RealtimeFactorDefinitionV1, 1U> definitions_;
 };
 
-// One immutable full-universe publication.  Its watermark is copied verbatim
-// from input_history and the shared input handle is retained for auditability
-// and lifetime safety.  There is no per-worker or per-instrument current slot:
-// readers acquire this single object once and therefore cannot observe a
-// half-old/half-new market cross-section.
+// One immutable full-universe publication. Its watermark is copied verbatim
+// from input_store and the shared input handle is retained for auditability
+// and borrowed-record lifetime safety. There is no per-worker or
+// per-instrument current slot: readers acquire this single object once and
+// therefore cannot observe a half-old/half-new market cross-section.
 class RealtimeFactorGenerationV1 final {
 public:
     [[nodiscard]] const l2flow::market::RealtimeHistoryWatermarkV1&
@@ -126,14 +127,9 @@ public:
     [[nodiscard]] const RealtimeFactorPointV1* Find(
         std::uint32_t instrument_id) const noexcept;
     [[nodiscard]] const std::shared_ptr<
-        const l2flow::market::RealtimeHistoryGenerationV1>&
-    input_history() const noexcept {
-        return input_history_;
-    }
-    [[nodiscard]] const std::shared_ptr<
         const l2flow::market::IntradayInstrumentStoreGenerationV1>&
-    input_intraday_store() const noexcept {
-        return input_history_->intraday_store_generation();
+    input_store() const noexcept {
+        return input_store_;
     }
 
 private:
@@ -141,23 +137,25 @@ private:
 
     RealtimeFactorGenerationV1(
         std::shared_ptr<
-            const l2flow::market::RealtimeHistoryGenerationV1>
-            input_history,
+            const l2flow::market::IntradayInstrumentStoreGenerationV1>
+            input_store,
         std::vector<RealtimeFactorDefinitionV1> definitions,
         std::vector<RealtimeFactorPointV1> points) noexcept;
 
-    std::shared_ptr<const l2flow::market::RealtimeHistoryGenerationV1>
-        input_history_;
+    std::shared_ptr<
+        const l2flow::market::IntradayInstrumentStoreGenerationV1>
+        input_store_;
     l2flow::market::RealtimeHistoryWatermarkV1 watermark_{};
     std::vector<RealtimeFactorDefinitionV1> definitions_;
     std::vector<RealtimeFactorPointV1> points_;
 };
 
 struct RealtimeFactorEngineConfigV1 final {
-    // registry and history_runtime must outlive the engine.  The calculator
+    // registry and generation_runtime must outlive the engine. The calculator
     // is shared-owned because a calculation may be deliberately long-running.
     const l2flow::market::InstrumentRegistryV1* registry = nullptr;
-    const l2flow::market::RealtimeHistoryRuntimeV1* history_runtime = nullptr;
+    const l2flow::market::RealtimeHistoryRuntimeV1* generation_runtime =
+        nullptr;
     std::shared_ptr<const RealtimeFactorCalculatorV1> calculator;
 };
 
@@ -172,9 +170,9 @@ enum class RealtimeFactorEngineCreateErrorV1 : std::uint8_t {
 
 enum class RealtimeFactorPublishErrorV1 : std::uint8_t {
     kNone = 0U,
-    kNullHistory,
-    kInvalidHistory,
-    kHistoryNotCurrentOrHealthy,
+    kNullStore,
+    kInvalidStore,
+    kStoreNotCurrentOrHealthy,
     kAlreadyPublished,
     kGenerationNotIncreasing,
     kCalculatorSchemaChanged,
@@ -216,12 +214,12 @@ public:
 
     // Calls are serialized so two calculations cannot race to publish the
     // same generation.  The expensive calculation is staged off-publication;
-    // history health/current-generation status is checked both before it and
+    // store health/current-generation status is checked both before it and
     // immediately before the single release publication.
     [[nodiscard]] RealtimeFactorPublishResultV1 CalculateAndPublish(
         std::shared_ptr<
-            const l2flow::market::RealtimeHistoryGenerationV1>
-            history) noexcept;
+            const l2flow::market::IntradayInstrumentStoreGenerationV1>
+            store) noexcept;
 
     [[nodiscard]] std::shared_ptr<const RealtimeFactorGenerationV1>
     AcquireLatestGeneration() const noexcept;

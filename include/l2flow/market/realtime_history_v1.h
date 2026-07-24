@@ -13,7 +13,6 @@
 #include <memory>
 #include <span>
 #include <string_view>
-#include <vector>
 
 namespace l2flow::market {
 
@@ -145,62 +144,16 @@ private:
 using RealtimeHistoryRecordHandleV1 =
     std::shared_ptr<const RealtimeHistoryRecordV1>;
 
-// A small, allocation-free publication action invoked only while the
-// history runtime still owns the exact current generation under its commit
-// lock. The action must be noexcept and must not call back into this runtime.
+// A small, allocation-free publication action invoked only while the runtime
+// still owns the exact current store generation under its commit lock. The
+// action must be noexcept and must not call back into this runtime.
 using RealtimeHistoryCommitActionV1 = void (*)(void* context) noexcept;
-
-// One fixed-universe row.  history is in process ingress order and contains a
-// bounded suffix ending at the generation fence.  Missing instruments remain
-// present with empty handles, so factor code never confuses missing coverage
-// with a changing universe.
-struct RealtimeInstrumentGenerationV1 final {
-    std::uint32_t instrument_id = 0U;
-    RealtimeHistoryRecordHandleV1 latest_snapshot;
-    RealtimeHistoryRecordHandleV1 latest_tick;
-    std::vector<RealtimeHistoryRecordHandleV1> history;
-};
-
-class RealtimeHistoryGenerationV1 final {
-public:
-    RealtimeHistoryGenerationV1(
-        RealtimeHistoryWatermarkV1 watermark,
-        std::vector<RealtimeInstrumentGenerationV1> instruments,
-        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
-            intraday_store_generation = nullptr) noexcept;
-
-    [[nodiscard]] const RealtimeHistoryWatermarkV1& watermark()
-        const noexcept {
-        return watermark_;
-    }
-    [[nodiscard]] std::span<const RealtimeInstrumentGenerationV1>
-    instruments() const noexcept {
-        return instruments_;
-    }
-    [[nodiscard]] const RealtimeInstrumentGenerationV1* Find(
-        std::uint32_t instrument_id) const noexcept;
-    // When enabled, this exact matching handle exposes the complete
-    // append-only session prefix. The bounded rows above remain the V1 factor
-    // compatibility view and do not grow with elapsed session history.
-    [[nodiscard]] const std::shared_ptr<
-        const IntradayInstrumentStoreGenerationV1>&
-    intraday_store_generation() const noexcept {
-        return intraday_store_generation_;
-    }
-
-private:
-    RealtimeHistoryWatermarkV1 watermark_{};
-    std::vector<RealtimeInstrumentGenerationV1> instruments_;
-    std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
-        intraday_store_generation_;
-};
 
 struct RealtimeHistoryRuntimeConfigV1 final {
     std::array<std::uint32_t, kRealtimeHistorySourceCountV1>
         source_stream_ids{};
     std::uint32_t worker_count = 0U;
     std::size_t queue_capacity_per_source_worker = 0U;
-    std::size_t maximum_records_per_instrument = 0U;
     const InstrumentRegistryV1* registry = nullptr;
     IntradayInstrumentStoreConfigV1 intraday_store{};
 };
@@ -211,9 +164,7 @@ enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
     kInvalidConfiguration,
     kResourceExhausted,
     kThreadStartFailed,
-    // Appended after the original V1 values so telemetry/FFI consumers keep
-    // the existing numeric contract.
-    kIntradayStoreCreateFailed,
+    kStoreCreateFailed,
 };
 
 enum class RealtimeHistorySubmitErrorV1 : std::uint8_t {
@@ -238,9 +189,7 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
     kStopped,
     kFatal,
     kResourceExhausted,
-    // Appended after the original V1 values so telemetry/FFI consumers keep
-    // the existing numeric contract.
-    kIntradayStoreFailed,
+    kStoreFailed,
 };
 
 [[nodiscard]] std::string_view RealtimeHistoryCreateErrorNameV1(
@@ -254,11 +203,12 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
 // SealSource must be called by the same serial decoder owner. The upstream
 // ingress authority must assign every accepted record one globally unique,
 // dense ingress_sequence and one dense per-source source_sequence. This
-// runtime validates per-source order and generation cuts; it does not invent a
-// second cross-source sequence authority. Internally there is one SPSC queue
+// runtime validates per-source order and generation cuts; it does not invent
+// a second cross-source sequence authority. Internally there is one SPSC queue
 // per source×worker. An instrument is permanently owned by
-// instrument_id % worker_count. The immutable registry referenced by config
-// must outlive the runtime.
+// instrument_id % worker_count, and IntradayInstrumentStoreV1 is the only
+// retained record container. The immutable registry referenced by config must
+// outlive the runtime and all generations/cursors derived from it.
 class RealtimeHistoryRuntimeV1 final {
 public:
     RealtimeHistoryRuntimeV1(const RealtimeHistoryRuntimeV1&) = delete;
@@ -287,26 +237,29 @@ public:
     [[nodiscard]] RealtimeHistoryGenerationErrorV1 WaitForGeneration(
         std::uint64_t generation,
         std::chrono::nanoseconds timeout,
-        std::shared_ptr<const RealtimeHistoryGenerationV1>* output) noexcept;
+        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output)
+        noexcept;
 
-    [[nodiscard]] std::shared_ptr<const RealtimeHistoryGenerationV1>
-    AcquireLatestGeneration() const noexcept;
     [[nodiscard]] std::shared_ptr<
         const IntradayInstrumentStoreGenerationV1>
-    AcquireLatestIntradayStoreGeneration() const noexcept;
+    AcquireLatestGeneration() const noexcept;
     [[nodiscard]] IntradayInstrumentStoreSnapshotV1
-    IntradayStoreSnapshot() const noexcept;
+    StoreSnapshot() const noexcept;
     [[nodiscard]] bool IsGenerationCurrentAndHealthy(
-        const std::shared_ptr<const RealtimeHistoryGenerationV1>& generation)
-        const noexcept;
+        const std::shared_ptr<
+            const IntradayInstrumentStoreGenerationV1>& generation) const
+        noexcept;
 
-    // Linearizes a downstream whole-generation publication with history
-    // generation replacement, fatal transition, and StopAndDrain. Returns
-    // false without invoking action unless generation is still the exact
-    // current healthy handle. This is the factor publication commit guard;
-    // it is not an API for long-running calculation.
+    // Linearizes a downstream whole-generation publication with store
+    // generation replacement, sticky coverage failure, fatal transition, and
+    // StopAndDrain. "Exact" requires both the same pointer and the same
+    // shared_ptr owner/control block. Returns false without invoking action
+    // unless generation is still that exact current healthy handle. This is
+    // the factor publication commit guard; it is not an API for long-running
+    // calculation.
     [[nodiscard]] bool CommitIfCurrentAndHealthy(
-        const std::shared_ptr<const RealtimeHistoryGenerationV1>& generation,
+        const std::shared_ptr<
+            const IntradayInstrumentStoreGenerationV1>& generation,
         RealtimeHistoryCommitActionV1 action,
         void* context) const noexcept;
 

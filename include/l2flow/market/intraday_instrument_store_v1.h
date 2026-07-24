@@ -21,32 +21,15 @@ inline constexpr std::size_t
 inline constexpr std::size_t
     kIntradayInstrumentStoreMaximumBatchRecordsV1 = 1024U * 1024U;
 
-// Disabled preserves the bounded RealtimeHistory V1 behavior exactly.
-// Shadow records an independently observable coverage loss but does not make
-// the bounded history fatal. Required and Primary fail the owning history
-// runtime closed; Primary currently retains the bounded V1 generation only as
-// a compatibility view for the V1 factor engine.
-enum class IntradayInstrumentStoreModeV1 : std::uint8_t {
-    kDisabled = 0U,
-    kShadow,
-    kRequired,
-    kPrimary,
-};
-
-[[nodiscard]] std::string_view IntradayInstrumentStoreModeNameV1(
-    IntradayInstrumentStoreModeV1 mode) noexcept;
-
 struct IntradayInstrumentStoreConfigV1 final {
-    IntradayInstrumentStoreModeV1 mode =
-        IntradayInstrumentStoreModeV1::kDisabled;
     // Chunks contain stable record owners. They are append-only and are
     // reclaimed only when the complete trade-day session is released.
     std::size_t chunk_record_capacity = 1024U;
-    // Both limits are required whenever mode is enabled. They are global
-    // session limits, not per-instrument limits; reaching either one never
-    // evicts an older record. The byte limit is one conservative logical
-    // budget shared by base index state, allocated chunks, and retained
-    // record accounting. It is not a promise about allocator RSS.
+    // Both limits are required. They are global session limits, not
+    // per-instrument limits; reaching either one never evicts an older record.
+    // The byte limit is one conservative logical budget shared by base index
+    // state, allocated chunks, and retained record accounting. It is not a
+    // promise about allocator RSS.
     std::uint64_t maximum_session_records = 0U;
     std::uint64_t maximum_session_accounted_bytes = 0U;
     // A cursor is streaming and may traverse the complete session, but one
@@ -139,8 +122,6 @@ struct IntradayInstrumentSummaryV1 final {
 };
 
 struct IntradayInstrumentStoreSnapshotV1 final {
-    IntradayInstrumentStoreModeV1 mode =
-        IntradayInstrumentStoreModeV1::kDisabled;
     std::uint64_t maximum_session_records = 0U;
     std::uint64_t maximum_session_accounted_bytes = 0U;
     std::uint64_t appended_records = 0U;
@@ -228,11 +209,15 @@ public:
     [[nodiscard]] std::uint64_t record_count() const noexcept;
     [[nodiscard]] std::uint64_t accounted_record_bytes() const noexcept;
     [[nodiscard]] std::uint64_t allocated_index_bytes() const noexcept;
-    [[nodiscard]] IntradayInstrumentStoreModeV1 mode() const noexcept;
     [[nodiscard]] bool coverage_from_open() const noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 Find(
         std::uint32_t instrument_id,
+        IntradayInstrumentSummaryV1* output) const noexcept;
+    // Allocation-free O(1) access in ascending instrument-id order.
+    // ordinal >= instrument_count() returns kNotFound.
+    [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 SummaryAt(
+        std::size_t ordinal,
         IntradayInstrumentSummaryV1* output) const noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1
@@ -252,6 +237,16 @@ public:
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1
     OpenUniverseCursor(
+        IntradayInstrumentScanOptionsV1 options,
+        std::unique_ptr<IntradayUniverseCursorV1>* output)
+        const noexcept;
+    // Opens one independent cursor over the half-open instrument-ordinal
+    // range. Ordinals follow SummaryAt ordering. An empty valid range returns
+    // a cursor that is immediately done.
+    [[nodiscard]] IntradayInstrumentStoreQueryErrorV1
+    OpenUniverseRangeCursor(
+        std::size_t ordinal_begin,
+        std::size_t ordinal_end_exclusive,
         IntradayInstrumentScanOptionsV1 options,
         std::unique_ptr<IntradayUniverseCursorV1>* output)
         const noexcept;
@@ -287,13 +282,15 @@ private:
     friend class IntradayInstrumentStoreV1;
 };
 
-// This component owns no worker threads. RealtimeHistoryRuntimeV1 invokes
-// Append and CaptureWorker from the existing permanent instrument owner, so
-// each lane has one writer and no append lock. Append is deliberately a
-// trusted-runtime boundary: the owning history admission authority must
-// provide globally dense/unique ingress sequences and dense/unique
-// per-source sequences. The store validates lane monotonicity and generation
-// totals but does not create a second global sequencing authority.
+// This required store is the sole retained session-history authority. It owns
+// no worker threads: the routing runtime invokes Append and CaptureWorker from
+// each permanent instrument owner, so every lane has one writer and no append
+// lock. Append is deliberately a trusted-runtime boundary: admission must
+// provide globally dense/unique ingress sequences and dense/unique per-source
+// sequences. The store validates lane monotonicity and generation totals but
+// does not create a second global sequencing authority. Any append, capture,
+// or build error means complete coverage can no longer be proven and the
+// owner must fail closed.
 class IntradayInstrumentStoreV1 final {
 public:
     IntradayInstrumentStoreV1(
@@ -306,8 +303,7 @@ public:
         IntradayInstrumentStoreV1&&) = delete;
     ~IntradayInstrumentStoreV1();
 
-    // Disabled is represented by the owner not constructing this component;
-    // the direct factory accepts enabled modes only.
+    // A successfully returned instance is always the required session store.
     [[nodiscard]] static IntradayInstrumentStoreCreateErrorV1 Create(
         IntradayInstrumentStoreConfigV1 config,
         std::uint32_t worker_count,

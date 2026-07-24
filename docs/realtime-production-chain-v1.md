@@ -16,7 +16,7 @@ Vendor DSO selected by operator
        `-> source decoder lane
             -> retained decoded event
             -> fixed instrument worker
-            -> bounded history
+            -> mandatory intraday instrument store
             -> full-universe generation barrier
             -> RealtimeFactorCalculatorV1
             -> atomic RealtimeFactorGenerationV1 publication
@@ -40,7 +40,7 @@ l2flow_realtime_ingress
              |
              v
 l2flow_market
-  decoder + immutable registry + fixed-worker history + generation barrier
+  decoder + immutable registry + fixed-worker intraday store + generation barrier
              |
              v
 l2flow_factor
@@ -53,10 +53,10 @@ l2flow_realtime
 
 Important negative dependencies follow from this graph:
 
-- WAL does not include or call the decoder, history runtime, or factor engine.
-- History records do not carry a WAL offset or durability state.
-- The factor engine cannot admit messages or mutate history.
-- The SDK adapter does not know the registry, WAL, router, history, or factor
+- WAL does not include or call the decoder, store runtime, or factor engine.
+- Store records do not carry a WAL offset or durability state.
+- The factor engine cannot admit messages or mutate the store.
+- The SDK adapter does not know the registry, WAL, router, store, or factor
   policy.
 - The registry SHA-256 identifies the fixed market universe; it is not an SDK
   library identity.
@@ -209,12 +209,12 @@ invalid and explicitly noticed; zero and `UINT32_MAX-1` remain valid raw values.
 Negative quantities retain raw values but are invalid, never set the tick
 quantity-valid bitmap, and carry a quantity-domain notice.
 
-## 6. Fixed-worker routing and bounded history
+## 6. Fixed-worker routing and mandatory store
 
 The router is deterministic for the lifetime of the process:
 
 ```text
-worker = instrument_id % worker_count
+worker = instrument_id % store_worker_count
 ```
 
 The registry, worker count, and instrument IDs are immutable, so an instrument
@@ -229,16 +229,26 @@ owner. The upstream callback authority must provide:
 - a dense `source_sequence` within each source;
 - exactly one source-sequence increment for each global increment.
 
-The standalone history runtime validates source-local density and monotonicity
-and validates the aggregate generation equation. It deliberately does not
+The store runtime validates source-local density and monotonicity and
+validates the aggregate generation equation. It deliberately does not
 create a second global ordering authority.
 
-Different source decoder threads can reach a worker in an order different
-from callback admission. A per-instrument history vector is therefore ordered
-by global ingress sequence on insertion. Duplicate sequence values for one row
-fail closed. If the configured bound is exceeded, the smallest ingress
-sequence is removed, leaving the greatest `N` sequences. Latest snapshot and
-latest tick handles advance only to a greater global ingress sequence.
+The production runtime always constructs the intraday store. Each instrument
+has four append-only source lanes made of fixed-capacity chunks. Different
+source decoder threads can reach a worker in an order different from callback
+admission, so readers merge the captured lanes by global ingress sequence.
+No record is evicted during the process trade-date session.
+
+Record and logical-byte limits are mandatory. Append, allocation, capacity, or
+sequence failure closes production admission and prevents publication of a
+later complete store or factor generation. There is no alternate retention
+path.
+
+This is a direct, source- and ABI-breaking replacement of the former V1
+retention contract. There is intentionally no compatibility adapter. Release
+and deployment must clean-rebuild every executable, static library, test, and
+injected calculator; an object or plugin compiled against the retired config
+layout or calculator vtable is incompatible.
 
 ## 7. Generation barrier
 
@@ -250,7 +260,7 @@ latest tick handles advance only to a greater global ingress sequence.
 1. snapshots global and per-source exclusive cuts;
 2. captures `recv_monotonic_cut_ns`;
 3. builds and validates the watermark identity;
-4. begins one pending history generation;
+4. begins one pending store generation;
 5. appends one generation marker to every serial decoder queue.
 
 No post-cut callback can overtake a marker because callback admission remains
@@ -264,13 +274,16 @@ places a fence into every worker queue for that source.
 
 When a worker consumes a source fence, it parks that source and does not
 consume post-fence records from it. Once all four sources are parked at the
-same generation, the worker freezes an immutable copy of every row it owns.
-Only when all worker slices are present, all source seals are present, and the
-sorted instrument IDs equal the complete registry universe does the runtime
-publish one history handle.
+same generation, the worker captures each lane's immutable endpoint, visible
+count, and latest snapshot/tick locator. It does not copy the accumulated
+record handles.
 
-The generation therefore includes empty rows for instruments not observed in
-the prefix. Absence of data is not confused with a changing universe.
+Only when all worker slices and source seals are present, instrument summaries
+match the fixed registry universe, and captured global and per-source totals
+match the watermark does the runtime publish one store handle. Instruments
+not observed in the prefix still have a summary with zero counts. Generation
+construction is O(the fixed instrument count), independent of accumulated
+session record count.
 
 ### Watermark meaning
 
@@ -293,7 +306,7 @@ What the watermark proves:
 
 ```text
 all messages admitted by this process before the captured prefix
-have reached this complete fixed-universe history generation
+have reached this complete fixed-universe store generation
 ```
 
 What it does not prove:
@@ -308,9 +321,14 @@ optional WAL durability
 
 ## 8. Factor calculation and atomic publication
 
-The factor engine receives the just-published immutable history handle. It
-first checks that the handle is the exact current healthy history and matches
-the fixed registry universe. Calculation occurs into private staging memory.
+The factor engine receives the just-published immutable store handle. It first
+checks that the handle is the exact current healthy generation and matches the
+fixed registry universe. Calculation occurs into private staging memory.
+
+Latest-only factor calculation uses `SummaryAt(index)`. Iterating the
+canonical summary ordinals is O(I) for I registry instruments. It reads the
+latest snapshot/tick locators and does not drain the O(N) session record
+stream.
 
 Before publication, the engine revalidates:
 
@@ -321,20 +339,20 @@ Before publication, the engine revalidates:
 - finite values only;
 - invalid values use canonical positive zero.
 
-The candidate `RealtimeFactorGenerationV1` retains the exact input history
+The candidate `RealtimeFactorGenerationV1` retains the exact input store
 shared pointer and copies its watermark. A small commit action executes while
-the history generation mutex proves that the input handle remains current,
+the store generation mutex proves that the input handle remains current,
 healthy, and not stopping. The final publication is one release-store of a
 single shared factor-generation pointer.
 
 This prevents a reader from observing a half-old/half-new factor cross-section.
-It does not make the independent latest-history and latest-factor slots a
+It does not make the independent latest-store and latest-factor slots a
 single atomic pair. The supported pair-read pattern is:
 
 ```text
 acquire one latest factor handle
--> read factor.input_history()
--> use those two retained handles as the matched pair
+-> read factor.input_store()
+-> use the factor and its retained store as the matched pair
 ```
 
 The default calculator is a last-price representation example, not a trading
@@ -342,6 +360,39 @@ model. It projects the most recent valid, strictly positive snapshot p6 last
 price into a decimal `double`; zero/negative prices remain explicitly invalid.
 Custom calculators must document their mathematics, missing-data
 policy, numeric bounds, and execution-time bound.
+
+### Store reads and lifetime
+
+`SummaryAt` is the O(I) latest-only path for factor work. Record cursors are
+the historical path: a full drain over N records is O(N), while each
+`ReadBatch` uses O(batch) caller-owned pointer storage. Cursor construction and
+draining must never materialize a second N-record result. Large drains can use
+independent `OpenUniverseRangeCursor` instances over non-overlapping half-open
+instrument-ordinal ranges. If no range is truncated by its per-cursor
+`maximum_records` setting, joining their outputs in ordinal order reproduces
+the full-universe ordering exactly.
+
+A factor retains its exact input store generation, and a cursor retains its
+generation. Those handles can pin the session, chunks, and decoded record
+owners after the runtime stops. Consumers must enforce a small fixed upper
+limit on retained factors, generations, and cursors; otherwise rollover cannot
+reclaim memory even though production admission has ended.
+
+The configured record and logical-byte limits cover store accounting, not
+complete process RSS. On a 1 TiB host, the initial envelope is a 600--620 GiB
+store hard limit, a process high-water alert near 800 GiB, and a termination
+boundary around 850--860 GiB. The remainder is reserved for the feeder,
+allocator variance, SDK, operating system, and page cache. Actual full-session
+and two-times-volume measurements remain release gates.
+
+### From-open reachability
+
+This project does not replay the feeder's CSV or the optional WAL. A watermark
+proves the complete prefix accepted by the current process, not exchange or
+vendor completeness. `coverage_from_open` is valid only for one process that
+started before the first expected market message and remained continuously
+healthy. Any process or host restart creates a partial session that cannot
+recover the earlier prefix during that trade date.
 
 ## 9. Terminal final generation
 
@@ -361,10 +412,10 @@ lock stop serialization
 -> release Subscriber and IOManager
 -> begin final generation from the frozen accepted counters
 -> insert final decoder markers
--> wait for complete history
+-> wait for complete store generation
 -> calculate and atomically publish factor generation
 -> stop/join decoder workers
--> stop/join history workers
+-> stop/join store workers
 -> drain, sync, close, and join optional WAL
 -> publish stopped=true
 ```
@@ -380,7 +431,7 @@ not be created, such as after a fatal error.
 
 The generation timeout is a shared wait budget, not a wall-clock API completion
 or process-wide cancellation deadline. Decoder-marker queue backpressure and
-the history condition wait consume that budget. Setup and allocation may run
+the store condition wait consume that budget. Setup and allocation may run
 past the deadline, and an operation that is already immediately ready can
 still complete after the nominal deadline. The timeout does not interrupt:
 
@@ -397,18 +448,19 @@ runtime bounds, and deployment supervision must own a process-level hard
 deadline if one is required.
 
 A custom calculator is non-reentrant: it must not call the owning pipeline's
-cut, stop, or publication APIs and must not call history lifecycle APIs. Such a
+cut, stop, or publication APIs and must not call store lifecycle APIs. Such a
 callback would attempt to reacquire lifecycle locks already held by its own
 calculation and violates the pure transformation contract.
 
 ## 11. Failure containment
 
-| Failure | Realtime admission | History/factor publication | WAL coverage |
+| Failure | Realtime admission | Store/factor publication | WAL coverage |
 |---|---|---|---|
 | Unsupported non-production tuple | ignored, no sequence | unaffected | unaffected |
 | Forbidden combined tick | fatal close | prohibited | prior accepted records may drain |
 | Owned-copy/decode/registry/routing error | fatal close | prohibited after fatal linearization | independent prior records may drain |
-| Decoder/history queue pressure | fatal close | incomplete generation not published | independent |
+| Decoder/store queue pressure | fatal close | incomplete generation not published | independent |
+| Store record/byte/allocation failure | fatal close | no later generation is advertised complete | independent |
 | Barrier timeout or inconsistent cut | fatal close | failed generation not published | independent |
 | Calculator/schema/output error | fatal close by pipeline | candidate not published | independent |
 | SDK lifecycle failure | fatal or terminate when safe release cannot be proved | no successful terminal result | best-effort drain where safe |
@@ -416,15 +468,27 @@ calculation and violates the pure transformation contract.
 | UTC+08 date boundary | clean close, no wrong-day sequence | final prior-day prefix may publish | drains accepted prior-day handles |
 
 The fatal transition closes admission while holding `admission_mutex_`, then
-marks history fatal under its generation mutex before publishing the pipeline
+marks the store fatal under its generation mutex before publishing the pipeline
 fatal flag. This lock order makes factor commit and fatal transition
 linearizable: after fatal becomes observable, a new factor commit cannot pass
-the history health guard.
+the store health guard.
 
-History stop and history generation publication also share the generation
-mutex. Whichever acquires the mutex first defines the order: a fully verified
-generation may publish before Stop begins, or Stop closes generation admission
-and no later worker slice may publish.
+`StoreSnapshot`, current-generation health checks, factor commit, store
+generation replacement, and store stop also share the generation mutex. A
+store append can discover and mark sticky coverage loss before its worker
+obtains that mutex, so both factor preflight and commit additionally check the
+store-failure and coverage flags. If a commit already owns the mutex, it is
+ordered before external runtime health observation of that failure; otherwise
+the commit observes the failure and rejects the candidate.
+
+Current-handle checks require both identical object pointers and an identical
+`shared_ptr` owner/control block. A caller-created no-op-deleter pointer to the
+same address is not accepted and therefore cannot weaken the generation
+lifetime guarantee.
+
+Whichever generation-mutex operation acquires the mutex first defines the
+order: a fully verified generation may publish before Stop begins, or Stop
+closes generation admission and no later worker slice may publish.
 
 ## 12. Verification surface
 
@@ -439,13 +503,18 @@ The test suite covers, among other cases:
 - exact Shenzhen source bytes `"102 "`;
 - unreachable registry SecurityID rejection before SDK connection;
 - deterministic fixed-worker routing and cross-source out-of-order insertion;
-- bounded history retaining the greatest ingress sequences;
+- append-only chunk rollover without record eviction;
 - contradictory watermark rejection and `UINT64_MAX` exclusive cuts;
-- source/worker generation barriers and full fixed-universe rows;
+- source/worker generation barriers and full fixed-universe summaries;
+- `SummaryAt` latest-only traversal in canonical registry order;
+- full-universe cursor ordering, four-source reconciliation, caller-owned
+  batches, and explicit terminal empty page;
 - factor missing/reordered/wrong-width/NaN/infinity/invalid-zero rejection;
-- exact factor-to-history handle retention;
-- a real Shenzhen snapshot through callback, decoder, history, projection, and
+- exact factor-to-store handle retention;
+- a real Shenzhen snapshot through callback, decoder, store, projection, and
   publication;
+- record/byte/allocation failure closing the production path;
+- partial coverage after a simulated process restart;
 - final prefix publication after SDK quiescence;
 - slow SDK shutdown not shifting the final prefix timestamp;
 - date-boundary timestamp preservation and zero wrong-day sequence allocation.

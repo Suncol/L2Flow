@@ -373,9 +373,14 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.maximum_sdk_message_bytes = 4096U;
     config.decoder_queue_capacity_per_source = 32U;
-    config.history_worker_count = 2U;
-    config.history_queue_capacity_per_source_worker = 32U;
-    config.maximum_history_records_per_instrument = 8U;
+    config.store_worker_count = 2U;
+    config.store_queue_capacity_per_source_worker = 32U;
+    config.intraday_store.chunk_record_capacity = 8U;
+    config.intraday_store.maximum_session_records = 1024U;
+    config.intraday_store.maximum_session_accounted_bytes =
+        64U * 1024U * 1024U;
+    config.intraday_store.maximum_records_per_batch = 64U;
+    config.intraday_store.coverage_from_open = true;
     config.enforce_receive_trade_date = false;
     config.wal.enabled = !wal_path.empty();
     config.wal.path = wal_path.string();
@@ -393,40 +398,60 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
 bool VerifyGeneration(
     TestContext* test,
     const runtime::RealtimePipelineCutResultV1& cut) {
-    test->Expect(cut.published(), "history and factor publish together");
+    test->Expect(cut.published(), "store and factor publish together");
     if (!cut.published()) {
         return false;
     }
+
+    market::IntradayInstrumentSummaryV1 first_summary{};
+    market::IntradayInstrumentSummaryV1 row{};
     test->Expect(
-        cut.history_generation->instruments().size() == 2U,
-        "history generation contains the exact fixed universe");
-    const market::RealtimeInstrumentGenerationV1* row =
-        cut.history_generation->Find(18U);
-    test->Expect(row != nullptr && row->latest_tick != nullptr,
-                 "Shenzhen order reaches instrument history");
-    if (row == nullptr || row->latest_tick == nullptr) {
+        cut.store_generation->instrument_count() == 2U &&
+            cut.store_generation->SummaryAt(0U, &first_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            first_summary.instrument_id == 7U &&
+            cut.store_generation->Find(18U, &row) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone,
+        "store generation contains the exact ascending fixed universe");
+    test->Expect(
+        row.latest_tick != nullptr && row.record_count == 1U,
+        "Shenzhen order reaches the instrument store");
+    if (row.latest_tick == nullptr) {
         return false;
     }
+    std::unique_ptr<market::IntradayInstrumentCursorV1> tail;
+    std::array<const market::RealtimeHistoryRecordV1*, 2U> records{};
+    std::size_t written = 0U;
+    test->Expect(
+        cut.store_generation->OpenTailCursor(
+            18U, row.record_count, &tail) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            tail != nullptr &&
+            tail->ReadBatch(records, &written) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            written == 1U && records[0U] == row.latest_tick &&
+            records[0U]->ingress_sequence() == 1U,
+        "tail cursor exposes the complete retained instrument prefix");
     const auto* order = market::RetainedMarketEventGetV1<
-        market::ShenzhenOrderV1>(row->latest_tick->event());
+        market::ShenzhenOrderV1>(row.latest_tick->event());
     test->Expect(
         order != nullptr && order->common.security_id_source == "102 " &&
             order->common.instrument_id == 18U &&
             order->fields.quantity.raw == 201,
         "owned bytes decode with exact four-byte Shenzhen key");
     test->Expect(
-        cut.factor_generation->input_history().get() ==
-            cut.history_generation.get() &&
+        cut.factor_generation->input_store().get() ==
+            cut.store_generation.get() &&
             cut.factor_generation->watermark().input_identity_sha256 ==
-                cut.history_generation->watermark()
+                cut.store_generation->watermark()
                     .input_identity_sha256,
-        "factor publication retains the exact history generation/watermark");
+        "factor publication retains the exact store generation/watermark");
     const factor::RealtimeFactorPointV1* factor_row =
         cut.factor_generation->Find(18U);
     test->Expect(
         factor_row != nullptr && factor_row->values.size() == 1U &&
             !factor_row->values[0U].valid,
-        "snapshot projection is explicitly invalid for order-only history");
+        "snapshot projection is explicitly invalid for an order-only store");
     return true;
 }
 
@@ -528,7 +553,7 @@ int main() {
     static_cast<void>(VerifyGeneration(&test, cut));
     test.Expect(
         cut.published() &&
-            cut.history_generation->watermark().recv_monotonic_cut_ns <=
+            cut.store_generation->watermark().recv_monotonic_cut_ns <=
                 sdk_state->shutdown_enter_monotonic_ns &&
             sdk_state->shutdown_enter_monotonic_ns <
                 sdk_state->shutdown_exit_monotonic_ns,
@@ -580,9 +605,9 @@ int main() {
         static_cast<void>(VerifyGeneration(&test, no_wal_cut));
         test.Expect(
             no_wal_cut.published() && cut.published() &&
-                no_wal_cut.history_generation->watermark()
+                no_wal_cut.store_generation->watermark()
                         .input_identity_sha256 ==
-                    cut.history_generation->watermark()
+                    cut.store_generation->watermark()
                         .input_identity_sha256,
             "WAL on/off has identical realtime generation identity");
         test.Expect(
@@ -595,8 +620,6 @@ int main() {
     std::unique_ptr<runtime::RealtimePipelineV1> snapshot_pipeline;
     runtime::RealtimePipelineConfigV1 snapshot_config =
         MakeConfig(registry.get());
-    snapshot_config.intraday_store.mode =
-        market::IntradayInstrumentStoreModeV1::kRequired;
     snapshot_config.intraday_store.chunk_record_capacity = 2U;
     snapshot_config.intraday_store.maximum_session_records = 16U;
     snapshot_config.intraday_store.maximum_session_accounted_bytes =
@@ -628,26 +651,18 @@ int main() {
                 point->values.size() == 1U &&
                 point->values[0U].valid &&
                 std::abs(point->values[0U].value - 12.3456) < 1.0e-12,
-            "binary SDK snapshot decodes through history into valid p6 price projection");
+            "binary SDK snapshot decodes through the store into a valid p6 price projection");
         const std::shared_ptr<
             const market::IntradayInstrumentStoreGenerationV1>
-            store_generation =
-                snapshot_cut.intraday_store_generation;
+            store_generation = snapshot_cut.store_generation;
         test.Expect(
-            snapshot_cut.intraday_store_required &&
-                store_generation != nullptr &&
-                snapshot_cut.history_generation != nullptr &&
-                snapshot_cut.history_generation->
-                        intraday_store_generation() ==
-                    store_generation &&
+            store_generation != nullptr &&
                 snapshot_cut.factor_generation != nullptr &&
-                snapshot_cut.factor_generation->
-                        input_intraday_store() ==
+                snapshot_cut.factor_generation->input_store() ==
                     store_generation &&
-                snapshot_pipeline->
-                        AcquireLatestIntradayStoreGeneration() ==
+                snapshot_pipeline->AcquireLatestStoreGeneration() ==
                     store_generation,
-            "required cut publishes one exact history/store/factor generation");
+            "cut publishes one exact store/factor generation");
         market::IntradayInstrumentSummaryV1 store_row{};
         std::unique_ptr<market::IntradayInstrumentCursorV1>
             store_cursor;
@@ -658,11 +673,12 @@ int main() {
             store_generation != nullptr &&
             store_generation->coverage_from_open() &&
             store_generation->record_count() == 1U &&
-            store_generation->Find(18U, &store_row) ==
+            store_generation->SummaryAt(1U, &store_row) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            store_row.instrument_id == 18U &&
             store_row.record_count == 1U &&
-            store_generation->OpenInstrumentCursor(
-                18U, {}, &store_cursor) ==
+            store_generation->OpenTailCursor(
+                18U, store_row.record_count, &store_cursor) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             store_cursor != nullptr &&
             store_cursor->ReadBatch(store_batch, &store_written) ==
@@ -673,11 +689,9 @@ int main() {
             store_query_ok,
             "required pipeline exposes the complete matching intraday prefix");
         const market::IntradayInstrumentStoreSnapshotV1 store_snapshot =
-            snapshot_pipeline->Snapshot().intraday_store;
+            snapshot_pipeline->Snapshot().store;
         test.Expect(
-            store_snapshot.mode ==
-                    market::IntradayInstrumentStoreModeV1::kRequired &&
-                store_snapshot.appended_records == 1U &&
+            store_snapshot.appended_records == 1U &&
                 store_snapshot.coverage_from_open &&
                 !store_snapshot.coverage_lost,
             "pipeline snapshot reports healthy from-open store coverage");
@@ -689,8 +703,6 @@ int main() {
         store_failure_pipeline;
     runtime::RealtimePipelineConfigV1 store_failure_config =
         MakeConfig(registry.get());
-    store_failure_config.intraday_store.mode =
-        market::IntradayInstrumentStoreModeV1::kRequired;
     store_failure_config.intraday_store.chunk_record_capacity = 2U;
     store_failure_config.intraday_store.maximum_session_records = 1U;
     store_failure_config.intraday_store.maximum_session_accounted_bytes =
@@ -724,12 +736,12 @@ int main() {
             store_failure_pipeline->CutAndPublishGeneration(2s);
         test.Expect(
             store_failure_pipeline->Snapshot()
-                    .intraday_store.coverage_lost &&
+                    .store.coverage_lost &&
                 failure_cut.error ==
                     runtime::RealtimePipelineCutErrorV1::kFatal &&
-                failure_cut.history_error ==
+                failure_cut.generation_error ==
                     market::RealtimeHistoryGenerationErrorV1::
-                        kIntradayStoreFailed,
+                        kStoreFailed,
             "required async store failure remains specific in cut diagnostics");
         store_failure_pipeline->StopAndDrain();
     }
@@ -772,9 +784,9 @@ int main() {
             boundary_pipeline->StopAndPublishFinalGeneration(2s);
         test.Expect(
             boundary_final.published() &&
-                boundary_final.history_generation->watermark()
+                boundary_final.store_generation->watermark()
                         .ingress_sequence_exclusive == 1U &&
-                boundary_final.history_generation->watermark()
+                boundary_final.store_generation->watermark()
                         .recv_monotonic_cut_ns <= boundary_observed_ns &&
                 boundary_pipeline->Snapshot().stopped,
             "date boundary preserves its original prefix-cut timestamp through shutdown");

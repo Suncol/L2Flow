@@ -73,26 +73,35 @@ void CommitFactorPublicationV1(void* opaque) noexcept {
     return true;
 }
 
-[[nodiscard]] bool HistoryMatchesRegistry(
-    const l2flow::market::RealtimeHistoryGenerationV1& history,
+template <typename Value>
+[[nodiscard]] bool SameSharedOwnerAndPointer(
+    const std::shared_ptr<const Value>& left,
+    const std::shared_ptr<const Value>& right) noexcept {
+    return left.get() == right.get() &&
+           !left.owner_before(right) &&
+           !right.owner_before(left);
+}
+
+[[nodiscard]] bool StoreMatchesRegistry(
+    const l2flow::market::IntradayInstrumentStoreGenerationV1& store,
     const l2flow::market::InstrumentRegistryV1& registry,
     std::span<const std::uint32_t> instrument_ids) noexcept {
     const l2flow::market::RealtimeHistoryWatermarkV1& watermark =
-        history.watermark();
+        store.watermark();
     if (watermark.generation == 0U ||
         watermark.registry_version != registry.registry_version() ||
         watermark.registry_sha256 != registry.registry_sha256()) {
         return false;
     }
 
-    const std::span<
-        const l2flow::market::RealtimeInstrumentGenerationV1>
-        instruments = history.instruments();
-    if (instruments.size() != instrument_ids.size()) {
+    if (store.instrument_count() != instrument_ids.size()) {
         return false;
     }
-    for (std::size_t index = 0U; index < instruments.size(); ++index) {
-        if (instruments[index].instrument_id != instrument_ids[index]) {
+    for (std::size_t index = 0U; index < instrument_ids.size(); ++index) {
+        l2flow::market::IntradayInstrumentSummaryV1 summary{};
+        if (store.SummaryAt(index, &summary) !=
+                l2flow::market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            summary.instrument_id != instrument_ids[index]) {
             return false;
         }
     }
@@ -126,7 +135,7 @@ void CommitFactorPublicationV1(void* opaque) noexcept {
 }
 
 [[nodiscard]] const l2flow::market::DecimalValueV1* SnapshotLastPrice(
-    const l2flow::market::RealtimeHistoryRecordHandleV1& record) noexcept {
+    const l2flow::market::RealtimeHistoryRecordV1* record) noexcept {
     if (record == nullptr) {
         return nullptr;
     }
@@ -160,8 +169,8 @@ std::string_view RealtimeFactorCalculatorErrorNameV1(
             return "none";
         case RealtimeFactorCalculatorErrorV1::kNullOutput:
             return "null_output";
-        case RealtimeFactorCalculatorErrorV1::kInvalidHistory:
-            return "invalid_history";
+        case RealtimeFactorCalculatorErrorV1::kInvalidStore:
+            return "invalid_store";
         case RealtimeFactorCalculatorErrorV1::kResourceExhausted:
             return "resource_exhausted";
         case RealtimeFactorCalculatorErrorV1::kCalculationFailed:
@@ -185,19 +194,22 @@ SnapshotLastPriceProjectionV1::definitions() const noexcept {
 
 RealtimeFactorCalculatorErrorV1
 SnapshotLastPriceProjectionV1::Calculate(
-    const l2flow::market::RealtimeHistoryGenerationV1& history,
+    const l2flow::market::IntradayInstrumentStoreGenerationV1& store,
     std::vector<RealtimeFactorPointV1>* output) const noexcept {
     if (output == nullptr) {
         return RealtimeFactorCalculatorErrorV1::kNullOutput;
     }
     try {
         std::vector<RealtimeFactorPointV1> candidate;
-        const std::span<
-            const l2flow::market::RealtimeInstrumentGenerationV1>
-            instruments = history.instruments();
-        candidate.reserve(instruments.size());
-        for (const l2flow::market::RealtimeInstrumentGenerationV1&
-                 instrument : instruments) {
+        candidate.reserve(store.instrument_count());
+        for (std::size_t ordinal = 0U;
+             ordinal < store.instrument_count();
+             ++ordinal) {
+            l2flow::market::IntradayInstrumentSummaryV1 instrument{};
+            if (store.SummaryAt(ordinal, &instrument) !=
+                l2flow::market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+                return RealtimeFactorCalculatorErrorV1::kInvalidStore;
+            }
             RealtimeFactorPointV1 point{};
             point.instrument_id = instrument.instrument_id;
             point.values.resize(1U);
@@ -225,12 +237,13 @@ SnapshotLastPriceProjectionV1::Calculate(
 }
 
 RealtimeFactorGenerationV1::RealtimeFactorGenerationV1(
-    std::shared_ptr<const l2flow::market::RealtimeHistoryGenerationV1>
-        input_history,
+    std::shared_ptr<
+        const l2flow::market::IntradayInstrumentStoreGenerationV1>
+        input_store,
     std::vector<RealtimeFactorDefinitionV1> definitions,
     std::vector<RealtimeFactorPointV1> points) noexcept
-    : input_history_(std::move(input_history)),
-      watermark_(input_history_->watermark()),
+    : input_store_(std::move(input_store)),
+      watermark_(input_store_->watermark()),
       definitions_(std::move(definitions)),
       points_(std::move(points)) {}
 
@@ -274,12 +287,12 @@ std::string_view RealtimeFactorPublishErrorNameV1(
     switch (error) {
         case RealtimeFactorPublishErrorV1::kNone:
             return "none";
-        case RealtimeFactorPublishErrorV1::kNullHistory:
-            return "null_history";
-        case RealtimeFactorPublishErrorV1::kInvalidHistory:
-            return "invalid_history";
-        case RealtimeFactorPublishErrorV1::kHistoryNotCurrentOrHealthy:
-            return "history_not_current_or_healthy";
+        case RealtimeFactorPublishErrorV1::kNullStore:
+            return "null_store";
+        case RealtimeFactorPublishErrorV1::kInvalidStore:
+            return "invalid_store";
+        case RealtimeFactorPublishErrorV1::kStoreNotCurrentOrHealthy:
+            return "store_not_current_or_healthy";
         case RealtimeFactorPublishErrorV1::kAlreadyPublished:
             return "already_published";
         case RealtimeFactorPublishErrorV1::kGenerationNotIncreasing:
@@ -314,7 +327,7 @@ RealtimeFactorEngineCreateErrorV1 RealtimeFactorEngineV1::Create(
         return RealtimeFactorEngineCreateErrorV1::kNullOutput;
     }
     output->reset();
-    if (config.registry == nullptr || config.history_runtime == nullptr ||
+    if (config.registry == nullptr || config.generation_runtime == nullptr ||
         config.calculator == nullptr || config.registry->empty()) {
         return RealtimeFactorEngineCreateErrorV1::kInvalidConfiguration;
     }
@@ -352,25 +365,26 @@ RealtimeFactorEngineCreateErrorV1 RealtimeFactorEngineV1::Create(
 
 RealtimeFactorPublishResultV1
 RealtimeFactorEngineV1::CalculateAndPublish(
-    std::shared_ptr<const l2flow::market::RealtimeHistoryGenerationV1>
-        history) noexcept {
+    std::shared_ptr<
+        const l2flow::market::IntradayInstrumentStoreGenerationV1>
+        store) noexcept {
     RealtimeFactorPublishResultV1 result{};
-    if (history == nullptr) {
-        result.error = RealtimeFactorPublishErrorV1::kNullHistory;
+    if (store == nullptr) {
+        result.error = RealtimeFactorPublishErrorV1::kNullStore;
         return result;
     }
 
     try {
         const std::lock_guard<std::mutex> guard(publish_mutex_);
-        if (!HistoryMatchesRegistry(
-                *history, *config_.registry, instrument_ids_)) {
-            result.error = RealtimeFactorPublishErrorV1::kInvalidHistory;
+        if (!config_.generation_runtime->IsGenerationCurrentAndHealthy(
+                store)) {
+            result.error = RealtimeFactorPublishErrorV1::
+                kStoreNotCurrentOrHealthy;
             return result;
         }
-        if (!config_.history_runtime->IsGenerationCurrentAndHealthy(
-                history)) {
-            result.error = RealtimeFactorPublishErrorV1::
-                kHistoryNotCurrentOrHealthy;
+        if (!StoreMatchesRegistry(
+                *store, *config_.registry, instrument_ids_)) {
+            result.error = RealtimeFactorPublishErrorV1::kInvalidStore;
             return result;
         }
 
@@ -378,12 +392,13 @@ RealtimeFactorEngineV1::CalculateAndPublish(
             std::atomic_load_explicit(
                 &latest_, std::memory_order_acquire);
         if (previous != nullptr) {
-            if (previous->input_history().get() == history.get()) {
+            if (SameSharedOwnerAndPointer(
+                    previous->input_store(), store)) {
                 result.error =
                     RealtimeFactorPublishErrorV1::kAlreadyPublished;
                 return result;
             }
-            if (history->watermark().generation <=
+            if (store->watermark().generation <=
                 previous->watermark().generation) {
                 result.error = RealtimeFactorPublishErrorV1::
                     kGenerationNotIncreasing;
@@ -400,7 +415,7 @@ RealtimeFactorEngineV1::CalculateAndPublish(
 
         std::vector<RealtimeFactorPointV1> points;
         result.calculator_error =
-            config_.calculator->Calculate(*history, &points);
+            config_.calculator->Calculate(*store, &points);
         if (result.calculator_error !=
             RealtimeFactorCalculatorErrorV1::kNone) {
             result.error =
@@ -423,17 +438,18 @@ RealtimeFactorEngineV1::CalculateAndPublish(
 
         std::shared_ptr<const RealtimeFactorGenerationV1> candidate(
             new RealtimeFactorGenerationV1(
-                history, definitions_, std::move(points)));
+                store, definitions_, std::move(points)));
 
-        // Calculation and allocation happen outside the history commit lock.
+        // Calculation and allocation happen outside the generation commit
+        // lock.
         // The small guarded action below makes the final eligibility check
         // and whole-factor-generation store indivisible with respect to a
-        // history replacement, fatal transition, or stop.
+        // store-generation replacement, fatal transition, or stop.
         FactorPublicationCommitV1 commit{&latest_, candidate};
-        if (!config_.history_runtime->CommitIfCurrentAndHealthy(
-                history, &CommitFactorPublicationV1, &commit)) {
+        if (!config_.generation_runtime->CommitIfCurrentAndHealthy(
+                store, &CommitFactorPublicationV1, &commit)) {
             result.error = RealtimeFactorPublishErrorV1::
-                kHistoryNotCurrentOrHealthy;
+                kStoreNotCurrentOrHealthy;
             return result;
         }
         result.generation = std::move(candidate);

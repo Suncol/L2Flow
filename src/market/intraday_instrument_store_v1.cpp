@@ -23,23 +23,6 @@ static_assert(
     kIntradayInstrumentStoreSourceCountV1 ==
     kRealtimeHistorySourceCountV1);
 
-[[nodiscard]] bool ValidMode(
-    IntradayInstrumentStoreModeV1 mode) noexcept {
-    switch (mode) {
-        case IntradayInstrumentStoreModeV1::kDisabled:
-        case IntradayInstrumentStoreModeV1::kShadow:
-        case IntradayInstrumentStoreModeV1::kRequired:
-        case IntradayInstrumentStoreModeV1::kPrimary:
-            return true;
-    }
-    return false;
-}
-
-[[nodiscard]] bool EnabledMode(
-    IntradayInstrumentStoreModeV1 mode) noexcept {
-    return mode != IntradayInstrumentStoreModeV1::kDisabled;
-}
-
 [[nodiscard]] bool ValidDirection(
     IntradayInstrumentScanDirectionV1 direction) noexcept {
     switch (direction) {
@@ -273,8 +256,6 @@ struct WorkerSliceData final {
 
 struct GenerationData final {
     RealtimeHistoryWatermarkV1 watermark{};
-    IntradayInstrumentStoreModeV1 mode =
-        IntradayInstrumentStoreModeV1::kDisabled;
     std::shared_ptr<const SessionState> session;
     std::vector<CapturedInstrumentRow> rows;
     std::uint64_t record_count = 0U;
@@ -314,6 +295,20 @@ struct GenerationData final {
                    found->instrument_id == instrument_id
                ? &*found
                : nullptr;
+}
+
+void FillSummary(
+    const CapturedInstrumentRow& row,
+    IntradayInstrumentSummaryV1* output) noexcept {
+    *output = IntradayInstrumentSummaryV1{};
+    output->instrument_id = row.instrument_id;
+    output->latest_snapshot = row.latest_snapshot;
+    output->latest_tick = row.latest_tick;
+    for (std::size_t source = 0U; source < row.lanes.size(); ++source) {
+        output->source_record_counts[source] =
+            row.lanes[source].record_count;
+        output->record_count += row.lanes[source].record_count;
+    }
 }
 
 [[nodiscard]] std::uint64_t CapturedLaneBytes(
@@ -600,9 +595,13 @@ class IntradayUniverseCursorV1::Impl final {
 public:
     Impl(
         std::shared_ptr<const GenerationData> value_generation,
+        std::size_t ordinal_begin,
+        std::size_t ordinal_end_exclusive,
         IntradayInstrumentScanOptionsV1 value_options) noexcept
         : generation(std::move(value_generation)),
-          options(value_options) {
+          options(value_options),
+          ordinal(ordinal_begin),
+          ordinal_end(ordinal_end_exclusive) {
         PrepareReader();
     }
 
@@ -638,7 +637,7 @@ public:
     void PrepareReader() noexcept {
         while (!done && reader == std::nullopt) {
             if (emitted >= options.maximum_records ||
-                ordinal >= generation->rows.size()) {
+                ordinal >= ordinal_end) {
                 done = true;
                 return;
             }
@@ -659,6 +658,7 @@ public:
     std::shared_ptr<const GenerationData> generation;
     IntradayInstrumentScanOptionsV1 options{};
     std::size_t ordinal = 0U;
+    std::size_t ordinal_end = 0U;
     std::uint64_t emitted = 0U;
     std::optional<MergedInstrumentReader> reader;
     bool done = false;
@@ -697,21 +697,6 @@ public:
 
     std::shared_ptr<SessionState> session;
 };
-
-std::string_view IntradayInstrumentStoreModeNameV1(
-    IntradayInstrumentStoreModeV1 mode) noexcept {
-    switch (mode) {
-        case IntradayInstrumentStoreModeV1::kDisabled:
-            return "disabled";
-        case IntradayInstrumentStoreModeV1::kShadow:
-            return "shadow";
-        case IntradayInstrumentStoreModeV1::kRequired:
-            return "required";
-        case IntradayInstrumentStoreModeV1::kPrimary:
-            return "primary";
-    }
-    return "invalid_intraday_instrument_store_mode";
-}
 
 std::string_view IntradayInstrumentStoreCreateErrorNameV1(
     IntradayInstrumentStoreCreateErrorV1 error) noexcept {
@@ -949,11 +934,6 @@ IntradayInstrumentStoreGenerationV1::allocated_index_bytes()
     return impl_->data->allocated_index_bytes;
 }
 
-IntradayInstrumentStoreModeV1
-IntradayInstrumentStoreGenerationV1::mode() const noexcept {
-    return impl_->data->mode;
-}
-
 bool IntradayInstrumentStoreGenerationV1::coverage_from_open()
     const noexcept {
     return impl_->data->coverage_from_open;
@@ -975,14 +955,22 @@ IntradayInstrumentStoreGenerationV1::Find(
     if (row == nullptr) {
         return IntradayInstrumentStoreQueryErrorV1::kNotFound;
     }
-    output->instrument_id = row->instrument_id;
-    output->latest_snapshot = row->latest_snapshot;
-    output->latest_tick = row->latest_tick;
-    for (std::size_t source = 0U; source < row->lanes.size(); ++source) {
-        output->source_record_counts[source] =
-            row->lanes[source].record_count;
-        output->record_count += row->lanes[source].record_count;
+    FillSummary(*row, output);
+    return IntradayInstrumentStoreQueryErrorV1::kNone;
+}
+
+IntradayInstrumentStoreQueryErrorV1
+IntradayInstrumentStoreGenerationV1::SummaryAt(
+    std::size_t ordinal,
+    IntradayInstrumentSummaryV1* output) const noexcept {
+    if (output == nullptr) {
+        return IntradayInstrumentStoreQueryErrorV1::kNullOutput;
     }
+    *output = IntradayInstrumentSummaryV1{};
+    if (ordinal >= impl_->data->rows.size()) {
+        return IntradayInstrumentStoreQueryErrorV1::kNotFound;
+    }
+    FillSummary(impl_->data->rows[ordinal], output);
     return IntradayInstrumentStoreQueryErrorV1::kNone;
 }
 
@@ -1038,19 +1026,34 @@ IntradayInstrumentStoreQueryErrorV1
 IntradayInstrumentStoreGenerationV1::OpenUniverseCursor(
     IntradayInstrumentScanOptionsV1 options,
     std::unique_ptr<IntradayUniverseCursorV1>* output) const noexcept {
+    return OpenUniverseRangeCursor(
+        0U, impl_->data->rows.size(), options, output);
+}
+
+IntradayInstrumentStoreQueryErrorV1
+IntradayInstrumentStoreGenerationV1::OpenUniverseRangeCursor(
+    std::size_t ordinal_begin,
+    std::size_t ordinal_end_exclusive,
+    IntradayInstrumentScanOptionsV1 options,
+    std::unique_ptr<IntradayUniverseCursorV1>* output) const noexcept {
     if (output == nullptr) {
         return IntradayInstrumentStoreQueryErrorV1::kNullOutput;
     }
     output->reset();
     if (!ValidScanOptions(options) ||
         options.direction !=
-            IntradayInstrumentScanDirectionV1::kOldestFirst) {
+            IntradayInstrumentScanDirectionV1::kOldestFirst ||
+        ordinal_begin > ordinal_end_exclusive ||
+        ordinal_end_exclusive > impl_->data->rows.size()) {
         return IntradayInstrumentStoreQueryErrorV1::kInvalidArgument;
     }
     try {
         auto cursor_impl =
             std::make_unique<IntradayUniverseCursorV1::Impl>(
-                impl_->data, options);
+                impl_->data,
+                ordinal_begin,
+                ordinal_end_exclusive,
+                options);
         output->reset(
             new IntradayUniverseCursorV1(std::move(cursor_impl)));
         return IntradayInstrumentStoreQueryErrorV1::kNone;
@@ -1083,10 +1086,9 @@ IntradayInstrumentStoreV1::Create(
         return IntradayInstrumentStoreCreateErrorV1::kNullOutput;
     }
     output->reset();
-    const bool enabled = EnabledMode(config.mode);
-    if (!ValidMode(config.mode) || !enabled || worker_count == 0U ||
-        worker_count > 256U || registry == nullptr ||
-        registry->empty() || config.chunk_record_capacity == 0U ||
+    if (worker_count == 0U || worker_count > 256U ||
+        registry == nullptr || registry->empty() ||
+        config.chunk_record_capacity == 0U ||
         config.chunk_record_capacity >
             kIntradayInstrumentStoreMaximumChunkRecordsV1 ||
         config.maximum_records_per_batch == 0U ||
@@ -1503,7 +1505,6 @@ IntradayInstrumentStoreV1::BuildGeneration(
 
         auto generation = std::make_shared<GenerationData>();
         generation->watermark = watermark;
-        generation->mode = session.config.mode;
         generation->session = impl_->session;
         generation->rows.resize(session.ordinals.size());
         generation->maximum_records_per_batch =
@@ -1667,7 +1668,6 @@ IntradayInstrumentStoreSnapshotV1
 IntradayInstrumentStoreV1::Snapshot() const noexcept {
     const SessionState& session = *impl_->session;
     IntradayInstrumentStoreSnapshotV1 result{};
-    result.mode = session.config.mode;
     result.maximum_session_records =
         session.config.maximum_session_records;
     result.maximum_session_accounted_bytes =

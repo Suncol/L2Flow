@@ -56,9 +56,8 @@ struct RealtimePipelineConfigV1 final {
     std::size_t decoder_queue_capacity_per_source = 4096U;
     l2flow::market::MarketDecoderLimitsV1 decoder_limits{};
 
-    std::uint32_t history_worker_count = 1U;
-    std::size_t history_queue_capacity_per_source_worker = 4096U;
-    std::size_t maximum_history_records_per_instrument = 64U;
+    std::uint32_t store_worker_count = 1U;
+    std::size_t store_queue_capacity_per_source_worker = 4096U;
 
     // Real SDK production must pin one process to one fixed UTC+08:00 civil
     // trade date. Historical injection tests may disable this explicitly;
@@ -78,7 +77,7 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
     kInvalidConfiguration,
-    kHistoryCreateFailed,
+    kStoreRuntimeCreateFailed,
     kWalCreateFailed,
     kFactorCreateFailed,
     kDecoderThreadStartFailed,
@@ -98,7 +97,7 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
 enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     kNone = 0U,
     // API/SYS and every tuple outside the five-message production catalog do
-    // not acquire ingress sequence numbers and do not enter WAL/history.
+    // not acquire ingress sequence numbers and do not enter WAL/store.
     kIgnoredUnsupported,
     kNullMessage,
     kClockFailure,
@@ -139,9 +138,9 @@ enum class RealtimePipelineCutErrorV1 : std::uint8_t {
     kSequenceExhausted,
     kClockFailure,
     kWatermarkFailed,
-    kHistoryBeginFailed,
+    kGenerationBeginFailed,
     kMarkerAdmissionFailed,
-    kHistoryWaitFailed,
+    kGenerationWaitFailed,
     kFactorPublishFailed,
     kUnexpectedFailure,
 };
@@ -154,24 +153,19 @@ struct RealtimePipelineCutResultV1 final {
         RealtimePipelineCutErrorV1::kNone;
     l2flow::market::RealtimeHistoryWatermarkErrorV1 watermark_error =
         l2flow::market::RealtimeHistoryWatermarkErrorV1::kNone;
-    l2flow::market::RealtimeHistoryGenerationErrorV1 history_error =
+    l2flow::market::RealtimeHistoryGenerationErrorV1 generation_error =
         l2flow::market::RealtimeHistoryGenerationErrorV1::kNone;
     l2flow::factor::RealtimeFactorPublishResultV1 factor_result{};
-    std::shared_ptr<const l2flow::market::RealtimeHistoryGenerationV1>
-        history_generation;
-    std::shared_ptr<const l2flow::factor::RealtimeFactorGenerationV1>
-        factor_generation;
     std::shared_ptr<
         const l2flow::market::IntradayInstrumentStoreGenerationV1>
-        intraday_store_generation;
-    bool intraday_store_required = false;
+        store_generation;
+    std::shared_ptr<const l2flow::factor::RealtimeFactorGenerationV1>
+        factor_generation;
 
     [[nodiscard]] bool published() const noexcept {
         return error == RealtimePipelineCutErrorV1::kNone &&
-               history_generation != nullptr &&
-               factor_generation != nullptr &&
-               (!intraday_store_required ||
-                intraday_store_generation != nullptr);
+               store_generation != nullptr &&
+               factor_generation != nullptr;
     }
 };
 
@@ -193,7 +187,7 @@ struct RealtimePipelineSnapshotV1 final {
     bool fatal = false;
     bool stopped = false;
     bool trade_date_boundary_reached = false;
-    l2flow::market::IntradayInstrumentStoreSnapshotV1 intraday_store{};
+    l2flow::market::IntradayInstrumentStoreSnapshotV1 store{};
 };
 
 // Owns the single production data chain. The registry and calculator backing
@@ -226,10 +220,10 @@ public:
         const datayes::mdl::MDLMessage* message) noexcept;
 
     // Establishes an exclusive process-owned ingress prefix, admits one
-    // marker into each serial decoder queue, waits for every history worker
+    // marker into each serial decoder queue, waits for every store worker
     // slice, then performs one atomic full-generation factor publication.
     // timeout is a shared wait budget for decoder-marker backpressure and the
-    // history condition wait; it is not an API completion deadline. It cannot
+    // generation condition wait; it is not an API completion deadline. It cannot
     // preempt setup/allocation or arbitrary user calculator code, and waiting
     // to serialize behind an already-running cut/stop is outside the budget.
     [[nodiscard]] RealtimePipelineCutResultV1 CutAndPublishGeneration(
@@ -238,7 +232,7 @@ public:
     // Terminal publication path. It first closes callback admission and
     // performs SDK Shutdown so no accepted message can appear after the cut.
     // It then releases the quiesced SDK objects, publishes the exact final
-    // accepted ingress prefix, drains the decoder/history/WAL workers, and
+    // accepted ingress prefix, drains the decoder/store/WAL workers, and
     // leaves the runtime stopped. This is the production shutdown path when a final
     // complete generation is required. Every normal return is destructive and
     // leaves the runtime stopped, including invalid timeout or publication
@@ -250,15 +244,12 @@ public:
         std::chrono::nanoseconds timeout) noexcept;
 
     [[nodiscard]] std::shared_ptr<
-        const l2flow::market::RealtimeHistoryGenerationV1>
-    AcquireLatestHistoryGeneration() const noexcept;
-    [[nodiscard]] std::shared_ptr<
         const l2flow::market::IntradayInstrumentStoreGenerationV1>
-    AcquireLatestIntradayStoreGeneration() const noexcept;
-    // The two latest slots are not a transactional pair: history N is stored
-    // before factor N. A consistent consumer must acquire the factor once and
-    // obtain its matching history through factor->input_history(). The direct
-    // history accessor is for history-only/diagnostic consumers.
+    AcquireLatestStoreGeneration() const noexcept;
+    // Store N is published before factor N. A consistent consumer must acquire
+    // the factor once and obtain its exact matching store through
+    // factor->input_store(). The direct store accessor is for store-only
+    // diagnostics.
     [[nodiscard]] std::shared_ptr<
         const l2flow::factor::RealtimeFactorGenerationV1>
     AcquireLatestFactorGeneration() const noexcept;
@@ -267,7 +258,7 @@ public:
 
     // Idempotent terminal shutdown without creating another generation. SDK
     // callbacks are stopped first, decoder queues are drained and joined
-    // next, then history and the independent optional WAL stop.
+    // next, then the store runtime and independent optional WAL stop.
     void StopAndDrain() noexcept;
 
 private:

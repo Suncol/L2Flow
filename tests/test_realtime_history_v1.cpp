@@ -135,14 +135,51 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
     return watermark;
 }
 
+bool Expect(bool condition, std::string_view message);
+
 std::int64_t LastPrice(
-    const market::RealtimeInstrumentGenerationV1* row) {
-    if (row == nullptr || row->latest_snapshot == nullptr) {
+    const market::IntradayInstrumentSummaryV1& summary) {
+    if (summary.latest_snapshot == nullptr) {
         return -1;
     }
     const auto* snapshot = market::RetainedMarketEventGetV1<
-        market::ShanghaiSnapshotV1>(row->latest_snapshot->event());
+        market::ShanghaiSnapshotV1>(summary.latest_snapshot->event());
     return snapshot == nullptr ? -1 : snapshot->last_price.normalized_p6;
+}
+
+std::vector<std::uint64_t> TailIngressSequences(
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    std::uint32_t instrument_id,
+    std::uint64_t count,
+    bool* ok) {
+    std::unique_ptr<market::IntradayInstrumentCursorV1> cursor;
+    *ok &= Expect(
+        generation.OpenTailCursor(instrument_id, count, &cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            cursor != nullptr,
+        "open store tail cursor");
+    if (cursor == nullptr) {
+        return {};
+    }
+    std::vector<std::uint64_t> result;
+    std::array<const market::RealtimeHistoryRecordV1*, 4U> batch{};
+    for (;;) {
+        std::size_t written = 0U;
+        const auto error = cursor->ReadBatch(batch, &written);
+        *ok &= Expect(
+            error == market::IntradayInstrumentStoreQueryErrorV1::kNone,
+            "read store tail cursor");
+        if (error != market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+            return result;
+        }
+        for (std::size_t index = 0U; index < written; ++index) {
+            result.push_back(batch[index]->ingress_sequence());
+        }
+        if (written == 0U) {
+            *ok &= Expect(cursor->done(), "tail cursor reaches end");
+            return result;
+        }
+    }
 }
 
 bool Expect(bool condition, std::string_view message) {
@@ -164,7 +201,11 @@ int main() {
     config.source_stream_ids = {11U, 12U, 13U, 14U};
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 32U;
-    config.maximum_records_per_instrument = 2U;
+    config.intraday_store.chunk_record_capacity = 2U;
+    config.intraday_store.maximum_session_records = 32U;
+    config.intraday_store.maximum_session_accounted_bytes = 1U << 20U;
+    config.intraday_store.maximum_records_per_batch = 4U;
+    config.intraday_store.coverage_from_open = true;
     config.registry = registry.get();
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
     if (!Expect(
@@ -240,29 +281,54 @@ int main() {
             "seal idle source generation 1");
     }
 
-    std::shared_ptr<const market::RealtimeHistoryGenerationV1> first;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1> first;
     ok &= Expect(
         runtime->WaitForGeneration(
             1U, std::chrono::seconds(2), &first) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "wait generation 1");
-    ok &= Expect(first != nullptr && first->instruments().size() == 3U,
+    ok &= Expect(first != nullptr && first->instrument_count() == 3U,
                  "generation 1 has exact fixed universe");
-    ok &= Expect(LastPrice(first->Find(1U)) == 1'000'001,
-                 "post-fence update excluded from generation 1");
-    const market::RealtimeInstrumentGenerationV1* first_row =
-        first->Find(1U);
-    ok &= Expect(
-        first_row != nullptr && first_row->history.size() == 2U &&
-            first_row->history[0U]->ingress_sequence() == 1U &&
-            first_row->history[1U]->ingress_sequence() == 2U,
-        "cross-source history is ordered by process ingress, not worker arrival");
-    ok &= Expect(LastPrice(first->Find(2U)) == 1'000'002,
-                 "other worker is same generation");
-    ok &= Expect(first->Find(9U) != nullptr &&
-                     first->Find(9U)->latest_snapshot == nullptr &&
-                     first->Find(9U)->history.empty(),
-                 "unobserved fixed-universe instrument remains empty");
+    if (first != nullptr) {
+        const std::array<std::uint32_t, 3U> expected_ids{1U, 2U, 9U};
+        for (std::size_t ordinal = 0U; ordinal < expected_ids.size();
+             ++ordinal) {
+            market::IntradayInstrumentSummaryV1 ordinal_summary{};
+            ok &= Expect(
+                first->SummaryAt(ordinal, &ordinal_summary) ==
+                        market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                    ordinal_summary.instrument_id == expected_ids[ordinal],
+                "SummaryAt exposes the sorted fixed universe");
+        }
+        market::IntradayInstrumentSummaryV1 first_summary{};
+        ok &= Expect(
+            first->Find(1U, &first_summary) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                LastPrice(first_summary) == 1'000'001,
+            "post-fence update excluded from generation 1");
+        ok &= Expect(
+            TailIngressSequences(*first, 1U, 3U, &ok) ==
+                std::vector<std::uint64_t>{2U, 1U},
+            "cross-source tail is merged by process ingress, not worker arrival");
+        market::IntradayInstrumentSummaryV1 other_worker{};
+        ok &= Expect(
+            first->Find(2U, &other_worker) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                LastPrice(other_worker) == 1'000'002,
+            "other worker is same generation");
+        market::IntradayInstrumentSummaryV1 empty{};
+        ok &= Expect(
+            first->Find(9U, &empty) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                empty.latest_snapshot == nullptr &&
+                empty.latest_tick == nullptr && empty.record_count == 0U,
+            "unobserved fixed-universe instrument remains empty");
+        ok &= Expect(
+            first->SummaryAt(first->instrument_count(), &empty) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
+            "SummaryAt rejects an ordinal outside the fixed universe");
+    }
 
     const auto generation2 = MakeWatermark(*registry, 2U, 5U, 4U, 2U);
     ok &= Expect(
@@ -275,23 +341,35 @@ int main() {
                 market::RealtimeHistoryGenerationErrorV1::kNone,
             "seal source generation 2");
     }
-    std::shared_ptr<const market::RealtimeHistoryGenerationV1> second;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1> second;
     ok &= Expect(
         runtime->WaitForGeneration(
             2U, std::chrono::seconds(2), &second) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "wait generation 2");
-    ok &= Expect(LastPrice(second->Find(1U)) == 2'000'001,
-                 "parked update appears only in generation 2");
-    const market::RealtimeInstrumentGenerationV1* second_row =
-        second->Find(1U);
-    ok &= Expect(
-        second_row != nullptr && second_row->history.size() == 2U &&
-            second_row->history[0U]->ingress_sequence() == 2U &&
-            second_row->history[1U]->ingress_sequence() == 4U,
-        "bounded history retains the newest ingress suffix");
-    ok &= Expect(LastPrice(first->Find(1U)) == 1'000'001,
-                 "old generation handle remains immutable and alive");
+    if (second != nullptr) {
+        market::IntradayInstrumentSummaryV1 second_summary{};
+        ok &= Expect(
+            second->Find(1U, &second_summary) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                LastPrice(second_summary) == 2'000'001,
+            "parked update appears only in generation 2");
+        ok &= Expect(
+            TailIngressSequences(*second, 1U, 4U, &ok) ==
+                std::vector<std::uint64_t>{4U, 2U, 1U},
+            "next store generation exposes the complete newest-first tail");
+    }
+    if (first != nullptr) {
+        market::IntradayInstrumentSummaryV1 old_summary{};
+        ok &= Expect(
+            first->Find(1U, &old_summary) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                LastPrice(old_summary) == 1'000'001 &&
+                TailIngressSequences(*first, 1U, 4U, &ok) ==
+                    std::vector<std::uint64_t>{2U, 1U},
+            "old generation remains immutable while the session grows");
+    }
     ok &= Expect(runtime->AcquireLatestGeneration().get() == second.get(),
                  "whole generation atomically published");
     ok &= Expect(!runtime->IsGenerationCurrentAndHealthy(first) &&

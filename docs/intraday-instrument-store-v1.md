@@ -2,166 +2,210 @@
 
 ## Scope
 
-The intraday instrument store retains the complete prefix accepted by the
-running process for the current trade date. It is an in-memory query view over
-the same immutable `RealtimeHistoryRecordV1` owners consumed by bounded
-history. It does not decode a second time and does not introduce another
-queue, worker pool, sequence authority, or publication clock.
+The intraday instrument store is the only production market-history store. It
+retains every record accepted by the running process for one fixed trade date
+and supplies the immutable generation consumed by factor calculation. There
+is no alternate in-memory retention path and no publication fallback when the
+store cannot append or publish a complete cut.
 
-The store intentionally has no disk recovery path. The feeder owns its CSV
-append stream independently. Starting or restarting L2Flow after market open
-creates a partial in-memory session; it never reads feeder CSV files and cannot
-prove open coverage. In that situation the operator must not set
-`coverage_from_open`.
+The store owns each decoded `RealtimeHistoryRecordV1` exactly once. It does
+not decode a second time and does not introduce another sequence authority or
+publication clock.
+
+## Coverage boundary
+
+The store is memory-only and intentionally has no recovery reader. The feeder
+client may append raw messages to its own CSV file, but that file is not read,
+indexed, replayed, or validated by this project. The optional audit WAL is
+also not a store recovery source.
+
+`coverage_from_open` is an operational assertion, not something inferred from
+process sequence number 1. It is true only if all of the following remain
+true:
+
+- the process was ready before the first market message it was expected to
+  accept for the trade date;
+- the same process has run continuously since then;
+- no append, allocation, capacity, generation, or publication failure has
+  occurred;
+- the upstream feed itself met the separately managed completeness contract.
+
+The watermark proves completeness only for the dense prefix accepted by this
+process. It does not prove absence of loss before the callback or completeness
+of the vendor server.
+
+A start after open, process crash, executable restart, or host restart creates
+a new partial session beginning at that start. Without recovery, the new
+process cannot regain the earlier records and must report
+`coverage_from_open=false`. A strict from-open service must remain unready for
+the rest of that trade date or continue serving from a still-running process
+that began before open.
 
 ## Ownership and append path
 
-The existing history route remains authoritative:
+The production path is:
 
 ```text
 decoded record
--> instrument_id % history_worker_count
--> permanent history worker
-     |-> bounded V1 factor compatibility row
-     `-> intraday store source lane
+-> instrument_id % store_worker_count
+-> permanent instrument-store worker
+-> one append-only source lane for that instrument
 ```
 
-Each fixed-registry instrument has four append-only source lanes. A lane is a
-doubly linked list of fixed-capacity chunks. One slot retains one
-`shared_ptr<const RealtimeHistoryRecordV1>`; the event object graph is shared
-with bounded history rather than copied.
+Each fixed-registry instrument has four source lanes. A lane is a doubly
+linked list of fixed-capacity chunks, and each slot retains one
+`shared_ptr<const RealtimeHistoryRecordV1>`. Only the permanent owner worker
+appends to an instrument, so a lane has one writer and does not require an
+append mutex.
 
-Chunk capacity is limited to 65,536 records so one append cannot trigger a
-pathological multi-GiB allocation even when the session budget is large. The
-default is 1,024.
+Source sequence must increase strictly within a lane. Different source
+workers can arrive in a different order from callback admission; readers merge
+the four captured lanes by the globally dense ingress sequence.
 
-Only the permanent owner worker appends to an instrument. Consequently a lane
-has one writer and requires no append mutex. Its source sequence must increase
-strictly. Readers never inspect a live tail: they operate on immutable
-endpoints captured by a generation fence.
+Chunk capacity is at most 65,536 records, with a default of 1,024. This keeps
+one append from requesting a pathological allocation even when the session
+budget is large.
 
-No record is evicted before the process releases the trade-day session.
-Reaching a configured record or accounted-byte limit is a coverage failure,
-not a request to discard old data.
+No record is evicted during the trade-date session. Reaching either capacity
+limit is a coverage failure and closes production admission; it is never a
+request to discard an old prefix.
 
 ## Generation semantics
 
-The store reuses all four existing source fences. After a worker has consumed
-every record below a cut, it captures, for each owned instrument and source:
+The store uses the same four source fences that prove the process ingress
+prefix. Once a worker has consumed every record below a cut, it captures for
+each owned instrument and source:
 
 - the last visible chunk;
-- the number of visible slots in that chunk;
-- the visible source count;
-- latest snapshot and tick locators.
+- the visible slot count in that chunk;
+- the visible source-record count;
+- the latest snapshot and tick locators.
 
-The slice contains endpoints, not a copy of every retained handle. Building a
-generation therefore scales with the fixed instrument universe, not with the
-number of records accumulated since open.
+The slice contains endpoints and locators, not a copy of all retained record
+handles. Building a generation is therefore O(I), where I is the fixed
+instrument count, and does not grow with the number of session records.
 
-Publication validates that all worker slices belong to the requested
-generation and that their captured global and per-source counts exactly match
-the `RealtimeHistoryWatermarkV1`. A published history generation owns the
-exact matching intraday generation. A factor generation owns that history, so
-the supported consistent read is:
+Publication verifies that every worker slice belongs to the requested
+generation and that captured global and per-source totals exactly match the
+watermark. The published store generation is the sole input to factor
+calculation.
+
+For latest-only factor work, `SummaryAt(index)` exposes the fixed registry
+universe in canonical order with record counts and latest snapshot/tick
+pointers. Iterating all summaries is O(I); the default last-price projection
+does not scan the accumulated session.
+
+The factor generation retains the exact store-generation shared pointer and
+copies its watermark:
 
 ```cpp
 auto factor = pipeline->AcquireLatestFactorGeneration();
 if (factor != nullptr) {
-    const auto& history = factor->input_history();
-    const auto& intraday = factor->input_intraday_store();
-    // factor, history, and intraday describe the same ingress prefix.
+    const auto& store = factor->input_store();
+    // factor and store describe the exact same ingress prefix.
 }
 ```
 
-Independent `AcquireLatest*` calls are observability conveniences and are not
-a transactional multi-slot read.
+The independent latest-store accessor is diagnostic. Reading latest store and
+latest factor in separate calls is not a transactional pair because store
+generation N is published before factor generation N. Acquire the factor once
+and use `input_store()` when an exact pair is needed.
 
-## Modes
+## Query complexity
 
-| Mode | Store append/cut failure | Bounded history/factor |
-|---|---|---|
-| `disabled` | store is not constructed | unchanged |
-| `shadow` | sticky `coverage_lost`; no later complete store generation | continues |
-| `required` | pipeline fails closed | retained for factor compatibility |
-| `primary` | pipeline fails closed | retained as the V1 compatibility view |
+All cursors retain their generation and return borrowed record pointers valid
+for the cursor lifetime.
 
-`primary` does not yet remove bounded history. It is an operational rollout
-label for consumers that treat intraday history as their primary read view.
+- `SummaryAt` and `Find` expose latest-only per-instrument state.
+- `OpenInstrumentCursor` merges four source lanes over a half-open ingress
+  range.
+- `OpenTailCursor` streams the newest N records without materializing the
+  complete instrument history.
+- `OpenUniverseCursor` emits ascending instrument ID and then ascending
+  ingress sequence within each instrument.
+- `OpenUniverseRangeCursor(begin, end, ...)` applies the same ordering to one
+  half-open `SummaryAt` ordinal range. Valid empty ranges are immediately
+  terminal; reversed or out-of-universe ranges are rejected.
 
-`coverage_from_open` is an operator assertion. It should be enabled only when
-the process started before the first accepted market message and has remained
-healthy continuously. Any failed store append clears that claim permanently.
+`ReadBatch` writes into caller-owned pointer storage and rejects a batch above
+`maximum_records_per_batch`, whose absolute limit is 1,048,576.
 
-## Memory limits
+For N visible records, a full universe drain performs O(N) record work and
+uses O(batch) caller storage. It does not allocate a second N-record result.
+Independent non-overlapping ordinal-range cursors can be drained concurrently;
+when no per-cursor `maximum_records` limit truncates a range, concatenating
+their outputs in ordinal order is exactly the full-universe ordering. Each
+cursor owns only its own traversal state and shares the immutable generation.
+The final acceptance probe must continue through an explicit terminal page
+with `written == 0` and `done() == true`, and must reconcile global and all
+four source counts with the generation watermark.
 
-Enabled modes require both:
+Oldest-first narrow ranges currently walk each selected source lane from its
+captured head to the lower bound. A late-session narrow range can therefore
+cost O(the preceding lane prefix). Sparse chunk-boundary indexes are a future
+optimization if that query shape becomes latency-sensitive.
+
+## Capacity and 1 TiB deployment boundary
+
+Production requires both:
 
 - `maximum_session_records`;
 - `maximum_session_accounted_bytes`.
 
 The byte limit is one conservative logical budget shared by base index state,
-whole chunk allocations, and retained record accounting. The observable
-logical total is `accounted_record_bytes + allocated_index_bytes`; chunk
-capacity is reserved before allocation, so an oversized chunk cannot bypass
-the limit. The two categories intentionally favor a safe upper estimate and
-may overlap for a lane-owner slot.
+whole chunk allocations, and retained-record accounting. The observable
+logical total is `accounted_record_bytes + allocated_index_bytes`. Chunk
+capacity is reserved before allocation so a new chunk cannot bypass the
+limit.
 
-This is still not allocator RSS. It cannot exactly include allocator metadata
-and fragmentation, thread stacks, SDK/feeder memory, kernel state, or page
-cache. The budget governs the retained session store; bounded-history
-compatibility rows and consumer-retained generation/cursor metadata are
-outside it. Consumers must not retain an unbounded number of old generations.
+Logical accounting is not allocator RSS. It cannot exactly include allocator
+metadata and fragmentation, thread stacks, SDK and feeder memory, consumer
+objects, kernel state, or page cache. This version also retains the exact
+decoded object graph rather than a compact POD payload.
 
-On a 1 TiB production host, a reasonable initial envelope is a 600--620 GiB
-store hard limit and an independently monitored 800 GiB process high-water
-alert, leaving roughly 160--220 GiB for the feeder, allocator variance,
-operating system, and page cache. The record cap should be derived from a live
-10-minute sample and include a burst multiplier; neither cap should be set to
-the full physical-memory size.
+For a 1 TiB host, the initial operational envelope is:
 
-This V1 retains the existing exact decoded object graph. It removes the
-day-end generation-copy problem, but it is not the final density
-optimization. Before relying on a two-times-volume session, measure real RSS,
-allocation rate, and cut latency. A later compact POD payload can preserve the
-same generation/query contract while reducing object and allocator overhead.
+- 600--620 GiB store logical hard limit;
+- an independently monitored process high-water alert near 800 GiB;
+- a process termination boundary around 850--860 GiB;
+- approximately 160--220 GiB reserved for the feeder, allocator variance,
+  operating system, and page cache.
 
-## Queries
+These are rollout starting points, not universal constants. The record cap
+must be derived from live rate measurements with an explicit burst and
+two-times-volume margin. Neither logical limit should equal physical memory.
 
-All cursors retain their generation and return borrowed record pointers valid
-for the cursor lifetime.
+### Generation and cursor pinning
 
-- `Find` returns counts and latest snapshot/tick for one instrument.
-- `OpenInstrumentCursor` performs a four-way merge by global ingress sequence
-  over a half-open sequence range.
-- `OpenTailCursor` streams the newest `N` records without materializing or
-  reversing the complete history.
-- `OpenUniverseCursor` emits ascending instrument ID, then ascending ingress
-  sequence within each instrument.
+A generation owns session state needed by its summaries and chunks. A cursor
+owns its generation. Retaining an old factor retains its exact `input_store`,
+and retaining a cursor can therefore keep the session and all referenced
+record owners alive even after the runtime stops.
 
-`ReadBatch` writes into caller-owned pointer storage and is bounded by
-`maximum_records_per_batch` (at most 1,048,576). Querying the full day is
-therefore streaming: the result set itself does not require a second full-day
-allocation.
+Consumers must enforce a small fixed upper bound on retained generations,
+factors, and concurrent cursors. Shutdown or trade-date rollover does not
+guarantee an immediate RSS drop while any such handle remains live. Monitoring
+must include old-generation count, cursor count, process RSS, and time since
+the runtime released the session.
 
-A complete scan is O(records) and can be sharded by instrument across reader
-threads. Generation publication remains O(fixed instrument universe).
-Oldest-first narrow ranges currently walk each selected source lane from its
-captured head until the lower bound; a late-session narrow query is therefore
-O(prefix before range), even though a full scan is already optimal. If that
-query shape becomes latency-sensitive, the next compatible optimization is
-chunk-boundary skipping followed by a sparse per-lane index.
+## Failure policy
 
-The healthy append path also updates global session record and byte
-reservations. At the current measured feed rate this is expected to be small,
-but a two-times-volume rollout must verify append throughput and cache-line
-contention on the production NUMA topology rather than assuming linear scale.
+Store construction, append, chunk allocation, record/byte reservation,
+worker capture, and generation construction are part of the production
+correctness path. Any failure makes coverage sticky-lost, closes admission,
+and prevents a later store or factor generation from being advertised as
+complete.
 
-## Production example
+The optional WAL remains an independent audit side sink. A WAL failure does
+not alter a healthy store prefix, while a store failure cannot be hidden by
+WAL or feeder output.
+
+## Production and acceptance
 
 ```bash
 ./build/mdl-production-router \
   ... \
-  --intraday-store-mode required \
+  --instrument-store-workers 4 \
   --intraday-store-max-records 1000000000 \
   --intraday-store-memory-gib 600 \
   --intraday-store-chunk-records 1024 \
@@ -169,14 +213,13 @@ contention on the production NUMA topology rather than assuming linear scale.
   --intraday-store-from-open
 ```
 
-The numeric values are deployment starting points, not universal sizing
-defaults. First deploy `shadow`, compare retained counts with feeder capture,
-and observe peak RSS. Promote to `required` only after the limits and coverage
-alarm have been exercised under representative load.
+The process must be deployed before open and kept alive when from-open
+coverage is part of the service contract. A same-day restart cannot restore
+that claim.
 
-Run `accept-realtime-pipeline` with the same store flags before promotion. For
-every enabled mode it rejects lost coverage, drains the final universe cursor
-in caller-bounded batches, checks the complete record and four-source counts,
-and reports `full_scan_records`, `full_scan_ns`, and scan records per second.
-This makes full-read correctness and throughput part of the rollout evidence
-instead of inferring them from append-side counters alone.
+`accept-realtime-pipeline` uses the same capacities, rejects lost or partial
+coverage, drains the final universe cursor in caller-owned batches, validates
+record ordering and the complete four-source watermark, and reports
+`full_scan_records`, `full_scan_ns`, and scan records per second. Promotion
+requires an actual full-session run; an earlier short run that measured a
+different retention contract is not sufficient evidence.

@@ -452,9 +452,14 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.maximum_sdk_message_bytes = 4096U;
     config.decoder_queue_capacity_per_source = 16U;
-    config.history_worker_count = 1U;
-    config.history_queue_capacity_per_source_worker = 16U;
-    config.maximum_history_records_per_instrument = 4U;
+    config.store_worker_count = 1U;
+    config.store_queue_capacity_per_source_worker = 16U;
+    config.intraday_store.chunk_record_capacity = 4U;
+    config.intraday_store.maximum_session_records = 64U;
+    config.intraday_store.maximum_session_accounted_bytes =
+        16U * 1024U * 1024U;
+    config.intraday_store.maximum_records_per_batch = 4U;
+    config.intraday_store.coverage_from_open = true;
     config.enforce_receive_trade_date = false;
     config.sdk.enabled = true;
     config.sdk.server_address = "127.0.0.1:9112";
@@ -559,9 +564,11 @@ int main() {
         "terminal publishes after the admitted callback exits");
     if (terminal.published()) {
         const market::RealtimeHistoryWatermarkV1& watermark =
-            terminal.history_generation->watermark();
-        const market::RealtimeInstrumentGenerationV1* const row =
-            terminal.history_generation->Find(18U);
+            terminal.store_generation->watermark();
+        market::IntradayInstrumentSummaryV1 row{};
+        const bool row_found =
+            terminal.store_generation->Find(18U, &row) ==
+            market::IntradayInstrumentStoreQueryErrorV1::kNone;
         test.Expect(
             watermark.ingress_sequence_exclusive == 2U &&
                 watermark.sources[3U].sequence_exclusive == 2U &&
@@ -569,15 +576,26 @@ int main() {
                 watermark.sources[1U].sequence_exclusive == 1U &&
                 watermark.sources[2U].sequence_exclusive == 1U,
             "final watermark includes the callback that entered admission first");
+
+        std::unique_ptr<market::IntradayInstrumentCursorV1> tail;
+        std::array<const market::RealtimeHistoryRecordV1*, 2U> records{};
+        std::size_t written = 0U;
         test.Expect(
-            row != nullptr && row->latest_tick != nullptr &&
-                row->history.size() == 1U &&
-                row->history.front()->ingress_sequence() == 1U,
-            "final history contains exactly the admitted callback record");
+            row_found && row.latest_tick != nullptr &&
+                row.record_count == 1U &&
+                terminal.store_generation->OpenTailCursor(
+                    18U, row.record_count, &tail) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                tail != nullptr &&
+                tail->ReadBatch(records, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                written == 1U && records[0U] == row.latest_tick &&
+                records[0U]->ingress_sequence() == 1U,
+            "final store contains exactly the admitted callback record");
         test.Expect(
-            terminal.factor_generation->input_history().get() ==
-                terminal.history_generation.get(),
-            "factor generation retains the exact terminal history handle");
+            terminal.factor_generation->input_store().get() ==
+                terminal.store_generation.get(),
+            "factor generation retains the exact terminal store handle");
     }
 
     const runtime::RealtimePipelineSnapshotV1 pipeline_snapshot =
