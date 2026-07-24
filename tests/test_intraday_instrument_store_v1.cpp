@@ -1,0 +1,1419 @@
+#include "l2flow/market/intraday_instrument_store_v1.h"
+#include "l2flow/market/realtime_history_v1.h"
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <span>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+namespace common = l2flow::common;
+namespace market = l2flow::market;
+
+constexpr std::array<std::uint32_t, 4U> kSourceStreamIds{
+    11U, 12U, 13U, 14U};
+constexpr std::uint32_t kTradeDate = 20260724U;
+
+static_assert(
+    static_cast<std::uint8_t>(
+        market::RealtimeHistoryCreateErrorV1::kResourceExhausted) == 3U);
+static_assert(
+    static_cast<std::uint8_t>(
+        market::RealtimeHistoryCreateErrorV1::kThreadStartFailed) == 4U);
+static_assert(
+    static_cast<std::uint8_t>(
+        market::RealtimeHistoryGenerationErrorV1::kResourceExhausted) ==
+    10U);
+
+bool Expect(bool condition, std::string_view message) {
+    if (!condition) {
+        std::cerr << "FAIL: " << message << '\n';
+    }
+    return condition;
+}
+
+std::vector<std::byte> Bytes(std::string_view text) {
+    const auto bytes = std::as_bytes(std::span(text));
+    return {bytes.begin(), bytes.end()};
+}
+
+std::unique_ptr<market::InstrumentRegistryV1> MakeRegistry() {
+    std::vector<market::InstrumentRegistryEntryV1> entries;
+    for (std::uint32_t instrument_id : {9U, 2U, 7U, 5U}) {
+        market::InstrumentRegistryEntryV1 entry{};
+        entry.instrument_id = instrument_id;
+        entry.key.market = market::MarketV1::kShanghai;
+        entry.key.security_id_source = Bytes("101");
+        switch (instrument_id) {
+            case 2U:
+                entry.key.security_id = Bytes("600002");
+                break;
+            case 5U:
+                entry.key.security_id = Bytes("600005");
+                break;
+            case 7U:
+                entry.key.security_id = Bytes("600007");
+                break;
+            case 9U:
+                entry.key.security_id = Bytes("600009");
+                break;
+            default:
+                return nullptr;
+        }
+        entry.quantity_unit = market::QuantityUnitV1::kShare;
+        entry.security_type = market::SecurityTypeV1::kEquity;
+        entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
+        entries.push_back(std::move(entry));
+    }
+
+    std::unique_ptr<market::InstrumentRegistryV1> registry;
+    if (market::InstrumentRegistryV1::Create(
+            17U, entries, &registry) !=
+        market::InstrumentRegistryCreateErrorV1::kNone) {
+        return nullptr;
+    }
+    return registry;
+}
+
+void FillCommon(
+    market::DecodedMarketCommonV1* common,
+    market::MarketEventKindV1 kind,
+    market::MarketV1 venue,
+    std::uint8_t source_slot,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint32_t instrument_id) {
+    common->kind = kind;
+    common->market = venue;
+    common->origin.source_stream_id = kSourceStreamIds[source_slot];
+    common->origin.trade_date = kTradeDate;
+    common->origin.source_sequence = source_sequence;
+    common->origin.recv_realtime_ns =
+        static_cast<std::int64_t>(ingress_sequence * 100U);
+    common->origin.recv_monotonic_ns =
+        static_cast<std::int64_t>(ingress_sequence * 10U);
+    common->instrument_id = instrument_id;
+}
+
+template <typename Event>
+market::RealtimeHistoryRecordHandleV1 OwnRecord(
+    std::uint8_t source_slot,
+    std::uint64_t ingress_sequence,
+    Event event) {
+    market::RetainedMarketEventV1 retained(
+        std::in_place_type<std::unique_ptr<const Event>>,
+        std::make_unique<const Event>(std::move(event)));
+    market::RealtimeHistoryRecordHandleV1 record;
+    if (!market::RealtimeHistoryRecordV1::Create(
+            source_slot, ingress_sequence, std::move(retained), &record)) {
+        return nullptr;
+    }
+    return record;
+}
+
+market::RealtimeHistoryRecordHandleV1 MakeRecord(
+    std::uint8_t source_slot,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint32_t instrument_id) {
+    const std::int64_t price =
+        static_cast<std::int64_t>(ingress_sequence * 1'000'000U);
+    switch (source_slot) {
+        case 0U: {
+            market::ShanghaiSnapshotV1 event{};
+            FillCommon(
+                &event.common,
+                market::MarketEventKindV1::kShanghaiSnapshot,
+                market::MarketV1::kShanghai,
+                source_slot,
+                source_sequence,
+                ingress_sequence,
+                instrument_id);
+            event.last_price.valid = true;
+            event.last_price.raw = price;
+            event.last_price.normalized_p6 = price;
+            event.last_price.scale = 6U;
+            return OwnRecord(
+                source_slot, ingress_sequence, std::move(event));
+        }
+        case 1U: {
+            market::ShanghaiTickV1 event{};
+            FillCommon(
+                &event.common,
+                market::MarketEventKindV1::kShanghaiTick,
+                market::MarketV1::kShanghai,
+                source_slot,
+                source_sequence,
+                ingress_sequence,
+                instrument_id);
+            event.fields.price.valid = true;
+            event.fields.price.raw = price;
+            event.fields.price.normalized_p6 = price;
+            event.fields.price.scale = 6U;
+            return OwnRecord(
+                source_slot, ingress_sequence, std::move(event));
+        }
+        case 2U: {
+            market::ShenzhenSnapshotV1 event{};
+            FillCommon(
+                &event.common,
+                market::MarketEventKindV1::kShenzhenSnapshot,
+                market::MarketV1::kShenzhen,
+                source_slot,
+                source_sequence,
+                ingress_sequence,
+                instrument_id);
+            event.last_price.valid = true;
+            event.last_price.raw = price;
+            event.last_price.normalized_p6 = price;
+            event.last_price.scale = 6U;
+            return OwnRecord(
+                source_slot, ingress_sequence, std::move(event));
+        }
+        case 3U: {
+            market::ShenzhenOrderV1 event{};
+            FillCommon(
+                &event.common,
+                market::MarketEventKindV1::kShenzhenOrder,
+                market::MarketV1::kShenzhen,
+                source_slot,
+                source_sequence,
+                ingress_sequence,
+                instrument_id);
+            event.fields.price.valid = true;
+            event.fields.price.raw = price;
+            event.fields.price.normalized_p6 = price;
+            event.fields.price.scale = 6U;
+            return OwnRecord(
+                source_slot, ingress_sequence, std::move(event));
+        }
+        default:
+            return nullptr;
+    }
+}
+
+market::RealtimeHistoryWatermarkV1 MakeWatermark(
+    const market::InstrumentRegistryV1& registry,
+    std::uint64_t generation,
+    std::array<std::uint64_t, 4U> source_sequence_exclusive) {
+    common::Identity128 run_id{};
+    run_id[0U] = std::byte{0x54U};
+    run_id[1U] = std::byte{0x31U};
+
+    std::array<market::RealtimeSourceWatermarkV1, 4U> sources{};
+    std::uint64_t ingress_sequence_exclusive = 1U;
+    for (std::size_t source_slot = 0U;
+         source_slot < sources.size();
+         ++source_slot) {
+        sources[source_slot].source_stream_id =
+            kSourceStreamIds[source_slot];
+        sources[source_slot].sequence_exclusive =
+            source_sequence_exclusive[source_slot];
+        ingress_sequence_exclusive +=
+            source_sequence_exclusive[source_slot] - 1U;
+    }
+
+    market::RealtimeHistoryWatermarkV1 watermark{};
+    if (market::BuildRealtimeHistoryWatermarkV1(
+            run_id,
+            generation,
+            kTradeDate,
+            ingress_sequence_exclusive,
+            10'000U + generation,
+            registry,
+            sources,
+            &watermark) !=
+        market::RealtimeHistoryWatermarkErrorV1::kNone) {
+        return {};
+    }
+    return watermark;
+}
+
+market::IntradayInstrumentStoreConfigV1 StoreConfig(
+    std::uint64_t maximum_records = 100U,
+    std::uint64_t maximum_bytes = 1U << 30U) {
+    market::IntradayInstrumentStoreConfigV1 config{};
+    config.mode = market::IntradayInstrumentStoreModeV1::kRequired;
+    config.chunk_record_capacity = 2U;
+    config.maximum_session_records = maximum_records;
+    config.maximum_session_accounted_bytes = maximum_bytes;
+    config.maximum_records_per_batch = 2U;
+    config.coverage_from_open = true;
+    return config;
+}
+
+std::unique_ptr<market::IntradayInstrumentStoreV1> CreateStore(
+    const market::InstrumentRegistryV1& registry,
+    std::uint32_t worker_count,
+    market::IntradayInstrumentStoreConfigV1 config,
+    std::string_view message,
+    bool* ok) {
+    std::unique_ptr<market::IntradayInstrumentStoreV1> store;
+    const auto error = market::IntradayInstrumentStoreV1::Create(
+        config, worker_count, &registry, &store);
+    *ok &= Expect(
+        error == market::IntradayInstrumentStoreCreateErrorV1::kNone &&
+            store != nullptr,
+        message);
+    return store;
+}
+
+std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
+BuildStoreGeneration(
+    market::IntradayInstrumentStoreV1* store,
+    const market::InstrumentRegistryV1& registry,
+    std::uint32_t worker_count,
+    std::uint64_t generation,
+    std::array<std::uint64_t, 4U> source_sequence_exclusive,
+    bool* ok) {
+    const market::RealtimeHistoryWatermarkV1 watermark =
+        MakeWatermark(registry, generation, source_sequence_exclusive);
+    *ok &= Expect(
+        watermark.generation == generation,
+        "build direct-store watermark");
+    if (watermark.generation != generation) {
+        return nullptr;
+    }
+
+    std::vector<
+        std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
+        slices(worker_count);
+    for (std::uint32_t worker = 0U; worker < worker_count; ++worker) {
+        const auto error =
+            store->CaptureWorker(worker, generation, &slices[worker]);
+        *ok &= Expect(
+            error ==
+                    market::IntradayInstrumentStoreGenerationErrorV1::
+                        kNone &&
+                slices[worker] != nullptr,
+            "capture direct-store worker slice");
+        if (error !=
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone ||
+            slices[worker] == nullptr) {
+            return nullptr;
+        }
+    }
+
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        result;
+    const auto error = store->BuildGeneration(
+        watermark, std::move(slices), &result);
+    *ok &= Expect(
+        error ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
+            result != nullptr,
+        "build direct-store generation");
+    return result;
+}
+
+template <typename Cursor>
+std::vector<const market::RealtimeHistoryRecordV1*> DrainCursor(
+    Cursor* cursor,
+    std::size_t batch_capacity,
+    bool* ok) {
+    std::vector<const market::RealtimeHistoryRecordV1*> records;
+    std::vector<const market::RealtimeHistoryRecordV1*> batch(
+        batch_capacity);
+    for (std::size_t iteration = 0U; iteration < 100U; ++iteration) {
+        std::size_t written = 0U;
+        const auto error = cursor->ReadBatch(batch, &written);
+        *ok &= Expect(
+            error == market::IntradayInstrumentStoreQueryErrorV1::kNone,
+            "cursor batch read");
+        *ok &= Expect(
+            written <= batch.size(), "cursor respects caller batch");
+        if (error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            written > batch.size()) {
+            return records;
+        }
+        records.insert(
+            records.end(), batch.begin(), batch.begin() + written);
+        if (written == 0U) {
+            *ok &= Expect(cursor->done(), "zero batch is end-of-stream");
+            return records;
+        }
+    }
+    *ok &= Expect(false, "cursor terminates in bounded iterations");
+    return records;
+}
+
+std::vector<std::uint64_t> IngressSequences(
+    const std::vector<const market::RealtimeHistoryRecordV1*>& records) {
+    std::vector<std::uint64_t> result;
+    result.reserve(records.size());
+    for (const market::RealtimeHistoryRecordV1* record : records) {
+        result.push_back(
+            record == nullptr ? 0U : record->ingress_sequence());
+    }
+    return result;
+}
+
+std::vector<std::uint32_t> InstrumentIds(
+    const std::vector<const market::RealtimeHistoryRecordV1*>& records) {
+    std::vector<std::uint32_t> result;
+    result.reserve(records.size());
+    for (const market::RealtimeHistoryRecordV1* record : records) {
+        result.push_back(
+            record == nullptr ? 0U : record->instrument_id());
+    }
+    return result;
+}
+
+bool CheckCreationAndInvalidConfiguration(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    const auto valid = StoreConfig();
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            valid, 2U, &registry, nullptr) ==
+            market::IntradayInstrumentStoreCreateErrorV1::kNullOutput,
+        "store rejects null output");
+
+    std::unique_ptr<market::IntradayInstrumentStoreV1> store;
+    auto invalid = valid;
+    invalid.mode =
+        static_cast<market::IntradayInstrumentStoreModeV1>(255U);
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects unknown operating mode");
+    invalid = valid;
+    invalid.mode =
+        market::IntradayInstrumentStoreModeV1::kDisabled;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "direct store factory rejects disabled mode");
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            valid, 0U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects zero workers");
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            valid, 2U, nullptr, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects null registry");
+
+    invalid = valid;
+    invalid.chunk_record_capacity = 0U;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects zero chunk capacity");
+    invalid = valid;
+    invalid.chunk_record_capacity =
+        market::kIntradayInstrumentStoreMaximumChunkRecordsV1 + 1U;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects pathological single-chunk allocation");
+    invalid = valid;
+    invalid.maximum_session_records = 0U;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store requires record hard cap");
+    invalid = valid;
+    invalid.maximum_session_accounted_bytes = 0U;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store requires byte hard cap");
+    invalid = valid;
+    invalid.maximum_records_per_batch = 0U;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects zero batch boundary");
+    invalid = valid;
+    invalid.maximum_records_per_batch =
+        market::kIntradayInstrumentStoreMaximumBatchRecordsV1 + 1U;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            invalid, 2U, &registry, &store) ==
+            market::IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration,
+        "store rejects unbounded per-call query work");
+
+    store = CreateStore(
+        registry, 2U, valid, "valid direct store creation", &ok);
+    if (store != nullptr) {
+        const auto snapshot = store->Snapshot();
+        ok &= Expect(
+            snapshot.mode ==
+                    market::IntradayInstrumentStoreModeV1::kRequired &&
+                snapshot.maximum_session_records ==
+                    valid.maximum_session_records &&
+                snapshot.maximum_session_accounted_bytes ==
+                    valid.maximum_session_accounted_bytes &&
+                snapshot.coverage_from_open &&
+                !snapshot.coverage_lost &&
+                snapshot.appended_records == 0U,
+            "new store exposes configured healthy coverage");
+        ok &= Expect(
+            store->WorkerForInstrument(2U) == 0U &&
+                store->WorkerForInstrument(5U) == 1U,
+            "store uses permanent modulo instrument ownership");
+    }
+    return ok;
+}
+
+bool CheckGenerationQueriesAndLifetime(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    auto store = CreateStore(
+        registry,
+        2U,
+        StoreConfig(),
+        "query-test store creation",
+        &ok);
+    if (store == nullptr) {
+        return false;
+    }
+
+    const auto ingress1 = MakeRecord(1U, 1U, 1U, 5U);
+    const auto ingress2 = MakeRecord(0U, 1U, 2U, 5U);
+    const auto ingress3 = MakeRecord(2U, 1U, 3U, 5U);
+    const auto ingress4 = MakeRecord(3U, 1U, 4U, 5U);
+    const auto ingress5 = MakeRecord(1U, 2U, 5U, 5U);
+    const auto ingress6 = MakeRecord(1U, 3U, 6U, 5U);
+    const auto ingress7 = MakeRecord(0U, 2U, 7U, 2U);
+    const auto ingress8 = MakeRecord(3U, 2U, 8U, 9U);
+    ok &= Expect(
+        ingress1 != nullptr && ingress2 != nullptr &&
+            ingress3 != nullptr && ingress4 != nullptr &&
+            ingress5 != nullptr && ingress6 != nullptr &&
+            ingress7 != nullptr && ingress8 != nullptr,
+        "construct direct-store records");
+    if (!ok) {
+        return false;
+    }
+
+    const auto append = [&ok, &store](
+                            const market::RealtimeHistoryRecordHandleV1&
+                                record,
+                            std::string_view message) {
+        const std::uint32_t worker =
+            store->WorkerForInstrument(record->instrument_id());
+        ok &= Expect(
+            store->Append(worker, record) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            message);
+    };
+
+    // Source-local order is increasing, while the four sources deliberately
+    // reach the owner in a different order from global process ingress.
+    append(ingress4, "append source 3 before earlier global records");
+    append(ingress3, "append source 2 before earlier global records");
+    append(ingress1, "append source 1 first record");
+    append(ingress2, "append source 0 first record");
+    append(ingress5, "append source 1 second record");
+    append(ingress6, "append source 1 third record");
+    append(ingress7, "append second instrument");
+    append(ingress8, "append third instrument");
+    if (!ok) {
+        return false;
+    }
+
+    const auto first = BuildStoreGeneration(
+        store.get(), registry, 2U, 1U, {3U, 4U, 2U, 3U}, &ok);
+    if (first == nullptr) {
+        return false;
+    }
+    ok &= Expect(
+        first->watermark().generation == 1U &&
+            first->watermark().ingress_sequence_exclusive == 9U &&
+            first->instrument_count() == 4U &&
+            first->record_count() == 8U &&
+            first->coverage_from_open(),
+        "generation carries exact fixed universe and global cut");
+
+    market::IntradayInstrumentSummaryV1 summary{};
+    ok &= Expect(
+        first->Find(5U, &summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            summary.instrument_id == 5U &&
+            summary.record_count == 6U &&
+            summary.source_record_counts ==
+                std::array<std::uint64_t, 4U>{1U, 3U, 1U, 1U} &&
+            summary.latest_snapshot != nullptr &&
+            summary.latest_snapshot->ingress_sequence() == 3U &&
+            summary.latest_tick != nullptr &&
+            summary.latest_tick->ingress_sequence() == 6U,
+        "Find exposes per-source counts and latest snapshot/tick");
+
+    market::IntradayInstrumentSummaryV1 empty_summary{};
+    ok &= Expect(
+        first->Find(7U, &empty_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            empty_summary.instrument_id == 7U &&
+            empty_summary.record_count == 0U &&
+            empty_summary.latest_snapshot == nullptr &&
+            empty_summary.latest_tick == nullptr,
+        "Find retains an unobserved fixed-universe instrument");
+    ok &= Expect(
+        first->Find(99U, &empty_summary) ==
+            market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
+        "Find rejects instrument outside registry");
+
+    std::unique_ptr<market::IntradayInstrumentCursorV1> all_cursor;
+    ok &= Expect(
+        first->OpenInstrumentCursor(5U, {}, &all_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            all_cursor != nullptr,
+        "open full instrument cursor");
+    if (all_cursor != nullptr) {
+        const auto records = DrainCursor(all_cursor.get(), 2U, &ok);
+        ok &= Expect(
+            IngressSequences(records) ==
+                std::vector<std::uint64_t>{1U, 2U, 3U, 4U, 5U, 6U},
+            "four source lanes merge by global ingress sequence");
+    }
+
+    market::IntradayInstrumentScanOptionsV1 range{};
+    range.ingress_sequence_begin_inclusive = 2U;
+    range.ingress_sequence_end_exclusive = 6U;
+    std::unique_ptr<market::IntradayInstrumentCursorV1> range_cursor;
+    ok &= Expect(
+        first->OpenInstrumentCursor(5U, range, &range_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            range_cursor != nullptr,
+        "open half-open range cursor");
+    if (range_cursor != nullptr) {
+        std::array<const market::RealtimeHistoryRecordV1*, 2U> batch{};
+        std::size_t written = 0U;
+        ok &= Expect(
+            range_cursor->ReadBatch(batch, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                written == 2U &&
+                batch[0U]->ingress_sequence() == 2U &&
+                batch[1U]->ingress_sequence() == 3U,
+            "range cursor first page");
+        ok &= Expect(
+            range_cursor->ReadBatch(batch, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                written == 2U &&
+                batch[0U]->ingress_sequence() == 4U &&
+                batch[1U]->ingress_sequence() == 5U,
+            "range cursor second page");
+        ok &= Expect(
+            range_cursor->ReadBatch(batch, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                written == 0U && range_cursor->done(),
+            "range cursor reports zero-sized terminal page");
+    }
+
+    market::IntradayInstrumentScanOptionsV1 reverse_range = range;
+    reverse_range.direction =
+        market::IntradayInstrumentScanDirectionV1::kNewestFirst;
+    std::unique_ptr<market::IntradayInstrumentCursorV1>
+        reverse_range_cursor;
+    ok &= Expect(
+        first->OpenInstrumentCursor(
+            5U, reverse_range, &reverse_range_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            reverse_range_cursor != nullptr,
+        "open reverse half-open range cursor");
+    if (reverse_range_cursor != nullptr) {
+        const auto records =
+            DrainCursor(reverse_range_cursor.get(), 2U, &ok);
+        ok &= Expect(
+            IngressSequences(records) ==
+                std::vector<std::uint64_t>{5U, 4U, 3U, 2U},
+            "reverse range preserves half-open bounds across chunks");
+    }
+
+    std::unique_ptr<market::IntradayInstrumentCursorV1> limited_cursor;
+    ok &= Expect(
+        first->OpenInstrumentCursor(5U, {}, &limited_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            limited_cursor != nullptr,
+        "open cursor for batch-limit check");
+    if (limited_cursor != nullptr) {
+        std::array<const market::RealtimeHistoryRecordV1*, 3U> too_large{};
+        std::size_t written = std::numeric_limits<std::size_t>::max();
+        ok &= Expect(
+            limited_cursor->ReadBatch(too_large, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded &&
+                written == 0U,
+            "ReadBatch enforces configured allocation boundary");
+    }
+
+    std::unique_ptr<market::IntradayInstrumentCursorV1> tail_cursor;
+    ok &= Expect(
+        first->OpenTailCursor(5U, 3U, &tail_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            tail_cursor != nullptr,
+        "open newest-first tail cursor");
+    if (tail_cursor != nullptr) {
+        const auto records = DrainCursor(tail_cursor.get(), 2U, &ok);
+        ok &= Expect(
+            IngressSequences(records) ==
+                std::vector<std::uint64_t>{6U, 5U, 4U},
+            "tail emits exactly newest N records newest-first");
+    }
+
+    std::unique_ptr<market::IntradayUniverseCursorV1> universe_cursor;
+    ok &= Expect(
+        first->OpenUniverseCursor({}, &universe_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            universe_cursor != nullptr,
+        "open universe cursor");
+    if (universe_cursor != nullptr) {
+        const auto records = DrainCursor(universe_cursor.get(), 2U, &ok);
+        ok &= Expect(
+            InstrumentIds(records) ==
+                std::vector<std::uint32_t>{
+                    2U, 5U, 5U, 5U, 5U, 5U, 5U, 9U},
+            "universe cursor is instrument-id ordered");
+        ok &= Expect(
+            IngressSequences(records) ==
+                std::vector<std::uint64_t>{
+                    7U, 1U, 2U, 3U, 4U, 5U, 6U, 8U},
+            "universe cursor is ingress ordered within instrument");
+    }
+
+    const auto ingress9 = MakeRecord(0U, 3U, 9U, 5U);
+    ok &= Expect(
+        ingress9 != nullptr &&
+            store->Append(1U, ingress9) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+        "append record after generation-1 cut");
+    const auto second = BuildStoreGeneration(
+        store.get(), registry, 2U, 2U, {4U, 4U, 2U, 3U}, &ok);
+    if (second == nullptr) {
+        return false;
+    }
+
+    market::IntradayInstrumentSummaryV1 first_after_append{};
+    market::IntradayInstrumentSummaryV1 second_summary{};
+    ok &= Expect(
+        first->Find(5U, &first_after_append) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            first_after_append.record_count == 6U &&
+            first_after_append.latest_snapshot != nullptr &&
+            first_after_append.latest_snapshot->ingress_sequence() == 3U,
+        "post-cut append cannot mutate older generation");
+    ok &= Expect(
+        second->Find(5U, &second_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            second->record_count() == 9U &&
+            second_summary.record_count == 7U &&
+            second_summary.latest_snapshot != nullptr &&
+            second_summary.latest_snapshot->ingress_sequence() == 9U,
+        "next generation includes post-cut append");
+
+    store.reset();
+    market::IntradayInstrumentSummaryV1 after_store_destroy{};
+    ok &= Expect(
+        first->Find(5U, &after_store_destroy) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            after_store_destroy.record_count == 6U,
+        "generation remains readable after store destruction");
+    std::unique_ptr<market::IntradayInstrumentCursorV1>
+        after_destroy_cursor;
+    ok &= Expect(
+        second->OpenTailCursor(5U, 1U, &after_destroy_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            after_destroy_cursor != nullptr,
+        "generation can open cursor after store destruction");
+    if (after_destroy_cursor != nullptr) {
+        const auto records =
+            DrainCursor(after_destroy_cursor.get(), 1U, &ok);
+        ok &= Expect(
+            IngressSequences(records) == std::vector<std::uint64_t>{9U},
+            "generation owns records independently of mutable store");
+    }
+    return ok;
+}
+
+bool CheckRolloverCapsAndWorkerOwnership(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    auto rollover = CreateStore(
+        registry,
+        1U,
+        StoreConfig(),
+        "rollover store creation",
+        &ok);
+    if (rollover == nullptr) {
+        return false;
+    }
+    for (std::uint64_t sequence = 1U; sequence <= 3U; ++sequence) {
+        const auto record = MakeRecord(1U, sequence, sequence, 5U);
+        ok &= Expect(
+            record != nullptr &&
+                rollover->Append(0U, record) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            "append same-lane rollover record");
+    }
+    ok &= Expect(
+        rollover->Snapshot().allocated_chunks == 2U,
+        "chunk capacity two rolls third lane record into second chunk");
+
+    auto wrong_worker = CreateStore(
+        registry,
+        2U,
+        StoreConfig(),
+        "wrong-worker store creation",
+        &ok);
+    const auto wrong_worker_record = MakeRecord(0U, 1U, 1U, 5U);
+    if (wrong_worker != nullptr && wrong_worker_record != nullptr) {
+        ok &= Expect(
+            wrong_worker->Append(0U, wrong_worker_record) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kWrongWorker,
+            "append rejects non-owner worker");
+    } else {
+        ok &= Expect(false, "construct wrong-worker fixture");
+    }
+
+    auto record_capped = CreateStore(
+        registry,
+        1U,
+        StoreConfig(1U),
+        "record-cap store creation",
+        &ok);
+    const auto record_cap_first = MakeRecord(0U, 1U, 1U, 5U);
+    const auto record_cap_second = MakeRecord(0U, 2U, 2U, 5U);
+    if (record_capped != nullptr && record_cap_first != nullptr &&
+        record_cap_second != nullptr) {
+        ok &= Expect(
+            record_capped->Append(0U, record_cap_first) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            "record-cap store accepts record at limit");
+        ok &= Expect(
+            record_capped->Append(0U, record_cap_second) ==
+                market::IntradayInstrumentStoreAppendErrorV1::
+                    kRecordCapacity,
+            "record hard cap fails closed without eviction");
+        const auto snapshot = record_capped->Snapshot();
+        ok &= Expect(
+            snapshot.appended_records == 1U &&
+                snapshot.failed_appends == 1U,
+            "record-cap failure leaves accepted prefix intact");
+    } else {
+        ok &= Expect(false, "construct record-cap fixture");
+    }
+
+    const auto byte_cap_first = MakeRecord(1U, 1U, 1U, 5U);
+    const auto byte_cap_second = MakeRecord(1U, 2U, 2U, 5U);
+    const std::uint64_t one_record_bytes =
+        market::EstimateIntradayInstrumentRecordBytesV1(byte_cap_first);
+    ok &= Expect(one_record_bytes > 0U, "record byte estimate is nonzero");
+    auto byte_sizing = CreateStore(
+        registry,
+        1U,
+        StoreConfig(),
+        "byte-cap sizing store creation",
+        &ok);
+    std::uint64_t one_record_total_bytes = 0U;
+    std::uint64_t base_index_bytes = 0U;
+    if (byte_sizing != nullptr && byte_cap_first != nullptr) {
+        base_index_bytes =
+            byte_sizing->Snapshot().allocated_index_bytes;
+        ok &= Expect(
+            byte_sizing->Append(0U, byte_cap_first) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            "sizing store appends one record");
+        const auto sizing_snapshot = byte_sizing->Snapshot();
+        if (sizing_snapshot.accounted_record_bytes <=
+            std::numeric_limits<std::uint64_t>::max() -
+                sizing_snapshot.allocated_index_bytes) {
+            one_record_total_bytes =
+                sizing_snapshot.accounted_record_bytes +
+                sizing_snapshot.allocated_index_bytes;
+        }
+        ok &= Expect(
+            one_record_total_bytes != 0U,
+            "total byte budget includes base and first chunk");
+    }
+    auto byte_capped = CreateStore(
+        registry,
+        1U,
+        StoreConfig(10U, one_record_total_bytes),
+        "byte-cap store creation",
+        &ok);
+    if (byte_capped != nullptr && byte_cap_first != nullptr &&
+        byte_cap_second != nullptr) {
+        ok &= Expect(
+            byte_capped->Append(0U, byte_cap_first) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            "byte-cap store accepts exactly one accounted record");
+        ok &= Expect(
+            byte_capped->Snapshot().accounted_record_bytes ==
+                one_record_bytes,
+            "snapshot uses conservative record accounting");
+        const auto one_record_snapshot = byte_capped->Snapshot();
+        ok &= Expect(
+            one_record_snapshot.accounted_record_bytes <=
+                    one_record_total_bytes -
+                        one_record_snapshot.allocated_index_bytes &&
+                one_record_snapshot.accounted_record_bytes +
+                        one_record_snapshot.allocated_index_bytes ==
+                    one_record_total_bytes,
+            "record and index accounting share the exact total byte cap");
+        ok &= Expect(
+            byte_capped->Append(0U, byte_cap_second) ==
+                market::IntradayInstrumentStoreAppendErrorV1::
+                    kByteCapacity,
+            "byte hard cap fails closed without eviction");
+    } else {
+        ok &= Expect(false, "construct byte-cap fixture");
+    }
+
+    const auto rollover_cap_first = MakeRecord(1U, 1U, 1U, 5U);
+    const auto rollover_cap_second = MakeRecord(1U, 2U, 2U, 5U);
+    const auto rollover_cap_third = MakeRecord(1U, 3U, 3U, 5U);
+    auto rollover_sizing = CreateStore(
+        registry,
+        1U,
+        StoreConfig(),
+        "rollover-cap sizing store creation",
+        &ok);
+    std::uint64_t full_chunk_total_bytes = 0U;
+    if (rollover_sizing != nullptr &&
+        rollover_cap_first != nullptr &&
+        rollover_cap_second != nullptr) {
+        ok &= Expect(
+            rollover_sizing->Append(0U, rollover_cap_first) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::kNone &&
+                rollover_sizing->Append(0U, rollover_cap_second) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            "sizing store fills one complete chunk");
+        const auto sizing_snapshot = rollover_sizing->Snapshot();
+        if (sizing_snapshot.accounted_record_bytes <=
+            std::numeric_limits<std::uint64_t>::max() -
+                sizing_snapshot.allocated_index_bytes) {
+            full_chunk_total_bytes =
+                sizing_snapshot.accounted_record_bytes +
+                sizing_snapshot.allocated_index_bytes;
+        }
+    }
+    auto rollover_capped = CreateStore(
+        registry,
+        1U,
+        StoreConfig(10U, full_chunk_total_bytes),
+        "rollover-cap store creation",
+        &ok);
+    if (rollover_capped != nullptr &&
+        rollover_cap_first != nullptr &&
+        rollover_cap_second != nullptr &&
+        rollover_cap_third != nullptr) {
+        ok &= Expect(
+            rollover_capped->Append(0U, rollover_cap_first) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::kNone &&
+                rollover_capped->Append(0U, rollover_cap_second) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::kNone,
+            "rollover-cap store fills its budgeted chunk");
+        ok &= Expect(
+            rollover_capped->Append(0U, rollover_cap_third) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::
+                        kByteCapacity,
+            "next rollover reserves a complete chunk before allocation");
+        const auto rollover_snapshot = rollover_capped->Snapshot();
+        ok &= Expect(
+            rollover_snapshot.appended_records == 2U &&
+                rollover_snapshot.allocated_chunks == 1U &&
+                rollover_snapshot.accounted_record_bytes +
+                        rollover_snapshot.allocated_index_bytes ==
+                    full_chunk_total_bytes,
+            "failed rollover leaves the complete prior chunk and budget intact");
+    } else {
+        ok &= Expect(false, "construct rollover-cap fixture");
+    }
+
+    std::uint64_t oversized_chunk_budget = 0U;
+    if (base_index_bytes <=
+        std::numeric_limits<std::uint64_t>::max() -
+            one_record_bytes) {
+        oversized_chunk_budget =
+            base_index_bytes + one_record_bytes;
+    }
+    auto oversized_chunk_config =
+        StoreConfig(10U, oversized_chunk_budget);
+    oversized_chunk_config.chunk_record_capacity =
+        market::kIntradayInstrumentStoreMaximumChunkRecordsV1;
+    auto oversized_chunk = CreateStore(
+        registry,
+        1U,
+        oversized_chunk_config,
+        "oversized-chunk store creation",
+        &ok);
+    const auto oversized_record = MakeRecord(0U, 1U, 1U, 5U);
+    if (oversized_chunk != nullptr && oversized_record != nullptr) {
+        ok &= Expect(
+            oversized_chunk->Append(0U, oversized_record) ==
+                    market::IntradayInstrumentStoreAppendErrorV1::
+                        kByteCapacity &&
+                oversized_chunk->Snapshot().allocated_chunks == 0U,
+            "chunk allocation is rejected before it can bypass byte cap");
+    } else {
+        ok &= Expect(false, "construct oversized-chunk fixture");
+    }
+
+    auto concurrent_cap = CreateStore(
+        registry,
+        2U,
+        StoreConfig(1U),
+        "concurrent-cap store creation",
+        &ok);
+    const std::array<market::RealtimeHistoryRecordHandleV1, 2U>
+        concurrent_records{
+            MakeRecord(0U, 1U, 1U, 2U),
+            MakeRecord(1U, 1U, 2U, 5U),
+        };
+    if (concurrent_cap != nullptr &&
+        concurrent_records[0U] != nullptr &&
+        concurrent_records[1U] != nullptr) {
+        std::array<market::IntradayInstrumentStoreAppendErrorV1, 2U>
+            results{};
+        std::atomic<std::uint32_t> ready{0U};
+        std::atomic<bool> go{false};
+        const auto append_concurrently =
+            [&concurrent_cap, &concurrent_records, &results, &ready, &go](
+                std::size_t index) {
+                ready.fetch_add(1U, std::memory_order_release);
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                results[index] = concurrent_cap->Append(
+                    static_cast<std::uint32_t>(index),
+                    concurrent_records[index]);
+            };
+        std::thread first(append_concurrently, 0U);
+        std::thread second(append_concurrently, 1U);
+        while (ready.load(std::memory_order_acquire) != 2U) {
+            std::this_thread::yield();
+        }
+        go.store(true, std::memory_order_release);
+        first.join();
+        second.join();
+        const std::size_t successes = static_cast<std::size_t>(
+            results[0U] ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone) +
+            static_cast<std::size_t>(
+                results[1U] ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone);
+        const std::size_t capacity_failures = static_cast<std::size_t>(
+            results[0U] ==
+                market::IntradayInstrumentStoreAppendErrorV1::
+                    kRecordCapacity) +
+            static_cast<std::size_t>(
+                results[1U] ==
+                market::IntradayInstrumentStoreAppendErrorV1::
+                    kRecordCapacity);
+        const auto concurrent_snapshot = concurrent_cap->Snapshot();
+        ok &= Expect(
+            successes == 1U && capacity_failures == 1U &&
+                concurrent_snapshot.appended_records == 1U &&
+                concurrent_snapshot.failed_appends == 1U &&
+                concurrent_snapshot.coverage_lost,
+            "global record cap admits exactly one concurrent owner append");
+    } else {
+        ok &= Expect(false, "construct concurrent-cap fixture");
+    }
+    return ok;
+}
+
+bool CheckLiveTailGenerationIsolation(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    constexpr std::uint64_t final_sequence = 5'000U;
+    const auto run_case =
+        [&registry, &ok](
+            std::uint64_t initial_records,
+            std::string_view creation_message,
+            std::string_view isolation_message) {
+            auto config = StoreConfig(10'000U);
+            config.chunk_record_capacity = 2U;
+            auto store = CreateStore(
+                registry,
+                1U,
+                config,
+                creation_message,
+                &ok);
+            if (store == nullptr) {
+                return;
+            }
+            for (std::uint64_t sequence = 1U;
+                 sequence <= initial_records;
+                 ++sequence) {
+                const auto record =
+                    MakeRecord(1U, sequence, sequence, 5U);
+                ok &= Expect(
+                    record != nullptr &&
+                        store->Append(0U, record) ==
+                            market::
+                                IntradayInstrumentStoreAppendErrorV1::
+                                    kNone,
+                    "append live-tail initial record");
+            }
+            const auto old_generation = BuildStoreGeneration(
+                store.get(),
+                registry,
+                1U,
+                1U,
+                {1U, initial_records + 1U, 1U, 1U},
+                &ok);
+            if (old_generation == nullptr) {
+                return;
+            }
+
+            std::atomic<bool> go{false};
+            std::atomic<bool> writer_done{false};
+            std::atomic<bool> writer_failed{false};
+            std::thread writer([&store,
+                                &go,
+                                &writer_done,
+                                &writer_failed,
+                                initial_records] {
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                for (std::uint64_t sequence = initial_records + 1U;
+                     sequence <= final_sequence;
+                     ++sequence) {
+                    const auto record =
+                        MakeRecord(1U, sequence, sequence, 5U);
+                    if (record == nullptr ||
+                        store->Append(0U, record) !=
+                            market::
+                                IntradayInstrumentStoreAppendErrorV1::
+                                    kNone) {
+                        writer_failed.store(
+                            true, std::memory_order_release);
+                        break;
+                    }
+                }
+                writer_done.store(true, std::memory_order_release);
+            });
+
+            go.store(true, std::memory_order_release);
+            std::size_t completed_reads = 0U;
+            do {
+                std::unique_ptr<market::IntradayInstrumentCursorV1>
+                    cursor;
+                ok &= Expect(
+                    old_generation->OpenInstrumentCursor(
+                        5U, {}, &cursor) ==
+                            market::
+                                IntradayInstrumentStoreQueryErrorV1::
+                                    kNone &&
+                        cursor != nullptr,
+                    "open cursor while live tail grows");
+                if (cursor != nullptr) {
+                    const auto records =
+                        DrainCursor(cursor.get(), 2U, &ok);
+                    ok &= Expect(
+                        records.size() ==
+                            static_cast<std::size_t>(
+                                initial_records),
+                        isolation_message);
+                    for (std::size_t index = 0U;
+                         index < records.size();
+                         ++index) {
+                        ok &= Expect(
+                            records[index] != nullptr &&
+                                records[index]->
+                                        ingress_sequence() ==
+                                    static_cast<std::uint64_t>(
+                                        index + 1U),
+                            isolation_message);
+                    }
+                }
+                ++completed_reads;
+            } while (
+                !writer_done.load(std::memory_order_acquire) ||
+                completed_reads < 16U);
+            writer.join();
+            const auto snapshot = store->Snapshot();
+            ok &= Expect(
+                !writer_failed.load(std::memory_order_acquire) &&
+                    snapshot.appended_records == final_sequence &&
+                    !snapshot.coverage_lost,
+                "post-cut writer completes while old generation is read");
+        };
+
+    run_case(
+        1U,
+        "partial-tail isolation store creation",
+        "partial captured tail never exposes post-cut slot writes");
+    run_case(
+        2U,
+        "full-tail isolation store creation",
+        "full captured tail never follows post-cut owned_next");
+    return ok;
+}
+
+bool CheckRequiredHistoryAttachment(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    market::RealtimeHistoryRuntimeConfigV1 config{};
+    config.source_stream_ids = kSourceStreamIds;
+    config.worker_count = 2U;
+    config.queue_capacity_per_source_worker = 32U;
+    config.maximum_records_per_instrument = 2U;
+    config.intraday_store = StoreConfig();
+    config.registry = &registry;
+
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(config, &runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            runtime != nullptr,
+        "required-mode history runtime creation");
+    if (runtime == nullptr) {
+        return false;
+    }
+
+    const auto watermark =
+        MakeWatermark(registry, 1U, {2U, 2U, 2U, 2U});
+    ok &= Expect(
+        runtime->BeginGeneration(watermark) ==
+            market::RealtimeHistoryGenerationErrorV1::kNone,
+        "begin required intraday generation");
+
+    const std::array<market::RealtimeHistoryRecordHandleV1, 4U> records{
+        MakeRecord(0U, 1U, 1U, 5U),
+        MakeRecord(1U, 1U, 2U, 5U),
+        MakeRecord(2U, 1U, 3U, 5U),
+        MakeRecord(3U, 1U, 4U, 5U),
+    };
+    for (std::size_t index : {3U, 2U, 0U, 1U}) {
+        ok &= Expect(
+            records[index] != nullptr &&
+                runtime->TrySubmit(records[index]) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone,
+            "submit cross-source required intraday record");
+    }
+    for (std::uint8_t source_slot = 0U; source_slot < 4U;
+         ++source_slot) {
+        ok &= Expect(
+            runtime->SealSource(source_slot, 1U) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "seal required intraday source fence");
+    }
+
+    std::shared_ptr<const market::RealtimeHistoryGenerationV1> history;
+    ok &= Expect(
+        runtime->WaitForGeneration(
+            1U, std::chrono::seconds(2), &history) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone &&
+            history != nullptr,
+        "wait required history generation");
+    if (history != nullptr) {
+        const auto& attached = history->intraday_store_generation();
+        const auto latest =
+            runtime->AcquireLatestIntradayStoreGeneration();
+        ok &= Expect(
+            attached != nullptr && latest.get() == attached.get(),
+            "required history publication carries attached store generation");
+        if (attached != nullptr) {
+            ok &= Expect(
+                attached->watermark().generation ==
+                        history->watermark().generation &&
+                    attached->watermark()
+                            .ingress_sequence_exclusive ==
+                        history->watermark()
+                            .ingress_sequence_exclusive &&
+                    attached->watermark().input_identity_sha256 ==
+                        history->watermark().input_identity_sha256 &&
+                    attached->record_count() == 4U &&
+                    attached->coverage_from_open(),
+                "history and store share the exact joint fence identity");
+            market::IntradayInstrumentSummaryV1 summary{};
+            ok &= Expect(
+                attached->Find(5U, &summary) ==
+                        market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                    summary.record_count == 4U,
+                "attached generation exposes complete required prefix");
+        }
+    }
+    const auto snapshot = runtime->IntradayStoreSnapshot();
+    ok &= Expect(
+        snapshot.mode ==
+                market::IntradayInstrumentStoreModeV1::kRequired &&
+            snapshot.appended_records == 4U &&
+            snapshot.latest_generation == 1U &&
+            snapshot.coverage_from_open && !snapshot.coverage_lost,
+        "runtime reports healthy required store publication");
+
+    runtime->StopAndDrain();
+    return ok;
+}
+
+bool CheckHistoryFailureModes(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    const auto make_config =
+        [&registry](market::IntradayInstrumentStoreModeV1 mode) {
+            market::RealtimeHistoryRuntimeConfigV1 config{};
+            config.source_stream_ids = kSourceStreamIds;
+            config.worker_count = 1U;
+            config.queue_capacity_per_source_worker = 16U;
+            config.maximum_records_per_instrument = 4U;
+            config.intraday_store = StoreConfig(1U);
+            config.intraday_store.mode = mode;
+            config.registry = &registry;
+            return config;
+        };
+    const market::RealtimeHistoryWatermarkV1 watermark =
+        MakeWatermark(registry, 1U, {3U, 1U, 1U, 1U});
+
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> shadow;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            make_config(
+                market::IntradayInstrumentStoreModeV1::kShadow),
+            &shadow) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            shadow != nullptr,
+        "shadow-mode history runtime creation");
+    if (shadow != nullptr) {
+        ok &= Expect(
+            shadow->BeginGeneration(watermark) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "begin shadow generation");
+        const auto first = MakeRecord(0U, 1U, 1U, 5U);
+        const auto second = MakeRecord(0U, 2U, 2U, 5U);
+        ok &= Expect(
+            first != nullptr && second != nullptr &&
+                shadow->TrySubmit(first) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone &&
+                shadow->TrySubmit(second) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone,
+            "submit records beyond shadow store cap");
+        for (std::uint8_t source = 0U; source < 4U; ++source) {
+            ok &= Expect(
+                shadow->SealSource(source, 1U) ==
+                    market::RealtimeHistoryGenerationErrorV1::kNone,
+                "seal shadow source fence");
+        }
+        std::shared_ptr<const market::RealtimeHistoryGenerationV1>
+            history;
+        ok &= Expect(
+            shadow->WaitForGeneration(
+                1U, std::chrono::seconds(2), &history) ==
+                    market::RealtimeHistoryGenerationErrorV1::kNone &&
+                history != nullptr && !shadow->fatal() &&
+                history->intraday_store_generation() == nullptr,
+            "shadow coverage failure preserves bounded publication");
+        const market::RealtimeInstrumentGenerationV1* row =
+            history == nullptr ? nullptr : history->Find(5U);
+        const auto snapshot = shadow->IntradayStoreSnapshot();
+        ok &= Expect(
+            row != nullptr && row->history.size() == 2U &&
+                snapshot.appended_records == 1U &&
+                snapshot.failed_appends == 1U &&
+                snapshot.coverage_lost &&
+                !snapshot.coverage_from_open,
+            "shadow failure is sticky without evicting bounded history");
+        shadow->StopAndDrain();
+    }
+
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> required;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            make_config(
+                market::IntradayInstrumentStoreModeV1::kRequired),
+            &required) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            required != nullptr,
+        "required-cap history runtime creation");
+    if (required != nullptr) {
+        ok &= Expect(
+            required->BeginGeneration(watermark) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "begin required-cap generation");
+        const auto first = MakeRecord(0U, 1U, 1U, 5U);
+        const auto second = MakeRecord(0U, 2U, 2U, 5U);
+        ok &= Expect(
+            first != nullptr && second != nullptr &&
+                required->TrySubmit(first) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone &&
+                required->TrySubmit(second) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone,
+            "submit records beyond required store cap");
+        for (std::uint8_t source = 0U; source < 4U; ++source) {
+            const auto seal = required->SealSource(source, 1U);
+            ok &= Expect(
+                seal ==
+                        market::RealtimeHistoryGenerationErrorV1::
+                            kNone ||
+                    seal ==
+                        market::RealtimeHistoryGenerationErrorV1::
+                            kFatal ||
+                    seal ==
+                        market::RealtimeHistoryGenerationErrorV1::
+                            kIntradayStoreFailed,
+                "required source fence races only with fail-closed transition");
+        }
+        std::shared_ptr<const market::RealtimeHistoryGenerationV1>
+            history;
+        ok &= Expect(
+            required->WaitForGeneration(
+                1U, std::chrono::seconds(2), &history) ==
+                    market::RealtimeHistoryGenerationErrorV1::
+                        kIntradayStoreFailed &&
+                history == nullptr && required->fatal(),
+            "required coverage failure reports store failure and prevents publication");
+        const auto snapshot = required->IntradayStoreSnapshot();
+        ok &= Expect(
+            snapshot.appended_records == 1U &&
+                snapshot.failed_appends == 1U &&
+                snapshot.coverage_lost &&
+                !snapshot.coverage_from_open,
+            "required failure reports the retained prefix and lost coverage");
+        required->StopAndDrain();
+    }
+    return ok;
+}
+
+}  // namespace
+
+int main() {
+    const std::unique_ptr<market::InstrumentRegistryV1> registry =
+        MakeRegistry();
+    if (!Expect(registry != nullptr, "instrument registry creation")) {
+        return 1;
+    }
+
+    bool ok = true;
+    ok &= CheckCreationAndInvalidConfiguration(*registry);
+    ok &= CheckGenerationQueriesAndLifetime(*registry);
+    ok &= CheckRolloverCapsAndWorkerOwnership(*registry);
+    ok &= CheckLiveTailGenerationIsolation(*registry);
+    ok &= CheckRequiredHistoryAttachment(*registry);
+    ok &= CheckHistoryFailureModes(*registry);
+    return ok ? 0 : 1;
+}

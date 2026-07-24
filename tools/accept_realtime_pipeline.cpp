@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <set>
 #include <span>
 #include <string>
@@ -58,6 +59,17 @@ struct Options final {
     std::uint32_t generation_timeout_ms = 10'000U;
     std::uint32_t history_workers = 4U;
     std::uint32_t acquire_repetitions = 32U;
+    market::IntradayInstrumentStoreModeV1 intraday_store_mode =
+        market::IntradayInstrumentStoreModeV1::kDisabled;
+    std::uint64_t intraday_store_maximum_records = 0U;
+    std::uint64_t intraday_store_memory_bytes = 0U;
+    std::uint32_t intraday_store_chunk_records = 1024U;
+    std::uint32_t intraday_store_batch_records = 64U * 1024U;
+    bool intraday_store_from_open = false;
+    bool intraday_store_maximum_records_set = false;
+    bool intraday_store_memory_set = false;
+    bool intraday_store_chunk_records_set = false;
+    bool intraday_store_batch_records_set = false;
 };
 
 struct UnsignedDistribution final {
@@ -99,6 +111,8 @@ struct AcceptanceState final {
     std::uint64_t generations = 0U;
     std::uint64_t universe_rows_checked = 0U;
     std::uint64_t retained_records_checked = 0U;
+    std::uint64_t intraday_full_scan_records = 0U;
+    std::uint64_t intraday_full_scan_ns = 0U;
     std::uint64_t updated_heads = 0U;
     std::uint64_t event_time_samples = 0U;
     std::array<bool, kEventKindCount> event_kinds_seen{};
@@ -192,6 +206,31 @@ void Fail(AcceptanceState* state, std::string message) {
     return true;
 }
 
+[[nodiscard]] bool ParseIntradayStoreMode(
+    std::string_view text,
+    market::IntradayInstrumentStoreModeV1* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    if (text == "disabled") {
+        *output = market::IntradayInstrumentStoreModeV1::kDisabled;
+        return true;
+    }
+    if (text == "shadow") {
+        *output = market::IntradayInstrumentStoreModeV1::kShadow;
+        return true;
+    }
+    if (text == "required") {
+        *output = market::IntradayInstrumentStoreModeV1::kRequired;
+        return true;
+    }
+    if (text == "primary") {
+        *output = market::IntradayInstrumentStoreModeV1::kPrimary;
+        return true;
+    }
+    return false;
+}
+
 [[nodiscard]] bool SafeFileName(std::string_view value) noexcept {
     return !value.empty() && value != "." && value != ".." &&
            value.find('/') == std::string_view::npos &&
@@ -218,7 +257,19 @@ void PrintUsage(std::ostream& output) {
         << "  --generation-interval-ms N    default 1000\n"
         << "  --generation-timeout-ms N     default 10000\n"
         << "  --history-workers N           default 4\n"
-        << "  --acquire-repetitions N       default 32\n";
+        << "  --acquire-repetitions N       default 32\n"
+        << "  --intraday-store-mode MODE    disabled|shadow|required|primary; "
+           "default disabled\n"
+        << "  --intraday-store-max-records N\n"
+        << "                                positive u64; required when enabled\n"
+        << "  --intraday-store-memory-gib N positive u64 logical total GiB; "
+           "required when enabled\n"
+        << "  --intraday-store-chunk-records N\n"
+        << "                                1..65536, default 1024\n"
+        << "  --intraday-store-batch-records N\n"
+        << "                                1..1048576, default 65536\n"
+        << "  --intraday-store-from-open    assert continuous coverage from "
+           "market open\n";
 }
 
 [[nodiscard]] bool TakeValue(
@@ -265,6 +316,14 @@ void PrintUsage(std::ostream& output) {
             *help = true;
             return true;
         }
+        if (option == "--intraday-store-from-open") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate --intraday-store-from-open";
+                return false;
+            }
+            parsed.intraday_store_from_open = true;
+            continue;
+        }
         if (!seen.insert(option).second) {
             *error = "duplicate option: " + std::string(option);
             return false;
@@ -305,6 +364,63 @@ void PrintUsage(std::ostream& output) {
             parsed.report_json = value;
         } else if (option == "--samples-csv") {
             parsed.samples_csv = value;
+        } else if (option == "--intraday-store-mode") {
+            if (!ParseIntradayStoreMode(
+                    value, &parsed.intraday_store_mode)) {
+                *error =
+                    "--intraday-store-mode must be "
+                    "disabled|shadow|required|primary";
+                return false;
+            }
+        } else if (option == "--intraday-store-max-records") {
+            if (!ParseU64(
+                    value, &parsed.intraday_store_maximum_records) ||
+                parsed.intraday_store_maximum_records == 0U) {
+                *error =
+                    "--intraday-store-max-records must be positive u64";
+                return false;
+            }
+            parsed.intraday_store_maximum_records_set = true;
+        } else if (option == "--intraday-store-memory-gib") {
+            std::uint64_t gib = 0U;
+            constexpr std::uint64_t bytes_per_gib =
+                std::uint64_t{1024U} * 1024U * 1024U;
+            if (!ParseU64(value, &gib) || gib == 0U ||
+                gib > std::numeric_limits<std::uint64_t>::max() /
+                          bytes_per_gib) {
+                *error =
+                    "--intraday-store-memory-gib must be a positive u64 "
+                    "whose byte conversion does not overflow";
+                return false;
+            }
+            parsed.intraday_store_memory_bytes = gib * bytes_per_gib;
+            parsed.intraday_store_memory_set = true;
+        } else if (option == "--intraday-store-chunk-records") {
+            if (!ParseU32(
+                    value, &parsed.intraday_store_chunk_records) ||
+                parsed.intraday_store_chunk_records == 0U ||
+                static_cast<std::size_t>(
+                    parsed.intraday_store_chunk_records) >
+                    market::
+                        kIntradayInstrumentStoreMaximumChunkRecordsV1) {
+                *error =
+                    "--intraday-store-chunk-records must be 1..65536";
+                return false;
+            }
+            parsed.intraday_store_chunk_records_set = true;
+        } else if (option == "--intraday-store-batch-records") {
+            if (!ParseU32(
+                    value, &parsed.intraday_store_batch_records) ||
+                parsed.intraday_store_batch_records == 0U ||
+                static_cast<std::size_t>(
+                    parsed.intraday_store_batch_records) >
+                    market::
+                        kIntradayInstrumentStoreMaximumBatchRecordsV1) {
+                *error =
+                    "--intraday-store-batch-records must be 1..1048576";
+                return false;
+            }
+            parsed.intraday_store_batch_records_set = true;
         } else {
             std::uint32_t number = 0U;
             if (!ParseU32(value, &number) || number == 0U) {
@@ -345,6 +461,28 @@ void PrintUsage(std::ostream& output) {
         parsed.history_workers > 256U ||
         parsed.acquire_repetitions > 10'000U) {
         *error = "required option missing or option is out of range";
+        return false;
+    }
+    const bool intraday_store_enabled =
+        parsed.intraday_store_mode !=
+        market::IntradayInstrumentStoreModeV1::kDisabled;
+    if (intraday_store_enabled) {
+        if (!parsed.intraday_store_maximum_records_set ||
+            !parsed.intraday_store_memory_set) {
+            *error =
+                "enabled --intraday-store-mode requires explicit positive "
+                "--intraday-store-max-records and "
+                "--intraday-store-memory-gib";
+            return false;
+        }
+    } else if (parsed.intraday_store_from_open ||
+               parsed.intraday_store_maximum_records_set ||
+               parsed.intraday_store_memory_set ||
+               parsed.intraday_store_chunk_records_set ||
+               parsed.intraday_store_batch_records_set) {
+        *error =
+            "disabled intraday store rejects --intraday-store-from-open "
+            "and all intraday store capacity options";
         return false;
     }
     *output = std::move(parsed);
@@ -656,6 +794,231 @@ void ValidateFinalRetainedHistory(
     }
 }
 
+void ValidateFinalIntradayStore(
+    const Options& options,
+    const runtime::RealtimePipelineCutResultV1& cut,
+    const runtime::RealtimePipelineSnapshotV1& snapshot,
+    const market::InstrumentRegistryV1& registry,
+    AcceptanceState* state) {
+    if (snapshot.intraday_store.mode != options.intraday_store_mode ||
+        snapshot.intraday_store.maximum_session_records !=
+            options.intraday_store_maximum_records ||
+        snapshot.intraday_store.maximum_session_accounted_bytes !=
+            options.intraday_store_memory_bytes) {
+        Fail(state, "intraday store snapshot configuration mismatch");
+        return;
+    }
+    const bool enabled =
+        options.intraday_store_mode !=
+        market::IntradayInstrumentStoreModeV1::kDisabled;
+    if (!enabled) {
+        if (cut.intraday_store_generation != nullptr) {
+            Fail(state, "disabled intraday store published a generation");
+        }
+        return;
+    }
+    if (snapshot.intraday_store.coverage_lost) {
+        Fail(state, "enabled intraday store lost coverage");
+        return;
+    }
+    if (cut.intraday_store_generation == nullptr) {
+        Fail(state, "enabled intraday store omitted final generation");
+        return;
+    }
+    const market::IntradayInstrumentStoreGenerationV1& generation =
+        *cut.intraday_store_generation;
+    if (cut.history_generation == nullptr ||
+        cut.factor_generation == nullptr ||
+        cut.history_generation->intraday_store_generation().get() !=
+            cut.intraday_store_generation.get() ||
+        cut.factor_generation->input_intraday_store().get() !=
+            cut.intraday_store_generation.get() ||
+        generation.mode() != options.intraday_store_mode ||
+        generation.instrument_count() != registry.size() ||
+        generation.record_count() != snapshot.intraday_store.appended_records ||
+        generation.accounted_record_bytes() !=
+            snapshot.intraday_store.accounted_record_bytes ||
+        generation.allocated_index_bytes() !=
+            snapshot.intraday_store.allocated_index_bytes ||
+        generation.coverage_from_open() !=
+            snapshot.intraday_store.coverage_from_open ||
+        snapshot.intraday_store.coverage_from_open !=
+            options.intraday_store_from_open ||
+        generation.watermark().generation !=
+            snapshot.intraday_store.latest_generation) {
+        Fail(state, "final intraday store generation/snapshot contract failed");
+        return;
+    }
+
+    try {
+        std::vector<const market::RealtimeHistoryRecordV1*> batch(
+            static_cast<std::size_t>(
+                options.intraday_store_batch_records));
+        std::uint64_t scan_start_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &scan_start_ns)) {
+            Fail(state, "cannot read intraday full-scan start clock");
+            return;
+        }
+
+        market::IntradayInstrumentScanOptionsV1 scan_options{};
+        scan_options.ingress_sequence_end_exclusive =
+            generation.watermark().ingress_sequence_exclusive;
+        std::unique_ptr<market::IntradayUniverseCursorV1> cursor;
+        const market::IntradayInstrumentStoreQueryErrorV1 open_error =
+            generation.OpenUniverseCursor(scan_options, &cursor);
+        if (open_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            cursor == nullptr) {
+            Fail(state, "cannot open final intraday universe cursor");
+            return;
+        }
+
+        std::array<
+            std::uint64_t,
+            market::kIntradayInstrumentStoreSourceCountV1>
+            source_counts{};
+        std::uint64_t scanned_records = 0U;
+        std::uint32_t previous_instrument_id = 0U;
+        std::uint64_t previous_instrument_ingress = 0U;
+        bool have_previous_record = false;
+        bool observed_terminal_page = false;
+        for (;;) {
+            std::size_t written =
+                std::numeric_limits<std::size_t>::max();
+            const market::IntradayInstrumentStoreQueryErrorV1 read_error =
+                cursor->ReadBatch(
+                    std::span<
+                        const market::RealtimeHistoryRecordV1*>(
+                        batch.data(), batch.size()),
+                    &written);
+            if (read_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+                Fail(state, "final intraday universe cursor read failed");
+                return;
+            }
+            if (written > batch.size()) {
+                Fail(state, "intraday cursor exceeded caller batch");
+                return;
+            }
+            if (written == 0U) {
+                if (!cursor->done()) {
+                    Fail(
+                        state,
+                        "intraday cursor returned empty nonterminal page");
+                    return;
+                }
+                observed_terminal_page = true;
+                break;
+            }
+            for (std::size_t index = 0U; index < written; ++index) {
+                const market::RealtimeHistoryRecordV1* const record =
+                    batch[index];
+                if (record == nullptr || record->instrument_id() == 0U) {
+                    Fail(state, "intraday cursor returned invalid record");
+                    return;
+                }
+                if (have_previous_record &&
+                    (record->instrument_id() < previous_instrument_id ||
+                     (record->instrument_id() ==
+                          previous_instrument_id &&
+                      record->ingress_sequence() <=
+                          previous_instrument_ingress))) {
+                    Fail(
+                        state,
+                        "intraday universe ordering invariant failed");
+                    return;
+                }
+                if (record->ingress_sequence() == 0U ||
+                    record->ingress_sequence() >=
+                        generation.watermark()
+                            .ingress_sequence_exclusive ||
+                    static_cast<std::size_t>(record->source_slot()) >=
+                        generation.watermark().sources.size()) {
+                    Fail(
+                        state,
+                        "intraday record global/source boundary failed");
+                    return;
+                }
+                const std::size_t source =
+                    static_cast<std::size_t>(record->source_slot());
+                const market::RealtimeSourceWatermarkV1&
+                    source_watermark =
+                        generation.watermark().sources[source];
+                if (record->source_stream_id() !=
+                        source_watermark.source_stream_id ||
+                    record->source_sequence() == 0U ||
+                    record->source_sequence() >=
+                        source_watermark.sequence_exclusive) {
+                    Fail(
+                        state,
+                        "intraday record source watermark failed");
+                    return;
+                }
+                if (source_counts[source] ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    scanned_records ==
+                        std::numeric_limits<std::uint64_t>::max()) {
+                    Fail(state, "intraday full-scan count overflow");
+                    return;
+                }
+                ++source_counts[source];
+                ++scanned_records;
+                previous_instrument_id = record->instrument_id();
+                previous_instrument_ingress =
+                    record->ingress_sequence();
+                have_previous_record = true;
+            }
+        }
+
+        if (!observed_terminal_page || !cursor->done() ||
+            scanned_records == 0U) {
+            Fail(state, "intraday full scan did not terminate nonempty");
+            return;
+        }
+        std::uint64_t expected_total = 0U;
+        for (std::size_t source = 0U;
+             source < source_counts.size();
+             ++source) {
+            const std::uint64_t exclusive =
+                generation.watermark().sources[source]
+                    .sequence_exclusive;
+            if (exclusive == 0U ||
+                source_counts[source] != exclusive - 1U ||
+                expected_total >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        source_counts[source]) {
+                Fail(state, "intraday four-source totals mismatch");
+                return;
+            }
+            expected_total += source_counts[source];
+        }
+        const std::uint64_t ingress_exclusive =
+            generation.watermark().ingress_sequence_exclusive;
+        if (ingress_exclusive == 0U ||
+            scanned_records != ingress_exclusive - 1U ||
+            scanned_records != expected_total ||
+            scanned_records != generation.record_count()) {
+            Fail(state, "intraday full-scan total mismatch");
+            return;
+        }
+
+        std::uint64_t scan_end_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &scan_end_ns) ||
+            scan_end_ns < scan_start_ns) {
+            Fail(state, "cannot read intraday full-scan end clock");
+            return;
+        }
+        state->intraday_full_scan_records = scanned_records;
+        state->intraday_full_scan_ns = scan_end_ns - scan_start_ns;
+    } catch (const std::bad_alloc&) {
+        Fail(state, "intraday full-scan allocation failed");
+    } catch (const std::exception&) {
+        Fail(state, "intraday full-scan unexpected exception");
+    } catch (...) {
+        Fail(state, "intraday full-scan unknown exception");
+    }
+}
+
 [[nodiscard]] bool WriteSamples(
     const std::filesystem::path& path,
     const std::vector<SampleRow>& samples,
@@ -751,6 +1114,17 @@ void ValidateFinalRetainedHistory(
     config.registry = registry_result.registry.get();
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.history_worker_count = options.history_workers;
+    config.intraday_store.mode = options.intraday_store_mode;
+    config.intraday_store.chunk_record_capacity =
+        static_cast<std::size_t>(options.intraday_store_chunk_records);
+    config.intraday_store.maximum_session_records =
+        options.intraday_store_maximum_records;
+    config.intraday_store.maximum_session_accounted_bytes =
+        options.intraday_store_memory_bytes;
+    config.intraday_store.maximum_records_per_batch =
+        static_cast<std::size_t>(options.intraday_store_batch_records);
+    config.intraday_store.coverage_from_open =
+        options.intraday_store_from_open;
     config.enforce_receive_trade_date = true;
     config.sdk.enabled = true;
     config.sdk.library_path = options.sdk_library;
@@ -943,6 +1317,14 @@ void ValidateFinalRetainedHistory(
     if (!ClockNs(CLOCK_MONOTONIC, &end_monotonic_ns)) {
         end_monotonic_ns = final_end_ns;
     }
+    if (final_cut.published()) {
+        ValidateFinalIntradayStore(
+            options,
+            final_cut,
+            final_snapshot,
+            *registry_result.registry,
+            &state);
+    }
     const std::uint64_t measured_window_ns =
         end_monotonic_ns >= start_monotonic_ns
             ? end_monotonic_ns - start_monotonic_ns
@@ -980,6 +1362,14 @@ void ValidateFinalRetainedHistory(
     const long double accepted_per_second = seconds > 0.0L
         ? static_cast<long double>(accepted_in_window) / seconds
         : 0.0L;
+    const long double intraday_full_scan_records_per_second =
+        state.intraday_full_scan_ns > 0U
+            ? static_cast<long double>(
+                  state.intraday_full_scan_records) *
+                  static_cast<long double>(kNanosecondsPerSecond) /
+                  static_cast<long double>(
+                      state.intraday_full_scan_ns)
+            : 0.0L;
     report << "{\n  \"schema_version\":1,\n"
            << "  \"passed\":" << (state.valid ? "true" : "false")
            << ",\n  \"first_error\":";
@@ -1000,7 +1390,43 @@ void ValidateFinalRetainedHistory(
     WriteJsonString(report, options.sdk_library.string());
     report << ",\n  \"server_address\":";
     WriteJsonString(report, options.server_address);
-    report << ",\n  \"counts\":{\"accepted\":"
+    report << ",\n  \"intraday_store\":{\"mode\":\""
+           << market::IntradayInstrumentStoreModeNameV1(
+                  final_snapshot.intraday_store.mode)
+           << "\",\"record_limit\":"
+           << final_snapshot.intraday_store.maximum_session_records
+           << ",\"byte_limit\":"
+           << final_snapshot.intraday_store
+                  .maximum_session_accounted_bytes
+           << ",\"records\":"
+           << final_snapshot.intraday_store.appended_records
+           << ",\"record_bytes\":"
+           << final_snapshot.intraday_store.accounted_record_bytes
+           << ",\"index_bytes\":"
+           << final_snapshot.intraday_store.allocated_index_bytes
+           << ",\"allocated_chunks\":"
+           << final_snapshot.intraday_store.allocated_chunks
+           << ",\"failed_appends\":"
+           << final_snapshot.intraday_store.failed_appends
+           << ",\"latest_generation\":"
+           << final_snapshot.intraday_store.latest_generation
+           << ",\"full_scan_records\":"
+           << state.intraday_full_scan_records
+           << ",\"full_scan_ns\":"
+           << state.intraday_full_scan_ns
+           << ",\"records_per_second\":"
+           << std::fixed << std::setprecision(3)
+           << intraday_full_scan_records_per_second
+           << std::defaultfloat
+           << ",\"coverage_from_open\":"
+           << (final_snapshot.intraday_store.coverage_from_open
+                   ? "true"
+                   : "false")
+           << ",\"coverage_lost\":"
+           << (final_snapshot.intraday_store.coverage_lost
+                   ? "true"
+                   : "false")
+           << "},\n  \"counts\":{\"accepted\":"
            << final_snapshot.accepted_messages
            << ",\"decoded\":" << final_snapshot.decoded_messages
            << ",\"ignored\":" << final_snapshot.ignored_messages
@@ -1080,7 +1506,34 @@ void ValidateFinalRetainedHistory(
               << ",\"decoded\":" << final_snapshot.decoded_messages
               << ",\"accepted_per_second\":" << std::fixed
               << std::setprecision(3) << accepted_per_second
-              << ",\"generations\":" << state.generations << "}\n";
+              << ",\"generations\":" << state.generations
+              << ",\"intraday_store\":{\"mode\":\""
+              << market::IntradayInstrumentStoreModeNameV1(
+                     final_snapshot.intraday_store.mode)
+              << "\",\"records\":"
+              << final_snapshot.intraday_store.appended_records
+              << ",\"record_bytes\":"
+              << final_snapshot.intraday_store.accounted_record_bytes
+              << ",\"index_bytes\":"
+              << final_snapshot.intraday_store.allocated_index_bytes
+              << ",\"byte_limit\":"
+              << final_snapshot.intraday_store
+                     .maximum_session_accounted_bytes
+              << ",\"full_scan_records\":"
+              << state.intraday_full_scan_records
+              << ",\"full_scan_ns\":"
+              << state.intraday_full_scan_ns
+              << ",\"records_per_second\":"
+              << intraday_full_scan_records_per_second
+              << ",\"coverage_from_open\":"
+              << (final_snapshot.intraday_store.coverage_from_open
+                      ? "true"
+                      : "false")
+              << ",\"coverage_lost\":"
+              << (final_snapshot.intraday_store.coverage_lost
+                      ? "true"
+                      : "false")
+              << "}}\n";
     return state.valid ? 0 : 1;
 }
 

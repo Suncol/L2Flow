@@ -130,6 +130,11 @@ public:
     input_history() const noexcept {
         return input_history_;
     }
+    [[nodiscard]] const std::shared_ptr<
+        const l2flow::market::IntradayInstrumentStoreGenerationV1>&
+    input_intraday_store() const noexcept {
+        return input_history_->intraday_store_generation();
+    }
 
 private:
     friend class RealtimeFactorEngineV1;
@@ -231,7 +236,10 @@ private:
     std::vector<RealtimeFactorDefinitionV1> definitions_;
     std::vector<std::uint32_t> instrument_ids_;
     mutable std::mutex publish_mutex_;
-    std::atomic<std::shared_ptr<const RealtimeFactorGenerationV1>> latest_;
+    // Use the standardized shared_ptr atomic free functions. This preserves
+    // the same acquire/release publication contract on libstdc++ versions
+    // that predate atomic<shared_ptr>'s C++20 specialization.
+    std::shared_ptr<const RealtimeFactorGenerationV1> latest_;
 };
 
 }  // namespace l2flow::factor

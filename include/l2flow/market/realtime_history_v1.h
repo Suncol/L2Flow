@@ -2,6 +2,7 @@
 
 #include "l2flow/common/identity128.h"
 #include "l2flow/common/sha256.h"
+#include "l2flow/market/intraday_instrument_store_v1.h"
 #include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_types_v1.h"
 
@@ -164,7 +165,9 @@ class RealtimeHistoryGenerationV1 final {
 public:
     RealtimeHistoryGenerationV1(
         RealtimeHistoryWatermarkV1 watermark,
-        std::vector<RealtimeInstrumentGenerationV1> instruments) noexcept;
+        std::vector<RealtimeInstrumentGenerationV1> instruments,
+        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
+            intraday_store_generation = nullptr) noexcept;
 
     [[nodiscard]] const RealtimeHistoryWatermarkV1& watermark()
         const noexcept {
@@ -176,10 +179,20 @@ public:
     }
     [[nodiscard]] const RealtimeInstrumentGenerationV1* Find(
         std::uint32_t instrument_id) const noexcept;
+    // When enabled, this exact matching handle exposes the complete
+    // append-only session prefix. The bounded rows above remain the V1 factor
+    // compatibility view and do not grow with elapsed session history.
+    [[nodiscard]] const std::shared_ptr<
+        const IntradayInstrumentStoreGenerationV1>&
+    intraday_store_generation() const noexcept {
+        return intraday_store_generation_;
+    }
 
 private:
     RealtimeHistoryWatermarkV1 watermark_{};
     std::vector<RealtimeInstrumentGenerationV1> instruments_;
+    std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
+        intraday_store_generation_;
 };
 
 struct RealtimeHistoryRuntimeConfigV1 final {
@@ -189,6 +202,7 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     std::size_t queue_capacity_per_source_worker = 0U;
     std::size_t maximum_records_per_instrument = 0U;
     const InstrumentRegistryV1* registry = nullptr;
+    IntradayInstrumentStoreConfigV1 intraday_store{};
 };
 
 enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
@@ -197,6 +211,9 @@ enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
     kInvalidConfiguration,
     kResourceExhausted,
     kThreadStartFailed,
+    // Appended after the original V1 values so telemetry/FFI consumers keep
+    // the existing numeric contract.
+    kIntradayStoreCreateFailed,
 };
 
 enum class RealtimeHistorySubmitErrorV1 : std::uint8_t {
@@ -221,6 +238,9 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
     kStopped,
     kFatal,
     kResourceExhausted,
+    // Appended after the original V1 values so telemetry/FFI consumers keep
+    // the existing numeric contract.
+    kIntradayStoreFailed,
 };
 
 [[nodiscard]] std::string_view RealtimeHistoryCreateErrorNameV1(
@@ -271,6 +291,11 @@ public:
 
     [[nodiscard]] std::shared_ptr<const RealtimeHistoryGenerationV1>
     AcquireLatestGeneration() const noexcept;
+    [[nodiscard]] std::shared_ptr<
+        const IntradayInstrumentStoreGenerationV1>
+    AcquireLatestIntradayStoreGeneration() const noexcept;
+    [[nodiscard]] IntradayInstrumentStoreSnapshotV1
+    IntradayStoreSnapshot() const noexcept;
     [[nodiscard]] bool IsGenerationCurrentAndHealthy(
         const std::shared_ptr<const RealtimeHistoryGenerationV1>& generation)
         const noexcept;

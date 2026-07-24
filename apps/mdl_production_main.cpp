@@ -8,9 +8,11 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -120,6 +122,17 @@ struct Options final {
     std::filesystem::path wal_path;
     bool replace_wal = false;
     std::uint32_t history_workers = 4U;
+    market::IntradayInstrumentStoreModeV1 intraday_store_mode =
+        market::IntradayInstrumentStoreModeV1::kDisabled;
+    std::uint64_t intraday_store_maximum_records = 0U;
+    std::uint64_t intraday_store_memory_bytes = 0U;
+    std::uint32_t intraday_store_chunk_records = 1024U;
+    std::uint32_t intraday_store_batch_records = 64U * 1024U;
+    bool intraday_store_from_open = false;
+    bool intraday_store_maximum_records_set = false;
+    bool intraday_store_memory_set = false;
+    bool intraday_store_chunk_records_set = false;
+    bool intraday_store_batch_records_set = false;
     std::uint32_t generation_interval_ms = 1000U;
     std::uint32_t generation_timeout_ms = 10'000U;
 };
@@ -141,6 +154,18 @@ void PrintUsage(std::ostream& output) {
         << "  --wal-path PATH               enable independent audit WAL\n"
         << "  --replace-wal                 explicitly truncate WAL path\n"
         << "  --history-workers N           1..256, default 4\n"
+        << "  --intraday-store-mode MODE    disabled|shadow|required|primary; "
+           "default disabled\n"
+        << "  --intraday-store-max-records N\n"
+        << "                                positive u64; required when enabled\n"
+        << "  --intraday-store-memory-gib N positive u64 logical total GiB; "
+           "required when enabled\n"
+        << "  --intraday-store-chunk-records N\n"
+        << "                                1..65536, default 1024\n"
+        << "  --intraday-store-batch-records N\n"
+        << "                                1..1048576, default 65536\n"
+        << "  --intraday-store-from-open    assert continuous coverage from "
+           "market open\n"
         << "  --generation-interval-ms N    1..60000, default 1000\n"
         << "  --generation-timeout-ms N     1..600000, default 10000\n"
         << "  --help\n\n"
@@ -176,6 +201,31 @@ bool ParseU64(std::string_view text, std::uint64_t* output) noexcept {
     }
     *output = value;
     return true;
+}
+
+bool ParseIntradayStoreMode(
+    std::string_view text,
+    market::IntradayInstrumentStoreModeV1* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    if (text == "disabled") {
+        *output = market::IntradayInstrumentStoreModeV1::kDisabled;
+        return true;
+    }
+    if (text == "shadow") {
+        *output = market::IntradayInstrumentStoreModeV1::kShadow;
+        return true;
+    }
+    if (text == "required") {
+        *output = market::IntradayInstrumentStoreModeV1::kRequired;
+        return true;
+    }
+    if (text == "primary") {
+        *output = market::IntradayInstrumentStoreModeV1::kPrimary;
+        return true;
+    }
+    return false;
 }
 
 bool TakeValue(
@@ -230,6 +280,14 @@ bool ParseOptions(
             parsed.replace_wal = true;
             continue;
         }
+        if (option == "--intraday-store-from-open") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate --intraday-store-from-open";
+                return false;
+            }
+            parsed.intraday_store_from_open = true;
+            continue;
+        }
         if (option != "--sdk-library" &&
             option != "--registry-directory" &&
             option != "--registry-file" &&
@@ -241,6 +299,11 @@ bool ParseOptions(
             option != "--sdk-log-prefix" &&
             option != "--wal-path" &&
             option != "--history-workers" &&
+            option != "--intraday-store-mode" &&
+            option != "--intraday-store-max-records" &&
+            option != "--intraday-store-memory-gib" &&
+            option != "--intraday-store-chunk-records" &&
+            option != "--intraday-store-batch-records" &&
             option != "--generation-interval-ms" &&
             option != "--generation-timeout-ms") {
             *error = "unknown option: " + std::string(option);
@@ -285,6 +348,61 @@ bool ParseOptions(
             parsed.sdk_log_prefix = value;
         } else if (option == "--wal-path") {
             parsed.wal_path = std::string(value);
+        } else if (option == "--intraday-store-mode") {
+            if (!ParseIntradayStoreMode(
+                    value, &parsed.intraday_store_mode)) {
+                *error =
+                    "--intraday-store-mode must be "
+                    "disabled|shadow|required|primary";
+                return false;
+            }
+        } else if (option == "--intraday-store-max-records") {
+            if (!ParseU64(
+                    value, &parsed.intraday_store_maximum_records) ||
+                parsed.intraday_store_maximum_records == 0U) {
+                *error =
+                    "--intraday-store-max-records must be positive u64";
+                return false;
+            }
+            parsed.intraday_store_maximum_records_set = true;
+        } else if (option == "--intraday-store-memory-gib") {
+            std::uint64_t gib = 0U;
+            constexpr std::uint64_t bytes_per_gib =
+                std::uint64_t{1024U} * 1024U * 1024U;
+            if (!ParseU64(value, &gib) || gib == 0U ||
+                gib > std::numeric_limits<std::uint64_t>::max() /
+                          bytes_per_gib) {
+                *error =
+                    "--intraday-store-memory-gib must be a positive u64 "
+                    "whose byte conversion does not overflow";
+                return false;
+            }
+            parsed.intraday_store_memory_bytes = gib * bytes_per_gib;
+            parsed.intraday_store_memory_set = true;
+        } else if (option == "--intraday-store-chunk-records") {
+            if (!ParseU32(
+                    value, &parsed.intraday_store_chunk_records) ||
+                parsed.intraday_store_chunk_records == 0U ||
+                parsed.intraday_store_chunk_records >
+                    market::
+                        kIntradayInstrumentStoreMaximumChunkRecordsV1) {
+                *error =
+                    "--intraday-store-chunk-records must be 1..65536";
+                return false;
+            }
+            parsed.intraday_store_chunk_records_set = true;
+        } else if (option == "--intraday-store-batch-records") {
+            if (!ParseU32(
+                    value, &parsed.intraday_store_batch_records) ||
+                parsed.intraday_store_batch_records == 0U ||
+                parsed.intraday_store_batch_records >
+                    market::
+                        kIntradayInstrumentStoreMaximumBatchRecordsV1) {
+                *error =
+                    "--intraday-store-batch-records must be 1..1048576";
+                return false;
+            }
+            parsed.intraday_store_batch_records_set = true;
         } else {
             std::uint32_t number = 0U;
             if (!ParseU32(value, &number)) {
@@ -324,6 +442,28 @@ bool ParseOptions(
     }
     if (parsed.replace_wal && parsed.wal_path.empty()) {
         *error = "--replace-wal requires --wal-path";
+        return false;
+    }
+    const bool intraday_store_enabled =
+        parsed.intraday_store_mode !=
+        market::IntradayInstrumentStoreModeV1::kDisabled;
+    if (intraday_store_enabled) {
+        if (!parsed.intraday_store_maximum_records_set ||
+            !parsed.intraday_store_memory_set) {
+            *error =
+                "enabled --intraday-store-mode requires explicit positive "
+                "--intraday-store-max-records and "
+                "--intraday-store-memory-gib";
+            return false;
+        }
+    } else if (parsed.intraday_store_from_open ||
+               parsed.intraday_store_maximum_records_set ||
+               parsed.intraday_store_memory_set ||
+               parsed.intraday_store_chunk_records_set ||
+               parsed.intraday_store_batch_records_set) {
+        *error =
+            "disabled intraday store rejects --intraday-store-from-open "
+            "and all intraday store capacity options";
         return false;
     }
     *output = std::move(parsed);
@@ -390,6 +530,17 @@ int Run(const Options& options) {
     config.registry = registry_result.registry.get();
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.history_worker_count = options.history_workers;
+    config.intraday_store.mode = options.intraday_store_mode;
+    config.intraday_store.chunk_record_capacity =
+        static_cast<std::size_t>(options.intraday_store_chunk_records);
+    config.intraday_store.maximum_session_records =
+        options.intraday_store_maximum_records;
+    config.intraday_store.maximum_session_accounted_bytes =
+        options.intraday_store_memory_bytes;
+    config.intraday_store.maximum_records_per_batch =
+        static_cast<std::size_t>(options.intraday_store_batch_records);
+    config.intraday_store.coverage_from_open =
+        options.intraday_store_from_open;
     config.enforce_receive_trade_date = true;
     config.wal.enabled = !options.wal_path.empty();
     config.wal.path = options.wal_path.string();
@@ -423,6 +574,7 @@ int Run(const Options& options) {
         std::chrono::milliseconds(options.generation_timeout_ms);
     int exit_code = 0;
     bool wal_warning_reported = false;
+    bool intraday_store_warning_reported = false;
     const auto report_wal_coverage =
         [&pipeline, &wal_warning_reported]() {
             const l2flow::realtime::OptionalWalSnapshotV1 wal =
@@ -442,7 +594,32 @@ int Run(const Options& options) {
                 wal_warning_reported = true;
             }
         };
+    const auto report_intraday_store_coverage =
+        [&pipeline, &intraday_store_warning_reported]() {
+            const market::IntradayInstrumentStoreSnapshotV1 store =
+                pipeline->Snapshot().intraday_store;
+            if (store.mode ==
+                    market::IntradayInstrumentStoreModeV1::kShadow &&
+                store.coverage_lost &&
+                !intraday_store_warning_reported) {
+                std::cerr
+                    << "mdl-production-router: shadow intraday store "
+                       "coverage lost; realtime publication continues: "
+                       "records="
+                    << store.appended_records
+                    << " record_bytes="
+                    << store.accounted_record_bytes
+                    << " index_bytes="
+                    << store.allocated_index_bytes
+                    << " byte_limit="
+                    << store.maximum_session_accounted_bytes
+                    << " failed_appends=" << store.failed_appends
+                    << " generation=" << store.latest_generation << '\n';
+                intraday_store_warning_reported = true;
+            }
+        };
     report_wal_coverage();
+    report_intraday_store_coverage();
     while (g_stop_requested == 0) {
         const IntervalWaitResult wait =
             WaitForInterval(interval, options.trade_date);
@@ -496,6 +673,7 @@ int Run(const Options& options) {
             break;
         }
         report_wal_coverage();
+        report_intraday_store_coverage();
     }
 
     if (exit_code == 0 && !pipeline->fatal()) {
@@ -513,6 +691,26 @@ int Run(const Options& options) {
         pipeline->StopAndDrain();
     }
     report_wal_coverage();
+    report_intraday_store_coverage();
+    const market::IntradayInstrumentStoreSnapshotV1 final_store =
+        pipeline->Snapshot().intraday_store;
+    if (final_store.mode !=
+        market::IntradayInstrumentStoreModeV1::kDisabled) {
+        std::cerr
+            << "mdl-production-router: intraday store final: mode="
+            << market::IntradayInstrumentStoreModeNameV1(final_store.mode)
+            << " records=" << final_store.appended_records
+            << " record_bytes="
+            << final_store.accounted_record_bytes
+            << " index_bytes="
+            << final_store.allocated_index_bytes
+            << " byte_limit="
+            << final_store.maximum_session_accounted_bytes
+            << " coverage_from_open="
+            << (final_store.coverage_from_open ? "true" : "false")
+            << " coverage_lost="
+            << (final_store.coverage_lost ? "true" : "false") << '\n';
+    }
     if (pipeline->fatal()) {
         exit_code = 1;
     }

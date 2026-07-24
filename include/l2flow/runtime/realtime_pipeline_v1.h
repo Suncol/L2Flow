@@ -71,6 +71,7 @@ struct RealtimePipelineConfigV1 final {
     std::shared_ptr<const l2flow::factor::RealtimeFactorCalculatorV1>
         factor_calculator;
     RealtimePipelineSdkConfigV1 sdk{};
+    l2flow::market::IntradayInstrumentStoreConfigV1 intraday_store{};
 };
 
 enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
@@ -160,11 +161,17 @@ struct RealtimePipelineCutResultV1 final {
         history_generation;
     std::shared_ptr<const l2flow::factor::RealtimeFactorGenerationV1>
         factor_generation;
+    std::shared_ptr<
+        const l2flow::market::IntradayInstrumentStoreGenerationV1>
+        intraday_store_generation;
+    bool intraday_store_required = false;
 
     [[nodiscard]] bool published() const noexcept {
         return error == RealtimePipelineCutErrorV1::kNone &&
                history_generation != nullptr &&
-               factor_generation != nullptr;
+               factor_generation != nullptr &&
+               (!intraday_store_required ||
+                intraday_store_generation != nullptr);
     }
 };
 
@@ -186,6 +193,7 @@ struct RealtimePipelineSnapshotV1 final {
     bool fatal = false;
     bool stopped = false;
     bool trade_date_boundary_reached = false;
+    l2flow::market::IntradayInstrumentStoreSnapshotV1 intraday_store{};
 };
 
 // Owns the single production data chain. The registry and calculator backing
@@ -244,6 +252,9 @@ public:
     [[nodiscard]] std::shared_ptr<
         const l2flow::market::RealtimeHistoryGenerationV1>
     AcquireLatestHistoryGeneration() const noexcept;
+    [[nodiscard]] std::shared_ptr<
+        const l2flow::market::IntradayInstrumentStoreGenerationV1>
+    AcquireLatestIntradayStoreGeneration() const noexcept;
     // The two latest slots are not a transactional pair: history N is stored
     // before factor N. A consistent consumer must acquire the factor once and
     // obtain its matching history through factor->input_history(). The direct

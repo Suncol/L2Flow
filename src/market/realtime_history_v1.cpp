@@ -418,9 +418,13 @@ bool RealtimeHistoryRecordV1::Create(
 
 RealtimeHistoryGenerationV1::RealtimeHistoryGenerationV1(
     RealtimeHistoryWatermarkV1 watermark,
-    std::vector<RealtimeInstrumentGenerationV1> instruments) noexcept
+    std::vector<RealtimeInstrumentGenerationV1> instruments,
+    std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
+        intraday_store_generation) noexcept
     : watermark_(std::move(watermark)),
-      instruments_(std::move(instruments)) {}
+      instruments_(std::move(instruments)),
+      intraday_store_generation_(
+          std::move(intraday_store_generation)) {}
 
 const RealtimeInstrumentGenerationV1* RealtimeHistoryGenerationV1::Find(
     std::uint32_t instrument_id) const noexcept {
@@ -445,6 +449,8 @@ std::string_view RealtimeHistoryCreateErrorNameV1(
             return "null_output";
         case RealtimeHistoryCreateErrorV1::kInvalidConfiguration:
             return "invalid_configuration";
+        case RealtimeHistoryCreateErrorV1::kIntradayStoreCreateFailed:
+            return "intraday_store_create_failed";
         case RealtimeHistoryCreateErrorV1::kResourceExhausted:
             return "resource_exhausted";
         case RealtimeHistoryCreateErrorV1::kThreadStartFailed:
@@ -497,6 +503,8 @@ std::string_view RealtimeHistoryGenerationErrorNameV1(
             return "stopped";
         case RealtimeHistoryGenerationErrorV1::kFatal:
             return "fatal";
+        case RealtimeHistoryGenerationErrorV1::kIntradayStoreFailed:
+            return "intraday_store_failed";
         case RealtimeHistoryGenerationErrorV1::kResourceExhausted:
             return "resource_exhausted";
     }
@@ -528,11 +536,17 @@ public:
         std::array<bool, kRealtimeHistorySourceCountV1> source_sealed{};
         std::vector<std::optional<
             std::vector<RealtimeInstrumentGenerationV1>>> worker_slices;
+        std::vector<std::unique_ptr<
+            IntradayInstrumentStoreWorkerSliceV1>>
+            intraday_worker_slices;
         std::size_t completed_workers = 0U;
     };
 
-    explicit Impl(RealtimeHistoryRuntimeConfigV1 config)
+    Impl(
+        RealtimeHistoryRuntimeConfigV1 config,
+        std::unique_ptr<IntradayInstrumentStoreV1> intraday_store)
         : config_(std::move(config)),
+          intraday_store_(std::move(intraday_store)),
           worker_rows_(config_.worker_count),
           queues_(kRealtimeHistorySourceCountV1 * config_.worker_count) {
         universe_ids_.reserve(config_.registry->size());
@@ -585,6 +599,22 @@ public:
 
     std::uint32_t WorkerFor(std::uint32_t instrument_id) const noexcept {
         return instrument_id % config_.worker_count;
+    }
+
+    bool IntradayRequired() const noexcept {
+        return config_.intraday_store.mode ==
+                   IntradayInstrumentStoreModeV1::kRequired ||
+               config_.intraday_store.mode ==
+                   IntradayInstrumentStoreModeV1::kPrimary;
+    }
+
+    RealtimeHistoryGenerationErrorV1 FatalGenerationError()
+        const noexcept {
+        return intraday_store_failed_.load(
+                   std::memory_order_acquire)
+                   ? RealtimeHistoryGenerationErrorV1::
+                         kIntradayStoreFailed
+                   : RealtimeHistoryGenerationErrorV1::kFatal;
     }
 
     SpscQueue<Command>& Queue(
@@ -678,7 +708,7 @@ public:
             return RealtimeHistoryGenerationErrorV1::kStopped;
         }
         if (fatal_.load(std::memory_order_acquire)) {
-            return RealtimeHistoryGenerationErrorV1::kFatal;
+            return FatalGenerationError();
         }
         RealtimeHistoryWatermarkV1 rebuilt{};
         if (BuildRealtimeHistoryWatermarkV1(
@@ -711,7 +741,7 @@ public:
                 return RealtimeHistoryGenerationErrorV1::kStopped;
             }
             if (fatal_.load(std::memory_order_acquire)) {
-                return RealtimeHistoryGenerationErrorV1::kFatal;
+                return FatalGenerationError();
             }
             if (pending_ != nullptr) {
                 return RealtimeHistoryGenerationErrorV1::
@@ -724,6 +754,19 @@ public:
             auto pending = std::make_unique<PendingGeneration>();
             pending->watermark = watermark;
             pending->worker_slices.resize(config_.worker_count);
+            if (intraday_store_ != nullptr) {
+                const IntradayInstrumentStoreSnapshotV1 snapshot =
+                    intraday_store_->Snapshot();
+                if (snapshot.coverage_lost && IntradayRequired()) {
+                    intraday_store_failed_.store(
+                        true, std::memory_order_release);
+                    MarkFatalLocked();
+                    return RealtimeHistoryGenerationErrorV1::
+                        kIntradayStoreFailed;
+                }
+                pending->intraday_worker_slices.resize(
+                    config_.worker_count);
+            }
             pending_ = std::move(pending);
             last_started_generation_ = watermark.generation;
             return RealtimeHistoryGenerationErrorV1::kNone;
@@ -743,7 +786,7 @@ public:
             return RealtimeHistoryGenerationErrorV1::kStopped;
         }
         if (fatal_.load(std::memory_order_acquire)) {
-            return RealtimeHistoryGenerationErrorV1::kFatal;
+            return FatalGenerationError();
         }
         {
             std::lock_guard<std::mutex> lock(generation_mutex_);
@@ -752,7 +795,7 @@ public:
                 return RealtimeHistoryGenerationErrorV1::kStopped;
             }
             if (fatal_.load(std::memory_order_acquire)) {
-                return RealtimeHistoryGenerationErrorV1::kFatal;
+                return FatalGenerationError();
             }
             if (pending_ == nullptr) {
                 return RealtimeHistoryGenerationErrorV1::
@@ -831,7 +874,7 @@ public:
             return RealtimeHistoryGenerationErrorV1::kGenerationConflict;
         }
         if (fatal_.load(std::memory_order_acquire)) {
-            return RealtimeHistoryGenerationErrorV1::kFatal;
+            return FatalGenerationError();
         }
         if (stopping_.load(std::memory_order_acquire)) {
             return RealtimeHistoryGenerationErrorV1::kStopped;
@@ -951,6 +994,20 @@ public:
                 latest->ingress_sequence() < record->ingress_sequence()) {
                 latest = record;
             }
+            if (intraday_store_ != nullptr) {
+                const IntradayInstrumentStoreAppendErrorV1
+                    intraday_error =
+                        intraday_store_->Append(worker, record);
+                if (intraday_error !=
+                    IntradayInstrumentStoreAppendErrorV1::kNone) {
+                    intraday_store_->MarkCoverageLost();
+                    if (IntradayRequired()) {
+                        intraday_store_failed_.store(
+                            true, std::memory_order_release);
+                        return false;
+                    }
+                }
+            }
             return true;
         } catch (...) {
             return false;
@@ -970,7 +1027,29 @@ public:
                     row.latest_tick,
                     row.history});
             }
-            return ReportSlice(worker, generation, std::move(slice));
+            std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>
+                intraday_slice;
+            if (intraday_store_ != nullptr &&
+                !intraday_store_->Snapshot().coverage_lost) {
+                const IntradayInstrumentStoreGenerationErrorV1 error =
+                    intraday_store_->CaptureWorker(
+                        worker, generation, &intraday_slice);
+                if (error !=
+                    IntradayInstrumentStoreGenerationErrorV1::kNone) {
+                    intraday_store_->MarkCoverageLost();
+                    if (IntradayRequired()) {
+                        intraday_store_failed_.store(
+                            true, std::memory_order_release);
+                        return false;
+                    }
+                    intraday_slice.reset();
+                }
+            }
+            return ReportSlice(
+                worker,
+                generation,
+                std::move(slice),
+                std::move(intraday_slice));
         } catch (...) {
             return false;
         }
@@ -979,7 +1058,9 @@ public:
     bool ReportSlice(
         std::uint32_t worker,
         std::uint64_t generation,
-        std::vector<RealtimeInstrumentGenerationV1> slice) noexcept {
+        std::vector<RealtimeInstrumentGenerationV1> slice,
+        std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>
+            intraday_slice) noexcept {
         try {
             std::lock_guard<std::mutex> lock(generation_mutex_);
             if (!admission_open_.load(std::memory_order_acquire) ||
@@ -992,6 +1073,10 @@ public:
                 return false;
             }
             pending_->worker_slices[worker].emplace(std::move(slice));
+            if (!pending_->intraday_worker_slices.empty()) {
+                pending_->intraday_worker_slices[worker] =
+                    std::move(intraday_slice);
+            }
             ++pending_->completed_workers;
             if (pending_->completed_workers != config_.worker_count) {
                 return true;
@@ -1030,9 +1115,49 @@ public:
                     return false;
                 }
             }
+            std::shared_ptr<
+                const IntradayInstrumentStoreGenerationV1>
+                intraday_generation;
+            if (intraday_store_ != nullptr) {
+                const IntradayInstrumentStoreSnapshotV1 snapshot =
+                    intraday_store_->Snapshot();
+                if (!snapshot.coverage_lost) {
+                    const IntradayInstrumentStoreGenerationErrorV1
+                        intraday_error =
+                            intraday_store_->BuildGeneration(
+                                pending_->watermark,
+                                std::move(
+                                    pending_->
+                                        intraday_worker_slices),
+                                &intraday_generation);
+                    if (intraday_error !=
+                        IntradayInstrumentStoreGenerationErrorV1::
+                            kNone) {
+                        intraday_store_->MarkCoverageLost();
+                        intraday_generation.reset();
+                        if (IntradayRequired()) {
+                            intraday_store_failed_.store(
+                                true, std::memory_order_release);
+                            return false;
+                        }
+                    }
+                } else if (IntradayRequired()) {
+                    intraday_store_failed_.store(
+                        true, std::memory_order_release);
+                    return false;
+                }
+            }
+            if (IntradayRequired() &&
+                intraday_generation == nullptr) {
+                intraday_store_failed_.store(
+                    true, std::memory_order_release);
+                return false;
+            }
             auto published =
                 std::make_shared<const RealtimeHistoryGenerationV1>(
-                    pending_->watermark, std::move(instruments));
+                    pending_->watermark,
+                    std::move(instruments),
+                    std::move(intraday_generation));
             std::atomic_store_explicit(
                 &latest_generation_, published,
                 std::memory_order_release);
@@ -1091,6 +1216,7 @@ public:
     }
 
     RealtimeHistoryRuntimeConfigV1 config_{};
+    std::unique_ptr<IntradayInstrumentStoreV1> intraday_store_;
     std::vector<std::uint32_t> universe_ids_;
     std::vector<std::vector<MutableInstrument>> worker_rows_;
     std::vector<std::unique_ptr<SpscQueue<Command>>> queues_;
@@ -1099,6 +1225,7 @@ public:
     std::atomic<bool> admission_open_{true};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> fatal_{false};
+    std::atomic<bool> intraday_store_failed_{false};
 
     std::mutex stop_mutex_;
     bool stop_complete_ = false;
@@ -1153,7 +1280,24 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
         }
     }
     try {
-        auto impl = std::make_unique<Impl>(config);
+        std::unique_ptr<IntradayInstrumentStoreV1> intraday_store;
+        if (config.intraday_store.mode !=
+            IntradayInstrumentStoreModeV1::kDisabled) {
+            const IntradayInstrumentStoreCreateErrorV1 error =
+                IntradayInstrumentStoreV1::Create(
+                    config.intraday_store,
+                    config.worker_count,
+                    config.registry,
+                    &intraday_store);
+            if (error !=
+                    IntradayInstrumentStoreCreateErrorV1::kNone ||
+                intraday_store == nullptr) {
+                return RealtimeHistoryCreateErrorV1::
+                    kIntradayStoreCreateFailed;
+            }
+        }
+        auto impl = std::make_unique<Impl>(
+            config, std::move(intraday_store));
         if (!impl->Start()) {
             return RealtimeHistoryCreateErrorV1::kThreadStartFailed;
         }
@@ -1197,6 +1341,30 @@ std::shared_ptr<const RealtimeHistoryGenerationV1>
 RealtimeHistoryRuntimeV1::AcquireLatestGeneration() const noexcept {
     return std::atomic_load_explicit(
         &impl_->latest_generation_, std::memory_order_acquire);
+}
+
+std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
+RealtimeHistoryRuntimeV1::AcquireLatestIntradayStoreGeneration()
+    const noexcept {
+    const auto history = AcquireLatestGeneration();
+    return history == nullptr
+               ? nullptr
+               : history->intraday_store_generation();
+}
+
+IntradayInstrumentStoreSnapshotV1
+RealtimeHistoryRuntimeV1::IntradayStoreSnapshot() const noexcept {
+    if (impl_->intraday_store_ == nullptr) {
+        IntradayInstrumentStoreSnapshotV1 snapshot{};
+        snapshot.mode = impl_->config_.intraday_store.mode;
+        snapshot.maximum_session_records =
+            impl_->config_.intraday_store.maximum_session_records;
+        snapshot.maximum_session_accounted_bytes =
+            impl_->config_.intraday_store
+                .maximum_session_accounted_bytes;
+        return snapshot;
+    }
+    return impl_->intraday_store_->Snapshot();
 }
 
 bool RealtimeHistoryRuntimeV1::IsGenerationCurrentAndHealthy(

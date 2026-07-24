@@ -11,6 +11,7 @@ operator-selected Vendor SDK shared library
        `-> source decoder
             -> instrument_id % worker_count router
             -> bounded per-instrument history
+            -> optional complete intraday instrument store
             -> generation barrier and ingress-prefix watermark
             -> full-universe factor calculation
             -> one atomic factor-generation publication
@@ -119,6 +120,17 @@ are explicitly sorted by the process-wide ingress sequence rather than worker
 arrival time. The fixed instrument registry is the generation universe;
 unseen instruments remain present as empty rows.
 
+When enabled, the intraday instrument store also retains every accepted record
+for the process trade date in append-only per-source chunks. It shares the
+decoded record owner with bounded history and reuses the same worker and
+four-source generation fence. Generation cuts capture chunk endpoints rather
+than copying the accumulated record handles, so periodic cut cost does not grow
+with the retained session record count. The store has explicit record and
+accounted-byte hard limits and never evicts old records.
+
+The store is memory-only. It does not replay the optional WAL or feeder CSV;
+after a mid-session process start or restart its coverage is partial.
+
 ### Generation barrier and watermark
 
 A generation cut is serialized with callback admission. The runtime captures
@@ -158,7 +170,8 @@ the matching history from it:
 auto factor = pipeline->AcquireLatestFactorGeneration();
 if (factor != nullptr) {
     const auto& matching_history = factor->input_history();
-    // Use factor and matching_history as one generation-consistent pair.
+    const auto& matching_intraday = factor->input_intraday_store();
+    // Use all three as one generation-consistent set.
 }
 ```
 
@@ -317,6 +330,10 @@ into a production target.
   --user-name runtime-token \
   --sdk-log-prefix /var/log/l2flow/mdl \
   --history-workers 4 \
+  --intraday-store-mode required \
+  --intraday-store-max-records 1000000000 \
+  --intraday-store-memory-gib 600 \
+  --intraday-store-from-open \
   --generation-interval-ms 1000 \
   --generation-timeout-ms 10000 \
   --wal-path /var/lib/l2flow/audit.wal
@@ -354,3 +371,6 @@ apps/mdl_production_main.cpp
 
 For the detailed concurrency invariants, failure model, and publication
 contract, see [docs/realtime-production-chain-v1.md](docs/realtime-production-chain-v1.md).
+The complete-session memory, generation, query, sizing, and rollout contract is
+documented in
+[docs/intraday-instrument-store-v1.md](docs/intraday-instrument-store-v1.md).

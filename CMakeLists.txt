@@ -101,6 +101,7 @@ add_library(l2flow_market STATIC
     src/control/checked_body_view.cpp
     src/market/instrument_registry.cpp
     src/market/instrument_registry_loader_v1.cpp
+    src/market/intraday_instrument_store_v1.cpp
     src/market/market_decoder.cpp
     src/market/market_types_v1.cpp
     src/market/realtime_history_v1.cpp)
@@ -251,6 +252,8 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_owned_ingress_wal_v1.cpp L2Flow::realtime_ingress)
     l2flow_add_test(test_realtime_history
         tests/test_realtime_history_v1.cpp L2Flow::market)
+    l2flow_add_test(test_intraday_instrument_store
+        tests/test_intraday_instrument_store_v1.cpp L2Flow::market)
     l2flow_add_test(test_realtime_factor_engine
         tests/test_realtime_factor_engine_v1.cpp L2Flow::factor)
     l2flow_add_test(test_realtime_pipeline

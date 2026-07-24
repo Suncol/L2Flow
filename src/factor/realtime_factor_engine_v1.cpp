@@ -19,7 +19,7 @@ constexpr std::size_t kMaximumDefinitionTextBytes = 4096U;
 constexpr double kNormalizedP6Divisor = 1'000'000.0;
 
 struct FactorPublicationCommitV1 final {
-    std::atomic<std::shared_ptr<const RealtimeFactorGenerationV1>>* slot =
+    std::shared_ptr<const RealtimeFactorGenerationV1>* slot =
         nullptr;
     std::shared_ptr<const RealtimeFactorGenerationV1> generation;
 };
@@ -27,7 +27,8 @@ struct FactorPublicationCommitV1 final {
 void CommitFactorPublicationV1(void* opaque) noexcept {
     auto* const commit =
         static_cast<FactorPublicationCommitV1*>(opaque);
-    commit->slot->store(commit->generation, std::memory_order_release);
+    std::atomic_store_explicit(
+        commit->slot, commit->generation, std::memory_order_release);
 }
 
 [[nodiscard]] bool DefinitionTextValid(std::string_view value) noexcept {
@@ -374,7 +375,8 @@ RealtimeFactorEngineV1::CalculateAndPublish(
         }
 
         const std::shared_ptr<const RealtimeFactorGenerationV1> previous =
-            latest_.load(std::memory_order_acquire);
+            std::atomic_load_explicit(
+                &latest_, std::memory_order_acquire);
         if (previous != nullptr) {
             if (previous->input_history().get() == history.get()) {
                 result.error =
@@ -450,7 +452,8 @@ RealtimeFactorEngineV1::CalculateAndPublish(
 
 std::shared_ptr<const RealtimeFactorGenerationV1>
 RealtimeFactorEngineV1::AcquireLatestGeneration() const noexcept {
-    return latest_.load(std::memory_order_acquire);
+    return std::atomic_load_explicit(
+        &latest_, std::memory_order_acquire);
 }
 
 }  // namespace l2flow::factor

@@ -593,10 +593,20 @@ int main() {
 
     auto snapshot_state = std::make_shared<PhysicalSdkState>();
     std::unique_ptr<runtime::RealtimePipelineV1> snapshot_pipeline;
+    runtime::RealtimePipelineConfigV1 snapshot_config =
+        MakeConfig(registry.get());
+    snapshot_config.intraday_store.mode =
+        market::IntradayInstrumentStoreModeV1::kRequired;
+    snapshot_config.intraday_store.chunk_record_capacity = 2U;
+    snapshot_config.intraday_store.maximum_session_records = 16U;
+    snapshot_config.intraday_store.maximum_session_accounted_bytes =
+        16U * 1024U * 1024U;
+    snapshot_config.intraday_store.maximum_records_per_batch = 4U;
+    snapshot_config.intraday_store.coverage_from_open = true;
     detail.clear();
     test.Expect(
         runtime::RealtimePipelineV1::CreateForTest(
-            MakeConfig(registry.get()),
+            std::move(snapshot_config),
             std::make_shared<FakeFactory>(snapshot_state),
             &snapshot_pipeline,
             &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&
@@ -619,7 +629,109 @@ int main() {
                 point->values[0U].valid &&
                 std::abs(point->values[0U].value - 12.3456) < 1.0e-12,
             "binary SDK snapshot decodes through history into valid p6 price projection");
+        const std::shared_ptr<
+            const market::IntradayInstrumentStoreGenerationV1>
+            store_generation =
+                snapshot_cut.intraday_store_generation;
+        test.Expect(
+            snapshot_cut.intraday_store_required &&
+                store_generation != nullptr &&
+                snapshot_cut.history_generation != nullptr &&
+                snapshot_cut.history_generation->
+                        intraday_store_generation() ==
+                    store_generation &&
+                snapshot_cut.factor_generation != nullptr &&
+                snapshot_cut.factor_generation->
+                        input_intraday_store() ==
+                    store_generation &&
+                snapshot_pipeline->
+                        AcquireLatestIntradayStoreGeneration() ==
+                    store_generation,
+            "required cut publishes one exact history/store/factor generation");
+        market::IntradayInstrumentSummaryV1 store_row{};
+        std::unique_ptr<market::IntradayInstrumentCursorV1>
+            store_cursor;
+        std::array<const market::RealtimeHistoryRecordV1*, 2U>
+            store_batch{};
+        std::size_t store_written = 0U;
+        const bool store_query_ok =
+            store_generation != nullptr &&
+            store_generation->coverage_from_open() &&
+            store_generation->record_count() == 1U &&
+            store_generation->Find(18U, &store_row) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            store_row.record_count == 1U &&
+            store_generation->OpenInstrumentCursor(
+                18U, {}, &store_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            store_cursor != nullptr &&
+            store_cursor->ReadBatch(store_batch, &store_written) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            store_written == 1U &&
+            store_batch[0U] == store_row.latest_snapshot;
+        test.Expect(
+            store_query_ok,
+            "required pipeline exposes the complete matching intraday prefix");
+        const market::IntradayInstrumentStoreSnapshotV1 store_snapshot =
+            snapshot_pipeline->Snapshot().intraday_store;
+        test.Expect(
+            store_snapshot.mode ==
+                    market::IntradayInstrumentStoreModeV1::kRequired &&
+                store_snapshot.appended_records == 1U &&
+                store_snapshot.coverage_from_open &&
+                !store_snapshot.coverage_lost,
+            "pipeline snapshot reports healthy from-open store coverage");
         snapshot_pipeline->StopAndDrain();
+    }
+
+    auto store_failure_state = std::make_shared<PhysicalSdkState>();
+    std::unique_ptr<runtime::RealtimePipelineV1>
+        store_failure_pipeline;
+    runtime::RealtimePipelineConfigV1 store_failure_config =
+        MakeConfig(registry.get());
+    store_failure_config.intraday_store.mode =
+        market::IntradayInstrumentStoreModeV1::kRequired;
+    store_failure_config.intraday_store.chunk_record_capacity = 2U;
+    store_failure_config.intraday_store.maximum_session_records = 1U;
+    store_failure_config.intraday_store.maximum_session_accounted_bytes =
+        16U * 1024U * 1024U;
+    store_failure_config.intraday_store.maximum_records_per_batch = 4U;
+    detail.clear();
+    test.Expect(
+        runtime::RealtimePipelineV1::CreateForTest(
+            std::move(store_failure_config),
+            std::make_shared<FakeFactory>(store_failure_state),
+            &store_failure_pipeline,
+            &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&
+            store_failure_pipeline != nullptr,
+        "required store-failure pipeline creation: " + detail);
+    if (store_failure_pipeline != nullptr) {
+        FakeMessage first(
+            sdk::MessageKey{6U, 101U, 33U},
+            ShenzhenOrderBody(40'001U));
+        FakeMessage second(
+            sdk::MessageKey{6U, 101U, 33U},
+            ShenzhenOrderBody(40'002U));
+        store_failure_state->handler->OnMessage(nullptr, &first);
+        store_failure_state->handler->OnMessage(nullptr, &second);
+        const auto failure_deadline =
+            std::chrono::steady_clock::now() + 2s;
+        while (!store_failure_pipeline->Snapshot().fatal &&
+               std::chrono::steady_clock::now() < failure_deadline) {
+            std::this_thread::yield();
+        }
+        const runtime::RealtimePipelineCutResultV1 failure_cut =
+            store_failure_pipeline->CutAndPublishGeneration(2s);
+        test.Expect(
+            store_failure_pipeline->Snapshot()
+                    .intraday_store.coverage_lost &&
+                failure_cut.error ==
+                    runtime::RealtimePipelineCutErrorV1::kFatal &&
+                failure_cut.history_error ==
+                    market::RealtimeHistoryGenerationErrorV1::
+                        kIntradayStoreFailed,
+            "required async store failure remains specific in cut diagnostics");
+        store_failure_pipeline->StopAndDrain();
     }
 
     // A production-date guard closes admission cleanly before any wrong-day

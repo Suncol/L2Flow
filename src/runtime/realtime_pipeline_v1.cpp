@@ -419,6 +419,7 @@ public:
                 config_.history_queue_capacity_per_source_worker;
             history_config.maximum_records_per_instrument =
                 config_.maximum_history_records_per_instrument;
+            history_config.intraday_store = config_.intraday_store;
             history_config.registry = config_.registry;
             const market::RealtimeHistoryCreateErrorV1 history_error =
                 market::RealtimeHistoryRuntimeV1::Create(
@@ -711,6 +712,7 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 Cut(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
+        result.intraday_store_required = IntradayStoreRequired();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -730,6 +732,7 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 StopAndPublishFinal(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
+        result.intraday_store_required = IntradayStoreRequired();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -786,6 +789,7 @@ public:
         bool admission_is_quiesced,
         std::optional<std::uint64_t> preclosed_monotonic_cut_ns) noexcept {
         RealtimePipelineCutResultV1 result{};
+        result.intraday_store_required = IntradayStoreRequired();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -797,8 +801,16 @@ public:
             std::uint64_t generation = 0U;
             {
                 std::unique_lock<std::mutex> admission(admission_mutex_);
+                const bool history_fatal = history_->fatal();
                 if (fatal_.load(std::memory_order_acquire) ||
-                    history_->fatal()) {
+                    history_fatal) {
+                    if (history_fatal &&
+                        result.intraday_store_required &&
+                        history_->IntradayStoreSnapshot().coverage_lost) {
+                        result.history_error =
+                            market::RealtimeHistoryGenerationErrorV1::
+                                kIntradayStoreFailed;
+                    }
                     result.error = RealtimePipelineCutErrorV1::kFatal;
                     TripFatalWithAdmissionLockHeld();
                     return result;
@@ -903,6 +915,19 @@ public:
                 TripFatal();
                 return result;
             }
+            result.intraday_store_generation =
+                result.history_generation->
+                    intraday_store_generation();
+            if (result.intraday_store_required &&
+                result.intraday_store_generation == nullptr) {
+                result.history_error =
+                    market::RealtimeHistoryGenerationErrorV1::
+                        kIntradayStoreFailed;
+                result.error =
+                    RealtimePipelineCutErrorV1::kHistoryWaitFailed;
+                TripFatal();
+                return result;
+            }
 
             result.factor_result =
                 factor_->CalculateAndPublish(result.history_generation);
@@ -923,12 +948,28 @@ public:
         }
     }
 
+    [[nodiscard]] bool IntradayStoreRequired() const noexcept {
+        return config_.intraday_store.mode ==
+                   market::IntradayInstrumentStoreModeV1::kRequired ||
+               config_.intraday_store.mode ==
+                   market::IntradayInstrumentStoreModeV1::kPrimary;
+    }
+
     [[nodiscard]] std::shared_ptr<
         const market::RealtimeHistoryGenerationV1>
     AcquireHistory() const noexcept {
         return history_ == nullptr
                    ? nullptr
                    : history_->AcquireLatestGeneration();
+    }
+
+    [[nodiscard]] std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+    AcquireIntradayStore() const noexcept {
+        return history_ == nullptr
+                   ? nullptr
+                   : history_->
+                         AcquireLatestIntradayStoreGeneration();
     }
 
     [[nodiscard]] std::shared_ptr<
@@ -959,6 +1000,10 @@ public:
                 last_decode_error_.load(std::memory_order_acquire));
         if (wal_ != nullptr) {
             result.wal = wal_->Snapshot();
+        }
+        if (history_ != nullptr) {
+            result.intraday_store =
+                history_->IntradayStoreSnapshot();
         }
         result.accepting = accepting_.load(std::memory_order_acquire);
         result.fatal = fatal_.load(std::memory_order_acquire) ||
@@ -1446,6 +1491,12 @@ RealtimePipelineV1::StopAndPublishFinalGeneration(
 std::shared_ptr<const market::RealtimeHistoryGenerationV1>
 RealtimePipelineV1::AcquireLatestHistoryGeneration() const noexcept {
     return impl_->AcquireHistory();
+}
+
+std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
+RealtimePipelineV1::AcquireLatestIntradayStoreGeneration()
+    const noexcept {
+    return impl_->AcquireIntradayStore();
 }
 
 std::shared_ptr<const factor::RealtimeFactorGenerationV1>
