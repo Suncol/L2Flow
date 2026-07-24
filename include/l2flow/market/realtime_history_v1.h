@@ -1,0 +1,303 @@
+#pragma once
+
+#include "l2flow/common/identity128.h"
+#include "l2flow/common/sha256.h"
+#include "l2flow/market/instrument_registry.h"
+#include "l2flow/market/market_types_v1.h"
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string_view>
+#include <vector>
+
+namespace l2flow::market {
+
+inline constexpr std::size_t kRealtimeHistorySourceCountV1 = 4U;
+
+// A source cut is an exclusive prefix of the sequence assigned by this
+// process.  It is intentionally unrelated to vendor sequence numbers and WAL
+// offsets: source_sequence < sequence_exclusive belongs to this generation.
+struct RealtimeSourceWatermarkV1 final {
+    std::uint32_t source_stream_id = 0U;
+    std::uint64_t sequence_exclusive = 0U;
+};
+
+// Immutable identity of one complete market-history generation.  The ingress
+// sequence vector is the completeness authority.  recv_monotonic_cut_ns is an
+// observation timestamp for latency/staleness only; it is not presented as an
+// exchange-event-time completeness proof.
+struct RealtimeHistoryWatermarkV1 final {
+    l2flow::common::Identity128 run_id{};
+    std::uint64_t generation = 0U;
+    std::uint32_t trade_date = 0U;
+    std::uint64_t ingress_sequence_exclusive = 0U;
+    std::uint64_t recv_monotonic_cut_ns = 0U;
+    std::uint64_t registry_version = 0U;
+    l2flow::common::Sha256Digest registry_sha256{};
+    std::array<RealtimeSourceWatermarkV1,
+               kRealtimeHistorySourceCountV1>
+        sources{};
+    l2flow::common::Sha256Digest input_identity_sha256{};
+};
+
+enum class RealtimeHistoryWatermarkErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kNullOutput,
+    kInvalidRun,
+    kInvalidGeneration,
+    kInvalidTradeDate,
+    kInvalidIngressCut,
+    kInvalidRegistry,
+    kInvalidSource,
+    kDuplicateSource,
+    kHashFailure,
+};
+
+[[nodiscard]] std::string_view RealtimeHistoryWatermarkErrorNameV1(
+    RealtimeHistoryWatermarkErrorV1 error) noexcept;
+
+[[nodiscard]] RealtimeHistoryWatermarkErrorV1
+BuildRealtimeHistoryWatermarkV1(
+    l2flow::common::Identity128 run_id,
+    std::uint64_t generation,
+    std::uint32_t trade_date,
+    std::uint64_t ingress_sequence_exclusive,
+    std::uint64_t recv_monotonic_cut_ns,
+    const InstrumentRegistryV1& registry,
+    std::span<const RealtimeSourceWatermarkV1,
+              kRealtimeHistorySourceCountV1> sources,
+    RealtimeHistoryWatermarkV1* output) noexcept;
+
+class RealtimeHistoryRecordV1 final {
+public:
+    RealtimeHistoryRecordV1(const RealtimeHistoryRecordV1&) = delete;
+    RealtimeHistoryRecordV1& operator=(
+        const RealtimeHistoryRecordV1&) = delete;
+    RealtimeHistoryRecordV1(RealtimeHistoryRecordV1&&) = delete;
+    RealtimeHistoryRecordV1& operator=(RealtimeHistoryRecordV1&&) = delete;
+    ~RealtimeHistoryRecordV1() = default;
+
+    [[nodiscard]] static bool Create(
+        std::uint8_t source_slot,
+        std::uint64_t ingress_sequence,
+        RetainedMarketEventV1 event,
+        std::shared_ptr<const RealtimeHistoryRecordV1>* output) noexcept;
+
+    [[nodiscard]] std::uint8_t source_slot() const noexcept {
+        return source_slot_;
+    }
+    [[nodiscard]] std::uint32_t source_stream_id() const noexcept {
+        return source_stream_id_;
+    }
+    [[nodiscard]] std::uint64_t source_sequence() const noexcept {
+        return source_sequence_;
+    }
+    [[nodiscard]] std::uint64_t ingress_sequence() const noexcept {
+        return ingress_sequence_;
+    }
+    [[nodiscard]] std::uint32_t instrument_id() const noexcept {
+        return instrument_id_;
+    }
+    [[nodiscard]] MarketEventKindV1 kind() const noexcept { return kind_; }
+    [[nodiscard]] std::int64_t event_time_ns() const noexcept {
+        return event_time_ns_;
+    }
+    [[nodiscard]] std::int64_t recv_realtime_ns() const noexcept {
+        return recv_realtime_ns_;
+    }
+    [[nodiscard]] std::int64_t recv_monotonic_ns() const noexcept {
+        return recv_monotonic_ns_;
+    }
+    [[nodiscard]] const RetainedMarketEventV1& event() const noexcept {
+        return event_;
+    }
+
+private:
+    RealtimeHistoryRecordV1(
+        std::uint8_t source_slot,
+        std::uint32_t source_stream_id,
+        std::uint64_t source_sequence,
+        std::uint64_t ingress_sequence,
+        std::uint32_t instrument_id,
+        MarketEventKindV1 kind,
+        std::int64_t event_time_ns,
+        std::int64_t recv_realtime_ns,
+        std::int64_t recv_monotonic_ns,
+        RetainedMarketEventV1 event) noexcept;
+
+    std::uint8_t source_slot_ = 0U;
+    std::uint32_t source_stream_id_ = 0U;
+    std::uint64_t source_sequence_ = 0U;
+    std::uint64_t ingress_sequence_ = 0U;
+    std::uint32_t instrument_id_ = 0U;
+    MarketEventKindV1 kind_ = MarketEventKindV1::kShanghaiSnapshot;
+    std::int64_t event_time_ns_ = 0;
+    std::int64_t recv_realtime_ns_ = 0;
+    std::int64_t recv_monotonic_ns_ = 0;
+    RetainedMarketEventV1 event_;
+};
+
+using RealtimeHistoryRecordHandleV1 =
+    std::shared_ptr<const RealtimeHistoryRecordV1>;
+
+// A small, allocation-free publication action invoked only while the
+// history runtime still owns the exact current generation under its commit
+// lock. The action must be noexcept and must not call back into this runtime.
+using RealtimeHistoryCommitActionV1 = void (*)(void* context) noexcept;
+
+// One fixed-universe row.  history is in process ingress order and contains a
+// bounded suffix ending at the generation fence.  Missing instruments remain
+// present with empty handles, so factor code never confuses missing coverage
+// with a changing universe.
+struct RealtimeInstrumentGenerationV1 final {
+    std::uint32_t instrument_id = 0U;
+    RealtimeHistoryRecordHandleV1 latest_snapshot;
+    RealtimeHistoryRecordHandleV1 latest_tick;
+    std::vector<RealtimeHistoryRecordHandleV1> history;
+};
+
+class RealtimeHistoryGenerationV1 final {
+public:
+    RealtimeHistoryGenerationV1(
+        RealtimeHistoryWatermarkV1 watermark,
+        std::vector<RealtimeInstrumentGenerationV1> instruments) noexcept;
+
+    [[nodiscard]] const RealtimeHistoryWatermarkV1& watermark()
+        const noexcept {
+        return watermark_;
+    }
+    [[nodiscard]] std::span<const RealtimeInstrumentGenerationV1>
+    instruments() const noexcept {
+        return instruments_;
+    }
+    [[nodiscard]] const RealtimeInstrumentGenerationV1* Find(
+        std::uint32_t instrument_id) const noexcept;
+
+private:
+    RealtimeHistoryWatermarkV1 watermark_{};
+    std::vector<RealtimeInstrumentGenerationV1> instruments_;
+};
+
+struct RealtimeHistoryRuntimeConfigV1 final {
+    std::array<std::uint32_t, kRealtimeHistorySourceCountV1>
+        source_stream_ids{};
+    std::uint32_t worker_count = 0U;
+    std::size_t queue_capacity_per_source_worker = 0U;
+    std::size_t maximum_records_per_instrument = 0U;
+    const InstrumentRegistryV1* registry = nullptr;
+};
+
+enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kNullOutput,
+    kInvalidConfiguration,
+    kResourceExhausted,
+    kThreadStartFailed,
+};
+
+enum class RealtimeHistorySubmitErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kInvalidRecord,
+    kSourceMismatch,
+    kSequenceNotIncreasing,
+    kQueueFull,
+    kStopped,
+    kFatal,
+};
+
+enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kNullOutput,
+    kInvalidWatermark,
+    kGenerationNotBegun,
+    kGenerationConflict,
+    kSourceAlreadySealed,
+    kQueueFull,
+    kTimeout,
+    kStopped,
+    kFatal,
+    kResourceExhausted,
+};
+
+[[nodiscard]] std::string_view RealtimeHistoryCreateErrorNameV1(
+    RealtimeHistoryCreateErrorV1 error) noexcept;
+[[nodiscard]] std::string_view RealtimeHistorySubmitErrorNameV1(
+    RealtimeHistorySubmitErrorV1 error) noexcept;
+[[nodiscard]] std::string_view RealtimeHistoryGenerationErrorNameV1(
+    RealtimeHistoryGenerationErrorV1 error) noexcept;
+
+// Four source owners submit concurrently. For a given source, TrySubmit and
+// SealSource must be called by the same serial decoder owner. The upstream
+// ingress authority must assign every accepted record one globally unique,
+// dense ingress_sequence and one dense per-source source_sequence. This
+// runtime validates per-source order and generation cuts; it does not invent a
+// second cross-source sequence authority. Internally there is one SPSC queue
+// per source×worker. An instrument is permanently owned by
+// instrument_id % worker_count. The immutable registry referenced by config
+// must outlive the runtime.
+class RealtimeHistoryRuntimeV1 final {
+public:
+    RealtimeHistoryRuntimeV1(const RealtimeHistoryRuntimeV1&) = delete;
+    RealtimeHistoryRuntimeV1& operator=(
+        const RealtimeHistoryRuntimeV1&) = delete;
+    RealtimeHistoryRuntimeV1(RealtimeHistoryRuntimeV1&&) = delete;
+    RealtimeHistoryRuntimeV1& operator=(RealtimeHistoryRuntimeV1&&) = delete;
+    ~RealtimeHistoryRuntimeV1();
+
+    [[nodiscard]] static RealtimeHistoryCreateErrorV1 Create(
+        RealtimeHistoryRuntimeConfigV1 config,
+        std::unique_ptr<RealtimeHistoryRuntimeV1>* output) noexcept;
+
+    [[nodiscard]] RealtimeHistorySubmitErrorV1 TrySubmit(
+        RealtimeHistoryRecordHandleV1 record) noexcept;
+
+    // BeginGeneration is called before the four decoder markers are admitted.
+    // Each decoder calls SealSource after it has routed every event preceding
+    // its marker. A worker parks fence-after data until all four source fences
+    // for that generation have arrived and its immutable slice is complete.
+    [[nodiscard]] RealtimeHistoryGenerationErrorV1 BeginGeneration(
+        const RealtimeHistoryWatermarkV1& watermark) noexcept;
+    [[nodiscard]] RealtimeHistoryGenerationErrorV1 SealSource(
+        std::uint8_t source_slot,
+        std::uint64_t generation) noexcept;
+    [[nodiscard]] RealtimeHistoryGenerationErrorV1 WaitForGeneration(
+        std::uint64_t generation,
+        std::chrono::nanoseconds timeout,
+        std::shared_ptr<const RealtimeHistoryGenerationV1>* output) noexcept;
+
+    [[nodiscard]] std::shared_ptr<const RealtimeHistoryGenerationV1>
+    AcquireLatestGeneration() const noexcept;
+    [[nodiscard]] bool IsGenerationCurrentAndHealthy(
+        const std::shared_ptr<const RealtimeHistoryGenerationV1>& generation)
+        const noexcept;
+
+    // Linearizes a downstream whole-generation publication with history
+    // generation replacement, fatal transition, and StopAndDrain. Returns
+    // false without invoking action unless generation is still the exact
+    // current healthy handle. This is the factor publication commit guard;
+    // it is not an API for long-running calculation.
+    [[nodiscard]] bool CommitIfCurrentAndHealthy(
+        const std::shared_ptr<const RealtimeHistoryGenerationV1>& generation,
+        RealtimeHistoryCommitActionV1 action,
+        void* context) const noexcept;
+
+    [[nodiscard]] std::uint32_t WorkerForInstrument(
+        std::uint32_t instrument_id) const noexcept;
+    [[nodiscard]] bool fatal() const noexcept;
+    void MarkFatal() noexcept;
+    void StopAndDrain() noexcept;
+
+    [[nodiscard]] const RealtimeHistoryRuntimeConfigV1& config()
+        const noexcept;
+
+private:
+    class Impl;
+    explicit RealtimeHistoryRuntimeV1(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace l2flow::market

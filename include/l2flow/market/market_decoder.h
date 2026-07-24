@@ -11,16 +11,6 @@ namespace l2flow::market {
 
 class InstrumentRegistryV1;
 
-enum class ShanghaiPhaseAttributionModeV1 : std::uint8_t {
-    // Phase-4 convenience mode: Decode applies accepted-by-caller SH status
-    // events immediately and attributes later events from decoder history.
-    kStateful = 0U,
-    // Phase-5 mode: Decode is pure with respect to phase history.  Status is
-    // parsed on its own event, but a downstream transactional sequence guard
-    // must commit it and attribute subsequent events only after acceptance.
-    kDeferred = 1U,
-};
-
 enum class MarketDecodeErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
@@ -52,25 +42,25 @@ struct MarketDecoderLimitsV1 final {
 };
 
 struct MarketDecoderConfigV1 final {
-    // V1 accepts valid calendar dates from 1992 onward.  Its Unix-time
+    // V1 accepts valid calendar dates from 1992-01-01 through 2200-12-31.
+    // Its Unix-time
     // projection is fixed UTC+08:00 and deliberately does not pretend to
     // model older Asia/Shanghai DST history.
     std::uint32_t trade_date = 0U;
     std::uint32_t source_stream_id = 0U;
-    // Borrowed immutable registry.  When non-null, it must outlive this
-    // decoder (and a MarketSessionV1 that owns such decoders).
+    // Borrowed immutable registry. When non-null, it must outlive this
+    // decoder.
     const InstrumentRegistryV1* instrument_registry = nullptr;
-    ShanghaiPhaseAttributionModeV1 shanghai_phase_attribution =
-        ShanghaiPhaseAttributionModeV1::kStateful;
     MarketDecoderLimitsV1 limits{};
 };
 
 // Stateful only for the documented SH 4.24 product-phase attribution.  One
 // decoder instance represents exactly one trade-date/source session and is a
 // single-writer object.  The caller must invoke Decode in authoritative,
-// strictly increasing source_sequence order; this object neither reorders nor
-// validates sequence monotonicity on its own.  Decoded events own every
-// published string/array and never retain MarketMessageViewV1::body.
+// strictly increasing owned-ingress source_sequence order; this object
+// neither reorders nor validates sequence monotonicity on its own. Decoded
+// events own every published string/array and never retain
+// MarketMessageViewV1::body.
 class MarketDecoderV1 final {
 public:
     explicit MarketDecoderV1(MarketDecoderConfigV1 config) noexcept;

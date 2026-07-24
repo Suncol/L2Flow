@@ -58,7 +58,22 @@ constexpr std::size_t kInstrumentStatus = 38U;
 constexpr std::size_t kTradeCount = 44U;
 constexpr std::size_t kTradeVolume = 48U;
 constexpr std::size_t kTurnover = 56U;
-constexpr std::size_t kLegacyWarLower = 148U;
+constexpr std::size_t kWeightedAverageBidPrice = 72U;
+constexpr std::size_t kAlternateWeightedAverageBidPrice = 76U;
+constexpr std::size_t kWeightedAverageAskPrice = 88U;
+constexpr std::size_t kAlternateWeightedAverageAskPrice = 92U;
+constexpr std::size_t kEtfBuyCount = 96U;
+constexpr std::size_t kEtfBuyQuantity = 100U;
+constexpr std::size_t kEtfBuyAmount = 108U;
+constexpr std::size_t kEtfSellCount = 116U;
+constexpr std::size_t kEtfSellQuantity = 120U;
+constexpr std::size_t kEtfSellAmount = 128U;
+constexpr std::size_t kYieldToMaturity = 136U;
+constexpr std::size_t kTotalWarrantExerciseQuantity = 140U;
+constexpr std::size_t kVendorWarLower = 148U;
+constexpr std::size_t kVendorWarUpper = 156U;
+constexpr std::size_t kMaximumBidDuration = 212U;
+constexpr std::size_t kMaximumAskDuration = 216U;
 constexpr std::size_t kBidCount = 220U;
 constexpr std::size_t kAskCount = 224U;
 constexpr std::size_t kBidLevels = 228U;
@@ -102,8 +117,19 @@ constexpr std::size_t kTradeCount = 40U;
 constexpr std::size_t kVolume = 48U;
 constexpr std::size_t kTurnover = 56U;
 constexpr std::size_t kLastPrice = 64U;
+constexpr std::size_t kOpenPrice = 72U;
+constexpr std::size_t kHighPrice = 80U;
+constexpr std::size_t kLowPrice = 88U;
+constexpr std::size_t kPeRatio1 = 112U;
+constexpr std::size_t kPeRatio2 = 120U;
+constexpr std::size_t kPreCloseIopv = 128U;
+constexpr std::size_t kIopv = 136U;
+constexpr std::size_t kWeightedAverageAskPrice = 152U;
+constexpr std::size_t kWeightedAverageBidPrice = 168U;
 constexpr std::size_t kHighLimitPrice = 176U;
 constexpr std::size_t kLowLimitPrice = 184U;
+constexpr std::size_t kOpenInterest = 192U;
+constexpr std::size_t kVendorOptPremiumRatio = 200U;
 constexpr std::size_t kBidLevels = 208U;
 constexpr std::size_t kAskLevels = 216U;
 
@@ -253,6 +279,26 @@ void OverwriteU32(
     }
 }
 
+void OverwriteI32(
+    std::vector<std::byte>* bytes,
+    std::size_t offset,
+    std::int32_t value) {
+    OverwriteU32(bytes, offset, static_cast<std::uint32_t>(value));
+}
+
+void OverwriteI64(
+    std::vector<std::byte>* bytes,
+    std::size_t offset,
+    std::int64_t value) {
+    const std::uint64_t raw = static_cast<std::uint64_t>(value);
+    for (std::size_t index = 0U; index < 8U; ++index) {
+        const unsigned int shift =
+            static_cast<unsigned int>(index * 8U);
+        bytes->at(offset + index) = static_cast<std::byte>(
+            (raw >> shift) & 0xffU);
+    }
+}
+
 struct ShanghaiTickSpec final {
     std::int64_t business_index = 101;
     std::int32_t channel = 7;
@@ -367,9 +413,29 @@ std::vector<std::byte> MakeShanghaiSnapshotWire() {
     writer.StoreU32(kTradeCount, 42U);
     writer.StoreI64(kTradeVolume, 123000);
     writer.StoreI64(kTurnover, 45600000);
-    writer.StoreI64(kLegacyWarLower, 123456);
-    writer.StoreU32(kBidCount, 12U);
-    writer.StoreU32(kAskCount, 1U);
+    writer.StoreI32(kWeightedAverageBidPrice, 10190);
+    writer.StoreI32(kAlternateWeightedAverageBidPrice, 10180);
+    writer.StoreI32(kWeightedAverageAskPrice, 10210);
+    writer.StoreI32(kAlternateWeightedAverageAskPrice, 10220);
+    writer.StoreU32(kEtfBuyCount, 17U);
+    writer.StoreI64(kEtfBuyQuantity, 21000);
+    writer.StoreI64(kEtfBuyAmount, 3'210'000);
+    writer.StoreU32(kEtfSellCount, 19U);
+    writer.StoreI64(kEtfSellQuantity, 23000);
+    writer.StoreI64(kEtfSellAmount, 4'560'000);
+    writer.StoreI32(kYieldToMaturity, -125);
+    writer.StoreI64(kTotalWarrantExerciseQuantity, 7000);
+    writer.StoreI64(kVendorWarLower, 123456);
+    writer.StoreI64(kVendorWarUpper, 654321);
+    writer.StoreU32(kMaximumBidDuration, 0U);
+    writer.StoreU32(
+        kMaximumAskDuration,
+        std::numeric_limits<std::uint32_t>::max() - 1U);
+    // Production continuous-trading messages prove these counters are not
+    // the MDLListT lengths.  Keep them deliberately different from the
+    // 12/1 dynamic level counts below.
+    writer.StoreU32(kBidCount, 43U);
+    writer.StoreU32(kAskCount, 74U);
     writer.StoreI32(kIopv, 10123);
     writer.StoreString(kSecurityId, "600000");
     writer.StoreString(kInstrumentStatus, "TRADE");
@@ -431,8 +497,19 @@ std::vector<std::byte> MakeShenzhenSnapshotWire() {
     writer.StoreI64(kVolume, 2000);
     writer.StoreI64(kTurnover, 900000);
     writer.StoreI64(kLastPrice, 1012345);
+    writer.StoreI64(kOpenPrice, 1'010'000);
+    writer.StoreI64(kHighPrice, 1'030'000);
+    writer.StoreI64(kLowPrice, 990'000);
+    writer.StoreI64(kPeRatio1, -123456);
+    writer.StoreI64(kPeRatio2, 654321);
+    writer.StoreI64(kPreCloseIopv, 1'000'001);
+    writer.StoreI64(kIopv, 1'000'002);
+    writer.StoreI64(kWeightedAverageAskPrice, 1'012'350);
+    writer.StoreI64(kWeightedAverageBidPrice, 1'012'340);
     writer.StoreI64(kHighLimitPrice, kUnresolvedHighLimitRaw);
     writer.StoreI64(kLowLimitPrice, kUnresolvedLowLimitRaw);
+    writer.StoreI64(kOpenInterest, 77);
+    writer.StoreI64(kVendorOptPremiumRatio, 88'000);
     writer.StoreString(kMdStreamId, "010");
     writer.StoreString(kSecurityId, "000001");
     writer.StoreString(kSecurityIdSource, "102");
@@ -592,7 +669,7 @@ void TestFixedLowerBoundsAndSchemaGate(TestContext* context) {
     market::MarketDecoderV1 decoder = MakeDecoder();
     context->Expect(
         decoder.configuration_valid(),
-        "valid Phase-4 decoder configuration is accepted");
+        "valid market decoder configuration is accepted");
     std::uint64_t sequence = 1U;
     for (const Case& test_case : cases) {
         std::vector<std::byte> exact(
@@ -1696,6 +1773,224 @@ void TestMatchedQuantityDomainAndFailureAtomicity(TestContext* context) {
                 market::MarketDecodeErrorV1::kInvalidInput &&
             IsSentinel(unchanged),
         "invalid input leaves output unchanged");
+
+    invalid_input = Message(
+        kShenzhenService,
+        kShenzhenOrderMessage,
+        body,
+        sequence++);
+    invalid_input.message_encoding = 2U;
+    unchanged = SentinelOutput();
+    context->Expect(
+        decoder.Decode(invalid_input, &unchanged) ==
+                market::MarketDecodeErrorV1::kInvalidInput &&
+            IsSentinel(unchanged),
+        "non-binary body never enters the binary decoder");
+}
+
+void TestNegativeQuantityDomains(TestContext* context) {
+    market::MarketDecoderV1 decoder = MakeDecoder();
+    std::uint64_t sequence = 470U;
+
+    struct ShanghaiCase final {
+        std::string type;
+        const char* label;
+    };
+    const std::vector<ShanghaiCase> shanghai_cases = {
+        {"A", "SH add"},
+        {"D", "SH cancel"},
+        {"T", "SH trade"},
+    };
+    for (const ShanghaiCase& test_case : shanghai_cases) {
+        ShanghaiTickSpec spec;
+        spec.type = test_case.type;
+        spec.quantity = -7;
+        const std::vector<std::byte> body = MakeShanghaiTickWire(spec);
+        market::DecodedMarketEventV1 event;
+        const market::MarketDecodeErrorV1 error = decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiTickMessage,
+                body,
+                sequence++),
+            &event);
+        context->Expect(
+            error == market::MarketDecodeErrorV1::kNone,
+            std::string(test_case.label) +
+                " with negative quantity decodes for audit retention");
+        const auto* const tick =
+            std::get_if<market::ShanghaiTickV1>(&event);
+        context->Expect(
+            tick != nullptr && tick->fields.quantity.raw == -7 &&
+                !tick->fields.quantity.valid &&
+                (tick->fields.validity_bitmap &
+                 market::kTickQuantityValidV1) == 0U &&
+                HasNotice(
+                    tick->common,
+                    market::MarketNoticeV1::kQuantityDomainInvalid),
+            std::string(test_case.label) +
+                " retains raw negative quantity without publishing validity");
+    }
+
+    ShenzhenOrderSpec order_spec;
+    order_spec.quantity = -11;
+    std::vector<std::byte> body = MakeShenzhenOrderWire(order_spec);
+    market::DecodedMarketEventV1 event;
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenOrderMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ order with negative quantity decodes for audit retention");
+    const auto* const order =
+        std::get_if<market::ShenzhenOrderV1>(&event);
+    context->Expect(
+        order != nullptr && order->fields.quantity.raw == -11 &&
+            !order->fields.quantity.valid &&
+            (order->fields.validity_bitmap &
+             market::kTickQuantityValidV1) == 0U &&
+            HasNotice(
+                order->common,
+                market::MarketNoticeV1::kQuantityDomainInvalid),
+        "SZ order retains raw negative quantity without publishing validity");
+
+    struct ShenzhenTransactionCase final {
+        std::int32_t execution_type;
+        const char* label;
+    };
+    const std::vector<ShenzhenTransactionCase> transaction_cases = {
+        {70, "SZ trade"},
+        {52, "SZ cancel"},
+        {99, "SZ unknown execution"},
+    };
+    for (const ShenzhenTransactionCase& test_case : transaction_cases) {
+        ShenzhenTransactionSpec spec;
+        spec.execution_type = test_case.execution_type;
+        spec.last_quantity = -13;
+        body = MakeShenzhenTransactionWire(spec);
+        event = SentinelOutput();
+        const market::MarketDecodeErrorV1 error = decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenTransactionMessage,
+                body,
+                sequence++),
+            &event);
+        context->Expect(
+            error == market::MarketDecodeErrorV1::kNone,
+            std::string(test_case.label) +
+                " with negative quantity decodes for audit retention");
+        const auto* const transaction =
+            std::get_if<market::ShenzhenTransactionV1>(&event);
+        context->Expect(
+            transaction != nullptr &&
+                transaction->fields.quantity.raw == -13 &&
+                !transaction->fields.quantity.valid &&
+                (transaction->fields.validity_bitmap &
+                 market::kTickQuantityValidV1) == 0U &&
+                HasNotice(
+                    transaction->common,
+                    market::MarketNoticeV1::kQuantityDomainInvalid),
+            std::string(test_case.label) +
+                " retains raw negative quantity without publishing validity");
+    }
+
+    // Golden SH snapshot construction: fixed body 248 + 6-byte SecurityID +
+    // 5-byte status => first bid at 259; 12 bids and one ask end at 623,
+    // where the first bid-one queue item begins.
+    constexpr std::size_t kFirstShanghaiBidQuantity = 267U;
+    constexpr std::size_t kFirstShanghaiBidQueueQuantity = 631U;
+    body = MakeShanghaiSnapshotWire();
+    OverwriteI64(&body, wire_abi::sh_snapshot::kTradeVolume, -17);
+    OverwriteI64(&body, kFirstShanghaiBidQuantity, -18);
+    OverwriteI64(&body, kFirstShanghaiBidQueueQuantity, -19);
+    event = SentinelOutput();
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH snapshot aggregate/book/queue negative quantities remain auditable");
+    const auto* const sh_snapshot =
+        std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        sh_snapshot != nullptr && sh_snapshot->trade_volume.raw == -17 &&
+            !sh_snapshot->trade_volume.valid &&
+            sh_snapshot->book.bids[0U].quantity.raw == -18 &&
+            !sh_snapshot->book.bids[0U].quantity.valid &&
+            sh_snapshot->book.bid1_queue.quantities[0U].raw == -19 &&
+            !sh_snapshot->book.bid1_queue.quantities[0U].valid &&
+            HasNotice(
+                sh_snapshot->common,
+                market::MarketNoticeV1::kQuantityDomainInvalid),
+        "SH nested quantity paths share the negative-domain contract");
+
+    body = MakeShanghaiSnapshotWire();
+    OverwriteI64(
+        &body,
+        wire_abi::sh_snapshot::kTradeVolume,
+        std::numeric_limits<std::int64_t>::min());
+    event = SentinelOutput();
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH nullable quantity sentinel remains decodable");
+    const auto* const sh_null_snapshot =
+        std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        sh_null_snapshot != nullptr &&
+            sh_null_snapshot->trade_volume.is_null &&
+            !sh_null_snapshot->trade_volume.valid &&
+            HasQuality(
+                sh_null_snapshot->common,
+                control::QualityFlagV1::kNullValuePresent) &&
+            !HasNotice(
+                sh_null_snapshot->common,
+                market::MarketNoticeV1::kQuantityDomainInvalid),
+        "SH null quantity is distinct from a negative-domain value");
+
+    // Golden SZ snapshot construction: four strings end at 237, two bid items
+    // and one ask item end at 321, where the bid-one queue begins.
+    constexpr std::size_t kFirstShenzhenBidQuantity = 237U;
+    constexpr std::size_t kFirstShenzhenBidQueueQuantity = 321U;
+    body = MakeShenzhenSnapshotWire();
+    OverwriteI64(&body, wire_abi::sz_snapshot::kVolume, -27);
+    OverwriteI64(&body, kFirstShenzhenBidQuantity, -28);
+    OverwriteI64(&body, kFirstShenzhenBidQueueQuantity, -29);
+    event = SentinelOutput();
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ snapshot aggregate/book/queue negative quantities remain auditable");
+    const auto* const sz_snapshot =
+        std::get_if<market::ShenzhenSnapshotV1>(&event);
+    context->Expect(
+        sz_snapshot != nullptr && sz_snapshot->volume.raw == -27 &&
+            !sz_snapshot->volume.valid &&
+            sz_snapshot->book.bids[0U].quantity.raw == -28 &&
+            !sz_snapshot->book.bids[0U].quantity.valid &&
+            sz_snapshot->book.bid1_queue.quantities[0U].raw == -29 &&
+            !sz_snapshot->book.bid1_queue.quantities[0U].valid &&
+            HasNotice(
+                sz_snapshot->common,
+                market::MarketNoticeV1::kQuantityDomainInvalid),
+        "SZ nested quantity paths share the negative-domain contract");
 }
 
 void TestOrderReferenceDomains(TestContext* context) {
@@ -2186,6 +2481,428 @@ void TestTimeNullInvalidAndBoundaries(TestContext* context) {
     }
 }
 
+void TestAbsolutePriceDomains(TestContext* context) {
+    market::MarketDecoderV1 decoder = MakeDecoder();
+    std::uint64_t sequence = 600U;
+    market::DecodedMarketEventV1 event;
+
+    std::vector<std::byte> body = MakeShanghaiSnapshotWire();
+    OverwriteI32(&body, wire_abi::sh_snapshot::kLastPrice, 0);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH snapshot zero last price remains a decoded audit record");
+    const auto* sh_snapshot =
+        std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        sh_snapshot != nullptr && sh_snapshot->last_price.raw == 0 &&
+            sh_snapshot->last_price.scale == 3U &&
+            sh_snapshot->last_price.normalized_p6 == 0 &&
+            !sh_snapshot->last_price.valid &&
+            !sh_snapshot->last_price.is_null &&
+            HasNotice(
+                sh_snapshot->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SH zero last price is retained but never advertised as a formed price");
+
+    body = MakeShanghaiSnapshotWire();
+    OverwriteI32(
+        &body,
+        wire_abi::sh_snapshot::kLastPrice,
+        std::numeric_limits<std::int32_t>::min());
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH snapshot null last price remains a decoded audit record");
+    sh_snapshot = std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        sh_snapshot != nullptr && sh_snapshot->last_price.is_null &&
+            !sh_snapshot->last_price.valid &&
+            HasQuality(
+                sh_snapshot->common,
+                control::QualityFlagV1::kNullValuePresent) &&
+            !HasNotice(
+                sh_snapshot->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SH null price is distinct from a nonpositive price-domain failure");
+
+    body = MakeShenzhenSnapshotWire();
+    const std::int64_t negative_extreme =
+        std::numeric_limits<std::int64_t>::min() + 1;
+    OverwriteI64(
+        &body,
+        wire_abi::sz_snapshot::kPreClosePrice,
+        negative_extreme);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ negative extreme scale-4 price is domain-invalid, not overflow-fatal");
+    const auto* sz_snapshot =
+        std::get_if<market::ShenzhenSnapshotV1>(&event);
+    context->Expect(
+        sz_snapshot != nullptr &&
+            sz_snapshot->pre_close_price.raw == negative_extreme &&
+            sz_snapshot->pre_close_price.scale == 4U &&
+            sz_snapshot->pre_close_price.normalized_p6 == 0 &&
+            !sz_snapshot->pre_close_price.valid &&
+            HasNotice(
+                sz_snapshot->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ invalid negative extreme is retained before p6 multiplication");
+
+    // Golden construction order puts the first SH bid at fixed body + the
+    // 6-byte SecurityID and 5-byte status strings; price is item offset +4.
+    constexpr std::size_t kFirstShanghaiBidPrice = 263U;
+    body = MakeShanghaiSnapshotWire();
+    OverwriteI32(&body, kFirstShanghaiBidPrice, -1);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH book level with negative price remains decodable");
+    sh_snapshot = std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        sh_snapshot != nullptr &&
+            sh_snapshot->book.bids[0U].price.raw == -1 &&
+            !sh_snapshot->book.bids[0U].price.valid &&
+            HasNotice(
+                sh_snapshot->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SH book price uses the same strict positive domain contract");
+
+    // The existing nested-offset oracle establishes the first SZ bid at 237;
+    // its price is the int64 at item offset +8.
+    constexpr std::size_t kFirstShenzhenBidPrice = 245U;
+    body = MakeShenzhenSnapshotWire();
+    OverwriteI64(&body, kFirstShenzhenBidPrice, 0);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ book level with zero price remains decodable");
+    sz_snapshot = std::get_if<market::ShenzhenSnapshotV1>(&event);
+    context->Expect(
+        sz_snapshot != nullptr &&
+            sz_snapshot->book.bids[0U].price.raw == 0 &&
+            !sz_snapshot->book.bids[0U].price.valid &&
+            HasNotice(
+                sz_snapshot->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ book zero price is retained but invalid");
+
+    struct ShanghaiTickPriceCase final {
+        std::string type;
+        std::int32_t price;
+        bool expect_domain_notice;
+        bool expect_null;
+        const char* label;
+    };
+    const std::vector<ShanghaiTickPriceCase> sh_tick_cases = {
+        {"A", 0, true, false, "SH add zero price"},
+        {"T", -1, true, false, "SH trade negative price"},
+        {"A",
+         std::numeric_limits<std::int32_t>::min(),
+         false,
+         true,
+         "SH add null price"},
+        {"D", -1, false, false, "SH cancel ignored negative price"},
+        {"S", -1, false, false, "SH status ignored negative price"},
+    };
+    for (const ShanghaiTickPriceCase& test_case : sh_tick_cases) {
+        ShanghaiTickSpec spec;
+        spec.type = test_case.type;
+        spec.price_p3 = test_case.price;
+        body = MakeShanghaiTickWire(spec);
+        context->Expect(
+            decoder.Decode(
+                Message(
+                    kShanghaiService,
+                    kShanghaiTickMessage,
+                    body,
+                    sequence++),
+                &event) == market::MarketDecodeErrorV1::kNone,
+            std::string(test_case.label) + " decodes");
+        const auto* const tick =
+            std::get_if<market::ShanghaiTickV1>(&event);
+        context->Expect(
+            tick != nullptr && !tick->fields.price.valid &&
+                (tick->fields.validity_bitmap &
+                 market::kTickPriceValidV1) == 0U &&
+                tick->fields.price.is_null == test_case.expect_null &&
+                HasNotice(
+                    tick->common,
+                    market::MarketNoticeV1::
+                        kAbsolutePriceDomainInvalid) ==
+                    test_case.expect_domain_notice,
+            std::string(test_case.label) +
+                " keeps value validity, bitmap, and notice consistent");
+    }
+
+    ShenzhenOrderSpec limit;
+    limit.order_type = 50;
+    limit.price_p4 = negative_extreme;
+    body = MakeShenzhenOrderWire(limit);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenOrderMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ limit negative extreme price is domain-invalid, not overflow-fatal");
+    const auto* order = std::get_if<market::ShenzhenOrderV1>(&event);
+    context->Expect(
+        order != nullptr && order->fields.price.raw == negative_extreme &&
+            !order->fields.price.valid &&
+            (order->fields.validity_bitmap &
+             market::kTickPriceValidV1) == 0U &&
+            HasNotice(
+                order->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ limit price gate precedes p6 normalization");
+
+    ShenzhenOrderSpec market_order;
+    market_order.order_type = 49;
+    market_order.price_p4 = negative_extreme;
+    body = MakeShenzhenOrderWire(market_order);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenOrderMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ market-order ignored negative price does not overflow");
+    order = std::get_if<market::ShenzhenOrderV1>(&event);
+    context->Expect(
+        order != nullptr && !order->fields.price.valid &&
+            !HasNotice(
+                order->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ market-order price placeholder does not emit a false domain notice");
+
+    ShenzhenTransactionSpec trade;
+    trade.execution_type = 70;
+    trade.last_price_p4 = 0;
+    body = MakeShenzhenTransactionWire(trade);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenTransactionMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ trade zero price remains a decoded audit record");
+    const auto* transaction =
+        std::get_if<market::ShenzhenTransactionV1>(&event);
+    context->Expect(
+        transaction != nullptr && !transaction->fields.price.valid &&
+            (transaction->fields.validity_bitmap &
+             market::kTickPriceValidV1) == 0U &&
+            HasNotice(
+                transaction->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ trade zero price is retained but invalid");
+
+    trade.last_price_p4 = std::numeric_limits<std::int64_t>::min();
+    body = MakeShenzhenTransactionWire(trade);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenTransactionMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ trade null price remains a decoded audit record");
+    transaction = std::get_if<market::ShenzhenTransactionV1>(&event);
+    context->Expect(
+        transaction != nullptr && transaction->fields.price.is_null &&
+            !transaction->fields.price.valid &&
+            !HasNotice(
+                transaction->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ trade null price is not misreported as a price-domain failure");
+
+    ShenzhenTransactionSpec cancel;
+    cancel.execution_type = 52;
+    cancel.last_price_p4 = negative_extreme;
+    body = MakeShenzhenTransactionWire(cancel);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenTransactionMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SZ cancel ignored negative price remains decodable");
+    transaction = std::get_if<market::ShenzhenTransactionV1>(&event);
+    context->Expect(
+        transaction != nullptr && !transaction->fields.price.valid &&
+            !HasNotice(
+                transaction->common,
+                market::MarketNoticeV1::kAbsolutePriceDomainInvalid),
+        "SZ cancel price placeholder does not emit a false domain notice");
+}
+
+void TestMaximumDurationSentinel(TestContext* context) {
+    market::MarketDecoderV1 decoder = MakeDecoder();
+    std::uint64_t sequence = 700U;
+    market::DecodedMarketEventV1 event;
+
+    std::vector<std::byte> body = MakeShanghaiSnapshotWire();
+    OverwriteU32(
+        &body,
+        wire_abi::sh_snapshot::kMaximumBidDuration,
+        std::numeric_limits<std::uint32_t>::max());
+    OverwriteU32(
+        &body,
+        wire_abi::sh_snapshot::kMaximumAskDuration,
+        7U);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH bid duration sentinel remains a decoded audit record");
+    const auto* snapshot =
+        std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        snapshot != nullptr &&
+            snapshot->maximum_bid_duration.raw ==
+                std::numeric_limits<std::uint32_t>::max() &&
+            !snapshot->maximum_bid_duration.valid &&
+            snapshot->maximum_ask_duration.raw == 7U &&
+            snapshot->maximum_ask_duration.valid &&
+            HasNotice(
+                snapshot->common,
+                market::MarketNoticeV1::kMaximumDurationUnavailable),
+        "SH bid and ask duration validity is independent");
+
+    body = MakeShanghaiSnapshotWire();
+    OverwriteU32(
+        &body,
+        wire_abi::sh_snapshot::kMaximumBidDuration,
+        8U);
+    OverwriteU32(
+        &body,
+        wire_abi::sh_snapshot::kMaximumAskDuration,
+        std::numeric_limits<std::uint32_t>::max());
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiSnapshotMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH ask duration sentinel remains a decoded audit record");
+    snapshot = std::get_if<market::ShanghaiSnapshotV1>(&event);
+    context->Expect(
+        snapshot != nullptr && snapshot->maximum_bid_duration.raw == 8U &&
+            snapshot->maximum_bid_duration.valid &&
+            snapshot->maximum_ask_duration.raw ==
+                std::numeric_limits<std::uint32_t>::max() &&
+            !snapshot->maximum_ask_duration.valid &&
+            HasNotice(
+                snapshot->common,
+                market::MarketNoticeV1::kMaximumDurationUnavailable),
+        "SH ask sentinel does not invalidate the independent bid duration");
+}
+
+void TestProductApplicabilityNotInferredFromSecurityType(
+    TestContext* context) {
+    const std::vector<market::SecurityTypeV1> security_types = {
+        market::SecurityTypeV1::kEquity,
+        market::SecurityTypeV1::kFund,
+    };
+    std::uint64_t sequence = 720U;
+    for (market::SecurityTypeV1 security_type : security_types) {
+        market::InstrumentRegistryEntryV1 entry;
+        entry.instrument_id =
+            security_type == market::SecurityTypeV1::kEquity ? 801U : 802U;
+        entry.key.market = market::MarketV1::kShanghai;
+        entry.key.security_id = Bytes("600000");
+        entry.quantity_unit = market::QuantityUnitV1::kShare;
+        entry.security_type = security_type;
+        entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
+        std::unique_ptr<market::InstrumentRegistryV1> registry;
+        context->Expect(
+            market::InstrumentRegistryV1::Create(
+                31U,
+                std::span<const market::InstrumentRegistryEntryV1>(
+                    &entry, 1U),
+                &registry) ==
+                    market::InstrumentRegistryCreateErrorV1::kNone &&
+                registry != nullptr,
+            "SH applicability test registry creates");
+        if (registry == nullptr) {
+            continue;
+        }
+
+        market::MarketDecoderV1 decoder = MakeDecoder(registry.get());
+        const std::vector<std::byte> body = MakeShanghaiSnapshotWire();
+        market::DecodedMarketEventV1 event;
+        context->Expect(
+            decoder.Decode(
+                Message(
+                    kShanghaiService,
+                    kShanghaiSnapshotMessage,
+                    body,
+                    sequence++),
+                &event) == market::MarketDecodeErrorV1::kNone,
+            "SH snapshot resolves coarse registry security type");
+        const auto* const snapshot =
+            std::get_if<market::ShanghaiSnapshotV1>(&event);
+        context->Expect(
+            snapshot != nullptr &&
+                snapshot->common.security_type == security_type &&
+                !snapshot->vendor_etf_buy_count.valid &&
+                !snapshot->vendor_etf_buy_quantity.valid &&
+                !snapshot->vendor_etf_buy_amount.valid &&
+                !snapshot->vendor_etf_sell_count.valid &&
+                !snapshot->vendor_etf_sell_quantity.valid &&
+                !snapshot->vendor_etf_sell_amount.valid &&
+                !snapshot->yield_to_maturity.valid &&
+                !snapshot->total_warrant_exercise_quantity.valid &&
+                !snapshot->iopv.valid &&
+                HasNotice(
+                    snapshot->common,
+                    market::MarketNoticeV1::kProductApplicabilityUnknown),
+            "coarse equity/fund metadata never guesses ETF or product-field applicability");
+    }
+}
+
 void TestSnapshotNestedListsAndPublicCaps(TestContext* context) {
     market::MarketDecoderV1 decoder = MakeDecoder();
     std::vector<std::byte> sh_body = MakeShanghaiSnapshotWire();
@@ -2204,14 +2921,62 @@ void TestSnapshotNestedListsAndPublicCaps(TestContext* context) {
     if (sh_snapshot != nullptr) {
         const market::SnapshotBookV1& book = sh_snapshot->book;
         context->Expect(
-            sh_snapshot->legacy_war_lower_value.raw == 123456 &&
-                sh_snapshot->legacy_war_lower_value.scale == 3U &&
-                !sh_snapshot->legacy_war_lower_value.valid &&
+            sh_snapshot->vendor_war_lower_value.raw == 123456 &&
+                sh_snapshot->vendor_war_lower_value.scale == 3U &&
+                !sh_snapshot->vendor_war_lower_value.valid &&
                 HasNotice(
                     sh_snapshot->common,
                     market::MarketNoticeV1::
-                        kLegacyWarLowerSemanticsUnknown),
-            "SH legacy WarLower raw is retained without guessed semantics");
+                        kVendorWarLowerSemanticsUnknown) &&
+                sh_snapshot->vendor_war_upper_value.raw == 654321 &&
+                sh_snapshot->vendor_war_upper_value.scale == 5U &&
+                !sh_snapshot->vendor_war_upper_value.valid &&
+                HasNotice(
+                    sh_snapshot->common,
+                    market::MarketNoticeV1::
+                        kVendorWarUpperSemanticsUnknown),
+            "SH vendor War fields retain raw values without guessed semantics");
+        context->Expect(
+            sh_snapshot->vendor_etf_buy_count.raw == 17U &&
+                !sh_snapshot->vendor_etf_buy_count.valid &&
+                sh_snapshot->vendor_etf_buy_quantity.raw == 21000 &&
+                sh_snapshot->vendor_etf_buy_quantity.scale == 3U &&
+                !sh_snapshot->vendor_etf_buy_quantity.valid &&
+                sh_snapshot->vendor_etf_buy_amount.raw == 3'210'000 &&
+                sh_snapshot->vendor_etf_buy_amount.scale == 5U &&
+                !sh_snapshot->vendor_etf_buy_amount.valid &&
+                sh_snapshot->vendor_etf_buy_amount.normalized_p6 == 0 &&
+                sh_snapshot->vendor_etf_sell_count.raw == 19U &&
+                !sh_snapshot->vendor_etf_sell_count.valid &&
+                sh_snapshot->vendor_etf_sell_quantity.raw == 23000 &&
+                sh_snapshot->vendor_etf_sell_quantity.scale == 3U &&
+                !sh_snapshot->vendor_etf_sell_quantity.valid &&
+                sh_snapshot->vendor_etf_sell_amount.raw == 4'560'000 &&
+                sh_snapshot->vendor_etf_sell_amount.scale == 5U &&
+                !sh_snapshot->vendor_etf_sell_amount.valid &&
+                sh_snapshot->yield_to_maturity.raw == -125 &&
+                sh_snapshot->yield_to_maturity.scale == 4U &&
+                !sh_snapshot->yield_to_maturity.valid &&
+                sh_snapshot->total_warrant_exercise_quantity.raw == 7000 &&
+                sh_snapshot->total_warrant_exercise_quantity.scale == 3U &&
+                !sh_snapshot->total_warrant_exercise_quantity.valid &&
+                sh_snapshot->iopv.raw == 10123 &&
+                sh_snapshot->iopv.scale == 3U &&
+                !sh_snapshot->iopv.valid &&
+                HasNotice(
+                    sh_snapshot->common,
+                    market::MarketNoticeV1::kProductApplicabilityUnknown),
+            "SH product-specific fields retain nonzero raw values without inferred applicability");
+        context->Expect(
+            sh_snapshot->maximum_bid_duration.raw == 0U &&
+                sh_snapshot->maximum_bid_duration.valid &&
+                sh_snapshot->maximum_ask_duration.raw ==
+                    std::numeric_limits<std::uint32_t>::max() - 1U &&
+                sh_snapshot->maximum_ask_duration.valid &&
+                !HasNotice(
+                    sh_snapshot->common,
+                    market::MarketNoticeV1::kMaximumDurationUnavailable),
+            "SH duration zero and UINT32_MAX-1 remain independent valid raw values");
         context->Expect(
             book.actual_bid_depth == 12U &&
                 book.retained_bid_depth == 10U &&
@@ -2282,6 +3047,34 @@ void TestSnapshotNestedListsAndPublicCaps(TestContext* context) {
                         kLimitPriceSemanticsUnknown),
             "SZ unresolved limit raw extremes are retained but not factor-safe");
         context->Expect(
+            sz_snapshot->pe_ratio_1.raw == -123456 &&
+                sz_snapshot->pe_ratio_1.scale == 6U &&
+                !sz_snapshot->pe_ratio_1.valid &&
+                sz_snapshot->pe_ratio_1.normalized_p6 == 0 &&
+                sz_snapshot->pe_ratio_2.raw == 654321 &&
+                sz_snapshot->pe_ratio_2.scale == 6U &&
+                !sz_snapshot->pe_ratio_2.valid &&
+                sz_snapshot->pre_close_iopv.raw == 1'000'001 &&
+                sz_snapshot->pre_close_iopv.scale == 6U &&
+                !sz_snapshot->pre_close_iopv.valid &&
+                sz_snapshot->iopv.raw == 1'000'002 &&
+                sz_snapshot->iopv.scale == 6U &&
+                !sz_snapshot->iopv.valid &&
+                sz_snapshot->open_interest.raw == 77 &&
+                sz_snapshot->open_interest.scale == 0U &&
+                !sz_snapshot->open_interest.valid &&
+                sz_snapshot->vendor_opt_premium_ratio.raw == 88'000 &&
+                sz_snapshot->vendor_opt_premium_ratio.scale == 6U &&
+                !sz_snapshot->vendor_opt_premium_ratio.valid &&
+                HasNotice(
+                    sz_snapshot->common,
+                    market::MarketNoticeV1::kProductApplicabilityUnknown) &&
+                HasNotice(
+                    sz_snapshot->common,
+                    market::MarketNoticeV1::
+                        kVendorOptPremiumRatioSemanticsUnknown),
+            "SZ product-specific fields retain nonzero raw values without inferred applicability");
+        context->Expect(
             book.actual_bid_depth == 2U &&
                 book.retained_bid_depth == 2U &&
                 book.actual_ask_depth == 1U &&
@@ -2305,6 +3098,23 @@ void TestSnapshotNestedListsAndPublicCaps(TestContext* context) {
     }
 }
 
+void TestDecoderTradeDateDomain(TestContext* context) {
+    const auto valid = [](std::uint32_t trade_date) {
+        market::MarketDecoderConfigV1 config{};
+        config.trade_date = trade_date;
+        config.source_stream_id = kSourceStreamId;
+        return market::MarketDecoderV1(config).configuration_valid();
+    };
+    context->Expect(
+        valid(19920101U) && valid(19920229U) && valid(20000229U) &&
+            valid(22001231U),
+        "decoder accepts documented endpoints and Gregorian leap dates");
+    context->Expect(
+        !valid(19911231U) && !valid(19930229U) && !valid(21000229U) &&
+            !valid(22010101U),
+        "decoder rejects out-of-domain and non-leap trade dates");
+}
+
 }  // namespace
 
 int main() {
@@ -2316,16 +3126,21 @@ int main() {
     TestShenzhenTransactionMatrix(&context);
     TestIgnoredNumericOverflowAndPhaseHistory(&context);
     TestMatchedQuantityDomainAndFailureAtomicity(&context);
+    TestNegativeQuantityDomains(&context);
     TestOrderReferenceDomains(&context);
     TestPhaseProductLimit(&context);
     TestTimeNullInvalidAndBoundaries(&context);
+    TestAbsolutePriceDomains(&context);
+    TestMaximumDurationSentinel(&context);
+    TestProductApplicabilityNotInferredFromSecurityType(&context);
     TestSnapshotNestedListsAndPublicCaps(&context);
+    TestDecoderTradeDateDomain(&context);
 
     if (context.failures != 0) {
         std::cerr << context.failures
-                  << " Phase-4 market decoder test(s) failed\n";
+                  << " market decoder test(s) failed\n";
         return 1;
     }
-    std::cout << "Phase-4 market decoder tests passed\n";
+    std::cout << "Market decoder tests passed\n";
     return 0;
 }

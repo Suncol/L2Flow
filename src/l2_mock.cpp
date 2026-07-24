@@ -218,9 +218,11 @@ uint32_t GregorianWeekday(uint32_t raw) {
     if (month < 3U) {
         --year;
     }
-    return (year + year / 4U - year / 100U + year / 400U +
-            static_cast<int64_t>(month_offsets[month - 1U]) + day) %
-           7;
+    const int64_t weekday =
+        (year + year / 4U - year / 100U + year / 400U +
+         static_cast<int64_t>(month_offsets[month - 1U]) + day) %
+        7;
+    return static_cast<uint32_t>(weekday);
 }
 
 uint32_t NextGregorianDate(uint32_t raw) {

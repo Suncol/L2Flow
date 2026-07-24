@@ -21,6 +21,11 @@ from pathlib import Path
 
 DOMAIN = b"L2FLOW_PHASE4_INSTRUMENT_REGISTRY_V1\x00"
 MAGIC = b"L2FLOW_INSTRUMENT_REGISTRY_V1"
+# The MDL Shenzhen market messages publish the exact four-byte source key
+# ``b"102 "``.  InstrumentRegistryV1 deliberately treats this field as an
+# opaque byte string, so dropping the trailing space makes every live
+# Shenzhen lookup unknown even though the SecurityID itself is present.
+SZ_SECURITY_ID_SOURCE = b"102 "
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,8 +103,8 @@ def add_capture_ids(
                 sh.add(security_id)
                 added_sh += len(sh) - before
             elif row["ServiceID"] == "6":
-                source_id = row["SecurityIDSource"].strip()
-                if source_id != "102":
+                source_id = row["SecurityIDSource"].encode("ascii")
+                if source_id != SZ_SECURITY_ID_SOURCE:
                     raise ValueError(
                         f"unsupported Shenzhen SecurityIDSource {source_id!r}: {path}"
                     )
@@ -120,7 +125,7 @@ def encode_registry(
     version: int, sh: set[bytes], sz: set[bytes]
 ) -> tuple[bytes, str, list[tuple[int, bytes, bytes, int]]]:
     keys = [(1, b"", value) for value in sh]
-    keys.extend((2, b"102", value) for value in sz)
+    keys.extend((2, SZ_SECURITY_ID_SOURCE, value) for value in sz)
     keys.sort(key=lambda value: (value[0], value[1], value[2]))
     if not keys:
         raise ValueError("registry would be empty")
@@ -192,6 +197,7 @@ def main() -> int:
         "entry_count": len(entries),
         "shanghai_entry_count": len(sh),
         "shenzhen_entry_count": len(sz),
+        "shenzhen_security_id_source_hex": SZ_SECURITY_ID_SOURCE.hex(),
         "metadata_policy": {
             "quantity_unit": "unknown",
             "security_type": "unknown",

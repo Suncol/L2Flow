@@ -1,5 +1,6 @@
+#include "l2flow/sdk/direct_sdk_runtime_v1.h"
+#include "l2flow/sdk/production_subscription_v1.h"
 #include "l2flow/sdk/sdk_runtime.h"
-#include "l2flow/sdk/subscription_manifest.h"
 
 #include "mdl_shl2_msg.h"
 #include "mdl_szl2_msg.h"
@@ -58,7 +59,7 @@ void PrintUsage(std::ostream& output) {
         << "  --minimum-market-messages N"
            " required data messages, 0..100000 (default 1)\n"
         << "  --maximum-captured-records N"
-           " capture capacity, 1..10000000 (default 100000)\n"
+           " capture capacity, 1..200000000 (default 100000)\n"
         << "  --capture-csv PATH        write normalized captured records after"
            " clean SDK shutdown\n"
         << "  --help                    show this help\n\n"
@@ -184,10 +185,10 @@ bool ParseOptions(int argc,
                 }
                 options->minimum_market_messages = parsed;
             } else {
-                if (parsed == 0U || parsed > 10000000U) {
+                if (parsed == 0U || parsed > 200000000U) {
                     *error =
                         "--maximum-captured-records must be from 1 through "
-                        "10000000";
+                        "200000000";
                     return false;
                 }
                 options->maximum_captured_records = parsed;
@@ -213,18 +214,8 @@ bool ParseOptions(int argc,
 }
 
 std::vector<sdk::MessageKey> RequiredMessages() {
-    const std::string manifest_error = sdk::ValidateIngressSpecs();
-    if (!manifest_error.empty()) {
-        throw std::runtime_error(
-            "invalid built-in subscription manifest: " + manifest_error);
-    }
-
-    std::vector<sdk::MessageKey> result;
-    for (const sdk::IngressSpec& spec : sdk::AllIngressSpecs()) {
-        result.insert(
-            result.end(), spec.required.begin(), spec.required.end());
-    }
-    return result;
+    const auto& required = sdk::ProductionSubscriptionKeysV1();
+    return {required.begin(), required.end()};
 }
 
 struct MarketMessageSample final {
@@ -569,7 +560,9 @@ public:
         : expected_(std::move(expected)),
           maximum_captured_records_(maximum_captured_records),
           required_ok_(expected_.size(), false),
-          required_failed_(expected_.size(), false) {}
+          required_failed_(expected_.size(), false) {
+        market_records_.reserve(maximum_captured_records_);
+    }
 
     void OnMessage(
         mdl::Subscriber*,
@@ -628,6 +621,13 @@ public:
     ProbeSnapshot Snapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return SnapshotLocked();
+    }
+
+    ProbeSnapshot TakeSnapshotAfterShutdown() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ProbeSnapshot result = SnapshotLocked();
+        result.market_records = std::move(market_records_);
+        return result;
     }
 
 private:
@@ -782,7 +782,6 @@ private:
                     required_failed_[index]});
         }
         result.market_samples = market_samples_;
-        result.market_records = market_records_;
         return result;
     }
 
@@ -995,7 +994,7 @@ int Run(const Options& options) {
     std::string failure;
     std::string loader_error;
     std::shared_ptr<sdk::SdkFactory> factory =
-        sdk::LoadApprovedSdkFactory(
+        sdk::LoadSdkFactoryFromPath(
             options.library, &loader_error);
     if (factory == nullptr) {
         std::cerr << "mdl-sdk-feeder-probe: "
@@ -1119,7 +1118,7 @@ int Run(const Options& options) {
             &manager, &subscriber, &cleanup_error)) {
         AppendError(&failure, std::move(cleanup_error));
     }
-    snapshot = handler.Snapshot();
+    snapshot = handler.TakeSnapshotAfterShutdown();
     if (failure.empty() && snapshot.capture_overflow) {
         failure = "market capture capacity exceeded after wait: maximum="
                   + std::to_string(options.maximum_captured_records) +

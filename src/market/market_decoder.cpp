@@ -6,6 +6,7 @@
 
 #include "mdl_shl2_msg.h"
 #include "mdl_szl2_msg.h"
+#include "mdl_api_types.h"
 
 #include <algorithm>
 #include <array>
@@ -506,20 +507,6 @@ MarketDecodeErrorV1 LoadDecimalI64Raw(
         raw, scale, kNullI64, quality_flags, output);
 }
 
-MarketDecodeErrorV1 DecodeDecimalI32(
-    std::span<const std::byte> body,
-    std::size_t offset,
-    std::uint8_t scale,
-    std::uint64_t* quality_flags,
-    DecimalValueV1* output) noexcept {
-    std::int32_t raw = 0;
-    if (!LoadI32(body, offset, &raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    return DecodeDecimal(
-        raw, scale, kNullI32, quality_flags, output);
-}
-
 MarketDecodeErrorV1 DecodeDecimalI64(
     std::span<const std::byte> body,
     std::size_t offset,
@@ -534,13 +521,93 @@ MarketDecodeErrorV1 DecodeDecimalI64(
         raw, scale, kNullI64, quality_flags, output);
 }
 
-MarketDecodeErrorV1 DecodeQuantityI64(
+MarketDecodeErrorV1 NormalizeStrictlyPositivePriceP6(
+    DecimalValueV1* output,
+    std::uint64_t* market_notices) noexcept {
+    if (output == nullptr || market_notices == nullptr) {
+        return MarketDecodeErrorV1::kInvalidInput;
+    }
+    if (output->is_null) {
+        return MarketDecodeErrorV1::kNone;
+    }
+    if (output->raw <= 0) {
+        // Domain rejection deliberately precedes p6 multiplication.  An
+        // invalid negative extreme remains an auditable decoded value instead
+        // of turning the whole message into a fixed-point-overflow failure.
+        *market_notices |= MarketNoticeBitV1(
+            MarketNoticeV1::kAbsolutePriceDomainInvalid);
+        return MarketDecodeErrorV1::kNone;
+    }
+    return NormalizeDecimalP6(output);
+}
+
+MarketDecodeErrorV1 DecodeStrictlyPositivePriceI32(
+    std::span<const std::byte> body,
+    std::size_t offset,
+    std::uint8_t scale,
+    std::uint64_t* quality_flags,
+    std::uint64_t* market_notices,
+    DecimalValueV1* output) noexcept {
+    const MarketDecodeErrorV1 error = LoadDecimalI32Raw(
+        body, offset, scale, quality_flags, output);
+    if (error != MarketDecodeErrorV1::kNone) {
+        return error;
+    }
+    return NormalizeStrictlyPositivePriceP6(output, market_notices);
+}
+
+MarketDecodeErrorV1 DecodeStrictlyPositivePriceI64(
+    std::span<const std::byte> body,
+    std::size_t offset,
+    std::uint8_t scale,
+    std::uint64_t* quality_flags,
+    std::uint64_t* market_notices,
+    DecimalValueV1* output) noexcept {
+    const MarketDecodeErrorV1 error = LoadDecimalI64Raw(
+        body, offset, scale, quality_flags, output);
+    if (error != MarketDecodeErrorV1::kNone) {
+        return error;
+    }
+    return NormalizeStrictlyPositivePriceP6(output, market_notices);
+}
+
+MarketDecodeErrorV1 LoadQuantityI64Raw(
     std::span<const std::byte> body,
     std::size_t offset,
     std::uint8_t scale,
     bool nullable,
     std::uint64_t* quality_flags,
     QuantityValueV1* output) noexcept {
+    if (quality_flags == nullptr || output == nullptr) {
+        return MarketDecodeErrorV1::kInvalidInput;
+    }
+    std::int64_t raw = 0;
+    if (!LoadI64(body, offset, &raw)) {
+        return MarketDecodeErrorV1::kTruncated;
+    }
+    output->raw = raw;
+    output->scale = scale;
+    if (nullable && raw == kNullI64) {
+        output->is_null = true;
+        *quality_flags |= QualityBit(QualityFlagV1::kNullValuePresent);
+    }
+    // valid remains false: this helper is for exact raw retention when a
+    // versioned product-applicability contract is unavailable.
+    return MarketDecodeErrorV1::kNone;
+}
+
+MarketDecodeErrorV1 DecodeQuantityI64(
+    std::span<const std::byte> body,
+    std::size_t offset,
+    std::uint8_t scale,
+    bool nullable,
+    std::uint64_t* quality_flags,
+    std::uint64_t* market_notices,
+    QuantityValueV1* output) noexcept {
+    if (quality_flags == nullptr || market_notices == nullptr ||
+        output == nullptr) {
+        return MarketDecodeErrorV1::kInvalidInput;
+    }
     std::int64_t raw = 0;
     if (!LoadI64(body, offset, &raw)) {
         return MarketDecodeErrorV1::kTruncated;
@@ -552,7 +619,11 @@ MarketDecodeErrorV1 DecodeQuantityI64(
         *quality_flags |= QualityBit(QualityFlagV1::kNullValuePresent);
         return MarketDecodeErrorV1::kNone;
     }
-    output->valid = true;
+    output->valid = raw >= 0;
+    if (!output->valid) {
+        *market_notices |= MarketNoticeBitV1(
+            MarketNoticeV1::kQuantityDomainInvalid);
+    }
     return MarketDecodeErrorV1::kNone;
 }
 
@@ -677,20 +748,21 @@ MarketDecodeErrorV1 DecodeShLevel(
     bool bid,
     const MarketDecoderLimitsV1& limits,
     std::uint64_t* quality_flags,
+    std::uint64_t* market_notices,
     BookLevelV1* retained_level,
     BestQueueV1* best_queue) noexcept {
     const std::size_t level_offset =
         levels.start + level_index * levels.item_bytes;
     BookLevelV1 local_level{};
-    MarketDecodeErrorV1 error = DecodeDecimalI32(
+    MarketDecodeErrorV1 error = DecodeStrictlyPositivePriceI32(
         view->body(), level_offset + 4U, 3U,
-        quality_flags, &local_level.price);
+        quality_flags, market_notices, &local_level.price);
     if (error != MarketDecodeErrorV1::kNone) {
         return error;
     }
     error = DecodeQuantityI64(
         view->body(), level_offset + 8U, 3U, true,
-        quality_flags, &local_level.quantity);
+        quality_flags, market_notices, &local_level.quantity);
     if (error != MarketDecodeErrorV1::kNone) {
         return error;
     }
@@ -726,6 +798,7 @@ MarketDecodeErrorV1 DecodeShLevel(
             3U,
             true,
             quality_flags,
+            market_notices,
             &quantity);
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
@@ -754,6 +827,7 @@ MarketDecodeErrorV1 DecodeSzLevel(
     std::size_t level_index,
     const MarketDecoderLimitsV1& limits,
     std::uint64_t* quality_flags,
+    std::uint64_t* market_notices,
     BookLevelV1* retained_level,
     BestQueueV1* best_queue) noexcept {
     const std::size_t level_offset =
@@ -761,13 +835,13 @@ MarketDecodeErrorV1 DecodeSzLevel(
     BookLevelV1 local_level{};
     MarketDecodeErrorV1 error = DecodeQuantityI64(
         view->body(), level_offset, 0U, false,
-        quality_flags, &local_level.quantity);
+        quality_flags, market_notices, &local_level.quantity);
     if (error != MarketDecodeErrorV1::kNone) {
         return error;
     }
-    error = DecodeDecimalI64(
+    error = DecodeStrictlyPositivePriceI64(
         view->body(), level_offset + 8U, 6U,
-        quality_flags, &local_level.price);
+        quality_flags, market_notices, &local_level.price);
     if (error != MarketDecodeErrorV1::kNone) {
         return error;
     }
@@ -803,6 +877,7 @@ MarketDecodeErrorV1 DecodeSzLevel(
             0U,
             false,
             quality_flags,
+            market_notices,
             &quantity);
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
@@ -882,12 +957,13 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
         return MarketDecodeErrorV1::kTruncated;
     }
 
-    const auto decimal32 = [&](std::size_t offset,
-                               std::uint8_t scale,
-                               DecimalValueV1* value) {
-        return DecodeDecimalI32(
+    const auto price32 = [&](std::size_t offset,
+                             std::uint8_t scale,
+                             DecimalValueV1* value) {
+        return DecodeStrictlyPositivePriceI32(
             input.body, offset, scale,
-            &decoded.common.quality_flags, value);
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, value);
     };
     const auto decimal64 = [&](std::size_t offset,
                                std::uint8_t scale,
@@ -901,7 +977,8 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
                                 QuantityValueV1* value) {
         return DecodeQuantityI64(
             input.body, offset, scale, true,
-            &decoded.common.quality_flags, value);
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, value);
     };
 #define L2FLOW_DECODE_OR_RETURN(expression)                                  \
     do {                                                                     \
@@ -910,53 +987,71 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
             return error;                                                    \
         }                                                                    \
     } while (false)
-    L2FLOW_DECODE_OR_RETURN(decimal32(14U, 3U, &decoded.pre_close_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(18U, 3U, &decoded.open_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(22U, 3U, &decoded.high_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(26U, 3U, &decoded.low_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(30U, 3U, &decoded.last_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(34U, 3U, &decoded.close_price));
+    L2FLOW_DECODE_OR_RETURN(price32(14U, 3U, &decoded.pre_close_price));
+    L2FLOW_DECODE_OR_RETURN(price32(18U, 3U, &decoded.open_price));
+    L2FLOW_DECODE_OR_RETURN(price32(22U, 3U, &decoded.high_price));
+    L2FLOW_DECODE_OR_RETURN(price32(26U, 3U, &decoded.low_price));
+    L2FLOW_DECODE_OR_RETURN(price32(30U, 3U, &decoded.last_price));
+    L2FLOW_DECODE_OR_RETURN(price32(34U, 3U, &decoded.close_price));
     if (!LoadUnsigned(input.body, 44U, &decoded.trade_count)) {
         return MarketDecodeErrorV1::kTruncated;
     }
     L2FLOW_DECODE_OR_RETURN(quantity64(48U, 3U, &decoded.trade_volume));
     L2FLOW_DECODE_OR_RETURN(decimal64(56U, 5U, &decoded.turnover));
     L2FLOW_DECODE_OR_RETURN(quantity64(64U, 3U, &decoded.total_bid_volume));
-    L2FLOW_DECODE_OR_RETURN(decimal32(
+    L2FLOW_DECODE_OR_RETURN(price32(
         72U, 3U, &decoded.weighted_average_bid_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(
+    L2FLOW_DECODE_OR_RETURN(price32(
         76U, 3U, &decoded.alternate_weighted_average_bid_price));
     L2FLOW_DECODE_OR_RETURN(quantity64(80U, 3U, &decoded.total_ask_volume));
-    L2FLOW_DECODE_OR_RETURN(decimal32(
+    L2FLOW_DECODE_OR_RETURN(price32(
         88U, 3U, &decoded.weighted_average_ask_price));
-    L2FLOW_DECODE_OR_RETURN(decimal32(
+    L2FLOW_DECODE_OR_RETURN(price32(
         92U, 3U, &decoded.alternate_weighted_average_ask_price));
     if (!LoadUnsigned(
-            input.body, 96U, &decoded.etf_subscription_count)) {
+            input.body, 96U, &decoded.vendor_etf_buy_count.raw)) {
         return MarketDecodeErrorV1::kTruncated;
     }
-    L2FLOW_DECODE_OR_RETURN(quantity64(
-        100U, 3U, &decoded.etf_subscription_quantity));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
-        108U, 5U, &decoded.etf_subscription_amount));
+    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
+        input.body, 100U, 3U, true,
+        &decoded.common.quality_flags,
+        &decoded.vendor_etf_buy_quantity));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 108U, 5U,
+        &decoded.common.quality_flags,
+        &decoded.vendor_etf_buy_amount));
     if (!LoadUnsigned(
-            input.body, 116U, &decoded.etf_redemption_count)) {
+            input.body, 116U, &decoded.vendor_etf_sell_count.raw)) {
         return MarketDecodeErrorV1::kTruncated;
     }
-    L2FLOW_DECODE_OR_RETURN(quantity64(
-        120U, 3U, &decoded.etf_redemption_quantity));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
-        128U, 5U, &decoded.etf_redemption_amount));
-    L2FLOW_DECODE_OR_RETURN(decimal32(136U, 4U, &decoded.yield_to_maturity));
-    L2FLOW_DECODE_OR_RETURN(quantity64(
-        140U, 3U, &decoded.total_warrant_exercise_quantity));
+    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
+        input.body, 120U, 3U, true,
+        &decoded.common.quality_flags,
+        &decoded.vendor_etf_sell_quantity));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 128U, 5U,
+        &decoded.common.quality_flags,
+        &decoded.vendor_etf_sell_amount));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI32Raw(
+        input.body, 136U, 4U,
+        &decoded.common.quality_flags,
+        &decoded.yield_to_maturity));
+    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
+        input.body, 140U, 3U, true,
+        &decoded.common.quality_flags,
+        &decoded.total_warrant_exercise_quantity));
     L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
         input.body, 148U, 3U, &decoded.common.quality_flags,
-        &decoded.legacy_war_lower_value));
+        &decoded.vendor_war_lower_value));
     decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kLegacyWarLowerSemanticsUnknown);
-    L2FLOW_DECODE_OR_RETURN(decimal64(
-        156U, 5U, &decoded.high_precision_iopv));
+        MarketNoticeV1::kVendorWarLowerSemanticsUnknown);
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 156U, 5U, &decoded.common.quality_flags,
+        &decoded.vendor_war_upper_value));
+    decoded.common.market_notices |= MarketNoticeBitV1(
+        MarketNoticeV1::kVendorWarUpperSemanticsUnknown);
+    decoded.common.market_notices |= MarketNoticeBitV1(
+        MarketNoticeV1::kProductApplicabilityUnknown);
     if (!LoadUnsigned(input.body, 164U, &decoded.withdrawal_buy_count)) {
         return MarketDecodeErrorV1::kTruncated;
     }
@@ -976,18 +1071,25 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
         !LoadUnsigned(
             input.body, 208U, &decoded.total_ask_order_count) ||
         !LoadUnsigned(
-            input.body, 212U, &decoded.maximum_bid_duration) ||
+            input.body, 212U, &decoded.maximum_bid_duration.raw) ||
         !LoadUnsigned(
-            input.body, 216U, &decoded.maximum_ask_duration)) {
+            input.body, 216U, &decoded.maximum_ask_duration.raw)) {
         return MarketDecodeErrorV1::kTruncated;
     }
-    std::uint32_t declared_bid_depth = 0U;
-    std::uint32_t declared_ask_depth = 0U;
-    if (!LoadUnsigned(input.body, 220U, &declared_bid_depth) ||
-        !LoadUnsigned(input.body, 224U, &declared_ask_depth)) {
-        return MarketDecodeErrorV1::kTruncated;
+    decoded.maximum_bid_duration.valid =
+        decoded.maximum_bid_duration.raw !=
+        std::numeric_limits<std::uint32_t>::max();
+    decoded.maximum_ask_duration.valid =
+        decoded.maximum_ask_duration.raw !=
+        std::numeric_limits<std::uint32_t>::max();
+    if (!decoded.maximum_bid_duration.valid ||
+        !decoded.maximum_ask_duration.valid) {
+        decoded.common.market_notices |= MarketNoticeBitV1(
+            MarketNoticeV1::kMaximumDurationUnavailable);
     }
-    L2FLOW_DECODE_OR_RETURN(decimal32(244U, 3U, &decoded.iopv));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI32Raw(
+        input.body, 244U, 3U,
+        &decoded.common.quality_flags, &decoded.iopv));
 
     CheckedBodyRangeV1 bids;
     body_error = view.ReadList(
@@ -1003,12 +1105,13 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
     if (body_error != CheckedBodyErrorV1::kNone) {
         return TranslateBodyError(body_error);
     }
-    if (bids.count != declared_bid_depth ||
-        asks.count != declared_ask_depth) {
-        return MarketDecodeErrorV1::kCountMismatch;
-    }
-    decoded.book.actual_bid_depth = declared_bid_depth;
-    decoded.book.actual_ask_depth = declared_ask_depth;
+    // SHL2MarketData::BidNum/SellNum are independent feed counters, not the
+    // MDLListT lengths.  Live continuous-trading messages routinely carry,
+    // for example, BidNum=43 and SellNum=74 while both level lists contain
+    // the published ten-depth book.  The list descriptors are the only
+    // authoritative bounds for the following dynamic level payloads.
+    decoded.book.actual_bid_depth = static_cast<std::uint32_t>(bids.count);
+    decoded.book.actual_ask_depth = static_cast<std::uint32_t>(asks.count);
     decoded.book.retained_bid_depth = static_cast<std::uint32_t>(
         std::min(bids.count, kMaximumPublicDepthV1));
     decoded.book.retained_ask_depth = static_cast<std::uint32_t>(
@@ -1020,7 +1123,8 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
                 : nullptr;
         L2FLOW_DECODE_OR_RETURN(DecodeShLevel(
             &view, bids, index, true, config.limits,
-            &decoded.common.quality_flags, retained,
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, retained,
             &decoded.book.bid1_queue));
     }
     for (std::size_t index = 0U; index < asks.count; ++index) {
@@ -1030,7 +1134,8 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
                 : nullptr;
         L2FLOW_DECODE_OR_RETURN(DecodeShLevel(
             &view, asks, index, false, config.limits,
-            &decoded.common.quality_flags, retained,
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, retained,
             &decoded.book.ask1_queue));
     }
     ApplyDepthQuality(bids.count, asks.count, &decoded.common);
@@ -1087,11 +1192,6 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         MarketEventKindV1::kShanghaiTick,
         MarketV1::kShanghai,
         exchange_time_raw);
-    const bool phase_attribution_deferred =
-        config.shanghai_phase_attribution ==
-        ShanghaiPhaseAttributionModeV1::kDeferred;
-    decoded.common.sh_phase_attribution_deferred =
-        phase_attribution_deferred;
     MarketDecodeErrorV1 error = ReadText(
         &view, 12U, sizeof(sh::NGTSTick),
         config.limits.maximum_text_bytes, true,
@@ -1150,6 +1250,7 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
     error = DecodeQuantityI64(
         input.body, 48U, 0U, false,
         &decoded.common.quality_flags,
+        &decoded.common.market_notices,
         &decoded.fields.quantity);
     if (error != MarketDecodeErrorV1::kNone) {
         return error;
@@ -1166,8 +1267,7 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
     }
 
     const auto set_phase_from_history = [&]() {
-        if (phase_attribution_deferred ||
-            !decoded.common.security_id_valid) {
+        if (!decoded.common.security_id_valid) {
             return;
         }
         const auto found = phases->find(decoded.common.security_id);
@@ -1200,14 +1300,18 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
 
     if (decoded.raw_type == "A") {
         decoded.fields.action = TickActionV1::kAdd;
-        error = NormalizeDecimalP6(&decoded.fields.price);
+        error = NormalizeStrictlyPositivePriceP6(
+            &decoded.fields.price,
+            &decoded.common.market_notices);
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
         }
         if (decoded.fields.price.valid) {
             decoded.fields.validity_bitmap |= kTickPriceValidV1;
         }
-        decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        if (decoded.fields.quantity.valid) {
+            decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        }
         set_order_side();
         if (decoded.fields.trade_amount.is_null) {
             // NULL_VALUE_PRESENT already describes this case; null is not a
@@ -1234,12 +1338,16 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         decoded.fields.action = TickActionV1::kCancel;
         decoded.fields.price.valid = false;
         decoded.fields.trade_amount.valid = false;
-        decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        if (decoded.fields.quantity.valid) {
+            decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        }
         set_order_side();
         set_phase_from_history();
     } else if (decoded.raw_type == "T") {
         decoded.fields.action = TickActionV1::kTrade;
-        error = NormalizeDecimalP6(&decoded.fields.price);
+        error = NormalizeStrictlyPositivePriceP6(
+            &decoded.fields.price,
+            &decoded.common.market_notices);
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
         }
@@ -1250,7 +1358,9 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         if (decoded.fields.price.valid) {
             decoded.fields.validity_bitmap |= kTickPriceValidV1;
         }
-        decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        if (decoded.fields.quantity.valid) {
+            decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        }
         if (decoded.fields.trade_amount.valid) {
             decoded.fields.validity_bitmap |=
                 kTickTradeAmountValidV1;
@@ -1287,8 +1397,7 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         } else {
             decoded.fields.validity_bitmap |= kTickPhaseValidV1;
         }
-        if (!phase_attribution_deferred &&
-            decoded.fields.phase != TradingPhaseV1::kUnknown &&
+        if (decoded.fields.phase != TradingPhaseV1::kUnknown &&
             decoded.common.security_id_valid &&
             decoded.raw_tick_flag_valid) {
             const auto existing = phases->find(decoded.common.security_id);
@@ -1386,11 +1495,20 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
             input.body, offset, scale,
             &decoded.common.quality_flags, value);
     };
+    const auto price64 = [&](std::size_t offset,
+                             std::uint8_t scale,
+                             DecimalValueV1* value) {
+        return DecodeStrictlyPositivePriceI64(
+            input.body, offset, scale,
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, value);
+    };
     const auto quantity64 = [&](std::size_t offset,
                                 QuantityValueV1* value) {
         return DecodeQuantityI64(
             input.body, offset, 0U, false,
-            &decoded.common.quality_flags, value);
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, value);
     };
 #define L2FLOW_DECODE_OR_RETURN(expression)                                  \
     do {                                                                     \
@@ -1399,29 +1517,37 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
             return error;                                                    \
         }                                                                    \
     } while (false)
-    L2FLOW_DECODE_OR_RETURN(decimal64(32U, 4U, &decoded.pre_close_price));
+    L2FLOW_DECODE_OR_RETURN(price64(32U, 4U, &decoded.pre_close_price));
     L2FLOW_DECODE_OR_RETURN(quantity64(48U, &decoded.volume));
     L2FLOW_DECODE_OR_RETURN(decimal64(56U, 4U, &decoded.turnover));
-    L2FLOW_DECODE_OR_RETURN(decimal64(64U, 6U, &decoded.last_price));
-    L2FLOW_DECODE_OR_RETURN(decimal64(72U, 6U, &decoded.open_price));
-    L2FLOW_DECODE_OR_RETURN(decimal64(80U, 6U, &decoded.high_price));
-    L2FLOW_DECODE_OR_RETURN(decimal64(88U, 6U, &decoded.low_price));
+    L2FLOW_DECODE_OR_RETURN(price64(64U, 6U, &decoded.last_price));
+    L2FLOW_DECODE_OR_RETURN(price64(72U, 6U, &decoded.open_price));
+    L2FLOW_DECODE_OR_RETURN(price64(80U, 6U, &decoded.high_price));
+    L2FLOW_DECODE_OR_RETURN(price64(88U, 6U, &decoded.low_price));
     L2FLOW_DECODE_OR_RETURN(decimal64(96U, 6U, &decoded.price_change_1));
     L2FLOW_DECODE_OR_RETURN(decimal64(104U, 6U, &decoded.price_change_2));
-    L2FLOW_DECODE_OR_RETURN(decimal64(112U, 6U, &decoded.pe_ratio_1));
-    L2FLOW_DECODE_OR_RETURN(decimal64(120U, 6U, &decoded.pe_ratio_2));
-    L2FLOW_DECODE_OR_RETURN(decimal64(128U, 6U, &decoded.pre_close_iopv));
-    L2FLOW_DECODE_OR_RETURN(decimal64(136U, 6U, &decoded.iopv));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 112U, 6U,
+        &decoded.common.quality_flags, &decoded.pe_ratio_1));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 120U, 6U,
+        &decoded.common.quality_flags, &decoded.pe_ratio_2));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 128U, 6U,
+        &decoded.common.quality_flags, &decoded.pre_close_iopv));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 136U, 6U,
+        &decoded.common.quality_flags, &decoded.iopv));
     L2FLOW_DECODE_OR_RETURN(quantity64(144U, &decoded.total_ask_quantity));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
+    L2FLOW_DECODE_OR_RETURN(price64(
         152U, 6U, &decoded.weighted_average_ask_price));
     L2FLOW_DECODE_OR_RETURN(quantity64(160U, &decoded.total_bid_quantity));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
+    L2FLOW_DECODE_OR_RETURN(price64(
         168U, 6U, &decoded.weighted_average_bid_price));
-    // No authoritative sentinel table is present in this Phase-4 slice.
+    // No authoritative sentinel table is present in this decoder.
     // Preserve exact raw values but do not publish them as factor-safe finite
     // prices merely because they fit int64/p6.  Versioned reference policy
-    // must resolve kUnknown before a later Canonical/factor layer uses them.
+    // must resolve kUnknown before a downstream calculator uses them.
     L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
         input.body, 176U, 6U, &decoded.common.quality_flags,
         &decoded.high_limit_price));
@@ -1430,9 +1556,16 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
         &decoded.low_limit_price));
     decoded.common.market_notices |= MarketNoticeBitV1(
         MarketNoticeV1::kLimitPriceSemanticsUnknown);
-    L2FLOW_DECODE_OR_RETURN(quantity64(192U, &decoded.open_interest));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
-        200U, 6U, &decoded.warrant_premium_ratio));
+    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
+        input.body, 192U, 0U, false,
+        &decoded.common.quality_flags, &decoded.open_interest));
+    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
+        input.body, 200U, 6U, &decoded.common.quality_flags,
+        &decoded.vendor_opt_premium_ratio));
+    decoded.common.market_notices |= MarketNoticeBitV1(
+        MarketNoticeV1::kVendorOptPremiumRatioSemanticsUnknown);
+    decoded.common.market_notices |= MarketNoticeBitV1(
+        MarketNoticeV1::kProductApplicabilityUnknown);
 
     CheckedBodyRangeV1 bids;
     body_error = view.ReadList(
@@ -1461,7 +1594,8 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
                 : nullptr;
         L2FLOW_DECODE_OR_RETURN(DecodeSzLevel(
             &view, bids, index, config.limits,
-            &decoded.common.quality_flags, retained,
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, retained,
             &decoded.book.bid1_queue));
     }
     for (std::size_t index = 0U; index < asks.count; ++index) {
@@ -1471,7 +1605,8 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
                 : nullptr;
         L2FLOW_DECODE_OR_RETURN(DecodeSzLevel(
             &view, asks, index, config.limits,
-            &decoded.common.quality_flags, retained,
+            &decoded.common.quality_flags,
+            &decoded.common.market_notices, retained,
             &decoded.book.ask1_queue));
     }
     ApplyDepthQuality(bids.count, asks.count, &decoded.common);
@@ -1575,10 +1710,16 @@ MarketDecodeErrorV1 DecodeShenzhenOrder(
         return MarketDecodeErrorV1::kTruncated;
     }
     decoded.fields.quantity.scale = 0U;
-    decoded.fields.quantity.valid = true;
+    decoded.fields.quantity.valid = decoded.fields.quantity.raw >= 0;
+    if (!decoded.fields.quantity.valid) {
+        decoded.common.market_notices |= MarketNoticeBitV1(
+            MarketNoticeV1::kQuantityDomainInvalid);
+    }
     decoded.fields.action = TickActionV1::kAdd;
     decoded.fields.primary_order_id = decoded.application_sequence;
-    decoded.fields.validity_bitmap = kTickQuantityValidV1;
+    if (decoded.fields.quantity.valid) {
+        decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+    }
     if (decoded.application_sequence > 0) {
         decoded.fields.validity_bitmap |= kTickPrimaryOrderIdValidV1;
     } else {
@@ -1616,7 +1757,9 @@ MarketDecodeErrorV1 DecodeShenzhenOrder(
         decoded.fields.validity_bitmap |= kTickOrderTypeValidV1;
     }
     if (decoded.fields.order_type == OrderTypeV1::kLimit) {
-        error = NormalizeDecimalP6(&decoded.fields.price);
+        error = NormalizeStrictlyPositivePriceP6(
+            &decoded.fields.price,
+            &decoded.common.market_notices);
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
         }
@@ -1674,7 +1817,11 @@ MarketDecodeErrorV1 DecodeShenzhenTransaction(
             MarketNoticeV1::kOrderReferenceDomainInvalid);
     }
     decoded.fields.quantity.scale = 0U;
-    decoded.fields.quantity.valid = true;
+    decoded.fields.quantity.valid = decoded.fields.quantity.raw >= 0;
+    if (!decoded.fields.quantity.valid) {
+        decoded.common.market_notices |= MarketNoticeBitV1(
+            MarketNoticeV1::kQuantityDomainInvalid);
+    }
     error = LoadDecimalI64Raw(
         input.body, 46U, 4U,
         &decoded.common.quality_flags,
@@ -1697,18 +1844,24 @@ MarketDecodeErrorV1 DecodeShenzhenTransaction(
     if (decoded.raw_execution_type == 70) {
         decoded.fields.action = TickActionV1::kTrade;
         publish_known_order_ids();
-        error = NormalizeDecimalP6(&decoded.fields.price);
+        error = NormalizeStrictlyPositivePriceP6(
+            &decoded.fields.price,
+            &decoded.common.market_notices);
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
         }
-        decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        if (decoded.fields.quantity.valid) {
+            decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        }
         if (decoded.fields.price.valid) {
             decoded.fields.validity_bitmap |= kTickPriceValidV1;
         }
     } else if (decoded.raw_execution_type == 52) {
         decoded.fields.action = TickActionV1::kCancel;
         publish_known_order_ids();
-        decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        if (decoded.fields.quantity.valid) {
+            decoded.fields.validity_bitmap |= kTickQuantityValidV1;
+        }
         // Zero means no referenced order for SZ transactions; negative IDs
         // are retained as raw diagnostics but never count as present.
         const bool has_bid = decoded.fields.buy_order_id > 0;
@@ -1765,11 +1918,7 @@ MarketDecoderV1::MarketDecoderV1(
         config_.limits.maximum_text_bytes != 0U &&
         config_.limits.maximum_depth_items != 0U &&
         config_.limits.maximum_queue_items != 0U &&
-        config_.limits.maximum_phase_products != 0U &&
-        (config_.shanghai_phase_attribution ==
-             ShanghaiPhaseAttributionModeV1::kStateful ||
-         config_.shanghai_phase_attribution ==
-             ShanghaiPhaseAttributionModeV1::kDeferred);
+        config_.limits.maximum_phase_products != 0U;
 }
 
 MarketDecodeErrorV1 MarketDecoderV1::Decode(
@@ -1784,6 +1933,8 @@ MarketDecodeErrorV1 MarketDecoderV1::Decode(
     if (input.trade_date != config_.trade_date ||
         input.source_stream_id != config_.source_stream_id ||
         input.source_sequence == 0U ||
+        input.message_encoding != static_cast<std::uint8_t>(
+            datayes::mdl::MDLEID_BINARY) ||
         input.body.size() > config_.limits.maximum_body_bytes) {
         return MarketDecodeErrorV1::kInvalidInput;
     }

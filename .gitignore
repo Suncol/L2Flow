@@ -1,5 +1,6 @@
 /build*/
 /cmake-build*/
+/artifacts/
 /.cache/
 __pycache__/
 *.py[cod]

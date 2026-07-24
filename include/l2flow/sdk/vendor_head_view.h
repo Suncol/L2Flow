@@ -21,7 +21,7 @@ template <typename T>
     return value;
 }
 
-// Reads the approved 23-byte wire header from an owned byte copy. It never
+// Reads the vendor-defined 23-byte wire header from an owned byte copy. It never
 // dereferences the vendor's packed MDLMessageHead as a C++ object.
 class VendorHeadView {
 public:

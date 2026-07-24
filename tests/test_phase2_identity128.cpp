@@ -162,9 +162,9 @@ int main() {
 
     if (test.failures != 0) {
         std::cerr << test.failures
-                  << " Phase 2 identity tests failed\n";
+                  << " identity tests failed\n";
         return 1;
     }
-    std::cout << "Phase 2 identity tests passed\n";
+    std::cout << "Identity tests passed\n";
     return 0;
 }

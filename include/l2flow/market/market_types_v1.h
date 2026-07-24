@@ -10,9 +10,8 @@
 
 namespace l2flow::market {
 
-// These values describe the decoded, owned Phase-4 view.  They are not a
-// persistent Canonical schema and deliberately do not reuse vendor packed
-// enums or structs.
+// These values describe the decoded, owned market view. They deliberately do
+// not reuse vendor packed enums or structs.
 enum class MarketV1 : std::uint8_t {
     kUnknown = 0U,
     kShanghai = 1U,
@@ -98,7 +97,7 @@ enum class TradingPhaseV1 : std::uint8_t {
 
 // A numeric high/low limit is not factor-safe until versioned reference data
 // has distinguished an ordinary finite value from the vendor's business
-// sentinels.  Phase 4 retains the raw wire integer but defaults to unknown;
+// sentinels. The decoder retains the raw wire integer but defaults to unknown;
 // it never guesses from magnitude.
 enum class LimitPriceSemanticsV1 : std::uint8_t {
     kUnknown = 0U,
@@ -108,9 +107,13 @@ enum class LimitPriceSemanticsV1 : std::uint8_t {
 
 struct DecimalValueV1 final {
     // Exact vendor fixed-point integer and scale are retained even when the
-    // action-specific validity matrix makes this field meaningless.  Only a
-    // semantically valid field is normalized to p6; no floating-point round
-    // trip is involved.
+    // field is null, action-inapplicable, product applicability is unknown,
+    // or a documented domain check fails.  valid means the decoder has both
+    // normalized the field to p6 without overflow and accepted it under that
+    // field's explicit action/product/domain contract.  It does not by itself
+    // make a value suitable for an arbitrary financial calculation: each
+    // calculator must still enforce its own documented economic constraints.
+    // No floating-point round trip is involved in normalized_p6.
     std::int64_t raw = 0;
     std::int64_t normalized_p6 = 0;
     std::uint8_t scale = 0U;
@@ -128,6 +131,13 @@ struct QuantityValueV1 final {
     bool is_null = false;
 };
 
+struct UnsignedValueV1 final {
+    // Exact unsigned vendor wire value.  The owning field documents why valid
+    // may be false; consumers must never infer validity from raw alone.
+    std::uint32_t raw = 0U;
+    bool valid = false;
+};
+
 struct TimeValueV1 final {
     std::uint32_t raw_hhmmssmmm = 0U;
     std::uint64_t nanoseconds_since_midnight = 0U;
@@ -142,7 +152,8 @@ struct TimeValueV1 final {
 struct MarketMessageViewV1 final {
     std::uint32_t source_stream_id = 0U;
     std::uint32_t trade_date = 0U;
-    // A caller-owned, per-source callback/Raw order.  Zero is not accepted.
+    // A caller-owned, dense per-source ingress order. Zero is not accepted;
+    // the value has no WAL-position or exchange-time meaning.
     std::uint64_t source_sequence = 0U;
     std::uint8_t service_id = 0U;
     std::uint16_t service_version = 0U;
@@ -155,8 +166,8 @@ struct MarketMessageViewV1 final {
     std::span<const std::byte> body;
 };
 
-// Phase-4-specific notices supplement the frozen Phase-3 quality bitmap.
-// They intentionally do not consume undocumented QualityFlagV1 bit numbers.
+// Decoder-specific notices supplement the shared quality bitmap. They
+// intentionally do not consume undocumented QualityFlagV1 bit numbers.
 enum class MarketNoticeV1 : std::uint8_t {
     kExchangeTimeInvalid = 0U,
     kVendorLocalTimeInvalid,
@@ -165,7 +176,13 @@ enum class MarketNoticeV1 : std::uint8_t {
     kMatchedQuantityDomainInvalid,
     kEventSequenceDomainInvalid,
     kOrderReferenceDomainInvalid,
-    kLegacyWarLowerSemanticsUnknown,
+    kVendorWarLowerSemanticsUnknown,
+    kVendorWarUpperSemanticsUnknown,
+    kVendorOptPremiumRatioSemanticsUnknown,
+    kQuantityDomainInvalid,
+    kAbsolutePriceDomainInvalid,
+    kProductApplicabilityUnknown,
+    kMaximumDurationUnavailable,
 };
 
 [[nodiscard]] constexpr std::uint64_t MarketNoticeBitV1(
@@ -179,7 +196,7 @@ struct DecodedMarketCommonV1 final {
     MarketV1 market = MarketV1::kUnknown;
     MarketMessageViewV1 origin{};
     // origin.body is cleared before publication so an owned event never
-    // retains callback- or Raw-view-scoped memory.
+    // retains callback-message-scoped memory.
     TimeValueV1 exchange_time{};
     // SDK header LocalTime is retained only as a validated time-of-day;
     // without a trusted capture calendar date its Unix projection is always
@@ -197,12 +214,6 @@ struct DecodedMarketCommonV1 final {
     AssetScopeV1 asset_scope = AssetScopeV1::kUnknown;
     std::uint64_t quality_flags = 0U;
     std::uint64_t market_notices = 0U;
-    // A Phase-5 sequence guard must decide whether an SH status event is
-    // accepted before it mutates product-phase history.  When true, the
-    // decoder parsed the status event but deliberately did not read or update
-    // its internal phase map; the accepting downstream normalizer owns phase
-    // attribution and commit.
-    bool sh_phase_attribution_deferred = false;
 };
 
 inline constexpr std::size_t kMaximumPublicDepthV1 = 10U;
@@ -253,22 +264,26 @@ struct ShanghaiSnapshotV1 final {
     QuantityValueV1 total_ask_volume{};
     DecimalValueV1 weighted_average_ask_price{};
     DecimalValueV1 alternate_weighted_average_ask_price{};
-    // Vendor EtfBuy* means ETF subscription and EtfSell* means redemption.
-    std::uint32_t etf_subscription_count = 0U;
-    QuantityValueV1 etf_subscription_quantity{};
-    DecimalValueV1 etf_subscription_amount{};
-    std::uint32_t etf_redemption_count = 0U;
-    QuantityValueV1 etf_redemption_quantity{};
-    DecimalValueV1 etf_redemption_amount{};
+    // Neutral names preserve the vendor's EtfBuy*/EtfSell* groups without
+    // asserting subscription/redemption semantics absent a versioned field
+    // dictionary.
+    // No versioned instrument-capability table currently proves that this
+    // vendor ETF group applies to a registry row.  V1 retains exact raw values
+    // but publishes every member invalid, even for coarse SecurityType::kFund.
+    UnsignedValueV1 vendor_etf_buy_count{};
+    QuantityValueV1 vendor_etf_buy_quantity{};
+    DecimalValueV1 vendor_etf_buy_amount{};
+    UnsignedValueV1 vendor_etf_sell_count{};
+    QuantityValueV1 vendor_etf_sell_quantity{};
+    DecimalValueV1 vendor_etf_sell_amount{};
     DecimalValueV1 yield_to_maturity{};
     QuantityValueV1 total_warrant_exercise_quantity{};
-    // Legacy WarLowerPri has been assigned product/version-dependent
-    // meanings.  V1 retains raw/scale with valid=false until applicability
-    // policy is pinned; consumers must not assume it is a warrant price.
-    DecimalValueV1 legacy_war_lower_value{};
-    // The legacy vendor member name is WarUpperPri; in this V4 schema the
-    // p5 value is the high-precision ETF IOPV, not a warrant upper limit.
-    DecimalValueV1 high_precision_iopv{};
+    // The SDK calls these fields WarLowerPri and WarUpperPri, but no
+    // authoritative product/version applicability table is available here.
+    // V1 therefore retains raw/scale with valid=false; consumers must not
+    // infer warrant-price, IOPV, or other financial semantics from the names.
+    DecimalValueV1 vendor_war_lower_value{};
+    DecimalValueV1 vendor_war_upper_value{};
     std::uint32_t withdrawal_buy_count = 0U;
     QuantityValueV1 withdrawal_buy_volume{};
     DecimalValueV1 withdrawal_buy_amount{};
@@ -277,8 +292,10 @@ struct ShanghaiSnapshotV1 final {
     DecimalValueV1 withdrawal_sell_amount{};
     std::uint32_t total_bid_order_count = 0U;
     std::uint32_t total_ask_order_count = 0U;
-    std::uint32_t maximum_bid_duration = 0U;
-    std::uint32_t maximum_ask_duration = 0U;
+    // Units are intentionally not guessed.  UINT32_MAX is the observed
+    // unavailable sentinel; every other raw value, including zero, is valid.
+    UnsignedValueV1 maximum_bid_duration{};
+    UnsignedValueV1 maximum_ask_duration{};
     DecimalValueV1 iopv{};
     SnapshotBookV1 book{};
 };
@@ -358,8 +375,9 @@ struct ShenzhenSnapshotV1 final {
     LimitPriceSemanticsV1 low_limit_semantics =
         LimitPriceSemanticsV1::kUnknown;
     QuantityValueV1 open_interest{};
-    // Vendor OptPremiumRatio is the warrant premium ratio in this feed.
-    DecimalValueV1 warrant_premium_ratio{};
+    // The SDK calls this OptPremiumRatio. Raw/scale are retained with
+    // valid=false until a versioned business dictionary pins its meaning.
+    DecimalValueV1 vendor_opt_premium_ratio{};
     SnapshotBookV1 book{};
 };
 

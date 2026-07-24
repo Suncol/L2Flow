@@ -1,0 +1,1112 @@
+#include "l2flow/common/identity128.h"
+#include "l2flow/common/sha256.h"
+#include "l2flow/market/instrument_registry_loader_v1.h"
+#include "l2flow/runtime/realtime_pipeline_v1.h"
+
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <set>
+#include <span>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+namespace {
+
+namespace common = l2flow::common;
+namespace factor = l2flow::factor;
+namespace market = l2flow::market;
+namespace runtime = l2flow::runtime;
+
+constexpr std::size_t kEventKindCount = 5U;
+constexpr std::uint64_t kNanosecondsPerSecond = UINT64_C(1'000'000'000);
+
+struct Options final {
+    std::filesystem::path sdk_library;
+    std::filesystem::path registry_directory;
+    std::string registry_file;
+    std::uint64_t registry_version = 0U;
+    common::Sha256Digest registry_sha256{};
+    bool registry_sha_set = false;
+    std::uint32_t trade_date = 0U;
+    std::string server_address;
+    std::filesystem::path user_name_file;
+    std::filesystem::path sdk_log_prefix;
+    std::filesystem::path report_json;
+    std::filesystem::path samples_csv;
+    std::uint32_t duration_seconds = 600U;
+    std::uint32_t generation_interval_ms = 1000U;
+    std::uint32_t generation_timeout_ms = 10'000U;
+    std::uint32_t history_workers = 4U;
+    std::uint32_t acquire_repetitions = 32U;
+};
+
+struct UnsignedDistribution final {
+    void Add(std::uint64_t value) { values.push_back(value); }
+    std::vector<std::uint64_t> values;
+};
+
+struct SignedDistribution final {
+    void Add(std::int64_t value) { values.push_back(value); }
+    std::vector<std::int64_t> values;
+};
+
+struct SampleRow final {
+    std::uint64_t elapsed_ns = 0U;
+    std::uint64_t accepted = 0U;
+    std::uint64_t decoded = 0U;
+    std::uint64_t accepted_delta = 0U;
+    std::uint64_t decoded_delta = 0U;
+    std::array<std::uint64_t, market::kRealtimeHistorySourceCountV1>
+        source_delta{};
+    std::uint64_t generation = 0U;
+    std::uint64_t ingress_prefix = 0U;
+    std::uint64_t cut_latency_ns = 0U;
+    std::uint64_t acquire_p50_ns = 0U;
+    std::uint64_t acquire_p99_ns = 0U;
+    std::uint64_t generation_age_ns = 0U;
+    std::uint64_t global_head_recv_age_ns = 0U;
+    std::int64_t global_head_event_age_ns = 0;
+    std::uint64_t updated_heads = 0U;
+    std::uint64_t updated_recv_age_p50_ns = 0U;
+    std::uint64_t updated_recv_age_p99_ns = 0U;
+    std::int64_t updated_event_age_p50_ns = 0;
+    std::int64_t updated_event_age_p99_ns = 0;
+};
+
+struct AcceptanceState final {
+    bool valid = true;
+    std::string first_error;
+    std::uint64_t generations = 0U;
+    std::uint64_t universe_rows_checked = 0U;
+    std::uint64_t retained_records_checked = 0U;
+    std::uint64_t updated_heads = 0U;
+    std::uint64_t event_time_samples = 0U;
+    std::array<bool, kEventKindCount> event_kinds_seen{};
+    std::vector<std::uint64_t> last_seen_head_by_universe_index;
+    UnsignedDistribution cut_latency_ns;
+    UnsignedDistribution acquire_latency_ns;
+    UnsignedDistribution generation_age_ns;
+    UnsignedDistribution global_head_recv_age_ns;
+    SignedDistribution global_head_event_age_ns;
+    UnsignedDistribution updated_head_recv_age_ns;
+    SignedDistribution updated_head_event_age_ns;
+    std::vector<SampleRow> samples;
+};
+
+class FileDescriptor final {
+public:
+    explicit FileDescriptor(int value = -1) noexcept : value_(value) {}
+    ~FileDescriptor() {
+        if (value_ >= 0) {
+            static_cast<void>(::close(value_));
+        }
+    }
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+    [[nodiscard]] int get() const noexcept { return value_; }
+    [[nodiscard]] bool valid() const noexcept { return value_ >= 0; }
+
+private:
+    int value_ = -1;
+};
+
+void Fail(AcceptanceState* state, std::string message) {
+    state->valid = false;
+    if (state->first_error.empty()) {
+        state->first_error = std::move(message);
+    }
+}
+
+[[nodiscard]] bool ClockNs(clockid_t clock, std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    struct timespec value {};
+    if (::clock_gettime(clock, &value) != 0 || value.tv_sec < 0 ||
+        value.tv_nsec < 0 || value.tv_nsec >= 1'000'000'000L) {
+        return false;
+    }
+    const std::uint64_t seconds = static_cast<std::uint64_t>(value.tv_sec);
+    if (seconds >
+        (std::numeric_limits<std::uint64_t>::max() -
+         static_cast<std::uint64_t>(value.tv_nsec)) /
+            kNanosecondsPerSecond) {
+        return false;
+    }
+    *output = seconds * kNanosecondsPerSecond +
+              static_cast<std::uint64_t>(value.tv_nsec);
+    return true;
+}
+
+[[nodiscard]] bool ParseU32(
+    std::string_view text,
+    std::uint32_t* output) noexcept {
+    if (output == nullptr || text.empty()) {
+        return false;
+    }
+    std::uint32_t value = 0U;
+    const std::from_chars_result parsed = std::from_chars(
+        text.data(), text.data() + text.size(), value, 10);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != text.data() + text.size()) {
+        return false;
+    }
+    *output = value;
+    return true;
+}
+
+[[nodiscard]] bool ParseU64(
+    std::string_view text,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr || text.empty()) {
+        return false;
+    }
+    std::uint64_t value = 0U;
+    const std::from_chars_result parsed = std::from_chars(
+        text.data(), text.data() + text.size(), value, 10);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != text.data() + text.size()) {
+        return false;
+    }
+    *output = value;
+    return true;
+}
+
+[[nodiscard]] bool SafeFileName(std::string_view value) noexcept {
+    return !value.empty() && value != "." && value != ".." &&
+           value.find('/') == std::string_view::npos &&
+           value.find('\0') == std::string_view::npos;
+}
+
+void PrintUsage(std::ostream& output) {
+    output
+        << "Usage: accept-realtime-pipeline [options]\n"
+        << "Required:\n"
+        << "  --sdk-library ABS\n"
+        << "  --registry-directory ABS\n"
+        << "  --registry-file NAME\n"
+        << "  --registry-version N\n"
+        << "  --registry-sha256 HEX64\n"
+        << "  --trade-date YYYYMMDD\n"
+        << "  --server-address HOST:PORT\n"
+        << "  --user-name-file ABS\n"
+        << "  --sdk-log-prefix ABS\n"
+        << "  --report-json ABS\n"
+        << "  --samples-csv ABS\n"
+        << "Optional:\n"
+        << "  --duration-seconds N          default 600\n"
+        << "  --generation-interval-ms N    default 1000\n"
+        << "  --generation-timeout-ms N     default 10000\n"
+        << "  --history-workers N           default 4\n"
+        << "  --acquire-repetitions N       default 32\n";
+}
+
+[[nodiscard]] bool TakeValue(
+    int argc,
+    char* argv[],
+    int* index,
+    std::string_view option,
+    std::string_view* output,
+    std::string* error) {
+    if (*index + 1 >= argc || argv[*index + 1] == nullptr) {
+        *error = std::string(option) + " requires a value";
+        return false;
+    }
+    *output = argv[++*index];
+    if (output->empty()) {
+        *error = std::string(option) + " rejects an empty value";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool ParseOptions(
+    int argc,
+    char* argv[],
+    Options* output,
+    bool* help,
+    std::string* error) {
+    if (output == nullptr || help == nullptr || error == nullptr) {
+        return false;
+    }
+    Options parsed{};
+    std::set<std::string_view> seen;
+    for (int index = 1; index < argc; ++index) {
+        if (argv[index] == nullptr) {
+            *error = "argv contains null";
+            return false;
+        }
+        const std::string_view option(argv[index]);
+        if (option == "--help") {
+            if (argc != 2) {
+                *error = "--help must be used alone";
+                return false;
+            }
+            *help = true;
+            return true;
+        }
+        if (!seen.insert(option).second) {
+            *error = "duplicate option: " + std::string(option);
+            return false;
+        }
+        std::string_view value;
+        if (!TakeValue(argc, argv, &index, option, &value, error)) {
+            return false;
+        }
+        if (option == "--sdk-library") {
+            parsed.sdk_library = value;
+        } else if (option == "--registry-directory") {
+            parsed.registry_directory = value;
+        } else if (option == "--registry-file") {
+            parsed.registry_file = value;
+        } else if (option == "--registry-version") {
+            if (!ParseU64(value, &parsed.registry_version)) {
+                *error = "invalid --registry-version";
+                return false;
+            }
+        } else if (option == "--registry-sha256") {
+            if (!common::ParseSha256Hex(
+                    value, &parsed.registry_sha256, error)) {
+                return false;
+            }
+            parsed.registry_sha_set = true;
+        } else if (option == "--trade-date") {
+            if (!ParseU32(value, &parsed.trade_date)) {
+                *error = "invalid --trade-date";
+                return false;
+            }
+        } else if (option == "--server-address") {
+            parsed.server_address = value;
+        } else if (option == "--user-name-file") {
+            parsed.user_name_file = value;
+        } else if (option == "--sdk-log-prefix") {
+            parsed.sdk_log_prefix = value;
+        } else if (option == "--report-json") {
+            parsed.report_json = value;
+        } else if (option == "--samples-csv") {
+            parsed.samples_csv = value;
+        } else {
+            std::uint32_t number = 0U;
+            if (!ParseU32(value, &number) || number == 0U) {
+                *error = "invalid numeric option: " + std::string(option);
+                return false;
+            }
+            if (option == "--duration-seconds") {
+                parsed.duration_seconds = number;
+            } else if (option == "--generation-interval-ms") {
+                parsed.generation_interval_ms = number;
+            } else if (option == "--generation-timeout-ms") {
+                parsed.generation_timeout_ms = number;
+            } else if (option == "--history-workers") {
+                parsed.history_workers = number;
+            } else if (option == "--acquire-repetitions") {
+                parsed.acquire_repetitions = number;
+            } else {
+                *error = "unknown option: " + std::string(option);
+                return false;
+            }
+        }
+    }
+    const auto absolute = [](const std::filesystem::path& path) {
+        return path.is_absolute() &&
+               path.native().find('\0') == std::string::npos;
+    };
+    if (!absolute(parsed.sdk_library) ||
+        !absolute(parsed.registry_directory) ||
+        !SafeFileName(parsed.registry_file) ||
+        parsed.registry_version == 0U || !parsed.registry_sha_set ||
+        parsed.trade_date == 0U || parsed.server_address.empty() ||
+        !absolute(parsed.user_name_file) ||
+        !absolute(parsed.sdk_log_prefix) ||
+        !absolute(parsed.report_json) || !absolute(parsed.samples_csv) ||
+        parsed.duration_seconds > 86'400U ||
+        parsed.generation_interval_ms > 60'000U ||
+        parsed.generation_timeout_ms > 600'000U ||
+        parsed.history_workers > 256U ||
+        parsed.acquire_repetitions > 10'000U) {
+        *error = "required option missing or option is out of range";
+        return false;
+    }
+    *output = std::move(parsed);
+    return true;
+}
+
+[[nodiscard]] bool ReadSecret(
+    const std::filesystem::path& path,
+    std::string* output,
+    std::string* error) {
+    FileDescriptor fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (!fd.valid()) {
+        *error = "cannot open user-name file";
+        return false;
+    }
+    struct stat metadata {};
+    if (::fstat(fd.get(), &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_size <= 0 || metadata.st_size > 4096) {
+        *error = "user-name file metadata is invalid";
+        return false;
+    }
+    std::string value(static_cast<std::size_t>(metadata.st_size), '\0');
+    std::size_t offset = 0U;
+    while (offset < value.size()) {
+        const ssize_t count = ::read(
+            fd.get(), value.data() + offset, value.size() - offset);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            *error = "cannot read complete user-name file";
+            return false;
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    while (!value.empty() &&
+           (value.back() == '\n' || value.back() == '\r')) {
+        value.pop_back();
+    }
+    if (value.empty() || value.find('\0') != std::string::npos) {
+        *error = "user-name file content is invalid";
+        return false;
+    }
+    *output = std::move(value);
+    return true;
+}
+
+template <typename T>
+[[nodiscard]] T QuantileOfSorted(
+    std::span<const T> sorted,
+    long double quantile) noexcept {
+    if (sorted.empty()) {
+        return T{};
+    }
+    const long double position =
+        quantile * static_cast<long double>(sorted.size() - 1U);
+    const std::size_t index = static_cast<std::size_t>(std::ceil(position));
+    return sorted[index];
+}
+
+template <typename T>
+[[nodiscard]] T Quantile(std::vector<T> values, long double quantile) {
+    std::sort(values.begin(), values.end());
+    return QuantileOfSorted<T>(values, quantile);
+}
+
+void WriteJsonString(std::ostream& output, std::string_view value) {
+    output.put('"');
+    for (const unsigned char byte : value) {
+        switch (byte) {
+            case '"': output << "\\\""; break;
+            case '\\': output << "\\\\"; break;
+            case '\n': output << "\\n"; break;
+            case '\r': output << "\\r"; break;
+            case '\t': output << "\\t"; break;
+            default:
+                if (byte < 0x20U) {
+                    output << "\\u00" << std::hex << std::setw(2)
+                           << std::setfill('0')
+                           << static_cast<unsigned int>(byte) << std::dec
+                           << std::setfill(' ');
+                } else {
+                    output.put(static_cast<char>(byte));
+                }
+                break;
+        }
+    }
+    output.put('"');
+}
+
+template <typename T>
+void WriteDistributionJson(
+    std::ostream& output,
+    std::vector<T> values) {
+    std::sort(values.begin(), values.end());
+    long double sum = 0.0L;
+    for (const T value : values) {
+        sum += static_cast<long double>(value);
+    }
+    output << "{\"count\":" << values.size();
+    if (values.empty()) {
+        output << ",\"min\":0,\"p50\":0,\"p90\":0,\"p95\":0,"
+                  "\"p99\":0,\"p999\":0,\"max\":0,\"mean\":0}";
+        return;
+    }
+    output << ",\"min\":" << values.front()
+           << ",\"p50\":" << QuantileOfSorted<T>(values, 0.50L)
+           << ",\"p90\":" << QuantileOfSorted<T>(values, 0.90L)
+           << ",\"p95\":" << QuantileOfSorted<T>(values, 0.95L)
+           << ",\"p99\":" << QuantileOfSorted<T>(values, 0.99L)
+           << ",\"p999\":" << QuantileOfSorted<T>(values, 0.999L)
+           << ",\"max\":" << values.back()
+           << ",\"mean\":" << std::fixed << std::setprecision(3)
+           << (sum / static_cast<long double>(values.size()))
+           << std::defaultfloat << '}';
+}
+
+[[nodiscard]] std::size_t EventKindIndex(
+    market::MarketEventKindV1 kind) noexcept {
+    const std::uint8_t raw = static_cast<std::uint8_t>(kind);
+    return raw == 0U || raw > kEventKindCount
+               ? kEventKindCount
+               : static_cast<std::size_t>(raw - 1U);
+}
+
+[[nodiscard]] bool SnapshotKind(market::MarketEventKindV1 kind) noexcept {
+    return kind == market::MarketEventKindV1::kShanghaiSnapshot ||
+           kind == market::MarketEventKindV1::kShenzhenSnapshot;
+}
+
+void ValidateWatermark(
+    const market::RealtimeHistoryGenerationV1& generation,
+    const market::InstrumentRegistryV1& registry,
+    AcceptanceState* state) {
+    const market::RealtimeHistoryWatermarkV1& watermark =
+        generation.watermark();
+    std::uint64_t sum = 0U;
+    for (const market::RealtimeSourceWatermarkV1& source :
+         watermark.sources) {
+        if (source.sequence_exclusive == 0U ||
+            sum > std::numeric_limits<std::uint64_t>::max() -
+                      (source.sequence_exclusive - 1U)) {
+            Fail(state, "invalid or overflowing source watermark");
+            return;
+        }
+        sum += source.sequence_exclusive - 1U;
+    }
+    if (watermark.ingress_sequence_exclusive == 0U ||
+        watermark.ingress_sequence_exclusive - 1U != sum ||
+        watermark.registry_version != registry.registry_version() ||
+        watermark.registry_sha256 != registry.registry_sha256()) {
+        Fail(state, "history watermark identity/prefix invariant failed");
+    }
+}
+
+void ValidateGenerationAndCollect(
+    const std::shared_ptr<const market::RealtimeHistoryGenerationV1>& generation,
+    const market::InstrumentRegistryV1& registry,
+    std::uint64_t read_realtime_ns,
+    std::uint64_t read_monotonic_ns,
+    AcceptanceState* state,
+    SampleRow* sample) {
+    if (generation == nullptr) {
+        Fail(state, "published history handle is null");
+        return;
+    }
+    ValidateWatermark(*generation, registry, state);
+    const auto rows = generation->instruments();
+    const auto entries = registry.entries();
+    if (rows.size() != entries.size() ||
+        state->last_seen_head_by_universe_index.size() != rows.size()) {
+        Fail(state, "history generation does not contain exact registry universe");
+        return;
+    }
+    if (generation->watermark().recv_monotonic_cut_ns > read_monotonic_ns) {
+        Fail(state, "history generation cut is in the monotonic-clock future");
+        return;
+    }
+    sample->generation_age_ns =
+        read_monotonic_ns - generation->watermark().recv_monotonic_cut_ns;
+    state->generation_age_ns.Add(sample->generation_age_ns);
+
+    market::RealtimeHistoryRecordHandleV1 global_head;
+    std::vector<std::uint64_t> local_recv_ages;
+    std::vector<std::int64_t> local_event_ages;
+    for (std::size_t index = 0U; index < rows.size(); ++index) {
+        const market::RealtimeInstrumentGenerationV1& row = rows[index];
+        if (row.instrument_id != entries[index].instrument_id) {
+            Fail(state, "history universe ordering/identity mismatch");
+            return;
+        }
+        ++state->universe_rows_checked;
+        if (row.history.empty()) {
+            continue;
+        }
+        const market::RealtimeHistoryRecordHandleV1& head = row.history.back();
+        if (head == nullptr || head->instrument_id() != row.instrument_id ||
+            head->ingress_sequence() >=
+                generation->watermark().ingress_sequence_exclusive ||
+            head->recv_monotonic_ns() < 0 ||
+            static_cast<std::uint64_t>(head->recv_monotonic_ns()) >
+                read_monotonic_ns) {
+            Fail(state, "history head metadata/timestamp invariant failed");
+            return;
+        }
+        if (global_head == nullptr ||
+            global_head->ingress_sequence() < head->ingress_sequence()) {
+            global_head = head;
+        }
+        const std::size_t kind_index = EventKindIndex(head->kind());
+        if (kind_index < state->event_kinds_seen.size()) {
+            state->event_kinds_seen[kind_index] = true;
+        }
+        if (head->ingress_sequence() >
+            state->last_seen_head_by_universe_index[index]) {
+            state->last_seen_head_by_universe_index[index] =
+                head->ingress_sequence();
+            const std::uint64_t recv_age = read_monotonic_ns -
+                static_cast<std::uint64_t>(head->recv_monotonic_ns());
+            state->updated_head_recv_age_ns.Add(recv_age);
+            local_recv_ages.push_back(recv_age);
+            ++state->updated_heads;
+            ++sample->updated_heads;
+            if (head->event_time_ns() > 0 &&
+                read_realtime_ns <= static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max())) {
+                const std::int64_t event_age =
+                    static_cast<std::int64_t>(read_realtime_ns) -
+                    head->event_time_ns();
+                state->updated_head_event_age_ns.Add(event_age);
+                local_event_ages.push_back(event_age);
+                ++state->event_time_samples;
+            }
+        }
+    }
+    if (global_head == nullptr) {
+        Fail(state, "published generation contains no market history head");
+        return;
+    }
+    sample->global_head_recv_age_ns = read_monotonic_ns -
+        static_cast<std::uint64_t>(global_head->recv_monotonic_ns());
+    state->global_head_recv_age_ns.Add(sample->global_head_recv_age_ns);
+    if (global_head->event_time_ns() > 0 &&
+        read_realtime_ns <= static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max())) {
+        sample->global_head_event_age_ns =
+            static_cast<std::int64_t>(read_realtime_ns) -
+            global_head->event_time_ns();
+        state->global_head_event_age_ns.Add(
+            sample->global_head_event_age_ns);
+    }
+    if (!local_recv_ages.empty()) {
+        sample->updated_recv_age_p50_ns =
+            Quantile(local_recv_ages, 0.50L);
+        sample->updated_recv_age_p99_ns =
+            Quantile(std::move(local_recv_ages), 0.99L);
+    }
+    if (!local_event_ages.empty()) {
+        sample->updated_event_age_p50_ns =
+            Quantile(local_event_ages, 0.50L);
+        sample->updated_event_age_p99_ns =
+            Quantile(std::move(local_event_ages), 0.99L);
+    }
+}
+
+void ValidateFinalRetainedHistory(
+    const market::RealtimeHistoryGenerationV1& generation,
+    std::size_t maximum_records_per_instrument,
+    AcceptanceState* state) {
+    const market::RealtimeHistoryWatermarkV1& watermark =
+        generation.watermark();
+    for (const market::RealtimeInstrumentGenerationV1& row :
+         generation.instruments()) {
+        if (row.history.size() > maximum_records_per_instrument) {
+            Fail(state, "bounded history capacity was exceeded");
+            return;
+        }
+        std::uint64_t previous = 0U;
+        for (const market::RealtimeHistoryRecordHandleV1& record : row.history) {
+            if (record == nullptr || record->instrument_id() != row.instrument_id ||
+                record->ingress_sequence() <= previous ||
+                record->ingress_sequence() >=
+                    watermark.ingress_sequence_exclusive ||
+                record->source_slot() >= watermark.sources.size() ||
+                record->source_sequence() >=
+                    watermark.sources[record->source_slot()].sequence_exclusive) {
+                Fail(state, "final retained history ordering/content invariant failed");
+                return;
+            }
+            previous = record->ingress_sequence();
+            ++state->retained_records_checked;
+            const std::size_t kind_index = EventKindIndex(record->kind());
+            if (kind_index < state->event_kinds_seen.size()) {
+                state->event_kinds_seen[kind_index] = true;
+            }
+        }
+        if (row.latest_snapshot != nullptr &&
+            (!SnapshotKind(row.latest_snapshot->kind()) ||
+             row.latest_snapshot->instrument_id() != row.instrument_id)) {
+            Fail(state, "latest_snapshot has invalid kind/instrument");
+            return;
+        }
+        if (row.latest_tick != nullptr &&
+            (SnapshotKind(row.latest_tick->kind()) ||
+             row.latest_tick->instrument_id() != row.instrument_id)) {
+            Fail(state, "latest_tick has invalid kind/instrument");
+            return;
+        }
+    }
+}
+
+[[nodiscard]] bool WriteSamples(
+    const std::filesystem::path& path,
+    const std::vector<SampleRow>& samples,
+    std::string* error) {
+    std::ofstream output(path, std::ios::out | std::ios::trunc);
+    if (!output.is_open()) {
+        *error = "cannot create samples CSV";
+        return false;
+    }
+    output
+        << "elapsed_ns,accepted,decoded,accepted_delta,decoded_delta,"
+           "source0_delta,source1_delta,source2_delta,source3_delta,"
+           "generation,ingress_prefix,cut_latency_ns,acquire_p50_ns,"
+           "acquire_p99_ns,generation_age_ns,global_head_recv_age_ns,"
+           "global_head_event_age_ns,updated_heads,"
+           "updated_recv_age_p50_ns,updated_recv_age_p99_ns,"
+           "updated_event_age_p50_ns,updated_event_age_p99_ns\n";
+    for (const SampleRow& row : samples) {
+        output << row.elapsed_ns << ',' << row.accepted << ',' << row.decoded
+               << ',' << row.accepted_delta << ',' << row.decoded_delta;
+        for (const std::uint64_t delta : row.source_delta) {
+            output << ',' << delta;
+        }
+        output << ',' << row.generation << ',' << row.ingress_prefix << ','
+               << row.cut_latency_ns << ',' << row.acquire_p50_ns << ','
+               << row.acquire_p99_ns << ',' << row.generation_age_ns << ','
+               << row.global_head_recv_age_ns << ','
+               << row.global_head_event_age_ns << ',' << row.updated_heads
+               << ',' << row.updated_recv_age_p50_ns << ','
+               << row.updated_recv_age_p99_ns << ','
+               << row.updated_event_age_p50_ns << ','
+               << row.updated_event_age_p99_ns << '\n';
+    }
+    output.flush();
+    if (!output.good()) {
+        *error = "samples CSV write failed";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool AllKindsSeen(
+    const std::array<bool, kEventKindCount>& seen) noexcept {
+    return std::all_of(seen.begin(), seen.end(), [](bool value) {
+        return value;
+    });
+}
+
+[[nodiscard]] int Run(const Options& options) {
+    std::string user_name;
+    std::string error;
+    if (!ReadSecret(options.user_name_file, &user_name, &error)) {
+        std::cerr << "accept-realtime-pipeline: " << error << '\n';
+        return 2;
+    }
+
+    FileDescriptor registry_directory_fd(::open(
+        options.registry_directory.c_str(),
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!registry_directory_fd.valid()) {
+        std::cerr << "accept-realtime-pipeline: cannot open registry directory\n";
+        return 2;
+    }
+    market::InstrumentRegistryFileOptionsV1 registry_options{};
+    registry_options.directory_fd = registry_directory_fd.get();
+    registry_options.file_name = options.registry_file;
+    registry_options.expected_owner_uid =
+        static_cast<std::uint32_t>(::getuid());
+    registry_options.expected_registry_version = options.registry_version;
+    registry_options.expected_registry_sha256 = options.registry_sha256;
+    market::InstrumentRegistryFileResultV1 registry_result =
+        market::LoadInstrumentRegistryFileV1(registry_options);
+    if (!registry_result.ok()) {
+        std::cerr << "accept-realtime-pipeline: registry load failed: "
+                  << market::InstrumentRegistryFileErrorNameV1(
+                         registry_result.error)
+                  << " line=" << registry_result.line
+                  << " errno=" << registry_result.system_error_number << '\n';
+        return 2;
+    }
+
+    common::Identity128 run_id{};
+    int entropy_error = 0;
+    if (!common::GenerateIdentity128(&run_id, &entropy_error)) {
+        std::cerr << "accept-realtime-pipeline: run-id failed errno="
+                  << entropy_error << '\n';
+        return 2;
+    }
+
+    runtime::RealtimePipelineConfigV1 config{};
+    config.run_id = run_id;
+    config.trade_date = options.trade_date;
+    config.registry = registry_result.registry.get();
+    config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
+    config.history_worker_count = options.history_workers;
+    config.enforce_receive_trade_date = true;
+    config.sdk.enabled = true;
+    config.sdk.library_path = options.sdk_library;
+    config.sdk.server_address = options.server_address;
+    config.sdk.user_name = std::move(user_name);
+    config.sdk.log_prefix = options.sdk_log_prefix.string();
+    config.sdk.message_encoding = datayes::mdl::MDLEID_BINARY;
+    config.sdk.merge_message = false;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    const runtime::RealtimePipelineCreateErrorV1 create_error =
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail);
+    if (create_error != runtime::RealtimePipelineCreateErrorV1::kNone ||
+        pipeline == nullptr) {
+        std::cerr << "accept-realtime-pipeline: create failed: "
+                  << runtime::RealtimePipelineCreateErrorNameV1(create_error)
+                  << (detail.empty() ? "" : ": ") << detail << '\n';
+        return 2;
+    }
+
+    AcceptanceState state{};
+    state.last_seen_head_by_universe_index.resize(
+        registry_result.registry->size(), 0U);
+    const runtime::RealtimePipelineSnapshotV1 initial = pipeline->Snapshot();
+    runtime::RealtimePipelineSnapshotV1 previous = initial;
+    std::uint64_t start_monotonic_ns = 0U;
+    std::uint64_t end_monotonic_ns = 0U;
+    if (!ClockNs(CLOCK_MONOTONIC, &start_monotonic_ns)) {
+        pipeline->StopAndDrain();
+        std::cerr << "accept-realtime-pipeline: cannot read start clock\n";
+        return 2;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(options.duration_seconds);
+    const auto interval =
+        std::chrono::milliseconds(options.generation_interval_ms);
+    const auto timeout =
+        std::chrono::milliseconds(options.generation_timeout_ms);
+    auto next = start + interval;
+    std::shared_ptr<const market::RealtimeHistoryGenerationV1> last_history;
+
+    while (next <= deadline) {
+        std::this_thread::sleep_until(next);
+        if (pipeline->fatal()) {
+            Fail(&state, "pipeline became fatal during the measurement window");
+            break;
+        }
+        std::uint64_t cut_start_ns = 0U;
+        std::uint64_t cut_end_ns = 0U;
+        if (!ClockNs(CLOCK_MONOTONIC, &cut_start_ns)) {
+            Fail(&state, "cannot read cut start clock");
+            break;
+        }
+        const runtime::RealtimePipelineCutResultV1 cut =
+            pipeline->CutAndPublishGeneration(timeout);
+        if (!ClockNs(CLOCK_MONOTONIC, &cut_end_ns)) {
+            Fail(&state, "cannot read cut end clock");
+            break;
+        }
+        if (!cut.published()) {
+            Fail(
+                &state,
+                "generation cut failed: " +
+                    std::string(runtime::RealtimePipelineCutErrorNameV1(
+                        cut.error)));
+            break;
+        }
+        SampleRow sample{};
+        sample.cut_latency_ns = cut_end_ns - cut_start_ns;
+        state.cut_latency_ns.Add(sample.cut_latency_ns);
+        ++state.generations;
+
+        std::vector<std::uint64_t> local_acquire;
+        local_acquire.reserve(options.acquire_repetitions);
+        std::shared_ptr<const market::RealtimeHistoryGenerationV1> acquired;
+        for (std::uint32_t repetition = 0U;
+             repetition < options.acquire_repetitions;
+             ++repetition) {
+            std::uint64_t before_ns = 0U;
+            std::uint64_t after_ns = 0U;
+            if (!ClockNs(CLOCK_MONOTONIC, &before_ns)) {
+                Fail(&state, "cannot read history acquire start clock");
+                break;
+            }
+            acquired = pipeline->AcquireLatestHistoryGeneration();
+            if (!ClockNs(CLOCK_MONOTONIC, &after_ns)) {
+                Fail(&state, "cannot read history acquire end clock");
+                break;
+            }
+            const std::uint64_t latency = after_ns - before_ns;
+            local_acquire.push_back(latency);
+            state.acquire_latency_ns.Add(latency);
+        }
+        if (!state.valid) {
+            break;
+        }
+        if (acquired.get() != cut.history_generation.get()) {
+            Fail(&state, "AcquireLatestHistoryGeneration returned wrong handle");
+            break;
+        }
+        sample.acquire_p50_ns = Quantile(local_acquire, 0.50L);
+        sample.acquire_p99_ns = Quantile(std::move(local_acquire), 0.99L);
+
+        const std::shared_ptr<const factor::RealtimeFactorGenerationV1> factor =
+            pipeline->AcquireLatestFactorGeneration();
+        if (factor == nullptr ||
+            factor.get() != cut.factor_generation.get() ||
+            factor->input_history().get() != cut.history_generation.get() ||
+            factor->points().size() != registry_result.registry->size()) {
+            Fail(&state, "factor/history atomic generation contract failed");
+            break;
+        }
+
+        std::uint64_t read_realtime_ns = 0U;
+        std::uint64_t read_monotonic_ns = 0U;
+        if (!ClockNs(CLOCK_REALTIME, &read_realtime_ns) ||
+            !ClockNs(CLOCK_MONOTONIC, &read_monotonic_ns)) {
+            Fail(&state, "cannot read history observation clocks");
+            break;
+        }
+        ValidateGenerationAndCollect(
+            cut.history_generation,
+            *registry_result.registry,
+            read_realtime_ns,
+            read_monotonic_ns,
+            &state,
+            &sample);
+        if (!state.valid) {
+            break;
+        }
+
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            pipeline->Snapshot();
+        sample.elapsed_ns = read_monotonic_ns - start_monotonic_ns;
+        sample.accepted = snapshot.accepted_messages;
+        sample.decoded = snapshot.decoded_messages;
+        sample.accepted_delta = snapshot.accepted_messages -
+            previous.accepted_messages;
+        sample.decoded_delta = snapshot.decoded_messages -
+            previous.decoded_messages;
+        for (std::size_t source = 0U;
+             source < sample.source_delta.size();
+             ++source) {
+            sample.source_delta[source] = snapshot.source_sequences[source] -
+                previous.source_sequences[source];
+        }
+        sample.generation = cut.history_generation->watermark().generation;
+        sample.ingress_prefix =
+            cut.history_generation->watermark().ingress_sequence_exclusive - 1U;
+        if (sample.ingress_prefix > snapshot.decoded_messages ||
+            snapshot.rejected_messages != 0U || snapshot.fatal) {
+            Fail(&state, "snapshot prefix/rejection/fatal invariant failed");
+            break;
+        }
+        previous = snapshot;
+        last_history = cut.history_generation;
+        state.samples.push_back(sample);
+        next += interval;
+    }
+
+    if (std::chrono::steady_clock::now() < deadline && state.valid) {
+        std::this_thread::sleep_until(deadline);
+    }
+    std::uint64_t final_start_ns = 0U;
+    std::uint64_t final_end_ns = 0U;
+    static_cast<void>(ClockNs(CLOCK_MONOTONIC, &final_start_ns));
+    const runtime::RealtimePipelineCutResultV1 final_cut =
+        pipeline->StopAndPublishFinalGeneration(timeout);
+    static_cast<void>(ClockNs(CLOCK_MONOTONIC, &final_end_ns));
+    if (final_end_ns >= final_start_ns) {
+        state.cut_latency_ns.Add(final_end_ns - final_start_ns);
+    }
+    if (!final_cut.published()) {
+        Fail(
+            &state,
+            "final generation failed: " +
+                std::string(runtime::RealtimePipelineCutErrorNameV1(
+                    final_cut.error)));
+    } else {
+        last_history = final_cut.history_generation;
+        ValidateFinalRetainedHistory(
+            *final_cut.history_generation,
+            config.maximum_history_records_per_instrument,
+            &state);
+    }
+    const runtime::RealtimePipelineSnapshotV1 final_snapshot =
+        pipeline->Snapshot();
+    if (!ClockNs(CLOCK_MONOTONIC, &end_monotonic_ns)) {
+        end_monotonic_ns = final_end_ns;
+    }
+    const std::uint64_t measured_window_ns =
+        end_monotonic_ns >= start_monotonic_ns
+            ? end_monotonic_ns - start_monotonic_ns
+            : 0U;
+    const std::uint64_t required_window_ns =
+        static_cast<std::uint64_t>(options.duration_seconds) *
+        kNanosecondsPerSecond;
+    if (measured_window_ns < required_window_ns ||
+        final_snapshot.accepted_messages == 0U ||
+        final_snapshot.accepted_messages != final_snapshot.decoded_messages ||
+        final_snapshot.rejected_messages != 0U || final_snapshot.fatal ||
+        !final_snapshot.stopped || last_history == nullptr ||
+        !AllKindsSeen(state.event_kinds_seen)) {
+        Fail(&state, "final duration/count/state/five-kind acceptance gate failed");
+    }
+
+    const std::filesystem::path report_temporary =
+        options.report_json.string() + ".tmp";
+    const std::filesystem::path samples_temporary =
+        options.samples_csv.string() + ".tmp";
+    if (!WriteSamples(samples_temporary, state.samples, &error)) {
+        std::cerr << "accept-realtime-pipeline: " << error << '\n';
+        return 2;
+    }
+    std::ofstream report(report_temporary, std::ios::out | std::ios::trunc);
+    if (!report.is_open()) {
+        std::cerr << "accept-realtime-pipeline: cannot create report JSON\n";
+        return 2;
+    }
+    const std::uint64_t accepted_in_window =
+        final_snapshot.accepted_messages - initial.accepted_messages;
+    const long double seconds =
+        static_cast<long double>(measured_window_ns) /
+        static_cast<long double>(kNanosecondsPerSecond);
+    const long double accepted_per_second = seconds > 0.0L
+        ? static_cast<long double>(accepted_in_window) / seconds
+        : 0.0L;
+    report << "{\n  \"schema_version\":1,\n"
+           << "  \"passed\":" << (state.valid ? "true" : "false")
+           << ",\n  \"first_error\":";
+    WriteJsonString(report, state.first_error);
+    report << ",\n  \"requested_window_seconds\":"
+           << options.duration_seconds
+           << ",\n  \"measured_window_ns\":" << measured_window_ns
+           << ",\n  \"generation_interval_ms\":"
+           << options.generation_interval_ms
+           << ",\n  \"history_workers\":" << options.history_workers
+           << ",\n  \"registry_version\":"
+           << registry_result.registry->registry_version()
+           << ",\n  \"registry_sha256\":\""
+           << common::Sha256Hex(registry_result.registry->registry_sha256())
+           << "\",\n  \"registry_entries\":"
+           << registry_result.registry->size()
+           << ",\n  \"sdk_library\":";
+    WriteJsonString(report, options.sdk_library.string());
+    report << ",\n  \"server_address\":";
+    WriteJsonString(report, options.server_address);
+    report << ",\n  \"counts\":{\"accepted\":"
+           << final_snapshot.accepted_messages
+           << ",\"decoded\":" << final_snapshot.decoded_messages
+           << ",\"ignored\":" << final_snapshot.ignored_messages
+           << ",\"rejected\":" << final_snapshot.rejected_messages
+           << ",\"generations_sampled\":" << state.generations
+           << ",\"last_published_generation\":"
+           << final_snapshot.last_published_generation
+           << ",\"updated_instrument_heads\":" << state.updated_heads
+           << ",\"event_time_samples\":" << state.event_time_samples
+           << ",\"universe_rows_checked\":"
+           << state.universe_rows_checked
+           << ",\"final_retained_records_checked\":"
+           << state.retained_records_checked << "},\n"
+           << "  \"source_sequences\":[";
+    for (std::size_t source = 0U;
+         source < final_snapshot.source_sequences.size();
+         ++source) {
+        if (source != 0U) {
+            report.put(',');
+        }
+        report << final_snapshot.source_sequences[source];
+    }
+    report << "],\n  \"event_kinds_seen\":[";
+    for (std::size_t kind = 0U; kind < state.event_kinds_seen.size(); ++kind) {
+        if (kind != 0U) {
+            report.put(',');
+        }
+        report << (state.event_kinds_seen[kind] ? "true" : "false");
+    }
+    report << "],\n  \"throughput\":{\"accepted_per_second\":"
+           << std::fixed << std::setprecision(3) << accepted_per_second
+           << ",\"decoded_per_second\":" << accepted_per_second
+           << std::defaultfloat << "},\n"
+           << "  \"latency_ns\":{\n"
+           << "    \"generation_cut_and_factor\":";
+    WriteDistributionJson(report, state.cut_latency_ns.values);
+    report << ",\n    \"history_acquire_call\":";
+    WriteDistributionJson(report, state.acquire_latency_ns.values);
+    report << ",\n    \"generation_cut_to_read\":";
+    WriteDistributionJson(report, state.generation_age_ns.values);
+    report << ",\n    \"global_market_head_recv_to_read\":";
+    WriteDistributionJson(report, state.global_head_recv_age_ns.values);
+    report << ",\n    \"global_market_head_event_to_read\":";
+    WriteDistributionJson(report, state.global_head_event_age_ns.values);
+    report << ",\n    \"updated_instrument_head_recv_to_read\":";
+    WriteDistributionJson(report, state.updated_head_recv_age_ns.values);
+    report << ",\n    \"updated_instrument_head_event_to_read\":";
+    WriteDistributionJson(report, state.updated_head_event_age_ns.values);
+    report << "\n  },\n  \"latency_semantics\":{\n"
+           << "    \"history_acquire_call\":"
+              "\"CLOCK_MONOTONIC around atomic shared history acquisition\",\n"
+           << "    \"recv_to_read\":"
+              "\"read CLOCK_MONOTONIC minus record recv_monotonic_ns; local process freshness including queue, decode, history barrier and publication interval\",\n"
+           << "    \"event_to_read\":"
+              "\"read CLOCK_REALTIME minus decoded exchange event_time_ns; end-to-end market freshness including upstream/feed/network/process/publication\"\n"
+           << "  }\n}\n";
+    report.flush();
+    if (!report.good()) {
+        std::cerr << "accept-realtime-pipeline: report JSON write failed\n";
+        return 2;
+    }
+    report.close();
+    std::error_code rename_error;
+    std::filesystem::rename(samples_temporary, options.samples_csv, rename_error);
+    if (rename_error) {
+        std::cerr << "accept-realtime-pipeline: cannot publish samples CSV\n";
+        return 2;
+    }
+    std::filesystem::rename(report_temporary, options.report_json, rename_error);
+    if (rename_error) {
+        std::cerr << "accept-realtime-pipeline: cannot publish report JSON\n";
+        return 2;
+    }
+    std::cout << "{\"passed\":" << (state.valid ? "true" : "false")
+              << ",\"measured_window_ns\":" << measured_window_ns
+              << ",\"accepted\":" << final_snapshot.accepted_messages
+              << ",\"decoded\":" << final_snapshot.decoded_messages
+              << ",\"accepted_per_second\":" << std::fixed
+              << std::setprecision(3) << accepted_per_second
+              << ",\"generations\":" << state.generations << "}\n";
+    return state.valid ? 0 : 1;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    Options options{};
+    bool help = false;
+    std::string error;
+    if (!ParseOptions(argc, argv, &options, &help, &error)) {
+        std::cerr << "accept-realtime-pipeline: " << error << '\n';
+        PrintUsage(std::cerr);
+        return 2;
+    }
+    if (help) {
+        PrintUsage(std::cout);
+        return 0;
+    }
+    try {
+        return Run(options);
+    } catch (const std::exception& exception) {
+        std::cerr << "accept-realtime-pipeline: fatal: "
+                  << exception.what() << '\n';
+        return 2;
+    } catch (...) {
+        std::cerr << "accept-realtime-pipeline: unknown fatal error\n";
+        return 2;
+    }
+}

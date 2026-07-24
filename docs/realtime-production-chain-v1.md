@@ -1,0 +1,451 @@
+# Realtime production chain V1
+
+## 1. Scope
+
+This document defines the only production market-data chain built by the root
+CMake project:
+
+```text
+Vendor DSO selected by operator
+  -> DllCreateIOManager
+  -> one IOManager
+  -> one Subscriber, serialized callback mode
+  -> callback admission authority
+  -> shared immutable OwnedIngressMessageV1
+       |-> OptionalWalSinkV1
+       `-> source decoder lane
+            -> retained decoded event
+            -> fixed instrument worker
+            -> bounded history
+            -> full-universe generation barrier
+            -> RealtimeFactorCalculatorV1
+            -> atomic RealtimeFactorGenerationV1 publication
+```
+
+The V1 scope intentionally has no alternate production admission, replay,
+normalization, recovery, or per-instrument factor-publication route. The
+optional feeder probe and vendor mock are manually enabled diagnostics and are
+not linked into `mdl-production-router`.
+
+## 2. Component and dependency boundaries
+
+The dependency direction is one-way:
+
+```text
+l2flow_sdk
+  physical SDK adapter + immutable five-key catalog
+
+l2flow_realtime_ingress
+  owned callback bytes + optional WAL side sink
+             |
+             v
+l2flow_market
+  decoder + immutable registry + fixed-worker history + generation barrier
+             |
+             v
+l2flow_factor
+  pure calculator boundary + whole-generation publication
+             |
+             v
+l2flow_realtime
+  lifecycle and production composition
+```
+
+Important negative dependencies follow from this graph:
+
+- WAL does not include or call the decoder, history runtime, or factor engine.
+- History records do not carry a WAL offset or durability state.
+- The factor engine cannot admit messages or mutate history.
+- The SDK adapter does not know the registry, WAL, router, history, or factor
+  policy.
+- The registry SHA-256 identifies the fixed market universe; it is not an SDK
+  library identity.
+
+## 3. SDK load and lifecycle boundary
+
+`LoadSdkFactoryFromPath()` accepts the operator path and performs only direct
+dynamic loading and symbol resolution:
+
+```text
+dlopen(path, RTLD_NOW | RTLD_LOCAL)
+dlsym("DllCreateIOManager")
+```
+
+The path is required to be non-empty and representable as a C string. The
+adapter does not validate the DSO by digest or byte comparison and does not
+copy it to a repository-controlled location.
+
+The resolved function is called with `MDL_VERSION` and the configured worker
+and IO thread counts. Production creates one IOManager and one Subscriber. The
+Subscriber is created with `multithread_callback=false`; callback admission is
+also protected by `admission_mutex_`, so sequence assignment remains a single
+authority even for a nonconforming test implementation.
+
+The five subscription calls and the ingress classifier consume the same
+`kProductionMessageKeysV1` array. This prevents the physical subscription set
+from silently drifting away from the accepted message set. The catalog is:
+
+```text
+4.101.4   Shanghai snapshot
+4.101.24  Shanghai tick
+6.101.28  Shenzhen snapshot
+6.101.33  Shenzhen order
+6.101.36  Shenzhen transaction
+```
+
+The combined Shenzhen tick tuple `6.101.53` is a distinguished fatal input,
+not an optional unsupported message.
+
+### Required vendor shutdown semantics
+
+The narrow `SdkManager::Shutdown()` contract is a full callback-quiescence
+barrier:
+
+1. every SDK-started `OnMessage` invocation has returned;
+2. no queued invocation can begin after return;
+3. no new invocation can begin after return.
+
+The pipeline closes its callback gate and maintains an active-entry counter as
+an additional check, but that counter cannot replace the SDK guarantee for a
+callback preempted at function entry. A vendor implementation that returns
+from Shutdown while a callback can still execute does not satisfy the
+production adapter contract and cannot be released safely in-process.
+
+The release order is fixed:
+
+```text
+IOManager Shutdown
+-> wait active handler entries to reach zero
+-> Subscriber ReleaseRef
+-> IOManager ReleaseRef
+```
+
+The DSO mapping remains loaded for process lifetime. That is a lifecycle
+policy for vendor process-global state, not a content-approval mechanism.
+
+## 4. Callback admission and immutable ownership
+
+Unsupported API, SYS, and non-catalog tuples are ignored before sequence
+assignment. Required catalog messages proceed under `admission_mutex_`:
+
+1. validate pipeline health and callback admission;
+2. read and classify the vendor header;
+3. reject the forbidden combined feed;
+4. check sequence capacity;
+5. read realtime and monotonic receive clocks;
+6. enforce the fixed UTC+08 process trade date;
+7. form candidate global and source sequences;
+8. copy the 23-byte vendor head and declared body into an immutable owner;
+9. admit that owner to the corresponding serial decoder queue;
+10. commit both sequence counters and the accepted count;
+11. offer the same owner to the optional WAL.
+
+Sequence counters advance only after decoder-queue admission succeeds. WAL is
+offered after realtime admission and cannot roll it back.
+
+`OwnedIngressMessageV1` validates the declared head size, total size, maximum
+size, binary encoding, catalog tuple, body pointer, and sequence metadata. It
+does not retain an `MDLMessage*` or callback-scoped body pointer.
+
+## 5. Decoder and registry reachability
+
+One serial decoder lane owns each source slot:
+
+```text
+0 = Shanghai snapshot
+1 = Shanghai tick
+2 = Shenzhen snapshot
+3 = Shenzhen order + Shenzhen transaction
+```
+
+Each decoder is pinned to one trade date and one source stream ID. It consumes
+only the vendor binary body encoding. Decoded strings and arrays are owned;
+the retained event clears its input body span.
+
+The immutable registry maps the decoded byte key to a stable nonzero
+`instrument_id`. Production validates the complete registry before starting
+decoder threads or connecting the SDK:
+
+- the market is Shanghai or Shenzhen;
+- Shanghai source bytes are empty;
+- Shenzhen source bytes are exactly `31 30 32 20` (`"102 "`);
+- SecurityID is non-empty printable ASCII, matching decoder reachability.
+
+This preflight prevents a well-formed registry from containing keys that live
+messages can never match.
+
+Decoded fixed-point values preserve the exact signed integer and scale.
+Normalization to p6 uses checked integer multiplication. `valid=true` means
+that the field is applicable to the decoded action, has a known product/domain
+contract, and passed checked normalization; it is not merely evidence that the
+wire bytes could be read. Calculators must still impose their own documented
+economic constraints.
+
+Known absolute prices are gated before normalization. A non-null snapshot,
+book, add/trade, limit-order, or trade-transaction price must be strictly
+positive. Zero and negative raw prices remain auditable but invalid with an
+explicit domain notice. The gate precedes multiplication so a negative extreme
+cannot turn a domain-invalid field into a fatal fixed-point-overflow error.
+Price changes, yields, PE values, amounts, and action-inapplicable price
+placeholders are not incorrectly subjected to the absolute-price rule.
+
+Product-specific fields are not enabled from a coarse security type. Without a
+versioned capability table, SH yield/warrant-exercise/IOPV, the complete vendor
+`EtfBuy*`/`EtfSell*` group, and SZ PE/IOPV/open-interest values retain raw and
+scale but remain invalid under a product-applicability notice. In particular,
+`SecurityType::kFund` does not prove ETF applicability. The vendor fields named
+`WarLowerPri` and `WarUpperPri` additionally carry explicit unknown-semantics
+notices.
+
+The SDK names `EtfBuy*` and `EtfSell*` are exposed under neutral vendor-group
+names rather than being relabeled as subscription/redemption without a field
+dictionary. `OptPremiumRatio` is likewise retained as raw/scale with
+`valid=false` and an unknown-semantics notice rather than being asserted to be
+a warrant or option business factor.
+
+SH `MaxBidDur` and `MaxSellDur` retain their independent unsigned raw values
+without guessing a time unit. The observed `UINT32_MAX` unavailable sentinel is
+invalid and explicitly noticed; zero and `UINT32_MAX-1` remain valid raw values.
+Negative quantities retain raw values but are invalid, never set the tick
+quantity-valid bitmap, and carry a quantity-domain notice.
+
+## 6. Fixed-worker routing and bounded history
+
+The router is deterministic for the lifetime of the process:
+
+```text
+worker = instrument_id % worker_count
+```
+
+The registry, worker count, and instrument IDs are immutable, so an instrument
+never migrates between workers. Each worker owns all mutable rows assigned to
+it; other workers never mutate those rows.
+
+There is one SPSC queue per source and worker. For a given source,
+`TrySubmit()` and `SealSource()` must be called by its one serial decoder
+owner. The upstream callback authority must provide:
+
+- a globally unique dense `ingress_sequence` across all four sources;
+- a dense `source_sequence` within each source;
+- exactly one source-sequence increment for each global increment.
+
+The standalone history runtime validates source-local density and monotonicity
+and validates the aggregate generation equation. It deliberately does not
+create a second global ordering authority.
+
+Different source decoder threads can reach a worker in an order different
+from callback admission. A per-instrument history vector is therefore ordered
+by global ingress sequence on insertion. Duplicate sequence values for one row
+fail closed. If the configured bound is exceeded, the smallest ingress
+sequence is removed, leaving the greatest `N` sequences. Latest snapshot and
+latest tick handles advance only to a greater global ingress sequence.
+
+## 7. Generation barrier
+
+### Cut creation
+
+`CutAndPublishGeneration()` serializes cuts with `cut_mutex_`, then acquires
+`admission_mutex_`. While admission remains locked it:
+
+1. snapshots global and per-source exclusive cuts;
+2. captures `recv_monotonic_cut_ns`;
+3. builds and validates the watermark identity;
+4. begins one pending history generation;
+5. appends one generation marker to every serial decoder queue.
+
+No post-cut callback can overtake a marker because callback admission remains
+locked until all four markers are queued.
+
+### Source and worker fences
+
+A decoder handles its marker only after decoding and submitting every earlier
+command in that source queue. `SealSource()` verifies its source prefix, then
+places a fence into every worker queue for that source.
+
+When a worker consumes a source fence, it parks that source and does not
+consume post-fence records from it. Once all four sources are parked at the
+same generation, the worker freezes an immutable copy of every row it owns.
+Only when all worker slices are present, all source seals are present, and the
+sorted instrument IDs equal the complete registry universe does the runtime
+publish one history handle.
+
+The generation therefore includes empty rows for instruments not observed in
+the prefix. Absence of data is not confused with a changing universe.
+
+### Watermark meaning
+
+For each message admitted by this process, the global counter and exactly one
+source counter advance together. The watermark builder checked-adds the four
+source counts and requires:
+
+```text
+ingress_sequence_exclusive - 1
+  == sum(source.sequence_exclusive - 1)
+```
+
+`UINT64_MAX` may be an exclusive cut but may not be a message sequence. The
+watermark identity hashes the run ID, generation, trade date, global cut,
+registry identity, and ordered source cuts. The monotonic cut time is metadata
+for process-observed staleness; it is not exchange time and is not part of the
+identity hash.
+
+What the watermark proves:
+
+```text
+all messages admitted by this process before the captured prefix
+have reached this complete fixed-universe history generation
+```
+
+What it does not prove:
+
+```text
+exchange packet completeness
+vendor-server completeness
+event-time ordering across instruments
+absence of upstream loss before the callback
+optional WAL durability
+```
+
+## 8. Factor calculation and atomic publication
+
+The factor engine receives the just-published immutable history handle. It
+first checks that the handle is the exact current healthy history and matches
+the fixed registry universe. Calculation occurs into private staging memory.
+
+Before publication, the engine revalidates:
+
+- calculator schema identity and order;
+- exactly one output row per registry instrument;
+- exact instrument order;
+- exact value count per row;
+- finite values only;
+- invalid values use canonical positive zero.
+
+The candidate `RealtimeFactorGenerationV1` retains the exact input history
+shared pointer and copies its watermark. A small commit action executes while
+the history generation mutex proves that the input handle remains current,
+healthy, and not stopping. The final publication is one release-store of a
+single shared factor-generation pointer.
+
+This prevents a reader from observing a half-old/half-new factor cross-section.
+It does not make the independent latest-history and latest-factor slots a
+single atomic pair. The supported pair-read pattern is:
+
+```text
+acquire one latest factor handle
+-> read factor.input_history()
+-> use those two retained handles as the matched pair
+```
+
+The default calculator is a last-price representation example, not a trading
+model. It projects the most recent valid, strictly positive snapshot p6 last
+price into a decimal `double`; zero/negative prices remain explicitly invalid.
+Custom calculators must document their mathematics, missing-data
+policy, numeric bounds, and execution-time bound.
+
+## 9. Terminal final generation
+
+Normal periodic cuts leave admission open after marker insertion. Terminal
+publication has an additional requirement: no accepted shutdown-tail message
+may appear after the final marker.
+
+`StopAndPublishFinalGeneration()` therefore performs:
+
+```text
+lock stop serialization
+-> lock cut serialization
+-> lock callback admission
+-> close admission and capture the final monotonic prefix cut
+-> unlock admission
+-> full SDK callback quiescence
+-> release Subscriber and IOManager
+-> begin final generation from the frozen accepted counters
+-> insert final decoder markers
+-> wait for complete history
+-> calculate and atomically publish factor generation
+-> stop/join decoder workers
+-> stop/join history workers
+-> drain, sync, close, and join optional WAL
+-> publish stopped=true
+```
+
+If a callback itself detects the UTC+08 date boundary, it records the existing
+message receive monotonic timestamp as the clean admission cut. A later
+terminal call reuses that timestamp rather than the later SDK shutdown time.
+
+`StopAndDrain()` is the idempotent terminal path when another generation must
+not be created, such as after a fatal error.
+
+## 10. Timeout scope
+
+The generation timeout is a shared wait budget, not a wall-clock API completion
+or process-wide cancellation deadline. Decoder-marker queue backpressure and
+the history condition wait consume that budget. Setup and allocation may run
+past the deadline, and an operation that is already immediately ready can
+still complete after the nominal deadline. The timeout does not interrupt:
+
+- waiting to serialize behind another cut or stop;
+- vendor `IOManager::Shutdown()`;
+- an already entered SDK callback;
+- arbitrary `RealtimeFactorCalculatorV1::Calculate()` code;
+- thread joins;
+- WAL writes or `fdatasync` during terminal drain.
+
+C++ cannot safely preempt those operations inside this in-process design.
+Production SDK implementations and custom calculators must provide strict
+runtime bounds, and deployment supervision must own a process-level hard
+deadline if one is required.
+
+A custom calculator is non-reentrant: it must not call the owning pipeline's
+cut, stop, or publication APIs and must not call history lifecycle APIs. Such a
+callback would attempt to reacquire lifecycle locks already held by its own
+calculation and violates the pure transformation contract.
+
+## 11. Failure containment
+
+| Failure | Realtime admission | History/factor publication | WAL coverage |
+|---|---|---|---|
+| Unsupported non-production tuple | ignored, no sequence | unaffected | unaffected |
+| Forbidden combined tick | fatal close | prohibited | prior accepted records may drain |
+| Owned-copy/decode/registry/routing error | fatal close | prohibited after fatal linearization | independent prior records may drain |
+| Decoder/history queue pressure | fatal close | incomplete generation not published | independent |
+| Barrier timeout or inconsistent cut | fatal close | failed generation not published | independent |
+| Calculator/schema/output error | fatal close by pipeline | candidate not published | independent |
+| SDK lifecycle failure | fatal or terminate when safe release cannot be proved | no successful terminal result | best-effort drain where safe |
+| WAL open/queue/write/sync/close error | continues | continues | sticky `coverage_lost` |
+| UTC+08 date boundary | clean close, no wrong-day sequence | final prior-day prefix may publish | drains accepted prior-day handles |
+
+The fatal transition closes admission while holding `admission_mutex_`, then
+marks history fatal under its generation mutex before publishing the pipeline
+fatal flag. This lock order makes factor commit and fatal transition
+linearizable: after fatal becomes observable, a new factor commit cannot pass
+the history health guard.
+
+History stop and history generation publication also share the generation
+mutex. Whichever acquires the mutex first defines the order: a fully verified
+generation may publish before Stop begins, or Stop closes generation admission
+and no later worker slice may publish.
+
+## 12. Verification surface
+
+The test suite covers, among other cases:
+
+- real test-only DSO `dlopen`/`dlsym` success and object reference lifecycle;
+- the exact five subscription keys and forbidden combined key;
+- callback-memory ownership after vendor bytes are overwritten;
+- WAL enabled/disabled identity equivalence and WAL failure isolation;
+- decoder body bounds, list descriptors, text validity, fixed-point overflow,
+  calendar endpoints, and message encoding;
+- exact Shenzhen source bytes `"102 "`;
+- unreachable registry SecurityID rejection before SDK connection;
+- deterministic fixed-worker routing and cross-source out-of-order insertion;
+- bounded history retaining the greatest ingress sequences;
+- contradictory watermark rejection and `UINT64_MAX` exclusive cuts;
+- source/worker generation barriers and full fixed-universe rows;
+- factor missing/reordered/wrong-width/NaN/infinity/invalid-zero rejection;
+- exact factor-to-history handle retention;
+- a real Shenzhen snapshot through callback, decoder, history, projection, and
+  publication;
+- final prefix publication after SDK quiescence;
+- slow SDK shutdown not shifting the final prefix timestamp;
+- date-boundary timestamp preservation and zero wrong-day sequence allocation.
