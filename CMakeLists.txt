@@ -171,7 +171,6 @@ if(L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER)
             "L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER requires Clang")
     endif()
     add_executable(fuzz_market_decoder
-        tests/fuzz/market_decoder_fuzz_harness.cpp
         tests/fuzz/market_decoder_fuzz_target.cpp)
     l2flow_configure_target(fuzz_market_decoder)
     target_link_libraries(fuzz_market_decoder PRIVATE L2Flow::market)
@@ -212,6 +211,20 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_phase4_instrument_registry_loader_v1.cpp L2Flow::market)
     l2flow_add_test(test_market_decoder
         tests/test_phase4_market_decoder.cpp L2Flow::market)
+
+    # A deterministic, compiler-independent fuzz smoke keeps all five decoder
+    # selectors, schema gates, fixed-size boundaries, and 50k pseudorandom
+    # bodies in the normal regression suite. The separate optional libFuzzer
+    # target above supplies its own main and therefore intentionally excludes
+    # this harness.
+    add_executable(test_market_decoder_fuzz_smoke
+        tests/fuzz/market_decoder_fuzz_harness.cpp
+        tests/fuzz/market_decoder_fuzz_target.cpp)
+    l2flow_configure_target(test_market_decoder_fuzz_smoke)
+    target_link_libraries(test_market_decoder_fuzz_smoke
+        PRIVATE L2Flow::market)
+    add_test(NAME test_market_decoder_fuzz_smoke
+        COMMAND test_market_decoder_fuzz_smoke)
 
     # Exercise the production dlopen/dlsym adapter against a real test-only
     # DSO.  Passing the generated path at test time avoids embedding or
