@@ -7,21 +7,52 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace l2flow::market {
 namespace {
 
-using RecordHandle = std::shared_ptr<const RealtimeHistoryRecordV1>;
-
 static_assert(
     kIntradayInstrumentStoreSourceCountV1 ==
     kRealtimeHistorySourceCountV1);
+static_assert(std::is_nothrow_move_constructible_v<ShanghaiSnapshotV1>);
+static_assert(std::is_nothrow_move_constructible_v<ShanghaiTickV1>);
+static_assert(std::is_nothrow_move_constructible_v<ShenzhenSnapshotV1>);
+static_assert(std::is_nothrow_move_constructible_v<ShenzhenOrderV1>);
+static_assert(
+    std::is_nothrow_move_constructible_v<ShenzhenTransactionV1>);
+static_assert(std::is_nothrow_move_constructible_v<DecodedMarketEventV1>);
+
+[[nodiscard]] constexpr std::size_t Maximum(
+    std::size_t left,
+    std::size_t right) noexcept {
+    return left > right ? left : right;
+}
+
+inline constexpr std::size_t kArenaStorageAlignment = Maximum(
+    alignof(RealtimeHistoryRecordV1),
+    Maximum(
+        alignof(ShanghaiSnapshotV1),
+        Maximum(
+            alignof(ShanghaiTickV1),
+            Maximum(
+                alignof(ShenzhenSnapshotV1),
+                Maximum(
+                    alignof(ShenzhenOrderV1),
+                    alignof(ShenzhenTransactionV1))))));
+
+static_assert(
+    kArenaStorageAlignment <= alignof(std::max_align_t),
+    "arena payload alternatives must be supported by ordinary operator new");
 
 [[nodiscard]] bool ValidDirection(
     IntradayInstrumentScanDirectionV1 direction) noexcept {
@@ -81,6 +112,30 @@ static_assert(
     return true;
 }
 
+[[nodiscard]] bool CheckedAddSize(
+    std::size_t left,
+    std::size_t right,
+    std::size_t* output) noexcept {
+    if (output == nullptr ||
+        left > std::numeric_limits<std::size_t>::max() - right) {
+        return false;
+    }
+    *output = left + right;
+    return true;
+}
+
+[[nodiscard]] constexpr std::size_t AlignUp(
+    std::size_t value,
+    std::size_t alignment) noexcept {
+    return (value + alignment - 1U) & ~(alignment - 1U);
+}
+
+[[nodiscard]] constexpr std::size_t AlignDown(
+    std::size_t value,
+    std::size_t alignment) noexcept {
+    return value & ~(alignment - 1U);
+}
+
 void SaturatingAtomicIncrement(
     std::atomic<std::uint64_t>* value) noexcept {
     std::uint64_t current = value->load(std::memory_order_relaxed);
@@ -93,59 +148,220 @@ void SaturatingAtomicIncrement(
     }
 }
 
-void SaturatingAtomicAdd(
-    std::atomic<std::uint64_t>* value,
-    std::uint64_t amount) noexcept {
-    std::uint64_t current = value->load(std::memory_order_relaxed);
+std::atomic<std::uint64_t> g_next_session_epoch{1U};
+
+[[nodiscard]] std::uint64_t AcquireSessionEpoch() noexcept {
+    std::uint64_t current =
+        g_next_session_epoch.load(std::memory_order_relaxed);
     for (;;) {
-        const std::uint64_t next =
-            current > std::numeric_limits<std::uint64_t>::max() - amount
-                ? std::numeric_limits<std::uint64_t>::max()
-                : current + amount;
-        if (value->compare_exchange_weak(
+        if (current == 0U ||
+            current == std::numeric_limits<std::uint64_t>::max()) {
+            return 0U;
+        }
+        if (g_next_session_epoch.compare_exchange_weak(
                 current,
-                next,
+                current + 1U,
                 std::memory_order_relaxed,
                 std::memory_order_relaxed)) {
-            return;
+            return current;
         }
     }
 }
 
-[[nodiscard]] bool TryReserve(
-    std::atomic<std::uint64_t>* reserved,
-    std::uint64_t amount,
-    std::uint64_t limit) noexcept {
-    if (reserved == nullptr || amount > limit) {
+struct ArenaSegment;
+
+struct ArenaSegmentDeleter final {
+    void operator()(ArenaSegment* segment) const noexcept;
+};
+
+using ArenaSegmentOwner =
+    std::unique_ptr<ArenaSegment, ArenaSegmentDeleter>;
+
+struct alignas(kArenaStorageAlignment) ArenaSegment final {
+    ArenaSegment(
+        std::size_t value_allocation_bytes,
+        std::size_t value_storage_capacity) noexcept
+        : allocation_bytes(value_allocation_bytes),
+          payload_frontier(value_storage_capacity) {}
+
+    ArenaSegmentOwner owned_next;
+    ArenaSegment* previous = nullptr;
+    std::size_t allocation_bytes = 0U;
+    std::size_t payload_frontier = 0U;
+    std::size_t header_count = 0U;
+};
+
+[[nodiscard]] constexpr std::size_t ArenaStorageOffset() noexcept {
+    return AlignUp(sizeof(ArenaSegment), kArenaStorageAlignment);
+}
+
+[[nodiscard]] std::byte* ArenaStorage(
+    ArenaSegment* segment) noexcept {
+    return reinterpret_cast<std::byte*>(segment) + ArenaStorageOffset();
+}
+
+[[nodiscard]] const std::byte* ArenaStorage(
+    const ArenaSegment* segment) noexcept {
+    return reinterpret_cast<const std::byte*>(segment) +
+           ArenaStorageOffset();
+}
+
+[[nodiscard]] RealtimeHistoryRecordV1* SegmentRecord(
+    ArenaSegment* segment,
+    std::size_t index) noexcept {
+    return std::launder(
+        reinterpret_cast<RealtimeHistoryRecordV1*>(
+            ArenaStorage(segment) +
+            index * sizeof(RealtimeHistoryRecordV1)));
+}
+
+[[nodiscard]] const RealtimeHistoryRecordV1* SegmentRecord(
+    const ArenaSegment* segment,
+    std::size_t index) noexcept {
+    return std::launder(
+        reinterpret_cast<const RealtimeHistoryRecordV1*>(
+            ArenaStorage(segment) +
+            index * sizeof(RealtimeHistoryRecordV1)));
+}
+
+void ArenaSegmentDeleter::operator()(
+    ArenaSegment* segment) const noexcept {
+    // The chain can be arbitrarily long for a hot symbol. Detach each link so
+    // destruction remains iterative rather than recursing through unique_ptr.
+    while (segment != nullptr) {
+        ArenaSegment* const next = segment->owned_next.release();
+        for (std::size_t index = 0U;
+             index < segment->header_count;
+             ++index) {
+            std::destroy_at(SegmentRecord(segment, index));
+        }
+        segment->~ArenaSegment();
+        ::operator delete(static_cast<void*>(segment));
+        segment = next;
+    }
+}
+
+[[nodiscard]] ArenaSegmentOwner AllocateArenaSegment(
+    std::size_t allocation_bytes) {
+    const std::size_t storage_offset = ArenaStorageOffset();
+    if (allocation_bytes <= storage_offset) {
+        throw std::bad_alloc();
+    }
+    void* const allocation = ::operator new(allocation_bytes);
+    return ArenaSegmentOwner(
+        ::new (allocation) ArenaSegment(
+            allocation_bytes,
+            allocation_bytes - storage_offset));
+}
+
+struct PayloadLayout final {
+    std::size_t size = 0U;
+    std::size_t alignment = 0U;
+};
+
+[[nodiscard]] PayloadLayout PayloadLayoutForKind(
+    MarketEventKindV1 kind) noexcept {
+    switch (kind) {
+        case MarketEventKindV1::kShanghaiSnapshot:
+            return PayloadLayout{
+                sizeof(ShanghaiSnapshotV1),
+                alignof(ShanghaiSnapshotV1)};
+        case MarketEventKindV1::kShanghaiTick:
+            return PayloadLayout{
+                sizeof(ShanghaiTickV1),
+                alignof(ShanghaiTickV1)};
+        case MarketEventKindV1::kShenzhenSnapshot:
+            return PayloadLayout{
+                sizeof(ShenzhenSnapshotV1),
+                alignof(ShenzhenSnapshotV1)};
+        case MarketEventKindV1::kShenzhenOrder:
+            return PayloadLayout{
+                sizeof(ShenzhenOrderV1),
+                alignof(ShenzhenOrderV1)};
+        case MarketEventKindV1::kShenzhenTransaction:
+            return PayloadLayout{
+                sizeof(ShenzhenTransactionV1),
+                alignof(ShenzhenTransactionV1)};
+    }
+    return {};
+}
+
+struct ArenaPlacement final {
+    RealtimeHistoryRecordV1* header = nullptr;
+    std::byte* payload = nullptr;
+    std::size_t payload_frontier = 0U;
+    std::uint32_t payload_delta = 0U;
+};
+
+[[nodiscard]] bool PlanArenaPlacement(
+    ArenaSegment* segment,
+    PayloadLayout payload,
+    ArenaPlacement* output) noexcept {
+    if (segment == nullptr || output == nullptr || payload.size == 0U ||
+        payload.alignment == 0U ||
+        (payload.alignment & (payload.alignment - 1U)) != 0U ||
+        payload.size > segment->payload_frontier ||
+        segment->header_count >
+            std::numeric_limits<std::size_t>::max() /
+                sizeof(RealtimeHistoryRecordV1)) {
         return false;
     }
-    std::uint64_t current = reserved->load(std::memory_order_relaxed);
-    for (;;) {
-        if (current > limit - amount) {
-            return false;
-        }
-        if (reserved->compare_exchange_weak(
-                current,
-                current + amount,
-                std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
-            return true;
-        }
+    const std::size_t header_offset =
+        segment->header_count * sizeof(RealtimeHistoryRecordV1);
+    std::size_t header_end = 0U;
+    if (!CheckedAddSize(
+            header_offset,
+            sizeof(RealtimeHistoryRecordV1),
+            &header_end)) {
+        return false;
     }
+    const std::size_t payload_begin = AlignDown(
+        segment->payload_frontier - payload.size,
+        payload.alignment);
+    if (header_end > payload_begin) {
+        return false;
+    }
+    std::byte* const storage = ArenaStorage(segment);
+    std::byte* const header_address = storage + header_offset;
+    std::byte* const payload_address = storage + payload_begin;
+    const std::size_t delta =
+        static_cast<std::size_t>(payload_address - header_address);
+    if (delta == 0U ||
+        delta > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    *output = ArenaPlacement{
+        reinterpret_cast<RealtimeHistoryRecordV1*>(header_address),
+        payload_address,
+        payload_begin,
+        static_cast<std::uint32_t>(delta)};
+    return true;
 }
 
-struct IntradayChunk final {
-    explicit IntradayChunk(std::size_t capacity)
-        : records(std::make_unique<RecordHandle[]>(capacity)) {}
-
-    std::unique_ptr<RecordHandle[]> records;
-    std::unique_ptr<IntradayChunk> owned_next;
-    IntradayChunk* previous = nullptr;
-    std::uint64_t first_ingress_sequence = 0U;
-    std::uint64_t last_ingress_sequence = 0U;
-    std::uint64_t first_source_sequence = 0U;
-    std::uint64_t last_source_sequence = 0U;
-};
+[[nodiscard]] bool RequiredSegmentAllocation(
+    PayloadLayout payload,
+    std::size_t target_bytes,
+    std::size_t* output) noexcept {
+    if (output == nullptr || payload.size == 0U ||
+        payload.alignment == 0U) {
+        return false;
+    }
+    std::size_t required = ArenaStorageOffset();
+    if (!CheckedAddSize(
+            required, sizeof(RealtimeHistoryRecordV1), &required) ||
+        !CheckedAddSize(required, payload.size, &required) ||
+        !CheckedAddSize(
+            required, payload.alignment - 1U, &required)) {
+        return false;
+    }
+    required = Maximum(required, target_bytes);
+    if (required >
+        kIntradayInstrumentStoreMaximumSegmentBytesV1) {
+        return false;
+    }
+    *output = required;
+    return true;
+}
 
 struct MutableLane final {
     MutableLane() = default;
@@ -153,24 +369,15 @@ struct MutableLane final {
     MutableLane& operator=(const MutableLane&) = delete;
     MutableLane(MutableLane&&) noexcept = default;
     MutableLane& operator=(MutableLane&&) noexcept = default;
+    ~MutableLane() = default;
 
-    ~MutableLane() {
-        // Avoid recursive destruction of a potentially very long hot-symbol
-        // chunk chain.
-        while (owned_head != nullptr) {
-            std::unique_ptr<IntradayChunk> next =
-                std::move(owned_head->owned_next);
-            owned_head->owned_next.reset();
-            owned_head = std::move(next);
-        }
-    }
-
-    std::unique_ptr<IntradayChunk> owned_head;
-    IntradayChunk* head = nullptr;
-    IntradayChunk* tail = nullptr;
-    std::size_t tail_used = 0U;
+    ArenaSegmentOwner owned_head;
+    ArenaSegment* head = nullptr;
+    ArenaSegment* tail = nullptr;
     std::uint64_t record_count = 0U;
     std::uint64_t accounted_bytes = 0U;
+    std::uint64_t allocated_segment_bytes = 0U;
+    std::uint64_t segment_count = 0U;
     std::uint64_t last_ingress_sequence = 0U;
     std::uint64_t last_source_sequence = 0U;
 };
@@ -184,7 +391,8 @@ struct MutableInstrumentRow final {
     MutableInstrumentRow(const MutableInstrumentRow&) = delete;
     MutableInstrumentRow& operator=(const MutableInstrumentRow&) = delete;
     MutableInstrumentRow(MutableInstrumentRow&&) noexcept = default;
-    MutableInstrumentRow& operator=(MutableInstrumentRow&&) noexcept = default;
+    MutableInstrumentRow& operator=(MutableInstrumentRow&&) noexcept =
+        default;
 
     std::uint32_t instrument_id = 0U;
     std::size_t ordinal = 0U;
@@ -193,9 +401,21 @@ struct MutableInstrumentRow final {
     const RealtimeHistoryRecordV1* latest_tick = nullptr;
 };
 
+struct alignas(64) WorkerAccounting final {
+    // Credits are normally touched by this worker only. Another worker may
+    // atomically reclaim unused credits on the rare global-cap slow path.
+    std::atomic<std::uint64_t> record_credits{0U};
+    std::atomic<std::uint64_t> byte_credits{0U};
+    std::atomic<std::uint64_t> appended_records{0U};
+    std::atomic<std::uint64_t> accounted_record_bytes{0U};
+    std::atomic<std::uint64_t> allocated_segment_bytes{0U};
+    std::atomic<std::uint64_t> allocated_segments{0U};
+};
+
 struct WorkerState final {
     std::vector<MutableInstrumentRow> rows;
     std::uint64_t last_captured_generation = 0U;
+    WorkerAccounting accounting;
 };
 
 struct OrdinalEntry final {
@@ -205,11 +425,13 @@ struct OrdinalEntry final {
 };
 
 struct CapturedLane final {
-    const IntradayChunk* head = nullptr;
-    const IntradayChunk* tail = nullptr;
+    const ArenaSegment* head = nullptr;
+    const ArenaSegment* tail = nullptr;
     std::size_t tail_used = 0U;
     std::uint64_t record_count = 0U;
     std::uint64_t accounted_bytes = 0U;
+    std::uint64_t allocated_segment_bytes = 0U;
+    std::uint64_t segment_count = 0U;
 };
 
 struct CapturedInstrumentRow final {
@@ -226,26 +448,129 @@ struct SessionState final {
     const InstrumentRegistryV1* registry = nullptr;
     std::uint64_t registry_version = 0U;
     l2flow::common::Sha256Digest registry_sha256{};
-    std::vector<std::unique_ptr<WorkerState>> workers;
-    std::vector<OrdinalEntry> ordinals;
-    std::array<std::atomic<std::uint32_t>,
-               kIntradayInstrumentStoreSourceCountV1>
+    std::uint64_t session_epoch = 0U;
+    std::array<std::uint32_t, kIntradayInstrumentStoreSourceCountV1>
         source_stream_ids{};
-    std::atomic<std::uint64_t> reserved_records{0U};
-    // Includes base index state, every allocated chunk, and conservative
-    // retained-record accounting. This is the one session byte authority.
-    std::atomic<std::uint64_t> reserved_session_bytes{0U};
-    std::atomic<std::uint64_t> appended_records{0U};
-    std::atomic<std::uint64_t> accounted_record_bytes{0U};
-    std::atomic<std::uint64_t> allocated_index_bytes{0U};
-    std::atomic<std::uint64_t> allocated_chunks{0U};
+    std::vector<std::unique_ptr<WorkerState>> workers;
+    // Exact registry-ordinal order: ascending instrument_id.
+    std::vector<OrdinalEntry> ordinals;
+    // These authorities include both consumed quota and outstanding
+    // worker-local credits. Hot appends consume local credits; the global
+    // atomics and quota mutex are touched only on block refill/reclaim.
+    std::atomic<std::uint64_t> issued_record_quota{0U};
+    std::atomic<std::uint64_t> issued_byte_quota{0U};
+    mutable std::mutex quota_mutex;
     std::atomic<std::uint64_t> failed_appends{0U};
     std::atomic<std::uint64_t> latest_generation{0U};
     std::atomic<bool> coverage_lost{false};
     std::uint64_t base_index_bytes = 0U;
-    std::uint64_t chunk_allocation_bytes = 0U;
     mutable std::mutex generation_mutex;
 };
+
+enum class QuotaKind : std::uint8_t {
+    kRecords = 0U,
+    kBytes,
+};
+
+inline constexpr std::uint64_t kRecordQuotaBlock = 4096U;
+inline constexpr std::uint64_t kByteQuotaBlock = 4U * 1024U * 1024U;
+
+[[nodiscard]] std::atomic<std::uint64_t>& WorkerCredits(
+    WorkerState& worker,
+    QuotaKind kind) noexcept {
+    return kind == QuotaKind::kRecords
+               ? worker.accounting.record_credits
+               : worker.accounting.byte_credits;
+}
+
+[[nodiscard]] bool TryConsumeCredits(
+    std::atomic<std::uint64_t>* credits,
+    std::uint64_t amount) noexcept {
+    std::uint64_t current = credits->load(std::memory_order_relaxed);
+    while (current >= amount) {
+        if (credits->compare_exchange_weak(
+                current,
+                current - amount,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool AcquireQuota(
+    SessionState& session,
+    WorkerState& worker,
+    QuotaKind kind,
+    std::uint64_t amount) noexcept {
+    std::atomic<std::uint64_t>& local = WorkerCredits(worker, kind);
+    if (amount == 0U || TryConsumeCredits(&local, amount)) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(session.quota_mutex);
+    if (TryConsumeCredits(&local, amount)) {
+        return true;
+    }
+    std::atomic<std::uint64_t>& issued =
+        kind == QuotaKind::kRecords
+            ? session.issued_record_quota
+            : session.issued_byte_quota;
+    const std::uint64_t maximum =
+        kind == QuotaKind::kRecords
+            ? session.config.maximum_session_records
+            : session.config.maximum_session_accounted_bytes;
+    const std::uint64_t block =
+        kind == QuotaKind::kRecords ? kRecordQuotaBlock : kByteQuotaBlock;
+
+    std::uint64_t issued_value =
+        issued.load(std::memory_order_relaxed);
+    if (issued_value > maximum) {
+        return false;
+    }
+    if (maximum - issued_value < amount) {
+        // Credits can be stranded on idle workers near a hard cap. Atomic
+        // exchange makes a concurrent owner either consume a credit or yield
+        // it, never both.
+        std::uint64_t reclaimed = 0U;
+        for (const std::unique_ptr<WorkerState>& candidate :
+             session.workers) {
+            const std::uint64_t value =
+                WorkerCredits(*candidate, kind).exchange(
+                    0U, std::memory_order_acq_rel);
+            if (value >
+                std::numeric_limits<std::uint64_t>::max() - reclaimed) {
+                return false;
+            }
+            reclaimed += value;
+        }
+        if (reclaimed > issued_value) {
+            return false;
+        }
+        issued_value -= reclaimed;
+        issued.store(issued_value, std::memory_order_relaxed);
+    }
+    if (issued_value > maximum ||
+        maximum - issued_value < amount) {
+        return false;
+    }
+    const std::uint64_t desired =
+        amount > block ? amount : block;
+    const std::uint64_t grant =
+        std::min(desired, maximum - issued_value);
+    issued.store(issued_value + grant, std::memory_order_relaxed);
+    local.fetch_add(grant, std::memory_order_relaxed);
+    return TryConsumeCredits(&local, amount);
+}
+
+void ReturnQuota(
+    WorkerState& worker,
+    QuotaKind kind,
+    std::uint64_t amount) noexcept {
+    WorkerCredits(worker, kind).fetch_add(
+        amount, std::memory_order_relaxed);
+}
 
 struct WorkerSliceData final {
     std::shared_ptr<SessionState> session;
@@ -264,22 +589,6 @@ struct GenerationData final {
     std::size_t maximum_records_per_batch = 0U;
     bool coverage_from_open = false;
 };
-
-[[nodiscard]] const OrdinalEntry* FindOrdinal(
-    const SessionState& session,
-    std::uint32_t instrument_id) noexcept {
-    const auto found = std::lower_bound(
-        session.ordinals.begin(),
-        session.ordinals.end(),
-        instrument_id,
-        [](const OrdinalEntry& entry, std::uint32_t id) noexcept {
-            return entry.instrument_id < id;
-        });
-    return found != session.ordinals.end() &&
-                   found->instrument_id == instrument_id
-               ? &*found
-               : nullptr;
-}
 
 [[nodiscard]] const CapturedInstrumentRow* FindCapturedRow(
     const GenerationData& generation,
@@ -309,22 +618,6 @@ void FillSummary(
             row.lanes[source].record_count;
         output->record_count += row.lanes[source].record_count;
     }
-}
-
-[[nodiscard]] std::uint64_t CapturedLaneBytes(
-    const CapturedLane& lane) noexcept {
-    return lane.accounted_bytes;
-}
-
-[[nodiscard]] std::uint64_t CapturedLaneChunks(
-    const CapturedLane& lane,
-    std::size_t chunk_capacity) noexcept {
-    if (lane.record_count == 0U || chunk_capacity == 0U) {
-        return 0U;
-    }
-    const std::uint64_t capacity =
-        static_cast<std::uint64_t>(chunk_capacity);
-    return 1U + (lane.record_count - 1U) / capacity;
 }
 
 [[nodiscard]] bool ValidScanOptions(
@@ -364,30 +657,25 @@ void FillSummary(
 
 [[nodiscard]] bool ValidateCapturedLane(
     const CapturedLane& lane,
-    std::size_t chunk_capacity,
     std::uint8_t source,
     const RealtimeHistoryWatermarkV1& watermark) noexcept {
     if (lane.record_count == 0U) {
         return lane.head == nullptr && lane.tail == nullptr &&
-               lane.tail_used == 0U && lane.accounted_bytes == 0U;
+               lane.tail_used == 0U && lane.accounted_bytes == 0U &&
+               lane.allocated_segment_bytes == 0U &&
+               lane.segment_count == 0U;
     }
     if (lane.head == nullptr || lane.tail == nullptr ||
-        lane.tail_used == 0U || lane.tail_used > chunk_capacity ||
-        lane.accounted_bytes == 0U) {
+        lane.tail_used == 0U ||
+        lane.accounted_bytes == 0U ||
+        lane.allocated_segment_bytes == 0U ||
+        lane.segment_count == 0U ||
+        lane.segment_count > lane.record_count) {
         return false;
     }
-    const std::uint64_t capacity =
-        static_cast<std::uint64_t>(chunk_capacity);
-    const std::uint64_t complete_chunks =
-        (lane.record_count - 1U) / capacity;
-    const std::size_t expected_tail_used = static_cast<std::size_t>(
-        lane.record_count - complete_chunks * capacity);
-    if (lane.tail_used != expected_tail_used) {
-        return false;
-    }
-    const RecordHandle& last =
-        lane.tail->records[lane.tail_used - 1U];
-    return last != nullptr && last->source_slot() == source &&
+    const RealtimeHistoryRecordV1* const last =
+        SegmentRecord(lane.tail, lane.tail_used - 1U);
+    return last->source_slot() == source &&
            last->source_stream_id() ==
                watermark.sources[source].source_stream_id &&
            last->source_sequence() <
@@ -398,33 +686,42 @@ void FillSummary(
 
 struct LanePosition final {
     CapturedLane endpoint{};
-    const IntradayChunk* chunk = nullptr;
+    const ArenaSegment* segment = nullptr;
     std::size_t index = 0U;
     std::uint64_t remaining = 0U;
 };
+
+[[nodiscard]] std::size_t UsedInPositionSegment(
+    const LanePosition& position) noexcept {
+    if (position.segment == nullptr) {
+        return 0U;
+    }
+    return position.segment == position.endpoint.tail
+               ? position.endpoint.tail_used
+               : position.segment->header_count;
+}
 
 class MergedInstrumentReader final {
 public:
     MergedInstrumentReader(
         const CapturedInstrumentRow& row,
-        IntradayInstrumentScanOptionsV1 options,
-        std::size_t chunk_capacity) noexcept
-        : options_(options), chunk_capacity_(chunk_capacity) {
+        IntradayInstrumentScanOptionsV1 options) noexcept
+        : options_(options) {
         for (std::size_t source = 0U; source < positions_.size(); ++source) {
             LanePosition& position = positions_[source];
             position.endpoint = row.lanes[source];
             position.remaining = position.endpoint.record_count;
             if (options_.direction ==
                 IntradayInstrumentScanDirectionV1::kOldestFirst) {
-                position.chunk = position.endpoint.head;
+                position.segment = position.endpoint.head;
                 position.index = 0U;
             } else {
-                position.chunk = position.endpoint.tail;
+                position.segment = position.endpoint.tail;
                 position.index = position.endpoint.tail_used;
             }
             current_[source] = Normalize(position);
         }
-        RefreshDone();
+        RefreshState();
     }
 
     [[nodiscard]] bool Pop(
@@ -432,18 +729,8 @@ public:
         if (output == nullptr || done_) {
             return false;
         }
-        std::size_t selected = current_.size();
-        for (std::size_t source = 0U; source < current_.size(); ++source) {
-            const RealtimeHistoryRecordV1* candidate = current_[source];
-            if (candidate == nullptr) {
-                continue;
-            }
-            if (selected == current_.size() ||
-                Better(candidate, current_[selected])) {
-                selected = source;
-            }
-        }
-        if (selected == current_.size()) {
+        const std::size_t selected = SelectSource();
+        if (selected >= current_.size()) {
             done_ = true;
             return false;
         }
@@ -452,39 +739,31 @@ public:
         Advance(positions_[selected]);
         ++emitted_;
         current_[selected] = Normalize(positions_[selected]);
-        RefreshDone();
+        RefreshState();
         return true;
     }
 
     [[nodiscard]] bool done() const noexcept { return done_; }
 
 private:
-    [[nodiscard]] std::size_t UsedInCurrentChunk(
-        const LanePosition& position) const noexcept {
-        return position.chunk == position.endpoint.tail
-                   ? position.endpoint.tail_used
-                   : chunk_capacity_;
-    }
-
     [[nodiscard]] const RealtimeHistoryRecordV1* Current(
         const LanePosition& position) const noexcept {
-        if (position.remaining == 0U || position.chunk == nullptr) {
+        if (position.remaining == 0U || position.segment == nullptr) {
             return nullptr;
         }
         if (options_.direction ==
             IntradayInstrumentScanDirectionV1::kOldestFirst) {
-            const std::size_t used = UsedInCurrentChunk(position);
-            return position.index < used
-                       ? position.chunk->records[position.index].get()
+            return position.index < UsedInPositionSegment(position)
+                       ? SegmentRecord(position.segment, position.index)
                        : nullptr;
         }
         return position.index != 0U
-                   ? position.chunk->records[position.index - 1U].get()
+                   ? SegmentRecord(position.segment, position.index - 1U)
                    : nullptr;
     }
 
     void Advance(LanePosition& position) noexcept {
-        if (position.remaining == 0U || position.chunk == nullptr) {
+        if (position.remaining == 0U || position.segment == nullptr) {
             return;
         }
         --position.remaining;
@@ -492,8 +771,8 @@ private:
             IntradayInstrumentScanDirectionV1::kOldestFirst) {
             ++position.index;
             if (position.remaining != 0U &&
-                position.index >= UsedInCurrentChunk(position)) {
-                position.chunk = position.chunk->owned_next.get();
+                position.index >= UsedInPositionSegment(position)) {
+                position.segment = position.segment->owned_next.get();
                 position.index = 0U;
             }
             return;
@@ -501,15 +780,19 @@ private:
 
         --position.index;
         if (position.remaining != 0U && position.index == 0U) {
-            position.chunk = position.chunk->previous;
-            position.index = chunk_capacity_;
+            position.segment = position.segment->previous;
+            position.index =
+                position.segment == nullptr
+                    ? 0U
+                    : position.segment->header_count;
         }
     }
 
     [[nodiscard]] const RealtimeHistoryRecordV1* Normalize(
         LanePosition& position) noexcept {
         while (position.remaining != 0U) {
-            const RealtimeHistoryRecordV1* record = Current(position);
+            const RealtimeHistoryRecordV1* const record =
+                Current(position);
             if (record == nullptr) {
                 position.remaining = 0U;
                 return nullptr;
@@ -521,7 +804,8 @@ private:
                     Advance(position);
                     continue;
                 }
-                if (ingress >= options_.ingress_sequence_end_exclusive) {
+                if (ingress >=
+                    options_.ingress_sequence_end_exclusive) {
                     position.remaining = 0U;
                     return nullptr;
                 }
@@ -552,23 +836,51 @@ private:
                selected->ingress_sequence();
     }
 
-    void RefreshDone() noexcept {
+    [[nodiscard]] std::size_t SelectSource() const noexcept {
+        if (active_count_ == 0U) {
+            return current_.size();
+        }
+        if (active_count_ == 1U) {
+            return active_sources_[0U];
+        }
+        if (active_count_ == 2U) {
+            const std::size_t first = active_sources_[0U];
+            const std::size_t second = active_sources_[1U];
+            return Better(current_[second], current_[first])
+                       ? second
+                       : first;
+        }
+        std::size_t selected = active_sources_[0U];
+        for (std::size_t index = 1U; index < active_count_; ++index) {
+            const std::size_t candidate = active_sources_[index];
+            if (Better(current_[candidate], current_[selected])) {
+                selected = candidate;
+            }
+        }
+        return selected;
+    }
+
+    void RefreshState() noexcept {
+        active_count_ = 0U;
+        for (std::size_t source = 0U; source < current_.size(); ++source) {
+            if (current_[source] != nullptr) {
+                active_sources_[active_count_] = source;
+                ++active_count_;
+            }
+        }
         done_ = emitted_ >= options_.maximum_records ||
-                std::none_of(
-                    current_.begin(),
-                    current_.end(),
-                    [](const RealtimeHistoryRecordV1* value) noexcept {
-                        return value != nullptr;
-                    });
+                active_count_ == 0U;
     }
 
     IntradayInstrumentScanOptionsV1 options_{};
-    std::size_t chunk_capacity_ = 0U;
     std::array<LanePosition, kIntradayInstrumentStoreSourceCountV1>
         positions_{};
     std::array<const RealtimeHistoryRecordV1*,
                kIntradayInstrumentStoreSourceCountV1>
         current_{};
+    std::array<std::size_t, kIntradayInstrumentStoreSourceCountV1>
+        active_sources_{};
+    std::size_t active_count_ = 0U;
     std::uint64_t emitted_ = 0U;
     bool done_ = false;
 };
@@ -582,10 +894,7 @@ public:
         const CapturedInstrumentRow& row,
         IntradayInstrumentScanOptionsV1 options) noexcept
         : generation(std::move(value_generation)),
-          reader(
-              row,
-              options,
-              generation->session->config.chunk_record_capacity) {}
+          reader(row, options) {}
 
     std::shared_ptr<const GenerationData> generation;
     MergedInstrumentReader reader;
@@ -646,8 +955,7 @@ public:
                 options.maximum_records - emitted;
             reader.emplace(
                 generation->rows[ordinal],
-                instrument_options,
-                generation->session->config.chunk_record_capacity);
+                instrument_options);
             if (reader->done()) {
                 reader.reset();
                 ++ordinal;
@@ -776,31 +1084,6 @@ std::string_view IntradayInstrumentStoreQueryErrorNameV1(
             return "resource_exhausted";
     }
     return "invalid_intraday_instrument_store_query_error";
-}
-
-std::uint64_t EstimateIntradayInstrumentRecordBytesV1(
-    const RecordHandle& record) noexcept {
-    if (record == nullptr) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    const std::size_t retained =
-        EstimateRetainedMarketEventBytesV1(record->event());
-    if (retained == std::numeric_limits<std::size_t>::max() ||
-        retained < sizeof(RetainedMarketEventV1)) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    std::uint64_t result =
-        static_cast<std::uint64_t>(sizeof(RealtimeHistoryRecordV1));
-    const std::uint64_t retained_tail = static_cast<std::uint64_t>(
-        retained - sizeof(RetainedMarketEventV1));
-    if (!CheckedAdd(result, retained_tail, &result) ||
-        !CheckedAdd(
-            result,
-            static_cast<std::uint64_t>(sizeof(RecordHandle)),
-            &result)) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    return result;
 }
 
 IntradayInstrumentCursorV1::IntradayInstrumentCursorV1(
@@ -992,9 +1275,9 @@ IntradayInstrumentStoreGenerationV1::OpenInstrumentCursor(
         return IntradayInstrumentStoreQueryErrorV1::kNotFound;
     }
     try {
-        auto cursor_impl = std::make_unique<
-            IntradayInstrumentCursorV1::Impl>(
-            impl_->data, *row, options);
+        auto cursor_impl =
+            std::make_unique<IntradayInstrumentCursorV1::Impl>(
+                impl_->data, *row, options);
         output->reset(
             new IntradayInstrumentCursorV1(std::move(cursor_impl)));
         return IntradayInstrumentStoreQueryErrorV1::kNone;
@@ -1080,27 +1363,47 @@ IntradayInstrumentStoreCreateErrorV1
 IntradayInstrumentStoreV1::Create(
     IntradayInstrumentStoreConfigV1 config,
     std::uint32_t worker_count,
+    std::array<std::uint32_t,
+               kIntradayInstrumentStoreSourceCountV1>
+        source_stream_ids,
     const InstrumentRegistryV1* registry,
     std::unique_ptr<IntradayInstrumentStoreV1>* output) noexcept {
     if (output == nullptr) {
         return IntradayInstrumentStoreCreateErrorV1::kNullOutput;
     }
     output->reset();
+    bool valid_source_ids = true;
+    for (std::size_t left = 0U; left < source_stream_ids.size(); ++left) {
+        valid_source_ids =
+            valid_source_ids && source_stream_ids[left] != 0U;
+        for (std::size_t right = left + 1U;
+             right < source_stream_ids.size();
+             ++right) {
+            valid_source_ids =
+                valid_source_ids &&
+                source_stream_ids[left] != source_stream_ids[right];
+        }
+    }
     if (worker_count == 0U || worker_count > 256U ||
         registry == nullptr || registry->empty() ||
-        config.chunk_record_capacity == 0U ||
-        config.chunk_record_capacity >
-            kIntradayInstrumentStoreMaximumChunkRecordsV1 ||
+        !valid_source_ids ||
+        config.segment_target_bytes <
+            kIntradayInstrumentStoreMinimumSegmentBytesV1 ||
+        config.segment_target_bytes >
+            kIntradayInstrumentStoreMaximumSegmentBytesV1 ||
         config.maximum_records_per_batch == 0U ||
         config.maximum_records_per_batch >
             kIntradayInstrumentStoreMaximumBatchRecordsV1 ||
-        config.chunk_record_capacity >
-            std::numeric_limits<std::size_t>::max() /
-                sizeof(RecordHandle) ||
         config.maximum_session_records == 0U ||
         config.maximum_session_accounted_bytes == 0U) {
         return IntradayInstrumentStoreCreateErrorV1::
             kInvalidConfiguration;
+    }
+
+    const std::uint64_t session_epoch = AcquireSessionEpoch();
+    if (session_epoch == 0U) {
+        return IntradayInstrumentStoreCreateErrorV1::
+            kResourceExhausted;
     }
 
     try {
@@ -1110,6 +1413,8 @@ IntradayInstrumentStoreV1::Create(
         session->registry = registry;
         session->registry_version = registry->registry_version();
         session->registry_sha256 = registry->registry_sha256();
+        session->session_epoch = session_epoch;
+        session->source_stream_ids = source_stream_ids;
         session->workers.reserve(worker_count);
         for (std::uint32_t worker = 0U; worker < worker_count; ++worker) {
             session->workers.push_back(std::make_unique<WorkerState>());
@@ -1130,7 +1435,18 @@ IntradayInstrumentStoreV1::Create(
             });
 
         std::vector<std::size_t> worker_sizes(worker_count, 0U);
-        for (const OrdinalEntry& ordinal : session->ordinals) {
+        for (std::size_t registry_ordinal = 0U;
+             registry_ordinal < session->ordinals.size();
+             ++registry_ordinal) {
+            const OrdinalEntry& ordinal =
+                session->ordinals[registry_ordinal];
+            const InstrumentRegistryLookupResultV1 lookup =
+                registry->LookupById(ordinal.instrument_id);
+            if (!lookup.known() ||
+                lookup.registry_ordinal != registry_ordinal) {
+                return IntradayInstrumentStoreCreateErrorV1::
+                    kInvalidConfiguration;
+            }
             ++worker_sizes[ordinal.instrument_id % worker_count];
         }
         for (std::uint32_t worker = 0U; worker < worker_count; ++worker) {
@@ -1145,21 +1461,6 @@ IntradayInstrumentStoreV1::Create(
             ordinal.local_index = worker.rows.size();
             worker.rows.emplace_back(
                 ordinal.instrument_id, ordinal_index);
-        }
-
-        std::uint64_t chunk_slots = 0U;
-        if (!CheckedMultiply(
-                static_cast<std::uint64_t>(
-                    config.chunk_record_capacity),
-                static_cast<std::uint64_t>(
-                    sizeof(RecordHandle)),
-                &chunk_slots) ||
-            !CheckedAdd(
-                static_cast<std::uint64_t>(sizeof(IntradayChunk)),
-                chunk_slots,
-                &session->chunk_allocation_bytes)) {
-            return IntradayInstrumentStoreCreateErrorV1::
-                kInvalidConfiguration;
         }
 
         std::uint64_t base_bytes =
@@ -1190,9 +1491,7 @@ IntradayInstrumentStoreV1::Create(
                 kInvalidConfiguration;
         }
         session->base_index_bytes = base_bytes;
-        session->allocated_index_bytes.store(
-            base_bytes, std::memory_order_relaxed);
-        session->reserved_session_bytes.store(
+        session->issued_byte_quota.store(
             base_bytes, std::memory_order_relaxed);
 
         auto impl = std::make_unique<Impl>(std::move(session));
@@ -1205,184 +1504,249 @@ IntradayInstrumentStoreV1::Create(
     }
 }
 
+IntradayInstrumentStoreQueryErrorV1
+IntradayInstrumentStoreV1::ResolveRouteToken(
+    std::size_t registry_ordinal,
+    std::uint32_t instrument_id,
+    InstrumentRouteTokenV1* output) const noexcept {
+    if (output == nullptr) {
+        return IntradayInstrumentStoreQueryErrorV1::kNullOutput;
+    }
+    *output = InstrumentRouteTokenV1{};
+    if (instrument_id == 0U) {
+        return IntradayInstrumentStoreQueryErrorV1::kInvalidArgument;
+    }
+    const SessionState& session = *impl_->session;
+    if (registry_ordinal >= session.ordinals.size() ||
+        session.ordinals[registry_ordinal].instrument_id !=
+            instrument_id) {
+        return IntradayInstrumentStoreQueryErrorV1::kNotFound;
+    }
+    const OrdinalEntry& entry = session.ordinals[registry_ordinal];
+    *output = InstrumentRouteTokenV1{
+        entry.instrument_id,
+        registry_ordinal,
+        entry.worker,
+        entry.local_index,
+        session.session_epoch};
+    return IntradayInstrumentStoreQueryErrorV1::kNone;
+}
+
 IntradayInstrumentStoreAppendErrorV1
 IntradayInstrumentStoreV1::Append(
     std::uint32_t worker,
-    RecordHandle record) noexcept {
+    const InstrumentRouteTokenV1& route,
+    RealtimeHistoryEventInputV1&& input) noexcept {
     SessionState& session = *impl_->session;
     if (session.coverage_lost.load(std::memory_order_acquire)) {
         return IntradayInstrumentStoreAppendErrorV1::kCoverageLost;
     }
-    if (record == nullptr ||
-        record->source_slot() >=
+    if (!input.valid() ||
+        input.source_slot() >=
             kIntradayInstrumentStoreSourceCountV1 ||
-        record->source_stream_id() == 0U ||
-        record->source_sequence() == 0U ||
-        record->source_sequence() ==
+        input.source_stream_id() == 0U ||
+        input.source_sequence() == 0U ||
+        input.source_sequence() ==
             std::numeric_limits<std::uint64_t>::max() ||
-        record->ingress_sequence() == 0U ||
-        record->ingress_sequence() ==
+        input.ingress_sequence() == 0U ||
+        input.ingress_sequence() ==
             std::numeric_limits<std::uint64_t>::max() ||
-        record->instrument_id() == 0U ||
-        !KindBelongsToSource(
-            record->kind(), record->source_slot())) {
-        return impl_->FailAppend(
-            IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
-    }
-    const OrdinalEntry* ordinal =
-        FindOrdinal(session, record->instrument_id());
-    if (ordinal == nullptr) {
+        input.instrument_id() == 0U ||
+        input.registry_ordinal() ==
+            std::numeric_limits<std::size_t>::max() ||
+        input.accounted_record_bytes() == 0U ||
+        !KindBelongsToSource(input.kind(), input.source_slot()) ||
+        input.source_stream_id() !=
+            session.source_stream_ids[input.source_slot()] ||
+        route.session_epoch != session.session_epoch ||
+        route.registry_ordinal != input.registry_ordinal() ||
+        route.instrument_id != input.instrument_id() ||
+        route.registry_ordinal >= session.ordinals.size()) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
     }
     if (worker >= session.worker_count ||
-        ordinal->worker != worker) {
+        route.worker != worker) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::kWrongWorker);
     }
 
+    const OrdinalEntry& ordinal =
+        session.ordinals[route.registry_ordinal];
+    if (ordinal.instrument_id != route.instrument_id ||
+        ordinal.worker != route.worker ||
+        ordinal.local_index != route.worker_local_row) {
+        return impl_->FailAppend(
+            IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
+    }
     WorkerState& worker_state = *session.workers[worker];
-    if (ordinal->local_index >= worker_state.rows.size()) {
+    if (route.worker_local_row >= worker_state.rows.size()) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::kWrongWorker);
     }
     MutableInstrumentRow& row =
-        worker_state.rows[ordinal->local_index];
-    if (row.instrument_id != record->instrument_id()) {
+        worker_state.rows[route.worker_local_row];
+    if (row.instrument_id != input.instrument_id() ||
+        row.ordinal != input.registry_ordinal()) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
     }
-    MutableLane& lane = row.lanes[record->source_slot()];
+    MutableLane& lane = row.lanes[input.source_slot()];
     if (lane.record_count != 0U &&
-        (record->source_sequence() <= lane.last_source_sequence ||
-         record->ingress_sequence() <=
-             lane.last_ingress_sequence)) {
+        (input.source_sequence() <= lane.last_source_sequence ||
+         input.ingress_sequence() <= lane.last_ingress_sequence)) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::
                 kSequenceNotIncreasing);
     }
 
-    std::uint32_t expected_stream = session.source_stream_ids[
-        record->source_slot()].load(std::memory_order_acquire);
-    if (expected_stream == 0U) {
-        static_cast<void>(
-            session.source_stream_ids[record->source_slot()]
-                .compare_exchange_strong(
-                    expected_stream,
-                    record->source_stream_id(),
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire));
-        expected_stream = session.source_stream_ids[
-            record->source_slot()].load(std::memory_order_acquire);
-    }
-    if (expected_stream != record->source_stream_id()) {
-        return impl_->FailAppend(
-            IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
-    }
-
-    const std::uint64_t accounted_bytes =
-        EstimateIntradayInstrumentRecordBytesV1(record);
-    if (accounted_bytes ==
-        std::numeric_limits<std::uint64_t>::max()) {
-        return impl_->FailAppend(
-            IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
-    }
-    const bool needs_chunk =
+    const PayloadLayout payload = PayloadLayoutForKind(input.kind());
+    ArenaPlacement placement{};
+    const bool needs_segment =
         lane.tail == nullptr ||
-        lane.tail_used == session.config.chunk_record_capacity;
-    std::uint64_t byte_reservation = accounted_bytes;
-    if (needs_chunk &&
-        !CheckedAdd(
-            byte_reservation,
-            session.chunk_allocation_bytes,
-            &byte_reservation)) {
-        return impl_->FailAppend(
-            IntradayInstrumentStoreAppendErrorV1::kByteCapacity);
-    }
-    if (!TryReserve(
-            &session.reserved_records,
-            1U,
-            session.config.maximum_session_records)) {
-        return impl_->FailAppend(
-            IntradayInstrumentStoreAppendErrorV1::kRecordCapacity);
-    }
-    if (!TryReserve(
-            &session.reserved_session_bytes,
-            byte_reservation,
-            session.config.maximum_session_accounted_bytes)) {
-        session.reserved_records.fetch_sub(
-            1U, std::memory_order_acq_rel);
-        return impl_->FailAppend(
-            IntradayInstrumentStoreAppendErrorV1::kByteCapacity);
-    }
-
-    try {
-        if (needs_chunk) {
-            auto candidate = std::make_unique<IntradayChunk>(
-                session.config.chunk_record_capacity);
-            candidate->previous = lane.tail;
-            IntradayChunk* const raw = candidate.get();
-            if (lane.tail == nullptr) {
-                lane.owned_head = std::move(candidate);
-                lane.head = raw;
-            } else {
-                lane.tail->owned_next = std::move(candidate);
-            }
-            lane.tail = raw;
-            lane.tail_used = 0U;
-            SaturatingAtomicIncrement(&session.allocated_chunks);
-            SaturatingAtomicAdd(
-                &session.allocated_index_bytes,
-                session.chunk_allocation_bytes);
-        }
-
-        const std::uint64_t next_lane_bytes =
-            lane.accounted_bytes + accounted_bytes;
-        IntradayChunk& chunk = *lane.tail;
-        chunk.records[lane.tail_used] = std::move(record);
-        const RealtimeHistoryRecordV1* const appended =
-            chunk.records[lane.tail_used].get();
-        if (lane.tail_used == 0U) {
-            chunk.first_ingress_sequence =
-                appended->ingress_sequence();
-            chunk.first_source_sequence =
-                appended->source_sequence();
-        }
-        chunk.last_ingress_sequence =
-            appended->ingress_sequence();
-        chunk.last_source_sequence =
-            appended->source_sequence();
-        ++lane.tail_used;
-        ++lane.record_count;
-        lane.accounted_bytes = next_lane_bytes;
-        lane.last_ingress_sequence =
-            appended->ingress_sequence();
-        lane.last_source_sequence =
-            appended->source_sequence();
-
-        const RealtimeHistoryRecordV1*& latest =
-            SnapshotKind(appended->kind())
-                ? row.latest_snapshot
-                : row.latest_tick;
-        if (latest == nullptr ||
-            latest->ingress_sequence() <
-                appended->ingress_sequence()) {
-            latest = appended;
-        }
-        session.appended_records.fetch_add(
-            1U, std::memory_order_release);
-        session.accounted_record_bytes.fetch_add(
-            accounted_bytes, std::memory_order_release);
-        return IntradayInstrumentStoreAppendErrorV1::kNone;
-    } catch (...) {
-        session.reserved_session_bytes.fetch_sub(
-            byte_reservation, std::memory_order_acq_rel);
-        session.reserved_records.fetch_sub(
-            1U, std::memory_order_acq_rel);
+        !PlanArenaPlacement(lane.tail, payload, &placement);
+    std::size_t segment_allocation_bytes = 0U;
+    if (needs_segment &&
+        !RequiredSegmentAllocation(
+            payload,
+            session.config.segment_target_bytes,
+            &segment_allocation_bytes)) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::
                 kResourceExhausted);
     }
+
+    std::uint64_t byte_reservation =
+        input.accounted_record_bytes();
+    if (needs_segment &&
+        !CheckedAdd(
+            byte_reservation,
+            static_cast<std::uint64_t>(segment_allocation_bytes),
+            &byte_reservation)) {
+        return impl_->FailAppend(
+            IntradayInstrumentStoreAppendErrorV1::kByteCapacity);
+    }
+    if (!AcquireQuota(
+            session, worker_state, QuotaKind::kRecords, 1U)) {
+        return impl_->FailAppend(
+            IntradayInstrumentStoreAppendErrorV1::kRecordCapacity);
+    }
+    if (!AcquireQuota(
+            session,
+            worker_state,
+            QuotaKind::kBytes,
+            byte_reservation)) {
+        ReturnQuota(worker_state, QuotaKind::kRecords, 1U);
+        return impl_->FailAppend(
+            IntradayInstrumentStoreAppendErrorV1::kByteCapacity);
+    }
+
+    ArenaSegmentOwner candidate;
+    if (needs_segment) {
+        try {
+            candidate =
+                AllocateArenaSegment(segment_allocation_bytes);
+        } catch (...) {
+            ReturnQuota(
+                worker_state, QuotaKind::kBytes, byte_reservation);
+            ReturnQuota(worker_state, QuotaKind::kRecords, 1U);
+            return impl_->FailAppend(
+                IntradayInstrumentStoreAppendErrorV1::
+                    kResourceExhausted);
+        }
+        if (!PlanArenaPlacement(
+                candidate.get(), payload, &placement)) {
+            ReturnQuota(
+                worker_state, QuotaKind::kBytes, byte_reservation);
+            ReturnQuota(worker_state, QuotaKind::kRecords, 1U);
+            return impl_->FailAppend(
+                IntradayInstrumentStoreAppendErrorV1::
+                    kResourceExhausted);
+        }
+    }
+
+    const std::uint8_t source_slot = input.source_slot();
+    const std::uint32_t source_stream_id =
+        input.source_stream_id();
+    const std::uint64_t source_sequence =
+        input.source_sequence();
+    const std::uint64_t ingress_sequence =
+        input.ingress_sequence();
+    const std::uint32_t instrument_id = input.instrument_id();
+    const MarketEventKindV1 kind = input.kind();
+    const std::int64_t event_time_ns = input.event_time_ns();
+    const std::int64_t recv_realtime_ns =
+        input.recv_realtime_ns();
+    const std::int64_t recv_monotonic_ns =
+        input.recv_monotonic_ns();
+    const std::uint64_t accounted_record_bytes =
+        input.accounted_record_bytes();
+
+    std::visit(
+        [&placement](auto&& value) noexcept {
+            using Event = std::decay_t<decltype(value)>;
+            static_assert(
+                std::is_nothrow_move_constructible_v<Event>);
+            ::new (static_cast<void*>(placement.payload))
+                Event(std::move(value));
+        },
+        std::move(input).TakeEvent());
+    ::new (static_cast<void*>(placement.header))
+        RealtimeHistoryRecordV1(
+            source_slot,
+            source_stream_id,
+            source_sequence,
+            ingress_sequence,
+            instrument_id,
+            kind,
+            event_time_ns,
+            recv_realtime_ns,
+            recv_monotonic_ns,
+            placement.payload_delta);
+
+    ArenaSegment* const appended_segment =
+        needs_segment ? candidate.get() : lane.tail;
+    appended_segment->payload_frontier =
+        placement.payload_frontier;
+    ++appended_segment->header_count;
+    if (needs_segment) {
+        candidate->previous = lane.tail;
+        ArenaSegment* const raw = candidate.get();
+        if (lane.tail == nullptr) {
+            lane.head = raw;
+            lane.owned_head = std::move(candidate);
+        } else {
+            lane.tail->owned_next = std::move(candidate);
+        }
+        lane.tail = raw;
+        lane.allocated_segment_bytes +=
+            static_cast<std::uint64_t>(segment_allocation_bytes);
+        ++lane.segment_count;
+        worker_state.accounting.allocated_segment_bytes.fetch_add(
+            static_cast<std::uint64_t>(segment_allocation_bytes),
+            std::memory_order_relaxed);
+        worker_state.accounting.allocated_segments.fetch_add(
+            1U, std::memory_order_relaxed);
+    }
+
+    ++lane.record_count;
+    lane.accounted_bytes += accounted_record_bytes;
+    lane.last_ingress_sequence = ingress_sequence;
+    lane.last_source_sequence = source_sequence;
+
+    const RealtimeHistoryRecordV1* const appended =
+        placement.header;
+    const RealtimeHistoryRecordV1*& latest =
+        SnapshotKind(kind) ? row.latest_snapshot : row.latest_tick;
+    if (latest == nullptr ||
+        latest->ingress_sequence() < ingress_sequence) {
+        latest = appended;
+    }
+    worker_state.accounting.appended_records.fetch_add(
+        1U, std::memory_order_release);
+    worker_state.accounting.accounted_record_bytes.fetch_add(
+        accounted_record_bytes, std::memory_order_release);
+    return IntradayInstrumentStoreAppendErrorV1::kNone;
 }
 
 IntradayInstrumentStoreGenerationErrorV1
@@ -1428,14 +1792,19 @@ IntradayInstrumentStoreV1::CaptureWorker(
                 captured.lanes[source] = CapturedLane{
                     lane.head,
                     lane.tail,
-                    lane.tail_used,
+                    lane.tail == nullptr
+                        ? 0U
+                        : lane.tail->header_count,
                     lane.record_count,
-                    lane.accounted_bytes};
+                    lane.accounted_bytes,
+                    lane.allocated_segment_bytes,
+                    lane.segment_count};
             }
             slice.rows.push_back(captured);
         }
         auto slice_impl =
-            std::make_unique<IntradayInstrumentStoreWorkerSliceV1::Impl>(
+            std::make_unique<
+                IntradayInstrumentStoreWorkerSliceV1::Impl>(
                 std::move(slice));
         output->reset(new IntradayInstrumentStoreWorkerSliceV1(
             std::move(slice_impl)));
@@ -1490,6 +1859,15 @@ IntradayInstrumentStoreV1::BuildGeneration(
         return IntradayInstrumentStoreGenerationErrorV1::
             kInvalidWatermark;
     }
+    for (std::size_t source = 0U;
+         source < session.source_stream_ids.size();
+         ++source) {
+        if (watermark.sources[source].source_stream_id !=
+            session.source_stream_ids[source]) {
+            return IntradayInstrumentStoreGenerationErrorV1::
+                kInvalidWatermark;
+        }
+    }
 
     try {
         std::lock_guard<std::mutex> lock(session.generation_mutex);
@@ -1517,7 +1895,7 @@ IntradayInstrumentStoreV1::BuildGeneration(
             source_counts{};
         std::uint64_t total_records = 0U;
         std::uint64_t total_bytes = 0U;
-        std::uint64_t total_chunks = 0U;
+        std::uint64_t total_segment_bytes = 0U;
 
         for (std::size_t worker = 0U;
              worker < worker_slices.size();
@@ -1552,7 +1930,6 @@ IntradayInstrumentStoreV1::BuildGeneration(
                     const CapturedLane& lane = row.lanes[source];
                     if (!ValidateCapturedLane(
                             lane,
-                            session.config.chunk_record_capacity,
                             static_cast<std::uint8_t>(source),
                             watermark) ||
                         !CheckedAdd(
@@ -1565,14 +1942,12 @@ IntradayInstrumentStoreV1::BuildGeneration(
                             &total_records) ||
                         !CheckedAdd(
                             total_bytes,
-                            CapturedLaneBytes(lane),
+                            lane.accounted_bytes,
                             &total_bytes) ||
                         !CheckedAdd(
-                            total_chunks,
-                            CapturedLaneChunks(
-                                lane,
-                                session.config.chunk_record_capacity),
-                            &total_chunks)) {
+                            total_segment_bytes,
+                            lane.allocated_segment_bytes,
+                            &total_segment_bytes)) {
                         return IntradayInstrumentStoreGenerationErrorV1::
                             kInvalidWatermark;
                     }
@@ -1607,26 +1982,11 @@ IntradayInstrumentStoreV1::BuildGeneration(
                 return IntradayInstrumentStoreGenerationErrorV1::
                     kInvalidWatermark;
             }
-            const std::uint32_t observed_stream =
-                session.source_stream_ids[source].load(
-                    std::memory_order_acquire);
-            if (observed_stream != 0U &&
-                observed_stream !=
-                    watermark.sources[source].source_stream_id) {
-                return IntradayInstrumentStoreGenerationErrorV1::
-                    kInvalidWatermark;
-            }
         }
-
-        std::uint64_t chunk_bytes = 0U;
         std::uint64_t generation_index_bytes = 0U;
-        if (!CheckedMultiply(
-                total_chunks,
-                session.chunk_allocation_bytes,
-                &chunk_bytes) ||
-            !CheckedAdd(
+        if (!CheckedAdd(
                 session.base_index_bytes,
-                chunk_bytes,
+                total_segment_bytes,
                 &generation_index_bytes)) {
             return IntradayInstrumentStoreGenerationErrorV1::
                 kResourceExhausted;
@@ -1645,15 +2005,53 @@ IntradayInstrumentStoreV1::BuildGeneration(
                 std::shared_ptr<const GenerationData>(
                     std::move(generation)));
         std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
-            published(
+            built(
                 new IntradayInstrumentStoreGenerationV1(
                     std::move(generation_impl)));
-        session.latest_generation.store(
-            watermark.generation, std::memory_order_release);
-        *output = std::move(published);
+        *output = std::move(built);
         return IntradayInstrumentStoreGenerationErrorV1::kNone;
     } catch (...) {
         output->reset();
+        return IntradayInstrumentStoreGenerationErrorV1::
+            kResourceExhausted;
+    }
+}
+
+IntradayInstrumentStoreGenerationErrorV1
+IntradayInstrumentStoreV1::PublishGeneration(
+    const std::shared_ptr<
+        const IntradayInstrumentStoreGenerationV1>& generation)
+    noexcept {
+    if (generation == nullptr || generation->impl_ == nullptr) {
+        return IntradayInstrumentStoreGenerationErrorV1::
+            kInvalidGeneration;
+    }
+    SessionState& session = *impl_->session;
+    if (session.coverage_lost.load(std::memory_order_acquire)) {
+        return IntradayInstrumentStoreGenerationErrorV1::kCoverageLost;
+    }
+    const std::shared_ptr<const GenerationData>& data =
+        generation->impl_->data;
+    if (data == nullptr || data->session.get() != &session ||
+        data->watermark.generation == 0U) {
+        return IntradayInstrumentStoreGenerationErrorV1::
+            kInvalidGeneration;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(session.generation_mutex);
+        if (session.coverage_lost.load(std::memory_order_acquire)) {
+            return IntradayInstrumentStoreGenerationErrorV1::
+                kCoverageLost;
+        }
+        if (data->watermark.generation <=
+            session.latest_generation.load(std::memory_order_acquire)) {
+            return IntradayInstrumentStoreGenerationErrorV1::
+                kInvalidGeneration;
+        }
+        session.latest_generation.store(
+            data->watermark.generation, std::memory_order_release);
+        return IntradayInstrumentStoreGenerationErrorV1::kNone;
+    } catch (...) {
         return IntradayInstrumentStoreGenerationErrorV1::
             kResourceExhausted;
     }
@@ -1672,14 +2070,25 @@ IntradayInstrumentStoreV1::Snapshot() const noexcept {
         session.config.maximum_session_records;
     result.maximum_session_accounted_bytes =
         session.config.maximum_session_accounted_bytes;
-    result.appended_records =
-        session.appended_records.load(std::memory_order_acquire);
-    result.accounted_record_bytes =
-        session.accounted_record_bytes.load(std::memory_order_acquire);
-    result.allocated_index_bytes =
-        session.allocated_index_bytes.load(std::memory_order_acquire);
-    result.allocated_chunks =
-        session.allocated_chunks.load(std::memory_order_acquire);
+    result.allocated_index_bytes = session.base_index_bytes;
+    for (const std::unique_ptr<WorkerState>& worker : session.workers) {
+        const WorkerAccounting& accounting = worker->accounting;
+        const std::uint64_t records =
+            accounting.appended_records.load(std::memory_order_acquire);
+        const std::uint64_t record_bytes =
+            accounting.accounted_record_bytes.load(
+                std::memory_order_acquire);
+        const std::uint64_t segment_bytes =
+            accounting.allocated_segment_bytes.load(
+                std::memory_order_acquire);
+        const std::uint64_t segments =
+            accounting.allocated_segments.load(
+                std::memory_order_acquire);
+        result.appended_records += records;
+        result.accounted_record_bytes += record_bytes;
+        result.allocated_index_bytes += segment_bytes;
+        result.allocated_segments += segments;
+    }
     result.failed_appends =
         session.failed_appends.load(std::memory_order_acquire);
     result.latest_generation =

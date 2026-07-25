@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -103,9 +104,14 @@ void TestCanonicalRegistry(TestContext* test) {
         market::MarketV1::kShenzhen, "102", "000001");
     test->Expect(
         sh.known() && sh.instrument_id == 100U &&
+            sh.registry_ordinal == 0U &&
             sh.quantity_unit == market::QuantityUnitV1::kShare &&
-            sz.known() && sz.instrument_id == 200U,
+            sz.known() && sz.instrument_id == 200U &&
+            sz.registry_ordinal == 1U,
         "exact byte keys resolve explicit metadata");
+    const market::InstrumentRegistryLookupResultV1 unknown_key =
+        first->Lookup(
+            market::MarketV1::kShanghai, "", "600001");
     test->Expect(
         first->Lookup(
                  market::MarketV1::kShanghai, "", "600000 ")
@@ -114,13 +120,76 @@ void TestCanonicalRegistry(TestContext* test) {
             first->Lookup(
                      market::MarketV1::kShenzhen, "", "000001")
                     .error == market::InstrumentRegistryLookupErrorV1::
-                                  kUnknownInstrument,
+                                  kUnknownInstrument &&
+            unknown_key.registry_ordinal ==
+                std::numeric_limits<std::size_t>::max(),
         "lookup never trims identifiers or guesses missing source bytes");
+    const market::InstrumentRegistryLookupResultV1 by_id =
+        first->LookupById(200U);
+    const market::InstrumentRegistryLookupResultV1 zero_id =
+        first->LookupById(0U);
+    const market::InstrumentRegistryLookupResultV1 unknown_id =
+        first->LookupById(201U);
     test->Expect(
-        first->LookupById(200U).known() &&
-            first->LookupById(0U).error ==
+        by_id.known() && by_id.registry_ordinal == 1U &&
+            zero_id.error ==
                 market::InstrumentRegistryLookupErrorV1::kZeroInstrumentId,
         "explicit instrument-id index is validated");
+    test->Expect(
+        zero_id.registry_ordinal ==
+                std::numeric_limits<std::size_t>::max() &&
+            unknown_id.error ==
+                market::InstrumentRegistryLookupErrorV1::
+                    kUnknownInstrument &&
+            unknown_id.registry_ordinal ==
+                std::numeric_limits<std::size_t>::max(),
+        "failed id lookups retain the unknown ordinal sentinel");
+}
+
+void TestInstrumentIdOrdinal(TestContext* test) {
+    market::InstrumentRegistryEntryV1 shanghai = ShanghaiEntry();
+    shanghai.instrument_id = 900U;
+    market::InstrumentRegistryEntryV1 shenzhen = ShenzhenEntry();
+    shenzhen.instrument_id = 100U;
+    const std::vector<market::InstrumentRegistryEntryV1> entries{
+        shenzhen, shanghai};
+
+    std::unique_ptr<market::InstrumentRegistryV1> registry;
+    test->Expect(
+        market::InstrumentRegistryV1::Create(
+            8U, entries, &registry) ==
+                market::InstrumentRegistryCreateErrorV1::kNone &&
+            registry != nullptr,
+        "registry with inverse key/id ordering creates");
+    if (registry == nullptr) {
+        return;
+    }
+
+    const auto shanghai_by_key = registry->Lookup(
+        market::MarketV1::kShanghai, "", "600000");
+    const auto shanghai_by_id = registry->LookupById(900U);
+    const auto shenzhen_by_key = registry->Lookup(
+        market::MarketV1::kShenzhen, "102", "000001");
+    const auto shenzhen_by_id = registry->LookupById(100U);
+
+    test->Expect(
+        registry->entries()[0].instrument_id == 900U &&
+            registry->entries()[1].instrument_id == 100U,
+        "public entries remain in canonical byte-key order");
+    test->Expect(
+        shenzhen_by_key.known() &&
+            shenzhen_by_key.registry_ordinal == 0U &&
+            shenzhen_by_id.known() &&
+            shenzhen_by_id.registry_ordinal == 0U &&
+            shenzhen_by_key.entry == shenzhen_by_id.entry,
+        "lowest instrument id has ordinal zero through both indexes");
+    test->Expect(
+        shanghai_by_key.known() &&
+            shanghai_by_key.registry_ordinal == 1U &&
+            shanghai_by_id.known() &&
+            shanghai_by_id.registry_ordinal == 1U &&
+            shanghai_by_key.entry == shanghai_by_id.entry,
+        "key lookup maps canonical entry index to id-sorted ordinal");
 }
 
 void TestCreationFailures(TestContext* test) {
@@ -167,6 +236,7 @@ void TestCreationFailures(TestContext* test) {
 int main() {
     TestContext test;
     TestCanonicalRegistry(&test);
+    TestInstrumentIdOrdinal(&test);
     TestCreationFailures(&test);
     if (test.failures() == 0) {
         std::cout << "phase4 instrument registry tests passed\n";

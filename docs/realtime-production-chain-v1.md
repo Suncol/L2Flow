@@ -11,12 +11,12 @@ Vendor DSO selected by operator
   -> one IOManager
   -> one Subscriber, serialized callback mode
   -> callback admission authority
-  -> shared immutable OwnedIngressMessageV1
+  -> bounded pooled immutable OwnedIngressMessageV1
        |-> OptionalWalSinkV1
        `-> source decoder lane
-            -> retained decoded event
+            -> transferable decoded event + stable registry ordinal
             -> fixed instrument worker
-            -> mandatory intraday instrument store
+            -> mandatory segmented-arena intraday instrument store
             -> full-universe generation barrier
             -> RealtimeFactorCalculatorV1
             -> atomic RealtimeFactorGenerationV1 publication
@@ -135,7 +135,8 @@ assignment. Required catalog messages proceed under `admission_mutex_`:
 5. read realtime and monotonic receive clocks;
 6. enforce the fixed UTC+08 process trade date;
 7. form candidate global and source sequences;
-8. copy the 23-byte vendor head and declared body into an immutable owner;
+8. acquire one bounded size-class-pool block and copy the 23-byte vendor head
+   and declared body into it;
 9. admit that owner to the corresponding serial decoder queue;
 10. commit both sequence counters and the accepted count;
 11. offer the same owner to the optional WAL.
@@ -143,9 +144,15 @@ assignment. Required catalog messages proceed under `admission_mutex_`:
 Sequence counters advance only after decoder-queue admission succeeds. WAL is
 offered after realtime admission and cannot roll it back.
 
-`OwnedIngressMessageV1` validates the declared head size, total size, maximum
-size, binary encoding, catalog tuple, body pointer, and sequence metadata. It
-does not retain an `MDLMessage*` or callback-scoped body pointer.
+`InspectOwnedIngressMessageV1()` reads and classifies the vendor head/body once
+and validates the declared head size, total size, maximum size, binary
+encoding, catalog tuple, and body pointer. Pool acquisition validates sequence
+metadata and copies the inspected bytes. `OwnedIngressMessageV1` retains no
+`MDLMessage*` or callback-scoped body pointer. With WAL disabled, the pooled
+allocation moves uniquely into its source SPSC ring. With WAL enabled, an
+intrusive reference shares that same immutable allocation with the audit
+writer. The pool has a fixed in-flight bound; exhaustion fails admission
+closed rather than falling back to unbounded allocation.
 
 ## 5. Decoder and registry reachability
 
@@ -160,11 +167,13 @@ One serial decoder lane owns each source slot:
 
 Each decoder is pinned to one trade date and one source stream ID. It consumes
 only the vendor binary body encoding. Decoded strings and arrays are owned;
-the retained event clears its input body span.
+the transferable event clears its input body span.
 
-The immutable registry maps the decoded byte key to a stable nonzero
-`instrument_id`. Production validates the complete registry before starting
-decoder threads or connecting the SDK:
+The immutable registry maps the decoded byte key to both a stable nonzero
+`instrument_id` and a stable instrument-ID-sorted registry ordinal. The
+decoder carries both values into a session-bound route token, so the append
+path does not repeat a key or ID search. Production validates the complete
+registry before starting decoder threads or connecting the SDK:
 
 - the market is Shanghai or Shenzhen;
 - Shanghai source bytes are empty;
@@ -221,7 +230,10 @@ The registry, worker count, and instrument IDs are immutable, so an instrument
 never migrates between workers. Each worker owns all mutable rows assigned to
 it; other workers never mutate those rows.
 
-There is one SPSC queue per source and worker. For a given source,
+Each source decoder input is a true SPSC ring: the callback producer and its
+one decoder consumer exchange slots without a queue mutex; a condition
+variable is only a wait/wakeup aid on empty/full transitions. There is also
+one SPSC queue per source and worker. For a given source,
 `TrySubmit()` and `SealSource()` must be called by its one serial decoder
 owner. The upstream callback authority must provide:
 
@@ -233,11 +245,20 @@ The store runtime validates source-local density and monotonicity and
 validates the aggregate generation equation. It deliberately does not
 create a second global ordering authority.
 
+Ordinary `TrySubmit()` does local source validation, resolves the precomputed
+route token, and pushes directly to its target SPSC queue without taking the
+global generation mutex. A worker is notified only while its idle gate is
+armed and opportunistically drains a small bounded batch without crossing a
+generation fence.
+
 The production runtime always constructs the intraday store. Each instrument
-has four append-only source lanes made of fixed-capacity chunks. Different
-source decoder threads can reach a worker in an order different from callback
-admission, so readers merge the captured lanes by global ingress sequence.
-No record is evicted during the process trade-date session.
+has four append-only source lanes made of fixed-target-byte arena segments.
+The owner worker constructs the exact event payload in-place and publishes a
+compact header containing cached ordering metadata and a self-relative payload
+offset; there is no per-record `shared_ptr`. Different source decoder threads
+can reach a worker in an order different from callback admission, so readers
+merge the captured lanes by cached global ingress sequence. No record is
+evicted during the process trade-date session.
 
 Record and logical-byte limits are mandatory. Append, allocation, capacity, or
 sequence failure closes production admission and prevents publication of a
@@ -274,16 +295,19 @@ places a fence into every worker queue for that source.
 
 When a worker consumes a source fence, it parks that source and does not
 consume post-fence records from it. Once all four sources are parked at the
-same generation, the worker captures each lane's immutable endpoint, visible
-count, and latest snapshot/tick locator. It does not copy the accumulated
-record handles.
+same generation, the worker captures each lane's immutable segment endpoint,
+visible count, and latest snapshot/tick locator. It does not copy the
+accumulated records.
 
 Only when all worker slices and source seals are present, instrument summaries
 match the fixed registry universe, and captured global and per-source totals
 match the watermark does the runtime publish one store handle. Instruments
 not observed in the prefix still have a summary with zero counts. Generation
 construction is O(the fixed instrument count), independent of accumulated
-session record count.
+session record count. The last slice changes the pending cut to a building
+state under the generation mutex, then performs that O(I) construction outside
+the mutex. Commit reacquires the mutex and publishes only if the same
+generation is still current and the runtime remains healthy and non-stopping.
 
 ### Watermark meaning
 
@@ -364,23 +388,24 @@ policy, numeric bounds, and execution-time bound.
 ### Store reads and lifetime
 
 `SummaryAt` is the O(I) latest-only path for factor work. Record cursors are
-the historical path: a full drain over N records is O(N), while each
-`ReadBatch` uses O(batch) caller-owned pointer storage. Cursor construction and
-draining must never materialize a second N-record result. The configured Store
-batch value is an upper bound; the acceptance consumer uses 1,024-record pages
-by default and consumes them immediately. Large drains can use independent
-`OpenUniverseRangeCursor` instances over non-overlapping half-open
-instrument-ordinal ranges. If no range is truncated by its per-cursor
+the historical path: a full-universe drain over I instrument rows and N
+records is O(I + N), while each `ReadBatch` uses O(batch) caller-owned pointer
+storage. Cursor construction and draining must never materialize a second
+N-record result. The configured Store batch value is an upper bound; the
+acceptance consumer uses 1,024-record pages by default and consumes them
+immediately. Large drains can use independent `OpenUniverseRangeCursor`
+instances over non-overlapping half-open instrument-ordinal ranges; each costs
+O(I_range + N_range). If no range is truncated by its per-cursor
 `maximum_records` setting, joining their outputs in ordinal order reproduces
 the full-universe ordering exactly. Acceptance reader affinity is applied only
 inside post-stop scan threads; 4--8 range readers each require a distinct CPU
 from the inherited, operator-selected NUMA-local mask.
 
 A factor retains its exact input store generation, and a cursor retains its
-generation. Those handles can pin the session, chunks, and decoded record
-owners after the runtime stops. Consumers must enforce a small fixed upper
-limit on retained factors, generations, and cursors; otherwise rollover cannot
-reclaim memory even though production admission has ended.
+generation. Those handles can pin the session arena after the runtime stops.
+Consumers must enforce a small fixed upper limit on retained factors,
+generations, and cursors; otherwise rollover cannot reclaim memory even though
+production admission has ended.
 
 The configured record and logical-byte limits cover store accounting, not
 complete process RSS. On a 1 TiB host, the initial envelope is a 600--620 GiB
@@ -507,7 +532,7 @@ The test suite covers, among other cases:
 - exact Shenzhen source bytes `"102 "`;
 - unreachable registry SecurityID rejection before SDK connection;
 - deterministic fixed-worker routing and cross-source out-of-order insertion;
-- append-only chunk rollover without record eviction;
+- append-only segment rollover without record eviction;
 - contradictory watermark rejection and `UINT64_MAX` exclusive cuts;
 - source/worker generation barriers and full fixed-universe summaries;
 - `SummaryAt` latest-only traversal in canonical registry order;

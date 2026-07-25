@@ -8,9 +8,10 @@ and supplies the immutable generation consumed by factor calculation. There
 is no alternate in-memory retention path and no publication fallback when the
 store cannot append or publish a complete cut.
 
-The store owns each decoded `RealtimeHistoryRecordV1` exactly once. It does
-not decode a second time and does not introduce another sequence authority or
-publication clock.
+The decoder transfers each decoded event to the permanent instrument owner.
+That owner constructs the exact concrete payload once in the session arena;
+the store does not decode or heap-wrap it a second time and does not introduce
+another sequence authority or publication clock.
 
 ## Coverage boundary
 
@@ -46,25 +47,32 @@ that began before open.
 The production path is:
 
 ```text
-decoded record
+decoded event + stable registry ordinal
+-> session-bound instrument route token
 -> instrument_id % store_worker_count
 -> permanent instrument-store worker
 -> one append-only source lane for that instrument
 ```
 
 Each fixed-registry instrument has four source lanes. A lane is a doubly
-linked list of fixed-capacity chunks, and each slot retains one
-`shared_ptr<const RealtimeHistoryRecordV1>`. Only the permanent owner worker
-appends to an instrument, so a lane has one writer and does not require an
-append mutex.
+linked list of append-only arena segments. Compact record headers grow from
+the front of a segment and exact concrete event payloads grow from the back;
+each header caches ingress/source metadata and holds a self-relative payload
+offset. There is no per-record header/payload wrapper allocation or shared
+owner; dynamic backing owned by fields such as strings remains separately
+allocated. Only the permanent owner worker allocates, first-touches,
+constructs, and appends its instrument data, so a lane has one writer and does
+not require an append mutex.
 
 Source sequence must increase strictly within a lane. Different source
 workers can arrive in a different order from callback admission; readers merge
 the four captured lanes by the globally dense ingress sequence.
 
-Chunk capacity is at most 65,536 records, with a default of 1,024. This keeps
-one append from requesting a pathological allocation even when the session
-budget is large.
+The target segment size is byte-based: 4 KiB through 16 MiB, with a 64 KiB
+default. A concrete event that cannot fit in the configured target receives a
+larger dedicated segment, still bounded by the 16 MiB absolute maximum. This
+keeps heterogeneous event sizes from turning a record-count capacity into
+unpredictable over-allocation.
 
 No record is evicted during the trade-date session. Reaching either capacity
 limit is a coverage failure and closes production admission; it is never a
@@ -76,13 +84,13 @@ The store uses the same four source fences that prove the process ingress
 prefix. Once a worker has consumed every record below a cut, it captures for
 each owned instrument and source:
 
-- the last visible chunk;
-- the visible slot count in that chunk;
+- the last visible segment;
+- the immutable used endpoint in that segment;
 - the visible source-record count;
 - the latest snapshot and tick locators.
 
-The slice contains endpoints and locators, not a copy of all retained record
-handles. Building a generation is therefore O(I), where I is the fixed
+The slice contains endpoints and locators, not a copy of all historical
+records. Building a generation is therefore O(I), where I is the fixed
 instrument count, and does not grow with the number of session records.
 
 Publication verifies that every worker slice belongs to the requested
@@ -136,8 +144,9 @@ Store upper bound. If an existing deployment configures a lower Store upper
 bound and omits the new scan-page option, the caller page is capped to that
 lower value.
 
-For N visible records, a full universe drain performs O(N) record work and
-uses O(batch) caller storage. It does not allocate a second N-record result.
+For I instrument rows and N visible records, a full-universe drain performs
+O(I + N) work and uses O(batch) caller storage. One ordinal-range cursor costs
+O(I_range + N_range). Neither form allocates a second N-record result.
 Independent non-overlapping ordinal-range cursors can be drained concurrently;
 when no per-cursor `maximum_records` limit truncates a range, concatenating
 their outputs in ordinal order is exactly the full-universe ordering. Each
@@ -148,8 +157,9 @@ four source counts with the generation watermark.
 
 Oldest-first narrow ranges currently walk each selected source lane from its
 captured head to the lower bound. A late-session narrow range can therefore
-cost O(the preceding lane prefix). Sparse chunk-boundary indexes are a future
-optimization if that query shape becomes latency-sensitive.
+cost O(the preceding lane prefix). A sparse chronological index is a future
+optimization if that query shape becomes latency-sensitive; the segmented
+layout does not claim sublinear full-history traversal.
 
 ## Capacity and 1 TiB deployment boundary
 
@@ -159,15 +169,24 @@ Production requires both:
 - `maximum_session_accounted_bytes`.
 
 The byte limit is one conservative logical budget shared by base index state,
-whole chunk allocations, and retained-record accounting. The observable
-logical total is `accounted_record_bytes + allocated_index_bytes`. Chunk
-capacity is reserved before allocation so a new chunk cannot bypass the
-limit.
+whole segment allocations, and a conservative logical stored-record charge.
+The observable logical total is
+`accounted_record_bytes + allocated_index_bytes`. Capacity is reserved before
+allocation so a new segment cannot bypass the limit.
+Each owner normally consumes record and byte credits from its own cache-line
+accounting block. The global hard-cap authorities are touched only when a
+worker refills a quota block; near a limit, unused credits are atomically
+reclaimed from idle workers before capacity is rejected. Snapshot counters
+are aggregated from worker-local accounting, so normal append does not
+contend on one global per-record counter while the configured caps remain
+strict process-session limits.
 
 Logical accounting is not allocator RSS. It cannot exactly include allocator
 metadata and fragmentation, thread stacks, SDK and feeder memory, consumer
-objects, kernel state, or page cache. This version also retains the exact
-decoded object graph rather than a compact POD payload.
+objects, kernel state, or page cache. Dynamic string backing owned by a
+concrete event remains separately allocated; the arena removes per-record
+owner/control blocks but does not pretend those dynamic bytes are physically
+inline.
 
 For a 1 TiB host, the initial operational envelope is:
 
@@ -183,10 +202,10 @@ two-times-volume margin. Neither logical limit should equal physical memory.
 
 ### Generation and cursor pinning
 
-A generation owns session state needed by its summaries and chunks. A cursor
+A generation owns session state needed by its summaries and segments. A cursor
 owns its generation. Retaining an old factor retains its exact `input_store`,
-and retaining a cursor can therefore keep the session and all referenced
-record owners alive even after the runtime stops.
+and retaining a cursor can therefore keep the session arena alive even after
+the runtime stops.
 
 Consumers must enforce a small fixed upper bound on retained generations,
 factors, and concurrent cursors. Shutdown or trade-date rollover does not
@@ -196,7 +215,7 @@ the runtime released the session.
 
 ## Failure policy
 
-Store construction, append, chunk allocation, record/byte reservation,
+Store construction, append, segment allocation, record/byte reservation,
 worker capture, and generation construction are part of the production
 correctness path. Any failure makes coverage sticky-lost, closes admission,
 and prevents a later store or factor generation from being advertised as
@@ -214,7 +233,7 @@ WAL or feeder output.
   --instrument-store-workers 4 \
   --intraday-store-max-records 1000000000 \
   --intraday-store-memory-gib 600 \
-  --intraday-store-chunk-records 1024 \
+  --intraday-store-segment-kib 64 \
   --intraday-store-batch-records 65536 \
   --intraday-store-from-open
 ```
@@ -241,7 +260,7 @@ The Store limit and caller working page are deliberately separate:
 taskset -c 0-31,64-95 ./build/accept-realtime-pipeline \
   ... \
   --instrument-store-workers 4 \
-  --intraday-store-chunk-records 1024 \
+  --intraday-store-segment-kib 64 \
   --intraday-store-batch-records 65536 \
   --intraday-scan-batch-records 1024 \
   --intraday-scan-workers 1 \
@@ -263,8 +282,8 @@ non-overlapping ordinal ranges, with one CPU per reader:
 ```
 
 Run each A/B point in a fresh process. First compare actual scan pages
-`512/1024/4096/8192` with Store maximum batch unchanged, then compare chunk
-capacity `1024/4096`, and finally Store workers `4/8`. Keep the feed window,
-registry, hard caps, CPU/NUMA mask, and reader CPUs identical. Promotion
-requires an actual full-session run; an earlier short run that measured a
-different retention contract is not sufficient evidence.
+`512/1024/4096/8192` with Store maximum batch unchanged, then compare segment
+targets such as `64/256` KiB, and finally Store workers `4/8`. Keep the feed
+window, registry, hard caps, CPU/NUMA mask, and reader CPUs identical.
+Promotion requires an actual full-session run; an earlier short run that
+measured a different retention contract is not sufficient evidence.

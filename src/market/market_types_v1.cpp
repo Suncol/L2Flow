@@ -64,73 +64,14 @@ DecodedMarketCommonV1& MarketCommonV1(
         event);
 }
 
-RetainedMarketEventCreateErrorV1 RetainMarketEventV1(
-    DecodedMarketEventV1 event,
-    RetainedMarketEventV1* output) noexcept {
-    if (output == nullptr) {
-        return RetainedMarketEventCreateErrorV1::kNullOutput;
-    }
-    try {
-        RetainedMarketEventV1 candidate = std::visit(
-            [](auto&& value) -> RetainedMarketEventV1 {
-                using Value = std::decay_t<decltype(value)>;
-                using Owner = std::unique_ptr<const Value>;
-                return RetainedMarketEventV1(
-                    std::in_place_type<Owner>,
-                    std::make_unique<const Value>(
-                        std::move(value)));
-            },
-            std::move(event));
-        *output = std::move(candidate);
-        return RetainedMarketEventCreateErrorV1::kNone;
-    } catch (const std::bad_alloc&) {
-        return RetainedMarketEventCreateErrorV1::kResourceExhausted;
-    } catch (...) {
-        return RetainedMarketEventCreateErrorV1::kUnexpectedFailure;
-    }
-}
-
-std::size_t EstimateOwnedMarketEventBytesV1(
-    const DecodedMarketEventV1& event) noexcept {
-    return std::visit(
-        [](const auto& value) {
-            std::size_t result = sizeof(DecodedMarketEventV1);
-            using Value = std::decay_t<decltype(value)>;
-            result = SaturatingAdd(
-                result, AlternativeDynamicBytes<Value>(value));
-            return result;
-        },
-        event);
-}
-
-std::size_t EstimateRetainedMarketEventBytesV1(
+std::size_t EstimateStoredMarketEventBytesV1(
     const DecodedMarketEventV1& event) noexcept {
     return std::visit(
         [](const auto& value) {
             using Value = std::decay_t<decltype(value)>;
-            std::size_t result = sizeof(RetainedMarketEventV1);
-            result = SaturatingAdd(result, sizeof(Value));
+            std::size_t result = sizeof(Value);
             result = SaturatingAdd(
                 result, AlternativeDynamicBytes<Value>(value));
-            return result;
-        },
-        event);
-}
-
-std::size_t EstimateRetainedMarketEventBytesV1(
-    const RetainedMarketEventV1& event) noexcept {
-    return std::visit(
-        [](const auto& owner) {
-            using Element =
-                typename std::decay_t<decltype(owner)>::element_type;
-            using Value = std::remove_const_t<Element>;
-            if (owner == nullptr) {
-                return std::numeric_limits<std::size_t>::max();
-            }
-            std::size_t result = sizeof(RetainedMarketEventV1);
-            result = SaturatingAdd(result, sizeof(Value));
-            result = SaturatingAdd(
-                result, AlternativeDynamicBytes<Value>(*owner));
             return result;
         },
         event);

@@ -233,13 +233,17 @@ bool ComputeRegistrySha256(
 }
 
 InstrumentRegistryLookupResultV1 KnownResult(
-    const InstrumentRegistryEntryV1* entry) noexcept {
+    const InstrumentRegistryEntryV1* entry,
+    std::size_t registry_ordinal) noexcept {
     InstrumentRegistryLookupResultV1 result{};
-    if (entry == nullptr || entry->instrument_id == 0U) {
+    if (entry == nullptr || entry->instrument_id == 0U ||
+        registry_ordinal ==
+            std::numeric_limits<std::size_t>::max()) {
         return result;
     }
     result.error = InstrumentRegistryLookupErrorV1::kNone;
     result.instrument_id = entry->instrument_id;
+    result.registry_ordinal = registry_ordinal;
     result.quantity_unit = entry->quantity_unit;
     result.security_type = entry->security_type;
     result.asset_scope = entry->asset_scope;
@@ -253,10 +257,13 @@ InstrumentRegistryV1::InstrumentRegistryV1(
     std::uint64_t registry_version,
     std::vector<InstrumentRegistryEntryV1> entries,
     std::vector<IdIndexEntryV1> id_index,
+    std::vector<std::size_t> entry_index_to_registry_ordinal,
     l2flow::common::Sha256Digest registry_sha256) noexcept
     : registry_version_(registry_version),
       entries_(std::move(entries)),
       id_index_(std::move(id_index)),
+      entry_index_to_registry_ordinal_(
+          std::move(entry_index_to_registry_ordinal)),
       registry_sha256_(registry_sha256) {}
 
 InstrumentRegistryCreateErrorV1 InstrumentRegistryV1::Create(
@@ -337,6 +344,23 @@ InstrumentRegistryCreateErrorV1 InstrumentRegistryV1::Create(
             }
         }
 
+        std::vector<std::size_t> entry_index_to_registry_ordinal(
+            sorted_entries.size(),
+            std::numeric_limits<std::size_t>::max());
+        for (std::size_t registry_ordinal = 0U;
+             registry_ordinal < id_index.size();
+             ++registry_ordinal) {
+            const std::size_t entry_index =
+                id_index[registry_ordinal].entry_index;
+            if (entry_index >=
+                    entry_index_to_registry_ordinal.size()) {
+                return InstrumentRegistryCreateErrorV1::
+                    kUnexpectedFailure;
+            }
+            entry_index_to_registry_ordinal[entry_index] =
+                registry_ordinal;
+        }
+
         l2flow::common::Sha256Digest registry_sha256{};
         if (!ComputeRegistrySha256(
                 registry_version,
@@ -348,6 +372,7 @@ InstrumentRegistryCreateErrorV1 InstrumentRegistryV1::Create(
             registry_version,
             std::move(sorted_entries),
             std::move(id_index),
+            std::move(entry_index_to_registry_ordinal),
             registry_sha256));
         return InstrumentRegistryCreateErrorV1::kNone;
     } catch (const std::bad_alloc&) {
@@ -398,7 +423,12 @@ InstrumentRegistryLookupResultV1 InstrumentRegistryV1::Lookup(
             ByteOrderV1::kEqual) {
         return result;
     }
-    return KnownResult(&entries_[first]);
+    if (first >= entry_index_to_registry_ordinal_.size()) {
+        return result;
+    }
+    return KnownResult(
+        &entries_[first],
+        entry_index_to_registry_ordinal_[first]);
 }
 
 InstrumentRegistryLookupResultV1 InstrumentRegistryV1::Lookup(
@@ -450,7 +480,7 @@ InstrumentRegistryLookupResultV1 InstrumentRegistryV1::LookupById(
     if (entry_index >= entries_.size()) {
         return result;
     }
-    return KnownResult(&entries_[entry_index]);
+    return KnownResult(&entries_[entry_index], first);
 }
 
 }  // namespace l2flow::market

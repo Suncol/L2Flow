@@ -3,7 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
+#include <limits>
 #include <span>
 #include <string>
 #include <variant>
@@ -209,6 +209,11 @@ struct DecodedMarketCommonV1 final {
     bool security_id_source_valid = false;
     bool md_stream_id_valid = false;
     std::uint32_t instrument_id = 0U;
+    // Stable ordinal in InstrumentRegistryV1's instrument-id ordering.  The
+    // decoder obtains it in the same exact-key lookup that resolves
+    // instrument_id; downstream routing must not perform another ID lookup.
+    std::size_t registry_ordinal =
+        std::numeric_limits<std::size_t>::max();
     QuantityUnitV1 quantity_unit = QuantityUnitV1::kUnknown;
     SecurityTypeV1 security_type = SecurityTypeV1::kUnknown;
     AssetScopeV1 asset_scope = AssetScopeV1::kUnknown;
@@ -405,49 +410,32 @@ using DecodedMarketEventV1 = std::variant<
     ShenzhenOrderV1,
     ShenzhenTransactionV1>;
 
-// Decoder output is a by-value variant and therefore has the footprint of
-// its largest snapshot alternative.  Keeping that representation for every
-// tick would waste several KiB per record.  The session layer materializes an
-// exact-type immutable allocation and stores only this small tagged owner.
-using RetainedMarketEventV1 = std::variant<
-    std::unique_ptr<const ShanghaiSnapshotV1>,
-    std::unique_ptr<const ShanghaiTickV1>,
-    std::unique_ptr<const ShenzhenSnapshotV1>,
-    std::unique_ptr<const ShenzhenOrderV1>,
-    std::unique_ptr<const ShenzhenTransactionV1>>;
-
-enum class RetainedMarketEventCreateErrorV1 : std::uint8_t {
-    kNone = 0U,
-    kNullOutput,
-    kResourceExhausted,
-    kUnexpectedFailure,
-};
-
-[[nodiscard]] RetainedMarketEventCreateErrorV1
-RetainMarketEventV1(
-    DecodedMarketEventV1 event,
-    RetainedMarketEventV1* output) noexcept;
+// Durable events are placement-constructed as their exact concrete type in a
+// store-owned segmented arena.  A record exposes only this borrowed view; the
+// matching generation/session owns the payload storage.
+using StoredMarketEventViewV1 = std::variant<
+    const ShanghaiSnapshotV1*,
+    const ShanghaiTickV1*,
+    const ShenzhenSnapshotV1*,
+    const ShenzhenOrderV1*,
+    const ShenzhenTransactionV1*>;
 
 template <typename Event>
-[[nodiscard]] const Event* RetainedMarketEventGetV1(
-    const RetainedMarketEventV1& event) noexcept {
-    const auto* owner =
-        std::get_if<std::unique_ptr<const Event>>(&event);
-    return owner == nullptr ? nullptr : owner->get();
+[[nodiscard]] const Event* StoredMarketEventGetV1(
+    const StoredMarketEventViewV1& event) noexcept {
+    const auto* pointer = std::get_if<const Event*>(&event);
+    return pointer == nullptr ? nullptr : *pointer;
 }
 
 [[nodiscard]] const DecodedMarketCommonV1& MarketCommonV1(
     const DecodedMarketEventV1& event) noexcept;
 [[nodiscard]] DecodedMarketCommonV1& MarketCommonV1(
     DecodedMarketEventV1& event) noexcept;
-[[nodiscard]] std::size_t EstimateOwnedMarketEventBytesV1(
+// Active concrete object size plus a conservative logical charge for each
+// dynamic string's capacity. It deliberately does not charge
+// sizeof(DecodedMarketEventV1), because the durable arena stores only the
+// active alternative. This is a hard-budget charge, not allocator RSS.
+[[nodiscard]] std::size_t EstimateStoredMarketEventBytesV1(
     const DecodedMarketEventV1& event) noexcept;
-[[nodiscard]] std::size_t EstimateRetainedMarketEventBytesV1(
-    const DecodedMarketEventV1& event) noexcept;
-// Measures the materialized owner after string moves/allocations, so session
-// admission charges the actual retained representation rather than assuming
-// a source string's capacity is preserved by its move constructor.
-[[nodiscard]] std::size_t EstimateRetainedMarketEventBytesV1(
-    const RetainedMarketEventV1& event) noexcept;
 
 }  // namespace l2flow::market

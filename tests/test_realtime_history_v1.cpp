@@ -7,8 +7,10 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -46,7 +48,8 @@ std::unique_ptr<market::InstrumentRegistryV1> MakeRegistry() {
     return registry;
 }
 
-market::RealtimeHistoryRecordHandleV1 MakeRecord(
+std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
+    const market::InstrumentRegistryV1& registry,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::uint32_t instrument_id,
@@ -58,25 +61,23 @@ market::RealtimeHistoryRecordHandleV1 MakeRecord(
     snapshot.common.origin.trade_date = 20260724U;
     snapshot.common.origin.source_sequence = source_sequence;
     snapshot.common.instrument_id = instrument_id;
+    const auto lookup = registry.LookupById(instrument_id);
+    if (!lookup.known()) {
+        return std::nullopt;
+    }
+    snapshot.common.registry_ordinal = lookup.registry_ordinal;
     snapshot.last_price.valid = true;
     snapshot.last_price.raw = price;
     snapshot.last_price.normalized_p6 = price;
     snapshot.last_price.scale = 6U;
 
-    market::RetainedMarketEventV1 retained(
-        std::in_place_type<
-            std::unique_ptr<const market::ShanghaiSnapshotV1>>,
-        std::make_unique<const market::ShanghaiSnapshotV1>(
-            std::move(snapshot)));
-    market::RealtimeHistoryRecordHandleV1 record;
-    if (!market::RealtimeHistoryRecordV1::Create(
-            0U, ingress_sequence, std::move(retained), &record)) {
-        return nullptr;
-    }
-    return record;
+    market::DecodedMarketEventV1 decoded(std::move(snapshot));
+    return market::RealtimeHistoryEventInputV1::Create(
+        0U, ingress_sequence, std::move(decoded));
 }
 
-market::RealtimeHistoryRecordHandleV1 MakeTickRecord(
+std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
+    const market::InstrumentRegistryV1& registry,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::uint32_t instrument_id,
@@ -88,21 +89,28 @@ market::RealtimeHistoryRecordHandleV1 MakeTickRecord(
     tick.common.origin.trade_date = 20260724U;
     tick.common.origin.source_sequence = source_sequence;
     tick.common.instrument_id = instrument_id;
+    const auto lookup = registry.LookupById(instrument_id);
+    if (!lookup.known()) {
+        return std::nullopt;
+    }
+    tick.common.registry_ordinal = lookup.registry_ordinal;
     tick.fields.price.valid = true;
     tick.fields.price.raw = price;
     tick.fields.price.normalized_p6 = price;
     tick.fields.price.scale = 6U;
 
-    market::RetainedMarketEventV1 retained(
-        std::in_place_type<
-            std::unique_ptr<const market::ShanghaiTickV1>>,
-        std::make_unique<const market::ShanghaiTickV1>(std::move(tick)));
-    market::RealtimeHistoryRecordHandleV1 record;
-    if (!market::RealtimeHistoryRecordV1::Create(
-            1U, ingress_sequence, std::move(retained), &record)) {
-        return nullptr;
+    market::DecodedMarketEventV1 decoded(std::move(tick));
+    return market::RealtimeHistoryEventInputV1::Create(
+        1U, ingress_sequence, std::move(decoded));
+}
+
+market::RealtimeHistorySubmitErrorV1 Submit(
+    market::RealtimeHistoryRuntimeV1* runtime,
+    std::optional<market::RealtimeHistoryEventInputV1> input) {
+    if (runtime == nullptr || !input.has_value()) {
+        return market::RealtimeHistorySubmitErrorV1::kInvalidRecord;
     }
-    return record;
+    return runtime->TrySubmit(std::move(*input));
 }
 
 market::RealtimeHistoryWatermarkV1 MakeWatermark(
@@ -142,7 +150,7 @@ std::int64_t LastPrice(
     if (summary.latest_snapshot == nullptr) {
         return -1;
     }
-    const auto* snapshot = market::RetainedMarketEventGetV1<
+    const auto* snapshot = market::StoredMarketEventGetV1<
         market::ShanghaiSnapshotV1>(summary.latest_snapshot->event());
     return snapshot == nullptr ? -1 : snapshot->last_price.normalized_p6;
 }
@@ -201,7 +209,8 @@ int main() {
     config.source_stream_ids = {11U, 12U, 13U, 14U};
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 32U;
-    config.intraday_store.chunk_record_capacity = 2U;
+    config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     config.intraday_store.maximum_session_records = 32U;
     config.intraday_store.maximum_session_accounted_bytes = 1U << 20U;
     config.intraday_store.maximum_records_per_batch = 4U;
@@ -231,16 +240,18 @@ int main() {
             1U).generation == 99U,
         "UINT64_MAX remains representable as an exclusive cut");
     ok &= Expect(
-        MakeRecord(
+        !MakeRecord(
+            *registry,
             std::numeric_limits<std::uint64_t>::max(),
             1U,
             1U,
-            1'000'000) == nullptr &&
-            MakeRecord(
+            1'000'000).has_value() &&
+            !MakeRecord(
+                *registry,
                 1U,
                 std::numeric_limits<std::uint64_t>::max(),
                 1U,
-                1'000'000) == nullptr,
+                1'000'000).has_value(),
         "message records reject the reserved sequence sentinel");
 
     const auto generation1 = MakeWatermark(*registry, 1U, 4U, 3U, 2U);
@@ -249,18 +260,24 @@ int main() {
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "begin generation 1");
     ok &= Expect(
-        runtime->TrySubmit(MakeRecord(1U, 2U, 1U, 1'000'001)) ==
+        Submit(
+            runtime.get(),
+            MakeRecord(*registry, 1U, 2U, 1U, 1'000'001)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit later snapshot to generation-1 worker 1");
     ok &= Expect(
-        runtime->TrySubmit(MakeRecord(2U, 3U, 2U, 1'000'002)) ==
+        Submit(
+            runtime.get(),
+            MakeRecord(*registry, 2U, 3U, 2U, 1'000'002)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit generation-1 worker-0 record");
     // Source decoders may reach a worker in a different order from the
     // serialized callback. This earlier global record is deliberately
     // submitted after the later snapshot above.
     ok &= Expect(
-        runtime->TrySubmit(MakeTickRecord(1U, 1U, 1U, 900'001)) ==
+        Submit(
+            runtime.get(),
+            MakeTickRecord(*registry, 1U, 1U, 1U, 900'001)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit earlier cross-source tick after later snapshot");
 
@@ -271,7 +288,9 @@ int main() {
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "seal source 0 generation 1");
     ok &= Expect(
-        runtime->TrySubmit(MakeRecord(3U, 4U, 1U, 2'000'001)) ==
+        Submit(
+            runtime.get(),
+            MakeRecord(*registry, 3U, 4U, 1U, 2'000'001)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit post-fence source record");
     for (std::uint8_t source = 1U; source < 4U; ++source) {

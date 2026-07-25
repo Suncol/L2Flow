@@ -88,11 +88,15 @@ struct OptionalWalSnapshotV1 final {
     }
 };
 
-// Optional, best-effort side branch. TryEnqueue performs no file I/O, waits
-// for no condition variable/mutex, and allocates no payload memory. Exactly
-// one serialized callback producer is expected; concurrent producer entry is
-// rejected instead of blocking. Queue pressure or writer failure is sticky
-// coverage loss but cannot change realtime decoder/history/factor state.
+// Optional, best-effort side branch. TryEnqueue transfers one intrusive
+// reference to the same immutable pooled message used by the decoder; it
+// performs no body copy, file I/O, or payload allocation and waits for no
+// condition variable/mutex. When disabled, the transferred reference is
+// released immediately, so the decoder may become the unique holder.
+// Exactly one serialized callback producer is expected; concurrent producer
+// entry is rejected instead of blocking. Queue pressure or writer failure is
+// sticky coverage loss but cannot change realtime decoder/history/factor
+// state.
 class OptionalWalSinkV1 final {
 public:
     OptionalWalSinkV1(const OptionalWalSinkV1&) = delete;

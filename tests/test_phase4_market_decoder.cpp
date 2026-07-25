@@ -696,9 +696,11 @@ void TestFixedLowerBoundsAndSchemaGate(TestContext* context) {
                 market::MarketCommonV1(decoded);
             context->Expect(
                 common.origin.body.empty() &&
-                    common.origin.body.data() == nullptr,
+                    common.origin.body.data() == nullptr &&
+                    common.registry_ordinal ==
+                        std::numeric_limits<std::size_t>::max(),
                 std::string(test_case.label) +
-                    " output does not retain the input body span");
+                    " output retains neither body span nor registry route");
             context->Expect(
                 HasQuality(
                     common,
@@ -1141,6 +1143,7 @@ void TestIdentityValidityGatesInstrumentRegistry(TestContext* context) {
                 common.security_id_source_valid &&
                 common.md_stream_id_valid &&
                 common.instrument_id == 501U &&
+                common.registry_ordinal == 0U &&
                 common.quantity_unit == market::QuantityUnitV1::kShare &&
                 common.security_type == market::SecurityTypeV1::kEquity &&
                 common.asset_scope ==
@@ -1152,6 +1155,38 @@ void TestIdentityValidityGatesInstrumentRegistry(TestContext* context) {
                     common,
                     control::QualityFlagV1::kQtyUnitUnknown),
             "normal exact identity publishes explicit registry metadata");
+    }
+
+    spec.security_id = "000002";
+    body = MakeShenzhenOrderWire(spec);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShenzhenService,
+                kShenzhenOrderMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "valid unregistered SZ identity remains a decoded message");
+    order = std::get_if<market::ShenzhenOrderV1>(&event);
+    if (order != nullptr) {
+        const market::DecodedMarketCommonV1& common = order->common;
+        context->Expect(
+            common.security_id_valid &&
+                common.security_id_source_valid &&
+                common.instrument_id == 0U &&
+                common.registry_ordinal ==
+                    std::numeric_limits<std::size_t>::max() &&
+                common.quantity_unit == market::QuantityUnitV1::kUnknown &&
+                common.security_type == market::SecurityTypeV1::kUnknown &&
+                common.asset_scope == market::AssetScopeV1::kUnknown &&
+                HasQuality(
+                    common,
+                    control::QualityFlagV1::kInstrumentUnknown) &&
+                HasQuality(
+                    common,
+                    control::QualityFlagV1::kQtyUnitUnknown),
+            "valid unknown identity retains the unknown registry ordinal");
     }
 
     spec.security_id = nonprinting_security_id;
@@ -1173,6 +1208,8 @@ void TestIdentityValidityGatesInstrumentRegistry(TestContext* context) {
                 !common.security_id_valid &&
                 common.security_id_source_valid &&
                 common.instrument_id == 0U &&
+                common.registry_ordinal ==
+                    std::numeric_limits<std::size_t>::max() &&
                 common.quantity_unit == market::QuantityUnitV1::kUnknown &&
                 common.security_type == market::SecurityTypeV1::kUnknown &&
                 common.asset_scope == market::AssetScopeV1::kUnknown &&
@@ -1209,6 +1246,8 @@ void TestIdentityValidityGatesInstrumentRegistry(TestContext* context) {
                     nonprinting_security_id_source &&
                 !common.security_id_source_valid &&
                 common.instrument_id == 0U &&
+                common.registry_ordinal ==
+                    std::numeric_limits<std::size_t>::max() &&
                 common.quantity_unit == market::QuantityUnitV1::kUnknown &&
                 common.security_type == market::SecurityTypeV1::kUnknown &&
                 common.asset_scope == market::AssetScopeV1::kUnknown &&

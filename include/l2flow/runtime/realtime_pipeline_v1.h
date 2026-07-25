@@ -116,8 +116,8 @@ enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
 struct RealtimePipelineIngressResultV1 final {
     RealtimePipelineIngressErrorV1 error =
         RealtimePipelineIngressErrorV1::kNone;
-    l2flow::realtime::OwnedIngressCreateErrorV1 owned_error =
-        l2flow::realtime::OwnedIngressCreateErrorV1::kNone;
+    l2flow::realtime::OwnedIngressMessageErrorV1 owned_error =
+        l2flow::realtime::OwnedIngressMessageErrorV1::kNone;
     l2flow::realtime::OptionalWalEnqueueResultV1 wal_result =
         l2flow::realtime::OptionalWalEnqueueResultV1::kDisabled;
     std::uint64_t global_ingress_sequence = 0U;
@@ -182,6 +182,7 @@ struct RealtimePipelineSnapshotV1 final {
     std::uint64_t last_published_generation = 0U;
     l2flow::market::MarketDecodeErrorV1 last_decode_error =
         l2flow::market::MarketDecodeErrorV1::kNone;
+    l2flow::realtime::OwnedIngressMessagePoolSnapshotV1 ingress_pool{};
     l2flow::realtime::OptionalWalSnapshotV1 wal{};
     bool accepting = false;
     bool fatal = false;

@@ -62,7 +62,7 @@ struct Options final {
     std::uint32_t acquire_repetitions = 32U;
     std::uint64_t intraday_store_maximum_records = 0U;
     std::uint64_t intraday_store_memory_bytes = 0U;
-    std::uint32_t intraday_store_chunk_records = 1024U;
+    std::uint32_t intraday_store_segment_kib = 64U;
     std::uint32_t intraday_store_batch_records = 64U * 1024U;
     std::uint32_t intraday_scan_batch_records = 1024U;
     std::uint32_t intraday_scan_workers = 1U;
@@ -296,8 +296,8 @@ void PrintUsage(std::ostream& output) {
         << "  --generation-timeout-ms N     default 10000\n"
         << "  --instrument-store-workers N  default 4\n"
         << "  --acquire-repetitions N       default 32\n"
-        << "  --intraday-store-chunk-records N\n"
-        << "                                1..65536, default 1024\n"
+        << "  --intraday-store-segment-kib N\n"
+        << "                                4..16384, default 64\n"
         << "  --intraday-store-batch-records N\n"
         << "                                Store ReadBatch upper bound; "
            "1..1048576, default 65536\n"
@@ -425,16 +425,17 @@ void PrintUsage(std::ostream& output) {
             }
             parsed.intraday_store_memory_bytes = gib * bytes_per_gib;
             parsed.intraday_store_memory_set = true;
-        } else if (option == "--intraday-store-chunk-records") {
+        } else if (option == "--intraday-store-segment-kib") {
             if (!ParseU32(
-                    value, &parsed.intraday_store_chunk_records) ||
-                parsed.intraday_store_chunk_records == 0U ||
-                static_cast<std::size_t>(
-                    parsed.intraday_store_chunk_records) >
-                    market::
-                        kIntradayInstrumentStoreMaximumChunkRecordsV1) {
+                    value, &parsed.intraday_store_segment_kib) ||
+                parsed.intraday_store_segment_kib <
+                    market::kIntradayInstrumentStoreMinimumSegmentBytesV1 /
+                        1024U ||
+                parsed.intraday_store_segment_kib >
+                    market::kIntradayInstrumentStoreMaximumSegmentBytesV1 /
+                        1024U) {
                 *error =
-                    "--intraday-store-chunk-records must be 1..65536";
+                    "--intraday-store-segment-kib must be 4..16384";
                 return false;
             }
         } else if (option == "--intraday-store-batch-records") {
@@ -1755,8 +1756,8 @@ void ValidateFinalStore(
     config.registry = registry_result.registry.get();
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.store_worker_count = options.instrument_store_workers;
-    config.intraday_store.chunk_record_capacity =
-        static_cast<std::size_t>(options.intraday_store_chunk_records);
+    config.intraday_store.segment_target_bytes =
+        static_cast<std::size_t>(options.intraday_store_segment_kib) * 1024U;
     config.intraday_store.maximum_session_records =
         options.intraday_store_maximum_records;
     config.intraday_store.maximum_session_accounted_bytes =
@@ -2052,8 +2053,8 @@ void ValidateFinalStore(
            << final_snapshot.store.accounted_record_bytes
            << ",\"index_bytes\":"
            << final_snapshot.store.allocated_index_bytes
-           << ",\"allocated_chunks\":"
-           << final_snapshot.store.allocated_chunks
+           << ",\"allocated_segments\":"
+           << final_snapshot.store.allocated_segments
            << ",\"failed_appends\":"
            << final_snapshot.store.failed_appends
            << ",\"latest_generation\":"
@@ -2066,8 +2067,10 @@ void ValidateFinalStore(
            << std::fixed << std::setprecision(3)
            << intraday_full_scan_records_per_second
            << std::defaultfloat
-           << ",\"chunk_records\":"
-           << options.intraday_store_chunk_records
+           << ",\"segment_target_bytes\":"
+           << (static_cast<std::uint64_t>(
+                   options.intraday_store_segment_kib) *
+               1024U)
            << ",\"maximum_batch_records\":"
            << options.intraday_store_batch_records
            << ",\"scan_batch_records\":"

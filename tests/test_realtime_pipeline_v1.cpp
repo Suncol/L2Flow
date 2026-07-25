@@ -194,6 +194,24 @@ std::vector<std::byte> ShenzhenOrderBody(std::uint64_t sequence) {
     return std::move(writer).Take();
 }
 
+std::vector<std::byte> ShenzhenTransactionBody(
+    std::uint64_t sequence) {
+    constexpr std::size_t fixed_bytes = 70U;
+    WireWriter writer(fixed_bytes);
+    writer.StoreU32(0U, 12U);
+    writer.StoreU64(4U, sequence);
+    writer.StoreU64(18U, sequence - 1U);
+    writer.StoreU64(26U, 0U);
+    writer.StoreU64(46U, 123'456U);
+    writer.StoreU64(54U, 33U);
+    writer.StoreU32(62U, 70U);
+    writer.StoreU32(66U, 93'000'124U);
+    writer.StoreString(12U, "010");
+    writer.StoreString(34U, "000001");
+    writer.StoreString(40U, "102 ");
+    return std::move(writer).Take();
+}
+
 std::vector<std::byte> ShenzhenSnapshotBody(
     std::int64_t normalized_last_price_p6) {
     constexpr std::size_t fixed_bytes = 224U;
@@ -375,7 +393,7 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
     config.decoder_queue_capacity_per_source = 32U;
     config.store_worker_count = 2U;
     config.store_queue_capacity_per_source_worker = 32U;
-    config.intraday_store.chunk_record_capacity = 8U;
+    config.intraday_store.segment_target_bytes = 4U * 1024U;
     config.intraday_store.maximum_session_records = 1024U;
     config.intraday_store.maximum_session_accounted_bytes =
         64U * 1024U * 1024U;
@@ -395,10 +413,24 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
     return config;
 }
 
+std::string DescribeCut(
+    const runtime::RealtimePipelineCutResultV1& cut) {
+    return "cut=" +
+        std::string(runtime::RealtimePipelineCutErrorNameV1(cut.error)) +
+        ", generation=" +
+        std::string(market::RealtimeHistoryGenerationErrorNameV1(
+            cut.generation_error)) +
+        ", factor=" +
+        std::string(factor::RealtimeFactorPublishErrorNameV1(
+            cut.factor_result.error));
+}
+
 bool VerifyGeneration(
     TestContext* test,
     const runtime::RealtimePipelineCutResultV1& cut) {
-    test->Expect(cut.published(), "store and factor publish together");
+    const std::string publish_detail =
+        "store and factor publish together: " + DescribeCut(cut);
+    test->Expect(cut.published(), publish_detail);
     if (!cut.published()) {
         return false;
     }
@@ -414,31 +446,48 @@ bool VerifyGeneration(
                 market::IntradayInstrumentStoreQueryErrorV1::kNone,
         "store generation contains the exact ascending fixed universe");
     test->Expect(
-        row.latest_tick != nullptr && row.record_count == 1U,
-        "Shenzhen order reaches the instrument store");
+        row.latest_tick != nullptr && row.record_count == 2U &&
+            row.source_record_counts[3U] == 2U,
+        "Shenzhen order and transaction reach one source-3 lane");
     if (row.latest_tick == nullptr) {
         return false;
     }
-    std::unique_ptr<market::IntradayInstrumentCursorV1> tail;
+    std::unique_ptr<market::IntradayInstrumentCursorV1> cursor;
     std::array<const market::RealtimeHistoryRecordV1*, 2U> records{};
     std::size_t written = 0U;
+    market::IntradayInstrumentScanOptionsV1 scan{};
     test->Expect(
-        cut.store_generation->OpenTailCursor(
-            18U, row.record_count, &tail) ==
+        cut.store_generation->OpenInstrumentCursor(
+            18U, scan, &cursor) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
-            tail != nullptr &&
-            tail->ReadBatch(records, &written) ==
+            cursor != nullptr &&
+            cursor->ReadBatch(records, &written) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
-            written == 1U && records[0U] == row.latest_tick &&
-            records[0U]->ingress_sequence() == 1U,
-        "tail cursor exposes the complete retained instrument prefix");
-    const auto* order = market::RetainedMarketEventGetV1<
-        market::ShenzhenOrderV1>(row.latest_tick->event());
+            written == 2U && records[1U] == row.latest_tick &&
+            records[0U]->ingress_sequence() == 1U &&
+            records[1U]->ingress_sequence() == 2U &&
+            records[0U]->source_sequence() == 1U &&
+            records[1U]->source_sequence() == 2U,
+        "cursor preserves order then transaction in the shared source-3 lane");
+    const market::ShenzhenOrderV1* order = nullptr;
+    const auto* transaction = written == 2U
+                                  ? market::StoredMarketEventGetV1<
+                                        market::ShenzhenTransactionV1>(
+                                        records[1U]->event())
+                                  : nullptr;
+    order = written == 2U
+                ? market::StoredMarketEventGetV1<
+                      market::ShenzhenOrderV1>(records[0U]->event())
+                : nullptr;
     test->Expect(
         order != nullptr && order->common.security_id_source == "102 " &&
             order->common.instrument_id == 18U &&
-            order->fields.quantity.raw == 201,
-        "owned bytes decode with exact four-byte Shenzhen key");
+            order->fields.quantity.raw == 201 &&
+            transaction != nullptr &&
+            transaction->common.security_id_source == "102 " &&
+            transaction->common.instrument_id == 18U &&
+            transaction->fields.quantity.raw == 33,
+        "pooled owned bytes decode both source-3 message kinds with the exact Shenzhen key");
     test->Expect(
         cut.factor_generation->input_store().get() ==
             cut.store_generation.get() &&
@@ -451,7 +500,7 @@ bool VerifyGeneration(
     test->Expect(
         factor_row != nullptr && factor_row->values.size() == 1U &&
             !factor_row->values[0U].valid,
-        "snapshot projection is explicitly invalid for an order-only store");
+        "snapshot projection is explicitly invalid for a tick-only store");
     return true;
 }
 
@@ -542,6 +591,10 @@ int main() {
         ShenzhenOrderBody(20'001U));
     test.Expect(sdk_state->handler != nullptr, "SDK callback is installed");
     sdk_state->handler->OnMessage(nullptr, &message);
+    FakeMessage transaction_message(
+        sdk::MessageKey{6U, 101U, 36U},
+        ShenzhenTransactionBody(20'002U));
+    sdk_state->handler->OnMessage(nullptr, &transaction_message);
     // The callback has returned; destroying/mutating vendor storage must not
     // affect the decoder because the ingress boundary owns one immutable copy.
     message.OverwriteBody();
@@ -562,18 +615,28 @@ int main() {
     const runtime::RealtimePipelineSnapshotV1 after_final =
         pipeline->Snapshot();
     test.Expect(
-        after_final.accepted_messages == 1U &&
-            after_final.decoded_messages == 1U &&
-            after_final.global_ingress_sequence == 1U &&
-            after_final.source_sequences[3U] == 1U &&
+        after_final.accepted_messages == 2U &&
+            after_final.decoded_messages ==
+                after_final.accepted_messages &&
+            after_final.store.appended_records ==
+                after_final.decoded_messages &&
+            after_final.global_ingress_sequence == 2U &&
+            after_final.source_sequences[3U] == 2U &&
             after_final.stopped && !after_final.fatal,
         "terminal generation contains the exact last accepted source prefix");
+    test.Expect(
+        after_final.ingress_pool.maximum_inflight_messages == 166U &&
+            after_final.ingress_pool.active_messages == 0U &&
+            after_final.ingress_pool.allocated_blocks <=
+                after_final.ingress_pool.maximum_inflight_messages &&
+            after_final.store.allocated_segments == 1U,
+        "WAL-on ingress pool and byte-target store remain within their hard bounds");
     pipeline->StopAndDrain();
     const runtime::RealtimePipelineSnapshotV1 after_stop =
         pipeline->Snapshot();
     test.Expect(
-        after_stop.wal.accepted_records == 1U &&
-            after_stop.wal.written_records == 1U &&
+        after_stop.wal.accepted_records == 2U &&
+            after_stop.wal.written_records == 2U &&
             after_stop.wal.finished && !after_stop.wal.coverage_lost,
         "optional WAL drains the same handle without gating realtime");
     test.Expect(
@@ -599,7 +662,11 @@ int main() {
         FakeMessage second(
             sdk::MessageKey{6U, 101U, 33U},
             ShenzhenOrderBody(20'001U));
+        FakeMessage second_transaction(
+            sdk::MessageKey{6U, 101U, 36U},
+            ShenzhenTransactionBody(20'002U));
         no_wal_state->handler->OnMessage(nullptr, &second);
+        no_wal_state->handler->OnMessage(nullptr, &second_transaction);
         const runtime::RealtimePipelineCutResultV1 no_wal_cut =
             no_wal->CutAndPublishGeneration(2s);
         static_cast<void>(VerifyGeneration(&test, no_wal_cut));
@@ -611,8 +678,18 @@ int main() {
                         .input_identity_sha256,
             "WAL on/off has identical realtime generation identity");
         test.Expect(
-            no_wal->Snapshot().wal.enabled == false,
+            !no_wal->Snapshot().wal.enabled,
             "disabled WAL stays outside realtime state");
+        const runtime::RealtimePipelineSnapshotV1 no_wal_snapshot =
+            no_wal->Snapshot();
+        test.Expect(
+            no_wal_snapshot.ingress_pool.maximum_inflight_messages ==
+                    133U &&
+                no_wal_snapshot.ingress_pool.active_messages == 0U &&
+                no_wal_snapshot.ingress_pool.allocated_blocks <=
+                    no_wal_snapshot.ingress_pool
+                        .maximum_inflight_messages,
+            "disabled WAL keeps unique ingress ownership inside its hard pool bound");
         no_wal->StopAndDrain();
     }
 
@@ -620,7 +697,7 @@ int main() {
     std::unique_ptr<runtime::RealtimePipelineV1> snapshot_pipeline;
     runtime::RealtimePipelineConfigV1 snapshot_config =
         MakeConfig(registry.get());
-    snapshot_config.intraday_store.chunk_record_capacity = 2U;
+    snapshot_config.intraday_store.segment_target_bytes = 4U * 1024U;
     snapshot_config.intraday_store.maximum_session_records = 16U;
     snapshot_config.intraday_store.maximum_session_accounted_bytes =
         16U * 1024U * 1024U;
@@ -636,9 +713,14 @@ int main() {
             snapshot_pipeline != nullptr,
         "snapshot projection pipeline creation: " + detail);
     if (snapshot_pipeline != nullptr) {
+        FakeMessage cross_source_order(
+            sdk::MessageKey{6U, 101U, 33U},
+            ShenzhenOrderBody(30'001U));
         FakeMessage snapshot(
             sdk::MessageKey{6U, 101U, 28U},
             ShenzhenSnapshotBody(12'345'600));
+        snapshot_state->handler->OnMessage(
+            nullptr, &cross_source_order);
         snapshot_state->handler->OnMessage(nullptr, &snapshot);
         const runtime::RealtimePipelineCutResultV1 snapshot_cut =
             snapshot_pipeline->CutAndPublishGeneration(2s);
@@ -669,29 +751,44 @@ int main() {
         std::array<const market::RealtimeHistoryRecordV1*, 2U>
             store_batch{};
         std::size_t store_written = 0U;
+        market::IntradayInstrumentScanOptionsV1 store_scan{};
         const bool store_query_ok =
             store_generation != nullptr &&
             store_generation->coverage_from_open() &&
-            store_generation->record_count() == 1U &&
+            store_generation->record_count() == 2U &&
             store_generation->SummaryAt(1U, &store_row) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             store_row.instrument_id == 18U &&
-            store_row.record_count == 1U &&
-            store_generation->OpenTailCursor(
-                18U, store_row.record_count, &store_cursor) ==
+            store_row.record_count == 2U &&
+            store_row.source_record_counts[2U] == 1U &&
+            store_row.source_record_counts[3U] == 1U &&
+            store_generation->OpenInstrumentCursor(
+                18U, store_scan, &store_cursor) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             store_cursor != nullptr &&
             store_cursor->ReadBatch(store_batch, &store_written) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
-            store_written == 1U &&
-            store_batch[0U] == store_row.latest_snapshot;
+            store_written == 2U &&
+            store_batch[0U] == store_row.latest_tick &&
+            store_batch[1U] == store_row.latest_snapshot &&
+            store_batch[0U]->ingress_sequence() == 1U &&
+            store_batch[0U]->source_slot() == 3U &&
+            store_batch[1U]->ingress_sequence() == 2U &&
+            store_batch[1U]->source_slot() == 2U;
         test.Expect(
             store_query_ok,
-            "required pipeline exposes the complete matching intraday prefix");
-        const market::IntradayInstrumentStoreSnapshotV1 store_snapshot =
-            snapshot_pipeline->Snapshot().store;
+            "cross-source lanes merge by cached ingress despite independent append completion");
+        const runtime::RealtimePipelineSnapshotV1 snapshot_state_view =
+            snapshot_pipeline->Snapshot();
+        const market::IntradayInstrumentStoreSnapshotV1& store_snapshot =
+            snapshot_state_view.store;
         test.Expect(
-            store_snapshot.appended_records == 1U &&
+            snapshot_state_view.accepted_messages == 2U &&
+                snapshot_state_view.decoded_messages ==
+                    snapshot_state_view.accepted_messages &&
+                store_snapshot.appended_records ==
+                    snapshot_state_view.decoded_messages &&
+                store_snapshot.allocated_segments == 2U &&
                 store_snapshot.coverage_from_open &&
                 !store_snapshot.coverage_lost,
             "pipeline snapshot reports healthy from-open store coverage");
@@ -703,7 +800,8 @@ int main() {
         store_failure_pipeline;
     runtime::RealtimePipelineConfigV1 store_failure_config =
         MakeConfig(registry.get());
-    store_failure_config.intraday_store.chunk_record_capacity = 2U;
+    store_failure_config.intraday_store.segment_target_bytes =
+        4U * 1024U;
     store_failure_config.intraday_store.maximum_session_records = 1U;
     store_failure_config.intraday_store.maximum_session_accounted_bytes =
         16U * 1024U * 1024U;
@@ -782,6 +880,11 @@ int main() {
         std::this_thread::sleep_for(10ms);
         const runtime::RealtimePipelineCutResultV1 boundary_final =
             boundary_pipeline->StopAndPublishFinalGeneration(2s);
+        const std::uint64_t boundary_cut_ns =
+            boundary_final.store_generation == nullptr
+                ? 0U
+                : boundary_final.store_generation->watermark()
+                      .recv_monotonic_cut_ns;
         test.Expect(
             boundary_final.published() &&
                 boundary_final.store_generation->watermark()
@@ -789,7 +892,12 @@ int main() {
                 boundary_final.store_generation->watermark()
                         .recv_monotonic_cut_ns <= boundary_observed_ns &&
                 boundary_pipeline->Snapshot().stopped,
-            "date boundary preserves its original prefix-cut timestamp through shutdown");
+            "date boundary preserves its original prefix-cut timestamp "
+            "through shutdown: " +
+                DescribeCut(boundary_final) +
+                ", cut_ns=" + std::to_string(boundary_cut_ns) +
+                ", observed_ns=" +
+                std::to_string(boundary_observed_ns));
     }
 
     std::filesystem::remove(wal_path, ignored);

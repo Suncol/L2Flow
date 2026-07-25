@@ -454,7 +454,7 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
     config.decoder_queue_capacity_per_source = 16U;
     config.store_worker_count = 1U;
     config.store_queue_capacity_per_source_worker = 16U;
-    config.intraday_store.chunk_record_capacity = 4U;
+    config.intraday_store.segment_target_bytes = 4U * 1024U;
     config.intraday_store.maximum_session_records = 64U;
     config.intraday_store.maximum_session_accounted_bytes =
         16U * 1024U * 1024U;
@@ -603,12 +603,21 @@ int main() {
     test.Expect(
         pipeline_snapshot.accepted_messages == 1U &&
             pipeline_snapshot.decoded_messages == 1U &&
+            pipeline_snapshot.store.appended_records == 1U &&
+            pipeline_snapshot.store.allocated_segments == 1U &&
             pipeline_snapshot.global_ingress_sequence == 1U &&
             pipeline_snapshot.source_sequences[3U] == 1U &&
             pipeline_snapshot.last_published_generation == 1U &&
             pipeline_snapshot.stopped && !pipeline_snapshot.accepting &&
             !pipeline_snapshot.fatal,
         "terminal state is the complete non-fatal one-message prefix");
+    test.Expect(
+        pipeline_snapshot.ingress_pool.maximum_inflight_messages == 69U &&
+            pipeline_snapshot.ingress_pool.active_messages == 0U &&
+            pipeline_snapshot.ingress_pool.allocated_blocks <=
+                pipeline_snapshot.ingress_pool
+                    .maximum_inflight_messages,
+        "callback/stop race stays within the bounded owned-ingress pool");
 
     const LifecycleSnapshot lifecycle = state->Snapshot();
     const std::size_t callback_exit = EventIndex(

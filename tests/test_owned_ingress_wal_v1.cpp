@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -123,22 +124,62 @@ private:
 
 [[nodiscard]] realtime::OwnedIngressMessageHandleV1 MakeOwned(
     TestContext* test,
+    realtime::OwnedIngressMessagePoolV1* pool,
     sdk::MessageKey key,
     std::vector<std::byte> body,
     std::uint64_t global_sequence,
     std::uint64_t source_sequence) {
     FakeMessage message(key, std::move(body));
+    realtime::OwnedIngressMessageInspectionV1 inspection;
     realtime::OwnedIngressMessageHandleV1 result;
-    const realtime::OwnedIngressCreateErrorV1 error =
-        realtime::OwnedIngressMessageV1::Create(
-            &message,
-            Metadata(global_sequence, source_sequence),
-            4096U,
+    const realtime::OwnedIngressMessageErrorV1 inspect_error =
+        realtime::InspectOwnedIngressMessageV1(
+            &message, 4096U, &inspection);
+    const realtime::OwnedIngressMessageErrorV1 acquire_error =
+        inspect_error == realtime::OwnedIngressMessageErrorV1::kNone
+            ? pool->Acquire(
+                  inspection,
+                  Metadata(global_sequence, source_sequence),
+                  &result)
+            : inspect_error;
+    test->Expect(
+        inspect_error ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            acquire_error ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            static_cast<bool>(result),
+        "owned message helper succeeds");
+    return result;
+}
+
+[[nodiscard]] std::unique_ptr<realtime::OwnedIngressMessagePoolV1>
+MakePool(
+    TestContext* test,
+    std::size_t maximum_inflight_messages = 64U) {
+    std::unique_ptr<realtime::OwnedIngressMessagePoolV1> result;
+    const realtime::OwnedIngressMessageErrorV1 error =
+        realtime::OwnedIngressMessagePoolV1::Create(
+            realtime::OwnedIngressMessagePoolConfigV1{
+                4096U, maximum_inflight_messages},
             &result);
     test->Expect(
-        error == realtime::OwnedIngressCreateErrorV1::kNone &&
+        error == realtime::OwnedIngressMessageErrorV1::kNone &&
             result != nullptr,
-        "owned message helper succeeds");
+        "owned ingress pool helper succeeds");
+    return result;
+}
+
+[[nodiscard]] realtime::OwnedIngressMessageInspectionV1 Inspect(
+    TestContext* test,
+    const mdl::MDLMessage* message) {
+    realtime::OwnedIngressMessageInspectionV1 result;
+    const realtime::OwnedIngressMessageErrorV1 error =
+        realtime::InspectOwnedIngressMessageV1(
+            message, 4096U, &result);
+    test->Expect(
+        error == realtime::OwnedIngressMessageErrorV1::kNone &&
+            static_cast<bool>(result),
+        "owned message inspection helper succeeds");
     return result;
 }
 
@@ -244,18 +285,34 @@ void CheckRequiredClassification(TestContext* test) {
 }
 
 void CheckOwnedLifetimeAndValidation(TestContext* test) {
+    auto pool = MakePool(test, 8U);
+    if (pool == nullptr) {
+        return;
+    }
+
     FakeMessage message(
         sdk::MessageKey{6U, 101U, 33U},
         {std::byte{0x11U}, std::byte{0x22U}, std::byte{0x33U}});
     const realtime::OwnedIngressMetadataV1 metadata = Metadata(17U, 8U);
+    realtime::OwnedIngressMessageInspectionV1 inspection;
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &message, 4096U, &inspection) ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            static_cast<bool>(inspection) &&
+            inspection.source() ==
+                realtime::OwnedIngressSourceV1::kShenzhenTick &&
+            inspection.wire_size() ==
+                sdk::kVendorHeadBytes + message.body().size(),
+        "inspection validates and classifies one callback view");
     realtime::OwnedIngressMessageHandleV1 owned;
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &message, metadata, 4096U, &owned) ==
-            realtime::OwnedIngressCreateErrorV1::kNone,
-        "valid vendor message crosses the ownership boundary");
+        pool->Acquire(inspection, metadata, &owned) ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            static_cast<bool>(owned),
+        "pool acquire crosses the ownership boundary");
     test->Expect(
-        owned != nullptr &&
+        static_cast<bool>(owned) &&
             owned->source() ==
                 realtime::OwnedIngressSourceV1::kShenzhenTick &&
             owned->global_ingress_sequence() == 17U &&
@@ -267,7 +324,12 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
         message.head_calls.load(std::memory_order_relaxed) == 1U &&
             message.body_calls.load(std::memory_order_relaxed) == 1U &&
             message.copy_calls.load(std::memory_order_relaxed) == 0U,
-        "ownership reads SDK head/body once and never invokes SDK Copy");
+        "inspect then acquire reads SDK head/body once and never calls Copy");
+    test->Expect(
+        owned->body().data() ==
+            reinterpret_cast<const std::byte*>(owned.get()) +
+                sizeof(realtime::OwnedIngressMessageV1),
+        "message object and body occupy one contiguous pool block");
 
     message.body()[0U] = std::byte{0xffU};
     message.head().SequenceID = 1U;
@@ -276,26 +338,54 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
             owned->vendor_head().sequence_id() == 9988U,
         "owned bytes do not alias vendor callback lifetime");
 
+    realtime::OwnedIngressMessageHandleV1 copied = owned;
+    realtime::OwnedIngressMessageHandleV1 moved = std::move(copied);
+    realtime::OwnedIngressMessageHandleV1 assigned;
+    assigned = moved;
+    test->Expect(
+        !copied && moved.get() == owned.get() &&
+            assigned.get() == owned.get(),
+        "intrusive handle copy and move retain exact object identity");
+    test->Expect(
+        pool->Snapshot().active_messages == 1U,
+        "handle copies do not create additional pooled messages");
+
     FakeMessage combined(
         realtime::kForbiddenShenzhenCombinedTickKeyV1,
         {std::byte{1U}});
-    realtime::OwnedIngressMessageHandleV1 rejected = owned;
+    realtime::OwnedIngressMessageInspectionV1 rejected = inspection;
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &combined, metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::kForbiddenCombinedTick &&
-            rejected == nullptr &&
+        realtime::InspectOwnedIngressMessageV1(
+            &combined, 4096U, &rejected) ==
+                realtime::OwnedIngressMessageErrorV1::
+                    kForbiddenCombinedTick &&
+            !rejected &&
             combined.body_calls.load(std::memory_order_relaxed) == 0U,
         "forbidden combined tick is rejected before body access");
+
+    FakeMessage unsupported(
+        sdk::MessageKey{6U, 101U, 29U},
+        {std::byte{1U}});
+    unsupported.head().HeadSize = 0U;
+    unsupported.head().MessageSize = 1U;
+    unsupported.head().MessageEncoding =
+        static_cast<std::uint8_t>(mdl::MDLEID_FAST);
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &unsupported, 4096U, &rejected) ==
+                realtime::OwnedIngressMessageErrorV1::
+                    kUnsupportedMessage &&
+            unsupported.body_calls.load(std::memory_order_relaxed) == 0U,
+        "unsupported tuple is ignored before production schema validation");
 
     FakeMessage wrong_head(
         sdk::MessageKey{4U, 101U, 24U},
         {std::byte{1U}});
     wrong_head.head().HeadSize = 22U;
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &wrong_head, metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::kWrongHeadSize,
+        realtime::InspectOwnedIngressMessageV1(
+            &wrong_head, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::kWrongHeadSize,
         "declared vendor HeadSize is validated");
 
     FakeMessage smaller(
@@ -303,9 +393,10 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
         {std::byte{1U}});
     smaller.head().MessageSize = 1U;
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &smaller, metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::kMessageSmallerThanHead,
+        realtime::InspectOwnedIngressMessageV1(
+            &smaller, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kMessageSmallerThanHead,
         "declared MessageSize cannot underflow body length");
 
     FakeMessage wrong_encoding(
@@ -314,9 +405,9 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
     wrong_encoding.head().MessageEncoding =
         static_cast<std::uint8_t>(mdl::MDLEID_FAST);
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &wrong_encoding, metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::
+        realtime::InspectOwnedIngressMessageV1(
+            &wrong_encoding, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::
                 kUnexpectedMessageEncoding &&
             wrong_encoding.body_calls.load(std::memory_order_relaxed) == 0U,
         "non-binary vendor encoding is rejected before body decoding");
@@ -326,32 +417,298 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
         {std::byte{1U}});
     null_body.null_body = true;
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &null_body, metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::kNullBody,
+        realtime::InspectOwnedIngressMessageV1(
+            &null_body, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::kNullBody,
         "non-empty declared body requires a vendor body pointer");
+
+    FakeMessage zero_body(
+        sdk::MessageKey{4U, 101U, 24U}, {});
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &zero_body, 4096U, &rejected) ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            rejected.body().empty() &&
+            zero_body.body_calls.load(std::memory_order_relaxed) == 0U,
+        "empty message body requires no SDK body access");
+
+    FakeMessage too_large(
+        sdk::MessageKey{4U, 101U, 24U},
+        {std::byte{1U}});
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &too_large,
+            static_cast<std::uint32_t>(sdk::kVendorHeadBytes),
+            &rejected) ==
+                realtime::OwnedIngressMessageErrorV1::kMessageTooLarge &&
+            too_large.body_calls.load(std::memory_order_relaxed) == 0U,
+        "message limit rejects before SDK body access");
+
+    FakeMessage null_head(
+        sdk::MessageKey{4U, 101U, 24U},
+        {std::byte{1U}});
+    null_head.null_head = true;
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &null_head, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::kNullHead,
+        "null SDK head is rejected");
+
+    FakeMessage throwing_head(
+        sdk::MessageKey{4U, 101U, 24U},
+        {std::byte{1U}});
+    throwing_head.throw_head = true;
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &throwing_head, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::kSdkAccess,
+        "SDK head exception cannot cross the callback boundary");
+
+    FakeMessage throwing_body(
+        sdk::MessageKey{4U, 101U, 24U},
+        {std::byte{1U}});
+    throwing_body.throw_body = true;
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &throwing_body, 4096U, &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::kSdkAccess,
+        "SDK body exception cannot cross the callback boundary");
+
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            nullptr, 4096U, &rejected) ==
+                realtime::OwnedIngressMessageErrorV1::kNullMessage &&
+            realtime::InspectOwnedIngressMessageV1(
+                &message, 4096U, nullptr) ==
+                realtime::OwnedIngressMessageErrorV1::kNullOutput,
+        "inspection rejects null message and output pointers");
+
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &message,
+            static_cast<std::uint32_t>(
+                sdk::kVendorHeadBytes - 1U),
+            &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kInvalidMaximumMessageBytes,
+        "inspection limit cannot be smaller than the vendor head");
+    test->Expect(
+        realtime::InspectOwnedIngressMessageV1(
+            &message,
+            realtime::kOwnedIngressMaximumMessageBytesV1 + 1U,
+            &rejected) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kInvalidMaximumMessageBytes,
+        "inspection limit has an explicit hard upper bound");
 
     realtime::OwnedIngressMetadataV1 invalid_metadata = metadata;
     invalid_metadata.run_id = {};
+    realtime::OwnedIngressMessageHandleV1 rejected_owned = owned;
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &message, invalid_metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::kInvalidMetadata,
-        "zero run identity cannot enter realtime ownership");
+        pool->Acquire(
+            inspection, invalid_metadata, &rejected_owned) ==
+                realtime::OwnedIngressMessageErrorV1::kInvalidMetadata &&
+            !rejected_owned,
+        "zero run identity cannot enter ownership and clears output");
 
     invalid_metadata = metadata;
     invalid_metadata.global_ingress_sequence =
         std::numeric_limits<std::uint64_t>::max();
     test->Expect(
-        realtime::OwnedIngressMessageV1::Create(
-            &message, invalid_metadata, 4096U, &rejected) ==
-            realtime::OwnedIngressCreateErrorV1::kInvalidMetadata,
+        pool->Acquire(
+            inspection, invalid_metadata, &rejected_owned) ==
+            realtime::OwnedIngressMessageErrorV1::kInvalidMetadata,
         "sequence exhaustion sentinel is never published as a message");
+
+    realtime::OwnedIngressMessageInspectionV1 invalid_inspection;
+    test->Expect(
+        pool->Acquire(
+            invalid_inspection, metadata, &rejected_owned) ==
+                realtime::OwnedIngressMessageErrorV1::
+                    kInvalidInspection &&
+            !rejected_owned,
+        "pool cannot acquire a default or failed inspection");
+}
+
+void CheckPoolBoundsReuseAndRetiredLifetime(TestContext* test) {
+    std::unique_ptr<realtime::OwnedIngressMessagePoolV1> invalid_pool;
+    test->Expect(
+        realtime::OwnedIngressMessagePoolV1::Create(
+            realtime::OwnedIngressMessagePoolConfigV1{
+                static_cast<std::uint32_t>(
+                    sdk::kVendorHeadBytes - 1U),
+                1U},
+            &invalid_pool) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kInvalidPoolConfiguration,
+        "pool rejects a maximum smaller than the vendor head");
+    test->Expect(
+        realtime::OwnedIngressMessagePoolV1::Create(
+            realtime::OwnedIngressMessagePoolConfigV1{
+                realtime::kOwnedIngressMaximumMessageBytesV1 + 1U,
+                1U},
+            &invalid_pool) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kInvalidPoolConfiguration,
+        "pool rejects a message bound above the hard maximum");
+    test->Expect(
+        realtime::OwnedIngressMessagePoolV1::Create(
+            realtime::OwnedIngressMessagePoolConfigV1{4096U, 0U},
+            &invalid_pool) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kInvalidPoolConfiguration,
+        "pool requires a nonzero inflight bound");
+    test->Expect(
+        realtime::OwnedIngressMessagePoolV1::Create(
+            realtime::OwnedIngressMessagePoolConfigV1{
+                4096U,
+                realtime::kOwnedIngressMaximumInflightMessagesV1 +
+                    1U},
+            &invalid_pool) ==
+            realtime::OwnedIngressMessageErrorV1::
+                kInvalidPoolConfiguration,
+        "pool inflight count has an explicit hard upper bound");
+
+    auto pool = MakePool(test, 2U);
+    if (pool == nullptr) {
+        return;
+    }
+    FakeMessage first_message(
+        sdk::MessageKey{4U, 101U, 4U},
+        {std::byte{0x31U}});
+    FakeMessage second_message(
+        sdk::MessageKey{4U, 101U, 24U},
+        {std::byte{0x32U}});
+    FakeMessage third_message(
+        sdk::MessageKey{6U, 101U, 28U},
+        {std::byte{0x33U}});
+    const auto first_inspection = Inspect(test, &first_message);
+    const auto second_inspection = Inspect(test, &second_message);
+    const auto third_inspection = Inspect(test, &third_message);
+
+    realtime::OwnedIngressMessageHandleV1 first;
+    realtime::OwnedIngressMessageHandleV1 second;
+    realtime::OwnedIngressMessageHandleV1 third;
+    test->Expect(
+        pool->Acquire(first_inspection, Metadata(1U, 1U), &first) ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            pool->Acquire(second_inspection, Metadata(2U, 1U), &second) ==
+                realtime::OwnedIngressMessageErrorV1::kNone,
+        "pool admits messages up to its inflight bound");
+    if (!first || !second) {
+        return;
+    }
+    test->Expect(
+        pool->Acquire(third_inspection, Metadata(3U, 1U), &third) ==
+                realtime::OwnedIngressMessageErrorV1::kPoolExhausted &&
+            !third,
+        "pool deterministically rejects beyond its inflight bound");
+    const realtime::OwnedIngressMessagePoolSnapshotV1 full_snapshot =
+        pool->Snapshot();
+    test->Expect(
+        full_snapshot.active_messages == 2U &&
+            full_snapshot.allocated_blocks == 2U &&
+            full_snapshot.cached_blocks == 0U &&
+            full_snapshot.allocated_blocks <=
+                full_snapshot.maximum_inflight_messages,
+        "pool snapshot proves bounded live and allocated block counts");
+
+    const realtime::OwnedIngressMessageV1* const first_address =
+        first.get();
+    first.reset();
+    test->Expect(
+        pool->Snapshot().cached_blocks == 1U,
+        "final handle release returns a live pool block to its class");
+    test->Expect(
+        pool->Acquire(third_inspection, Metadata(3U, 1U), &third) ==
+                realtime::OwnedIngressMessageErrorV1::kNone &&
+            third.get() == first_address &&
+            pool->Snapshot().allocated_blocks == 2U,
+        "a matching cached size class is reused without new allocation");
+    if (!third) {
+        return;
+    }
+
+    realtime::OwnedIngressMessageHandleV1 survivor = second;
+    second.reset();
+    third.reset();
+    pool.reset();
+    test->Expect(
+        survivor->body()[0U] == std::byte{0x32U},
+        "live intrusive handles survive destruction of the pool wrapper");
+    std::thread final_releaser(
+        [owned = std::move(survivor)]() mutable {
+            owned.reset();
+        });
+    final_releaser.join();
+
+    constexpr std::size_t release_thread_count = 16U;
+    auto race_pool = MakePool(test, release_thread_count);
+    if (race_pool == nullptr) {
+        return;
+    }
+    FakeMessage race_message(
+        sdk::MessageKey{6U, 101U, 36U},
+        {std::byte{0x71U}});
+    const auto race_inspection = Inspect(test, &race_message);
+    std::array<realtime::OwnedIngressMessageHandleV1,
+               release_thread_count>
+        release_handles{};
+    for (std::size_t index = 0U;
+         index < release_handles.size();
+         ++index) {
+        test->Expect(
+            race_pool->Acquire(
+                race_inspection,
+                Metadata(index + 10U, index + 1U),
+                &release_handles[index]) ==
+                realtime::OwnedIngressMessageErrorV1::kNone,
+            "retirement race message acquisition succeeds");
+    }
+    std::atomic<bool> release_now{false};
+    std::atomic<std::size_t> completed_releases{0U};
+    std::vector<std::thread> releasers;
+    releasers.reserve(release_thread_count);
+    for (auto& handle : release_handles) {
+        releasers.emplace_back(
+            [owned = std::move(handle),
+             &release_now,
+             &completed_releases]() mutable {
+                while (!release_now.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                owned.reset();
+                completed_releases.fetch_add(
+                    1U, std::memory_order_release);
+            });
+    }
+    std::thread retire_pool(
+        [&race_pool, &release_now] {
+            while (!release_now.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            race_pool.reset();
+        });
+    release_now.store(true, std::memory_order_release);
+    for (std::thread& releaser : releasers) {
+        releaser.join();
+    }
+    retire_pool.join();
+    test->Expect(
+        completed_releases.load(std::memory_order_acquire) ==
+                release_thread_count &&
+            race_pool == nullptr,
+        "multithread final release safely races pool retirement");
 }
 
 void CheckDisabledAndFailedWalAreSideBranches(TestContext* test) {
+    auto pool = MakePool(test, 4U);
+    if (pool == nullptr) {
+        return;
+    }
     const auto decoder_handle = MakeOwned(
         test,
+        pool.get(),
         sdk::MessageKey{4U, 101U, 4U},
         {std::byte{0x41U}},
         1U,
@@ -439,6 +796,10 @@ void CheckWalFramingAndDrain(TestContext* test) {
     if (temporary.path().empty()) {
         return;
     }
+    auto pool = MakePool(test, 8U);
+    if (pool == nullptr) {
+        return;
+    }
 
     realtime::OptionalWalSinkConfigV1 config{};
     config.enabled = true;
@@ -454,14 +815,16 @@ void CheckWalFramingAndDrain(TestContext* test) {
         return;
     }
 
-    const auto first = MakeOwned(
+    auto first = MakeOwned(
         test,
+        pool.get(),
         sdk::MessageKey{4U, 101U, 24U},
         {std::byte{0x10U}, std::byte{0x11U}},
         11U,
         7U);
-    const auto second = MakeOwned(
+    auto second = MakeOwned(
         test,
+        pool.get(),
         sdk::MessageKey{6U, 101U, 36U},
         {std::byte{0x20U}, std::byte{0x21U}, std::byte{0x22U}},
         12U,
@@ -475,6 +838,13 @@ void CheckWalFramingAndDrain(TestContext* test) {
                 realtime::OptionalWalEnqueueResultV1::kAccepted &&
             decoder_copy.get() == first_identity,
         "WAL and decoder share the exact immutable ingress object");
+    first.reset();
+    second.reset();
+    pool.reset();
+    test->Expect(
+        decoder_copy.get() == first_identity &&
+            decoder_copy->body()[0U] == std::byte{0x10U},
+        "WAL/decoder handles remain valid after their pool wrapper retires");
     sink->StopAndDrain();
 
     const realtime::OptionalWalSnapshotV1 snapshot = sink->Snapshot();
@@ -487,7 +857,7 @@ void CheckWalFramingAndDrain(TestContext* test) {
             snapshot.finished,
         "clean stop drains and syncs every accepted WAL handle");
     test->Expect(
-        sink->TryEnqueue(first) ==
+        sink->TryEnqueue(decoder_copy) ==
             realtime::OptionalWalEnqueueResultV1::kStopped,
         "post-quiescence WAL submission reports stopped");
     const realtime::OptionalWalSnapshotV1 after_stopped =
@@ -570,6 +940,7 @@ int main() {
     TestContext test;
     CheckRequiredClassification(&test);
     CheckOwnedLifetimeAndValidation(&test);
+    CheckPoolBoundsReuseAndRetiredLifetime(&test);
     CheckDisabledAndFailedWalAreSideBranches(&test);
     CheckWalFramingAndDrain(&test);
     return test.failures() == 0 ? 0 : 1;

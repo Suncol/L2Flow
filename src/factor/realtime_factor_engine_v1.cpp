@@ -139,15 +139,15 @@ template <typename Value>
     if (record == nullptr) {
         return nullptr;
     }
-    const l2flow::market::RetainedMarketEventV1& event = record->event();
+    const l2flow::market::StoredMarketEventViewV1 event = record->event();
     const auto* shanghai =
-        l2flow::market::RetainedMarketEventGetV1<
+        l2flow::market::StoredMarketEventGetV1<
             l2flow::market::ShanghaiSnapshotV1>(event);
     if (shanghai != nullptr) {
         return &shanghai->last_price;
     }
     const auto* shenzhen =
-        l2flow::market::RetainedMarketEventGetV1<
+        l2flow::market::StoredMarketEventGetV1<
             l2flow::market::ShenzhenSnapshotV1>(event);
     return shenzhen == nullptr ? nullptr : &shenzhen->last_price;
 }

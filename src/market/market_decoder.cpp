@@ -726,6 +726,7 @@ void ResolveInstrument(
             common->security_id);
         if (lookup.known()) {
             common->instrument_id = lookup.instrument_id;
+            common->registry_ordinal = lookup.registry_ordinal;
             common->quantity_unit = lookup.quantity_unit;
             common->security_type = lookup.security_type;
             common->asset_scope = lookup.asset_scope;

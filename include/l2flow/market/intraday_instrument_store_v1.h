@@ -12,23 +12,29 @@
 namespace l2flow::market {
 
 class InstrumentRegistryV1;
+class RealtimeHistoryEventInputV1;
 class RealtimeHistoryRecordV1;
 struct RealtimeHistoryWatermarkV1;
 
 inline constexpr std::size_t kIntradayInstrumentStoreSourceCountV1 = 4U;
 inline constexpr std::size_t
-    kIntradayInstrumentStoreMaximumChunkRecordsV1 = 64U * 1024U;
+    kIntradayInstrumentStoreMinimumSegmentBytesV1 = 4U * 1024U;
+inline constexpr std::size_t
+    kIntradayInstrumentStoreMaximumSegmentBytesV1 =
+        16U * 1024U * 1024U;
 inline constexpr std::size_t
     kIntradayInstrumentStoreMaximumBatchRecordsV1 = 1024U * 1024U;
 
 struct IntradayInstrumentStoreConfigV1 final {
-    // Chunks contain stable record owners. They are append-only and are
-    // reclaimed only when the complete trade-day session is released.
-    std::size_t chunk_record_capacity = 1024U;
+    // Each instrument/source lane owns append-only fixed-target-byte
+    // segments. Record headers grow forward and exact event payloads grow
+    // backward. An individual event may require a larger segment, up to the
+    // absolute maximum, but existing segments never move.
+    std::size_t segment_target_bytes = 64U * 1024U;
     // Both limits are required. They are global session limits, not
     // per-instrument limits; reaching either one never evicts an older record.
     // The byte limit is one conservative logical budget shared by base index
-    // state, allocated chunks, and retained record accounting. It is not a
+    // state, allocated segments, and retained record accounting. It is not a
     // promise about allocator RSS.
     std::uint64_t maximum_session_records = 0U;
     std::uint64_t maximum_session_accounted_bytes = 0U;
@@ -39,6 +45,18 @@ struct IntradayInstrumentStoreConfigV1 final {
     // It may be true only when the process began before the first market
     // message and has remained continuously healthy.
     bool coverage_from_open = false;
+};
+
+// The decoder resolves the immutable registry ordinal once. The history
+// runtime carries this value through its source×worker queue so append does
+// not repeat an ID lookup. A token is valid only for the Store session epoch
+// that created it.
+struct InstrumentRouteTokenV1 final {
+    std::uint32_t instrument_id = 0U;
+    std::size_t registry_ordinal = std::numeric_limits<std::size_t>::max();
+    std::uint32_t worker = std::numeric_limits<std::uint32_t>::max();
+    std::size_t worker_local_row = std::numeric_limits<std::size_t>::max();
+    std::uint64_t session_epoch = 0U;
 };
 
 enum class IntradayInstrumentStoreCreateErrorV1 : std::uint8_t {
@@ -127,7 +145,7 @@ struct IntradayInstrumentStoreSnapshotV1 final {
     std::uint64_t appended_records = 0U;
     std::uint64_t accounted_record_bytes = 0U;
     std::uint64_t allocated_index_bytes = 0U;
-    std::uint64_t allocated_chunks = 0U;
+    std::uint64_t allocated_segments = 0U;
     std::uint64_t failed_appends = 0U;
     std::uint64_t latest_generation = 0U;
     bool coverage_from_open = false;
@@ -307,12 +325,21 @@ public:
     [[nodiscard]] static IntradayInstrumentStoreCreateErrorV1 Create(
         IntradayInstrumentStoreConfigV1 config,
         std::uint32_t worker_count,
+        std::array<std::uint32_t,
+                   kIntradayInstrumentStoreSourceCountV1>
+            source_stream_ids,
         const InstrumentRegistryV1* registry,
         std::unique_ptr<IntradayInstrumentStoreV1>* output) noexcept;
 
+    [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 ResolveRouteToken(
+        std::size_t registry_ordinal,
+        std::uint32_t instrument_id,
+        InstrumentRouteTokenV1* output) const noexcept;
+
     [[nodiscard]] IntradayInstrumentStoreAppendErrorV1 Append(
         std::uint32_t worker,
-        std::shared_ptr<const RealtimeHistoryRecordV1> record) noexcept;
+        const InstrumentRouteTokenV1& route,
+        RealtimeHistoryEventInputV1&& input) noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreGenerationErrorV1 CaptureWorker(
         std::uint32_t worker,
@@ -326,6 +353,16 @@ public:
             std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>>
             worker_slices,
         std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output)
+        noexcept;
+
+    // BuildGeneration is intentionally publication-free and may run outside
+    // the history commit lock. The history runtime calls PublishGeneration
+    // only after reacquiring that lock and proving that the built handle is
+    // still the exact healthy generation to publish.
+    [[nodiscard]] IntradayInstrumentStoreGenerationErrorV1
+    PublishGeneration(
+        const std::shared_ptr<
+            const IntradayInstrumentStoreGenerationV1>& generation)
         noexcept;
 
     void MarkCoverageLost() noexcept;
@@ -342,13 +379,5 @@ private:
         std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
 };
-
-// Conservative record-side logical accounting for one retained object graph
-// plus its lane owner. The session byte cap additionally charges base index
-// state and whole chunk allocations. Neither value claims to equal allocator
-// RSS.
-[[nodiscard]] std::uint64_t
-EstimateIntradayInstrumentRecordBytesV1(
-    const std::shared_ptr<const RealtimeHistoryRecordV1>& record) noexcept;
 
 }  // namespace l2flow::market

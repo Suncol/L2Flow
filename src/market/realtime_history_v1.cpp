@@ -137,23 +137,19 @@ constexpr MarketEventKindV1 EventKind<ShenzhenTransactionV1>() noexcept {
     return MarketEventKindV1::kShenzhenTransaction;
 }
 
-struct RetainedEventDescription final {
+struct DecodedEventDescription final {
     const DecodedMarketCommonV1* common = nullptr;
     MarketEventKindV1 kind = MarketEventKindV1::kShanghaiSnapshot;
 };
 
-RetainedEventDescription Describe(
-    const RetainedMarketEventV1& event) noexcept {
+DecodedEventDescription Describe(
+    const DecodedMarketEventV1& event) noexcept {
     return std::visit(
-        [](const auto& owner) noexcept {
-            using Owner = std::decay_t<decltype(owner)>;
-            using Element = typename Owner::element_type;
-            using Event = std::remove_const_t<Element>;
-            RetainedEventDescription result{};
-            if (owner != nullptr) {
-                result.common = &owner->common;
-                result.kind = EventKind<Event>();
-            }
+        [](const auto& value) noexcept {
+            using Event = std::decay_t<decltype(value)>;
+            DecodedEventDescription result{};
+            result.common = &value.common;
+            result.kind = EventKind<Event>();
             return result;
         },
         event);
@@ -189,7 +185,9 @@ public:
     bool TryPush(Value value) noexcept {
         const std::size_t tail = tail_.load(std::memory_order_relaxed);
         const std::size_t next = Increment(tail);
-        if (next == head_.load(std::memory_order_acquire)) {
+        const std::size_t head =
+            head_.load(std::memory_order_acquire);
+        if (next == head) {
             return false;
         }
         slots_[tail].emplace(std::move(value));
@@ -226,6 +224,109 @@ private:
     std::vector<std::optional<Value>> slots_;
     alignas(64) std::atomic<std::size_t> head_{0U};
     alignas(64) std::atomic<std::size_t> tail_{0U};
+};
+
+// The command ring deliberately carries only one pointer-sized lease, not the
+// multi-kilobyte decoded-event variant.  Slots are allocated lazily up to the
+// queue's hard bound and then recycled over a reverse SPSC ring.  The source
+// decoder is the sole allocator/acquirer and the instrument worker is the
+// sole releaser.
+class HistoryHandoffPool final {
+public:
+    struct Slot final {
+        alignas(RealtimeHistoryEventInputV1)
+            std::array<std::byte, sizeof(RealtimeHistoryEventInputV1)>
+                storage{};
+        bool engaged = false;
+
+        [[nodiscard]] RealtimeHistoryEventInputV1* Input() noexcept {
+            return std::launder(
+                reinterpret_cast<RealtimeHistoryEventInputV1*>(
+                    storage.data()));
+        }
+    };
+
+    explicit HistoryHandoffPool(std::size_t capacity)
+        : capacity_(capacity), returned_(capacity) {
+        owned_.reserve(capacity);
+        producer_free_.reserve(capacity);
+    }
+
+    HistoryHandoffPool(const HistoryHandoffPool&) = delete;
+    HistoryHandoffPool& operator=(const HistoryHandoffPool&) = delete;
+
+    ~HistoryHandoffPool() {
+        Slot* returned = nullptr;
+        while (returned_.TryPop(&returned)) {
+            producer_free_.push_back(returned);
+        }
+        for (const std::unique_ptr<Slot>& slot : owned_) {
+            if (slot->engaged) {
+                std::destroy_at(slot->Input());
+                slot->engaged = false;
+            }
+        }
+    }
+
+    [[nodiscard]] bool Acquire(
+        RealtimeHistoryEventInputV1&& input,
+        Slot** output) noexcept {
+        if (output == nullptr) {
+            return false;
+        }
+        DrainReturned();
+        Slot* slot = nullptr;
+        if (!producer_free_.empty()) {
+            slot = producer_free_.back();
+            producer_free_.pop_back();
+        } else {
+            if (owned_.size() >= capacity_) {
+                return false;
+            }
+            std::unique_ptr<Slot> candidate(new (std::nothrow) Slot());
+            if (candidate == nullptr) {
+                return false;
+            }
+            slot = candidate.get();
+            // reserve(capacity_) in the constructor makes this nonallocating.
+            owned_.push_back(std::move(candidate));
+        }
+        std::construct_at(slot->Input(), std::move(input));
+        slot->engaged = true;
+        *output = slot;
+        return true;
+    }
+
+    void ReleaseFromProducer(Slot* slot) noexcept {
+        Destroy(slot);
+        producer_free_.push_back(slot);
+    }
+
+    [[nodiscard]] bool ReleaseFromConsumer(Slot* slot) noexcept {
+        Destroy(slot);
+        return returned_.TryPush(slot);
+    }
+
+private:
+    void DrainReturned() noexcept {
+        Slot* slot = nullptr;
+        while (returned_.TryPop(&slot)) {
+            producer_free_.push_back(slot);
+        }
+    }
+
+    static void Destroy(Slot* slot) noexcept {
+        if (slot == nullptr || !slot->engaged) {
+            return;
+        }
+        std::destroy_at(slot->Input());
+        slot->engaged = false;
+    }
+
+    std::size_t capacity_ = 0U;
+    SpscQueue<Slot*> returned_;
+    std::vector<std::unique_ptr<Slot>> owned_;
+    std::vector<Slot*> producer_free_;
 };
 
 }  // namespace
@@ -351,7 +452,7 @@ RealtimeHistoryRecordV1::RealtimeHistoryRecordV1(
     std::int64_t event_time_ns,
     std::int64_t recv_realtime_ns,
     std::int64_t recv_monotonic_ns,
-    RetainedMarketEventV1 event) noexcept
+    std::uint32_t payload_delta) noexcept
     : source_slot_(source_slot),
       source_stream_id_(source_stream_id),
       source_sequence_(source_sequence),
@@ -361,20 +462,142 @@ RealtimeHistoryRecordV1::RealtimeHistoryRecordV1(
       event_time_ns_(event_time_ns),
       recv_realtime_ns_(recv_realtime_ns),
       recv_monotonic_ns_(recv_monotonic_ns),
+      payload_delta_(payload_delta) {}
+
+RealtimeHistoryRecordV1::~RealtimeHistoryRecordV1() {
+    if (payload_delta_ == 0U) {
+        return;
+    }
+    std::byte* const payload =
+        reinterpret_cast<std::byte*>(this) + payload_delta_;
+    switch (kind_) {
+        case MarketEventKindV1::kShanghaiSnapshot:
+            std::destroy_at(
+                reinterpret_cast<ShanghaiSnapshotV1*>(payload));
+            return;
+        case MarketEventKindV1::kShanghaiTick:
+            std::destroy_at(reinterpret_cast<ShanghaiTickV1*>(payload));
+            return;
+        case MarketEventKindV1::kShenzhenSnapshot:
+            std::destroy_at(
+                reinterpret_cast<ShenzhenSnapshotV1*>(payload));
+            return;
+        case MarketEventKindV1::kShenzhenOrder:
+            std::destroy_at(reinterpret_cast<ShenzhenOrderV1*>(payload));
+            return;
+        case MarketEventKindV1::kShenzhenTransaction:
+            std::destroy_at(
+                reinterpret_cast<ShenzhenTransactionV1*>(payload));
+            return;
+    }
+}
+
+StoredMarketEventViewV1 RealtimeHistoryRecordV1::event() const noexcept {
+    const std::byte* const payload =
+        reinterpret_cast<const std::byte*>(this) + payload_delta_;
+    switch (kind_) {
+        case MarketEventKindV1::kShanghaiSnapshot:
+            return StoredMarketEventViewV1(
+                std::in_place_type<const ShanghaiSnapshotV1*>,
+                reinterpret_cast<const ShanghaiSnapshotV1*>(payload));
+        case MarketEventKindV1::kShanghaiTick:
+            return StoredMarketEventViewV1(
+                std::in_place_type<const ShanghaiTickV1*>,
+                reinterpret_cast<const ShanghaiTickV1*>(payload));
+        case MarketEventKindV1::kShenzhenSnapshot:
+            return StoredMarketEventViewV1(
+                std::in_place_type<const ShenzhenSnapshotV1*>,
+                reinterpret_cast<const ShenzhenSnapshotV1*>(payload));
+        case MarketEventKindV1::kShenzhenOrder:
+            return StoredMarketEventViewV1(
+                std::in_place_type<const ShenzhenOrderV1*>,
+                reinterpret_cast<const ShenzhenOrderV1*>(payload));
+        case MarketEventKindV1::kShenzhenTransaction:
+            return StoredMarketEventViewV1(
+                std::in_place_type<const ShenzhenTransactionV1*>,
+                reinterpret_cast<const ShenzhenTransactionV1*>(payload));
+    }
+    return StoredMarketEventViewV1(
+        std::in_place_type<const ShanghaiSnapshotV1*>, nullptr);
+}
+
+RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
+    std::uint8_t source_slot,
+    std::uint32_t source_stream_id,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint32_t instrument_id,
+    std::size_t registry_ordinal,
+    MarketEventKindV1 kind,
+    std::int64_t event_time_ns,
+    std::int64_t recv_realtime_ns,
+    std::int64_t recv_monotonic_ns,
+    std::uint64_t accounted_record_bytes,
+    DecodedMarketEventV1&& event) noexcept
+    : source_slot_(source_slot),
+      source_stream_id_(source_stream_id),
+      source_sequence_(source_sequence),
+      ingress_sequence_(ingress_sequence),
+      instrument_id_(instrument_id),
+      registry_ordinal_(registry_ordinal),
+      kind_(kind),
+      event_time_ns_(event_time_ns),
+      recv_realtime_ns_(recv_realtime_ns),
+      recv_monotonic_ns_(recv_monotonic_ns),
+      accounted_record_bytes_(accounted_record_bytes),
       event_(std::move(event)) {}
 
-bool RealtimeHistoryRecordV1::Create(
+RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
+    RealtimeHistoryEventInputV1&& other) noexcept
+    : source_slot_(other.source_slot_),
+      source_stream_id_(other.source_stream_id_),
+      source_sequence_(other.source_sequence_),
+      ingress_sequence_(other.ingress_sequence_),
+      instrument_id_(other.instrument_id_),
+      registry_ordinal_(other.registry_ordinal_),
+      kind_(other.kind_),
+      event_time_ns_(other.event_time_ns_),
+      recv_realtime_ns_(other.recv_realtime_ns_),
+      recv_monotonic_ns_(other.recv_monotonic_ns_),
+      accounted_record_bytes_(other.accounted_record_bytes_),
+      event_(std::move(other.event_)),
+      valid_(other.valid_) {
+    other.valid_ = false;
+}
+
+RealtimeHistoryEventInputV1& RealtimeHistoryEventInputV1::operator=(
+    RealtimeHistoryEventInputV1&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    source_slot_ = other.source_slot_;
+    source_stream_id_ = other.source_stream_id_;
+    source_sequence_ = other.source_sequence_;
+    ingress_sequence_ = other.ingress_sequence_;
+    instrument_id_ = other.instrument_id_;
+    registry_ordinal_ = other.registry_ordinal_;
+    kind_ = other.kind_;
+    event_time_ns_ = other.event_time_ns_;
+    recv_realtime_ns_ = other.recv_realtime_ns_;
+    recv_monotonic_ns_ = other.recv_monotonic_ns_;
+    accounted_record_bytes_ = other.accounted_record_bytes_;
+    event_ = std::move(other.event_);
+    valid_ = other.valid_;
+    other.valid_ = false;
+    return *this;
+}
+
+std::optional<RealtimeHistoryEventInputV1>
+RealtimeHistoryEventInputV1::Create(
     std::uint8_t source_slot,
     std::uint64_t ingress_sequence,
-    RetainedMarketEventV1 event,
-    std::shared_ptr<const RealtimeHistoryRecordV1>* output) noexcept {
-    if (output == nullptr ||
-        source_slot >= kRealtimeHistorySourceCountV1 ||
+    DecodedMarketEventV1&& event) noexcept {
+    if (source_slot >= kRealtimeHistorySourceCountV1 ||
         ingress_sequence == 0U ||
         ingress_sequence == std::numeric_limits<std::uint64_t>::max()) {
-        return false;
+        return std::nullopt;
     }
-    const RetainedEventDescription description = Describe(event);
+    const DecodedEventDescription description = Describe(event);
     if (description.common == nullptr ||
         description.common->kind != description.kind ||
         !KindBelongsToSource(description.kind, source_slot) ||
@@ -383,32 +606,40 @@ bool RealtimeHistoryRecordV1::Create(
         description.common->origin.source_sequence ==
             std::numeric_limits<std::uint64_t>::max() ||
         description.common->instrument_id == 0U ||
+        description.common->registry_ordinal ==
+            std::numeric_limits<std::size_t>::max() ||
         !description.common->origin.body.empty()) {
-        return false;
+        return std::nullopt;
     }
     const std::int64_t event_time_ns =
         description.common->exchange_time.valid &&
                 description.common->exchange_time.unix_nanoseconds_valid
             ? description.common->exchange_time.unix_nanoseconds
             : 0;
-    try {
-        std::shared_ptr<const RealtimeHistoryRecordV1> candidate(
-            new RealtimeHistoryRecordV1(
-                source_slot,
-                description.common->origin.source_stream_id,
-                description.common->origin.source_sequence,
-                ingress_sequence,
-                description.common->instrument_id,
-                description.kind,
-                event_time_ns,
-                description.common->origin.recv_realtime_ns,
-                description.common->origin.recv_monotonic_ns,
-                std::move(event)));
-        *output = std::move(candidate);
-        return true;
-    } catch (...) {
-        return false;
+    const std::size_t event_bytes =
+        EstimateStoredMarketEventBytesV1(event);
+    if (event_bytes == std::numeric_limits<std::size_t>::max() ||
+        event_bytes >
+            std::numeric_limits<std::uint64_t>::max() -
+                sizeof(RealtimeHistoryRecordV1)) {
+        return std::nullopt;
     }
+    const std::uint64_t accounted_record_bytes =
+        static_cast<std::uint64_t>(event_bytes) +
+        static_cast<std::uint64_t>(sizeof(RealtimeHistoryRecordV1));
+    return RealtimeHistoryEventInputV1(
+        source_slot,
+        description.common->origin.source_stream_id,
+        description.common->origin.source_sequence,
+        ingress_sequence,
+        description.common->instrument_id,
+        description.common->registry_ordinal,
+        description.kind,
+        event_time_ns,
+        description.common->origin.recv_realtime_ns,
+        description.common->origin.recv_monotonic_ns,
+        accounted_record_bytes,
+        std::move(event));
 }
 
 std::string_view RealtimeHistoryCreateErrorNameV1(
@@ -484,6 +715,11 @@ std::string_view RealtimeHistoryGenerationErrorNameV1(
 
 class RealtimeHistoryRuntimeV1::Impl final {
 public:
+    static constexpr std::uint64_t kSubmissionsClosed =
+        std::uint64_t{1U} << 63U;
+    static constexpr std::uint64_t kSubmissionCountMask =
+        kSubmissionsClosed - 1U;
+
     enum class CommandKind : std::uint8_t {
         kRecord = 0U,
         kFence,
@@ -491,7 +727,8 @@ public:
 
     struct Command final {
         CommandKind kind = CommandKind::kRecord;
-        RealtimeHistoryRecordHandleV1 record;
+        HistoryHandoffPool::Slot* slot = nullptr;
+        InstrumentRouteTokenV1 route{};
         std::uint64_t generation = 0U;
     };
 
@@ -504,15 +741,36 @@ public:
         std::size_t completed_workers = 0U;
     };
 
+    struct WorkerSignal final {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::atomic<bool> sleeping{false};
+    };
+
+    struct alignas(64) SourceOwnerState final {
+        std::atomic<std::uint64_t> submission_state{0U};
+        std::uint64_t last_sequence = 0U;
+        std::uint64_t last_ingress_sequence = 0U;
+    };
+
     Impl(
         RealtimeHistoryRuntimeConfigV1 config,
         std::unique_ptr<IntradayInstrumentStoreV1> store)
         : config_(std::move(config)),
           store_(std::move(store)),
-          queues_(kRealtimeHistorySourceCountV1 * config_.worker_count) {
-        for (std::unique_ptr<SpscQueue<Command>>& queue : queues_) {
-            queue = std::make_unique<SpscQueue<Command>>(
-                config_.queue_capacity_per_source_worker);
+          queues_(kRealtimeHistorySourceCountV1 * config_.worker_count),
+          handoff_pools_(
+              kRealtimeHistorySourceCountV1 * config_.worker_count),
+          worker_signals_(config_.worker_count) {
+        for (std::size_t index = 0U; index < queues_.size(); ++index) {
+            queues_[index] = std::make_unique<SpscQueue<Command>>(
+                config_.queue_capacity_per_source_worker + 1U);
+            handoff_pools_[index] =
+                std::make_unique<HistoryHandoffPool>(
+                    config_.queue_capacity_per_source_worker);
+        }
+        for (std::unique_ptr<WorkerSignal>& signal : worker_signals_) {
+            signal = std::make_unique<WorkerSignal>();
         }
     }
 
@@ -520,6 +778,7 @@ public:
 
     bool Start() noexcept {
         try {
+            builder_thread_ = std::thread([this] { BuilderLoop(); });
             workers_.reserve(config_.worker_count);
             for (std::uint32_t worker = 0U;
                  worker < config_.worker_count;
@@ -531,12 +790,21 @@ public:
             return true;
         } catch (...) {
             admission_open_.store(false, std::memory_order_release);
+            CloseSubmissionGates();
             stopping_.store(true, std::memory_order_release);
-            work_cv_.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(builder_mutex_);
+                builder_stop_requested_ = true;
+            }
+            WakeAllWorkers();
+            builder_cv_.notify_all();
             for (std::thread& worker : workers_) {
                 if (worker.joinable()) {
                     worker.join();
                 }
+            }
+            if (builder_thread_.joinable()) {
+                builder_thread_.join();
             }
             return false;
         }
@@ -565,78 +833,149 @@ public:
         return *queues_[index];
     }
 
+    HistoryHandoffPool& HandoffPool(
+        std::uint8_t source_slot,
+        std::uint32_t worker) noexcept {
+        const std::size_t index =
+            static_cast<std::size_t>(source_slot) *
+                static_cast<std::size_t>(config_.worker_count) +
+            static_cast<std::size_t>(worker);
+        return *handoff_pools_[index];
+    }
+
+    [[nodiscard]] bool BeginSubmission(std::uint8_t source) noexcept {
+        std::atomic<std::uint64_t>& submission_state =
+            source_owner_states_[source].submission_state;
+        std::uint64_t state =
+            submission_state.load(std::memory_order_acquire);
+        for (;;) {
+            if ((state & kSubmissionsClosed) != 0U ||
+                (state & kSubmissionCountMask) ==
+                    kSubmissionCountMask) {
+                return false;
+            }
+            if (submission_state.compare_exchange_weak(
+                    state,
+                    state + 1U,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
+    void EndSubmission(std::uint8_t source) noexcept {
+        const std::uint64_t previous =
+            source_owner_states_[source].submission_state.fetch_sub(
+                1U, std::memory_order_acq_rel);
+        if ((previous & kSubmissionsClosed) != 0U &&
+            (previous & kSubmissionCountMask) == 1U) {
+            std::lock_guard<std::mutex> lock(submission_mutex_);
+            submission_cv_.notify_all();
+        }
+    }
+
+    void CloseSubmissionGates() noexcept {
+        for (SourceOwnerState& state : source_owner_states_) {
+            state.submission_state.fetch_or(
+                kSubmissionsClosed, std::memory_order_acq_rel);
+        }
+    }
+
+    [[nodiscard]] bool SubmissionsDrained() const noexcept {
+        return std::all_of(
+            source_owner_states_.begin(),
+            source_owner_states_.end(),
+            [](const SourceOwnerState& state) noexcept {
+                return (state.submission_state.load(
+                            std::memory_order_acquire) &
+                        kSubmissionCountMask) == 0U;
+            });
+    }
+
     RealtimeHistorySubmitErrorV1 Submit(
-        RealtimeHistoryRecordHandleV1 record) noexcept {
+        RealtimeHistoryEventInputV1&& input) noexcept {
+        const std::uint8_t source =
+            input.source_slot() < kRealtimeHistorySourceCountV1
+                ? input.source_slot()
+                : 0U;
+        if (!BeginSubmission(source)) {
+            return RealtimeHistorySubmitErrorV1::kStopped;
+        }
+        struct SubmissionGuard final {
+            Impl* owner = nullptr;
+            std::uint8_t source = 0U;
+            ~SubmissionGuard() {
+                if (owner != nullptr) {
+                    owner->EndSubmission(source);
+                }
+            }
+        } submission_guard{this, source};
         if (!admission_open_.load(std::memory_order_acquire)) {
             return RealtimeHistorySubmitErrorV1::kStopped;
         }
         if (fatal_.load(std::memory_order_acquire)) {
             return RealtimeHistorySubmitErrorV1::kFatal;
         }
-        if (record == nullptr || record->instrument_id() == 0U ||
-            record->source_slot() >= kRealtimeHistorySourceCountV1 ||
-            record->source_sequence() == 0U ||
-            record->ingress_sequence() == 0U ||
-            !KindBelongsToSource(record->kind(), record->source_slot()) ||
-            config_.registry->LookupById(record->instrument_id()).known() ==
-                false) {
+        if (!input.valid() || input.instrument_id() == 0U ||
+            input.source_slot() >= kRealtimeHistorySourceCountV1 ||
+            input.source_sequence() == 0U ||
+            input.ingress_sequence() == 0U ||
+            !KindBelongsToSource(input.kind(), input.source_slot())) {
             MarkFatal();
             return RealtimeHistorySubmitErrorV1::kInvalidRecord;
         }
 
-        const std::uint8_t source = record->source_slot();
-        {
-            std::lock_guard<std::mutex> lock(generation_mutex_);
-            if (!admission_open_.load(std::memory_order_acquire) ||
-                stopping_.load(std::memory_order_acquire)) {
-                return RealtimeHistorySubmitErrorV1::kStopped;
-            }
-            if (fatal_.load(std::memory_order_acquire)) {
-                return RealtimeHistorySubmitErrorV1::kFatal;
-            }
-            if (record->source_stream_id() !=
-                config_.source_stream_ids[source]) {
-                MarkFatalLocked();
-                return RealtimeHistorySubmitErrorV1::kSourceMismatch;
-            }
-            if (source_last_sequence_[source] ==
-                    std::numeric_limits<std::uint64_t>::max() ||
-                record->source_sequence() !=
-                    source_last_sequence_[source] + 1U ||
-                record->ingress_sequence() <=
-                    source_last_ingress_sequence_[source]) {
-                MarkFatalLocked();
-                return RealtimeHistorySubmitErrorV1::kSequenceNotIncreasing;
-            }
-            if (pending_ != nullptr) {
-                const bool sealed = pending_->source_sealed[source];
-                const RealtimeSourceWatermarkV1& cut =
-                    pending_->watermark.sources[source];
-                const bool source_before_cut =
-                    record->source_sequence() < cut.sequence_exclusive;
-                const bool ingress_before_cut =
-                    record->ingress_sequence() <
-                    pending_->watermark.ingress_sequence_exclusive;
-                if (sealed == source_before_cut ||
-                    sealed == ingress_before_cut) {
-                    MarkFatalLocked();
-                    return RealtimeHistorySubmitErrorV1::kSequenceNotIncreasing;
-                }
-            }
-            Command command{};
-            command.kind = CommandKind::kRecord;
-            command.record = record;
-            const std::uint32_t worker =
-                WorkerFor(command.record->instrument_id());
-            if (!Queue(source, worker).TryPush(std::move(command))) {
-                MarkFatalLocked();
-                return RealtimeHistorySubmitErrorV1::kQueueFull;
-            }
-            source_last_sequence_[source] = record->source_sequence();
-            source_last_ingress_sequence_[source] =
-                record->ingress_sequence();
+        if (input.source_stream_id() != config_.source_stream_ids[source]) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kSourceMismatch;
         }
-        work_cv_.notify_all();
+        // This state is source-owner local.  Submit and SealSource for one
+        // source must run on its single serial decoder owner, so the ordinary
+        // append path does not acquire the generation commit mutex.
+        SourceOwnerState& source_owner = source_owner_states_[source];
+        if (source_owner.last_sequence ==
+                std::numeric_limits<std::uint64_t>::max() ||
+            input.source_sequence() != source_owner.last_sequence + 1U ||
+            input.ingress_sequence() <=
+                source_owner.last_ingress_sequence) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kSequenceNotIncreasing;
+        }
+
+        InstrumentRouteTokenV1 route{};
+        if (store_->ResolveRouteToken(
+                input.registry_ordinal(),
+                input.instrument_id(),
+                &route) != IntradayInstrumentStoreQueryErrorV1::kNone ||
+            route.worker != WorkerFor(input.instrument_id())) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        }
+        const std::uint32_t worker = route.worker;
+        const std::uint64_t accepted_source_sequence =
+            input.source_sequence();
+        const std::uint64_t accepted_ingress_sequence =
+            input.ingress_sequence();
+        HistoryHandoffPool::Slot* slot = nullptr;
+        HistoryHandoffPool& pool = HandoffPool(source, worker);
+        if (!pool.Acquire(std::move(input), &slot) || slot == nullptr) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kQueueFull;
+        }
+        Command command{};
+        command.kind = CommandKind::kRecord;
+        command.slot = slot;
+        command.route = route;
+        if (!Queue(source, worker).TryPush(std::move(command))) {
+            pool.ReleaseFromProducer(slot);
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kQueueFull;
+        }
+        source_owner.last_sequence = accepted_source_sequence;
+        source_owner.last_ingress_sequence =
+            accepted_ingress_sequence;
+        SignalWorkIfNeeded(worker);
         return RealtimeHistorySubmitErrorV1::kNone;
     }
 
@@ -681,7 +1020,7 @@ public:
             if (fatal_.load(std::memory_order_acquire)) {
                 return FatalGenerationError();
             }
-            if (pending_ != nullptr) {
+            if (pending_ != nullptr || building_generation_ != 0U) {
                 return RealtimeHistoryGenerationErrorV1::
                     kGenerationConflict;
             }
@@ -693,7 +1032,7 @@ public:
             pending->watermark = watermark;
             if (store_->Snapshot().coverage_lost) {
                 store_failed_.store(true, std::memory_order_release);
-                MarkFatalLocked();
+                MarkFatalLocked(true);
                 return RealtimeHistoryGenerationErrorV1::kStoreFailed;
             }
             pending->store_worker_slices.resize(config_.worker_count);
@@ -739,21 +1078,24 @@ public:
                 return RealtimeHistoryGenerationErrorV1::
                     kSourceAlreadySealed;
             }
-            if (source_last_sequence_[source] ==
+            const SourceOwnerState& source_owner =
+                source_owner_states_[source];
+            if (source_owner.last_sequence ==
                     std::numeric_limits<std::uint64_t>::max() ||
-                source_last_sequence_[source] + 1U !=
+                source_owner.last_sequence + 1U !=
                     pending_->watermark.sources[source]
                         .sequence_exclusive ||
-                source_last_ingress_sequence_[source] >=
+                source_owner.last_ingress_sequence >=
                     pending_->watermark.ingress_sequence_exclusive) {
-                MarkFatalLocked();
+                MarkFatalLocked(false);
                 return RealtimeHistoryGenerationErrorV1::
                     kInvalidWatermark;
             }
             pending_->source_sealed[source] = true;
-            // Keep the generation lock through all nonblocking fence pushes.
-            // Stop/fatal and worker ReportSlice therefore observe either the
-            // complete source fence admission or the fatal partial failure.
+            // The source marker and all of this source's records share one
+            // decoder FIFO.  Holding the commit lock only for the rare marker
+            // transition makes the source's complete fence fan-out visible
+            // atomically to Stop/fatal/generation state.
             for (std::uint32_t worker = 0U;
                  worker < config_.worker_count;
                  ++worker) {
@@ -761,12 +1103,12 @@ public:
                 command.kind = CommandKind::kFence;
                 command.generation = generation;
                 if (!Queue(source, worker).TryPush(std::move(command))) {
-                    MarkFatalLocked();
+                    MarkFatalLocked(false);
                     return RealtimeHistoryGenerationErrorV1::kQueueFull;
                 }
+                SignalWorkIfNeeded(worker);
             }
         }
-        work_cv_.notify_all();
         return RealtimeHistoryGenerationErrorV1::kNone;
     }
 
@@ -778,6 +1120,7 @@ public:
         if (output == nullptr) {
             return RealtimeHistoryGenerationErrorV1::kNullOutput;
         }
+        output->reset();
         std::unique_lock<std::mutex> lock(generation_mutex_);
         const auto ready = [this, generation] {
             const auto latest = std::atomic_load_explicit(
@@ -786,8 +1129,9 @@ public:
                     latest->watermark().generation >= generation) ||
                    fatal_.load(std::memory_order_acquire) ||
                    stopping_.load(std::memory_order_acquire) ||
-                   pending_ == nullptr ||
-                   pending_->watermark.generation != generation;
+                   ((pending_ == nullptr ||
+                     pending_->watermark.generation != generation) &&
+                    building_generation_ != generation);
         };
         if (!ready() &&
             !generation_cv_.wait_for(lock, timeout, ready)) {
@@ -817,6 +1161,7 @@ public:
     }
 
     void WorkerLoop(std::uint32_t worker) noexcept {
+        constexpr std::size_t kMaximumMicroDrain = 64U;
         std::array<bool, kRealtimeHistorySourceCountV1> parked{};
         std::uint64_t parked_generation = 0U;
         while (true) {
@@ -831,24 +1176,33 @@ public:
                 if (parked[source]) {
                     continue;
                 }
-                Command command{};
-                if (!Queue(source, worker).TryPop(&command)) {
-                    continue;
-                }
-                progressed = true;
-                if (command.kind == CommandKind::kRecord) {
-                    if (!Append(
-                            worker, source, std::move(command.record))) {
-                        MarkFatal();
+                for (std::size_t drained = 0U;
+                     drained < kMaximumMicroDrain;
+                     ++drained) {
+                    Command command{};
+                    if (!Queue(source, worker).TryPop(&command)) {
+                        break;
                     }
-                } else if (!stopping_.load(std::memory_order_acquire)) {
-                    if (command.generation == 0U ||
-                        (parked_generation != 0U &&
-                         parked_generation != command.generation)) {
-                        MarkFatal();
+                    progressed = true;
+                    if (command.kind == CommandKind::kRecord) {
+                        if (!Append(
+                                worker, source, command.slot, command.route)) {
+                            MarkFatal();
+                        }
+                    } else if (!stopping_.load(
+                                   std::memory_order_acquire)) {
+                        if (command.generation == 0U ||
+                            (parked_generation != 0U &&
+                             parked_generation != command.generation)) {
+                            MarkFatal();
+                        } else {
+                            parked_generation = command.generation;
+                            parked[source] = true;
+                        }
+                        break;
                     } else {
-                        parked_generation = command.generation;
-                        parked[source] = true;
+                        // Stop drains post-cut records and ignores fence
+                        // commands; no unpublished generation can commit.
                     }
                 }
             }
@@ -871,8 +1225,7 @@ public:
                 return;
             }
             if (!progressed) {
-                std::unique_lock<std::mutex> lock(work_mutex_);
-                work_cv_.wait_for(lock, std::chrono::milliseconds(1));
+                WaitForWork(worker);
             }
         }
     }
@@ -880,13 +1233,26 @@ public:
     bool Append(
         std::uint32_t worker,
         std::uint8_t source,
-        RealtimeHistoryRecordHandleV1 record) noexcept {
-        if (record == nullptr || record->source_slot() != source ||
-            WorkerFor(record->instrument_id()) != worker) {
+        HistoryHandoffPool::Slot* slot,
+        const InstrumentRouteTokenV1& route) noexcept {
+        if (slot == nullptr || !slot->engaged) {
             return false;
         }
-        const IntradayInstrumentStoreAppendErrorV1 error =
-            store_->Append(worker, std::move(record));
+        RealtimeHistoryEventInputV1* const input = slot->Input();
+        IntradayInstrumentStoreAppendErrorV1 error =
+            IntradayInstrumentStoreAppendErrorV1::kInvalidRecord;
+        if (input->valid() && input->source_slot() == source &&
+            route.worker == worker &&
+            route.instrument_id == input->instrument_id()) {
+            error = store_->Append(worker, route, std::move(*input));
+        }
+        const bool released =
+            HandoffPool(source, worker).ReleaseFromConsumer(slot);
+        if (!released) {
+            store_->MarkCoverageLost();
+            store_failed_.store(true, std::memory_order_release);
+            return false;
+        }
         if (error != IntradayInstrumentStoreAppendErrorV1::kNone) {
             store_->MarkCoverageLost();
             store_failed_.store(true, std::memory_order_release);
@@ -926,50 +1292,154 @@ public:
         std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>
             slice) noexcept {
         try {
-            std::lock_guard<std::mutex> lock(generation_mutex_);
-            if (!admission_open_.load(std::memory_order_acquire) ||
-                stopping_.load(std::memory_order_acquire) ||
-                fatal_.load(std::memory_order_acquire) ||
-                pending_ == nullptr ||
-                pending_->watermark.generation != generation ||
-                slice == nullptr ||
-                worker >= pending_->store_worker_slices.size() ||
-                pending_->store_worker_slices[worker] != nullptr) {
-                return false;
+            {
+                std::lock_guard<std::mutex> lock(generation_mutex_);
+                if (!admission_open_.load(std::memory_order_acquire) ||
+                    stopping_.load(std::memory_order_acquire) ||
+                    fatal_.load(std::memory_order_acquire) ||
+                    pending_ == nullptr ||
+                    pending_->watermark.generation != generation ||
+                    slice == nullptr ||
+                    worker >= pending_->store_worker_slices.size() ||
+                    pending_->store_worker_slices[worker] != nullptr ||
+                    building_generation_ != 0U) {
+                    return false;
+                }
+                pending_->store_worker_slices[worker] = std::move(slice);
+                ++pending_->completed_workers;
+                if (pending_->completed_workers != config_.worker_count) {
+                    return true;
+                }
+                if (!std::all_of(
+                        pending_->source_sealed.begin(),
+                        pending_->source_sealed.end(),
+                        [](bool value) { return value; })) {
+                    return false;
+                }
+                std::lock_guard<std::mutex> builder_lock(builder_mutex_);
+                if (builder_job_ != nullptr) {
+                    return false;
+                }
+                building_generation_ = generation;
+                builder_job_ = std::move(pending_);
             }
-            pending_->store_worker_slices[worker] = std::move(slice);
-            ++pending_->completed_workers;
-            if (pending_->completed_workers != config_.worker_count) {
-                return true;
-            }
-            if (!std::all_of(
-                    pending_->source_sealed.begin(),
-                    pending_->source_sealed.end(),
-                    [](bool value) { return value; })) {
-                return false;
-            }
-            std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
-                published;
-            const IntradayInstrumentStoreGenerationErrorV1 error =
-                store_->BuildGeneration(
-                    pending_->watermark,
-                    std::move(pending_->store_worker_slices),
-                    &published);
-            if (error !=
-                    IntradayInstrumentStoreGenerationErrorV1::kNone ||
-                published == nullptr) {
-                store_->MarkCoverageLost();
-                store_failed_.store(true, std::memory_order_release);
-                return false;
-            }
-            std::atomic_store_explicit(
-                &latest_generation_, published,
-                std::memory_order_release);
-            pending_.reset();
-            generation_cv_.notify_all();
+            // The dedicated builder owns the immutable endpoint slices from
+            // here. This instrument worker immediately resumes post-cut
+            // append work; no owner is held behind the O(I) generation build.
+            builder_cv_.notify_one();
             return true;
         } catch (...) {
+            store_->MarkCoverageLost();
+            store_failed_.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(generation_mutex_);
+            if (building_generation_ == generation) {
+                building_generation_ = 0U;
+            }
+            MarkFatalLocked(true);
             return false;
+        }
+    }
+
+    void BuilderLoop() noexcept {
+        while (true) {
+            std::unique_ptr<PendingGeneration> building;
+            bool stop_requested = false;
+            {
+                std::unique_lock<std::mutex> lock(builder_mutex_);
+                builder_cv_.wait(lock, [this] {
+                    return builder_stop_requested_ ||
+                           builder_job_ != nullptr;
+                });
+                stop_requested = builder_stop_requested_;
+                building = std::move(builder_job_);
+            }
+            if (building == nullptr) {
+                if (stop_requested) {
+                    return;
+                }
+                continue;
+            }
+            const std::uint64_t generation =
+                building->watermark.generation;
+            {
+                std::lock_guard<std::mutex> lock(generation_mutex_);
+                if (building_generation_ != generation ||
+                    !admission_open_.load(std::memory_order_acquire) ||
+                    stopping_.load(std::memory_order_acquire) ||
+                    fatal_.load(std::memory_order_acquire)) {
+                    if (building_generation_ == generation) {
+                        building_generation_ = 0U;
+                    }
+                    generation_cv_.notify_all();
+                    if (stopping_.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            BuildAndCommit(std::move(building));
+            if (stopping_.load(std::memory_order_acquire)) {
+                return;
+            }
+        }
+    }
+
+    void BuildAndCommit(
+        std::unique_ptr<PendingGeneration> building) noexcept {
+        const std::uint64_t generation =
+            building->watermark.generation;
+        try {
+            // Captured lane endpoints are immutable. The O(I) validation and
+            // index build run without the history commit mutex while decoder
+            // and instrument-owner queues continue routing post-cut records.
+            std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
+                candidate;
+            const IntradayInstrumentStoreGenerationErrorV1 error =
+                store_->BuildGeneration(
+                    building->watermark,
+                    std::move(building->store_worker_slices),
+                    &candidate);
+            const bool build_failed =
+                error != IntradayInstrumentStoreGenerationErrorV1::kNone ||
+                candidate == nullptr;
+            if (build_failed) {
+                store_->MarkCoverageLost();
+                store_failed_.store(true, std::memory_order_release);
+            }
+
+            std::lock_guard<std::mutex> lock(generation_mutex_);
+            if (building_generation_ != generation) {
+                return;
+            }
+            building_generation_ = 0U;
+            if (build_failed) {
+                MarkFatalLocked(true);
+                return;
+            }
+            if (!admission_open_.load(std::memory_order_acquire) ||
+                stopping_.load(std::memory_order_acquire) ||
+                fatal_.load(std::memory_order_acquire)) {
+                generation_cv_.notify_all();
+                return;
+            }
+            if (store_->PublishGeneration(candidate) !=
+                IntradayInstrumentStoreGenerationErrorV1::kNone) {
+                store_->MarkCoverageLost();
+                MarkFatalLocked(true);
+                return;
+            }
+            std::atomic_store_explicit(
+                &latest_generation_, candidate,
+                std::memory_order_release);
+            generation_cv_.notify_all();
+        } catch (...) {
+            store_->MarkCoverageLost();
+            store_failed_.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(generation_mutex_);
+            if (building_generation_ == generation) {
+                building_generation_ = 0U;
+            }
+            MarkFatalLocked(true);
         }
     }
 
@@ -988,15 +1458,60 @@ public:
         return true;
     }
 
-    void MarkFatalLocked() noexcept {
+    void SignalWorkIfNeeded(std::uint32_t worker) noexcept {
+        WorkerSignal& signal = *worker_signals_[worker];
+        // Both sides deliberately use an acq_rel RMW. A load-only sleeping
+        // hint plus a possibly stale ring head permits the producer and
+        // waiter to observe each other's old state and lose the only wake.
+        // The exchange notifies only when the worker has armed its idle gate.
+        if (!signal.sleeping.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(signal.mutex);
+        signal.cv.notify_one();
+    }
+
+    void WaitForWork(std::uint32_t worker) noexcept {
+        WorkerSignal& signal = *worker_signals_[worker];
+        std::unique_lock<std::mutex> lock(signal.mutex);
+        signal.sleeping.exchange(true, std::memory_order_acq_rel);
+        if (stopping_.load(std::memory_order_acquire) ||
+            !AllQueuesEmpty(worker)) {
+            signal.sleeping.store(false, std::memory_order_release);
+            return;
+        }
+        signal.cv.wait(lock, [this, &signal] {
+            return stopping_.load(std::memory_order_acquire) ||
+                   !signal.sleeping.load(std::memory_order_acquire);
+        });
+        signal.sleeping.store(false, std::memory_order_release);
+    }
+
+    void WakeAllWorkers() noexcept {
+        for (const std::unique_ptr<WorkerSignal>& owned_signal :
+             worker_signals_) {
+            if (owned_signal == nullptr) {
+                continue;
+            }
+            WorkerSignal& signal = *owned_signal;
+            signal.sleeping.store(false, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(signal.mutex);
+            signal.cv.notify_one();
+        }
+    }
+
+    void MarkFatalLocked(bool store_failure) noexcept {
+        store_->MarkCoverageLost();
+        if (store_failure) {
+            store_failed_.store(true, std::memory_order_release);
+        }
         fatal_.store(true, std::memory_order_release);
         generation_cv_.notify_all();
-        work_cv_.notify_all();
     }
 
     void MarkFatal() noexcept {
         std::lock_guard<std::mutex> lock(generation_mutex_);
-        MarkFatalLocked();
+        MarkFatalLocked(false);
     }
 
     void StopAndDrain() noexcept {
@@ -1006,15 +1521,33 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(generation_mutex_);
-            stopping_.store(true, std::memory_order_release);
             admission_open_.store(false, std::memory_order_release);
+            CloseSubmissionGates();
         }
-        work_cv_.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(submission_mutex_);
+            submission_cv_.wait(lock, [this] {
+                return SubmissionsDrained();
+            });
+        }
+        {
+            std::lock_guard<std::mutex> lock(generation_mutex_);
+            stopping_.store(true, std::memory_order_release);
+        }
+        {
+            std::lock_guard<std::mutex> lock(builder_mutex_);
+            builder_stop_requested_ = true;
+        }
+        WakeAllWorkers();
+        builder_cv_.notify_all();
         generation_cv_.notify_all();
         for (std::thread& worker : workers_) {
             if (worker.joinable()) {
                 worker.join();
             }
+        }
+        if (builder_thread_.joinable()) {
+            builder_thread_.join();
         }
         stop_complete_ = true;
     }
@@ -1022,29 +1555,34 @@ public:
     RealtimeHistoryRuntimeConfigV1 config_{};
     std::unique_ptr<IntradayInstrumentStoreV1> store_;
     std::vector<std::unique_ptr<SpscQueue<Command>>> queues_;
+    std::vector<std::unique_ptr<HistoryHandoffPool>> handoff_pools_;
+    std::vector<std::unique_ptr<WorkerSignal>> worker_signals_;
     std::vector<std::thread> workers_;
+    std::thread builder_thread_;
 
     std::atomic<bool> admission_open_{true};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> fatal_{false};
     std::atomic<bool> store_failed_{false};
+    std::array<SourceOwnerState, kRealtimeHistorySourceCountV1>
+        source_owner_states_{};
 
     std::mutex stop_mutex_;
     bool stop_complete_ = false;
+    std::mutex submission_mutex_;
+    std::condition_variable submission_cv_;
 
     mutable std::mutex generation_mutex_;
     std::condition_variable generation_cv_;
     std::unique_ptr<PendingGeneration> pending_;
+    std::uint64_t building_generation_ = 0U;
+    std::mutex builder_mutex_;
+    std::condition_variable builder_cv_;
+    std::unique_ptr<PendingGeneration> builder_job_;
+    bool builder_stop_requested_ = false;
     std::uint64_t last_started_generation_ = 0U;
-    std::array<std::uint64_t, kRealtimeHistorySourceCountV1>
-        source_last_sequence_{};
-    std::array<std::uint64_t, kRealtimeHistorySourceCountV1>
-        source_last_ingress_sequence_{};
     std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
         latest_generation_;
-
-    std::mutex work_mutex_;
-    std::condition_variable work_cv_;
 };
 
 RealtimeHistoryRuntimeV1::RealtimeHistoryRuntimeV1(
@@ -1062,8 +1600,8 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
     if (config.registry == nullptr || config.registry->empty() ||
         config.worker_count == 0U || config.worker_count > 256U ||
         config.queue_capacity_per_source_worker == 0U ||
-        config.queue_capacity_per_source_worker ==
-            std::numeric_limits<std::size_t>::max()) {
+        config.queue_capacity_per_source_worker >
+            std::numeric_limits<std::size_t>::max() - 2U) {
         return RealtimeHistoryCreateErrorV1::kInvalidConfiguration;
     }
     for (std::size_t source = 0U;
@@ -1086,6 +1624,7 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
             IntradayInstrumentStoreV1::Create(
                 config.intraday_store,
                 config.worker_count,
+                config.source_stream_ids,
                 config.registry,
                 &store);
         if (error != IntradayInstrumentStoreCreateErrorV1::kNone ||
@@ -1109,8 +1648,8 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
 }
 
 RealtimeHistorySubmitErrorV1 RealtimeHistoryRuntimeV1::TrySubmit(
-    RealtimeHistoryRecordHandleV1 record) noexcept {
-    return impl_->Submit(std::move(record));
+    RealtimeHistoryEventInputV1&& input) noexcept {
+    return impl_->Submit(std::move(input));
 }
 
 RealtimeHistoryGenerationErrorV1

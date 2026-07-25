@@ -124,7 +124,7 @@ struct Options final {
     std::uint32_t instrument_store_workers = 4U;
     std::uint64_t intraday_store_maximum_records = 0U;
     std::uint64_t intraday_store_memory_bytes = 0U;
-    std::uint32_t intraday_store_chunk_records = 1024U;
+    std::uint32_t intraday_store_segment_kib = 64U;
     std::uint32_t intraday_store_batch_records = 64U * 1024U;
     bool intraday_store_from_open = false;
     bool intraday_store_maximum_records_set = false;
@@ -155,8 +155,8 @@ void PrintUsage(std::ostream& output) {
         << "  --wal-path PATH               enable independent audit WAL\n"
         << "  --replace-wal                 explicitly truncate WAL path\n"
         << "  --instrument-store-workers N  1..256, default 4\n"
-        << "  --intraday-store-chunk-records N\n"
-        << "                                1..65536, default 1024\n"
+        << "  --intraday-store-segment-kib N\n"
+        << "                                4..16384, default 64\n"
         << "  --intraday-store-batch-records N\n"
         << "                                1..1048576, default 65536\n"
         << "  --generation-interval-ms N    1..60000, default 1000\n"
@@ -269,7 +269,7 @@ bool ParseOptions(
             option != "--instrument-store-workers" &&
             option != "--intraday-store-max-records" &&
             option != "--intraday-store-memory-gib" &&
-            option != "--intraday-store-chunk-records" &&
+            option != "--intraday-store-segment-kib" &&
             option != "--intraday-store-batch-records" &&
             option != "--generation-interval-ms" &&
             option != "--generation-timeout-ms") {
@@ -338,15 +338,17 @@ bool ParseOptions(
             }
             parsed.intraday_store_memory_bytes = gib * bytes_per_gib;
             parsed.intraday_store_memory_set = true;
-        } else if (option == "--intraday-store-chunk-records") {
+        } else if (option == "--intraday-store-segment-kib") {
             if (!ParseU32(
-                    value, &parsed.intraday_store_chunk_records) ||
-                parsed.intraday_store_chunk_records == 0U ||
-                parsed.intraday_store_chunk_records >
-                    market::
-                        kIntradayInstrumentStoreMaximumChunkRecordsV1) {
+                    value, &parsed.intraday_store_segment_kib) ||
+                parsed.intraday_store_segment_kib <
+                    market::kIntradayInstrumentStoreMinimumSegmentBytesV1 /
+                        1024U ||
+                parsed.intraday_store_segment_kib >
+                    market::kIntradayInstrumentStoreMaximumSegmentBytesV1 /
+                        1024U) {
                 *error =
-                    "--intraday-store-chunk-records must be 1..65536";
+                    "--intraday-store-segment-kib must be 4..16384";
                 return false;
             }
         } else if (option == "--intraday-store-batch-records") {
@@ -475,8 +477,8 @@ int Run(const Options& options) {
     config.registry = registry_result.registry.get();
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.store_worker_count = options.instrument_store_workers;
-    config.intraday_store.chunk_record_capacity =
-        static_cast<std::size_t>(options.intraday_store_chunk_records);
+    config.intraday_store.segment_target_bytes =
+        static_cast<std::size_t>(options.intraday_store_segment_kib) * 1024U;
     config.intraday_store.maximum_session_records =
         options.intraday_store_maximum_records;
     config.intraday_store.maximum_session_accounted_bytes =

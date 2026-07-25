@@ -7,7 +7,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <ctime>
-#include <deque>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -180,6 +179,35 @@ void SetDetailLiteral(std::string* detail, const char* message) noexcept {
         deadline - now);
 }
 
+[[nodiscard]] bool MaximumIngressPoolMessages(
+    const RealtimePipelineConfigV1& config,
+    std::size_t* output) noexcept {
+    if (output == nullptr ||
+        config.decoder_queue_capacity_per_source >
+            (std::numeric_limits<std::size_t>::max() - 4U) / 4U) {
+        return false;
+    }
+    // Four full decoder rings, one message currently owned by each decoder,
+    // and the callback's not-yet-enqueued message are simultaneously live.
+    std::size_t maximum =
+        config.decoder_queue_capacity_per_source * 4U + 4U + 1U;
+    if (config.wal.enabled) {
+        // WAL may independently retain a full queue plus the record currently
+        // owned by its writer, with no overlap available as a proof.
+        if (config.wal.queue_capacity >
+            std::numeric_limits<std::size_t>::max() - maximum - 1U) {
+            return false;
+        }
+        maximum += config.wal.queue_capacity + 1U;
+    }
+    if (maximum == 0U ||
+        maximum > realtime::kOwnedIngressMaximumInflightMessagesV1) {
+        return false;
+    }
+    *output = maximum;
+    return true;
+}
+
 }  // namespace
 
 std::string_view RealtimePipelineCreateErrorNameV1(
@@ -295,46 +323,63 @@ public:
     class DecoderQueue final {
     public:
         explicit DecoderQueue(std::size_t capacity)
-            : slots_(capacity) {}
+            : slots_(capacity + 1U) {}
 
         DecoderQueue(const DecoderQueue&) = delete;
         DecoderQueue& operator=(const DecoderQueue&) = delete;
 
-        [[nodiscard]] bool TryPush(DecoderCommand command) noexcept {
-            try {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (stop_requested_ || size_ == slots_.size()) {
-                    return false;
-                }
-                slots_[tail_].emplace(std::move(command));
-                tail_ = Increment(tail_);
-                ++size_;
-                not_empty_.notify_one();
-                return true;
-            } catch (...) {
+        [[nodiscard]] bool TryPush(DecoderCommand&& command) noexcept {
+            if (stop_requested_.load(std::memory_order_acquire)) {
                 return false;
             }
+            const std::size_t tail =
+                tail_.load(std::memory_order_relaxed);
+            const std::size_t next = Increment(tail);
+            const std::size_t head =
+                head_.load(std::memory_order_acquire);
+            if (next == head) {
+                return false;
+            }
+            slots_[tail].emplace(std::move(command));
+            tail_.store(next, std::memory_order_release);
+            WakeConsumer();
+            return true;
         }
 
         [[nodiscard]] bool PushUntil(
             DecoderCommand command,
             std::chrono::steady_clock::time_point deadline) noexcept {
             try {
-                std::unique_lock<std::mutex> lock(mutex_);
-                const auto ready = [this] {
-                    return stop_requested_ || size_ < slots_.size();
-                };
-                if (!ready() && !not_full_.wait_until(lock, deadline, ready)) {
-                    return false;
+                while (true) {
+                    if (TryPush(std::move(command))) {
+                        return true;
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire)) {
+                        return false;
+                    }
+                    std::unique_lock<std::mutex> lock(wait_mutex_);
+                    producer_waiting_.exchange(
+                        true, std::memory_order_acq_rel);
+                    if (!Full()) {
+                        producer_waiting_.store(
+                            false, std::memory_order_release);
+                        continue;
+                    }
+                    const auto ready = [this] {
+                        return stop_requested_.load(
+                                   std::memory_order_acquire) ||
+                               !producer_waiting_.load(
+                                   std::memory_order_acquire);
+                    };
+                    if (!not_full_.wait_until(lock, deadline, ready)) {
+                        producer_waiting_.store(
+                            false, std::memory_order_release);
+                        return false;
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire)) {
+                        return false;
+                    }
                 }
-                if (stop_requested_ || size_ == slots_.size()) {
-                    return false;
-                }
-                slots_[tail_].emplace(std::move(command));
-                tail_ = Increment(tail_);
-                ++size_;
-                not_empty_.notify_one();
-                return true;
             } catch (...) {
                 return false;
             }
@@ -345,43 +390,107 @@ public:
                 return false;
             }
             try {
-                std::unique_lock<std::mutex> lock(mutex_);
-                not_empty_.wait(lock, [this] {
-                    return stop_requested_ || size_ != 0U;
-                });
-                if (size_ == 0U) {
-                    return false;
+                while (true) {
+                    if (TryPop(output)) {
+                        return true;
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire)) {
+                        return false;
+                    }
+                    std::unique_lock<std::mutex> lock(wait_mutex_);
+                    consumer_sleeping_.exchange(
+                        true, std::memory_order_acq_rel);
+                    if (!Empty()) {
+                        consumer_sleeping_.store(
+                            false, std::memory_order_release);
+                        continue;
+                    }
+                    not_empty_.wait(lock, [this] {
+                        return stop_requested_.load(
+                                   std::memory_order_acquire) ||
+                               !consumer_sleeping_.load(
+                                   std::memory_order_acquire);
+                    });
                 }
-                *output = std::move(*slots_[head_]);
-                slots_[head_].reset();
-                head_ = Increment(head_);
-                --size_;
-                not_full_.notify_one();
-                return true;
             } catch (...) {
                 return false;
             }
         }
 
         void RequestStop() noexcept {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_requested_ = true;
+            stop_requested_.store(true, std::memory_order_release);
+            consumer_sleeping_.store(false, std::memory_order_release);
+            producer_waiting_.store(false, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(wait_mutex_);
             not_empty_.notify_all();
             not_full_.notify_all();
         }
 
     private:
+        [[nodiscard]] bool TryPop(DecoderCommand* output) noexcept {
+            const std::size_t head =
+                head_.load(std::memory_order_relaxed);
+            const std::size_t tail =
+                tail_.load(std::memory_order_acquire);
+            if (head == tail) {
+                return false;
+            }
+            *output = std::move(*slots_[head]);
+            slots_[head].reset();
+            head_.store(Increment(head), std::memory_order_release);
+            WakeProducer();
+            return true;
+        }
+
+        [[nodiscard]] bool Empty() const noexcept {
+            return head_.load(std::memory_order_acquire) ==
+                   tail_.load(std::memory_order_acquire);
+        }
+
+        [[nodiscard]] bool Full() const noexcept {
+            const std::size_t tail =
+                tail_.load(std::memory_order_acquire);
+            return Increment(tail) ==
+                   head_.load(std::memory_order_acquire);
+        }
+
+        void WakeConsumer() noexcept {
+            // This RMW pairs with the waiter's exchange(true). A load-only
+            // shortcut is not correct: the producer could read the old
+            // sleeping=false while the waiter reads the old tail and then
+            // sleeps forever. If this exchange wins first, the waiter's
+            // acquire observes our prior tail publication; if the waiter
+            // wins first, we observe true and notify under the wait mutex.
+            if (!consumer_sleeping_.exchange(
+                    false, std::memory_order_acq_rel)) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(wait_mutex_);
+            not_empty_.notify_one();
+        }
+
+        void WakeProducer() noexcept {
+            // Symmetric full->non-full handshake for marker backpressure.
+            if (!producer_waiting_.exchange(
+                    false, std::memory_order_acq_rel)) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(wait_mutex_);
+            not_full_.notify_one();
+        }
+
         [[nodiscard]] std::size_t Increment(std::size_t value) const noexcept {
             ++value;
             return value == slots_.size() ? 0U : value;
         }
 
         std::vector<std::optional<DecoderCommand>> slots_;
-        std::size_t head_ = 0U;
-        std::size_t tail_ = 0U;
-        std::size_t size_ = 0U;
-        bool stop_requested_ = false;
-        std::mutex mutex_;
+        alignas(64) std::atomic<std::size_t> head_{0U};
+        alignas(64) std::atomic<std::size_t> tail_{0U};
+        std::atomic<bool> stop_requested_{false};
+        std::atomic<bool> consumer_sleeping_{false};
+        std::atomic<bool> producer_waiting_{false};
+        std::mutex wait_mutex_;
         std::condition_variable not_empty_;
         std::condition_variable not_full_;
     };
@@ -412,6 +521,40 @@ public:
         }
 
         try {
+            std::size_t maximum_inflight_messages = 0U;
+            if (!MaximumIngressPoolMessages(
+                    config_, &maximum_inflight_messages)) {
+                SetDetailLiteral(
+                    detail, "invalid ingress pool capacity");
+                return RealtimePipelineCreateErrorV1::
+                    kInvalidConfiguration;
+            }
+            realtime::OwnedIngressMessagePoolConfigV1 pool_config{};
+            pool_config.maximum_message_bytes =
+                config_.maximum_sdk_message_bytes;
+            pool_config.maximum_inflight_messages =
+                maximum_inflight_messages;
+            const realtime::OwnedIngressMessageErrorV1 pool_error =
+                realtime::OwnedIngressMessagePoolV1::Create(
+                    pool_config, &ingress_pool_);
+            if (pool_error !=
+                    realtime::OwnedIngressMessageErrorV1::kNone ||
+                ingress_pool_ == nullptr) {
+                SetDetail(
+                    detail,
+                    "owned ingress pool create failed: " +
+                        std::string(
+                            realtime::OwnedIngressMessageErrorNameV1(
+                                pool_error)));
+                return pool_error ==
+                               realtime::OwnedIngressMessageErrorV1::
+                                   kInvalidPoolConfiguration
+                           ? RealtimePipelineCreateErrorV1::
+                                 kInvalidConfiguration
+                           : RealtimePipelineCreateErrorV1::
+                                 kResourceExhausted;
+            }
+
             market::RealtimeHistoryRuntimeConfigV1 history_config{};
             history_config.source_stream_ids = config_.source_stream_ids;
             history_config.worker_count = config_.store_worker_count;
@@ -558,57 +701,43 @@ public:
         }
         if (message == nullptr) {
             result.error = RealtimePipelineIngressErrorV1::kNullMessage;
-            ++rejected_messages_;
-            TripFatalWithAdmissionLockHeld();
-            return result;
-        }
-
-        sdk::MessageKey key{};
-        try {
-            const mdl::MDLMessageHead* const head = message->GetHead();
-            if (head == nullptr) {
-                result.error =
-                    RealtimePipelineIngressErrorV1::kOwnedMessageRejected;
-                result.owned_error =
-                    realtime::OwnedIngressCreateErrorV1::kNullHead;
-                ++rejected_messages_;
-                TripFatalWithAdmissionLockHeld();
-                return result;
-            }
-            key = sdk::MessageKey{
-                head->ServiceID, head->ServiceVersion, head->MessageID};
-        } catch (...) {
-            result.error =
-                RealtimePipelineIngressErrorV1::kOwnedMessageRejected;
             result.owned_error =
-                realtime::OwnedIngressCreateErrorV1::kSdkAccess;
+                realtime::OwnedIngressMessageErrorV1::kNullMessage;
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
             return result;
         }
 
-        realtime::OwnedIngressSourceV1 source{};
-        const realtime::OwnedIngressKeyErrorV1 key_error =
-            realtime::ClassifyOwnedIngressMessageKeyV1(key, &source);
-        if (key_error ==
-            realtime::OwnedIngressKeyErrorV1::kForbiddenCombinedTick) {
+        realtime::OwnedIngressMessageInspectionV1 inspection{};
+        result.owned_error = realtime::InspectOwnedIngressMessageV1(
+            message, config_.maximum_sdk_message_bytes, &inspection);
+        if (result.owned_error ==
+            realtime::OwnedIngressMessageErrorV1::
+                kForbiddenCombinedTick) {
             result.error =
                 RealtimePipelineIngressErrorV1::kForbiddenCombinedTick;
-            result.owned_error = realtime::OwnedIngressCreateErrorV1::
-                kForbiddenCombinedTick;
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
             return result;
         }
-        if (key_error != realtime::OwnedIngressKeyErrorV1::kNone) {
+        if (result.owned_error ==
+            realtime::OwnedIngressMessageErrorV1::kUnsupportedMessage) {
             result.error =
                 RealtimePipelineIngressErrorV1::kIgnoredUnsupported;
             ++ignored_messages_;
             return result;
         }
+        if (result.owned_error !=
+                realtime::OwnedIngressMessageErrorV1::kNone ||
+            !inspection) {
+            result.error =
+                RealtimePipelineIngressErrorV1::kOwnedMessageRejected;
+            ++rejected_messages_;
+            TripFatalWithAdmissionLockHeld();
+            return result;
+        }
 
-        const std::uint8_t source_slot =
-            static_cast<std::uint8_t>(source);
+        const std::uint8_t source_slot = inspection.source_slot();
         result.source_slot = source_slot;
         constexpr std::uint64_t exhaustion_sentinel =
             std::numeric_limits<std::uint64_t>::max();
@@ -667,29 +796,28 @@ public:
         metadata.recv_monotonic_ns = monotonic_ns;
 
         realtime::OwnedIngressMessageHandleV1 owned;
-        result.owned_error = realtime::OwnedIngressMessageV1::Create(
-            message,
-            metadata,
-            config_.maximum_sdk_message_bytes,
-            &owned);
+        result.owned_error =
+            ingress_pool_->Acquire(inspection, metadata, &owned);
         if (result.owned_error !=
-                realtime::OwnedIngressCreateErrorV1::kNone ||
-            owned == nullptr || owned->source_slot() != source_slot) {
-            result.error = result.owned_error ==
-                                   realtime::OwnedIngressCreateErrorV1::
-                                       kForbiddenCombinedTick
-                               ? RealtimePipelineIngressErrorV1::
-                                     kForbiddenCombinedTick
-                               : RealtimePipelineIngressErrorV1::
-                                     kOwnedMessageRejected;
+                realtime::OwnedIngressMessageErrorV1::kNone ||
+            !owned || owned->source_slot() != source_slot) {
+            result.error =
+                RealtimePipelineIngressErrorV1::kOwnedMessageRejected;
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
             return result;
         }
 
+        realtime::OwnedIngressMessageHandleV1 wal_message;
+        if (config_.wal.enabled) {
+            // WAL-on creates exactly one intrusive reference for its
+            // independent lifetime. WAL-off keeps the decoder as the unique
+            // owner and performs no atomic reference increment/decrement.
+            wal_message = owned;
+        }
         DecoderCommand command{};
         command.kind = CommandKind::kMessage;
-        command.message = owned;
+        command.message = std::move(owned);
         if (!lanes_[source_slot]->queue.TryPush(std::move(command))) {
             result.error =
                 RealtimePipelineIngressErrorV1::kDecoderQueueFull;
@@ -704,9 +832,14 @@ public:
         result.global_ingress_sequence = metadata.global_ingress_sequence;
         result.source_sequence = metadata.source_sequence;
 
-        // The decoder queue and WAL queue receive the same immutable owner.
         // WAL status is intentionally observed only after realtime admission.
-        result.wal_result = wal_->TryEnqueue(std::move(owned));
+        if (config_.wal.enabled) {
+            result.wal_result =
+                wal_->TryEnqueue(std::move(wal_message));
+        } else {
+            result.wal_result =
+                realtime::OptionalWalEnqueueResultV1::kDisabled;
+        }
         return result;
     }
 
@@ -977,6 +1110,9 @@ public:
         result.last_decode_error =
             static_cast<market::MarketDecodeErrorV1>(
                 last_decode_error_.load(std::memory_order_acquire));
+        if (ingress_pool_ != nullptr) {
+            result.ingress_pool = ingress_pool_->Snapshot();
+        }
         if (wal_ != nullptr) {
             result.wal = wal_->Snapshot();
         }
@@ -1027,22 +1163,28 @@ private:
 
     [[nodiscard]] bool ValidateConfiguration(
         bool factory_is_test_override) const noexcept {
+        std::size_t maximum_inflight_messages = 0U;
         if (config_.registry == nullptr || config_.registry->empty() ||
             !ProductionRegistryValid(*config_.registry) ||
             l2flow::common::IsZeroIdentity(config_.run_id) ||
             config_.trade_date == 0U ||
             config_.maximum_sdk_message_bytes < sdk::kVendorHeadBytes ||
+            config_.maximum_sdk_message_bytes >
+                realtime::kOwnedIngressMaximumMessageBytesV1 ||
             config_.decoder_queue_capacity_per_source == 0U ||
             config_.store_worker_count == 0U ||
             config_.store_queue_capacity_per_source_worker == 0U ||
-            config_.intraday_store.chunk_record_capacity == 0U ||
-            config_.intraday_store.chunk_record_capacity >
-                market::kIntradayInstrumentStoreMaximumChunkRecordsV1 ||
+            config_.intraday_store.segment_target_bytes <
+                market::kIntradayInstrumentStoreMinimumSegmentBytesV1 ||
+            config_.intraday_store.segment_target_bytes >
+                market::kIntradayInstrumentStoreMaximumSegmentBytesV1 ||
             config_.intraday_store.maximum_session_records == 0U ||
             config_.intraday_store.maximum_session_accounted_bytes == 0U ||
             config_.intraday_store.maximum_records_per_batch == 0U ||
             config_.intraday_store.maximum_records_per_batch >
-                market::kIntradayInstrumentStoreMaximumBatchRecordsV1) {
+                market::kIntradayInstrumentStoreMaximumBatchRecordsV1 ||
+            !MaximumIngressPoolMessages(
+                config_, &maximum_inflight_messages)) {
             return false;
         }
         const std::size_t maximum_body =
@@ -1218,7 +1360,7 @@ private:
     [[nodiscard]] bool DecodeOne(
         std::uint8_t source,
         const realtime::OwnedIngressMessageHandleV1& message) noexcept {
-        if (message == nullptr || message->source_slot() != source ||
+        if (!message || message->source_slot() != source ||
             message->recv_realtime_ns() >
                 static_cast<std::uint64_t>(
                     std::numeric_limits<std::int64_t>::max()) ||
@@ -1259,21 +1401,15 @@ private:
             return false;
         }
 
-        market::RetainedMarketEventV1 retained;
-        if (market::RetainMarketEventV1(
-                std::move(decoded), &retained) !=
-            market::RetainedMarketEventCreateErrorV1::kNone) {
-            return false;
-        }
-        market::RealtimeHistoryRecordHandleV1 record;
-        if (!market::RealtimeHistoryRecordV1::Create(
+        std::optional<market::RealtimeHistoryEventInputV1> input =
+            market::RealtimeHistoryEventInputV1::Create(
                 source,
                 message->global_ingress_sequence(),
-                std::move(retained),
-                &record)) {
+                std::move(decoded));
+        if (!input.has_value()) {
             return false;
         }
-        if (history_->TrySubmit(std::move(record)) !=
+        if (history_->TrySubmit(std::move(*input)) !=
             market::RealtimeHistorySubmitErrorV1::kNone) {
             return false;
         }
@@ -1354,6 +1490,9 @@ private:
     }
 
     RealtimePipelineConfigV1 config_{};
+    // Declared before every possible handle owner so pool state is retired
+    // only after decoder rings and WAL have released their handles.
+    std::unique_ptr<realtime::OwnedIngressMessagePoolV1> ingress_pool_;
     std::array<std::unique_ptr<DecoderLane>,
                market::kRealtimeHistorySourceCountV1>
         lanes_{};

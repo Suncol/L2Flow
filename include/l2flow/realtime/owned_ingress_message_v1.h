@@ -6,22 +6,26 @@
 
 #include "mdl_api.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
-#include <vector>
 
 namespace l2flow::realtime {
 
 inline constexpr std::size_t kOwnedIngressSourceCountV1 = 4U;
 inline constexpr std::size_t kRequiredOwnedIngressMessageCountV1 =
     l2flow::sdk::kProductionMessageCountV1;
+inline constexpr std::uint32_t kOwnedIngressMaximumMessageBytesV1 =
+    16U * 1024U * 1024U;
+inline constexpr std::size_t
+    kOwnedIngressMaximumInflightMessagesV1 = 10'000'000U;
 static_assert(kRequiredOwnedIngressMessageCountV1 == 5U);
 
 // These are the only market messages admitted by the production realtime
-// ingress.  Shanghai and Shenzhen each have a snapshot source; the two
+// ingress. Shanghai and Shenzhen each have a snapshot source; the two
 // Shenzhen tick message types deliberately share one serial source.
 enum class OwnedIngressSourceV1 : std::uint8_t {
     kShanghaiSnapshot = 0U,
@@ -68,9 +72,10 @@ struct OwnedIngressMetadataV1 final {
     std::uint64_t recv_monotonic_ns = 0U;
 };
 
-enum class OwnedIngressCreateErrorV1 : std::uint8_t {
+enum class OwnedIngressMessageErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
+    kInvalidPoolConfiguration,
     kInvalidMetadata,
     kInvalidMaximumMessageBytes,
     kNullMessage,
@@ -83,16 +88,122 @@ enum class OwnedIngressCreateErrorV1 : std::uint8_t {
     kUnsupportedMessage,
     kForbiddenCombinedTick,
     kNullBody,
+    kInvalidInspection,
+    kPoolExhausted,
     kResourceExhausted,
 };
 
-[[nodiscard]] std::string_view OwnedIngressCreateErrorNameV1(
-    OwnedIngressCreateErrorV1 error) noexcept;
+[[nodiscard]] std::string_view OwnedIngressMessageErrorNameV1(
+    OwnedIngressMessageErrorV1 error) noexcept;
 
-// Immutable ownership boundary between the vendor callback and every
-// downstream consumer. The callback copies the packed vendor head once and
-// the declared body once. Decoder and optional WAL consumers share the same
-// const object; audit-sink state is not part of this schema.
+class OwnedIngressMessagePoolStateV1;
+
+// A non-owning, callback-lifetime view produced by exactly one SDK head read
+// and, for a non-empty body, exactly one SDK body read. Acquire must be called
+// before the vendor callback returns. It copies these already classified
+// bytes into pool ownership without calling the SDK again.
+class OwnedIngressMessageInspectionV1 final {
+public:
+    OwnedIngressMessageInspectionV1() noexcept = default;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return valid_;
+    }
+    [[nodiscard]] OwnedIngressSourceV1 source() const noexcept {
+        return source_;
+    }
+    [[nodiscard]] std::uint8_t source_slot() const noexcept {
+        return static_cast<std::uint8_t>(source_);
+    }
+    [[nodiscard]] const l2flow::sdk::MessageKey& key() const noexcept {
+        return key_;
+    }
+    [[nodiscard]] const l2flow::sdk::VendorHeadBytes&
+    vendor_head_bytes() const noexcept {
+        return vendor_head_bytes_;
+    }
+    [[nodiscard]] l2flow::sdk::VendorHeadView vendor_head()
+        const noexcept {
+        return l2flow::sdk::VendorHeadView(vendor_head_bytes_);
+    }
+    [[nodiscard]] std::span<const std::byte> body() const noexcept {
+        return body_;
+    }
+    [[nodiscard]] std::size_t wire_size() const noexcept {
+        return wire_size_;
+    }
+
+private:
+    friend OwnedIngressMessageErrorV1 InspectOwnedIngressMessageV1(
+        const datayes::mdl::MDLMessage*,
+        std::uint32_t,
+        OwnedIngressMessageInspectionV1*) noexcept;
+    friend class OwnedIngressMessagePoolStateV1;
+
+    bool valid_ = false;
+    OwnedIngressSourceV1 source_ =
+        OwnedIngressSourceV1::kShanghaiSnapshot;
+    l2flow::sdk::MessageKey key_{};
+    l2flow::sdk::VendorHeadBytes vendor_head_bytes_{};
+    std::span<const std::byte> body_{};
+    std::uint32_t wire_size_ = 0U;
+};
+
+[[nodiscard]] OwnedIngressMessageErrorV1 InspectOwnedIngressMessageV1(
+    const datayes::mdl::MDLMessage* message,
+    std::uint32_t maximum_message_bytes,
+    OwnedIngressMessageInspectionV1* output) noexcept;
+
+class OwnedIngressMessageV1;
+
+// Intrusive immutable message ownership. Copies add a reference to the same
+// pooled block; moves only transfer that reference. No per-message shared_ptr
+// control block is allocated.
+class OwnedIngressMessageHandleV1 final {
+public:
+    OwnedIngressMessageHandleV1() noexcept = default;
+    OwnedIngressMessageHandleV1(
+        const OwnedIngressMessageHandleV1& other) noexcept;
+    OwnedIngressMessageHandleV1& operator=(
+        const OwnedIngressMessageHandleV1& other) noexcept;
+    OwnedIngressMessageHandleV1(
+        OwnedIngressMessageHandleV1&& other) noexcept;
+    OwnedIngressMessageHandleV1& operator=(
+        OwnedIngressMessageHandleV1&& other) noexcept;
+    ~OwnedIngressMessageHandleV1();
+
+    void reset() noexcept;
+    void swap(OwnedIngressMessageHandleV1& other) noexcept;
+
+    [[nodiscard]] const OwnedIngressMessageV1* get() const noexcept {
+        return message_;
+    }
+    [[nodiscard]] const OwnedIngressMessageV1* operator->()
+        const noexcept {
+        return message_;
+    }
+    [[nodiscard]] const OwnedIngressMessageV1& operator*()
+        const noexcept;
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return message_ != nullptr;
+    }
+
+private:
+    struct AdoptReference final {};
+
+    explicit OwnedIngressMessageHandleV1(
+        const OwnedIngressMessageV1* message,
+        AdoptReference) noexcept
+        : message_(message) {}
+
+    friend class OwnedIngressMessagePoolStateV1;
+
+    const OwnedIngressMessageV1* message_ = nullptr;
+};
+
+// Immutable ownership boundary between the vendor callback and downstream
+// decoder/WAL consumers. Object storage and body bytes occupy one size-class
+// pool block; the body starts immediately after this object.
 class OwnedIngressMessageV1 final {
 public:
     OwnedIngressMessageV1(const OwnedIngressMessageV1&) = delete;
@@ -101,13 +212,6 @@ public:
     OwnedIngressMessageV1(OwnedIngressMessageV1&&) = delete;
     OwnedIngressMessageV1& operator=(
         OwnedIngressMessageV1&&) = delete;
-    ~OwnedIngressMessageV1() = default;
-
-    [[nodiscard]] static OwnedIngressCreateErrorV1 Create(
-        const datayes::mdl::MDLMessage* message,
-        const OwnedIngressMetadataV1& metadata,
-        std::uint32_t maximum_message_bytes,
-        std::shared_ptr<const OwnedIngressMessageV1>* output) noexcept;
 
     [[nodiscard]] const l2flow::common::Identity128& run_id()
         const noexcept {
@@ -149,26 +253,89 @@ public:
         const noexcept {
         return l2flow::sdk::VendorHeadView(vendor_head_bytes_);
     }
-    [[nodiscard]] std::span<const std::byte> body() const noexcept {
-        return body_;
-    }
+    [[nodiscard]] std::span<const std::byte> body() const noexcept;
     [[nodiscard]] std::size_t wire_size() const noexcept {
-        return vendor_head_bytes_.size() + body_.size();
+        return l2flow::sdk::kVendorHeadBytes +
+               static_cast<std::size_t>(body_size_);
     }
 
 private:
-    explicit OwnedIngressMessageV1(
-        OwnedIngressMetadataV1 metadata) noexcept;
+    friend class OwnedIngressMessageHandleV1;
+    friend class OwnedIngressMessagePoolStateV1;
+
+    OwnedIngressMessageV1(
+        const OwnedIngressMetadataV1& metadata,
+        const OwnedIngressMessageInspectionV1& inspection,
+        OwnedIngressMessagePoolStateV1* pool_state,
+        std::byte* body_data,
+        std::uint8_t size_class_index) noexcept;
+    ~OwnedIngressMessageV1() = default;
+
+    void AddReference() const noexcept;
+    void ReleaseReference() const noexcept;
+    [[nodiscard]] std::byte* mutable_body_data() noexcept;
+    [[nodiscard]] const std::byte* body_data() const noexcept;
 
     OwnedIngressMetadataV1 metadata_{};
+    OwnedIngressMessagePoolStateV1* pool_state_ = nullptr;
+    std::byte* body_data_ = nullptr;
+    l2flow::sdk::VendorHeadBytes vendor_head_bytes_{};
+    l2flow::sdk::MessageKey key_{};
+    std::uint32_t body_size_ = 0U;
+    mutable std::atomic<std::uint32_t> references_{1U};
     OwnedIngressSourceV1 source_ =
         OwnedIngressSourceV1::kShanghaiSnapshot;
-    l2flow::sdk::MessageKey key_{};
-    l2flow::sdk::VendorHeadBytes vendor_head_bytes_{};
-    std::vector<std::byte> body_;
+    std::uint8_t size_class_index_ = 0U;
 };
 
-using OwnedIngressMessageHandleV1 =
-    std::shared_ptr<const OwnedIngressMessageV1>;
+struct OwnedIngressMessagePoolConfigV1 final {
+    std::uint32_t maximum_message_bytes = 0U;
+    std::size_t maximum_inflight_messages = 0U;
+};
+
+struct OwnedIngressMessagePoolSnapshotV1 final {
+    std::uint32_t maximum_message_bytes = 0U;
+    std::size_t maximum_inflight_messages = 0U;
+    std::size_t active_messages = 0U;
+    std::size_t allocated_blocks = 0U;
+    std::size_t cached_blocks = 0U;
+    std::size_t allocated_bytes = 0U;
+    bool retired = false;
+};
+
+// Bounded, thread-safe size-class storage. Acquire is allocation-free after a
+// suitable block has been cached. Destroying the pool stops new acquisition
+// and frees idle blocks; blocks still referenced by handles remain valid and
+// are deleted safely by whichever thread performs their final release.
+class OwnedIngressMessagePoolV1 final {
+public:
+    OwnedIngressMessagePoolV1(
+        const OwnedIngressMessagePoolV1&) = delete;
+    OwnedIngressMessagePoolV1& operator=(
+        const OwnedIngressMessagePoolV1&) = delete;
+    OwnedIngressMessagePoolV1(OwnedIngressMessagePoolV1&&) = delete;
+    OwnedIngressMessagePoolV1& operator=(
+        OwnedIngressMessagePoolV1&&) = delete;
+    ~OwnedIngressMessagePoolV1();
+
+    [[nodiscard]] static OwnedIngressMessageErrorV1 Create(
+        OwnedIngressMessagePoolConfigV1 config,
+        std::unique_ptr<OwnedIngressMessagePoolV1>* output) noexcept;
+
+    [[nodiscard]] OwnedIngressMessageErrorV1 Acquire(
+        const OwnedIngressMessageInspectionV1& inspection,
+        const OwnedIngressMetadataV1& metadata,
+        OwnedIngressMessageHandleV1* output) noexcept;
+
+    [[nodiscard]] OwnedIngressMessagePoolSnapshotV1 Snapshot()
+        const noexcept;
+
+private:
+    explicit OwnedIngressMessagePoolV1(
+        OwnedIngressMessagePoolStateV1* state) noexcept
+        : state_(state) {}
+
+    OwnedIngressMessagePoolStateV1* state_ = nullptr;
+};
 
 }  // namespace l2flow::realtime

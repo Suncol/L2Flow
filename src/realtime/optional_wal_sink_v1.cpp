@@ -222,7 +222,7 @@ public:
     }
 
     [[nodiscard]] OptionalWalEnqueueResultV1 TryEnqueue(
-        OwnedIngressMessageHandleV1 message) noexcept {
+        OwnedIngressMessageHandleV1&& message) noexcept {
         if (!config_.enabled) {
             return OptionalWalEnqueueResultV1::kDisabled;
         }

@@ -95,7 +95,8 @@ std::unique_ptr<market::RealtimeHistoryRuntimeV1> MakeRuntime(
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 64U;
     config.registry = registry;
-    config.intraday_store.chunk_record_capacity = 8U;
+    config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     config.intraday_store.maximum_session_records =
         maximum_session_records;
     config.intraday_store.maximum_session_accounted_bytes = 1U << 30U;
@@ -188,6 +189,15 @@ bool SubmitShanghaiSnapshot(
     snapshot.common.origin.source_stream_id = 101U;
     snapshot.common.origin.source_sequence = source_sequence;
     snapshot.common.instrument_id = instrument_id;
+    if (runtime == nullptr || runtime->config().registry == nullptr) {
+        return false;
+    }
+    const auto lookup =
+        runtime->config().registry->LookupById(instrument_id);
+    if (!lookup.known()) {
+        return false;
+    }
+    snapshot.common.registry_ordinal = lookup.registry_ordinal;
     snapshot.common.origin.recv_realtime_ns = 100;
     snapshot.common.origin.recv_monotonic_ns = 90;
     snapshot.last_price.raw = normalized_last_price_p6 / 1000;
@@ -196,21 +206,12 @@ bool SubmitShanghaiSnapshot(
     snapshot.last_price.valid = true;
 
     market::DecodedMarketEventV1 decoded(std::move(snapshot));
-    market::RetainedMarketEventV1 retained;
-    if (market::RetainMarketEventV1(
-            std::move(decoded), &retained) !=
-        market::RetainedMarketEventCreateErrorV1::kNone) {
+    auto input = market::RealtimeHistoryEventInputV1::Create(
+        0U, ingress_sequence, std::move(decoded));
+    if (!input.has_value()) {
         return false;
     }
-    market::RealtimeHistoryRecordHandleV1 record;
-    if (!market::RealtimeHistoryRecordV1::Create(
-            0U,
-            ingress_sequence,
-            std::move(retained),
-            &record)) {
-        return false;
-    }
-    return runtime->TrySubmit(std::move(record)) ==
+    return runtime->TrySubmit(std::move(*input)) ==
            market::RealtimeHistorySubmitErrorV1::kNone;
 }
 
@@ -226,6 +227,15 @@ bool SubmitShenzhenSnapshot(
     snapshot.common.origin.source_stream_id = 103U;
     snapshot.common.origin.source_sequence = source_sequence;
     snapshot.common.instrument_id = instrument_id;
+    if (runtime == nullptr || runtime->config().registry == nullptr) {
+        return false;
+    }
+    const auto lookup =
+        runtime->config().registry->LookupById(instrument_id);
+    if (!lookup.known()) {
+        return false;
+    }
+    snapshot.common.registry_ordinal = lookup.registry_ordinal;
     snapshot.common.origin.recv_realtime_ns = 200;
     snapshot.common.origin.recv_monotonic_ns = 190;
     snapshot.last_price.raw = normalized_last_price_p6 / 1000;
@@ -234,21 +244,12 @@ bool SubmitShenzhenSnapshot(
     snapshot.last_price.valid = true;
 
     market::DecodedMarketEventV1 decoded(std::move(snapshot));
-    market::RetainedMarketEventV1 retained;
-    if (market::RetainMarketEventV1(
-            std::move(decoded), &retained) !=
-        market::RetainedMarketEventCreateErrorV1::kNone) {
+    auto input = market::RealtimeHistoryEventInputV1::Create(
+        2U, ingress_sequence, std::move(decoded));
+    if (!input.has_value()) {
         return false;
     }
-    market::RealtimeHistoryRecordHandleV1 record;
-    if (!market::RealtimeHistoryRecordV1::Create(
-            2U,
-            ingress_sequence,
-            std::move(retained),
-            &record)) {
-        return false;
-    }
-    return runtime->TrySubmit(std::move(record)) ==
+    return runtime->TrySubmit(std::move(*input)) ==
            market::RealtimeHistorySubmitErrorV1::kNone;
 }
 
@@ -562,13 +563,13 @@ void CheckDefaultProjectionEconomicDomain(TestContext* test) {
     const auto* shanghai_snapshot =
         shanghai_row.latest_snapshot == nullptr
             ? nullptr
-            : market::RetainedMarketEventGetV1<
+            : market::StoredMarketEventGetV1<
                   market::ShanghaiSnapshotV1>(
                   shanghai_row.latest_snapshot->event());
     const auto* shenzhen_snapshot =
         shenzhen_row.latest_snapshot == nullptr
             ? nullptr
-            : market::RetainedMarketEventGetV1<
+            : market::StoredMarketEventGetV1<
                   market::ShenzhenSnapshotV1>(
                   shenzhen_row.latest_snapshot->event());
     test->Expect(

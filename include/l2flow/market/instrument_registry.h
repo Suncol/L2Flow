@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -69,6 +70,11 @@ struct InstrumentRegistryLookupResultV1 final {
     InstrumentRegistryLookupErrorV1 error =
         InstrumentRegistryLookupErrorV1::kUnknownInstrument;
     std::uint32_t instrument_id = 0U;
+    // Stable zero-based position in the registry's instrument_id ordering.
+    // It is deliberately independent of entries(), whose public canonical
+    // order remains the exact byte-key order used by the registry digest.
+    std::size_t registry_ordinal =
+        std::numeric_limits<std::size_t>::max();
     QuantityUnitV1 quantity_unit = QuantityUnitV1::kUnknown;
     SecurityTypeV1 security_type = SecurityTypeV1::kUnknown;
     AssetScopeV1 asset_scope = AssetScopeV1::kUnknown;
@@ -76,7 +82,10 @@ struct InstrumentRegistryLookupResultV1 final {
 
     [[nodiscard]] bool known() const noexcept {
         return error == InstrumentRegistryLookupErrorV1::kNone &&
-               instrument_id != 0U && entry != nullptr;
+               instrument_id != 0U &&
+               registry_ordinal !=
+                   std::numeric_limits<std::size_t>::max() &&
+               entry != nullptr;
     }
 };
 
@@ -154,11 +163,13 @@ private:
         std::uint64_t registry_version,
         std::vector<InstrumentRegistryEntryV1> entries,
         std::vector<IdIndexEntryV1> id_index,
+        std::vector<std::size_t> entry_index_to_registry_ordinal,
         l2flow::common::Sha256Digest registry_sha256) noexcept;
 
     std::uint64_t registry_version_ = 0U;
     std::vector<InstrumentRegistryEntryV1> entries_;
     std::vector<IdIndexEntryV1> id_index_;
+    std::vector<std::size_t> entry_index_to_registry_ordinal_;
     l2flow::common::Sha256Digest registry_sha256_{};
 };
 

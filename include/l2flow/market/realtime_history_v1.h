@@ -10,7 +10,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -79,13 +81,9 @@ public:
         const RealtimeHistoryRecordV1&) = delete;
     RealtimeHistoryRecordV1(RealtimeHistoryRecordV1&&) = delete;
     RealtimeHistoryRecordV1& operator=(RealtimeHistoryRecordV1&&) = delete;
-    ~RealtimeHistoryRecordV1() = default;
-
-    [[nodiscard]] static bool Create(
-        std::uint8_t source_slot,
-        std::uint64_t ingress_sequence,
-        RetainedMarketEventV1 event,
-        std::shared_ptr<const RealtimeHistoryRecordV1>* output) noexcept;
+    // The matching store segment invokes this exactly once.  It dispatches
+    // destruction of the placement-constructed exact event payload.
+    ~RealtimeHistoryRecordV1();
 
     [[nodiscard]] std::uint8_t source_slot() const noexcept {
         return source_slot_;
@@ -112,9 +110,7 @@ public:
     [[nodiscard]] std::int64_t recv_monotonic_ns() const noexcept {
         return recv_monotonic_ns_;
     }
-    [[nodiscard]] const RetainedMarketEventV1& event() const noexcept {
-        return event_;
-    }
+    [[nodiscard]] StoredMarketEventViewV1 event() const noexcept;
 
 private:
     RealtimeHistoryRecordV1(
@@ -127,7 +123,7 @@ private:
         std::int64_t event_time_ns,
         std::int64_t recv_realtime_ns,
         std::int64_t recv_monotonic_ns,
-        RetainedMarketEventV1 event) noexcept;
+        std::uint32_t payload_delta) noexcept;
 
     std::uint8_t source_slot_ = 0U;
     std::uint32_t source_stream_id_ = 0U;
@@ -138,11 +134,104 @@ private:
     std::int64_t event_time_ns_ = 0;
     std::int64_t recv_realtime_ns_ = 0;
     std::int64_t recv_monotonic_ns_ = 0;
-    RetainedMarketEventV1 event_;
+    // Exact payload is in the same segment allocation at
+    // reinterpret_cast<byte*>(this) + payload_delta_.  A zero delta is never
+    // published.
+    std::uint32_t payload_delta_ = 0U;
+
+    friend class IntradayInstrumentStoreV1;
 };
 
-using RealtimeHistoryRecordHandleV1 =
-    std::shared_ptr<const RealtimeHistoryRecordV1>;
+// Move-only decoder output envelope.  It contains no durable owner or heap
+// control block: the history handoff pool bounds its transient lifetime, and
+// the instrument owner worker consumes it into the store arena.
+class RealtimeHistoryEventInputV1 final {
+public:
+    RealtimeHistoryEventInputV1(
+        const RealtimeHistoryEventInputV1&) = delete;
+    RealtimeHistoryEventInputV1& operator=(
+        const RealtimeHistoryEventInputV1&) = delete;
+    RealtimeHistoryEventInputV1(
+        RealtimeHistoryEventInputV1&& other) noexcept;
+    RealtimeHistoryEventInputV1& operator=(
+        RealtimeHistoryEventInputV1&& other) noexcept;
+    ~RealtimeHistoryEventInputV1() = default;
+
+    [[nodiscard]] static std::optional<RealtimeHistoryEventInputV1> Create(
+        std::uint8_t source_slot,
+        std::uint64_t ingress_sequence,
+        DecodedMarketEventV1&& event) noexcept;
+
+    [[nodiscard]] std::uint8_t source_slot() const noexcept {
+        return source_slot_;
+    }
+    [[nodiscard]] std::uint32_t source_stream_id() const noexcept {
+        return source_stream_id_;
+    }
+    [[nodiscard]] std::uint64_t source_sequence() const noexcept {
+        return source_sequence_;
+    }
+    [[nodiscard]] std::uint64_t ingress_sequence() const noexcept {
+        return ingress_sequence_;
+    }
+    [[nodiscard]] std::uint32_t instrument_id() const noexcept {
+        return instrument_id_;
+    }
+    [[nodiscard]] std::size_t registry_ordinal() const noexcept {
+        return registry_ordinal_;
+    }
+    [[nodiscard]] MarketEventKindV1 kind() const noexcept { return kind_; }
+    [[nodiscard]] std::int64_t event_time_ns() const noexcept {
+        return event_time_ns_;
+    }
+    [[nodiscard]] std::int64_t recv_realtime_ns() const noexcept {
+        return recv_realtime_ns_;
+    }
+    [[nodiscard]] std::int64_t recv_monotonic_ns() const noexcept {
+        return recv_monotonic_ns_;
+    }
+    [[nodiscard]] std::uint64_t accounted_record_bytes() const noexcept {
+        return accounted_record_bytes_;
+    }
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
+    [[nodiscard]] const DecodedMarketEventV1& event() const noexcept {
+        return event_;
+    }
+    [[nodiscard]] DecodedMarketEventV1&& TakeEvent() && noexcept {
+        valid_ = false;
+        return std::move(event_);
+    }
+
+private:
+    RealtimeHistoryEventInputV1(
+        std::uint8_t source_slot,
+        std::uint32_t source_stream_id,
+        std::uint64_t source_sequence,
+        std::uint64_t ingress_sequence,
+        std::uint32_t instrument_id,
+        std::size_t registry_ordinal,
+        MarketEventKindV1 kind,
+        std::int64_t event_time_ns,
+        std::int64_t recv_realtime_ns,
+        std::int64_t recv_monotonic_ns,
+        std::uint64_t accounted_record_bytes,
+        DecodedMarketEventV1&& event) noexcept;
+
+    std::uint8_t source_slot_ = 0U;
+    std::uint32_t source_stream_id_ = 0U;
+    std::uint64_t source_sequence_ = 0U;
+    std::uint64_t ingress_sequence_ = 0U;
+    std::uint32_t instrument_id_ = 0U;
+    std::size_t registry_ordinal_ =
+        std::numeric_limits<std::size_t>::max();
+    MarketEventKindV1 kind_ = MarketEventKindV1::kShanghaiSnapshot;
+    std::int64_t event_time_ns_ = 0;
+    std::int64_t recv_realtime_ns_ = 0;
+    std::int64_t recv_monotonic_ns_ = 0;
+    std::uint64_t accounted_record_bytes_ = 0U;
+    DecodedMarketEventV1 event_;
+    bool valid_ = true;
+};
 
 // A small, allocation-free publication action invoked only while the runtime
 // still owns the exact current store generation under its commit lock. The
@@ -153,6 +242,8 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     std::array<std::uint32_t, kRealtimeHistorySourceCountV1>
         source_stream_ids{};
     std::uint32_t worker_count = 0U;
+    // Maximum in-flight record handoffs per source×worker. The command ring
+    // reserves one additional internal slot for the generation fence.
     std::size_t queue_capacity_per_source_worker = 0U;
     const InstrumentRegistryV1* registry = nullptr;
     IntradayInstrumentStoreConfigV1 intraday_store{};
@@ -223,7 +314,7 @@ public:
         std::unique_ptr<RealtimeHistoryRuntimeV1>* output) noexcept;
 
     [[nodiscard]] RealtimeHistorySubmitErrorV1 TrySubmit(
-        RealtimeHistoryRecordHandleV1 record) noexcept;
+        RealtimeHistoryEventInputV1&& input) noexcept;
 
     // BeginGeneration is called before the four decoder markers are admitted.
     // Each decoder calls SealSource after it has routed every event preceding

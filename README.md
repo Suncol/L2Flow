@@ -67,9 +67,13 @@ boundary. SDK objects are still shut down and released explicitly.
 
 ### Owned ingress and WAL isolation
 
-The callback copies the vendor's 23-byte message header and declared body into
-one `shared_ptr<const OwnedIngressMessageV1>`. Vendor callback memory may be
-released immediately after the callback returns.
+The callback inspects the vendor message once, then copies its 23-byte header
+and declared body into one bounded size-class-pool allocation. Vendor callback
+memory may be released immediately after the callback returns. When WAL is
+disabled the pooled message has one owner from callback to decoder; when WAL
+is enabled an intrusive reference shares that same immutable allocation with
+the audit writer. Pool exhaustion rejects the callback instead of falling
+back to an unbounded allocation.
 
 The decoder queue and optional WAL receive the same immutable owner. WAL is a
 side sink only:
@@ -107,7 +111,9 @@ equity/fund/bond/option label is not enough. SH maximum-duration values keep
 their vendor raw unit, with `UINT32_MAX` treated as the observed unavailable
 sentinel and no unit guessed.
 
-After decode and registry lookup, a record is routed permanently by:
+The registry lookup returns both the stable registry ordinal and instrument
+ID. The history runtime resolves those values once to a session-bound route
+token, then routes the moved decoded event permanently by:
 
 ```text
 worker = instrument_id % store_worker_count
@@ -119,12 +125,14 @@ decoder arrival may be out of order; generation queries merge the captured
 lanes by the dense process-wide ingress sequence. The fixed instrument
 registry is the generation universe, including instruments with no records.
 
-The store owns the decoded record exactly once. Generation cuts capture chunk
-endpoints and latest-record locators rather than copying the accumulated
-record handles, so publication remains O(the fixed instrument universe) as the
-session grows. Record and logical-byte limits are mandatory, and reaching
-either limit fails the production pipeline closed; old records are never
-evicted to regain capacity.
+The owner worker constructs the exact concrete event once in an append-only
+per-instrument/source segmented arena. Compact record headers cache ordering
+metadata and point to their arena-local payload by relative offset.
+Generation cuts capture segment endpoints, visible byte/record counts, and
+latest-record locators rather than copying accumulated records, so publication
+remains O(the fixed instrument universe) as the session grows. Record and
+logical-byte limits are mandatory, and reaching either limit fails the
+production pipeline closed; old records are never evicted to regain capacity.
 
 The store is memory-only. It does not replay the optional WAL or feeder CSV;
 the feeder's append-only CSV is outside this project's recovery path. After a
@@ -133,8 +141,8 @@ accepted after that start and must not claim `coverage_from_open`.
 
 On a 1 TiB host, the initial envelope is a 600--620 GiB logical store limit,
 an 800 GiB process high-water alert, and an 850--860 GiB termination boundary.
-Old factors, store generations, and cursors pin their session and record
-owners, so consumers must enforce a small fixed limit on retained handles.
+Old factors, store generations, and cursors pin their owning session arena, so
+consumers must enforce a small fixed limit on retained handles.
 
 ### Generation barrier and watermark
 
@@ -186,23 +194,25 @@ they have the same generation: store generation `N` is necessarily published
 before factor generation `N`, so two latest-slot reads may briefly observe
 different generations.
 
-Full-session consumers use store cursors: draining N records is O(N) and each
-`ReadBatch` uses O(batch) caller-owned pointer storage rather than allocating a
-second full-session result. `maximum_records_per_batch` is only an upper bound;
-the acceptance reader keeps that Store limit at 65,536 but defaults the actual
-`ReadBatch` span to 1,024 and consumes each page immediately. Large drains can
-be split into independent half-open instrument-ordinal ranges with
-`OpenUniverseRangeCursor`. With an untruncated `maximum_records` setting,
-concatenating non-overlapping ranges in ordinal order is identical to one
-full-universe cursor.
+Full-session consumers use store cursors: a full-universe drain over I
+instrument rows and N records is O(I + N), and each `ReadBatch` uses O(batch)
+caller-owned pointer storage rather than allocating a second full-session
+result. `maximum_records_per_batch` is only an upper bound; the acceptance
+reader keeps that Store limit at 65,536 but defaults the actual `ReadBatch`
+span to 1,024 and consumes each page immediately. Large drains can be split
+into independent half-open instrument-ordinal ranges with
+`OpenUniverseRangeCursor`; one range costs O(I_range + N_range). With an
+untruncated `maximum_records` setting, concatenating non-overlapping ranges in
+ordinal order is identical to one full-universe cursor.
 
 The acceptance probe exposes `--intraday-scan-batch-records`,
 `--intraday-scan-workers`, and `--intraday-reader-cpus`. Single-reader scans
 are pinned to one allowed CPU; 4--8 reader scans use record-balanced,
 non-overlapping ordinal ranges and one CPU per reader. Store worker count and
-chunk capacity remain separately configurable for 4/8 and 1024/4096 A/B
-runs. CPU affinity is applied only in the post-stop reader threads, so the
-live SDK, decoder, and Store workers do not inherit a single-core mask.
+segment target size remain separately configurable, for example 4/8 workers
+and 64/256 KiB segments in A/B runs. CPU affinity is applied only in the
+post-stop reader threads, so the live SDK, decoder, and Store workers do not
+inherit a single-core mask.
 
 The default `SnapshotLastPriceProjectionV1` is deliberately literal:
 
