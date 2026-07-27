@@ -71,6 +71,10 @@ struct RealtimePipelineConfigV1 final {
         factor_calculator;
     RealtimePipelineSdkConfigV1 sdk{};
     l2flow::market::IntradayInstrumentStoreConfigV1 intraday_store{};
+    // Empty windows disable aggregation. Pipeline creation supplies
+    // trade_date from the process/server date and derives maximum_bars from
+    // the retained store bound when it is zero.
+    l2flow::market::KLineAggregatorConfigV1 kline{};
     // Explicit test/diagnostic mode.  Disabled by default because the extra
     // clock reads and atomic histogram updates perturb the measured system.
     // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
@@ -144,6 +148,7 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
     kNullOutput,
     kInvalidConfiguration,
     kStoreRuntimeCreateFailed,
+    kKLineRuntimeCreateFailed,
     kWalCreateFailed,
     kFactorCreateFailed,
     kDecoderThreadStartFailed,
@@ -228,11 +233,15 @@ struct RealtimePipelineCutResultV1 final {
         store_generation;
     std::shared_ptr<const l2flow::factor::RealtimeFactorGenerationV1>
         factor_generation;
+    std::shared_ptr<const l2flow::market::RealtimeKLineGenerationV1>
+        kline_generation;
+    bool kline_enabled = false;
 
     [[nodiscard]] bool published() const noexcept {
         return error == RealtimePipelineCutErrorV1::kNone &&
                store_generation != nullptr &&
-               factor_generation != nullptr;
+               factor_generation != nullptr &&
+               (!kline_enabled || kline_generation != nullptr);
     }
 };
 
@@ -314,6 +323,11 @@ public:
     [[nodiscard]] std::shared_ptr<
         const l2flow::market::IntradayInstrumentStoreGenerationV1>
     AcquireLatestStoreGeneration() const noexcept;
+    // The returned object owns its exact matching store generation and
+    // exposes all non-empty bars since coverage began.
+    [[nodiscard]] std::shared_ptr<
+        const l2flow::market::RealtimeKLineGenerationV1>
+    AcquireLatestKLineGeneration() const noexcept;
     // Store N is published before factor N. A consistent consumer must acquire
     // the factor once and obtain its exact matching store through
     // factor->input_store(). The direct store accessor is for store-only

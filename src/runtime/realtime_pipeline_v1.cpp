@@ -682,6 +682,8 @@ std::string_view RealtimePipelineCreateErrorNameV1(
             return "invalid_configuration";
         case RealtimePipelineCreateErrorV1::kStoreRuntimeCreateFailed:
             return "store_runtime_create_failed";
+        case RealtimePipelineCreateErrorV1::kKLineRuntimeCreateFailed:
+            return "kline_runtime_create_failed";
         case RealtimePipelineCreateErrorV1::kWalCreateFailed:
             return "wal_create_failed";
         case RealtimePipelineCreateErrorV1::kFactorCreateFailed:
@@ -1044,6 +1046,8 @@ public:
             history_config.queue_capacity_per_source_worker =
                 config_.store_queue_capacity_per_source_worker;
             history_config.intraday_store = config_.intraday_store;
+            history_config.kline = config_.kline;
+            history_config.kline.trade_date = config_.trade_date;
             history_config.registry = config_.registry;
             if (latency_collector_ != nullptr) {
                 history_config.append_observer = &ObserveAppend;
@@ -1061,6 +1065,12 @@ public:
                         std::string(
                             market::RealtimeHistoryCreateErrorNameV1(
                                 store_runtime_error)));
+                if (store_runtime_error ==
+                    market::RealtimeHistoryCreateErrorV1::
+                        kKLineCreateFailed) {
+                    return RealtimePipelineCreateErrorV1::
+                        kKLineRuntimeCreateFailed;
+                }
                 return RealtimePipelineCreateErrorV1::
                     kStoreRuntimeCreateFailed;
             }
@@ -1376,6 +1386,7 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 Cut(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
+        result.kline_enabled = config_.kline.enabled();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -1395,6 +1406,7 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 StopAndPublishFinal(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
+        result.kline_enabled = config_.kline.enabled();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -1451,6 +1463,7 @@ public:
         bool admission_is_quiesced,
         std::optional<std::uint64_t> preclosed_monotonic_cut_ns) noexcept {
         RealtimePipelineCutResultV1 result{};
+        result.kline_enabled = config_.kline.enabled();
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -1465,11 +1478,9 @@ public:
                 const bool history_fatal = history_->fatal();
                 if (fatal_.load(std::memory_order_acquire) ||
                     history_fatal) {
-                    if (history_fatal &&
-                        history_->StoreSnapshot().coverage_lost) {
+                    if (history_fatal) {
                         result.generation_error =
-                            market::RealtimeHistoryGenerationErrorV1::
-                                kStoreFailed;
+                            history_->FailureError();
                     }
                     result.error = RealtimePipelineCutErrorV1::kFatal;
                     TripFatalWithAdmissionLockHeld();
@@ -1569,7 +1580,10 @@ public:
             }
 
             result.generation_error = history_->WaitForGeneration(
-                generation, Remaining(deadline), &result.store_generation);
+                generation,
+                Remaining(deadline),
+                &result.store_generation,
+                &result.kline_generation);
             if (result.generation_error !=
                 market::RealtimeHistoryGenerationErrorV1::kNone) {
                 result.error =
@@ -1583,6 +1597,17 @@ public:
                         kStoreFailed;
                 result.error =
                     RealtimePipelineCutErrorV1::kGenerationWaitFailed;
+                TripFatal();
+                return result;
+            }
+            if (result.kline_enabled &&
+                result.kline_generation == nullptr) {
+                result.generation_error =
+                    market::RealtimeHistoryGenerationErrorV1::
+                        kKLineFailed;
+                result.error =
+                    RealtimePipelineCutErrorV1::
+                        kGenerationWaitFailed;
                 TripFatal();
                 return result;
             }
@@ -1612,6 +1637,14 @@ public:
         return history_ == nullptr
                    ? nullptr
                    : history_->AcquireLatestGeneration();
+    }
+
+    [[nodiscard]] std::shared_ptr<
+        const market::RealtimeKLineGenerationV1>
+    AcquireKLine() const noexcept {
+        return history_ == nullptr
+                   ? nullptr
+                   : history_->AcquireLatestKLineGeneration();
     }
 
     [[nodiscard]] std::shared_ptr<
@@ -2153,6 +2186,11 @@ RealtimePipelineV1::StopAndPublishFinalGeneration(
 std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
 RealtimePipelineV1::AcquireLatestStoreGeneration() const noexcept {
     return impl_->AcquireStore();
+}
+
+std::shared_ptr<const market::RealtimeKLineGenerationV1>
+RealtimePipelineV1::AcquireLatestKLineGeneration() const noexcept {
+    return impl_->AcquireKLine();
 }
 
 std::shared_ptr<const factor::RealtimeFactorGenerationV1>

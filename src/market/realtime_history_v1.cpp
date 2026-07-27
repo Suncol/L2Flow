@@ -684,6 +684,8 @@ std::string_view RealtimeHistoryCreateErrorNameV1(
             return "invalid_configuration";
         case RealtimeHistoryCreateErrorV1::kStoreCreateFailed:
             return "store_create_failed";
+        case RealtimeHistoryCreateErrorV1::kKLineCreateFailed:
+            return "kline_create_failed";
         case RealtimeHistoryCreateErrorV1::kResourceExhausted:
             return "resource_exhausted";
         case RealtimeHistoryCreateErrorV1::kThreadStartFailed:
@@ -738,6 +740,8 @@ std::string_view RealtimeHistoryGenerationErrorNameV1(
             return "fatal";
         case RealtimeHistoryGenerationErrorV1::kStoreFailed:
             return "store_failed";
+        case RealtimeHistoryGenerationErrorV1::kKLineFailed:
+            return "kline_failed";
         case RealtimeHistoryGenerationErrorV1::kResourceExhausted:
             return "resource_exhausted";
     }
@@ -769,6 +773,9 @@ public:
         std::vector<std::unique_ptr<
             IntradayInstrumentStoreWorkerSliceV1>>
             store_worker_slices;
+        std::vector<std::shared_ptr<
+            const KLineAggregatorSnapshotV1>>
+            kline_worker_snapshots;
         std::size_t completed_workers = 0U;
     };
 
@@ -786,9 +793,12 @@ public:
 
     Impl(
         RealtimeHistoryRuntimeConfigV1 config,
-        std::unique_ptr<IntradayInstrumentStoreV1> store)
+        std::unique_ptr<IntradayInstrumentStoreV1> store,
+        std::vector<std::unique_ptr<KLineAggregatorV1>>
+            kline_aggregators)
         : config_(std::move(config)),
           store_(std::move(store)),
+          kline_aggregators_(std::move(kline_aggregators)),
           queues_(kRealtimeHistorySourceCountV1 * config_.worker_count),
           handoff_pools_(
               kRealtimeHistorySourceCountV1 * config_.worker_count),
@@ -847,11 +857,13 @@ public:
 
     RealtimeHistoryGenerationErrorV1 FatalGenerationError()
         const noexcept {
-        return store_failed_.load(
-                   std::memory_order_acquire)
-                   ? RealtimeHistoryGenerationErrorV1::
-                         kStoreFailed
-                   : RealtimeHistoryGenerationErrorV1::kFatal;
+        if (store_failed_.load(std::memory_order_acquire)) {
+            return RealtimeHistoryGenerationErrorV1::kStoreFailed;
+        }
+        if (kline_failed_.load(std::memory_order_acquire)) {
+            return RealtimeHistoryGenerationErrorV1::kKLineFailed;
+        }
+        return RealtimeHistoryGenerationErrorV1::kFatal;
     }
 
     SpscQueue<Command>& Queue(
@@ -1031,7 +1043,9 @@ public:
             rebuilt.registry_version != watermark.registry_version ||
             rebuilt.registry_sha256 != watermark.registry_sha256 ||
             rebuilt.input_identity_sha256 !=
-                watermark.input_identity_sha256) {
+                watermark.input_identity_sha256 ||
+            (config_.kline.enabled() &&
+             watermark.trade_date != config_.kline.trade_date)) {
             return RealtimeHistoryGenerationErrorV1::kInvalidWatermark;
         }
         for (std::size_t source = 0U;
@@ -1067,6 +1081,10 @@ public:
                 return RealtimeHistoryGenerationErrorV1::kStoreFailed;
             }
             pending->store_worker_slices.resize(config_.worker_count);
+            if (config_.kline.enabled()) {
+                pending->kline_worker_snapshots.resize(
+                    config_.worker_count);
+            }
             pending_ = std::move(pending);
             last_started_generation_ = watermark.generation;
             return RealtimeHistoryGenerationErrorV1::kNone;
@@ -1146,12 +1164,16 @@ public:
     RealtimeHistoryGenerationErrorV1 Wait(
         std::uint64_t generation,
         std::chrono::nanoseconds timeout,
-        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output)
+        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output,
+        std::shared_ptr<const RealtimeKLineGenerationV1>* kline_output)
         noexcept {
         if (output == nullptr) {
             return RealtimeHistoryGenerationErrorV1::kNullOutput;
         }
         output->reset();
+        if (kline_output != nullptr) {
+            kline_output->reset();
+        }
         std::unique_lock<std::mutex> lock(generation_mutex_);
         const auto ready = [this, generation] {
             const auto latest = std::atomic_load_explicit(
@@ -1172,6 +1194,23 @@ public:
             &latest_generation_, std::memory_order_acquire);
         if (latest != nullptr &&
             latest->watermark().generation == generation) {
+            if (config_.kline.enabled()) {
+                const auto latest_kline = std::atomic_load_explicit(
+                    &latest_kline_generation_,
+                    std::memory_order_acquire);
+                if (latest_kline == nullptr ||
+                    latest_kline->watermark().generation != generation ||
+                    latest_kline->input_store().get() != latest.get() ||
+                    latest_kline->input_store().owner_before(latest) ||
+                    latest.owner_before(
+                        latest_kline->input_store())) {
+                    return RealtimeHistoryGenerationErrorV1::
+                        kKLineFailed;
+                }
+                if (kline_output != nullptr) {
+                    *kline_output = latest_kline;
+                }
+            }
             *output = latest;
             return RealtimeHistoryGenerationErrorV1::kNone;
         }
@@ -1270,6 +1309,15 @@ public:
             return false;
         }
         RealtimeHistoryEventInputV1* const input = slot->Input();
+        KLineTradeV1 kline_trade{};
+        KLineTradeProjectionV1 kline_projection =
+            KLineTradeProjectionV1::kNotTrade;
+        if (config_.kline.enabled() && input->valid()) {
+            kline_projection = ProjectKLineTradeV1(
+                input->event(),
+                input->ingress_sequence(),
+                &kline_trade);
+        }
         RealtimeHistoryAppendObservationV1 observation{};
         const bool observe = config_.append_observer != nullptr;
         bool append_start_clock_valid = false;
@@ -1305,6 +1353,31 @@ public:
                 append_complete_monotonic_valid &&
                 append_complete_realtime_valid;
         }
+        KLineAppendErrorV1 kline_error = KLineAppendErrorV1::kNone;
+        if (error == IntradayInstrumentStoreAppendErrorV1::kNone) {
+            if (kline_projection ==
+                KLineTradeProjectionV1::kTrade) {
+                if (worker >= kline_aggregators_.size() ||
+                    kline_aggregators_[worker] == nullptr) {
+                    kline_error = KLineAppendErrorV1::kFailed;
+                } else {
+                    kline_error =
+                        kline_aggregators_[worker]->Append(
+                            kline_trade,
+                            route.worker_local_row);
+                }
+            } else if (
+                kline_projection ==
+                KLineTradeProjectionV1::kInvalidTrade) {
+                // Publishing a "complete" KLine while silently omitting a
+                // decoded trade with invalid event time/price/quantity would
+                // be a factual error. Fail the optional KLine chain closed.
+                kline_error = KLineAppendErrorV1::kInvalidTrade;
+            }
+            if (kline_error != KLineAppendErrorV1::kNone) {
+                kline_failed_.store(true, std::memory_order_release);
+            }
+        }
         const bool released =
             HandoffPool(source, worker).ReleaseFromConsumer(slot);
         if (observe &&
@@ -1320,6 +1393,9 @@ public:
         if (error != IntradayInstrumentStoreAppendErrorV1::kNone) {
             store_->MarkCoverageLost();
             store_failed_.store(true, std::memory_order_release);
+            return false;
+        }
+        if (kline_error != KLineAppendErrorV1::kNone) {
             return false;
         }
         return true;
@@ -1343,8 +1419,25 @@ public:
                 store_failed_.store(true, std::memory_order_release);
                 return false;
             }
+            std::shared_ptr<const KLineAggregatorSnapshotV1>
+                kline_snapshot;
+            if (config_.kline.enabled()) {
+                if (worker >= kline_aggregators_.size() ||
+                    kline_aggregators_[worker] == nullptr ||
+                    kline_aggregators_[worker]->Capture(
+                        &kline_snapshot) !=
+                        KLineCaptureErrorV1::kNone ||
+                    kline_snapshot == nullptr) {
+                    kline_failed_.store(
+                        true, std::memory_order_release);
+                    return false;
+                }
+            }
             return ReportSlice(
-                worker, generation, std::move(slice));
+                worker,
+                generation,
+                std::move(slice),
+                std::move(kline_snapshot));
         } catch (...) {
             return false;
         }
@@ -1354,7 +1447,9 @@ public:
         std::uint32_t worker,
         std::uint64_t generation,
         std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>
-            slice) noexcept {
+            slice,
+        std::shared_ptr<const KLineAggregatorSnapshotV1>
+            kline_snapshot) noexcept {
         try {
             {
                 std::lock_guard<std::mutex> lock(generation_mutex_);
@@ -1366,10 +1461,22 @@ public:
                     slice == nullptr ||
                     worker >= pending_->store_worker_slices.size() ||
                     pending_->store_worker_slices[worker] != nullptr ||
+                    (config_.kline.enabled() &&
+                     (worker >=
+                          pending_->kline_worker_snapshots.size() ||
+                      kline_snapshot == nullptr ||
+                      pending_->kline_worker_snapshots[worker] !=
+                          nullptr)) ||
+                    (!config_.kline.enabled() &&
+                     kline_snapshot != nullptr) ||
                     building_generation_ != 0U) {
                     return false;
                 }
                 pending_->store_worker_slices[worker] = std::move(slice);
+                if (config_.kline.enabled()) {
+                    pending_->kline_worker_snapshots[worker] =
+                        std::move(kline_snapshot);
+                }
                 ++pending_->completed_workers;
                 if (pending_->completed_workers != config_.worker_count) {
                     return true;
@@ -1470,14 +1577,34 @@ public:
                 store_->MarkCoverageLost();
                 store_failed_.store(true, std::memory_order_release);
             }
+            std::shared_ptr<const RealtimeKLineGenerationV1>
+                kline_candidate;
+            bool kline_build_failed = false;
+            if (!build_failed && config_.kline.enabled()) {
+                const RealtimeKLineGenerationErrorV1 kline_error =
+                    RealtimeKLineGenerationV1::Build(
+                        candidate,
+                        std::move(
+                            building->kline_worker_snapshots),
+                        config_.worker_count,
+                        &kline_candidate);
+                kline_build_failed =
+                    kline_error !=
+                        RealtimeKLineGenerationErrorV1::kNone ||
+                    kline_candidate == nullptr;
+                if (kline_build_failed) {
+                    kline_failed_.store(
+                        true, std::memory_order_release);
+                }
+            }
 
             std::lock_guard<std::mutex> lock(generation_mutex_);
             if (building_generation_ != generation) {
                 return;
             }
             building_generation_ = 0U;
-            if (build_failed) {
-                MarkFatalLocked(true);
+            if (build_failed || kline_build_failed) {
+                MarkFatalLocked(build_failed);
                 return;
             }
             if (!admission_open_.load(std::memory_order_acquire) ||
@@ -1495,6 +1622,12 @@ public:
             std::atomic_store_explicit(
                 &latest_generation_, candidate,
                 std::memory_order_release);
+            if (config_.kline.enabled()) {
+                std::atomic_store_explicit(
+                    &latest_kline_generation_,
+                    kline_candidate,
+                    std::memory_order_release);
+            }
             generation_cv_.notify_all();
         } catch (...) {
             store_->MarkCoverageLost();
@@ -1618,6 +1751,8 @@ public:
 
     RealtimeHistoryRuntimeConfigV1 config_{};
     std::unique_ptr<IntradayInstrumentStoreV1> store_;
+    std::vector<std::unique_ptr<KLineAggregatorV1>>
+        kline_aggregators_;
     std::vector<std::unique_ptr<SpscQueue<Command>>> queues_;
     std::vector<std::unique_ptr<HistoryHandoffPool>> handoff_pools_;
     std::vector<std::unique_ptr<WorkerSignal>> worker_signals_;
@@ -1628,6 +1763,7 @@ public:
     std::atomic<bool> stopping_{false};
     std::atomic<bool> fatal_{false};
     std::atomic<bool> store_failed_{false};
+    std::atomic<bool> kline_failed_{false};
     std::array<SourceOwnerState, kRealtimeHistorySourceCountV1>
         source_owner_states_{};
 
@@ -1647,6 +1783,8 @@ public:
     std::uint64_t last_started_generation_ = 0U;
     std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
         latest_generation_;
+    std::shared_ptr<const RealtimeKLineGenerationV1>
+        latest_kline_generation_;
 };
 
 RealtimeHistoryRuntimeV1::RealtimeHistoryRuntimeV1(
@@ -1682,6 +1820,23 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
             }
         }
     }
+    if (config.kline.enabled() &&
+        config.kline.maximum_bars == 0U) {
+        const std::uint64_t window_count =
+            static_cast<std::uint64_t>(
+                config.kline.windows.size());
+        if (config.intraday_store.maximum_session_records == 0U ||
+            window_count == 0U ||
+            config.intraday_store.maximum_session_records >
+                std::numeric_limits<std::uint64_t>::max() /
+                    window_count) {
+            return RealtimeHistoryCreateErrorV1::
+                kInvalidConfiguration;
+        }
+        config.kline.maximum_bars =
+            config.intraday_store.maximum_session_records *
+            window_count;
+    }
     try {
         std::unique_ptr<IntradayInstrumentStoreV1> store;
         const IntradayInstrumentStoreCreateErrorV1 error =
@@ -1695,8 +1850,40 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
             store == nullptr) {
             return RealtimeHistoryCreateErrorV1::kStoreCreateFailed;
         }
+        std::vector<std::unique_ptr<KLineAggregatorV1>>
+            kline_aggregators;
+        if (config.kline.enabled()) {
+            std::vector<std::size_t> worker_instrument_counts(
+                config.worker_count, 0U);
+            for (const InstrumentRegistryEntryV1& entry :
+                 config.registry->entries()) {
+                ++worker_instrument_counts[
+                    entry.instrument_id % config.worker_count];
+            }
+            kline_aggregators.reserve(config.worker_count);
+            for (std::uint32_t worker = 0U;
+                 worker < config.worker_count;
+                 ++worker) {
+                KLineAggregatorConfigV1 worker_config =
+                    config.kline;
+                worker_config.instrument_capacity =
+                    worker_instrument_counts[worker];
+                std::unique_ptr<KLineAggregatorV1> aggregator;
+                if (KLineAggregatorV1::Create(
+                        std::move(worker_config), &aggregator) !=
+                        KLineCreateErrorV1::kNone ||
+                    aggregator == nullptr) {
+                    return RealtimeHistoryCreateErrorV1::
+                        kKLineCreateFailed;
+                }
+                kline_aggregators.push_back(
+                    std::move(aggregator));
+            }
+        }
         auto impl = std::make_unique<Impl>(
-            config, std::move(store));
+            config,
+            std::move(store),
+            std::move(kline_aggregators));
         if (!impl->Start()) {
             return RealtimeHistoryCreateErrorV1::kThreadStartFailed;
         }
@@ -1732,15 +1919,25 @@ RealtimeHistoryGenerationErrorV1
 RealtimeHistoryRuntimeV1::WaitForGeneration(
     std::uint64_t generation,
     std::chrono::nanoseconds timeout,
-    std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output)
+    std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output,
+    std::shared_ptr<const RealtimeKLineGenerationV1>* kline_output)
     noexcept {
-    return impl_->Wait(generation, timeout, output);
+    return impl_->Wait(
+        generation, timeout, output, kline_output);
 }
 
 std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
 RealtimeHistoryRuntimeV1::AcquireLatestGeneration() const noexcept {
     return std::atomic_load_explicit(
         &impl_->latest_generation_, std::memory_order_acquire);
+}
+
+std::shared_ptr<const RealtimeKLineGenerationV1>
+RealtimeHistoryRuntimeV1::AcquireLatestKLineGeneration()
+    const noexcept {
+    return std::atomic_load_explicit(
+        &impl_->latest_kline_generation_,
+        std::memory_order_acquire);
 }
 
 IntradayInstrumentStoreSnapshotV1
@@ -1804,6 +2001,13 @@ std::uint32_t RealtimeHistoryRuntimeV1::WorkerForInstrument(
 
 bool RealtimeHistoryRuntimeV1::fatal() const noexcept {
     return impl_->fatal_.load(std::memory_order_acquire);
+}
+
+RealtimeHistoryGenerationErrorV1
+RealtimeHistoryRuntimeV1::FailureError() const noexcept {
+    return impl_->fatal_.load(std::memory_order_acquire)
+               ? impl_->FatalGenerationError()
+               : RealtimeHistoryGenerationErrorV1::kNone;
 }
 
 void RealtimeHistoryRuntimeV1::MarkFatal() noexcept {

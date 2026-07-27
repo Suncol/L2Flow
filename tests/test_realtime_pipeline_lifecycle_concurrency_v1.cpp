@@ -362,18 +362,19 @@ private:
     std::vector<std::byte> bytes_;
 };
 
-std::vector<std::byte> ShenzhenOrderBody() {
-    WireWriter writer(58U);
+std::vector<std::byte> ShenzhenTransactionBody() {
+    WireWriter writer(70U);
     writer.StoreU32(0U, 12U);
     writer.StoreU64(4U, 91U);
-    writer.StoreU64(30U, 123'456U);
-    writer.StoreU64(38U, 201U);
-    writer.StoreU32(46U, 49U);
-    writer.StoreU32(50U, 93'000'123U);
-    writer.StoreU32(54U, 50U);
+    writer.StoreU64(18U, 90U);
+    writer.StoreU64(26U, 0U);
+    writer.StoreU64(46U, 123'456U);
+    writer.StoreU64(54U, 33U);
+    writer.StoreU32(62U, 70U);
+    writer.StoreU32(66U, 93'000'124U);
     writer.StoreString(12U, "010");
-    writer.StoreString(18U, "000001");
-    writer.StoreString(24U, "102 ");
+    writer.StoreString(34U, "000001");
+    writer.StoreString(40U, "102 ");
     return std::move(writer).Take();
 }
 
@@ -381,7 +382,7 @@ class BlockingMessage final : public mdl::MDLMessage {
 public:
     explicit BlockingMessage(std::shared_ptr<OneShotGate> access_gate)
         : access_gate_(std::move(access_gate)),
-          body_(ShenzhenOrderBody()) {
+          body_(ShenzhenTransactionBody()) {
         std::memset(&head_, 0, sizeof(head_));
         head_.HeadSize = static_cast<std::uint8_t>(sdk::kVendorHeadBytes);
         head_.MessageSize = static_cast<std::uint32_t>(
@@ -390,7 +391,7 @@ public:
             static_cast<std::uint8_t>(mdl::MDLEID_BINARY);
         head_.ServiceID = 6U;
         head_.ServiceVersion = 101U;
-        head_.MessageID = 33U;
+        head_.MessageID = 36U;
         head_.LocalTime.m_Value = 93'000'000U;
         head_.SequenceID = 777U;
     }
@@ -460,6 +461,9 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
         16U * 1024U * 1024U;
     config.intraday_store.maximum_records_per_batch = 4U;
     config.intraday_store.coverage_from_open = true;
+    config.kline.windows.push_back(
+        market::KLineWindowSpecV1{
+            1U, market::kKLineNanosecondsPerSecondV1});
     config.enforce_receive_trade_date = false;
     config.sdk.enabled = true;
     config.sdk.server_address = "127.0.0.1:9112";
@@ -596,6 +600,29 @@ int main() {
             terminal.factor_generation->input_store().get() ==
                 terminal.store_generation.get(),
             "factor generation retains the exact terminal store handle");
+        std::unique_ptr<market::KLineCursorV1> kline_cursor;
+        std::array<market::KLineBarV1, 1U> bars{};
+        std::size_t bars_written = 0U;
+        constexpr std::uint64_t k0930StartNs =
+            (9ULL * 60ULL * 60ULL + 30ULL * 60ULL) *
+            market::kKLineNanosecondsPerSecondV1;
+        test.Expect(
+            terminal.kline_generation != nullptr &&
+                terminal.kline_generation->input_store() ==
+                    terminal.store_generation &&
+                terminal.kline_generation->OpenInstrumentCursor(
+                    18U, 1U, &kline_cursor) ==
+                    market::KLineQueryErrorV1::kNone &&
+                kline_cursor != nullptr &&
+                kline_cursor->ReadBatch(bars, &bars_written) ==
+                    market::KLineQueryErrorV1::kNone &&
+                bars_written == 1U &&
+                bars[0U].window_start_ns_since_midnight ==
+                    k0930StartNs &&
+                bars[0U].open_price_p6 == 12'345'600 &&
+                bars[0U].volume_raw == 33U &&
+                bars[0U].trade_count == 1U,
+            "terminal KLine contains the callback admitted before shutdown");
     }
 
     const runtime::RealtimePipelineSnapshotV1 pipeline_snapshot =

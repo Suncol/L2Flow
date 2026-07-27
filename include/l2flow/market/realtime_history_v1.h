@@ -5,6 +5,7 @@
 #include "l2flow/market/intraday_instrument_store_v1.h"
 #include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_types_v1.h"
+#include "l2flow/market/realtime_kline_v1.h"
 
 #include <array>
 #include <chrono>
@@ -278,6 +279,11 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     std::size_t queue_capacity_per_source_worker = 0U;
     const InstrumentRegistryV1* registry = nullptr;
     IntradayInstrumentStoreConfigV1 intraday_store{};
+    // Empty windows disable KLine aggregation. When enabled, trade_date must
+    // be the server/operator date used by the decoder. maximum_bars may be
+    // zero; Create then derives a hard per-worker bound from the retained
+    // history record bound and window count.
+    KLineAggregatorConfigV1 kline{};
     RealtimeHistoryAppendObserverV1 append_observer = nullptr;
     void* append_observer_context = nullptr;
 };
@@ -289,6 +295,7 @@ enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
     kResourceExhausted,
     kThreadStartFailed,
     kStoreCreateFailed,
+    kKLineCreateFailed,
 };
 
 enum class RealtimeHistorySubmitErrorV1 : std::uint8_t {
@@ -314,6 +321,7 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
     kFatal,
     kResourceExhausted,
     kStoreFailed,
+    kKLineFailed,
 };
 
 [[nodiscard]] std::string_view RealtimeHistoryCreateErrorNameV1(
@@ -361,12 +369,16 @@ public:
     [[nodiscard]] RealtimeHistoryGenerationErrorV1 WaitForGeneration(
         std::uint64_t generation,
         std::chrono::nanoseconds timeout,
-        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output)
+        std::shared_ptr<const IntradayInstrumentStoreGenerationV1>* output,
+        std::shared_ptr<const RealtimeKLineGenerationV1>* kline_output =
+            nullptr)
         noexcept;
 
     [[nodiscard]] std::shared_ptr<
         const IntradayInstrumentStoreGenerationV1>
     AcquireLatestGeneration() const noexcept;
+    [[nodiscard]] std::shared_ptr<const RealtimeKLineGenerationV1>
+    AcquireLatestKLineGeneration() const noexcept;
     [[nodiscard]] IntradayInstrumentStoreSnapshotV1
     StoreSnapshot() const noexcept;
     [[nodiscard]] bool IsGenerationCurrentAndHealthy(
@@ -390,6 +402,8 @@ public:
     [[nodiscard]] std::uint32_t WorkerForInstrument(
         std::uint32_t instrument_id) const noexcept;
     [[nodiscard]] bool fatal() const noexcept;
+    [[nodiscard]] RealtimeHistoryGenerationErrorV1 FailureError()
+        const noexcept;
     void MarkFatal() noexcept;
     void StopAndDrain() noexcept;
 

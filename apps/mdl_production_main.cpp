@@ -19,6 +19,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -129,6 +130,8 @@ struct Options final {
     bool intraday_store_from_open = false;
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
+    // Each duration in milliseconds is also its stable public window_id.
+    std::vector<std::uint32_t> kline_windows_ms;
     std::uint32_t generation_interval_ms = 1000U;
     std::uint32_t generation_timeout_ms = 10'000U;
 };
@@ -159,6 +162,9 @@ void PrintUsage(std::ostream& output) {
         << "                                4..16384, default 64\n"
         << "  --intraday-store-batch-records N\n"
         << "                                1..1048576, default 65536\n"
+        << "  --kline-windows-ms LIST        comma-separated 1..86400000 "
+           "ms windows;\n"
+        << "                                duration-ms is the window id\n"
         << "  --generation-interval-ms N    1..60000, default 1000\n"
         << "  --generation-timeout-ms N     1..600000, default 10000\n"
         << "  --help\n\n"
@@ -193,6 +199,51 @@ bool ParseU64(std::string_view text, std::uint64_t* output) noexcept {
         return false;
     }
     *output = value;
+    return true;
+}
+
+bool ParseKLineWindows(
+    std::string_view text,
+    std::vector<std::uint32_t>* output,
+    std::string* error) {
+    if (output == nullptr || error == nullptr || text.empty()) {
+        return false;
+    }
+    std::vector<std::uint32_t> parsed;
+    std::size_t begin = 0U;
+    while (begin < text.size()) {
+        const std::size_t comma = text.find(',', begin);
+        const std::size_t end =
+            comma == std::string_view::npos ? text.size() : comma;
+        std::uint32_t duration_ms = 0U;
+        if (end == begin ||
+            !ParseU32(
+                text.substr(begin, end - begin), &duration_ms) ||
+            duration_ms == 0U || duration_ms > 86'400'000U ||
+            std::find(
+                parsed.begin(), parsed.end(), duration_ms) !=
+                parsed.end()) {
+            *error =
+                "--kline-windows-ms requires unique comma-separated "
+                "durations in 1..86400000";
+            return false;
+        }
+        parsed.push_back(duration_ms);
+        if (parsed.size() > market::kKLineMaximumWindowsV1) {
+            *error = "--kline-windows-ms accepts at most 32 windows";
+            return false;
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        if (comma + 1U == text.size()) {
+            *error =
+                "--kline-windows-ms must not end with a comma";
+            return false;
+        }
+        begin = comma + 1U;
+    }
+    *output = std::move(parsed);
     return true;
 }
 
@@ -271,6 +322,7 @@ bool ParseOptions(
             option != "--intraday-store-memory-gib" &&
             option != "--intraday-store-segment-kib" &&
             option != "--intraday-store-batch-records" &&
+            option != "--kline-windows-ms" &&
             option != "--generation-interval-ms" &&
             option != "--generation-timeout-ms") {
             *error = "unknown option: " + std::string(option);
@@ -360,6 +412,11 @@ bool ParseOptions(
                         kIntradayInstrumentStoreMaximumBatchRecordsV1) {
                 *error =
                     "--intraday-store-batch-records must be 1..1048576";
+                return false;
+            }
+        } else if (option == "--kline-windows-ms") {
+            if (!ParseKLineWindows(
+                    value, &parsed.kline_windows_ms, error)) {
                 return false;
             }
         } else {
@@ -487,6 +544,16 @@ int Run(const Options& options) {
         static_cast<std::size_t>(options.intraday_store_batch_records);
     config.intraday_store.coverage_from_open =
         options.intraday_store_from_open;
+    config.kline.windows.reserve(options.kline_windows_ms.size());
+    for (const std::uint32_t duration_ms :
+         options.kline_windows_ms) {
+        market::KLineWindowSpecV1 window{};
+        window.window_id = duration_ms;
+        window.duration_ns =
+            static_cast<std::uint64_t>(duration_ms) *
+            market::kKLineNanosecondsPerMillisecondV1;
+        config.kline.windows.push_back(window);
+    }
     config.enforce_receive_trade_date = true;
     config.wal.enabled = !options.wal_path.empty();
     config.wal.path = options.wal_path.string();
@@ -612,6 +679,8 @@ int Run(const Options& options) {
     report_wal_coverage();
     const market::IntradayInstrumentStoreSnapshotV1 final_store =
         pipeline->Snapshot().store;
+    const std::shared_ptr<const market::RealtimeKLineGenerationV1>
+        final_kline = pipeline->AcquireLatestKLineGeneration();
     std::cerr
         << "mdl-production-router: intraday store final: records="
         << final_store.appended_records
@@ -622,7 +691,10 @@ int Run(const Options& options) {
         << " coverage_from_open="
         << (final_store.coverage_from_open ? "true" : "false")
         << " coverage_lost="
-        << (final_store.coverage_lost ? "true" : "false") << '\n';
+        << (final_store.coverage_lost ? "true" : "false")
+        << " kline_bars="
+        << (final_kline == nullptr ? 0U : final_kline->bar_count())
+        << '\n';
     if (pipeline->fatal()) {
         exit_code = 1;
     }

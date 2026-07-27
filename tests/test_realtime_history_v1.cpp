@@ -104,6 +104,80 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
         1U, ingress_sequence, std::move(decoded));
 }
 
+constexpr std::int64_t kTradeDateMidnightUnixNs =
+    1'784'822'400'000'000'000LL;
+
+constexpr std::uint64_t TimeSinceMidnightNs(
+    std::uint32_t hour,
+    std::uint32_t minute,
+    std::uint32_t second,
+    std::uint32_t millisecond) {
+    return (((static_cast<std::uint64_t>(hour) * 60U + minute) * 60U +
+             second) *
+                market::kKLineNanosecondsPerSecondV1) +
+           static_cast<std::uint64_t>(millisecond) *
+               market::kKLineNanosecondsPerMillisecondV1;
+}
+
+std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
+    const market::InstrumentRegistryV1& registry,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint32_t instrument_id,
+    std::uint32_t raw_exchange_time,
+    std::uint64_t exchange_time_ns_since_midnight,
+    std::int64_t price_p6,
+    std::int64_t quantity,
+    std::int64_t recv_realtime_ns,
+    std::int64_t recv_monotonic_ns) {
+    market::ShanghaiTickV1 tick{};
+    tick.common.kind = market::MarketEventKindV1::kShanghaiTick;
+    tick.common.market = market::MarketV1::kShanghai;
+    tick.common.origin.source_stream_id = 12U;
+    tick.common.origin.trade_date = 20260724U;
+    tick.common.origin.source_sequence = source_sequence;
+    tick.common.origin.recv_realtime_ns = recv_realtime_ns;
+    tick.common.origin.recv_monotonic_ns = recv_monotonic_ns;
+    tick.common.instrument_id = instrument_id;
+    const auto lookup = registry.LookupById(instrument_id);
+    if (!lookup.known() ||
+        exchange_time_ns_since_midnight >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max()) ||
+        exchange_time_ns_since_midnight >=
+            market::kKLineNanosecondsPerDayV1) {
+        return std::nullopt;
+    }
+    tick.common.registry_ordinal = lookup.registry_ordinal;
+    tick.common.quantity_unit = lookup.quantity_unit;
+    tick.common.security_type = lookup.security_type;
+    tick.common.asset_scope = lookup.asset_scope;
+    tick.common.exchange_time.raw_hhmmssmmm = raw_exchange_time;
+    tick.common.exchange_time.nanoseconds_since_midnight =
+        exchange_time_ns_since_midnight;
+    tick.common.exchange_time.unix_nanoseconds =
+        kTradeDateMidnightUnixNs +
+        static_cast<std::int64_t>(exchange_time_ns_since_midnight);
+    tick.common.exchange_time.valid = true;
+    tick.common.exchange_time.unix_nanoseconds_valid = true;
+    tick.fields.action = market::TickActionV1::kTrade;
+    tick.fields.price.valid = true;
+    tick.fields.price.raw = price_p6;
+    tick.fields.price.normalized_p6 = price_p6;
+    tick.fields.price.scale = 6U;
+    tick.fields.quantity.valid = true;
+    tick.fields.quantity.raw = quantity;
+    tick.fields.quantity.scale = 0U;
+    tick.fields.validity_bitmap =
+        market::kTickPriceValidV1 |
+        market::kTickQuantityValidV1 |
+        market::kTickExchangeTimeValidV1;
+
+    market::DecodedMarketEventV1 decoded(std::move(tick));
+    return market::RealtimeHistoryEventInputV1::Create(
+        1U, ingress_sequence, std::move(decoded));
+}
+
 market::RealtimeHistorySubmitErrorV1 Submit(
     market::RealtimeHistoryRuntimeV1* runtime,
     std::optional<market::RealtimeHistoryEventInputV1> input) {
@@ -188,6 +262,49 @@ std::vector<std::uint64_t> TailIngressSequences(
             return result;
         }
     }
+}
+
+std::vector<market::KLineBarV1> ReadKLines(
+    const market::RealtimeKLineGenerationV1& generation,
+    std::uint32_t instrument_id,
+    std::uint32_t window_id,
+    bool* ok) {
+    std::unique_ptr<market::KLineCursorV1> cursor;
+    *ok &= Expect(
+        generation.OpenInstrumentCursor(
+            instrument_id, window_id, &cursor) ==
+                market::KLineQueryErrorV1::kNone &&
+            cursor != nullptr,
+        "open KLine instrument/window cursor");
+    if (cursor == nullptr) {
+        return {};
+    }
+
+    std::vector<market::KLineBarV1> result;
+    std::array<market::KLineBarV1, 2U> batch{};
+    for (;;) {
+        std::size_t written = 0U;
+        const auto error = cursor->ReadBatch(batch, &written);
+        *ok &= Expect(
+            error == market::KLineQueryErrorV1::kNone,
+            "read KLine cursor batch");
+        if (error != market::KLineQueryErrorV1::kNone) {
+            return result;
+        }
+        result.insert(
+            result.end(), batch.begin(), batch.begin() + written);
+        if (written == 0U) {
+            *ok &= Expect(cursor->done(), "KLine cursor reaches end");
+            break;
+        }
+    }
+    for (std::size_t index = 1U; index < result.size(); ++index) {
+        *ok &= Expect(
+            result[index - 1U].window_start_ns_since_midnight <
+                result[index].window_start_ns_since_midnight,
+            "KLine cursor is strictly ascending by window start");
+    }
+    return result;
 }
 
 bool Expect(bool condition, std::string_view message) {
@@ -396,5 +513,331 @@ int main() {
                  "only latest complete generation is current");
 
     runtime->StopAndDrain();
+
+    // A separate runtime exercises event-time KLine aggregation without
+    // changing any of the store-only generation assertions above.
+    market::RealtimeHistoryRuntimeConfigV1 kline_config{};
+    kline_config.source_stream_ids = {11U, 12U, 13U, 14U};
+    kline_config.worker_count = 2U;
+    kline_config.queue_capacity_per_source_worker = 32U;
+    kline_config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    kline_config.intraday_store.maximum_session_records = 16U;
+    kline_config.intraday_store.maximum_session_accounted_bytes =
+        1U << 20U;
+    kline_config.intraday_store.maximum_records_per_batch = 4U;
+    kline_config.intraday_store.coverage_from_open = true;
+    kline_config.kline.trade_date = 20260724U;
+    kline_config.kline.windows = {
+        {1U, market::kKLineNanosecondsPerSecondV1},
+        {2U, 5U * market::kKLineNanosecondsPerSecondV1},
+    };
+    // Leave maximum_bars at zero so history derives the bounded capacity
+    // from its retained-record limit and the two configured windows.
+    kline_config.registry = registry.get();
+
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> kline_runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            kline_config, &kline_runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            kline_runtime != nullptr,
+        "KLine history runtime creation");
+    if (kline_runtime == nullptr) {
+        return 1;
+    }
+
+    constexpr std::uint64_t k093000100 =
+        TimeSinceMidnightNs(9U, 30U, 0U, 100U);
+    constexpr std::uint64_t k093000500 =
+        TimeSinceMidnightNs(9U, 30U, 0U, 500U);
+    constexpr std::uint64_t k093000800 =
+        TimeSinceMidnightNs(9U, 30U, 0U, 800U);
+    constexpr std::uint64_t k093000999 =
+        TimeSinceMidnightNs(9U, 30U, 0U, 999U);
+    constexpr std::uint64_t k093001000 =
+        TimeSinceMidnightNs(9U, 30U, 1U, 0U);
+    constexpr std::uint64_t k145959900 =
+        TimeSinceMidnightNs(14U, 59U, 59U, 900U);
+    constexpr std::uint64_t k093000Window =
+        TimeSinceMidnightNs(9U, 30U, 0U, 0U);
+    constexpr std::uint64_t k093001Window =
+        TimeSinceMidnightNs(9U, 30U, 1U, 0U);
+    constexpr std::uint64_t k145955Window =
+        TimeSinceMidnightNs(14U, 59U, 55U, 0U);
+    constexpr std::uint64_t k145959Window =
+        TimeSinceMidnightNs(14U, 59U, 59U, 0U);
+
+    const auto kline_generation1_watermark =
+        MakeWatermark(*registry, 1U, 6U, 1U, 6U);
+    ok &= Expect(
+        kline_runtime->BeginGeneration(
+            kline_generation1_watermark) ==
+            market::RealtimeHistoryGenerationErrorV1::kNone,
+        "begin KLine generation 1");
+
+    struct TradeInput final {
+        std::uint32_t raw_exchange_time;
+        std::uint64_t exchange_time_ns_since_midnight;
+        std::int64_t price_p6;
+        std::int64_t quantity;
+        std::int64_t recv_realtime_ns;
+    };
+    const std::array<TradeInput, 5U> generation1_trades{{
+        {93'000'800U,
+         k093000800,
+         10'000'000,
+         2,
+         kTradeDateMidnightUnixNs + 15LL * 60LL * 60LL *
+             static_cast<std::int64_t>(
+                 market::kKLineNanosecondsPerSecondV1)},
+        {93'000'500U,
+         k093000500,
+         12'000'000,
+         3,
+         kTradeDateMidnightUnixNs + 8LL * 60LL * 60LL *
+             static_cast<std::int64_t>(
+                 market::kKLineNanosecondsPerSecondV1)},
+        {93'000'999U,
+         k093000999,
+         11'000'000,
+         4,
+         kTradeDateMidnightUnixNs + 20LL * 60LL * 60LL *
+             static_cast<std::int64_t>(
+                 market::kKLineNanosecondsPerSecondV1)},
+        {93'001'000U,
+         k093001000,
+         8'000'000,
+         5,
+         kTradeDateMidnightUnixNs + 1LL * 60LL * 60LL *
+             static_cast<std::int64_t>(
+                 market::kKLineNanosecondsPerSecondV1)},
+        {145'959'900U,
+         k145959900,
+         13'000'000,
+         6,
+         kTradeDateMidnightUnixNs + 9LL * 60LL * 60LL *
+             static_cast<std::int64_t>(
+                 market::kKLineNanosecondsPerSecondV1)},
+    }};
+    for (std::size_t index = 0U;
+         index < generation1_trades.size();
+         ++index) {
+        const TradeInput& trade = generation1_trades[index];
+        const std::uint64_t sequence =
+            static_cast<std::uint64_t>(index) + 1U;
+        ok &= Expect(
+            Submit(
+                kline_runtime.get(),
+                MakeKLineTradeRecord(
+                    *registry,
+                    sequence,
+                    sequence,
+                    1U,
+                    trade.raw_exchange_time,
+                    trade.exchange_time_ns_since_midnight,
+                    trade.price_p6,
+                    trade.quantity,
+                    trade.recv_realtime_ns,
+                    static_cast<std::int64_t>(sequence))) ==
+                market::RealtimeHistorySubmitErrorV1::kNone,
+            "submit generation-1 KLine trade");
+    }
+
+    // This source's next record is admitted after its generation-1 fence.
+    // Its earlier exchange timestamp must revise generation 2 only.
+    ok &= Expect(
+        kline_runtime->SealSource(1U, 1U) ==
+            market::RealtimeHistoryGenerationErrorV1::kNone,
+        "seal KLine trade source for generation 1");
+    ok &= Expect(
+        Submit(
+            kline_runtime.get(),
+            MakeKLineTradeRecord(
+                *registry,
+                6U,
+                6U,
+                1U,
+                93'000'100U,
+                k093000100,
+                9'000'000,
+                1,
+                kTradeDateMidnightUnixNs + 23LL * 60LL * 60LL *
+                    static_cast<std::int64_t>(
+                        market::kKLineNanosecondsPerSecondV1),
+                6)) ==
+            market::RealtimeHistorySubmitErrorV1::kNone,
+        "submit post-fence late KLine trade");
+    constexpr std::array<std::uint8_t, 3U> kIdleSources{
+        0U, 2U, 3U};
+    for (std::uint8_t source : kIdleSources) {
+        ok &= Expect(
+            kline_runtime->SealSource(source, 1U) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "seal idle KLine source for generation 1");
+    }
+
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        kline_store1;
+    std::shared_ptr<const market::RealtimeKLineGenerationV1>
+        kline_generation1;
+    ok &= Expect(
+        kline_runtime->WaitForGeneration(
+            1U,
+            std::chrono::seconds(2),
+            &kline_store1,
+            &kline_generation1) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone &&
+            kline_store1 != nullptr &&
+            kline_generation1 != nullptr,
+        "wait KLine generation 1");
+
+    std::vector<market::KLineBarV1> first_1s;
+    std::vector<market::KLineBarV1> first_5s;
+    if (kline_generation1 != nullptr) {
+        ok &= Expect(
+            kline_generation1->coverage_from_open() &&
+                kline_generation1->input_store().get() ==
+                    kline_store1.get() &&
+                kline_generation1->bar_count() == 5U,
+            "KLine generation 1 retains the complete from-open store prefix");
+        first_1s =
+            ReadKLines(*kline_generation1, 1U, 1U, &ok);
+        first_5s =
+            ReadKLines(*kline_generation1, 1U, 2U, &ok);
+        ok &= Expect(
+            first_1s.size() == 3U &&
+                first_1s[0U].window_start_ns_since_midnight ==
+                    k093000Window &&
+                first_1s[0U].open_price_p6 == 12'000'000 &&
+                first_1s[0U].high_price_p6 == 12'000'000 &&
+                first_1s[0U].low_price_p6 == 10'000'000 &&
+                first_1s[0U].close_price_p6 == 11'000'000 &&
+                first_1s[0U].volume_raw == 9U &&
+                first_1s[0U].trade_count == 3U &&
+                first_1s[0U].revision == 3U &&
+                first_1s[0U].first_trade
+                        .event_time_ns_since_midnight ==
+                    k093000500 &&
+                first_1s[0U].last_trade
+                        .event_time_ns_since_midnight ==
+                    k093000999 &&
+                first_1s[1U].window_start_ns_since_midnight ==
+                    k093001Window &&
+                first_1s[1U].open_price_p6 == 8'000'000 &&
+                first_1s[1U].volume_raw == 5U &&
+                first_1s[1U].trade_count == 1U &&
+                first_1s[2U].window_start_ns_since_midnight ==
+                    k145959Window &&
+                first_1s[2U].open_price_p6 == 13'000'000 &&
+                first_1s[2U].volume_raw == 6U &&
+                first_1s[2U].trade_count == 1U,
+            "1-second KLines use exchange time for OHLC and expose the full day");
+        ok &= Expect(
+            first_5s.size() == 2U &&
+                first_5s[0U].window_start_ns_since_midnight ==
+                    k093000Window &&
+                first_5s[0U].open_price_p6 == 12'000'000 &&
+                first_5s[0U].high_price_p6 == 12'000'000 &&
+                first_5s[0U].low_price_p6 == 8'000'000 &&
+                first_5s[0U].close_price_p6 == 8'000'000 &&
+                first_5s[0U].volume_raw == 14U &&
+                first_5s[0U].trade_count == 4U &&
+                first_5s[0U].revision == 4U &&
+                first_5s[1U].window_start_ns_since_midnight ==
+                    k145955Window &&
+                first_5s[1U].open_price_p6 == 13'000'000 &&
+                first_5s[1U].volume_raw == 6U &&
+                first_5s[1U].trade_count == 1U,
+            "5-second KLines aggregate the same trades in a second window");
+    }
+
+    const auto kline_generation2_watermark =
+        MakeWatermark(*registry, 2U, 7U, 1U, 7U);
+    ok &= Expect(
+        kline_runtime->BeginGeneration(
+            kline_generation2_watermark) ==
+            market::RealtimeHistoryGenerationErrorV1::kNone,
+        "begin KLine generation 2");
+    for (std::uint8_t source = 0U; source < 4U; ++source) {
+        ok &= Expect(
+            kline_runtime->SealSource(source, 2U) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "seal source for KLine generation 2");
+    }
+
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        kline_store2;
+    std::shared_ptr<const market::RealtimeKLineGenerationV1>
+        kline_generation2;
+    ok &= Expect(
+        kline_runtime->WaitForGeneration(
+            2U,
+            std::chrono::seconds(2),
+            &kline_store2,
+            &kline_generation2) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone &&
+            kline_store2 != nullptr &&
+            kline_generation2 != nullptr,
+        "wait KLine generation 2");
+    if (kline_generation2 != nullptr) {
+        const std::vector<market::KLineBarV1> second_1s =
+            ReadKLines(*kline_generation2, 1U, 1U, &ok);
+        const std::vector<market::KLineBarV1> second_5s =
+            ReadKLines(*kline_generation2, 1U, 2U, &ok);
+        ok &= Expect(
+            kline_generation2->coverage_from_open() &&
+                kline_generation2->input_store().get() ==
+                    kline_store2.get() &&
+                kline_generation2->bar_count() == 5U &&
+                second_1s.size() == 3U &&
+                second_1s[0U].open_price_p6 == 9'000'000 &&
+                second_1s[0U].high_price_p6 == 12'000'000 &&
+                second_1s[0U].low_price_p6 == 9'000'000 &&
+                second_1s[0U].close_price_p6 == 11'000'000 &&
+                second_1s[0U].volume_raw == 10U &&
+                second_1s[0U].trade_count == 4U &&
+                second_1s[0U].revision == 4U &&
+                second_1s[0U].first_trade
+                        .event_time_ns_since_midnight ==
+                    k093000100 &&
+                second_5s.size() == 2U &&
+                second_5s[0U].open_price_p6 == 9'000'000 &&
+                second_5s[0U].high_price_p6 == 12'000'000 &&
+                second_5s[0U].low_price_p6 == 8'000'000 &&
+                second_5s[0U].close_price_p6 == 8'000'000 &&
+                second_5s[0U].volume_raw == 15U &&
+                second_5s[0U].trade_count == 5U &&
+                second_5s[0U].revision == 5U,
+            "late exchange-time trade revises both windows in generation 2");
+        ok &= Expect(
+            kline_runtime->AcquireLatestKLineGeneration().get() ==
+                kline_generation2.get(),
+            "latest KLine generation is atomically published");
+    }
+
+    if (kline_generation1 != nullptr) {
+        const std::vector<market::KLineBarV1> old_1s =
+            ReadKLines(*kline_generation1, 1U, 1U, &ok);
+        const std::vector<market::KLineBarV1> old_5s =
+            ReadKLines(*kline_generation1, 1U, 2U, &ok);
+        ok &= Expect(
+            old_1s.size() == 3U &&
+                old_1s[0U].open_price_p6 == 12'000'000 &&
+                old_1s[0U].low_price_p6 == 10'000'000 &&
+                old_1s[0U].volume_raw == 9U &&
+                old_1s[0U].trade_count == 3U &&
+                old_1s[0U].revision == 3U &&
+                old_5s.size() == 2U &&
+                old_5s[0U].open_price_p6 == 12'000'000 &&
+                old_5s[0U].volume_raw == 14U &&
+                old_5s[0U].trade_count == 4U &&
+                old_5s[0U].revision == 4U,
+            "older KLine generation remains immutable after late revision");
+    }
+
+    kline_runtime->StopAndDrain();
     return ok ? 0 : 1;
 }

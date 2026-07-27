@@ -11,6 +11,7 @@ operator-selected Vendor SDK shared library
        `-> source decoder
             -> instrument_id % worker_count router
             -> mandatory complete intraday instrument store
+            -> optional event-time multi-window KLine aggregation
             -> generation barrier and ingress-prefix watermark
             -> full-universe factor calculation
             -> one atomic factor-generation publication
@@ -373,6 +374,7 @@ into a production target.
   --intraday-store-max-records 1000000000 \
   --intraday-store-memory-gib 600 \
   --intraday-store-from-open \
+  --kline-windows-ms 1000,5000 \
   --generation-interval-ms 1000 \
   --generation-timeout-ms 10000 \
   --wal-path /var/lib/l2flow/audit.wal
@@ -381,6 +383,23 @@ into a production target.
 `--replace-wal` is required to truncate an existing WAL path. Without it, an
 existing path is refused by the optional WAL sink and reported as audit
 coverage loss while realtime publication continues.
+
+`--kline-windows-ms` enables one or more exchange-event-time windows. The
+duration in milliseconds is also the public `window_id` (for example, `1000`
+is the one-second window). Empty bars are not synthesized. Each immutable
+`RealtimeKLineGenerationV1` exposes all bars for an instrument/window through
+`OpenInstrumentCursor`; `coverage_from_open()` is true only when the matching
+store has continuous from-open coverage. The KLine generation retains that
+exact store generation, so consumers should acquire the KLine handle and use
+`input_store()` rather than combining two independently acquired latest
+handles.
+
+Bucket selection and OHLC open/close ordering use the decoded message's
+exchange timestamp. Callback receive clocks, SDK `LocalTime`, and the local
+server's seconds do not participate. The configured process `trade_date`
+provides the calendar date; a later-arriving or out-of-order trade revises the
+appropriate bar in the next published generation without mutating older
+generations.
 
 The process exits nonzero on a fatal decode, routing, store, barrier, factor,
 or SDK lifecycle error. A clean signal or civil-date boundary attempts one

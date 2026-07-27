@@ -212,6 +212,27 @@ std::vector<std::byte> ShenzhenTransactionBody(
     return std::move(writer).Take();
 }
 
+std::vector<std::byte> ShanghaiTradeBody(
+    std::uint64_t business_index) {
+    // Frozen wire ABI for sh::NGTSTick. This test deliberately constructs a
+    // trade rather than relying on a decoded object, so exchange-time bucket
+    // selection is exercised through the complete SDK ingress path.
+    constexpr std::size_t fixed_bytes = 70U;
+    WireWriter writer(fixed_bytes);
+    writer.StoreU64(0U, business_index);
+    writer.StoreU32(8U, 7U);
+    writer.StoreU32(18U, 93'000'125U);
+    writer.StoreU64(28U, 11'001U);
+    writer.StoreU64(36U, 22'002U);
+    writer.StoreU32(44U, 12'345U);
+    writer.StoreU64(48U, 41U);
+    writer.StoreU64(56U, 506'145U);
+    writer.StoreString(12U, "600007");
+    writer.StoreString(22U, "T");
+    writer.StoreString(64U, "B");
+    return std::move(writer).Take();
+}
+
 std::vector<std::byte> ShenzhenSnapshotBody(
     std::int64_t normalized_last_price_p6) {
     constexpr std::size_t fixed_bytes = 224U;
@@ -233,7 +254,10 @@ std::vector<std::byte> ShenzhenSnapshotBody(
 
 class FakeMessage final : public mdl::MDLMessage {
 public:
-    FakeMessage(sdk::MessageKey key, std::vector<std::byte> body)
+    FakeMessage(
+        sdk::MessageKey key,
+        std::vector<std::byte> body,
+        std::uint32_t sdk_local_time = 93'000'000U)
         : body_(std::move(body)) {
         std::memset(&head_, 0, sizeof(head_));
         head_.HeadSize =
@@ -245,7 +269,7 @@ public:
         head_.ServiceID = key.service_id;
         head_.ServiceVersion = key.service_version;
         head_.MessageID = key.message_id;
-        head_.LocalTime.m_Value = 93'000'000U;
+        head_.LocalTime.m_Value = sdk_local_time;
         head_.SequenceID = 9988U;
     }
 
@@ -814,6 +838,137 @@ int main() {
                 !store_snapshot.coverage_lost,
             "pipeline snapshot reports healthy from-open store coverage");
         snapshot_pipeline->StopAndDrain();
+    }
+
+    // KLine aggregation is driven exclusively by the exchange timestamp in
+    // each decoded trade. SDK LocalTime is deliberately 14:59 for all three
+    // messages while their exchange timestamps are in the 09:30:00 window.
+    auto kline_state = std::make_shared<PhysicalSdkState>();
+    std::unique_ptr<runtime::RealtimePipelineV1> kline_pipeline;
+    runtime::RealtimePipelineConfigV1 kline_config =
+        MakeConfig(registry.get());
+    kline_config.kline.windows.push_back(
+        market::KLineWindowSpecV1{
+            1U, market::kKLineNanosecondsPerSecondV1});
+    kline_config.kline.maximum_bars = 16U;
+    kline_config.kline.bars_per_chunk = 4U;
+    kline_config.kline.maximum_bars_per_read = 8U;
+    detail.clear();
+    test.Expect(
+        runtime::RealtimePipelineV1::CreateForTest(
+            std::move(kline_config),
+            std::make_shared<FakeFactory>(kline_state),
+            &kline_pipeline,
+            &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&
+            kline_pipeline != nullptr,
+        "event-time KLine pipeline creation: " + detail);
+    if (kline_pipeline != nullptr) {
+        constexpr std::uint32_t kWrongSdkLocalTime = 145'900'000U;
+        FakeMessage sh_trade(
+            sdk::MessageKey{4U, 101U, 24U},
+            ShanghaiTradeBody(50'001U),
+            kWrongSdkLocalTime);
+        FakeMessage sz_order(
+            sdk::MessageKey{6U, 101U, 33U},
+            ShenzhenOrderBody(50'002U),
+            kWrongSdkLocalTime);
+        FakeMessage sz_trade(
+            sdk::MessageKey{6U, 101U, 36U},
+            ShenzhenTransactionBody(50'003U),
+            kWrongSdkLocalTime);
+        kline_state->handler->OnMessage(nullptr, &sh_trade);
+        kline_state->handler->OnMessage(nullptr, &sz_order);
+        kline_state->handler->OnMessage(nullptr, &sz_trade);
+
+        const runtime::RealtimePipelineCutResultV1 kline_cut =
+            kline_pipeline->CutAndPublishGeneration(2s);
+        const auto acquired_kline =
+            kline_pipeline->AcquireLatestKLineGeneration();
+        const bool matching_store_owner =
+            kline_cut.kline_generation != nullptr &&
+            kline_cut.store_generation != nullptr &&
+            kline_cut.kline_generation->input_store().get() ==
+                kline_cut.store_generation.get() &&
+            !kline_cut.kline_generation->input_store().owner_before(
+                kline_cut.store_generation) &&
+            !kline_cut.store_generation.owner_before(
+                kline_cut.kline_generation->input_store());
+        test.Expect(
+            kline_cut.published() && kline_cut.kline_enabled &&
+                kline_cut.kline_generation != nullptr &&
+                kline_cut.kline_generation->bar_count() == 2U &&
+                matching_store_owner &&
+                acquired_kline == kline_cut.kline_generation,
+            "cut atomically publishes two trade bars with the exact store "
+            "owner and latest KLine handle");
+
+        constexpr std::uint64_t k0930StartNs =
+            (9ULL * 60ULL * 60ULL + 30ULL * 60ULL) *
+            market::kKLineNanosecondsPerSecondV1;
+        std::unique_ptr<market::KLineCursorV1> sh_cursor;
+        std::unique_ptr<market::KLineCursorV1> sz_cursor;
+        std::array<market::KLineBarV1, 2U> sh_bars{};
+        std::array<market::KLineBarV1, 2U> sz_bars{};
+        std::size_t sh_written = 0U;
+        std::size_t sz_written = 0U;
+        const bool sh_query_ok =
+            kline_cut.kline_generation != nullptr &&
+            kline_cut.kline_generation->OpenInstrumentCursor(
+                7U, 1U, &sh_cursor) ==
+                market::KLineQueryErrorV1::kNone &&
+            sh_cursor != nullptr &&
+            sh_cursor->ReadBatch(sh_bars, &sh_written) ==
+                market::KLineQueryErrorV1::kNone &&
+            sh_written == 1U;
+        const bool sz_query_ok =
+            kline_cut.kline_generation != nullptr &&
+            kline_cut.kline_generation->OpenInstrumentCursor(
+                18U, 1U, &sz_cursor) ==
+                market::KLineQueryErrorV1::kNone &&
+            sz_cursor != nullptr &&
+            sz_cursor->ReadBatch(sz_bars, &sz_written) ==
+                market::KLineQueryErrorV1::kNone &&
+            sz_written == 1U;
+        test.Expect(
+            sh_query_ok &&
+                sh_bars[0U].window_id == 1U &&
+                sh_bars[0U].window_duration_ns ==
+                    market::kKLineNanosecondsPerSecondV1 &&
+                sh_bars[0U].window_start_ns_since_midnight ==
+                    k0930StartNs &&
+                sh_bars[0U].window_end_ns_since_midnight ==
+                    k0930StartNs +
+                        market::kKLineNanosecondsPerSecondV1 &&
+                sh_bars[0U].open_price_p6 == 12'345'000 &&
+                sh_bars[0U].high_price_p6 == 12'345'000 &&
+                sh_bars[0U].low_price_p6 == 12'345'000 &&
+                sh_bars[0U].close_price_p6 == 12'345'000 &&
+                sh_bars[0U].volume_raw == 41U &&
+                sh_bars[0U].volume_scale == 0U &&
+                sh_bars[0U].quantity_unit ==
+                    market::QuantityUnitV1::kShare &&
+                sh_bars[0U].trade_count == 1U,
+            "Shanghai Type=T forms the exact 09:30 event-time bar despite "
+            "14:59 SDK LocalTime");
+        test.Expect(
+            sz_query_ok &&
+                sz_bars[0U].window_start_ns_since_midnight ==
+                    k0930StartNs &&
+                sz_bars[0U].window_end_ns_since_midnight ==
+                    k0930StartNs +
+                        market::kKLineNanosecondsPerSecondV1 &&
+                sz_bars[0U].open_price_p6 == 12'345'600 &&
+                sz_bars[0U].high_price_p6 == 12'345'600 &&
+                sz_bars[0U].low_price_p6 == 12'345'600 &&
+                sz_bars[0U].close_price_p6 == 12'345'600 &&
+                sz_bars[0U].volume_raw == 33U &&
+                sz_bars[0U].volume_scale == 0U &&
+                sz_bars[0U].quantity_unit ==
+                    market::QuantityUnitV1::kShare &&
+                sz_bars[0U].trade_count == 1U,
+            "Shenzhen ExecType=70 forms one bar while the preceding order "
+            "does not aggregate");
+        kline_pipeline->StopAndDrain();
     }
 
     auto store_failure_state = std::make_shared<PhysicalSdkState>();
