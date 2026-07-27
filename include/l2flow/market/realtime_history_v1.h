@@ -6,6 +6,7 @@
 #include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_types_v1.h"
 #include "l2flow/market/realtime_kline_v1.h"
+#include "l2flow/market/realtime_latest_read_model_v1.h"
 
 #include <array>
 #include <chrono>
@@ -296,6 +297,7 @@ enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
     kThreadStartFailed,
     kStoreCreateFailed,
     kKLineCreateFailed,
+    kLatestReadModelCreateFailed,
 };
 
 enum class RealtimeHistorySubmitErrorV1 : std::uint8_t {
@@ -379,6 +381,23 @@ public:
     AcquireLatestGeneration() const noexcept;
     [[nodiscard]] std::shared_ptr<const RealtimeKLineGenerationV1>
     AcquireLatestKLineGeneration() const noexcept;
+    // Allocation-free live point reads. A returned record is the latest
+    // successfully applied record for that instrument and category, ordered
+    // by process ingress_sequence. Batch reads preserve input order but are
+    // per-instrument observations, not one cross-instrument generation.
+    // Borrowed record pointers remain valid only while this runtime lives.
+    [[nodiscard]] RealtimeLatestQueryErrorV1 GetLatestSnapshot(
+        std::uint32_t instrument_id,
+        RealtimeLatestRecordViewV1* output) const noexcept;
+    [[nodiscard]] RealtimeLatestQueryErrorV1 GetLatestSnapshots(
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<RealtimeLatestRecordViewV1> output) const noexcept;
+    [[nodiscard]] RealtimeLatestQueryErrorV1 GetLatestTick(
+        std::uint32_t instrument_id,
+        RealtimeLatestRecordViewV1* output) const noexcept;
+    [[nodiscard]] RealtimeLatestQueryErrorV1 GetLatestTicks(
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<RealtimeLatestRecordViewV1> output) const noexcept;
     [[nodiscard]] IntradayInstrumentStoreSnapshotV1
     StoreSnapshot() const noexcept;
     [[nodiscard]] bool IsGenerationCurrentAndHealthy(

@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -397,6 +398,65 @@ int main() {
             MakeTickRecord(*registry, 1U, 1U, 1U, 900'001)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit earlier cross-source tick after later snapshot");
+
+    market::RealtimeLatestRecordViewV1 live_snapshot{};
+    market::RealtimeLatestRecordViewV1 live_snapshot_other_worker{};
+    market::RealtimeLatestRecordViewV1 live_tick{};
+    const auto live_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        const bool snapshot_ready =
+            runtime->GetLatestSnapshot(1U, &live_snapshot) ==
+                market::RealtimeLatestQueryErrorV1::kNone &&
+            live_snapshot.available() &&
+            live_snapshot.record->ingress_sequence() == 2U;
+        const bool tick_ready =
+            runtime->GetLatestTick(1U, &live_tick) ==
+                market::RealtimeLatestQueryErrorV1::kNone &&
+            live_tick.available() &&
+            live_tick.record->ingress_sequence() == 1U;
+        const bool other_snapshot_ready =
+            runtime->GetLatestSnapshot(
+                2U, &live_snapshot_other_worker) ==
+                market::RealtimeLatestQueryErrorV1::kNone &&
+            live_snapshot_other_worker.available() &&
+            live_snapshot_other_worker.record->ingress_sequence() == 3U;
+        if (snapshot_ready && tick_ready && other_snapshot_ready) {
+            break;
+        }
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < live_deadline);
+    ok &= Expect(
+        live_snapshot.available() &&
+            live_snapshot.record->ingress_sequence() == 2U &&
+            live_snapshot_other_worker.available() &&
+            live_snapshot_other_worker.record->ingress_sequence() == 3U &&
+            live_tick.available() &&
+            live_tick.record->ingress_sequence() == 1U &&
+            runtime->AcquireLatestGeneration() == nullptr,
+        "latest snapshot/tick are visible after apply without waiting for a generation");
+
+    const std::array<std::uint32_t, 5U> live_ids{
+        1U, 2U, 9U, 999U, 0U};
+    std::array<market::RealtimeLatestRecordViewV1, 5U>
+        live_snapshots{};
+    ok &= Expect(
+        runtime->GetLatestSnapshots(live_ids, live_snapshots) ==
+                market::RealtimeLatestQueryErrorV1::kNone &&
+            live_snapshots[0U].record ==
+                live_snapshot.record &&
+            live_snapshots[1U].available() &&
+            live_snapshots[1U].record->ingress_sequence() == 3U &&
+            live_snapshots[2U].status ==
+                market::RealtimeLatestRecordStatusV1::
+                    kNotYetObserved &&
+            live_snapshots[3U].status ==
+                market::RealtimeLatestRecordStatusV1::
+                    kUnknownInstrument &&
+            live_snapshots[4U].status ==
+                market::RealtimeLatestRecordStatusV1::
+                    kInvalidInstrumentId,
+        "batch latest snapshots preserve request order and observation status");
 
     // Source 0 is fenced first. Its next record is legal realtime work, but
     // every worker must park it until all four generation-1 fences arrive.

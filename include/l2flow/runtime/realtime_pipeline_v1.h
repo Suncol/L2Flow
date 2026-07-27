@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -160,6 +161,7 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
     kSdkCallbackFailed,
     kResourceExhausted,
     kUnexpectedFailure,
+    kLatestReadModelCreateFailed,
 };
 
 [[nodiscard]] std::string_view RealtimePipelineCreateErrorNameV1(
@@ -328,6 +330,30 @@ public:
     [[nodiscard]] std::shared_ptr<
         const l2flow::market::RealtimeKLineGenerationV1>
     AcquireLatestKLineGeneration() const noexcept;
+    // Live, read-only point access. These records become visible only after
+    // Store append, every enabled KLine update, and the history handoff have
+    // all succeeded. Latest is the greatest process ingress_sequence for the
+    // instrument/category; it is not exchange-event-time ordering.
+    [[nodiscard]] l2flow::market::RealtimeLatestQueryErrorV1
+    GetLatestSnapshot(
+        std::uint32_t instrument_id,
+        l2flow::market::RealtimeLatestRecordViewV1* output)
+        const noexcept;
+    [[nodiscard]] l2flow::market::RealtimeLatestQueryErrorV1
+    GetLatestSnapshots(
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<l2flow::market::RealtimeLatestRecordViewV1> output)
+        const noexcept;
+    [[nodiscard]] l2flow::market::RealtimeLatestQueryErrorV1
+    GetLatestTick(
+        std::uint32_t instrument_id,
+        l2flow::market::RealtimeLatestRecordViewV1* output)
+        const noexcept;
+    [[nodiscard]] l2flow::market::RealtimeLatestQueryErrorV1
+    GetLatestTicks(
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<l2flow::market::RealtimeLatestRecordViewV1> output)
+        const noexcept;
     // Store N is published before factor N. A consistent consumer must acquire
     // the factor once and obtain its exact matching store through
     // factor->input_store(). The direct store accessor is for store-only

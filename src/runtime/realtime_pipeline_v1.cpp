@@ -684,6 +684,9 @@ std::string_view RealtimePipelineCreateErrorNameV1(
             return "store_runtime_create_failed";
         case RealtimePipelineCreateErrorV1::kKLineRuntimeCreateFailed:
             return "kline_runtime_create_failed";
+        case RealtimePipelineCreateErrorV1::
+            kLatestReadModelCreateFailed:
+            return "latest_read_model_create_failed";
         case RealtimePipelineCreateErrorV1::kWalCreateFailed:
             return "wal_create_failed";
         case RealtimePipelineCreateErrorV1::kFactorCreateFailed:
@@ -1061,7 +1064,7 @@ public:
                 market::RealtimeHistoryCreateErrorV1::kNone) {
                 SetDetail(
                     detail,
-                    "store runtime create failed: " +
+                    "history runtime create failed: " +
                         std::string(
                             market::RealtimeHistoryCreateErrorNameV1(
                                 store_runtime_error)));
@@ -1070,6 +1073,12 @@ public:
                         kKLineCreateFailed) {
                     return RealtimePipelineCreateErrorV1::
                         kKLineRuntimeCreateFailed;
+                }
+                if (store_runtime_error ==
+                    market::RealtimeHistoryCreateErrorV1::
+                        kLatestReadModelCreateFailed) {
+                    return RealtimePipelineCreateErrorV1::
+                        kLatestReadModelCreateFailed;
                 }
                 return RealtimePipelineCreateErrorV1::
                     kStoreRuntimeCreateFailed;
@@ -1647,6 +1656,46 @@ public:
                    : history_->AcquireLatestKLineGeneration();
     }
 
+    [[nodiscard]] market::RealtimeLatestQueryErrorV1
+    GetLatestSnapshot(
+        std::uint32_t instrument_id,
+        market::RealtimeLatestRecordViewV1* output) const noexcept {
+        if (history_ == nullptr) {
+            return market::RealtimeLatestQueryErrorV1::kUnavailable;
+        }
+        return history_->GetLatestSnapshot(instrument_id, output);
+    }
+
+    [[nodiscard]] market::RealtimeLatestQueryErrorV1
+    GetLatestSnapshots(
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<market::RealtimeLatestRecordViewV1> output)
+        const noexcept {
+        if (history_ == nullptr) {
+            return market::RealtimeLatestQueryErrorV1::kUnavailable;
+        }
+        return history_->GetLatestSnapshots(instrument_ids, output);
+    }
+
+    [[nodiscard]] market::RealtimeLatestQueryErrorV1 GetLatestTick(
+        std::uint32_t instrument_id,
+        market::RealtimeLatestRecordViewV1* output) const noexcept {
+        if (history_ == nullptr) {
+            return market::RealtimeLatestQueryErrorV1::kUnavailable;
+        }
+        return history_->GetLatestTick(instrument_id, output);
+    }
+
+    [[nodiscard]] market::RealtimeLatestQueryErrorV1 GetLatestTicks(
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<market::RealtimeLatestRecordViewV1> output)
+        const noexcept {
+        if (history_ == nullptr) {
+            return market::RealtimeLatestQueryErrorV1::kUnavailable;
+        }
+        return history_->GetLatestTicks(instrument_ids, output);
+    }
+
     [[nodiscard]] std::shared_ptr<
         const factor::RealtimeFactorGenerationV1>
     AcquireFactor() const noexcept {
@@ -2191,6 +2240,34 @@ RealtimePipelineV1::AcquireLatestStoreGeneration() const noexcept {
 std::shared_ptr<const market::RealtimeKLineGenerationV1>
 RealtimePipelineV1::AcquireLatestKLineGeneration() const noexcept {
     return impl_->AcquireKLine();
+}
+
+market::RealtimeLatestQueryErrorV1
+RealtimePipelineV1::GetLatestSnapshot(
+    std::uint32_t instrument_id,
+    market::RealtimeLatestRecordViewV1* output) const noexcept {
+    return impl_->GetLatestSnapshot(instrument_id, output);
+}
+
+market::RealtimeLatestQueryErrorV1
+RealtimePipelineV1::GetLatestSnapshots(
+    std::span<const std::uint32_t> instrument_ids,
+    std::span<market::RealtimeLatestRecordViewV1> output)
+    const noexcept {
+    return impl_->GetLatestSnapshots(instrument_ids, output);
+}
+
+market::RealtimeLatestQueryErrorV1 RealtimePipelineV1::GetLatestTick(
+    std::uint32_t instrument_id,
+    market::RealtimeLatestRecordViewV1* output) const noexcept {
+    return impl_->GetLatestTick(instrument_id, output);
+}
+
+market::RealtimeLatestQueryErrorV1 RealtimePipelineV1::GetLatestTicks(
+    std::span<const std::uint32_t> instrument_ids,
+    std::span<market::RealtimeLatestRecordViewV1> output)
+    const noexcept {
+    return impl_->GetLatestTicks(instrument_ids, output);
 }
 
 std::shared_ptr<const factor::RealtimeFactorGenerationV1>

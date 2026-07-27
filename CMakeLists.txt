@@ -106,7 +106,8 @@ add_library(l2flow_market STATIC
     src/market/market_decoder.cpp
     src/market/market_types_v1.cpp
     src/market/realtime_history_v1.cpp
-    src/market/realtime_kline_v1.cpp)
+    src/market/realtime_kline_v1.cpp
+    src/market/realtime_latest_read_model_v1.cpp)
 add_library(L2Flow::market ALIAS l2flow_market)
 l2flow_configure_target(l2flow_market)
 target_link_libraries(l2flow_market
@@ -254,6 +255,8 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_owned_ingress_wal_v1.cpp L2Flow::realtime_ingress)
     l2flow_add_test(test_realtime_history
         tests/test_realtime_history_v1.cpp L2Flow::market)
+    l2flow_add_test(test_realtime_latest_read_model
+        tests/test_realtime_latest_read_model_v1.cpp L2Flow::market)
     l2flow_add_test(test_kline_aggregator
         tests/test_kline_aggregator_v1.cpp L2Flow::market)
     l2flow_add_test(test_intraday_instrument_store

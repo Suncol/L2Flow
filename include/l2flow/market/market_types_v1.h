@@ -54,6 +54,19 @@ enum class MarketEventKindV1 : std::uint8_t {
     kShenzhenTransaction = 5U,
 };
 
+[[nodiscard]] constexpr bool IsSnapshotEventKindV1(
+    MarketEventKindV1 kind) noexcept {
+    return kind == MarketEventKindV1::kShanghaiSnapshot ||
+           kind == MarketEventKindV1::kShenzhenSnapshot;
+}
+
+[[nodiscard]] constexpr bool IsTickEventKindV1(
+    MarketEventKindV1 kind) noexcept {
+    return kind == MarketEventKindV1::kShanghaiTick ||
+           kind == MarketEventKindV1::kShenzhenOrder ||
+           kind == MarketEventKindV1::kShenzhenTransaction;
+}
+
 enum class TickActionV1 : std::uint8_t {
     kUnknown = 0U,
     kAdd,

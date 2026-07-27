@@ -12,14 +12,16 @@ operator-selected Vendor SDK shared library
             -> instrument_id % worker_count router
             -> mandatory complete intraday instrument store
             -> optional event-time multi-window KLine aggregation
+            |-> applied latest snapshot/tick read model
             -> generation barrier and ingress-prefix watermark
             -> full-universe factor calculation
             -> one atomic factor-generation publication
 ```
 
-The production executable is `mdl-production-router`. There is no second
-replay, normalization, fast-path, or per-instrument publication route in the
-production composition.
+The production executable is `mdl-production-router`. The live latest read
+model is a read-only projection of the same successfully applied Store
+records; it is not a second admission, replay, normalization, or retention
+route.
 
 ## Production contract
 
@@ -144,6 +146,53 @@ On a 1 TiB host, the initial envelope is a 600--620 GiB logical store limit,
 an 800 GiB process high-water alert, and an 850--860 GiB termination boundary.
 Old factors, store generations, and cursors pin their owning session arena, so
 consumers must enforce a small fixed limit on retained handles.
+
+### Live latest snapshot/tick reads
+
+The owner worker publishes a Store-owned immutable record to the live latest
+read model only after all of these steps succeed:
+
+```text
+Store append
+-> every enabled KLine update
+-> history handoff release
+-> release-publish latest pointer
+```
+
+The production facade exposes allocation-free point and batch APIs:
+
+```cpp
+RealtimeLatestRecordViewV1 snapshot;
+pipeline->GetLatestSnapshot(instrument_id, &snapshot);
+
+std::array<std::uint32_t, 2> ids{sh_id, sz_id};
+std::array<RealtimeLatestRecordViewV1, 2> snapshots;
+pipeline->GetLatestSnapshots(ids, snapshots);
+```
+
+`GetLatestTick(s)` uses the same query implementation. Its meaning remains
+the Store's existing mixed non-snapshot category: Shanghai tick, Shenzhen
+order, or Shenzhen transaction. It must not be interpreted as “latest
+trade”. Snapshot and tick slots advance independently, and a candidate only
+replaces the current slot when its process `ingress_sequence` is greater.
+Every successfully applied event is release-published to its point slot, but
+this remains a latest-value cache: a polling reader can miss intermediate
+values when writers advance faster than it reads. Lossless per-record
+consumption requires a sequence cursor/stream over retained Store records,
+not a latest API.
+
+Each batch row is one acquire observation and reports `available`,
+`not-yet-observed`, `unknown-instrument`, or `invalid-instrument-id`
+independently. A batch is not a market-wide atomic cut. Consumers requiring a
+repeatable cross-instrument prefix must continue to use an immutable Store
+generation. Separate snapshot and tick calls are likewise independent
+observations and do not form a joint cut.
+
+Returned records are borrowed from the Store arena. They remain valid while
+the pipeline/runtime is alive, including after a clean `StopAndDrain`, but
+must not become a cross-process ABI or outlive the runtime. A Python, Arrow,
+or shared-memory adapter must project them into its own versioned wire
+representation.
 
 ### Generation barrier and watermark
 

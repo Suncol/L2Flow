@@ -64,11 +64,6 @@ static_assert(
     return false;
 }
 
-[[nodiscard]] bool SnapshotKind(MarketEventKindV1 kind) noexcept {
-    return kind == MarketEventKindV1::kShanghaiSnapshot ||
-           kind == MarketEventKindV1::kShenzhenSnapshot;
-}
-
 [[nodiscard]] bool KindBelongsToSource(
     MarketEventKindV1 kind,
     std::uint8_t source) noexcept {
@@ -1537,6 +1532,18 @@ IntradayInstrumentStoreV1::Append(
     std::uint32_t worker,
     const InstrumentRouteTokenV1& route,
     RealtimeHistoryEventInputV1&& input) noexcept {
+    return Append(worker, route, std::move(input), nullptr);
+}
+
+IntradayInstrumentStoreAppendErrorV1
+IntradayInstrumentStoreV1::Append(
+    std::uint32_t worker,
+    const InstrumentRouteTokenV1& route,
+    RealtimeHistoryEventInputV1&& input,
+    const RealtimeHistoryRecordV1** appended_record) noexcept {
+    if (appended_record != nullptr) {
+        *appended_record = nullptr;
+    }
     SessionState& session = *impl_->session;
     if (session.coverage_lost.load(std::memory_order_acquire)) {
         return IntradayInstrumentStoreAppendErrorV1::kCoverageLost;
@@ -1737,7 +1744,7 @@ IntradayInstrumentStoreV1::Append(
     const RealtimeHistoryRecordV1* const appended =
         placement.header;
     const RealtimeHistoryRecordV1*& latest =
-        SnapshotKind(kind) ? row.latest_snapshot : row.latest_tick;
+        IsSnapshotEventKindV1(kind) ? row.latest_snapshot : row.latest_tick;
     if (latest == nullptr ||
         latest->ingress_sequence() < ingress_sequence) {
         latest = appended;
@@ -1746,6 +1753,9 @@ IntradayInstrumentStoreV1::Append(
         1U, std::memory_order_release);
     worker_state.accounting.accounted_record_bytes.fetch_add(
         accounted_record_bytes, std::memory_order_release);
+    if (appended_record != nullptr) {
+        *appended_record = appended;
+    }
     return IntradayInstrumentStoreAppendErrorV1::kNone;
 }
 
@@ -2098,6 +2108,11 @@ IntradayInstrumentStoreV1::Snapshot() const noexcept {
     result.coverage_from_open =
         session.config.coverage_from_open && !result.coverage_lost;
     return result;
+}
+
+bool IntradayInstrumentStoreV1::coverage_lost() const noexcept {
+    return impl_->session->coverage_lost.load(
+        std::memory_order_acquire);
 }
 
 std::uint32_t IntradayInstrumentStoreV1::WorkerForInstrument(

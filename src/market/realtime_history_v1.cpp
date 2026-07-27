@@ -686,6 +686,8 @@ std::string_view RealtimeHistoryCreateErrorNameV1(
             return "store_create_failed";
         case RealtimeHistoryCreateErrorV1::kKLineCreateFailed:
             return "kline_create_failed";
+        case RealtimeHistoryCreateErrorV1::kLatestReadModelCreateFailed:
+            return "latest_read_model_create_failed";
         case RealtimeHistoryCreateErrorV1::kResourceExhausted:
             return "resource_exhausted";
         case RealtimeHistoryCreateErrorV1::kThreadStartFailed:
@@ -794,10 +796,12 @@ public:
     Impl(
         RealtimeHistoryRuntimeConfigV1 config,
         std::unique_ptr<IntradayInstrumentStoreV1> store,
+        std::unique_ptr<RealtimeLatestReadModelV1> latest_read_model,
         std::vector<std::unique_ptr<KLineAggregatorV1>>
             kline_aggregators)
         : config_(std::move(config)),
           store_(std::move(store)),
+          latest_read_model_(std::move(latest_read_model)),
           kline_aggregators_(std::move(kline_aggregators)),
           queues_(kRealtimeHistorySourceCountV1 * config_.worker_count),
           handoff_pools_(
@@ -853,6 +857,41 @@ public:
 
     std::uint32_t WorkerFor(std::uint32_t instrument_id) const noexcept {
         return instrument_id % config_.worker_count;
+    }
+
+    RealtimeLatestQueryErrorV1 GetLatest(
+        RealtimeLatestRecordKindV1 kind,
+        std::uint32_t instrument_id,
+        RealtimeLatestRecordViewV1* output) const noexcept {
+        SynchronizeLatestCoverageFromStore();
+        const RealtimeLatestQueryErrorV1 error =
+            latest_read_model_->GetLatest(
+                kind, instrument_id, output);
+        if (!store_->coverage_lost()) {
+            return error;
+        }
+        // Store::Append may fail its own coverage before returning to the
+        // owner worker. Recheck after the point read so an overlapping query
+        // either linearizes before that transition or clears and fails closed.
+        latest_read_model_->MarkCoverageLost();
+        return latest_read_model_->GetLatest(
+            kind, instrument_id, output);
+    }
+
+    RealtimeLatestQueryErrorV1 GetLatestRecords(
+        RealtimeLatestRecordKindV1 kind,
+        std::span<const std::uint32_t> instrument_ids,
+        std::span<RealtimeLatestRecordViewV1> output) const noexcept {
+        SynchronizeLatestCoverageFromStore();
+        const RealtimeLatestQueryErrorV1 error =
+            latest_read_model_->GetLatestRecords(
+                kind, instrument_ids, output);
+        if (!store_->coverage_lost()) {
+            return error;
+        }
+        latest_read_model_->MarkCoverageLost();
+        return latest_read_model_->GetLatestRecords(
+            kind, instrument_ids, output);
     }
 
     RealtimeHistoryGenerationErrorV1 FatalGenerationError()
@@ -1335,10 +1374,15 @@ public:
         }
         IntradayInstrumentStoreAppendErrorV1 error =
             IntradayInstrumentStoreAppendErrorV1::kInvalidRecord;
+        const RealtimeHistoryRecordV1* appended_record = nullptr;
         if (input->valid() && input->source_slot() == source &&
             route.worker == worker &&
             route.instrument_id == input->instrument_id()) {
-            error = store_->Append(worker, route, std::move(*input));
+            error = store_->Append(
+                worker,
+                route,
+                std::move(*input),
+                &appended_record);
         }
         if (observe &&
             error == IntradayInstrumentStoreAppendErrorV1::kNone) {
@@ -1375,6 +1419,7 @@ public:
                 kline_error = KLineAppendErrorV1::kInvalidTrade;
             }
             if (kline_error != KLineAppendErrorV1::kNone) {
+                MarkLatestCoverageLost();
                 kline_failed_.store(true, std::memory_order_release);
             }
         }
@@ -1386,16 +1431,30 @@ public:
                 config_.append_observer_context, observation);
         }
         if (!released) {
-            store_->MarkCoverageLost();
+            MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
             return false;
         }
         if (error != IntradayInstrumentStoreAppendErrorV1::kNone) {
-            store_->MarkCoverageLost();
+            MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
             return false;
         }
         if (kline_error != KLineAppendErrorV1::kNone) {
+            return false;
+        }
+        if (appended_record == nullptr || latest_read_model_ == nullptr) {
+            MarkLatestCoverageLost();
+            return false;
+        }
+        const RealtimeLatestPublishErrorV1 latest_error =
+            latest_read_model_->PublishApplied(
+                route.registry_ordinal, appended_record);
+        if (latest_error != RealtimeLatestPublishErrorV1::kNone) {
+            // A publish failure violates the required live-read projection.
+            // Fail the projection closed before returning; WorkerLoop then
+            // transitions the complete History/Store chain to fatal.
+            MarkLatestCoverageLost();
             return false;
         }
         return true;
@@ -1406,6 +1465,7 @@ public:
         std::uint64_t generation) noexcept {
         try {
             if (store_->Snapshot().coverage_lost) {
+                MarkLatestCoverageLost();
                 store_failed_.store(true, std::memory_order_release);
                 return false;
             }
@@ -1415,7 +1475,7 @@ public:
             if (error !=
                     IntradayInstrumentStoreGenerationErrorV1::kNone ||
                 slice == nullptr) {
-                store_->MarkCoverageLost();
+                MarkStoreCoverageLost();
                 store_failed_.store(true, std::memory_order_release);
                 return false;
             }
@@ -1428,6 +1488,7 @@ public:
                         &kline_snapshot) !=
                         KLineCaptureErrorV1::kNone ||
                     kline_snapshot == nullptr) {
+                    MarkLatestCoverageLost();
                     kline_failed_.store(
                         true, std::memory_order_release);
                     return false;
@@ -1500,7 +1561,7 @@ public:
             builder_cv_.notify_one();
             return true;
         } catch (...) {
-            store_->MarkCoverageLost();
+            MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lock(generation_mutex_);
             if (building_generation_ == generation) {
@@ -1574,7 +1635,7 @@ public:
                 error != IntradayInstrumentStoreGenerationErrorV1::kNone ||
                 candidate == nullptr;
             if (build_failed) {
-                store_->MarkCoverageLost();
+                MarkStoreCoverageLost();
                 store_failed_.store(true, std::memory_order_release);
             }
             std::shared_ptr<const RealtimeKLineGenerationV1>
@@ -1593,6 +1654,7 @@ public:
                         RealtimeKLineGenerationErrorV1::kNone ||
                     kline_candidate == nullptr;
                 if (kline_build_failed) {
+                    MarkLatestCoverageLost();
                     kline_failed_.store(
                         true, std::memory_order_release);
                 }
@@ -1615,7 +1677,7 @@ public:
             }
             if (store_->PublishGeneration(candidate) !=
                 IntradayInstrumentStoreGenerationErrorV1::kNone) {
-                store_->MarkCoverageLost();
+                MarkStoreCoverageLost();
                 MarkFatalLocked(true);
                 return;
             }
@@ -1630,7 +1692,7 @@ public:
             }
             generation_cv_.notify_all();
         } catch (...) {
-            store_->MarkCoverageLost();
+            MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lock(generation_mutex_);
             if (building_generation_ == generation) {
@@ -1697,8 +1759,27 @@ public:
         }
     }
 
-    void MarkFatalLocked(bool store_failure) noexcept {
+    void MarkLatestCoverageLost() noexcept {
+        if (latest_read_model_ != nullptr) {
+            latest_read_model_->MarkCoverageLost();
+        }
+    }
+
+    void SynchronizeLatestCoverageFromStore() const noexcept {
+        if (store_->coverage_lost()) {
+            latest_read_model_->MarkCoverageLost();
+        }
+    }
+
+    // Publish latest loss first. Therefore any observer that can already see
+    // Store coverage loss is also guaranteed to fail latest queries closed.
+    void MarkStoreCoverageLost() noexcept {
+        MarkLatestCoverageLost();
         store_->MarkCoverageLost();
+    }
+
+    void MarkFatalLocked(bool store_failure) noexcept {
+        MarkStoreCoverageLost();
         if (store_failure) {
             store_failed_.store(true, std::memory_order_release);
         }
@@ -1751,6 +1832,7 @@ public:
 
     RealtimeHistoryRuntimeConfigV1 config_{};
     std::unique_ptr<IntradayInstrumentStoreV1> store_;
+    std::unique_ptr<RealtimeLatestReadModelV1> latest_read_model_;
     std::vector<std::unique_ptr<KLineAggregatorV1>>
         kline_aggregators_;
     std::vector<std::unique_ptr<SpscQueue<Command>>> queues_;
@@ -1850,6 +1932,14 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
             store == nullptr) {
             return RealtimeHistoryCreateErrorV1::kStoreCreateFailed;
         }
+        std::unique_ptr<RealtimeLatestReadModelV1> latest_read_model;
+        if (RealtimeLatestReadModelV1::Create(
+                config.registry, &latest_read_model) !=
+                RealtimeLatestReadModelCreateErrorV1::kNone ||
+            latest_read_model == nullptr) {
+            return RealtimeHistoryCreateErrorV1::
+                kLatestReadModelCreateFailed;
+        }
         std::vector<std::unique_ptr<KLineAggregatorV1>>
             kline_aggregators;
         if (config.kline.enabled()) {
@@ -1883,6 +1973,7 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
         auto impl = std::make_unique<Impl>(
             config,
             std::move(store),
+            std::move(latest_read_model),
             std::move(kline_aggregators));
         if (!impl->Start()) {
             return RealtimeHistoryCreateErrorV1::kThreadStartFailed;
@@ -1938,6 +2029,44 @@ RealtimeHistoryRuntimeV1::AcquireLatestKLineGeneration()
     return std::atomic_load_explicit(
         &impl_->latest_kline_generation_,
         std::memory_order_acquire);
+}
+
+RealtimeLatestQueryErrorV1
+RealtimeHistoryRuntimeV1::GetLatestSnapshot(
+    std::uint32_t instrument_id,
+    RealtimeLatestRecordViewV1* output) const noexcept {
+    return impl_->GetLatest(
+        RealtimeLatestRecordKindV1::kSnapshot,
+        instrument_id,
+        output);
+}
+
+RealtimeLatestQueryErrorV1
+RealtimeHistoryRuntimeV1::GetLatestSnapshots(
+    std::span<const std::uint32_t> instrument_ids,
+    std::span<RealtimeLatestRecordViewV1> output) const noexcept {
+    return impl_->GetLatestRecords(
+        RealtimeLatestRecordKindV1::kSnapshot,
+        instrument_ids,
+        output);
+}
+
+RealtimeLatestQueryErrorV1 RealtimeHistoryRuntimeV1::GetLatestTick(
+    std::uint32_t instrument_id,
+    RealtimeLatestRecordViewV1* output) const noexcept {
+    return impl_->GetLatest(
+        RealtimeLatestRecordKindV1::kTick,
+        instrument_id,
+        output);
+}
+
+RealtimeLatestQueryErrorV1 RealtimeHistoryRuntimeV1::GetLatestTicks(
+    std::span<const std::uint32_t> instrument_ids,
+    std::span<RealtimeLatestRecordViewV1> output) const noexcept {
+    return impl_->GetLatestRecords(
+        RealtimeLatestRecordKindV1::kTick,
+        instrument_ids,
+        output);
 }
 
 IntradayInstrumentStoreSnapshotV1

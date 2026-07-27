@@ -532,6 +532,12 @@ bool VerifyGeneration(
 
 int main() {
     TestContext test;
+    test.Expect(
+        runtime::RealtimePipelineCreateErrorNameV1(
+            runtime::RealtimePipelineCreateErrorV1::
+                kLatestReadModelCreateFailed) ==
+            "latest_read_model_create_failed",
+        "latest read-model startup failure has a distinct public name");
     std::unique_ptr<market::InstrumentRegistryV1> registry = MakeRegistry();
     test.Expect(registry != nullptr, "registry creation");
     if (registry == nullptr) {
@@ -631,6 +637,36 @@ int main() {
     const runtime::RealtimePipelineCutResultV1 cut =
         pipeline->StopAndPublishFinalGeneration(2s);
     static_cast<void>(VerifyGeneration(&test, cut));
+    market::RealtimeLatestRecordViewV1 latest_tick{};
+    test.Expect(
+        pipeline->GetLatestTick(18U, &latest_tick) ==
+                market::RealtimeLatestQueryErrorV1::kNone &&
+            latest_tick.available() &&
+            latest_tick.record->ingress_sequence() == 2U &&
+            latest_tick.record->kind() ==
+                market::MarketEventKindV1::kShenzhenTransaction,
+        "live latest_tick preserves the mixed order/transaction semantics");
+    const std::array<std::uint32_t, 4U> latest_tick_ids{
+        18U, 7U, 0U, 999U};
+    std::array<market::RealtimeLatestRecordViewV1, 4U>
+        latest_tick_batch{};
+    test.Expect(
+        pipeline->GetLatestTicks(
+            latest_tick_ids, latest_tick_batch) ==
+                market::RealtimeLatestQueryErrorV1::kNone &&
+            latest_tick_batch[0U].available() &&
+            latest_tick_batch[0U].record ==
+                latest_tick.record &&
+            latest_tick_batch[1U].status ==
+                market::RealtimeLatestRecordStatusV1::
+                    kNotYetObserved &&
+            latest_tick_batch[2U].status ==
+                market::RealtimeLatestRecordStatusV1::
+                    kInvalidInstrumentId &&
+            latest_tick_batch[3U].status ==
+                market::RealtimeLatestRecordStatusV1::
+                    kUnknownInstrument,
+        "batch latest ticks preserve request order and per-instrument status");
     test.Expect(
         cut.published() &&
             cut.store_generation->watermark().recv_monotonic_cut_ns <=
@@ -769,6 +805,44 @@ int main() {
         snapshot_state->handler->OnMessage(nullptr, &snapshot);
         const runtime::RealtimePipelineCutResultV1 snapshot_cut =
             snapshot_pipeline->CutAndPublishGeneration(2s);
+        market::RealtimeLatestRecordViewV1 latest_snapshot{};
+        market::RealtimeLatestRecordViewV1 latest_order{};
+        const auto* latest_snapshot_payload =
+            snapshot_pipeline->GetLatestSnapshot(
+                18U, &latest_snapshot) ==
+                        market::RealtimeLatestQueryErrorV1::kNone &&
+                    latest_snapshot.available()
+                ? market::StoredMarketEventGetV1<
+                      market::ShenzhenSnapshotV1>(
+                      latest_snapshot.record->event())
+                : nullptr;
+        test.Expect(
+            latest_snapshot_payload != nullptr &&
+                latest_snapshot.record->ingress_sequence() == 2U &&
+                latest_snapshot_payload->last_price.normalized_p6 ==
+                    12'345'600,
+            "GetLatestSnapshot exposes the applied Shenzhen snapshot");
+        test.Expect(
+            snapshot_pipeline->GetLatestTick(18U, &latest_order) ==
+                    market::RealtimeLatestQueryErrorV1::kNone &&
+                latest_order.available() &&
+                latest_order.record->ingress_sequence() == 1U &&
+                latest_order.record->kind() ==
+                    market::MarketEventKindV1::kShenzhenOrder,
+            "snapshot and mixed latest_tick advance independently");
+        const std::array<std::uint32_t, 2U> snapshot_ids{18U, 7U};
+        std::array<market::RealtimeLatestRecordViewV1, 2U>
+            snapshot_views{};
+        test.Expect(
+            snapshot_pipeline->GetLatestSnapshots(
+                snapshot_ids, snapshot_views) ==
+                    market::RealtimeLatestQueryErrorV1::kNone &&
+                snapshot_views[0U].record ==
+                    latest_snapshot.record &&
+                snapshot_views[1U].status ==
+                    market::RealtimeLatestRecordStatusV1::
+                        kNotYetObserved,
+            "GetLatestSnapshots returns independent live rows without claiming a generation cut");
         const factor::RealtimeFactorPointV1* point =
             snapshot_cut.published()
                 ? snapshot_cut.factor_generation->Find(18U)
@@ -1008,6 +1082,7 @@ int main() {
         }
         const runtime::RealtimePipelineCutResultV1 failure_cut =
             store_failure_pipeline->CutAndPublishGeneration(2s);
+        market::RealtimeLatestRecordViewV1 failed_latest{};
         test.Expect(
             store_failure_pipeline->Snapshot()
                     .store.coverage_lost &&
@@ -1017,6 +1092,12 @@ int main() {
                     market::RealtimeHistoryGenerationErrorV1::
                         kStoreFailed,
             "required async store failure remains specific in cut diagnostics");
+        test.Expect(
+            store_failure_pipeline->GetLatestTick(
+                18U, &failed_latest) ==
+                    market::RealtimeLatestQueryErrorV1::kCoverageLost &&
+                !failed_latest.available(),
+            "live latest view fails closed after authoritative coverage loss");
         store_failure_pipeline->StopAndDrain();
     }
 

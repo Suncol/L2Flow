@@ -17,6 +17,7 @@ Vendor DSO selected by operator
             -> transferable decoded event + stable registry ordinal
             -> fixed instrument worker
             -> mandatory segmented-arena intraday instrument store
+            |-> applied latest snapshot/tick read model
             -> full-universe generation barrier
             -> RealtimeFactorCalculatorV1
             -> atomic RealtimeFactorGenerationV1 publication
@@ -24,8 +25,9 @@ Vendor DSO selected by operator
 
 The V1 scope intentionally has no alternate production admission, replay,
 normalization, recovery, or per-instrument factor-publication route. The
-optional feeder probe and vendor mock are manually enabled diagnostics and are
-not linked into `mdl-production-router`.
+latest read model is a read-only point projection over records already owned
+by the mandatory Store. The optional feeder probe and vendor mock are manually
+enabled diagnostics and are not linked into `mdl-production-router`.
 
 ## 2. Component and dependency boundaries
 
@@ -40,7 +42,8 @@ l2flow_realtime_ingress
              |
              v
 l2flow_market
-  decoder + immutable registry + fixed-worker intraday store + generation barrier
+  decoder + immutable registry + fixed-worker intraday store
+  + applied latest read model + generation barrier
              |
              v
 l2flow_factor
@@ -264,6 +267,62 @@ Record and logical-byte limits are mandatory. Append, allocation, capacity, or
 sequence failure closes production admission and prevents publication of a
 later complete store or factor generation. There is no alternate retention
 path.
+
+### Applied latest read model
+
+Mutable Store rows already track one `latest_snapshot` and one `latest_tick`
+locator, but those ordinary pointers are owner-only state and cannot be read
+concurrently. `RealtimeLatestReadModelV1` therefore maintains two separate
+atomic borrowed-record slots per fixed registry ordinal. Snapshot and tick
+use separate 64-byte-aligned slot arrays; on the target 64-byte cache-line
+deployments, a high-rate tick publisher therefore does not invalidate an
+unrelated snapshot polling line.
+
+Publication occurs on the permanent instrument owner only after:
+
+```text
+Store::Append == success
+AND all enabled KLine updates == success
+AND handoff release == success
+```
+
+The fully constructed Store record is immutable. A release publication of its
+pointer followed by an acquire query therefore exposes the complete header
+and typed payload without copying a snapshot. Cross-source worker completion
+may be out of callback order, so publication compares process
+`ingress_sequence` and never replaces a greater current value with an older
+candidate.
+
+The snapshot category contains exactly Shanghai snapshot and Shenzhen
+snapshot. The tick category deliberately preserves the existing mixed
+meaning: Shanghai tick, Shenzhen order, and Shenzhen transaction. The public
+single and batch APIs share one selector-based query implementation:
+
+```text
+GetLatestSnapshot / GetLatestSnapshots
+GetLatestTick     / GetLatestTicks
+```
+
+Batch output preserves request order and distinguishes a known but
+not-yet-observed instrument from an unknown or zero instrument ID. It is
+coherent per row, not one global ingress cut. Exact cross-instrument reads
+still require an immutable generation. A fatal Store/history transition
+marks latest coverage lost; subsequent latest queries fail closed instead of
+advertising the old point state as a healthy live view. A normal
+`StopAndDrain` retains the final successfully applied point values until the
+runtime is destroyed.
+
+This model is a latest-point cache, not a lossless event stream or contiguous
+applied watermark. Every successfully applied record is release-published,
+but a slower polling reader can miss intermediate pointer values. Consumers
+that must process every retained record need a sequence cursor/stream instead.
+Snapshot and tick calls, including two calls for the same instrument, are
+independent observations rather than one joint atomic cut.
+
+The returned record pointer is an in-process borrowed handle owned by the
+Store session. It may be inspected only while the runtime remains alive and
+must be converted to a versioned wire/Arrow/shared-memory value before
+crossing a process boundary.
 
 This is a direct, source- and ABI-breaking replacement of the former V1
 retention contract. There is intentionally no compatibility adapter. Release

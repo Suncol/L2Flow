@@ -340,6 +340,16 @@ public:
         std::uint32_t worker,
         const InstrumentRouteTokenV1& route,
         RealtimeHistoryEventInputV1&& input) noexcept;
+    // On success the optional receipt points at the exact immutable record
+    // placement owned by this Store session. The pointer remains valid until
+    // the Store is destroyed. It is an in-process handoff only and must never
+    // be used as a cross-process ABI. On every failure *appended_record is
+    // reset to nullptr.
+    [[nodiscard]] IntradayInstrumentStoreAppendErrorV1 Append(
+        std::uint32_t worker,
+        const InstrumentRouteTokenV1& route,
+        RealtimeHistoryEventInputV1&& input,
+        const RealtimeHistoryRecordV1** appended_record) noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreGenerationErrorV1 CaptureWorker(
         std::uint32_t worker,
@@ -368,6 +378,8 @@ public:
     void MarkCoverageLost() noexcept;
     [[nodiscard]] IntradayInstrumentStoreSnapshotV1 Snapshot()
         const noexcept;
+    // One acquire load for latency-sensitive dependent read models.
+    [[nodiscard]] bool coverage_lost() const noexcept;
     [[nodiscard]] std::uint32_t WorkerForInstrument(
         std::uint32_t instrument_id) const noexcept;
     [[nodiscard]] const IntradayInstrumentStoreConfigV1& config()
