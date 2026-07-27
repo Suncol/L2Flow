@@ -564,9 +564,12 @@ int main() {
     auto factory = std::make_shared<FakeFactory>(sdk_state);
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
     std::string detail;
+    runtime::RealtimePipelineConfigV1 measured_config =
+        MakeConfig(registry.get(), wal_path);
+    measured_config.measure_stage_latency = true;
     test.Expect(
         runtime::RealtimePipelineV1::CreateForTest(
-            MakeConfig(registry.get(), wal_path),
+            std::move(measured_config),
             factory,
             &pipeline,
             &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&
@@ -631,6 +634,24 @@ int main() {
                 after_final.ingress_pool.maximum_inflight_messages &&
             after_final.store.allocated_segments == 1U,
         "WAL-on ingress pool and byte-target store remain within their hard bounds");
+    const runtime::RealtimePipelineStageLatencySnapshotV1 latency =
+        pipeline->LatencySnapshot();
+    test.Expect(
+        latency.enabled && latency.sdk_local_time_trade_date == 20260724U &&
+            latency.callback_samples_by_source[3U] == 2U &&
+            latency.append_samples_by_source[3U] == 2U &&
+            latency.sdk_local_to_callback_success.samples == 2U &&
+            latency.sdk_local_to_callback_success.invalid_samples == 0U &&
+            latency.sdk_local_to_callback_success.above_histogram_range ==
+                2U &&
+            latency.sdk_local_to_append_complete.samples == 2U &&
+            latency.callback_entry_to_success.samples == 2U &&
+            latency.callback_entry_to_append_complete.samples == 2U &&
+            latency.append_call.samples == 2U &&
+            latency.callback_entry_to_success.minimum_ns >= 0 &&
+            latency.callback_entry_to_append_complete.minimum_ns >= 0 &&
+            latency.append_call.minimum_ns >= 0,
+        "stage-latency mode accounts for callback and successful append boundaries");
     pipeline->StopAndDrain();
     const runtime::RealtimePipelineSnapshotV1 after_stop =
         pipeline->Snapshot();

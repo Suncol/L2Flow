@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <ctime>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -17,6 +18,31 @@ namespace {
 
 constexpr std::string_view kWatermarkHashDomainV1 =
     "L2FLOW_REALTIME_HISTORY_WATERMARK_V1";
+
+[[nodiscard]] bool ReadClockNs(
+    clockid_t clock,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    struct timespec value {};
+    if (::clock_gettime(clock, &value) != 0 || value.tv_sec < 0 ||
+        value.tv_nsec < 0 || value.tv_nsec >= 1'000'000'000L) {
+        return false;
+    }
+    const std::uint64_t seconds =
+        static_cast<std::uint64_t>(value.tv_sec);
+    constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
+    if (seconds >
+        (std::numeric_limits<std::uint64_t>::max() -
+         static_cast<std::uint64_t>(value.tv_nsec)) /
+            kNanosecondsPerSecond) {
+        return false;
+    }
+    *output = seconds * kNanosecondsPerSecond +
+              static_cast<std::uint64_t>(value.tv_nsec);
+    return true;
+}
 
 bool DigestNonzero(const l2flow::common::Sha256Digest& digest) noexcept {
     return std::any_of(
@@ -532,6 +558,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
     std::int64_t event_time_ns,
     std::int64_t recv_realtime_ns,
     std::int64_t recv_monotonic_ns,
+    std::uint32_t vendor_local_time_raw,
     std::uint64_t accounted_record_bytes,
     DecodedMarketEventV1&& event) noexcept
     : source_slot_(source_slot),
@@ -544,6 +571,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
       event_time_ns_(event_time_ns),
       recv_realtime_ns_(recv_realtime_ns),
       recv_monotonic_ns_(recv_monotonic_ns),
+      vendor_local_time_raw_(vendor_local_time_raw),
       accounted_record_bytes_(accounted_record_bytes),
       event_(std::move(event)) {}
 
@@ -559,6 +587,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
       event_time_ns_(other.event_time_ns_),
       recv_realtime_ns_(other.recv_realtime_ns_),
       recv_monotonic_ns_(other.recv_monotonic_ns_),
+      vendor_local_time_raw_(other.vendor_local_time_raw_),
       accounted_record_bytes_(other.accounted_record_bytes_),
       event_(std::move(other.event_)),
       valid_(other.valid_) {
@@ -580,6 +609,7 @@ RealtimeHistoryEventInputV1& RealtimeHistoryEventInputV1::operator=(
     event_time_ns_ = other.event_time_ns_;
     recv_realtime_ns_ = other.recv_realtime_ns_;
     recv_monotonic_ns_ = other.recv_monotonic_ns_;
+    vendor_local_time_raw_ = other.vendor_local_time_raw_;
     accounted_record_bytes_ = other.accounted_record_bytes_;
     event_ = std::move(other.event_);
     valid_ = other.valid_;
@@ -638,6 +668,7 @@ RealtimeHistoryEventInputV1::Create(
         event_time_ns,
         description.common->origin.recv_realtime_ns,
         description.common->origin.recv_monotonic_ns,
+        description.common->origin.vendor_local_time_raw,
         accounted_record_bytes,
         std::move(event));
 }
@@ -1239,6 +1270,21 @@ public:
             return false;
         }
         RealtimeHistoryEventInputV1* const input = slot->Input();
+        RealtimeHistoryAppendObservationV1 observation{};
+        const bool observe = config_.append_observer != nullptr;
+        bool append_start_clock_valid = false;
+        if (observe) {
+            observation.worker = worker;
+            observation.source_slot = source;
+            observation.ingress_sequence = input->ingress_sequence();
+            observation.vendor_local_time_raw =
+                input->vendor_local_time_raw();
+            observation.recv_realtime_ns = input->recv_realtime_ns();
+            observation.recv_monotonic_ns = input->recv_monotonic_ns();
+            append_start_clock_valid = ReadClockNs(
+                CLOCK_MONOTONIC,
+                &observation.append_start_monotonic_ns);
+        }
         IntradayInstrumentStoreAppendErrorV1 error =
             IntradayInstrumentStoreAppendErrorV1::kInvalidRecord;
         if (input->valid() && input->source_slot() == source &&
@@ -1246,8 +1292,26 @@ public:
             route.instrument_id == input->instrument_id()) {
             error = store_->Append(worker, route, std::move(*input));
         }
+        if (observe &&
+            error == IntradayInstrumentStoreAppendErrorV1::kNone) {
+            const bool append_complete_monotonic_valid = ReadClockNs(
+                CLOCK_MONOTONIC,
+                &observation.append_complete_monotonic_ns);
+            const bool append_complete_realtime_valid = ReadClockNs(
+                CLOCK_REALTIME,
+                &observation.append_complete_realtime_ns);
+            observation.clock_observation_valid =
+                append_start_clock_valid &&
+                append_complete_monotonic_valid &&
+                append_complete_realtime_valid;
+        }
         const bool released =
             HandoffPool(source, worker).ReleaseFromConsumer(slot);
+        if (observe &&
+            error == IntradayInstrumentStoreAppendErrorV1::kNone) {
+            config_.append_observer(
+                config_.append_observer_context, observation);
+        }
         if (!released) {
             store_->MarkCoverageLost();
             store_failed_.store(true, std::memory_order_release);

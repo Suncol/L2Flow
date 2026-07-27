@@ -190,6 +190,9 @@ public:
     [[nodiscard]] std::int64_t recv_monotonic_ns() const noexcept {
         return recv_monotonic_ns_;
     }
+    [[nodiscard]] std::uint32_t vendor_local_time_raw() const noexcept {
+        return vendor_local_time_raw_;
+    }
     [[nodiscard]] std::uint64_t accounted_record_bytes() const noexcept {
         return accounted_record_bytes_;
     }
@@ -214,6 +217,7 @@ private:
         std::int64_t event_time_ns,
         std::int64_t recv_realtime_ns,
         std::int64_t recv_monotonic_ns,
+        std::uint32_t vendor_local_time_raw,
         std::uint64_t accounted_record_bytes,
         DecodedMarketEventV1&& event) noexcept;
 
@@ -228,6 +232,10 @@ private:
     std::int64_t event_time_ns_ = 0;
     std::int64_t recv_realtime_ns_ = 0;
     std::int64_t recv_monotonic_ns_ = 0;
+    // Exact hhmmssmmm value from MDLMessageHead::LocalTime.  It remains a
+    // time-of-day without a calendar date; the optional production latency
+    // observer combines it only with its explicitly configured capture date.
+    std::uint32_t vendor_local_time_raw_ = 0U;
     std::uint64_t accounted_record_bytes_ = 0U;
     DecodedMarketEventV1 event_;
     bool valid_ = true;
@@ -238,6 +246,29 @@ private:
 // action must be noexcept and must not call back into this runtime.
 using RealtimeHistoryCommitActionV1 = void (*)(void* context) noexcept;
 
+// Optional measurement hook invoked by the permanent owner worker only after
+// IntradayInstrumentStoreV1::Append has returned kNone.  The first monotonic
+// clock read after that return defines append_complete_monotonic_ns; the
+// realtime observation follows it.  The hook runs after both observations, so
+// its own aggregation cost is excluded from the measured append boundary.
+// It must be allocation-free, nonblocking, and noexcept.
+struct RealtimeHistoryAppendObservationV1 final {
+    std::uint32_t worker = 0U;
+    std::uint8_t source_slot = 0U;
+    std::uint64_t ingress_sequence = 0U;
+    std::uint32_t vendor_local_time_raw = 0U;
+    std::int64_t recv_realtime_ns = 0;
+    std::int64_t recv_monotonic_ns = 0;
+    std::uint64_t append_start_monotonic_ns = 0U;
+    std::uint64_t append_complete_monotonic_ns = 0U;
+    std::uint64_t append_complete_realtime_ns = 0U;
+    bool clock_observation_valid = false;
+};
+
+using RealtimeHistoryAppendObserverV1 = void (*)(
+    void* context,
+    const RealtimeHistoryAppendObservationV1& observation) noexcept;
+
 struct RealtimeHistoryRuntimeConfigV1 final {
     std::array<std::uint32_t, kRealtimeHistorySourceCountV1>
         source_stream_ids{};
@@ -247,6 +278,8 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     std::size_t queue_capacity_per_source_worker = 0U;
     const InstrumentRegistryV1* registry = nullptr;
     IntradayInstrumentStoreConfigV1 intraday_store{};
+    RealtimeHistoryAppendObserverV1 append_observer = nullptr;
+    void* append_observer_context = nullptr;
 };
 
 enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {

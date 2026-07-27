@@ -71,6 +71,72 @@ struct RealtimePipelineConfigV1 final {
         factor_calculator;
     RealtimePipelineSdkConfigV1 sdk{};
     l2flow::market::IntradayInstrumentStoreConfigV1 intraday_store{};
+    // Explicit test/diagnostic mode.  Disabled by default because the extra
+    // clock reads and atomic histogram updates perturb the measured system.
+    // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
+    // append-stage distributions defined below.
+    bool measure_stage_latency = false;
+};
+
+struct RealtimeLatencyQuantileV1 final {
+    // The estimate is the midpoint of the containing linear histogram bucket.
+    // lower/upper are inclusive bounds.  A clipped quantile fell outside the
+    // configured histogram range; its estimate is then only a boundary value.
+    std::int64_t estimate_ns = 0;
+    std::int64_t lower_bound_ns = 0;
+    std::int64_t upper_bound_ns = 0;
+    bool clipped_below = false;
+    bool clipped_above = false;
+};
+
+struct RealtimeLatencyDistributionV1 final {
+    std::uint64_t samples = 0U;
+    std::uint64_t invalid_samples = 0U;
+    std::uint64_t below_histogram_range = 0U;
+    std::uint64_t above_histogram_range = 0U;
+    std::int64_t minimum_ns = 0;
+    std::int64_t maximum_ns = 0;
+    std::int64_t mean_ns = 0;
+    std::int64_t histogram_minimum_ns = 0;
+    std::int64_t histogram_maximum_ns = 0;
+    std::uint64_t histogram_bucket_width_ns = 0U;
+    bool sum_saturated = false;
+    RealtimeLatencyQuantileV1 p50{};
+    RealtimeLatencyQuantileV1 p90{};
+    RealtimeLatencyQuantileV1 p95{};
+    RealtimeLatencyQuantileV1 p99{};
+    RealtimeLatencyQuantileV1 p999{};
+};
+
+struct RealtimePipelineStageLatencySnapshotV1 final {
+    bool enabled = false;
+    std::uint32_t sdk_local_time_trade_date = 0U;
+    std::array<std::uint64_t,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        callback_samples_by_source{};
+    std::array<std::uint64_t,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        append_samples_by_source{};
+
+    // Signed CLOCK_REALTIME observation minus MDLMessageHead::LocalTime after
+    // assigning the configured fixed UTC+08 capture trade date.  This contains
+    // upstream/feed/network delay and realtime-clock offset; LocalTime itself
+    // has only one-millisecond resolution and carries no date.
+    RealtimeLatencyDistributionV1 sdk_local_to_callback_success{};
+    RealtimeLatencyDistributionV1 sdk_local_to_append_complete{};
+
+    // Same-host CLOCK_MONOTONIC measurements.  callback_entry is the first
+    // clock observation made by OnMessage (or the injection seam); callback
+    // success is the first observation after successful admission and optional
+    // WAL enqueue.  append_complete is the first observation after the store's
+    // Append returned kNone.
+    RealtimeLatencyDistributionV1 callback_entry_to_success{};
+    RealtimeLatencyDistributionV1 callback_entry_to_append_complete{};
+    // Starts immediately before the successful-path input/route validation
+    // and ends at the first observation after Append returns.  This is a tight
+    // upper bound for the store call rather than an isolated function-body
+    // measurement.
+    RealtimeLatencyDistributionV1 append_call{};
 };
 
 enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
@@ -123,6 +189,7 @@ struct RealtimePipelineIngressResultV1 final {
     std::uint64_t global_ingress_sequence = 0U;
     std::uint64_t source_sequence = 0U;
     std::uint8_t source_slot = 0U;
+    std::uint32_t vendor_local_time_raw = 0U;
 
     [[nodiscard]] bool accepted() const noexcept {
         return error == RealtimePipelineIngressErrorV1::kNone &&
@@ -255,6 +322,11 @@ public:
         const l2flow::factor::RealtimeFactorGenerationV1>
     AcquireLatestFactorGeneration() const noexcept;
     [[nodiscard]] RealtimePipelineSnapshotV1 Snapshot() const noexcept;
+    // Histogram summaries are coherent after StopAndPublishFinalGeneration or
+    // StopAndDrain.  A live call is safe but may combine adjacent in-flight
+    // observations and is intended only for diagnostics.
+    [[nodiscard]] RealtimePipelineStageLatencySnapshotV1 LatencySnapshot()
+        const noexcept;
     [[nodiscard]] bool fatal() const noexcept;
 
     // Idempotent terminal shutdown without creating another generation. SDK

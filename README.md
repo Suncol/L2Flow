@@ -386,6 +386,37 @@ The process exits nonzero on a fatal decode, routing, store, barrier, factor,
 or SDK lifecycle error. A clean signal or civil-date boundary attempts one
 final complete generation before stopping.
 
+### Per-message callback and append latency diagnostics
+
+`accept-realtime-pipeline` accepts the explicit diagnostic flag
+`--measure-stage-latency`. A mid-session diagnostic must additionally pass
+`--partial-session` instead of falsely asserting `--intraday-store-from-open`.
+It enables bounded concurrent histograms on the
+same production callback, decoder, router, and append path; it does not create
+a second data path. The final JSON adds these per-message distributions:
+
+- `sdk_local_to_callback_success`: callback-success `CLOCK_REALTIME` minus
+  `MDLMessageHead::LocalTime`;
+- `sdk_local_to_append_complete`: first realtime observation after
+  `IntradayInstrumentStoreV1::Append` returns success, minus the same SDK
+  header time;
+- `callback_entry_to_success`: same-host monotonic callback work;
+- `callback_entry_to_append_complete`: same-host monotonic queue/decode/route/
+  append latency;
+- `append_call`: the monotonic bracket beginning immediately before the
+  successful-path input/route checks and ending immediately after the store
+  append call returns. It is therefore a tight upper bound for the call, not
+  an isolated function-body measurement.
+
+The two `sdk_local_*` values are signed end-to-end observations, not pure
+process latency. SDK `LocalTime` is only `hhmmssmmm` (one-millisecond
+resolution) and has no date; the diagnostic projects it onto the configured
+fixed-UTC+08 trade date. The result therefore also contains upstream feeder
+delay and any realtime-clock offset. The three monotonic distributions are
+the authoritative same-host stage measurements. Completion clocks are read
+before histogram aggregation, but the extra clock reads and atomic updates
+can still perturb later messages, so this mode is disabled by default.
+
 ## Code map
 
 ```text

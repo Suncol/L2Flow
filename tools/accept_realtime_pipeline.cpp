@@ -72,6 +72,8 @@ struct Options final {
     bool intraday_store_from_open = false;
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
+    bool measure_stage_latency = false;
+    bool partial_session = false;
 };
 
 struct UnsignedDistribution final {
@@ -288,8 +290,12 @@ void PrintUsage(std::ostream& output) {
         << "  --intraday-store-max-records N\n"
         << "                                positive u64 session record cap\n"
         << "  --intraday-store-memory-gib N positive u64 logical total GiB cap\n"
+        << "Coverage mode (choose exactly one):\n"
         << "  --intraday-store-from-open    require continuous coverage from "
            "market open\n"
+        << "  --partial-session             latency-diagnostic start without "
+           "claiming coverage from market open; requires "
+           "--measure-stage-latency\n"
         << "Optional:\n"
         << "  --duration-seconds N          default 600\n"
         << "  --generation-interval-ms N    default 1000\n"
@@ -307,7 +313,9 @@ void PrintUsage(std::ostream& output) {
         << "  --intraday-scan-workers N     independent ordinal-range readers; "
            "1..256, default 1\n"
         << "  --intraday-reader-cpus LIST   one allowed CPU per scan worker; "
-           "default first allowed CPUs\n";
+           "default first allowed CPUs\n"
+        << "  --measure-stage-latency       enable per-message callback/append "
+           "latency histograms\n";
 }
 
 [[nodiscard]] bool TakeValue(
@@ -360,6 +368,22 @@ void PrintUsage(std::ostream& output) {
                 return false;
             }
             parsed.intraday_store_from_open = true;
+            continue;
+        }
+        if (option == "--measure-stage-latency") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate --measure-stage-latency";
+                return false;
+            }
+            parsed.measure_stage_latency = true;
+            continue;
+        }
+        if (option == "--partial-session") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate --partial-session";
+                return false;
+            }
+            parsed.partial_session = true;
             continue;
         }
         if (!seen.insert(option).second) {
@@ -536,12 +560,18 @@ void PrintUsage(std::ostream& output) {
         return false;
     }
     if (!parsed.intraday_store_maximum_records_set ||
-        !parsed.intraday_store_memory_set ||
-        !parsed.intraday_store_from_open) {
+        !parsed.intraday_store_memory_set) {
         *error =
             "store-only acceptance requires explicit positive "
-            "--intraday-store-max-records, --intraday-store-memory-gib, "
-            "and --intraday-store-from-open";
+            "--intraday-store-max-records and --intraday-store-memory-gib";
+        return false;
+    }
+    if (parsed.partial_session == parsed.intraday_store_from_open ||
+        (parsed.partial_session && !parsed.measure_stage_latency)) {
+        *error =
+            "select exactly one of --intraday-store-from-open or "
+            "--partial-session; partial session is allowed only with "
+            "--measure-stage-latency";
         return false;
     }
     *output = std::move(parsed);
@@ -732,6 +762,51 @@ void WriteDistributionJson(
            << ",\"mean\":" << std::fixed << std::setprecision(3)
            << (sum / static_cast<long double>(values.size()))
            << std::defaultfloat << '}';
+}
+
+void WriteLatencyQuantileJson(
+    std::ostream& output,
+    const runtime::RealtimeLatencyQuantileV1& value) {
+    output << "{\"estimate\":" << value.estimate_ns
+           << ",\"lower_bound\":" << value.lower_bound_ns
+           << ",\"upper_bound\":" << value.upper_bound_ns
+           << ",\"clipped_below\":"
+           << (value.clipped_below ? "true" : "false")
+           << ",\"clipped_above\":"
+           << (value.clipped_above ? "true" : "false") << '}';
+}
+
+void WriteStageLatencyDistributionJson(
+    std::ostream& output,
+    const runtime::RealtimeLatencyDistributionV1& value) {
+    output << "{\"count\":" << value.samples
+           << ",\"invalid_samples\":" << value.invalid_samples
+           << ",\"below_histogram_range\":"
+           << value.below_histogram_range
+           << ",\"above_histogram_range\":"
+           << value.above_histogram_range
+           << ",\"min\":" << value.minimum_ns
+           << ",\"max\":" << value.maximum_ns
+           << ",\"mean\":" << value.mean_ns
+           << ",\"histogram_minimum\":"
+           << value.histogram_minimum_ns
+           << ",\"histogram_maximum\":"
+           << value.histogram_maximum_ns
+           << ",\"histogram_bucket_width\":"
+           << value.histogram_bucket_width_ns
+           << ",\"sum_saturated\":"
+           << (value.sum_saturated ? "true" : "false")
+           << ",\"p50\":";
+    WriteLatencyQuantileJson(output, value.p50);
+    output << ",\"p90\":";
+    WriteLatencyQuantileJson(output, value.p90);
+    output << ",\"p95\":";
+    WriteLatencyQuantileJson(output, value.p95);
+    output << ",\"p99\":";
+    WriteLatencyQuantileJson(output, value.p99);
+    output << ",\"p999\":";
+    WriteLatencyQuantileJson(output, value.p999);
+    output << '}';
 }
 
 [[nodiscard]] std::size_t EventKindIndex(
@@ -1165,6 +1240,7 @@ void ValidateGenerationAndCollect(
     const market::InstrumentRegistryV1& registry,
     std::uint64_t read_realtime_ns,
     std::uint64_t read_monotonic_ns,
+    bool expected_coverage_from_open,
     AcceptanceState* state,
     SampleRow* sample) {
     if (generation == nullptr) {
@@ -1176,12 +1252,12 @@ void ValidateGenerationAndCollect(
         return;
     }
     const auto entries = registry.entries();
-    if (!generation->coverage_from_open() ||
+    if (generation->coverage_from_open() != expected_coverage_from_open ||
         generation->instrument_count() != entries.size() ||
         state->last_seen_head_by_universe_index.size() != entries.size()) {
         Fail(
             state,
-            "store generation does not contain the exact from-open universe");
+            "store generation coverage flag or fixed universe is incorrect");
         return;
     }
     if (generation->watermark().recv_monotonic_cut_ns > read_monotonic_ns) {
@@ -1360,9 +1436,9 @@ void ValidateFinalStore(
         return;
     }
     if (snapshot.store.coverage_lost ||
-        !snapshot.store.coverage_from_open ||
-        !options.intraday_store_from_open) {
-        Fail(state, "required intraday store lost from-open coverage");
+        snapshot.store.coverage_from_open !=
+            options.intraday_store_from_open) {
+        Fail(state, "required intraday store coverage contract failed");
         return;
     }
     if (cut.store_generation == nullptr) {
@@ -1767,6 +1843,7 @@ void ValidateFinalStore(
     config.intraday_store.coverage_from_open =
         options.intraday_store_from_open;
     config.enforce_receive_trade_date = true;
+    config.measure_stage_latency = options.measure_stage_latency;
     config.sdk.enabled = true;
     config.sdk.library_path = options.sdk_library;
     config.sdk.server_address = options.server_address;
@@ -1897,6 +1974,7 @@ void ValidateFinalStore(
             *registry_result.registry,
             read_realtime_ns,
             read_monotonic_ns,
+            options.intraday_store_from_open,
             &state,
             &sample);
         if (!state.valid) {
@@ -1955,6 +2033,8 @@ void ValidateFinalStore(
     }
     const runtime::RealtimePipelineSnapshotV1 final_snapshot =
         pipeline->Snapshot();
+    const runtime::RealtimePipelineStageLatencySnapshotV1 stage_latency =
+        pipeline->LatencySnapshot();
     if (!ClockNs(CLOCK_MONOTONIC, &end_monotonic_ns)) {
         end_monotonic_ns = final_end_ns;
     }
@@ -1982,6 +2062,45 @@ void ValidateFinalStore(
         !final_snapshot.stopped || last_store == nullptr ||
         !AllKindsSeen(state.event_kinds_seen)) {
         Fail(&state, "final duration/count/state/five-kind acceptance gate failed");
+    }
+    if (options.measure_stage_latency) {
+        std::uint64_t callback_observations = 0U;
+        std::uint64_t append_observations = 0U;
+        for (std::size_t source = 0U;
+             source < stage_latency.callback_samples_by_source.size();
+             ++source) {
+            callback_observations +=
+                stage_latency.callback_samples_by_source[source];
+            append_observations +=
+                stage_latency.append_samples_by_source[source];
+        }
+        const auto completely_accounted = [](
+            const runtime::RealtimeLatencyDistributionV1& distribution,
+            std::uint64_t expected) noexcept {
+            return distribution.samples <= expected &&
+                   distribution.invalid_samples ==
+                       expected - distribution.samples;
+        };
+        if (!stage_latency.enabled ||
+            callback_observations != final_snapshot.accepted_messages ||
+            append_observations != final_snapshot.store.appended_records ||
+            !completely_accounted(
+                stage_latency.sdk_local_to_callback_success,
+                callback_observations) ||
+            !completely_accounted(
+                stage_latency.callback_entry_to_success,
+                callback_observations) ||
+            !completely_accounted(
+                stage_latency.sdk_local_to_append_complete,
+                append_observations) ||
+            !completely_accounted(
+                stage_latency.callback_entry_to_append_complete,
+                append_observations) ||
+            !completely_accounted(
+                stage_latency.append_call,
+                append_observations)) {
+            Fail(&state, "stage-latency observation accounting failed");
+        }
     }
 
     const std::filesystem::path report_temporary =
@@ -2191,13 +2310,63 @@ void ValidateFinalStore(
     WriteDistributionJson(report, state.updated_head_recv_age_ns.values);
     report << ",\n    \"updated_instrument_head_event_to_read\":";
     WriteDistributionJson(report, state.updated_head_event_age_ns.values);
+    report << "\n  },\n  \"stage_latency_ns\":{\n"
+           << "    \"schema_version\":1,\n"
+           << "    \"enabled\":"
+           << (stage_latency.enabled ? "true" : "false")
+           << ",\n    \"sdk_local_time_trade_date\":"
+           << stage_latency.sdk_local_time_trade_date
+           << ",\n    \"callback_samples_by_source\":[";
+    for (std::size_t source = 0U;
+         source < stage_latency.callback_samples_by_source.size();
+         ++source) {
+        if (source != 0U) {
+            report.put(',');
+        }
+        report << stage_latency.callback_samples_by_source[source];
+    }
+    report << "],\n    \"append_samples_by_source\":[";
+    for (std::size_t source = 0U;
+         source < stage_latency.append_samples_by_source.size();
+         ++source) {
+        if (source != 0U) {
+            report.put(',');
+        }
+        report << stage_latency.append_samples_by_source[source];
+    }
+    report << "],\n    \"sdk_local_to_callback_success\":";
+    WriteStageLatencyDistributionJson(
+        report, stage_latency.sdk_local_to_callback_success);
+    report << ",\n    \"sdk_local_to_append_complete\":";
+    WriteStageLatencyDistributionJson(
+        report, stage_latency.sdk_local_to_append_complete);
+    report << ",\n    \"callback_entry_to_success\":";
+    WriteStageLatencyDistributionJson(
+        report, stage_latency.callback_entry_to_success);
+    report << ",\n    \"callback_entry_to_append_complete\":";
+    WriteStageLatencyDistributionJson(
+        report, stage_latency.callback_entry_to_append_complete);
+    report << ",\n    \"append_call\":";
+    WriteStageLatencyDistributionJson(report, stage_latency.append_call);
     report << "\n  },\n  \"latency_semantics\":{\n"
            << "    \"store_acquire_call\":"
               "\"CLOCK_MONOTONIC around atomic shared store acquisition\",\n"
            << "    \"recv_to_read\":"
               "\"read CLOCK_MONOTONIC minus record recv_monotonic_ns; local process freshness including queue, decode, store barrier and publication interval\",\n"
            << "    \"event_to_read\":"
-              "\"read CLOCK_REALTIME minus decoded exchange event_time_ns; end-to-end market freshness including upstream/feed/network/process/publication\"\n"
+              "\"read CLOCK_REALTIME minus decoded exchange event_time_ns; end-to-end market freshness including upstream/feed/network/process/publication\",\n"
+           << "    \"sdk_local_to_callback_success\":"
+              "\"successful callback admission completion CLOCK_REALTIME minus MDLMessageHead::LocalTime projected onto sdk_local_time_trade_date at fixed UTC+08; signed and contaminated by upstream delay and realtime clock offset; source resolution is 1 ms\",\n"
+           << "    \"sdk_local_to_append_complete\":"
+              "\"first CLOCK_REALTIME observation after IntradayInstrumentStoreV1::Append returned success minus the same projected SDK LocalTime\",\n"
+           << "    \"callback_entry_to_success\":"
+              "\"same-host CLOCK_MONOTONIC from callback entry observation through owned copy, decoder enqueue, optional WAL enqueue, and admission-lock release\",\n"
+           << "    \"callback_entry_to_append_complete\":"
+              "\"same-host CLOCK_MONOTONIC from callback entry observation to first observation after store Append returned success; includes decoder and history queues\",\n"
+           << "    \"append_call\":"
+              "\"CLOCK_MONOTONIC from immediately before successful-path input/route validation to the first observation after IntradayInstrumentStoreV1::Append returns; a tight upper bound for the call that excludes post-return histogram aggregation\",\n"
+           << "    \"measurement_perturbation\":"
+              "\"diagnostic mode adds clock reads and atomic histogram updates; completion timestamps are captured before histogram aggregation, but later messages can observe the instrumentation load\"\n"
            << "  }\n}\n";
     report.flush();
     if (!report.good()) {
@@ -2252,6 +2421,28 @@ void ValidateFinalStore(
               << (final_snapshot.store.coverage_lost
                       ? "true"
                       : "false")
+              << "},\"stage_latency\":{\"enabled\":"
+              << (stage_latency.enabled ? "true" : "false")
+              << ",\"sdk_local_to_callback_p50_ns\":"
+              << stage_latency.sdk_local_to_callback_success.p50.estimate_ns
+              << ",\"sdk_local_to_callback_p99_ns\":"
+              << stage_latency.sdk_local_to_callback_success.p99.estimate_ns
+              << ",\"sdk_local_to_append_p50_ns\":"
+              << stage_latency.sdk_local_to_append_complete.p50.estimate_ns
+              << ",\"sdk_local_to_append_p99_ns\":"
+              << stage_latency.sdk_local_to_append_complete.p99.estimate_ns
+              << ",\"callback_work_p50_ns\":"
+              << stage_latency.callback_entry_to_success.p50.estimate_ns
+              << ",\"callback_work_p99_ns\":"
+              << stage_latency.callback_entry_to_success.p99.estimate_ns
+              << ",\"callback_entry_to_append_p50_ns\":"
+              << stage_latency.callback_entry_to_append_complete.p50.estimate_ns
+              << ",\"callback_entry_to_append_p99_ns\":"
+              << stage_latency.callback_entry_to_append_complete.p99.estimate_ns
+              << ",\"append_call_p50_ns\":"
+              << stage_latency.append_call.p50.estimate_ns
+              << ",\"append_call_p99_ns\":"
+              << stage_latency.append_call.p99.estimate_ns
               << "}}\n";
     return state.valid ? 0 : 1;
 }

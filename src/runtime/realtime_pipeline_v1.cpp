@@ -179,6 +179,467 @@ void SetDetailLiteral(std::string* detail, const char* message) noexcept {
         deadline - now);
 }
 
+class ConcurrentLinearLatencyHistogram final {
+public:
+    ConcurrentLinearLatencyHistogram(
+        std::int64_t minimum_ns,
+        std::int64_t maximum_exclusive_ns,
+        std::uint64_t bucket_width_ns)
+        : minimum_ns_(minimum_ns),
+          maximum_exclusive_ns_(maximum_exclusive_ns),
+          bucket_width_ns_(bucket_width_ns),
+          buckets_(BucketCount(
+              minimum_ns, maximum_exclusive_ns, bucket_width_ns)) {
+        for (std::atomic<std::uint64_t>& bucket : buckets_) {
+            bucket.store(0U, std::memory_order_relaxed);
+        }
+    }
+
+    ConcurrentLinearLatencyHistogram(
+        const ConcurrentLinearLatencyHistogram&) = delete;
+    ConcurrentLinearLatencyHistogram& operator=(
+        const ConcurrentLinearLatencyHistogram&) = delete;
+
+    void AddInvalid() noexcept {
+        invalid_samples_.fetch_add(1U, std::memory_order_relaxed);
+    }
+
+    void Add(std::int64_t value) noexcept {
+        UpdateMinimum(value);
+        UpdateMaximum(value);
+        AddToSum(value);
+        if (value < minimum_ns_) {
+            below_range_.fetch_add(1U, std::memory_order_relaxed);
+        } else if (value >= maximum_exclusive_ns_) {
+            above_range_.fetch_add(1U, std::memory_order_relaxed);
+        } else {
+            const std::uint64_t offset = static_cast<std::uint64_t>(
+                value - minimum_ns_);
+            const std::size_t index = static_cast<std::size_t>(
+                offset / bucket_width_ns_);
+            buckets_[index].fetch_add(1U, std::memory_order_relaxed);
+        }
+        samples_.fetch_add(1U, std::memory_order_release);
+    }
+
+    [[nodiscard]] RealtimeLatencyDistributionV1 Snapshot() const noexcept {
+        RealtimeLatencyDistributionV1 result{};
+        result.samples = samples_.load(std::memory_order_acquire);
+        result.invalid_samples =
+            invalid_samples_.load(std::memory_order_acquire);
+        result.below_histogram_range =
+            below_range_.load(std::memory_order_acquire);
+        result.above_histogram_range =
+            above_range_.load(std::memory_order_acquire);
+        result.histogram_minimum_ns = minimum_ns_;
+        result.histogram_maximum_ns = maximum_exclusive_ns_ - 1;
+        result.histogram_bucket_width_ns = bucket_width_ns_;
+        result.sum_saturated =
+            sum_saturated_.load(std::memory_order_acquire);
+        if (result.samples == 0U) {
+            return result;
+        }
+        result.minimum_ns = minimum_observed_.load(std::memory_order_acquire);
+        result.maximum_ns = maximum_observed_.load(std::memory_order_acquire);
+        result.mean_ns = sum_.load(std::memory_order_acquire) /
+                         static_cast<std::int64_t>(result.samples);
+        result.p50 = Quantile(result.samples, 50U, 100U);
+        result.p90 = Quantile(result.samples, 90U, 100U);
+        result.p95 = Quantile(result.samples, 95U, 100U);
+        result.p99 = Quantile(result.samples, 99U, 100U);
+        result.p999 = Quantile(result.samples, 999U, 1000U);
+        return result;
+    }
+
+private:
+    [[nodiscard]] static std::size_t BucketCount(
+        std::int64_t minimum_ns,
+        std::int64_t maximum_exclusive_ns,
+        std::uint64_t bucket_width_ns) {
+        if (maximum_exclusive_ns <= minimum_ns || bucket_width_ns == 0U) {
+            throw std::invalid_argument("invalid latency histogram range");
+        }
+        std::uint64_t range = 0U;
+        if (minimum_ns < 0 && maximum_exclusive_ns >= 0) {
+            const std::uint64_t negative_magnitude =
+                static_cast<std::uint64_t>(-(minimum_ns + 1)) + 1U;
+            const std::uint64_t positive =
+                static_cast<std::uint64_t>(maximum_exclusive_ns);
+            if (positive >
+                std::numeric_limits<std::uint64_t>::max() -
+                    negative_magnitude) {
+                throw std::length_error("latency histogram is too large");
+            }
+            range = negative_magnitude + positive;
+        } else {
+            range = static_cast<std::uint64_t>(
+                maximum_exclusive_ns - minimum_ns);
+        }
+        const std::uint64_t count =
+            range / bucket_width_ns +
+            (range % bucket_width_ns == 0U ? 0U : 1U);
+        if (count == 0U ||
+            count > static_cast<std::uint64_t>(
+                        std::numeric_limits<std::size_t>::max())) {
+            throw std::length_error("latency histogram is too large");
+        }
+        return static_cast<std::size_t>(count);
+    }
+
+    void UpdateMinimum(std::int64_t value) noexcept {
+        std::int64_t current =
+            minimum_observed_.load(std::memory_order_relaxed);
+        while (value < current &&
+               !minimum_observed_.compare_exchange_weak(
+                   current,
+                   value,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    void UpdateMaximum(std::int64_t value) noexcept {
+        std::int64_t current =
+            maximum_observed_.load(std::memory_order_relaxed);
+        while (value > current &&
+               !maximum_observed_.compare_exchange_weak(
+                   current,
+                   value,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    void AddToSum(std::int64_t value) noexcept {
+        std::int64_t current = sum_.load(std::memory_order_relaxed);
+        for (;;) {
+            std::int64_t next = 0;
+            bool saturated = false;
+            if (value > 0 &&
+                current > std::numeric_limits<std::int64_t>::max() - value) {
+                next = std::numeric_limits<std::int64_t>::max();
+                saturated = true;
+            } else if (
+                value < 0 &&
+                current < std::numeric_limits<std::int64_t>::min() - value) {
+                next = std::numeric_limits<std::int64_t>::min();
+                saturated = true;
+            } else {
+                next = current + value;
+            }
+            if (sum_.compare_exchange_weak(
+                    current,
+                    next,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                if (saturated) {
+                    sum_saturated_.store(true, std::memory_order_relaxed);
+                }
+                return;
+            }
+        }
+    }
+
+    [[nodiscard]] RealtimeLatencyQuantileV1 Quantile(
+        std::uint64_t samples,
+        std::uint64_t numerator,
+        std::uint64_t denominator) const noexcept {
+        RealtimeLatencyQuantileV1 result{};
+        if (samples == 0U || denominator == 0U) {
+            return result;
+        }
+        const std::uint64_t sample_index = samples - 1U;
+        const std::uint64_t quotient = sample_index / denominator;
+        const std::uint64_t remainder = sample_index % denominator;
+        const std::uint64_t rank = quotient * numerator +
+            (remainder * numerator + denominator - 1U) / denominator;
+        std::uint64_t cumulative =
+            below_range_.load(std::memory_order_acquire);
+        if (rank < cumulative) {
+            result.lower_bound_ns =
+                minimum_observed_.load(std::memory_order_acquire);
+            result.upper_bound_ns = minimum_ns_ - 1;
+            result.estimate_ns = result.upper_bound_ns;
+            result.clipped_below = true;
+            return result;
+        }
+        for (std::size_t index = 0U; index < buckets_.size(); ++index) {
+            const std::uint64_t count =
+                buckets_[index].load(std::memory_order_acquire);
+            if (count > std::numeric_limits<std::uint64_t>::max() -
+                            cumulative) {
+                cumulative = std::numeric_limits<std::uint64_t>::max();
+            } else {
+                cumulative += count;
+            }
+            if (rank < cumulative) {
+                const std::uint64_t offset =
+                    static_cast<std::uint64_t>(index) * bucket_width_ns_;
+                result.lower_bound_ns = minimum_ns_ +
+                    static_cast<std::int64_t>(offset);
+                result.upper_bound_ns = std::min(
+                    result.lower_bound_ns +
+                        static_cast<std::int64_t>(bucket_width_ns_ - 1U),
+                    maximum_exclusive_ns_ - 1);
+                result.estimate_ns = result.lower_bound_ns +
+                    (result.upper_bound_ns - result.lower_bound_ns) / 2;
+                return result;
+            }
+        }
+        result.lower_bound_ns = maximum_exclusive_ns_;
+        result.upper_bound_ns =
+            maximum_observed_.load(std::memory_order_acquire);
+        result.estimate_ns = result.lower_bound_ns;
+        result.clipped_above = true;
+        return result;
+    }
+
+    const std::int64_t minimum_ns_;
+    const std::int64_t maximum_exclusive_ns_;
+    const std::uint64_t bucket_width_ns_;
+    std::vector<std::atomic<std::uint64_t>> buckets_;
+    std::atomic<std::uint64_t> samples_{0U};
+    std::atomic<std::uint64_t> invalid_samples_{0U};
+    std::atomic<std::uint64_t> below_range_{0U};
+    std::atomic<std::uint64_t> above_range_{0U};
+    std::atomic<std::int64_t> minimum_observed_{
+        std::numeric_limits<std::int64_t>::max()};
+    std::atomic<std::int64_t> maximum_observed_{
+        std::numeric_limits<std::int64_t>::min()};
+    std::atomic<std::int64_t> sum_{0};
+    std::atomic<bool> sum_saturated_{false};
+};
+
+[[nodiscard]] bool FixedUtc8MidnightNs(
+    std::uint32_t trade_date,
+    std::int64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    const int year = static_cast<int>(trade_date / 10'000U);
+    const unsigned int month = (trade_date / 100U) % 100U;
+    const unsigned int day = trade_date % 100U;
+    const std::chrono::year_month_day calendar{
+        std::chrono::year(year),
+        std::chrono::month(month),
+        std::chrono::day(day)};
+    if (!calendar.ok()) {
+        return false;
+    }
+    const auto utc_midnight = std::chrono::sys_days(calendar) -
+                              std::chrono::hours(8);
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        utc_midnight.time_since_epoch());
+    *output = ns.count();
+    return true;
+}
+
+[[nodiscard]] bool SignedDifference(
+    std::uint64_t later,
+    std::int64_t earlier,
+    std::int64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    if (later > static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    const std::int64_t signed_later = static_cast<std::int64_t>(later);
+    if (earlier < 0 &&
+        signed_later >
+            std::numeric_limits<std::int64_t>::max() + earlier) {
+        return false;
+    }
+    *output = signed_later - earlier;
+    return true;
+}
+
+[[nodiscard]] bool UnsignedElapsed(
+    std::uint64_t begin,
+    std::uint64_t end,
+    std::int64_t* output) noexcept {
+    if (output == nullptr || end < begin ||
+        end - begin >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    *output = static_cast<std::int64_t>(end - begin);
+    return true;
+}
+
+class StageLatencyCollector final {
+public:
+    explicit StageLatencyCollector(std::uint32_t trade_date)
+        : trade_date_(trade_date),
+          sdk_local_to_callback_success_(
+              -60'000'000'000LL, 60'000'000'000LL, 100'000ULL),
+          sdk_local_to_append_complete_(
+              -60'000'000'000LL, 60'000'000'000LL, 100'000ULL),
+          callback_entry_to_success_(0, 20'000'000LL, 50ULL),
+          callback_entry_to_append_complete_(
+              0, 5'000'000'000LL, 5'000ULL),
+          append_call_(0, 20'000'000LL, 50ULL) {
+        trade_date_valid_ =
+            FixedUtc8MidnightNs(trade_date_, &fixed_utc8_midnight_ns_);
+    }
+
+    void RecordCallback(
+        const RealtimePipelineIngressResultV1& ingress,
+        std::uint64_t entry_monotonic_ns,
+        std::uint64_t success_realtime_ns,
+        std::uint64_t success_monotonic_ns,
+        bool clock_observation_valid) noexcept {
+        if (!ingress.accepted() ||
+            ingress.source_slot >=
+                market::kRealtimeHistorySourceCountV1) {
+            return;
+        }
+        callback_samples_by_source_[ingress.source_slot].fetch_add(
+            1U, std::memory_order_relaxed);
+        std::int64_t elapsed = 0;
+        if (clock_observation_valid &&
+            UnsignedElapsed(
+                entry_monotonic_ns, success_monotonic_ns, &elapsed)) {
+            callback_entry_to_success_.Add(elapsed);
+        } else {
+            callback_entry_to_success_.AddInvalid();
+        }
+        std::int64_t vendor_realtime_ns = 0;
+        std::int64_t sdk_age = 0;
+        if (clock_observation_valid &&
+            VendorRealtimeNs(
+                ingress.vendor_local_time_raw, &vendor_realtime_ns) &&
+            SignedDifference(
+                success_realtime_ns, vendor_realtime_ns, &sdk_age)) {
+            sdk_local_to_callback_success_.Add(sdk_age);
+        } else {
+            sdk_local_to_callback_success_.AddInvalid();
+        }
+    }
+
+    void RecordAppend(
+        const market::RealtimeHistoryAppendObservationV1& observation)
+        noexcept {
+        if (observation.source_slot >=
+            market::kRealtimeHistorySourceCountV1) {
+            return;
+        }
+        append_samples_by_source_[observation.source_slot].fetch_add(
+            1U, std::memory_order_relaxed);
+        std::int64_t elapsed = 0;
+        if (observation.clock_observation_valid &&
+            observation.recv_monotonic_ns >= 0 &&
+            UnsignedElapsed(
+                static_cast<std::uint64_t>(
+                    observation.recv_monotonic_ns),
+                observation.append_complete_monotonic_ns,
+                &elapsed)) {
+            callback_entry_to_append_complete_.Add(elapsed);
+        } else {
+            callback_entry_to_append_complete_.AddInvalid();
+        }
+        if (observation.clock_observation_valid &&
+            UnsignedElapsed(
+                observation.append_start_monotonic_ns,
+                observation.append_complete_monotonic_ns,
+                &elapsed)) {
+            append_call_.Add(elapsed);
+        } else {
+            append_call_.AddInvalid();
+        }
+        std::int64_t vendor_realtime_ns = 0;
+        std::int64_t sdk_age = 0;
+        if (observation.clock_observation_valid &&
+            VendorRealtimeNs(
+                observation.vendor_local_time_raw,
+                &vendor_realtime_ns) &&
+            SignedDifference(
+                observation.append_complete_realtime_ns,
+                vendor_realtime_ns,
+                &sdk_age)) {
+            sdk_local_to_append_complete_.Add(sdk_age);
+        } else {
+            sdk_local_to_append_complete_.AddInvalid();
+        }
+    }
+
+    [[nodiscard]] RealtimePipelineStageLatencySnapshotV1 Snapshot()
+        const noexcept {
+        RealtimePipelineStageLatencySnapshotV1 result{};
+        result.enabled = true;
+        result.sdk_local_time_trade_date = trade_date_;
+        for (std::size_t source = 0U;
+             source < market::kRealtimeHistorySourceCountV1;
+             ++source) {
+            result.callback_samples_by_source[source] =
+                callback_samples_by_source_[source].load(
+                    std::memory_order_acquire);
+            result.append_samples_by_source[source] =
+                append_samples_by_source_[source].load(
+                    std::memory_order_acquire);
+        }
+        result.sdk_local_to_callback_success =
+            sdk_local_to_callback_success_.Snapshot();
+        result.sdk_local_to_append_complete =
+            sdk_local_to_append_complete_.Snapshot();
+        result.callback_entry_to_success =
+            callback_entry_to_success_.Snapshot();
+        result.callback_entry_to_append_complete =
+            callback_entry_to_append_complete_.Snapshot();
+        result.append_call = append_call_.Snapshot();
+        return result;
+    }
+
+private:
+    [[nodiscard]] bool VendorRealtimeNs(
+        std::uint32_t raw,
+        std::int64_t* output) const noexcept {
+        if (!trade_date_valid_ || output == nullptr ||
+            raw >= 1'000'000'000U) {
+            return false;
+        }
+        const std::uint32_t hour = raw / 10'000'000U;
+        const std::uint32_t minute = (raw / 100'000U) % 100U;
+        const std::uint32_t second = (raw / 1'000U) % 100U;
+        const std::uint32_t millisecond = raw % 1'000U;
+        if (hour >= 24U || minute >= 60U || second >= 60U) {
+            return false;
+        }
+        const std::uint64_t seconds_since_midnight =
+            static_cast<std::uint64_t>(hour) * 3'600U +
+            static_cast<std::uint64_t>(minute) * 60U + second;
+        const std::uint64_t since_midnight_ns =
+            seconds_since_midnight * 1'000'000'000ULL +
+            static_cast<std::uint64_t>(millisecond) * 1'000'000ULL;
+        if (fixed_utc8_midnight_ns_ < 0 ||
+            since_midnight_ns > static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max() -
+                fixed_utc8_midnight_ns_)) {
+            return false;
+        }
+        *output = fixed_utc8_midnight_ns_ +
+                  static_cast<std::int64_t>(since_midnight_ns);
+        return true;
+    }
+
+    const std::uint32_t trade_date_;
+    std::int64_t fixed_utc8_midnight_ns_ = 0;
+    bool trade_date_valid_ = false;
+    std::array<std::atomic<std::uint64_t>,
+               market::kRealtimeHistorySourceCountV1>
+        callback_samples_by_source_{};
+    std::array<std::atomic<std::uint64_t>,
+               market::kRealtimeHistorySourceCountV1>
+        append_samples_by_source_{};
+    ConcurrentLinearLatencyHistogram sdk_local_to_callback_success_;
+    ConcurrentLinearLatencyHistogram sdk_local_to_append_complete_;
+    ConcurrentLinearLatencyHistogram callback_entry_to_success_;
+    ConcurrentLinearLatencyHistogram callback_entry_to_append_complete_;
+    ConcurrentLinearLatencyHistogram append_call_;
+};
+
 [[nodiscard]] bool MaximumIngressPoolMessages(
     const RealtimePipelineConfigV1& config,
     std::size_t* output) noexcept {
@@ -309,6 +770,12 @@ std::string_view RealtimePipelineCutErrorNameV1(
 
 class RealtimePipelineV1::Impl final : public mdl::MessageHandlerBase {
 public:
+    struct CallbackClockObservation final {
+        std::uint64_t realtime_ns = 0U;
+        std::uint64_t monotonic_ns = 0U;
+        bool valid = false;
+    };
+
     enum class CommandKind : std::uint8_t {
         kMessage = 0U,
         kGenerationMarker,
@@ -512,6 +979,16 @@ public:
 
     ~Impl() { StopAndDrain(); }
 
+    static void ObserveAppend(
+        void* context,
+        const market::RealtimeHistoryAppendObservationV1& observation)
+        noexcept {
+        auto* const owner = static_cast<Impl*>(context);
+        if (owner != nullptr && owner->latency_collector_ != nullptr) {
+            owner->latency_collector_->RecordAppend(observation);
+        }
+    }
+
     [[nodiscard]] RealtimePipelineCreateErrorV1 Initialize(
         bool factory_is_test_override,
         std::string* detail) noexcept {
@@ -555,6 +1032,12 @@ public:
                                  kResourceExhausted;
             }
 
+            if (config_.measure_stage_latency) {
+                latency_collector_ =
+                    std::make_unique<StageLatencyCollector>(
+                        config_.trade_date);
+            }
+
             market::RealtimeHistoryRuntimeConfigV1 history_config{};
             history_config.source_stream_ids = config_.source_stream_ids;
             history_config.worker_count = config_.store_worker_count;
@@ -562,6 +1045,10 @@ public:
                 config_.store_queue_capacity_per_source_worker;
             history_config.intraday_store = config_.intraday_store;
             history_config.registry = config_.registry;
+            if (latency_collector_ != nullptr) {
+                history_config.append_observer = &ObserveAppend;
+                history_config.append_observer_context = this;
+            }
             const market::RealtimeHistoryCreateErrorV1
                 store_runtime_error =
                 market::RealtimeHistoryRuntimeV1::Create(
@@ -669,10 +1156,21 @@ public:
     void OnMessage(mdl::Subscriber*,
                    const mdl::MDLMessage* message) override {
         active_callbacks_.fetch_add(1U, std::memory_order_acq_rel);
+        CallbackClockObservation callback_entry{};
+        const CallbackClockObservation* callback_entry_pointer = nullptr;
+        if (latency_collector_ != nullptr) {
+            callback_entry.valid =
+                ReadClockNs(
+                    CLOCK_REALTIME, &callback_entry.realtime_ns) &&
+                ReadClockNs(
+                    CLOCK_MONOTONIC, &callback_entry.monotonic_ns);
+            callback_entry_pointer = &callback_entry;
+        }
         RealtimePipelineIngressErrorV1 callback_error =
             RealtimePipelineIngressErrorV1::kStopped;
         if (!callback_gate_closed_.load(std::memory_order_acquire)) {
-            callback_error = Ingest(message).error;
+            callback_error =
+                Ingest(message, callback_entry_pointer).error;
         }
         last_callback_error_.store(
             static_cast<std::uint8_t>(callback_error),
@@ -684,7 +1182,8 @@ public:
     }
 
     [[nodiscard]] RealtimePipelineIngressResultV1 Ingest(
-        const mdl::MDLMessage* message) noexcept {
+        const mdl::MDLMessage* message,
+        const CallbackClockObservation* callback_entry = nullptr) noexcept {
         RealtimePipelineIngressResultV1 result{};
         std::unique_lock<std::mutex> admission(admission_mutex_);
         if (fatal_.load(std::memory_order_acquire) ||
@@ -739,6 +1238,8 @@ public:
 
         const std::uint8_t source_slot = inspection.source_slot();
         result.source_slot = source_slot;
+        result.vendor_local_time_raw =
+            inspection.vendor_head().local_time_raw();
         constexpr std::uint64_t exhaustion_sentinel =
             std::numeric_limits<std::uint64_t>::max();
         // UINT64_MAX is a valid exclusive cut but is never assigned to a
@@ -755,8 +1256,17 @@ public:
 
         std::uint64_t realtime_ns = 0U;
         std::uint64_t monotonic_ns = 0U;
-        if (!ReadClockNs(CLOCK_REALTIME, &realtime_ns) ||
-            !ReadClockNs(CLOCK_MONOTONIC, &monotonic_ns)) {
+        bool callback_entry_clock_valid = false;
+        if (callback_entry != nullptr) {
+            realtime_ns = callback_entry->realtime_ns;
+            monotonic_ns = callback_entry->monotonic_ns;
+            callback_entry_clock_valid = callback_entry->valid;
+        } else {
+            callback_entry_clock_valid =
+                ReadClockNs(CLOCK_REALTIME, &realtime_ns) &&
+                ReadClockNs(CLOCK_MONOTONIC, &monotonic_ns);
+        }
+        if (!callback_entry_clock_valid) {
             result.error = RealtimePipelineIngressErrorV1::kClockFailure;
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
@@ -839,6 +1349,26 @@ public:
         } else {
             result.wal_result =
                 realtime::OptionalWalEnqueueResultV1::kDisabled;
+        }
+        // Successful admission is complete only after the serialized callback
+        // authority has been released.  The completion clocks below therefore
+        // include owned-copy, decoder enqueue, optional WAL enqueue, and the
+        // admission critical section, but exclude histogram aggregation.
+        admission.unlock();
+        if (latency_collector_ != nullptr) {
+            std::uint64_t success_monotonic_ns = 0U;
+            std::uint64_t success_realtime_ns = 0U;
+            const bool success_clock_valid =
+                ReadClockNs(
+                    CLOCK_MONOTONIC, &success_monotonic_ns) &&
+                ReadClockNs(
+                    CLOCK_REALTIME, &success_realtime_ns);
+            latency_collector_->RecordCallback(
+                result,
+                monotonic_ns,
+                success_realtime_ns,
+                success_monotonic_ns,
+                callback_entry_clock_valid && success_clock_valid);
         }
         return result;
     }
@@ -1126,6 +1656,13 @@ public:
         result.trade_date_boundary_reached =
             trade_date_boundary_reached_.load(std::memory_order_acquire);
         return result;
+    }
+
+    [[nodiscard]] RealtimePipelineStageLatencySnapshotV1 LatencySnapshot()
+        const noexcept {
+        return latency_collector_ == nullptr
+                   ? RealtimePipelineStageLatencySnapshotV1{}
+                   : latency_collector_->Snapshot();
     }
 
     [[nodiscard]] bool fatal() const noexcept {
@@ -1493,6 +2030,7 @@ private:
     // Declared before every possible handle owner so pool state is retired
     // only after decoder rings and WAL have released their handles.
     std::unique_ptr<realtime::OwnedIngressMessagePoolV1> ingress_pool_;
+    std::unique_ptr<StageLatencyCollector> latency_collector_;
     std::array<std::unique_ptr<DecoderLane>,
                market::kRealtimeHistorySourceCountV1>
         lanes_{};
@@ -1624,6 +2162,11 @@ RealtimePipelineV1::AcquireLatestFactorGeneration() const noexcept {
 
 RealtimePipelineSnapshotV1 RealtimePipelineV1::Snapshot() const noexcept {
     return impl_->Snapshot();
+}
+
+RealtimePipelineStageLatencySnapshotV1
+RealtimePipelineV1::LatencySnapshot() const noexcept {
+    return impl_->LatencySnapshot();
 }
 
 bool RealtimePipelineV1::fatal() const noexcept {
