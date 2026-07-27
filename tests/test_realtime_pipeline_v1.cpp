@@ -491,7 +491,9 @@ bool VerifyGeneration(
             records[0U]->ingress_sequence() == 1U &&
             records[1U]->ingress_sequence() == 2U &&
             records[0U]->source_sequence() == 1U &&
-            records[1U]->source_sequence() == 2U,
+            records[1U]->source_sequence() == 2U &&
+            records[0U]->tick_stream_sequence() == 1U &&
+            records[1U]->tick_stream_sequence() == 2U,
         "cursor preserves order then transaction in the shared source-3 lane");
     const market::ShenzhenOrderV1* order = nullptr;
     const auto* transaction = written == 2U
@@ -684,6 +686,7 @@ int main() {
             after_final.store.appended_records ==
                 after_final.decoded_messages &&
             after_final.global_ingress_sequence == 2U &&
+            after_final.tick_stream_sequence == 2U &&
             after_final.source_sequences[3U] == 2U &&
             after_final.stopped && !after_final.fatal,
         "terminal generation contains the exact last accepted source prefix");
@@ -800,9 +803,22 @@ int main() {
         FakeMessage snapshot(
             sdk::MessageKey{6U, 101U, 28U},
             ShenzhenSnapshotBody(12'345'600));
-        snapshot_state->handler->OnMessage(
-            nullptr, &cross_source_order);
-        snapshot_state->handler->OnMessage(nullptr, &snapshot);
+        const runtime::RealtimePipelineIngressResultV1 order_ingress =
+            snapshot_pipeline->InjectSdkMessageForTest(
+                &cross_source_order);
+        const runtime::RealtimePipelineIngressResultV1 snapshot_ingress =
+            snapshot_pipeline->InjectSdkMessageForTest(&snapshot);
+        const runtime::RealtimePipelineSnapshotV1 admission_snapshot =
+            snapshot_pipeline->Snapshot();
+        test.Expect(
+            order_ingress.accepted() &&
+                order_ingress.global_ingress_sequence == 1U &&
+                order_ingress.tick_stream_sequence == 1U &&
+                snapshot_ingress.accepted() &&
+                snapshot_ingress.global_ingress_sequence == 2U &&
+                snapshot_ingress.tick_stream_sequence == 0U &&
+                admission_snapshot.tick_stream_sequence == 1U,
+            "admission assigns one dense mixed-tick sequence while snapshots carry zero");
         const runtime::RealtimePipelineCutResultV1 snapshot_cut =
             snapshot_pipeline->CutAndPublishGeneration(2s);
         market::RealtimeLatestRecordViewV1 latest_snapshot{};
@@ -827,6 +843,7 @@ int main() {
                     market::RealtimeLatestQueryErrorV1::kNone &&
                 latest_order.available() &&
                 latest_order.record->ingress_sequence() == 1U &&
+                latest_order.record->tick_stream_sequence() == 1U &&
                 latest_order.record->kind() ==
                     market::MarketEventKindV1::kShenzhenOrder,
             "snapshot and mixed latest_tick advance independently");
@@ -891,8 +908,10 @@ int main() {
             store_batch[0U] == store_row.latest_tick &&
             store_batch[1U] == store_row.latest_snapshot &&
             store_batch[0U]->ingress_sequence() == 1U &&
+            store_batch[0U]->tick_stream_sequence() == 1U &&
             store_batch[0U]->source_slot() == 3U &&
             store_batch[1U]->ingress_sequence() == 2U &&
+            store_batch[1U]->tick_stream_sequence() == 0U &&
             store_batch[1U]->source_slot() == 2U;
         test.Expect(
             store_query_ok,

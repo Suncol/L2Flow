@@ -1,5 +1,8 @@
 #include "l2flow/common/identity128.h"
 #include "l2flow/common/sha256.h"
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+#include "l2flow/ipc/realtime_shared_service_v1.h"
+#endif
 #include "l2flow/market/instrument_registry_loader_v1.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
@@ -27,6 +30,9 @@
 namespace {
 
 namespace common = l2flow::common;
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+namespace ipc = l2flow::ipc;
+#endif
 namespace market = l2flow::market;
 namespace runtime = l2flow::runtime;
 
@@ -134,6 +140,14 @@ struct Options final {
     std::vector<std::uint32_t> kline_windows_ms;
     std::uint32_t generation_interval_ms = 1000U;
     std::uint32_t generation_timeout_ms = 10'000U;
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    std::filesystem::path ipc_socket;
+    std::uint64_t ipc_tick_ring_records = 262'144U;
+    std::uint64_t ipc_maximum_mapping_bytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
+    bool ipc_tick_ring_records_set = false;
+    bool ipc_maximum_mapping_set = false;
+#endif
 };
 
 void PrintUsage(std::ostream& output) {
@@ -166,7 +180,17 @@ void PrintUsage(std::ostream& output) {
            "ms windows;\n"
         << "                                duration-ms is the window id\n"
         << "  --generation-interval-ms N    1..60000, default 1000\n"
-        << "  --generation-timeout-ms N     1..600000, default 10000\n"
+        << "  --generation-timeout-ms N     1..600000, default 10000\n";
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    output
+        << "  --ipc-socket PATH             enable read-only memfd/UDS "
+           "service\n"
+        << "  --ipc-tick-ring-records N     mixed-tick ring capacity, "
+           "default 262144\n"
+        << "  --ipc-max-mapping-mib N       shared-memory hard cap, "
+           "default 2048\n";
+#endif
+    output
         << "  --help\n\n"
         << "The SDK path is passed directly to dlopen/dlsym. No SDK digest, "
            "baseline, archive, ELF, ABI, or exact-byte approval is used.\n";
@@ -324,7 +348,14 @@ bool ParseOptions(
             option != "--intraday-store-batch-records" &&
             option != "--kline-windows-ms" &&
             option != "--generation-interval-ms" &&
-            option != "--generation-timeout-ms") {
+            option != "--generation-timeout-ms"
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+            &&
+            option != "--ipc-socket" &&
+            option != "--ipc-tick-ring-records" &&
+            option != "--ipc-max-mapping-mib"
+#endif
+        ) {
             *error = "unknown option: " + std::string(option);
             return false;
         }
@@ -367,6 +398,33 @@ bool ParseOptions(
             parsed.sdk_log_prefix = value;
         } else if (option == "--wal-path") {
             parsed.wal_path = std::string(value);
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+        } else if (option == "--ipc-socket") {
+            parsed.ipc_socket = std::string(value);
+        } else if (option == "--ipc-tick-ring-records") {
+            if (!ParseU64(
+                    value, &parsed.ipc_tick_ring_records) ||
+                parsed.ipc_tick_ring_records == 0U) {
+                *error =
+                    "--ipc-tick-ring-records must be positive u64";
+                return false;
+            }
+            parsed.ipc_tick_ring_records_set = true;
+        } else if (option == "--ipc-max-mapping-mib") {
+            std::uint64_t mib = 0U;
+            constexpr std::uint64_t bytes_per_mib =
+                std::uint64_t{1024U} * 1024U;
+            if (!ParseU64(value, &mib) || mib == 0U ||
+                mib > std::numeric_limits<std::uint64_t>::max() /
+                          bytes_per_mib) {
+                *error =
+                    "--ipc-max-mapping-mib must be a positive u64 "
+                    "whose byte conversion does not overflow";
+                return false;
+            }
+            parsed.ipc_maximum_mapping_bytes = mib * bytes_per_mib;
+            parsed.ipc_maximum_mapping_set = true;
+#endif
         } else if (option == "--intraday-store-max-records") {
             if (!ParseU64(
                     value, &parsed.intraday_store_maximum_records) ||
@@ -461,6 +519,16 @@ bool ParseOptions(
         *error = "--replace-wal requires --wal-path";
         return false;
     }
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    if (parsed.ipc_socket.empty() &&
+        (parsed.ipc_tick_ring_records_set ||
+         parsed.ipc_maximum_mapping_set)) {
+        *error =
+            "--ipc-tick-ring-records and --ipc-max-mapping-mib "
+            "require --ipc-socket";
+        return false;
+    }
+#endif
     if (!parsed.intraday_store_maximum_records_set ||
         !parsed.intraday_store_memory_set ||
         !parsed.intraday_store_from_open) {
@@ -567,6 +635,69 @@ int Run(const Options& options) {
     config.sdk.message_encoding = datayes::mdl::MDLEID_BINARY;
     config.sdk.merge_message = false;
 
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV1> ipc_service;
+    if (!options.ipc_socket.empty()) {
+        constexpr std::uint64_t tick_source_count = 2U;
+        const std::uint64_t decoder_pending =
+            tick_source_count *
+            static_cast<std::uint64_t>(
+                config.decoder_queue_capacity_per_source);
+        const std::uint64_t history_pending =
+            tick_source_count *
+            static_cast<std::uint64_t>(config.store_worker_count) *
+            static_cast<std::uint64_t>(
+                config.store_queue_capacity_per_source_worker);
+        // In addition to queued messages, each serial tick decoder and each
+        // Store worker can own one in-flight tick. Include all of them so two
+        // concurrently published sequences can never alias the same ring
+        // slot merely because an earlier worker is delayed.
+        const std::uint64_t reorder_guard =
+            tick_source_count +
+            static_cast<std::uint64_t>(config.store_worker_count);
+        if (decoder_pending >
+                std::numeric_limits<std::uint64_t>::max() -
+                    history_pending - reorder_guard ||
+            options.ipc_tick_ring_records <
+                decoder_pending + history_pending + reorder_guard) {
+            std::cerr
+                << "mdl-production-router: --ipc-tick-ring-records "
+                   "must cover the maximum in-flight mixed-tick "
+                   "reorder span (minimum="
+                << decoder_pending + history_pending + reorder_guard
+                << ")\n";
+            return 1;
+        }
+        ipc::RealtimeSharedServiceConfigV1 ipc_config{};
+        ipc_config.run_id = run_id;
+        ipc_config.trade_date = options.trade_date;
+        ipc_config.registry = registry_result.registry.get();
+        ipc_config.kline_windows = config.kline.windows;
+        ipc_config.tick_ring_capacity =
+            options.ipc_tick_ring_records;
+        ipc_config.maximum_mapping_bytes =
+            options.ipc_maximum_mapping_bytes;
+        ipc_config.control_socket_path = options.ipc_socket;
+        int ipc_system_error = 0;
+        const ipc::RealtimeSharedServiceCreateErrorV1 ipc_error =
+            ipc::RealtimeSharedMarketServiceV1::Create(
+                std::move(ipc_config),
+                &ipc_service,
+                &ipc_system_error);
+        if (ipc_error !=
+                ipc::RealtimeSharedServiceCreateErrorV1::kNone ||
+            ipc_service == nullptr) {
+            std::cerr
+                << "mdl-production-router: IPC service create failed: "
+                << ipc::RealtimeSharedServiceCreateErrorNameV1(
+                       ipc_error)
+                << " errno=" << ipc_system_error << '\n';
+            return 1;
+        }
+        config.applied_record_sink = ipc_service;
+    }
+#endif
+
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
     std::string detail;
     const runtime::RealtimePipelineCreateErrorV1 create_error =
@@ -580,6 +711,25 @@ int Run(const Options& options) {
             << (detail.empty() ? "" : ": ") << detail << '\n';
         return 1;
     }
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    if (ipc_service != nullptr) {
+        int ipc_system_error = 0;
+        if (!ipc_service->Start(&ipc_system_error)) {
+            std::cerr
+                << "mdl-production-router: IPC control start failed: "
+                   "errno="
+                << ipc_system_error << '\n';
+            pipeline->StopAndDrain();
+            ipc_service->MarkFailed();
+            return 1;
+        }
+        std::cerr
+            << "mdl-production-router: IPC active: socket="
+            << ipc_service->control_socket_path()
+            << " mapping_bytes=" << ipc_service->mapping_bytes()
+            << '\n';
+    }
+#endif
 
     const auto interval =
         std::chrono::milliseconds(options.generation_interval_ms);
@@ -625,6 +775,14 @@ int Run(const Options& options) {
                    "publishing final prior-day generation\n";
             break;
         }
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+        if (ipc_service != nullptr && ipc_service->failed()) {
+            std::cerr
+                << "mdl-production-router: IPC service lost coverage\n";
+            exit_code = 1;
+            break;
+        }
+#endif
         const runtime::RealtimePipelineSnapshotV1 before_cut =
             pipeline->Snapshot();
         if (before_cut.trade_date_boundary_reached) {
@@ -659,9 +817,26 @@ int Run(const Options& options) {
             exit_code = 1;
             break;
         }
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+        if (ipc_service != nullptr && cut.kline_enabled &&
+            (cut.kline_generation == nullptr ||
+             !ipc_service->PublishKLineGeneration(
+                 *cut.kline_generation))) {
+            std::cerr
+                << "mdl-production-router: IPC KLine publication "
+                   "failed\n";
+            exit_code = 1;
+            break;
+        }
+#endif
         report_wal_coverage();
     }
 
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    if (ipc_service != nullptr) {
+        ipc_service->MarkDraining();
+    }
+#endif
     if (exit_code == 0 && !pipeline->fatal()) {
         const runtime::RealtimePipelineCutResultV1 final_cut =
             pipeline->StopAndPublishFinalGeneration(timeout);
@@ -673,6 +848,18 @@ int Run(const Options& options) {
                 << '\n';
             exit_code = 1;
         }
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+        else if (
+            ipc_service != nullptr && final_cut.kline_enabled &&
+            (final_cut.kline_generation == nullptr ||
+             !ipc_service->PublishKLineGeneration(
+                 *final_cut.kline_generation))) {
+            std::cerr
+                << "mdl-production-router: final IPC KLine "
+                   "publication failed\n";
+            exit_code = 1;
+        }
+#endif
     } else {
         pipeline->StopAndDrain();
     }
@@ -698,6 +885,22 @@ int Run(const Options& options) {
     if (pipeline->fatal()) {
         exit_code = 1;
     }
+#if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
+    if (ipc_service != nullptr) {
+        const std::uint64_t final_tick_sequence =
+            pipeline->Snapshot().tick_stream_sequence;
+        if (exit_code == 0 &&
+            !ipc_service->MarkStoppedClean(final_tick_sequence)) {
+            std::cerr
+                << "mdl-production-router: IPC final tick prefix is "
+                   "incomplete\n";
+            exit_code = 1;
+        }
+        if (exit_code != 0) {
+            ipc_service->MarkFailed();
+        }
+    }
+#endif
     return exit_code;
 }
 

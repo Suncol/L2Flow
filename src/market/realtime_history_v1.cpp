@@ -199,6 +199,22 @@ bool KindBelongsToSource(
     }
 }
 
+// A zero mixed-tick sequence remains accepted at this standalone C++ Create
+// seam for source compatibility. The production OwnedIngress boundary
+// requires a positive dense value for every tick source.
+bool TickStreamSequenceConsistent(
+    MarketEventKindV1 kind,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence) noexcept {
+    if (IsSnapshotEventKindV1(kind)) {
+        return tick_stream_sequence == 0U;
+    }
+    return IsTickEventKindV1(kind) &&
+           tick_stream_sequence !=
+               std::numeric_limits<std::uint64_t>::max() &&
+           tick_stream_sequence <= ingress_sequence;
+}
+
 template <typename Value>
 class SpscQueue final {
 public:
@@ -473,6 +489,7 @@ RealtimeHistoryRecordV1::RealtimeHistoryRecordV1(
     std::uint32_t source_stream_id,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence,
     std::uint32_t instrument_id,
     MarketEventKindV1 kind,
     std::int64_t event_time_ns,
@@ -483,6 +500,7 @@ RealtimeHistoryRecordV1::RealtimeHistoryRecordV1(
       source_stream_id_(source_stream_id),
       source_sequence_(source_sequence),
       ingress_sequence_(ingress_sequence),
+      tick_stream_sequence_(tick_stream_sequence),
       instrument_id_(instrument_id),
       kind_(kind),
       event_time_ns_(event_time_ns),
@@ -552,6 +570,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
     std::uint32_t source_stream_id,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence,
     std::uint32_t instrument_id,
     std::size_t registry_ordinal,
     MarketEventKindV1 kind,
@@ -565,6 +584,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
       source_stream_id_(source_stream_id),
       source_sequence_(source_sequence),
       ingress_sequence_(ingress_sequence),
+      tick_stream_sequence_(tick_stream_sequence),
       instrument_id_(instrument_id),
       registry_ordinal_(registry_ordinal),
       kind_(kind),
@@ -581,6 +601,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
       source_stream_id_(other.source_stream_id_),
       source_sequence_(other.source_sequence_),
       ingress_sequence_(other.ingress_sequence_),
+      tick_stream_sequence_(other.tick_stream_sequence_),
       instrument_id_(other.instrument_id_),
       registry_ordinal_(other.registry_ordinal_),
       kind_(other.kind_),
@@ -603,6 +624,7 @@ RealtimeHistoryEventInputV1& RealtimeHistoryEventInputV1::operator=(
     source_stream_id_ = other.source_stream_id_;
     source_sequence_ = other.source_sequence_;
     ingress_sequence_ = other.ingress_sequence_;
+    tick_stream_sequence_ = other.tick_stream_sequence_;
     instrument_id_ = other.instrument_id_;
     registry_ordinal_ = other.registry_ordinal_;
     kind_ = other.kind_;
@@ -621,7 +643,8 @@ std::optional<RealtimeHistoryEventInputV1>
 RealtimeHistoryEventInputV1::Create(
     std::uint8_t source_slot,
     std::uint64_t ingress_sequence,
-    DecodedMarketEventV1&& event) noexcept {
+    DecodedMarketEventV1&& event,
+    std::uint64_t tick_stream_sequence) noexcept {
     if (source_slot >= kRealtimeHistorySourceCountV1 ||
         ingress_sequence == 0U ||
         ingress_sequence == std::numeric_limits<std::uint64_t>::max()) {
@@ -631,6 +654,10 @@ RealtimeHistoryEventInputV1::Create(
     if (description.common == nullptr ||
         description.common->kind != description.kind ||
         !KindBelongsToSource(description.kind, source_slot) ||
+        !TickStreamSequenceConsistent(
+            description.kind,
+            ingress_sequence,
+            tick_stream_sequence) ||
         description.common->origin.source_stream_id == 0U ||
         description.common->origin.source_sequence == 0U ||
         description.common->origin.source_sequence ==
@@ -662,6 +689,7 @@ RealtimeHistoryEventInputV1::Create(
         description.common->origin.source_stream_id,
         description.common->origin.source_sequence,
         ingress_sequence,
+        tick_stream_sequence,
         description.common->instrument_id,
         description.common->registry_ordinal,
         description.kind,
@@ -791,6 +819,7 @@ public:
         std::atomic<std::uint64_t> submission_state{0U};
         std::uint64_t last_sequence = 0U;
         std::uint64_t last_ingress_sequence = 0U;
+        std::uint64_t last_tick_stream_sequence = 0U;
     };
 
     Impl(
@@ -1003,7 +1032,11 @@ public:
             input.source_slot() >= kRealtimeHistorySourceCountV1 ||
             input.source_sequence() == 0U ||
             input.ingress_sequence() == 0U ||
-            !KindBelongsToSource(input.kind(), input.source_slot())) {
+            !KindBelongsToSource(input.kind(), input.source_slot()) ||
+            !TickStreamSequenceConsistent(
+                input.kind(),
+                input.ingress_sequence(),
+                input.tick_stream_sequence())) {
             MarkFatal();
             return RealtimeHistorySubmitErrorV1::kInvalidRecord;
         }
@@ -1020,7 +1053,10 @@ public:
                 std::numeric_limits<std::uint64_t>::max() ||
             input.source_sequence() != source_owner.last_sequence + 1U ||
             input.ingress_sequence() <=
-                source_owner.last_ingress_sequence) {
+                source_owner.last_ingress_sequence ||
+            (input.tick_stream_sequence() != 0U &&
+             input.tick_stream_sequence() <=
+                 source_owner.last_tick_stream_sequence)) {
             MarkFatal();
             return RealtimeHistorySubmitErrorV1::kSequenceNotIncreasing;
         }
@@ -1039,6 +1075,8 @@ public:
             input.source_sequence();
         const std::uint64_t accepted_ingress_sequence =
             input.ingress_sequence();
+        const std::uint64_t accepted_tick_stream_sequence =
+            input.tick_stream_sequence();
         HistoryHandoffPool::Slot* slot = nullptr;
         HistoryHandoffPool& pool = HandoffPool(source, worker);
         if (!pool.Acquire(std::move(input), &slot) || slot == nullptr) {
@@ -1057,6 +1095,10 @@ public:
         source_owner.last_sequence = accepted_source_sequence;
         source_owner.last_ingress_sequence =
             accepted_ingress_sequence;
+        if (accepted_tick_stream_sequence != 0U) {
+            source_owner.last_tick_stream_sequence =
+                accepted_tick_stream_sequence;
+        }
         SignalWorkIfNeeded(worker);
         return RealtimeHistorySubmitErrorV1::kNone;
     }
@@ -1457,6 +1499,12 @@ public:
             MarkLatestCoverageLost();
             return false;
         }
+        if (config_.applied_record_sink != nullptr &&
+            !config_.applied_record_sink->PublishApplied(
+                route.registry_ordinal, *appended_record)) {
+            MarkLatestCoverageLost();
+            return false;
+        }
         return true;
     }
 
@@ -1763,11 +1811,17 @@ public:
         if (latest_read_model_ != nullptr) {
             latest_read_model_->MarkCoverageLost();
         }
+        if (config_.applied_record_sink != nullptr) {
+            config_.applied_record_sink->MarkCoverageLost();
+        }
     }
 
     void SynchronizeLatestCoverageFromStore() const noexcept {
         if (store_->coverage_lost()) {
             latest_read_model_->MarkCoverageLost();
+            if (config_.applied_record_sink != nullptr) {
+                config_.applied_record_sink->MarkCoverageLost();
+            }
         }
     }
 

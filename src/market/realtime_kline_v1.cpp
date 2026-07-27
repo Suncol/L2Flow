@@ -138,6 +138,28 @@ bool RealtimeKLineGenerationV1::coverage_from_open() const noexcept {
     return impl_->input_store->coverage_from_open();
 }
 
+KLineQueryErrorV1 RealtimeKLineGenerationV1::GetLatestBar(
+    std::uint32_t instrument_id,
+    std::uint32_t window_id,
+    KLineBarV1* output) const noexcept {
+    if (output == nullptr) {
+        return KLineQueryErrorV1::kNullOutput;
+    }
+    *output = KLineBarV1{};
+    if (instrument_id == 0U || window_id == 0U ||
+        impl_ == nullptr || impl_->worker_count == 0U) {
+        return KLineQueryErrorV1::kInvalidArgument;
+    }
+    const std::uint32_t worker =
+        instrument_id % impl_->worker_count;
+    if (worker >= impl_->worker_snapshots.size() ||
+        impl_->worker_snapshots[worker] == nullptr) {
+        return KLineQueryErrorV1::kNotFound;
+    }
+    return impl_->worker_snapshots[worker]->GetLatestBar(
+        instrument_id, window_id, output);
+}
+
 KLineQueryErrorV1 RealtimeKLineGenerationV1::OpenInstrumentCursor(
     std::uint32_t instrument_id,
     std::uint32_t window_id,

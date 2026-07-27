@@ -153,6 +153,33 @@ int main() {
         return 1;
     }
 
+    std::shared_ptr<const market::KLineAggregatorSnapshotV1>
+        empty_snapshot;
+    ok &= Expect(
+        aggregator->Capture(&empty_snapshot) ==
+                market::KLineCaptureErrorV1::kNone &&
+            empty_snapshot != nullptr,
+        "capture empty KLine snapshot");
+    if (empty_snapshot != nullptr) {
+        market::KLineBarV1 absent{};
+        absent.instrument_id = 999U;
+        ok &= Expect(
+            empty_snapshot->GetLatestBar(9U, 1U, &absent) ==
+                    market::KLineQueryErrorV1::kNotFound &&
+                absent.instrument_id == 0U,
+            "latest bar reports not found and clears output before trades");
+        ok &= Expect(
+            empty_snapshot->GetLatestBar(9U, 1U, nullptr) ==
+                market::KLineQueryErrorV1::kNullOutput,
+            "latest bar rejects null output");
+        absent.instrument_id = 999U;
+        ok &= Expect(
+            empty_snapshot->GetLatestBar(0U, 1U, &absent) ==
+                    market::KLineQueryErrorV1::kInvalidArgument &&
+                absent.instrument_id == 0U,
+            "latest bar rejects zero instrument and clears output");
+    }
+
     ok &= Expect(
         aggregator->Append(
             Trade(
@@ -229,6 +256,14 @@ int main() {
             old_bars[0U].volume_raw == 2U &&
             old_bars[0U].trade_count == 1U,
         "old snapshot remains unchanged after late trade");
+    market::KLineBarV1 first_latest{};
+    ok &= Expect(
+        first_snapshot->GetLatestBar(9U, 1U, &first_latest) ==
+                market::KLineQueryErrorV1::kNone &&
+            first_latest.window_start_ns_since_midnight ==
+                TimeNs(9U, 30U, 0U, 0U) &&
+            first_latest.close_price_p6 == 10'000'000,
+        "old snapshot latest bar remains immutable");
 
     const std::vector<market::KLineBarV1> one_second =
         Read(*second_snapshot, 1U, &ok);
@@ -262,6 +297,37 @@ int main() {
             five_second[1U].window_start_ns_since_midnight ==
                 TimeNs(14U, 59U, 55U, 0U),
         "5-second fan-out is sorted and complete");
+
+    market::KLineBarV1 latest_one_second{};
+    market::KLineBarV1 latest_five_second{};
+    ok &= Expect(
+        second_snapshot->GetLatestBar(
+            9U, 1U, &latest_one_second) ==
+                market::KLineQueryErrorV1::kNone &&
+            latest_one_second.window_start_ns_since_midnight ==
+                TimeNs(14U, 59U, 59U, 0U) &&
+            latest_one_second.close_price_p6 == 13'000'000,
+        "latest 1-second bar comes from the greatest window start");
+    ok &= Expect(
+        second_snapshot->GetLatestBar(
+            9U, 2U, &latest_five_second) ==
+                market::KLineQueryErrorV1::kNone &&
+            latest_five_second.window_start_ns_since_midnight ==
+                TimeNs(14U, 59U, 55U, 0U) &&
+            latest_five_second.close_price_p6 == 13'000'000,
+        "latest 5-second bar comes from the greatest window start");
+    latest_one_second.instrument_id = 999U;
+    ok &= Expect(
+        second_snapshot->GetLatestBar(
+            99U, 1U, &latest_one_second) ==
+                market::KLineQueryErrorV1::kNotFound &&
+            latest_one_second.instrument_id == 0U,
+        "latest bar reports an unknown instrument without stale output");
+    ok &= Expect(
+        second_snapshot->GetLatestBar(
+            9U, 99U, &latest_one_second) ==
+            market::KLineQueryErrorV1::kNotFound,
+        "latest bar reports an unknown window");
 
     market::KLineAggregatorConfigV1 tie_config{};
     tie_config.trade_date = 20260724U;

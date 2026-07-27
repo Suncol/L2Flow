@@ -99,6 +99,9 @@ public:
     [[nodiscard]] std::uint64_t ingress_sequence() const noexcept {
         return ingress_sequence_;
     }
+    [[nodiscard]] std::uint64_t tick_stream_sequence() const noexcept {
+        return tick_stream_sequence_;
+    }
     [[nodiscard]] std::uint32_t instrument_id() const noexcept {
         return instrument_id_;
     }
@@ -120,6 +123,7 @@ private:
         std::uint32_t source_stream_id,
         std::uint64_t source_sequence,
         std::uint64_t ingress_sequence,
+        std::uint64_t tick_stream_sequence,
         std::uint32_t instrument_id,
         MarketEventKindV1 kind,
         std::int64_t event_time_ns,
@@ -131,6 +135,7 @@ private:
     std::uint32_t source_stream_id_ = 0U;
     std::uint64_t source_sequence_ = 0U;
     std::uint64_t ingress_sequence_ = 0U;
+    std::uint64_t tick_stream_sequence_ = 0U;
     std::uint32_t instrument_id_ = 0U;
     MarketEventKindV1 kind_ = MarketEventKindV1::kShanghaiSnapshot;
     std::int64_t event_time_ns_ = 0;
@@ -142,6 +147,22 @@ private:
     std::uint32_t payload_delta_ = 0U;
 
     friend class IntradayInstrumentStoreV1;
+};
+
+// Optional application-composition boundary invoked only after Store append,
+// every enabled KLine update, handoff release, and the in-process latest
+// projection have all succeeded. Implementations run on permanent history
+// workers and therefore must be allocation-free, nonblocking, and noexcept.
+// Returning false is a required-projection failure: History marks all live
+// projections coverage-lost and transitions the pipeline to fatal.
+class RealtimeAppliedRecordSinkV1 {
+public:
+    virtual ~RealtimeAppliedRecordSinkV1() = default;
+
+    [[nodiscard]] virtual bool PublishApplied(
+        std::size_t registry_ordinal,
+        const RealtimeHistoryRecordV1& record) noexcept = 0;
+    virtual void MarkCoverageLost() noexcept = 0;
 };
 
 // Move-only decoder output envelope.  It contains no durable owner or heap
@@ -162,7 +183,8 @@ public:
     [[nodiscard]] static std::optional<RealtimeHistoryEventInputV1> Create(
         std::uint8_t source_slot,
         std::uint64_t ingress_sequence,
-        DecodedMarketEventV1&& event) noexcept;
+        DecodedMarketEventV1&& event,
+        std::uint64_t tick_stream_sequence = 0U) noexcept;
 
     [[nodiscard]] std::uint8_t source_slot() const noexcept {
         return source_slot_;
@@ -175,6 +197,9 @@ public:
     }
     [[nodiscard]] std::uint64_t ingress_sequence() const noexcept {
         return ingress_sequence_;
+    }
+    [[nodiscard]] std::uint64_t tick_stream_sequence() const noexcept {
+        return tick_stream_sequence_;
     }
     [[nodiscard]] std::uint32_t instrument_id() const noexcept {
         return instrument_id_;
@@ -213,6 +238,7 @@ private:
         std::uint32_t source_stream_id,
         std::uint64_t source_sequence,
         std::uint64_t ingress_sequence,
+        std::uint64_t tick_stream_sequence,
         std::uint32_t instrument_id,
         std::size_t registry_ordinal,
         MarketEventKindV1 kind,
@@ -227,6 +253,7 @@ private:
     std::uint32_t source_stream_id_ = 0U;
     std::uint64_t source_sequence_ = 0U;
     std::uint64_t ingress_sequence_ = 0U;
+    std::uint64_t tick_stream_sequence_ = 0U;
     std::uint32_t instrument_id_ = 0U;
     std::size_t registry_ordinal_ =
         std::numeric_limits<std::size_t>::max();
@@ -285,6 +312,7 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     // zero; Create then derives a hard per-worker bound from the retained
     // history record bound and window count.
     KLineAggregatorConfigV1 kline{};
+    std::shared_ptr<RealtimeAppliedRecordSinkV1> applied_record_sink;
     RealtimeHistoryAppendObserverV1 append_observer = nullptr;
     void* append_observer_context = nullptr;
 };

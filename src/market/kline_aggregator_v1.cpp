@@ -109,6 +109,37 @@ struct SnapshotSeries final {
     std::shared_ptr<const BarSeries> series;
 };
 
+[[nodiscard]] const SnapshotSeries* FindSnapshotSeries(
+    const std::vector<SnapshotSeries>& series,
+    const SeriesKey& key) noexcept {
+    const auto found = std::lower_bound(
+        series.begin(),
+        series.end(),
+        key,
+        [](const SnapshotSeries& lhs, const SeriesKey& rhs) noexcept {
+            return lhs.key < rhs;
+        });
+    if (found == series.end() ||
+        found->key.instrument_id != key.instrument_id ||
+        found->key.window_id != key.window_id ||
+        found->series == nullptr) {
+        return nullptr;
+    }
+    return &*found;
+}
+
+[[nodiscard]] const KLineBarV1* FindLatestBar(
+    const BarSeries& series) noexcept {
+    for (auto chunk = series.chunks.rbegin();
+         chunk != series.chunks.rend();
+         ++chunk) {
+        if (*chunk != nullptr && !(*chunk)->bars.empty()) {
+            return &(*chunk)->bars.back();
+        }
+    }
+    return nullptr;
+}
+
 [[nodiscard]] KLineTradeProjectionV1 ProjectTickFields(
     const DecodedMarketCommonV1& common,
     const TickFieldsV1& fields,
@@ -426,6 +457,30 @@ std::uint64_t KLineAggregatorSnapshotV1::bar_count() const noexcept {
     return impl_ == nullptr ? 0U : impl_->bar_count;
 }
 
+KLineQueryErrorV1 KLineAggregatorSnapshotV1::GetLatestBar(
+    std::uint32_t instrument_id,
+    std::uint32_t window_id,
+    KLineBarV1* output) const noexcept {
+    if (output == nullptr) {
+        return KLineQueryErrorV1::kNullOutput;
+    }
+    *output = KLineBarV1{};
+    if (impl_ == nullptr || instrument_id == 0U || window_id == 0U) {
+        return KLineQueryErrorV1::kInvalidArgument;
+    }
+    const SnapshotSeries* const found = FindSnapshotSeries(
+        impl_->series, SeriesKey{instrument_id, window_id});
+    if (found == nullptr) {
+        return KLineQueryErrorV1::kNotFound;
+    }
+    const KLineBarV1* const latest = FindLatestBar(*found->series);
+    if (latest == nullptr) {
+        return KLineQueryErrorV1::kNotFound;
+    }
+    *output = *latest;
+    return KLineQueryErrorV1::kNone;
+}
+
 KLineQueryErrorV1 KLineAggregatorSnapshotV1::OpenInstrumentCursor(
     std::uint32_t instrument_id,
     std::uint32_t window_id,
@@ -437,18 +492,9 @@ KLineQueryErrorV1 KLineAggregatorSnapshotV1::OpenInstrumentCursor(
     if (impl_ == nullptr || instrument_id == 0U || window_id == 0U) {
         return KLineQueryErrorV1::kInvalidArgument;
     }
-    const SeriesKey key{instrument_id, window_id};
-    const auto found = std::lower_bound(
-        impl_->series.begin(),
-        impl_->series.end(),
-        key,
-        [](const SnapshotSeries& lhs, const SeriesKey& rhs) noexcept {
-            return lhs.key < rhs;
-        });
-    if (found == impl_->series.end() ||
-        found->key.instrument_id != instrument_id ||
-        found->key.window_id != window_id ||
-        found->series == nullptr) {
+    const SnapshotSeries* const found = FindSnapshotSeries(
+        impl_->series, SeriesKey{instrument_id, window_id});
+    if (found == nullptr) {
         return KLineQueryErrorV1::kNotFound;
     }
     try {

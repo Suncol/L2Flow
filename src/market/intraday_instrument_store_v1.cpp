@@ -82,6 +82,19 @@ static_assert(
     }
 }
 
+[[nodiscard]] bool TickStreamSequenceConsistent(
+    MarketEventKindV1 kind,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence) noexcept {
+    if (IsSnapshotEventKindV1(kind)) {
+        return tick_stream_sequence == 0U;
+    }
+    return IsTickEventKindV1(kind) &&
+           tick_stream_sequence !=
+               std::numeric_limits<std::uint64_t>::max() &&
+           tick_stream_sequence <= ingress_sequence;
+}
+
 [[nodiscard]] bool CheckedAdd(
     std::uint64_t left,
     std::uint64_t right,
@@ -1563,6 +1576,10 @@ IntradayInstrumentStoreV1::Append(
             std::numeric_limits<std::size_t>::max() ||
         input.accounted_record_bytes() == 0U ||
         !KindBelongsToSource(input.kind(), input.source_slot()) ||
+        !TickStreamSequenceConsistent(
+            input.kind(),
+            input.ingress_sequence(),
+            input.tick_stream_sequence()) ||
         input.source_stream_id() !=
             session.source_stream_ids[input.source_slot()] ||
         route.session_epoch != session.session_epoch ||
@@ -1679,6 +1696,8 @@ IntradayInstrumentStoreV1::Append(
         input.source_sequence();
     const std::uint64_t ingress_sequence =
         input.ingress_sequence();
+    const std::uint64_t tick_stream_sequence =
+        input.tick_stream_sequence();
     const std::uint32_t instrument_id = input.instrument_id();
     const MarketEventKindV1 kind = input.kind();
     const std::int64_t event_time_ns = input.event_time_ns();
@@ -1704,6 +1723,7 @@ IntradayInstrumentStoreV1::Append(
             source_stream_id,
             source_sequence,
             ingress_sequence,
+            tick_stream_sequence,
             instrument_id,
             kind,
             event_time_ns,

@@ -110,7 +110,8 @@ private:
 
 [[nodiscard]] realtime::OwnedIngressMetadataV1 Metadata(
     std::uint64_t global_sequence,
-    std::uint64_t source_sequence) {
+    std::uint64_t source_sequence,
+    std::uint64_t tick_stream_sequence = 0U) {
     realtime::OwnedIngressMetadataV1 result{};
     result.run_id[0U] = std::byte{0x51U};
     result.run_id[15U] = std::byte{0xa5U};
@@ -119,6 +120,7 @@ private:
     result.recv_realtime_ns = 1'721'800'000'000'000'000ULL +
                               global_sequence;
     result.recv_monotonic_ns = 123'000U + global_sequence;
+    result.tick_stream_sequence = tick_stream_sequence;
     return result;
 }
 
@@ -139,7 +141,17 @@ private:
         inspect_error == realtime::OwnedIngressMessageErrorV1::kNone
             ? pool->Acquire(
                   inspection,
-                  Metadata(global_sequence, source_sequence),
+                  Metadata(
+                      global_sequence,
+                      source_sequence,
+                      inspection.source() ==
+                                  realtime::OwnedIngressSourceV1::
+                                      kShanghaiTick ||
+                              inspection.source() ==
+                                  realtime::OwnedIngressSourceV1::
+                                      kShenzhenTick
+                          ? global_sequence
+                          : 0U),
                   &result)
             : inspect_error;
     test->Expect(
@@ -293,7 +305,8 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
     FakeMessage message(
         sdk::MessageKey{6U, 101U, 33U},
         {std::byte{0x11U}, std::byte{0x22U}, std::byte{0x33U}});
-    const realtime::OwnedIngressMetadataV1 metadata = Metadata(17U, 8U);
+    const realtime::OwnedIngressMetadataV1 metadata =
+        Metadata(17U, 8U, 9U);
     realtime::OwnedIngressMessageInspectionV1 inspection;
     test->Expect(
         realtime::InspectOwnedIngressMessageV1(
@@ -317,6 +330,7 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
                 realtime::OwnedIngressSourceV1::kShenzhenTick &&
             owned->global_ingress_sequence() == 17U &&
             owned->source_sequence() == 8U &&
+            owned->tick_stream_sequence() == 9U &&
             owned->recv_realtime_ns() == metadata.recv_realtime_ns &&
             owned->recv_monotonic_ns() == metadata.recv_monotonic_ns,
         "owned message retains process sequence and receive clocks");
@@ -520,6 +534,26 @@ void CheckOwnedLifetimeAndValidation(TestContext* test) {
             realtime::OwnedIngressMessageErrorV1::kInvalidMetadata,
         "sequence exhaustion sentinel is never published as a message");
 
+    invalid_metadata = metadata;
+    invalid_metadata.tick_stream_sequence = 0U;
+    test->Expect(
+        pool->Acquire(
+            inspection, invalid_metadata, &rejected_owned) ==
+                realtime::OwnedIngressMessageErrorV1::kInvalidMetadata,
+        "a mixed-tick source requires a positive tick stream sequence");
+
+    FakeMessage snapshot_message(
+        sdk::MessageKey{6U, 101U, 28U}, {std::byte{0x01U}});
+    const auto snapshot_inspection = Inspect(test, &snapshot_message);
+    invalid_metadata = Metadata(18U, 9U, 1U);
+    test->Expect(
+        pool->Acquire(
+            snapshot_inspection,
+            invalid_metadata,
+            &rejected_owned) ==
+                realtime::OwnedIngressMessageErrorV1::kInvalidMetadata,
+        "a snapshot source cannot carry a tick stream sequence");
+
     realtime::OwnedIngressMessageInspectionV1 invalid_inspection;
     test->Expect(
         pool->Acquire(
@@ -592,7 +626,8 @@ void CheckPoolBoundsReuseAndRetiredLifetime(TestContext* test) {
     test->Expect(
         pool->Acquire(first_inspection, Metadata(1U, 1U), &first) ==
                 realtime::OwnedIngressMessageErrorV1::kNone &&
-            pool->Acquire(second_inspection, Metadata(2U, 1U), &second) ==
+            pool->Acquire(
+                second_inspection, Metadata(2U, 1U, 1U), &second) ==
                 realtime::OwnedIngressMessageErrorV1::kNone,
         "pool admits messages up to its inflight bound");
     if (!first || !second) {
@@ -660,7 +695,10 @@ void CheckPoolBoundsReuseAndRetiredLifetime(TestContext* test) {
         test->Expect(
             race_pool->Acquire(
                 race_inspection,
-                Metadata(index + 10U, index + 1U),
+                Metadata(
+                    index + 10U,
+                    index + 1U,
+                    index + 1U),
                 &release_handles[index]) ==
                 realtime::OwnedIngressMessageErrorV1::kNone,
             "retirement race message acquisition succeeds");

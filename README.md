@@ -13,6 +13,7 @@ operator-selected Vendor SDK shared library
             -> mandatory complete intraday instrument store
             -> optional event-time multi-window KLine aggregation
             |-> applied latest snapshot/tick read model
+            |-> optional read-only Linux memfd IPC projection
             -> generation barrier and ingress-prefix watermark
             -> full-universe factor calculation
             -> one atomic factor-generation publication
@@ -178,8 +179,9 @@ replaces the current slot when its process `ingress_sequence` is greater.
 Every successfully applied event is release-published to its point slot, but
 this remains a latest-value cache: a polling reader can miss intermediate
 values when writers advance faster than it reads. Lossless per-record
-consumption requires a sequence cursor/stream over retained Store records,
-not a latest API.
+consumption requires a sequence cursor, not a latest API; the optional Linux
+IPC service described below provides a bounded mixed-tick ring for that use
+case.
 
 Each batch row is one acquire observation and reports `available`,
 `not-yet-observed`, `unknown-instrument`, or `invalid-instrument-id`
@@ -190,9 +192,30 @@ observations and do not form a joint cut.
 
 Returned records are borrowed from the Store arena. They remain valid while
 the pipeline/runtime is alive, including after a clean `StopAndDrain`, but
-must not become a cross-process ABI or outlive the runtime. A Python, Arrow,
-or shared-memory adapter must project them into its own versioned wire
+must not themselves become a cross-process ABI or outlive the runtime. The
+optional IPC service projects them into an independent, versioned wire
 representation.
+
+### Python/Polars read-only IPC
+
+On Linux, `mdl-production-router` can expose the already-applied latest
+snapshot core projection, mixed latest ticks, latest KLines, and a bounded,
+sequence-checked mixed-tick cursor through a sealed memfd. An owner-only
+Unix-domain control socket passes only a read-only descriptor to same-UID
+clients. The core Pipeline remains unaware of sockets, Python, Arrow, or
+Polars. Snapshot fields outside the V1 projection—including some normalized
+status, time-validity, and market-specific fields—remain available only from
+the complete C++ Store event; the linked specification lists the boundary
+explicitly.
+
+Enable it with `--ipc-socket`; tune the ring and total mapping cap with
+`--ipc-tick-ring-records` and `--ipc-max-mapping-mib`. The socket must be an
+absolute path below an operator-owned directory with no group/other
+permissions (normally mode `0700`). The Python client uses the native C reader
+for acquire/consistent copies, then optionally builds PyArrow or Polars
+micro-batches. See
+[Realtime Python/Polars IPC V1](docs/realtime-python-polars-ipc-v1.md) for
+startup, API, cursor, heartbeat, overrun, ABI, and zero-copy constraints.
 
 ### Generation barrier and watermark
 

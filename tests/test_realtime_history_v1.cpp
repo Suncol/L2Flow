@@ -54,7 +54,8 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::uint32_t instrument_id,
-    std::int64_t price) {
+    std::int64_t price,
+    std::uint64_t tick_stream_sequence = 0U) {
     market::ShanghaiSnapshotV1 snapshot{};
     snapshot.common.kind = market::MarketEventKindV1::kShanghaiSnapshot;
     snapshot.common.market = market::MarketV1::kShanghai;
@@ -74,7 +75,10 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
 
     market::DecodedMarketEventV1 decoded(std::move(snapshot));
     return market::RealtimeHistoryEventInputV1::Create(
-        0U, ingress_sequence, std::move(decoded));
+        0U,
+        ingress_sequence,
+        std::move(decoded),
+        tick_stream_sequence);
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
@@ -82,7 +86,8 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::uint32_t instrument_id,
-    std::int64_t price) {
+    std::int64_t price,
+    std::uint64_t tick_stream_sequence = 0U) {
     market::ShanghaiTickV1 tick{};
     tick.common.kind = market::MarketEventKindV1::kShanghaiTick;
     tick.common.market = market::MarketV1::kShanghai;
@@ -102,7 +107,10 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
 
     market::DecodedMarketEventV1 decoded(std::move(tick));
     return market::RealtimeHistoryEventInputV1::Create(
-        1U, ingress_sequence, std::move(decoded));
+        1U,
+        ingress_sequence,
+        std::move(decoded),
+        tick_stream_sequence);
 }
 
 constexpr std::int64_t kTradeDateMidnightUnixNs =
@@ -371,6 +379,12 @@ int main() {
                 1U,
                 1'000'000).has_value(),
         "message records reject the reserved sequence sentinel");
+    ok &= Expect(
+        !MakeRecord(*registry, 1U, 1U, 1U, 1'000'000, 1U)
+             .has_value() &&
+            !MakeTickRecord(*registry, 1U, 1U, 1U, 900'000, 2U)
+                 .has_value(),
+        "snapshot/tick stream sequence consistency is validated");
 
     const auto generation1 = MakeWatermark(*registry, 1U, 4U, 3U, 2U);
     ok &= Expect(
@@ -395,7 +409,8 @@ int main() {
     ok &= Expect(
         Submit(
             runtime.get(),
-            MakeTickRecord(*registry, 1U, 1U, 1U, 900'001)) ==
+            MakeTickRecord(
+                *registry, 1U, 1U, 1U, 900'001, 1U)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit earlier cross-source tick after later snapshot");
 
@@ -414,7 +429,8 @@ int main() {
             runtime->GetLatestTick(1U, &live_tick) ==
                 market::RealtimeLatestQueryErrorV1::kNone &&
             live_tick.available() &&
-            live_tick.record->ingress_sequence() == 1U;
+            live_tick.record->ingress_sequence() == 1U &&
+            live_tick.record->tick_stream_sequence() == 1U;
         const bool other_snapshot_ready =
             runtime->GetLatestSnapshot(
                 2U, &live_snapshot_other_worker) ==
@@ -766,6 +782,43 @@ int main() {
             ReadKLines(*kline_generation1, 1U, 1U, &ok);
         first_5s =
             ReadKLines(*kline_generation1, 1U, 2U, &ok);
+        market::KLineBarV1 latest_1s{};
+        market::KLineBarV1 latest_5s{};
+        ok &= Expect(
+            kline_generation1->GetLatestBar(
+                1U, 1U, &latest_1s) ==
+                    market::KLineQueryErrorV1::kNone &&
+                latest_1s.window_start_ns_since_midnight ==
+                    k145959Window &&
+                latest_1s.close_price_p6 == 13'000'000,
+            "KLine generation forwards latest 1-second bar lookup");
+        ok &= Expect(
+            kline_generation1->GetLatestBar(
+                1U, 2U, &latest_5s) ==
+                    market::KLineQueryErrorV1::kNone &&
+                latest_5s.window_start_ns_since_midnight ==
+                    k145955Window &&
+                latest_5s.close_price_p6 == 13'000'000,
+            "KLine generation forwards latest 5-second bar lookup");
+        latest_1s.instrument_id = 999U;
+        ok &= Expect(
+            kline_generation1->GetLatestBar(
+                2U, 1U, &latest_1s) ==
+                    market::KLineQueryErrorV1::kNotFound &&
+                latest_1s.instrument_id == 0U,
+            "KLine generation reports no bar on another worker");
+        ok &= Expect(
+            kline_generation1->GetLatestBar(
+                1U, 1U, nullptr) ==
+                market::KLineQueryErrorV1::kNullOutput,
+            "KLine generation rejects null latest-bar output");
+        latest_1s.instrument_id = 999U;
+        ok &= Expect(
+            kline_generation1->GetLatestBar(
+                0U, 1U, &latest_1s) ==
+                    market::KLineQueryErrorV1::kInvalidArgument &&
+                latest_1s.instrument_id == 0U,
+            "KLine generation rejects zero instrument without stale output");
         ok &= Expect(
             first_1s.size() == 3U &&
                 first_1s[0U].window_start_ns_since_midnight ==
@@ -847,6 +900,22 @@ int main() {
             ReadKLines(*kline_generation2, 1U, 1U, &ok);
         const std::vector<market::KLineBarV1> second_5s =
             ReadKLines(*kline_generation2, 1U, 2U, &ok);
+        market::KLineBarV1 second_latest_1s{};
+        market::KLineBarV1 second_latest_5s{};
+        ok &= Expect(
+            kline_generation2->GetLatestBar(
+                1U, 1U, &second_latest_1s) ==
+                    market::KLineQueryErrorV1::kNone &&
+                second_latest_1s.window_start_ns_since_midnight ==
+                    k145959Window &&
+                second_latest_1s.close_price_p6 == 13'000'000 &&
+                kline_generation2->GetLatestBar(
+                    1U, 2U, &second_latest_5s) ==
+                    market::KLineQueryErrorV1::kNone &&
+                second_latest_5s.window_start_ns_since_midnight ==
+                    k145955Window &&
+                second_latest_5s.close_price_p6 == 13'000'000,
+            "late revision does not replace the greatest-window latest bars");
         ok &= Expect(
             kline_generation2->coverage_from_open() &&
                 kline_generation2->input_store().get() ==

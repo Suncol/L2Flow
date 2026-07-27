@@ -39,7 +39,25 @@ static_assert(
            metadata.global_ingress_sequence !=
                std::numeric_limits<std::uint64_t>::max() &&
            metadata.source_sequence !=
-               std::numeric_limits<std::uint64_t>::max();
+               std::numeric_limits<std::uint64_t>::max() &&
+           metadata.tick_stream_sequence !=
+               std::numeric_limits<std::uint64_t>::max() &&
+           metadata.tick_stream_sequence <=
+               metadata.global_ingress_sequence;
+}
+
+[[nodiscard]] bool TickStreamSequenceMatchesSource(
+    OwnedIngressSourceV1 source,
+    std::uint64_t tick_stream_sequence) noexcept {
+    switch (source) {
+        case OwnedIngressSourceV1::kShanghaiSnapshot:
+        case OwnedIngressSourceV1::kShenzhenSnapshot:
+            return tick_stream_sequence == 0U;
+        case OwnedIngressSourceV1::kShanghaiTick:
+        case OwnedIngressSourceV1::kShenzhenTick:
+            return tick_stream_sequence != 0U;
+    }
+    return false;
 }
 
 [[nodiscard]] bool IsValidMaximumMessageBytes(
@@ -129,6 +147,10 @@ public:
         }
         if (!InspectionValid(inspection)) {
             return OwnedIngressMessageErrorV1::kInvalidInspection;
+        }
+        if (!TickStreamSequenceMatchesSource(
+                inspection.source(), metadata.tick_stream_sequence)) {
+            return OwnedIngressMessageErrorV1::kInvalidMetadata;
         }
         if (inspection.wire_size_ > config_.maximum_message_bytes) {
             return OwnedIngressMessageErrorV1::kMessageTooLarge;

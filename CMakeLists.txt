@@ -146,9 +146,42 @@ target_link_libraries(l2flow_realtime
         L2Flow::factor
         Threads::Threads)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Cross-process read-only market data. This remains an application-layer
+    # composition dependency; the core realtime pipeline has no edge back to
+    # sockets, memfd, Python, Arrow, or Polars.
+    add_library(l2flow_ipc STATIC
+        src/ipc/realtime_wire_projection_v1.cpp
+        src/ipc/realtime_shared_service_v1.cpp)
+    add_library(L2Flow::ipc ALIAS l2flow_ipc)
+    l2flow_configure_target(l2flow_ipc)
+    target_compile_definitions(l2flow_ipc PRIVATE _GNU_SOURCE)
+    target_link_libraries(l2flow_ipc
+        PUBLIC L2Flow::market L2Flow::common Threads::Threads)
+
+    # Stable native acquire/seqcount helper. Python loads this with ctypes;
+    # it has no Python, Arrow, or Polars build dependency.
+    add_library(l2flow_shm_reader SHARED
+        src/ipc/realtime_shm_reader_c_v1.cpp)
+    l2flow_configure_target(l2flow_shm_reader)
+    target_compile_definitions(l2flow_shm_reader PRIVATE _GNU_SOURCE)
+    set_target_properties(l2flow_shm_reader PROPERTIES
+        OUTPUT_NAME "l2flow_shm_reader"
+        VERSION 1.0.0
+        SOVERSION 1
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES)
+endif()
+
 add_executable(mdl_production_router apps/mdl_production_main.cpp)
 l2flow_configure_target(mdl_production_router)
 target_link_libraries(mdl_production_router PRIVATE L2Flow::realtime)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(
+        mdl_production_router
+        PRIVATE L2FLOW_HAS_LINUX_REALTIME_IPC_V1=1)
+    target_link_libraries(mdl_production_router PRIVATE L2Flow::ipc)
+endif()
 set_target_properties(mdl_production_router PROPERTIES
     OUTPUT_NAME "mdl-production-router")
 
@@ -268,6 +301,40 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_realtime_pipeline_lifecycle_concurrency
         tests/test_realtime_pipeline_lifecycle_concurrency_v1.cpp
         L2Flow::realtime)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_realtime_ipc
+            tests/test_realtime_ipc_v1.cpp)
+        l2flow_configure_target(test_realtime_ipc)
+        target_link_libraries(test_realtime_ipc
+            PRIVATE L2Flow::ipc l2flow_shm_reader)
+        add_test(NAME test_realtime_ipc COMMAND test_realtime_ipc)
+
+        # The Python client core and its regression suite are stdlib-only.
+        # Missing Python, PyArrow, or Polars never blocks the C++ build.
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            target_compile_definitions(
+                test_realtime_ipc
+                PRIVATE
+                    L2FLOW_IPC_E2E_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+                    L2FLOW_IPC_E2E_PYTHON_PROBE="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_ipc_e2e_probe.py"
+                    L2FLOW_IPC_E2E_NATIVE_READER="$<TARGET_FILE:l2flow_shm_reader>"
+                    L2FLOW_IPC_E2E_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python")
+            add_test(
+                NAME test_l2flow_realtime_python
+                COMMAND
+                    ${Python3_EXECUTABLE} -m unittest discover
+                    -s tests/python
+                    -p test_l2flow_realtime.py
+                    -v)
+            set_tests_properties(
+                test_l2flow_realtime_python
+                PROPERTIES
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    ENVIRONMENT
+                    "PYTHONDONTWRITEBYTECODE=1;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python")
+        endif()
+    endif()
 endif()
 
 if(L2MOCK_BUILD_TESTS)

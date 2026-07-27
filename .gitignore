@@ -1,6 +1,9 @@
 /build*/
 /cmake-build*/
 /artifacts/
+/python/build/
+/python/dist/
+/python/*.egg-info/
 /.cache/
 __pycache__/
 *.py[cod]

@@ -57,6 +57,15 @@ public:
         const noexcept;
     [[nodiscard]] std::uint64_t bar_count() const noexcept;
 
+    // Copies the bar with the greatest window_start_ns_since_midnight for the
+    // requested instrument/window. The immutable snapshot owns the indexed
+    // series, so this lookup performs no allocation. A configured window with
+    // no bar and an unknown instrument/window both return kNotFound.
+    [[nodiscard]] KLineQueryErrorV1 GetLatestBar(
+        std::uint32_t instrument_id,
+        std::uint32_t window_id,
+        KLineBarV1* output) const noexcept;
+
     [[nodiscard]] KLineQueryErrorV1 OpenInstrumentCursor(
         std::uint32_t instrument_id,
         std::uint32_t window_id,

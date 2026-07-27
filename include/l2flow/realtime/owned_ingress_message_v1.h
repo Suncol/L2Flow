@@ -60,16 +60,19 @@ enum class OwnedIngressKeyErrorV1 : std::uint8_t {
 
 // Sequence values are assigned by the single serialized subscription
 // callback. They describe prefixes owned by this process, not vendor event
-// time and not WAL durability. A successful message owns both sequence
-// values exactly once; a rejected callback must not advance either counter.
-// UINT64_MAX is reserved as the exhaustion sentinel so an exclusive
-// generation cut can always be represented without wraparound.
+// time and not WAL durability. A successful message owns its sequence values
+// exactly once; a rejected callback must not advance any counter.
+// tick_stream_sequence is one dense order shared by Shanghai tick, Shenzhen
+// order, and Shenzhen transaction. Snapshot messages carry zero. UINT64_MAX
+// is reserved as the exhaustion sentinel so an exclusive generation cut can
+// always be represented without wraparound.
 struct OwnedIngressMetadataV1 final {
     l2flow::common::Identity128 run_id{};
     std::uint64_t global_ingress_sequence = 0U;
     std::uint64_t source_sequence = 0U;
     std::uint64_t recv_realtime_ns = 0U;
     std::uint64_t recv_monotonic_ns = 0U;
+    std::uint64_t tick_stream_sequence = 0U;
 };
 
 enum class OwnedIngressMessageErrorV1 : std::uint8_t {
@@ -223,6 +226,9 @@ public:
     }
     [[nodiscard]] std::uint64_t source_sequence() const noexcept {
         return metadata_.source_sequence;
+    }
+    [[nodiscard]] std::uint64_t tick_stream_sequence() const noexcept {
+        return metadata_.tick_stream_sequence;
     }
     [[nodiscard]] std::uint64_t recv_realtime_ns() const noexcept {
         return metadata_.recv_realtime_ns;

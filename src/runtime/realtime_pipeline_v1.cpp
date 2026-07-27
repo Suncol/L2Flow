@@ -70,6 +70,16 @@ void SetDetailLiteral(std::string* detail, const char* message) noexcept {
     return encoding == mdl::MDLEID_BINARY;
 }
 
+[[nodiscard]] constexpr bool IsMixedTickSourceSlot(
+    std::uint8_t source_slot) noexcept {
+    return source_slot ==
+               static_cast<std::uint8_t>(
+                   realtime::OwnedIngressSourceV1::kShanghaiTick) ||
+           source_slot ==
+               static_cast<std::uint8_t>(
+                   realtime::OwnedIngressSourceV1::kShenzhenTick);
+}
+
 [[nodiscard]] bool ProductionRegistryValid(
     const market::InstrumentRegistryV1& registry) noexcept {
     constexpr std::array<std::byte, 4U> shenzhen_source{
@@ -1052,6 +1062,8 @@ public:
             history_config.kline = config_.kline;
             history_config.kline.trade_date = config_.trade_date;
             history_config.registry = config_.registry;
+            history_config.applied_record_sink =
+                config_.applied_record_sink;
             if (latency_collector_ != nullptr) {
                 history_config.append_observer = &ObserveAppend;
                 history_config.append_observer_context = this;
@@ -1261,11 +1273,15 @@ public:
             inspection.vendor_head().local_time_raw();
         constexpr std::uint64_t exhaustion_sentinel =
             std::numeric_limits<std::uint64_t>::max();
+        const bool mixed_tick_source =
+            IsMixedTickSourceSlot(source_slot);
         // UINT64_MAX is a valid exclusive cut but is never assigned to a
         // message.  Detect that boundary here instead of misclassifying the
         // candidate as an OwnedIngress metadata failure.
         if (global_ingress_sequence_ >= exhaustion_sentinel - 1U ||
-            source_sequences_[source_slot] >= exhaustion_sentinel - 1U) {
+            source_sequences_[source_slot] >= exhaustion_sentinel - 1U ||
+            (mixed_tick_source &&
+             tick_stream_sequence_ >= exhaustion_sentinel - 1U)) {
             result.error =
                 RealtimePipelineIngressErrorV1::kSequenceExhausted;
             ++rejected_messages_;
@@ -1323,6 +1339,8 @@ public:
         metadata.source_sequence = source_sequences_[source_slot] + 1U;
         metadata.recv_realtime_ns = realtime_ns;
         metadata.recv_monotonic_ns = monotonic_ns;
+        metadata.tick_stream_sequence =
+            mixed_tick_source ? tick_stream_sequence_ + 1U : 0U;
 
         realtime::OwnedIngressMessageHandleV1 owned;
         result.owned_error =
@@ -1357,9 +1375,13 @@ public:
 
         global_ingress_sequence_ = metadata.global_ingress_sequence;
         source_sequences_[source_slot] = metadata.source_sequence;
+        if (mixed_tick_source) {
+            tick_stream_sequence_ = metadata.tick_stream_sequence;
+        }
         ++accepted_messages_;
         result.global_ingress_sequence = metadata.global_ingress_sequence;
         result.source_sequence = metadata.source_sequence;
+        result.tick_stream_sequence = metadata.tick_stream_sequence;
 
         // WAL status is intentionally observed only after realtime admission.
         if (config_.wal.enabled) {
@@ -1712,6 +1734,7 @@ public:
             result.ignored_messages = ignored_messages_;
             result.rejected_messages = rejected_messages_;
             result.global_ingress_sequence = global_ingress_sequence_;
+            result.tick_stream_sequence = tick_stream_sequence_;
             result.source_sequences = source_sequences_;
             result.last_started_generation = last_started_generation_;
         }
@@ -1980,6 +2003,8 @@ private:
         std::uint8_t source,
         const realtime::OwnedIngressMessageHandleV1& message) noexcept {
         if (!message || message->source_slot() != source ||
+            IsMixedTickSourceSlot(source) !=
+                (message->tick_stream_sequence() != 0U) ||
             message->recv_realtime_ns() >
                 static_cast<std::uint64_t>(
                     std::numeric_limits<std::int64_t>::max()) ||
@@ -2024,7 +2049,8 @@ private:
             market::RealtimeHistoryEventInputV1::Create(
                 source,
                 message->global_ingress_sequence(),
-                std::move(decoded));
+                std::move(decoded),
+                message->tick_stream_sequence());
         if (!input.has_value()) {
             return false;
         }
@@ -2128,6 +2154,7 @@ private:
 
     mutable std::mutex admission_mutex_;
     std::uint64_t global_ingress_sequence_ = 0U;
+    std::uint64_t tick_stream_sequence_ = 0U;
     std::array<std::uint64_t,
                market::kRealtimeHistorySourceCountV1>
         source_sequences_{};

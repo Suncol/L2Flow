@@ -76,6 +76,11 @@ struct RealtimePipelineConfigV1 final {
     // trade_date from the process/server date and derives maximum_bars from
     // the retained store bound when it is zero.
     l2flow::market::KLineAggregatorConfigV1 kline{};
+    // Optional required applied-record projection. The application owns the
+    // concrete transport; Pipeline only forwards this generic market-layer
+    // boundary to History.
+    std::shared_ptr<l2flow::market::RealtimeAppliedRecordSinkV1>
+        applied_record_sink;
     // Explicit test/diagnostic mode.  Disabled by default because the extra
     // clock reads and atomic histogram updates perturb the measured system.
     // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
@@ -195,6 +200,9 @@ struct RealtimePipelineIngressResultV1 final {
         l2flow::realtime::OptionalWalEnqueueResultV1::kDisabled;
     std::uint64_t global_ingress_sequence = 0U;
     std::uint64_t source_sequence = 0U;
+    // Zero for snapshots. Tick, order, and transaction share one dense
+    // process-admission sequence.
+    std::uint64_t tick_stream_sequence = 0U;
     std::uint8_t source_slot = 0U;
     std::uint32_t vendor_local_time_raw = 0U;
 
@@ -253,6 +261,9 @@ struct RealtimePipelineSnapshotV1 final {
     std::uint64_t rejected_messages = 0U;
     std::uint64_t decoded_messages = 0U;
     std::uint64_t global_ingress_sequence = 0U;
+    // Latest successfully admitted mixed-tick sequence. Snapshot admission
+    // does not advance it.
+    std::uint64_t tick_stream_sequence = 0U;
     std::array<std::uint64_t,
                l2flow::market::kRealtimeHistorySourceCountV1>
         source_sequences{};

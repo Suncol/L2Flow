@@ -56,6 +56,14 @@ public:
     [[nodiscard]] std::uint64_t bar_count() const noexcept;
     [[nodiscard]] bool coverage_from_open() const noexcept;
 
+    // Allocation-free point lookup in this exact immutable generation. The
+    // selected bar has the greatest window_start_ns_since_midnight for the
+    // requested instrument/window.
+    [[nodiscard]] KLineQueryErrorV1 GetLatestBar(
+        std::uint32_t instrument_id,
+        std::uint32_t window_id,
+        KLineBarV1* output) const noexcept;
+
     // Returns all non-empty bars since process coverage began for one
     // instrument/window, in ascending window-start order. When
     // coverage_from_open() is true this is the complete from-open view for
