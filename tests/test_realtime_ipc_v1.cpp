@@ -1,5 +1,6 @@
 #include "l2flow/ipc/realtime_shared_service_v1.h"
 #include "l2flow/ipc/realtime_shm_reader_c_v1.h"
+#include "l2flow/ipc/realtime_history_wire_v1.h"
 #include "l2flow/ipc/realtime_wire_projection_v1.h"
 #include "l2flow/ipc/realtime_wire_v1.h"
 #include "l2flow/market/instrument_registry.h"
@@ -7,6 +8,7 @@
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -14,11 +16,13 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -51,6 +55,8 @@ enum RecordIndex : std::size_t {
     kShenzhenSnapshot,
     kShenzhenOrder,
     kShenzhenTransaction,
+    kHistoryZeroSequenceTick,
+    kHistoryLongRawTick,
     kRecordCount,
 };
 
@@ -109,6 +115,42 @@ public:
 
 private:
     int descriptor_ = -1;
+};
+
+class HistoryPageStageObserver final
+    : public ipc::RealtimeHistoryPageStageObserverV1 {
+public:
+    void ObserveHistoryPageStageTiming(
+        const ipc::RealtimeHistoryPageStageTimingV1& timing)
+        noexcept override {
+        const std::size_t index =
+            next_.fetch_add(1U, std::memory_order_relaxed);
+        if (index >= timings_.size()) {
+            overflow_.store(true, std::memory_order_release);
+            return;
+        }
+        timings_[index] = timing;
+        completed_.fetch_add(1U, std::memory_order_release);
+    }
+
+    [[nodiscard]] std::size_t completed() const noexcept {
+        return completed_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool overflow() const noexcept {
+        return overflow_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] const ipc::RealtimeHistoryPageStageTimingV1&
+    timing(std::size_t index) const noexcept {
+        return timings_[index];
+    }
+
+private:
+    std::array<ipc::RealtimeHistoryPageStageTimingV1, 8U> timings_{};
+    std::atomic<std::size_t> next_{0U};
+    std::atomic<std::size_t> completed_{0U};
+    std::atomic<bool> overflow_{false};
 };
 
 class ReaderHandle final {
@@ -249,6 +291,66 @@ public:
     [[nodiscard]] std::size_t Ordinal(
         std::uint32_t instrument_id) const {
         return registry->LookupById(instrument_id).registry_ordinal;
+    }
+
+    [[nodiscard]] bool BuildStoreGeneration(
+        common::Identity128 run_id,
+        std::uint64_t generation,
+        std::uint64_t recv_monotonic_cut_ns,
+        std::shared_ptr<const market::
+                            IntradayInstrumentStoreGenerationV1>*
+            output) {
+        if (output == nullptr || generation == 0U ||
+            recv_monotonic_cut_ns == 0U) {
+            return false;
+        }
+        output->reset();
+        std::array<market::RealtimeSourceWatermarkV1, 4U> sources{};
+        for (std::size_t source = 0U; source < sources.size(); ++source) {
+            sources[source].source_stream_id =
+                kSourceStreamIds[source];
+            sources[source].sequence_exclusive =
+                source == 1U ? 4U : source == 3U ? 3U : 2U;
+        }
+        market::RealtimeHistoryWatermarkV1 watermark{};
+        if (!Expect(
+                market::BuildRealtimeHistoryWatermarkV1(
+                    run_id,
+                    generation,
+                    kTradeDate,
+                    8U,
+                    recv_monotonic_cut_ns,
+                    *registry,
+                    sources,
+                    &watermark) ==
+                    market::RealtimeHistoryWatermarkErrorV1::kNone,
+                "build IPC Store fixture watermark")) {
+            return false;
+        }
+        std::unique_ptr<
+            market::IntradayInstrumentStoreWorkerSliceV1>
+            slice;
+        if (!Expect(
+                store->CaptureWorker(0U, generation, &slice) ==
+                        market::
+                            IntradayInstrumentStoreGenerationErrorV1::
+                                kNone &&
+                    slice != nullptr,
+                "capture IPC Store fixture worker")) {
+            return false;
+        }
+        std::vector<std::unique_ptr<
+            market::IntradayInstrumentStoreWorkerSliceV1>>
+            slices;
+        slices.push_back(std::move(slice));
+        return Expect(
+            store->BuildGeneration(
+                watermark, std::move(slices), output) ==
+                    market::
+                        IntradayInstrumentStoreGenerationErrorV1::
+                            kNone &&
+                *output != nullptr,
+            "build exact immutable IPC Store generation");
     }
 
     [[nodiscard]] bool BuildKLineGenerations(
@@ -681,12 +783,63 @@ private:
             market::kTickQuantityValidV1 |
             market::kTickBuyOrderIdValidV1 |
             market::kTickSellOrderIdValidV1;
+        if (!Append(
+                std::move(shenzhen_transaction),
+                3U,
+                5U,
+                3U,
+                kShenzhenTransaction)) {
+            return false;
+        }
+
+        market::ShanghaiTickV1 zero_sequence_tick{};
+        if (!FillCommon(
+                &zero_sequence_tick.common,
+                market::MarketEventKindV1::kShanghaiTick,
+                market::MarketV1::kShanghai,
+                1U,
+                2U,
+                6U,
+                kShanghaiInstrumentId)) {
+            return false;
+        }
+        zero_sequence_tick.business_index = 502;
+        zero_sequence_tick.channel = 10;
+        zero_sequence_tick.raw_type = "D";
+        zero_sequence_tick.raw_tick_flag = "N";
+        zero_sequence_tick.fields.action =
+            market::TickActionV1::kCancel;
+        if (!Append(
+                std::move(zero_sequence_tick),
+                1U,
+                6U,
+                0U,
+                kHistoryZeroSequenceTick)) {
+            return false;
+        }
+
+        market::ShanghaiTickV1 long_raw_tick{};
+        if (!FillCommon(
+                &long_raw_tick.common,
+                market::MarketEventKindV1::kShanghaiTick,
+                market::MarketV1::kShanghai,
+                1U,
+                3U,
+                7U,
+                kShanghaiInstrumentId)) {
+            return false;
+        }
+        long_raw_tick.business_index = 503;
+        long_raw_tick.channel = 11;
+        long_raw_tick.raw_type = std::string(33U, 'T');
+        long_raw_tick.raw_tick_flag = std::string(34U, 'F');
+        long_raw_tick.fields.action = market::TickActionV1::kTrade;
         return Append(
-            std::move(shenzhen_transaction),
-            3U,
-            5U,
-            3U,
-            kShenzhenTransaction);
+            std::move(long_raw_tick),
+            1U,
+            7U,
+            4U,
+            kHistoryLongRawTick);
     }
 };
 
@@ -773,6 +926,78 @@ bool TestWireProjection(const MarketFixture& fixture) {
                     market::TickActionV1::kTrade) &&
             tick.buy_order_id == 8001 && tick.sell_order_id == 8002,
         "Shenzhen transaction wire fields");
+
+    std::uint32_t history_projection_flags =
+        std::numeric_limits<std::uint32_t>::max();
+    tick = {};
+    ok &= Expect(
+        ipc::ProjectHistoryTickWireV1(
+            *fixture.records[kHistoryZeroSequenceTick],
+            fixture.Ordinal(kShanghaiInstrumentId),
+            &tick,
+            &history_projection_flags),
+        "history projection accepts standalone zero mixed-tick sequence");
+    ok &= Expect(
+        history_projection_flags == 0U &&
+            tick.common.ingress_sequence == 6U &&
+            tick.common.tick_stream_sequence == 0U &&
+            tick.native_event_sequence == 502 &&
+            tick.raw_type_length == 1U && tick.raw_type[0U] == 'D' &&
+            tick.raw_tick_flag_length == 1U &&
+            tick.raw_tick_flag[0U] == 'N',
+        "zero-sequence history tick retains its CoreV1 fields");
+
+    ipc::RealtimeWireTickPayloadV1 strict_unchanged{};
+    strict_unchanged.common.instrument_id = 0xfeedU;
+    ok &= Expect(
+        !ipc::ProjectTickWireV1(
+            *fixture.records[kHistoryZeroSequenceTick],
+            fixture.Ordinal(kShanghaiInstrumentId),
+            &strict_unchanged) &&
+            strict_unchanged.common.instrument_id == 0xfeedU,
+        "latest/ring projection still rejects zero mixed-tick sequence");
+
+    history_projection_flags = 0U;
+    tick = {};
+    ok &= Expect(
+        ipc::ProjectHistoryTickWireV1(
+            *fixture.records[kHistoryLongRawTick],
+            fixture.Ordinal(kShanghaiInstrumentId),
+            &tick,
+            &history_projection_flags),
+        "history projection retains tick with oversized raw strings");
+    ok &= Expect(
+        history_projection_flags ==
+                (ipc::kRealtimeHistoryRawTypeOmittedV1 |
+                 ipc::kRealtimeHistoryRawTickFlagOmittedV1) &&
+            tick.projection_flags == history_projection_flags &&
+            tick.common.ingress_sequence == 7U &&
+            tick.common.tick_stream_sequence == 4U &&
+            tick.native_event_sequence == 503 &&
+            tick.raw_type_length == 0U &&
+            tick.raw_tick_flag_length == 0U &&
+            tick.raw_type ==
+                std::array<std::uint8_t, 32U>{} &&
+            tick.raw_tick_flag ==
+                std::array<std::uint8_t, 32U>{},
+        "oversized raw strings are explicitly omitted without dropping row");
+
+    strict_unchanged = {};
+    ok &= Expect(
+        ipc::ProjectTickWireV1(
+            *fixture.records[kHistoryLongRawTick],
+            fixture.Ordinal(kShanghaiInstrumentId),
+            &strict_unchanged) &&
+            strict_unchanged.projection_flags ==
+                (ipc::kRealtimeWireTickRawTypeOmittedV1 |
+                 ipc::kRealtimeWireTickRawTickFlagOmittedV1) &&
+            strict_unchanged.raw_type_length == 0U &&
+            strict_unchanged.raw_tick_flag_length == 0U &&
+            strict_unchanged.raw_type ==
+                std::array<std::uint8_t, 32U>{} &&
+            strict_unchanged.raw_tick_flag ==
+                std::array<std::uint8_t, 32U>{},
+        "latest/ring projection explicitly marks oversized raw strings");
 
     ipc::RealtimeWireTickPayloadV1 unchanged{};
     unchanged.common.instrument_id = 0xfeedU;
@@ -897,14 +1122,69 @@ bool StatusEquals(std::uint8_t actual, int expected) {
 }
 
 #if defined(L2FLOW_IPC_E2E_PYTHON_EXECUTABLE)
+bool ReadOneByte(int descriptor, char* output) {
+    if (descriptor < 0 || output == nullptr) {
+        return false;
+    }
+    ssize_t result = -1;
+    do {
+        result = ::read(descriptor, output, 1U);
+    } while (result < 0 && errno == EINTR);
+    return result == 1;
+}
+
+bool WriteOneByte(int descriptor, char value) {
+    if (descriptor < 0) {
+        return false;
+    }
+    ssize_t result = -1;
+    do {
+        result = ::write(descriptor, &value, 1U);
+    } while (result < 0 && errno == EINTR);
+    return result == 1;
+}
+
 bool RunPythonE2EProbe(
-    const std::filesystem::path& socket_path) {
+    const std::filesystem::path& socket_path,
+    const std::shared_ptr<ipc::RealtimeSharedMarketServiceV1>& service,
+    const std::shared_ptr<const market::
+                              IntradayInstrumentStoreGenerationV1>&
+        second_store_generation) {
+    if (!Expect(
+            service != nullptr && second_store_generation != nullptr,
+            "prepare Python IPC generation handoff")) {
+        return false;
+    }
+
+    int ready_descriptors[2]{-1, -1};
+    int release_descriptors[2]{-1, -1};
+    if (!Expect(
+            ::pipe(ready_descriptors) == 0,
+            "create Python IPC ready pipe")) {
+        return false;
+    }
+    UniqueFd ready_reader(ready_descriptors[0U]);
+    UniqueFd ready_writer(ready_descriptors[1U]);
+    if (!Expect(
+            ::pipe(release_descriptors) == 0,
+            "create Python IPC release pipe")) {
+        return false;
+    }
+    UniqueFd release_reader(release_descriptors[0U]);
+    UniqueFd release_writer(release_descriptors[1U]);
+
     const std::string native_socket_path = socket_path.string();
     const pid_t child = ::fork();
     if (!Expect(child >= 0, "fork Python IPC E2E probe")) {
         return false;
     }
     if (child == 0) {
+        ready_reader.Reset();
+        release_writer.Reset();
+        const std::string ready_descriptor =
+            std::to_string(ready_writer.get());
+        const std::string release_descriptor =
+            std::to_string(release_reader.get());
         ::execl(
             L2FLOW_IPC_E2E_PYTHON_EXECUTABLE,
             L2FLOW_IPC_E2E_PYTHON_EXECUTABLE,
@@ -913,6 +1193,8 @@ bool RunPythonE2EProbe(
             native_socket_path.c_str(),
             L2FLOW_IPC_E2E_NATIVE_READER,
             L2FLOW_IPC_E2E_PYTHON_SOURCE,
+            ready_descriptor.c_str(),
+            release_descriptor.c_str(),
             static_cast<char*>(nullptr));
         constexpr char message[] =
             "FAIL: exec Python IPC E2E probe\n";
@@ -924,15 +1206,33 @@ bool RunPythonE2EProbe(
         ::_exit(127);
     }
 
+    ready_writer.Reset();
+    release_reader.Reset();
+    char child_ready = '\0';
+    const bool ready =
+        ReadOneByte(ready_reader.get(), &child_ready) &&
+        child_ready == 'R';
+    const bool published =
+        ready &&
+        service->PublishStoreGeneration(second_store_generation);
+    const bool released =
+        ready &&
+        WriteOneByte(
+            release_writer.get(), published ? 'P' : 'F');
+    ready_reader.Reset();
+    release_writer.Reset();
+
     int status = 0;
     pid_t waited = -1;
     do {
         waited = ::waitpid(child, &status, 0);
     } while (waited < 0 && errno == EINTR);
     return Expect(
-        waited == child && WIFEXITED(status) &&
+        ready && published && released &&
+            waited == child && WIFEXITED(status) &&
             WEXITSTATUS(status) == 0,
-        "independent Python/native IPC E2E probe");
+        "Python cursor pins generation 1 and a new cursor reads "
+        "empty-increment generation 2");
 }
 #endif
 
@@ -1125,10 +1425,137 @@ bool TestLatestBatches(
                         ->LookupById(kShanghaiInstrumentId)
                         .quantity_unit),
         "read registry row and opaque keys");
+
+    constexpr std::size_t key_count = 9U;
+    const std::array<std::uint8_t, key_count> markets{
+        1U, 1U, 2U, 1U, 2U, 1U, 1U, 0U, 1U};
+    const std::array<std::string_view, key_count> sources{
+        "101", "101", "102", "101", "102 ", "101", "101", "", "101"};
+    const std::array<std::string_view, key_count> security_ids{
+        "600001",
+        "600003",
+        "000002",
+        "600001",
+        "000002",
+        std::string_view("600001\0", 7U),
+        "999999",
+        "600001",
+        "",
+    };
+    std::array<const std::uint8_t*, key_count> source_pointers{};
+    std::array<std::size_t, key_count> source_lengths{};
+    std::array<const std::uint8_t*, key_count> security_pointers{};
+    std::array<std::size_t, key_count> security_lengths{};
+    for (std::size_t index = 0U; index < key_count; ++index) {
+        source_pointers[index] =
+            sources[index].empty()
+                ? nullptr
+                : reinterpret_cast<const std::uint8_t*>(
+                      sources[index].data());
+        source_lengths[index] = sources[index].size();
+        security_pointers[index] =
+            security_ids[index].empty()
+                ? nullptr
+                : reinterpret_cast<const std::uint8_t*>(
+                      security_ids[index].data());
+        security_lengths[index] = security_ids[index].size();
+    }
+    std::array<std::uint32_t, key_count> resolved_ids{};
+    resolved_ids.fill(std::numeric_limits<std::uint32_t>::max());
+    std::array<std::uint8_t, key_count> lookup_statuses{};
+    const int lookup_error =
+        l2flow_shm_reader_resolve_instruments_v1(
+            reader,
+            markets.data(),
+            source_pointers.data(),
+            source_lengths.data(),
+            security_pointers.data(),
+            security_lengths.data(),
+            key_count,
+            resolved_ids.data(),
+            lookup_statuses.data());
+    ok &= Expect(
+        lookup_error == L2FLOW_SHM_READER_OK_V1 &&
+            resolved_ids[0U] == kShanghaiInstrumentId &&
+            resolved_ids[1U] == kUnobservedInstrumentId &&
+            resolved_ids[2U] == kShenzhenInstrumentId &&
+            resolved_ids[3U] == kShanghaiInstrumentId &&
+            resolved_ids[4U] == 0U && resolved_ids[5U] == 0U &&
+            resolved_ids[6U] == 0U && resolved_ids[7U] == 0U &&
+            resolved_ids[8U] == 0U &&
+            lookup_statuses[0U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_FOUND_V1 &&
+            lookup_statuses[1U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_FOUND_V1 &&
+            lookup_statuses[2U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_FOUND_V1 &&
+            lookup_statuses[3U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_FOUND_V1 &&
+            lookup_statuses[4U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_UNKNOWN_V1 &&
+            lookup_statuses[5U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_UNKNOWN_V1 &&
+            lookup_statuses[6U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_UNKNOWN_V1 &&
+            lookup_statuses[7U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_INVALID_MARKET_V1 &&
+            lookup_statuses[8U] ==
+                L2FLOW_INSTRUMENT_LOOKUP_EMPTY_SECURITY_ID_V1,
+        "exact-byte instrument resolver preserves order, duplicates, "
+        "and per-item status");
+    ok &= Expect(
+        l2flow_shm_reader_resolve_instruments_v1(
+            reader,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            0U,
+            nullptr,
+            nullptr) == L2FLOW_SHM_READER_OK_V1,
+        "empty instrument resolver batch permits null arrays");
+
+    auto malformed_source_pointers = source_pointers;
+    malformed_source_pointers[0U] = nullptr;
+    resolved_ids.fill(std::numeric_limits<std::uint32_t>::max());
+    ok &= Expect(
+        l2flow_shm_reader_resolve_instruments_v1(
+            reader,
+            markets.data(),
+            malformed_source_pointers.data(),
+            source_lengths.data(),
+            security_pointers.data(),
+            security_lengths.data(),
+            key_count,
+            resolved_ids.data(),
+            lookup_statuses.data()) ==
+                L2FLOW_SHM_READER_INVALID_ARGUMENT_V1 &&
+            resolved_ids[0U] ==
+                std::numeric_limits<std::uint32_t>::max(),
+        "instrument resolver validates all byte spans before output");
+    auto malformed_security_pointers = security_pointers;
+    malformed_security_pointers[0U] = nullptr;
+    resolved_ids.fill(std::numeric_limits<std::uint32_t>::max());
+    ok &= Expect(
+        l2flow_shm_reader_resolve_instruments_v1(
+            reader,
+            markets.data(),
+            source_pointers.data(),
+            source_lengths.data(),
+            malformed_security_pointers.data(),
+            security_lengths.data(),
+            key_count,
+            resolved_ids.data(),
+            lookup_statuses.data()) ==
+                L2FLOW_SHM_READER_INVALID_ARGUMENT_V1 &&
+            resolved_ids[0U] ==
+                std::numeric_limits<std::uint32_t>::max(),
+        "instrument resolver validates every security-ID span before output");
     return ok;
 }
 
-bool TestServiceAndReader(const MarketFixture& fixture) {
+bool TestServiceAndReader(MarketFixture& fixture) {
     bool ok = true;
     ScopedTempDirectory directory;
     if (!Expect(directory.valid(), "create private IPC temp directory")) {
@@ -1145,6 +1572,7 @@ bool TestServiceAndReader(const MarketFixture& fixture) {
 
     common::Identity128 service_run_id{};
     service_run_id[0U] = std::byte{0x5aU};
+    HistoryPageStageObserver history_stage_observer;
     ipc::RealtimeSharedServiceConfigV1 config{};
     config.run_id = service_run_id;
     config.session_epoch = 19U;
@@ -1156,6 +1584,8 @@ bool TestServiceAndReader(const MarketFixture& fixture) {
     }};
     config.tick_ring_capacity = 2U;
     config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.maximum_history_page_records = 2U;
+    config.history_stage_observer = &history_stage_observer;
     config.control_socket_path = socket_path;
 
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV1> service;
@@ -1298,13 +1728,109 @@ bool TestServiceAndReader(const MarketFixture& fixture) {
         service_run_id,
         &kline_generation,
         &second_kline_generation);
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        store_generation;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        second_store_generation;
+    ok &= fixture.BuildStoreGeneration(
+        service_run_id, 1U, 60'000U, &store_generation);
+    ok &= fixture.BuildStoreGeneration(
+        service_run_id, 2U, 60'001U, &second_store_generation);
+    ok &= Expect(
+        store_generation != nullptr &&
+            second_store_generation != nullptr &&
+            store_generation->store_session_epoch() != 0U &&
+            second_store_generation->store_session_epoch() ==
+                store_generation->store_session_epoch() &&
+            second_store_generation->record_count() ==
+                store_generation->record_count(),
+        "same Store builds a valid empty-increment generation");
+    ok &= Expect(
+        store_generation != nullptr &&
+            service->PublishStoreGeneration(store_generation),
+        "publish exact immutable Store generation");
     ok &= Expect(
         kline_generation != nullptr &&
             service->PublishKLineGeneration(*kline_generation),
         "publish exact immutable KLine generation");
 
 #if defined(L2FLOW_IPC_E2E_PYTHON_EXECUTABLE)
-    ok &= RunPythonE2EProbe(socket_path);
+    ok &= RunPythonE2EProbe(
+        socket_path, service, second_store_generation);
+    ok &= Expect(
+        history_stage_observer.completed() == 4U &&
+            !history_stage_observer.overflow(),
+        "history stage observer receives both pinned generations");
+    if (history_stage_observer.completed() == 4U) {
+        for (std::size_t index = 0U; index < 4U; ++index) {
+            const ipc::RealtimeHistoryPageStageTimingV1& timing =
+                history_stage_observer.timing(index);
+            const std::size_t generation_page = index % 2U;
+            const std::uint64_t named_build_stages =
+                timing.cursor_read_ns +
+                timing.classify_layout_ns +
+                timing.memfd_prepare_ns +
+                timing.projection_ns +
+                timing.memfd_finalize_ns;
+            const std::uint32_t expected_snapshot_count =
+                generation_page == 0U ? 1U : 0U;
+            const std::uint32_t expected_tick_count =
+                generation_page == 0U ? 1U : 2U;
+            const std::uint64_t expected_mapping_bytes =
+                sizeof(ipc::RealtimeHistoryPageHeaderV1) +
+                2U * sizeof(
+                         ipc::RealtimeHistoryRecordDescriptorV1) +
+                static_cast<std::uint64_t>(
+                    expected_snapshot_count) *
+                    sizeof(ipc::RealtimeWireSnapshotPayloadV1) +
+                static_cast<std::uint64_t>(expected_tick_count) *
+                    sizeof(ipc::RealtimeWireTickPayloadV1);
+            ok &= Expect(
+                timing.open_request_id != 0U &&
+                    timing.read_request_id != 0U &&
+                    timing.generation ==
+                        (index < 2U ? 1U : 2U) &&
+                    timing.instrument_id ==
+                        kShanghaiInstrumentId &&
+                    timing.page_index == generation_page &&
+                    timing.record_count == 2U &&
+                    timing.snapshot_count ==
+                        expected_snapshot_count &&
+                    timing.tick_count == expected_tick_count &&
+                    timing.page_mapping_bytes ==
+                        expected_mapping_bytes &&
+                    timing.clock_read_failures == 0U &&
+                    timing.cursor_read_ns != 0U &&
+                    timing.classify_layout_ns != 0U &&
+                    timing.memfd_prepare_ns != 0U &&
+                    timing.projection_ns != 0U &&
+                    timing.memfd_finalize_ns != 0U &&
+                    timing.token_ns != 0U &&
+                    timing.send_ns != 0U &&
+                    timing.build_total_ns >= named_build_stages,
+                "history stage timing identity, mix, and durations are valid");
+        }
+        ok &= Expect(
+            history_stage_observer.timing(0U).open_request_id ==
+                    history_stage_observer.timing(1U).open_request_id &&
+                history_stage_observer.timing(0U).read_request_id !=
+                    history_stage_observer.timing(1U).read_request_id &&
+                history_stage_observer.timing(2U).open_request_id ==
+                    history_stage_observer.timing(3U).open_request_id &&
+                history_stage_observer.timing(2U).read_request_id !=
+                    history_stage_observer.timing(3U).read_request_id &&
+                history_stage_observer.timing(0U).open_request_id !=
+                    history_stage_observer.timing(2U).open_request_id,
+            "history stage timing distinguishes pinned cursor identities");
+    }
+#else
+    ok &= Expect(
+        second_store_generation != nullptr &&
+            service->PublishStoreGeneration(second_store_generation) &&
+            !service->failed(),
+        "publish valid empty-increment Store generation without Python");
 #endif
 
     written = 99U;
@@ -1350,6 +1876,34 @@ bool TestServiceAndReader(const MarketFixture& fixture) {
 
     ok &= TestLatestBatches(reader.get(), fixture);
     ok &= Expect(
+        publish(kHistoryLongRawTick, kShanghaiInstrumentId) &&
+            !service->failed(),
+        "production applied sink retains tick with oversized raw strings");
+    std::array<std::uint32_t, 1U> long_raw_id{
+        kShanghaiInstrumentId};
+    std::array<ipc::RealtimeWireTickPayloadV1, 1U>
+        long_raw_latest{};
+    std::array<std::uint8_t, 1U> long_raw_status{};
+    ok &= Expect(
+        l2flow_shm_reader_latest_ticks_v1(
+            reader.get(),
+            long_raw_id.data(),
+            long_raw_id.size(),
+            long_raw_latest.data(),
+            sizeof(long_raw_latest[0U]),
+            long_raw_status.data()) ==
+                L2FLOW_SHM_READER_OK_V1 &&
+            StatusEquals(
+                long_raw_status[0U],
+                L2FLOW_LATEST_AVAILABLE_V1) &&
+            long_raw_latest[0U].common.tick_stream_sequence == 4U &&
+            long_raw_latest[0U].projection_flags ==
+                (ipc::kRealtimeWireTickRawTypeOmittedV1 |
+                 ipc::kRealtimeWireTickRawTickFlagOmittedV1) &&
+            long_raw_latest[0U].raw_type_length == 0U &&
+            long_raw_latest[0U].raw_tick_flag_length == 0U,
+        "latest tick exposes explicit oversized-raw omission flags");
+    ok &= Expect(
         second_kline_generation != nullptr &&
             service->PublishKLineGeneration(
                 *second_kline_generation),
@@ -1385,8 +1939,8 @@ bool TestServiceAndReader(const MarketFixture& fixture) {
     ok &= Expect(
         l2flow_shm_reader_session_v1(reader.get(), &session) ==
                 L2FLOW_SHM_READER_OK_V1 &&
-            session.tick_highest_published_sequence == 3U &&
-            session.tick_contiguous_published_sequence == 3U &&
+            session.tick_highest_published_sequence == 4U &&
+            session.tick_contiguous_published_sequence == 4U &&
             session.kline_generation == 2U &&
             session.heartbeat_monotonic_ns >= initial_heartbeat,
         "session exposes complete tick prefix and monotonic heartbeat");
@@ -1448,6 +2002,162 @@ bool TestServiceAndReader(const MarketFixture& fixture) {
         ::lstat(socket_path.c_str(), &socket_stat) == -1 &&
             errno == ENOENT,
         "service destruction removes its control socket");
+    return ok;
+}
+
+bool TestForeignStoreGenerationFailsClosed() {
+    MarketFixture owner_fixture;
+    MarketFixture foreign_fixture;
+    if (!owner_fixture.Initialize() || !foreign_fixture.Initialize()) {
+        return false;
+    }
+
+    bool ok = true;
+    ok &= Expect(
+        owner_fixture.registry.get() != foreign_fixture.registry.get() &&
+            owner_fixture.registry->registry_version() ==
+                foreign_fixture.registry->registry_version() &&
+            owner_fixture.registry->registry_sha256() ==
+                foreign_fixture.registry->registry_sha256(),
+        "foreign Store fixture has an independent registry object "
+        "with the same registry identity");
+
+    common::Identity128 run_id{};
+    run_id[0U] = std::byte{0x6cU};
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        owner_generation;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        foreign_generation;
+    ok &= owner_fixture.BuildStoreGeneration(
+        run_id, 1U, 70'000U, &owner_generation);
+    ok &= foreign_fixture.BuildStoreGeneration(
+        run_id, 2U, 70'001U, &foreign_generation);
+    if (owner_generation == nullptr || foreign_generation == nullptr) {
+        return false;
+    }
+
+    bool same_source_cuts = true;
+    for (std::size_t source = 0U;
+         source <
+         owner_generation->watermark().sources.size();
+         ++source) {
+        same_source_cuts =
+            same_source_cuts &&
+            owner_generation->watermark()
+                    .sources[source]
+                    .source_stream_id ==
+                foreign_generation->watermark()
+                    .sources[source]
+                    .source_stream_id &&
+            owner_generation->watermark()
+                    .sources[source]
+                    .sequence_exclusive ==
+            foreign_generation->watermark()
+                    .sources[source]
+                    .sequence_exclusive;
+    }
+    bool same_instrument_counts = true;
+    for (std::size_t ordinal = 0U;
+         ordinal < owner_generation->instrument_count();
+         ++ordinal) {
+        market::IntradayInstrumentSummaryV1 owner_summary{};
+        market::IntradayInstrumentSummaryV1 foreign_summary{};
+        same_instrument_counts =
+            same_instrument_counts &&
+            owner_generation->SummaryAt(ordinal, &owner_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            foreign_generation->SummaryAt(ordinal, &foreign_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            owner_summary.instrument_id ==
+                foreign_summary.instrument_id &&
+            owner_summary.record_count ==
+                foreign_summary.record_count &&
+            owner_summary.source_record_counts ==
+                foreign_summary.source_record_counts;
+    }
+    ok &= Expect(
+        owner_generation->store_session_epoch() != 0U &&
+            foreign_generation->store_session_epoch() != 0U &&
+            owner_generation->store_session_epoch() !=
+                foreign_generation->store_session_epoch() &&
+            owner_generation->record_count() ==
+                foreign_generation->record_count() &&
+            owner_generation->watermark()
+                    .ingress_sequence_exclusive ==
+                foreign_generation->watermark()
+                    .ingress_sequence_exclusive &&
+            owner_generation->watermark().generation == 1U &&
+            foreign_generation->watermark().generation == 2U &&
+            owner_generation->watermark().recv_monotonic_cut_ns ==
+                70'000U &&
+            foreign_generation->watermark().recv_monotonic_cut_ns ==
+                70'001U &&
+            owner_generation->watermark().run_id ==
+                foreign_generation->watermark().run_id &&
+            owner_generation->watermark().trade_date ==
+                foreign_generation->watermark().trade_date &&
+            owner_generation->watermark().registry_version ==
+                foreign_generation->watermark().registry_version &&
+            owner_generation->watermark().registry_sha256 ==
+                foreign_generation->watermark().registry_sha256 &&
+            owner_generation->coverage_from_open() ==
+                foreign_generation->coverage_from_open() &&
+            same_source_cuts && same_instrument_counts,
+        "foreign generation matches service continuity metadata "
+        "except Store provenance and expected monotonic cuts");
+
+    ScopedTempDirectory directory;
+    if (!Expect(
+            directory.valid(),
+            "create private foreign-Store IPC directory")) {
+        return false;
+    }
+    const std::filesystem::path socket_path =
+        directory.path() / "foreign-store.sock";
+    ipc::RealtimeSharedServiceConfigV1 config{};
+    config.run_id = run_id;
+    config.session_epoch = 23U;
+    config.trade_date = kTradeDate;
+    config.registry = owner_fixture.registry.get();
+    config.tick_ring_capacity = 2U;
+    config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.control_socket_path = socket_path;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV1> service;
+    int system_error = 0;
+    const auto create_error =
+        ipc::RealtimeSharedMarketServiceV1::Create(
+            std::move(config), &service, &system_error);
+    if (!Expect(
+            create_error ==
+                    ipc::RealtimeSharedServiceCreateErrorV1::kNone &&
+                service != nullptr && system_error == 0,
+            "create independent foreign-Store test service")) {
+        return false;
+    }
+    if (!Expect(
+            service->Start(&system_error) && system_error == 0,
+            "start independent foreign-Store test service")) {
+        service->StopControl();
+        return false;
+    }
+
+    ok &= Expect(
+        service->PublishStoreGeneration(owner_generation) &&
+            !service->failed(),
+        "independent service accepts its first Store provenance");
+    ok &= Expect(
+        !service->PublishStoreGeneration(foreign_generation) &&
+            service->failed(),
+        "same-registry generation from a foreign Store fails closed");
+    ok &= Expect(
+        !service->PublishApplied(
+            owner_fixture.Ordinal(kShanghaiInstrumentId),
+            *owner_fixture.records[kShanghaiSnapshot]),
+        "failed service rejects publication after foreign Store provenance");
+    service->StopControl();
     return ok;
 }
 
@@ -1514,7 +2224,15 @@ bool TestServiceLifecycle(const MarketFixture& fixture) {
         ok &= Expect(
             clean->MarkStoppedClean(0U) && !clean->failed(),
             "empty mixed-tick session reaches STOPPED_CLEAN");
-        clean->StopControl();
+        std::thread first_stop(
+            [&clean]() { clean->StopControl(); });
+        std::thread second_stop(
+            [&clean]() { clean->StopControl(); });
+        first_stop.join();
+        second_stop.join();
+        ok &= Expect(
+            !clean->failed(),
+            "concurrent control stop calls are serialized safely");
     }
     clean.reset();
 
@@ -1544,6 +2262,7 @@ int main() {
     }
     bool ok = true;
     ok &= TestWireProjection(fixture);
+    ok &= TestForeignStoreGenerationFailsClosed();
     ok &= TestServiceAndReader(fixture);
     ok &= TestServiceLifecycle(fixture);
     if (!ok) {

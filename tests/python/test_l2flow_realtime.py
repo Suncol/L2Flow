@@ -1,22 +1,31 @@
 from __future__ import annotations
 
 import array
+import csv
 import ctypes
+import fcntl
 import importlib.util
+import json
 import os
 import socket
 import struct
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from l2flow_realtime import (
+    ClientClosedError,
+    InstrumentKey,
+    InstrumentLookupStatus,
     L2FlowClient,
     LatestBatch,
     LatestResult,
     LatestStatus,
+    Market,
     MarketEventKind,
     OptionalDependencyError,
     ServerState,
@@ -27,6 +36,8 @@ from l2flow_realtime import (
     TickBatch,
     TickFactorRunner,
     TickOverrunError,
+    TickProjectionFlag,
+    WireFormatError,
 )
 from l2flow_realtime.control import (
     CONTROL_MAGIC,
@@ -34,6 +45,13 @@ from l2flow_realtime.control import (
     RESPONSE_BYTES,
     discover_session_fd,
     receive_session_fd,
+)
+from l2flow_realtime.history import (
+    HISTORY_GENERATION_RECORD_COVERAGE_COMPLETE,
+    READ_HISTORY_REQUEST_BYTES,
+    HistoryCursor,
+    HistoryGeneration,
+    _validate_expected_generation,
 )
 from l2flow_realtime.models import Instrument
 from l2flow_realtime.native import (
@@ -45,6 +63,10 @@ from l2flow_realtime.wire import (
     KLINE_BYTES,
     SNAPSHOT_BYTES,
     TICK_BYTES,
+    TICK_PROJECTION_RAW_TICK_FLAG_OMITTED,
+    TICK_PROJECTION_RAW_TYPE_OMITTED,
+    WIRE_MAJOR,
+    WIRE_MINOR,
     _COMMON,
     _INSTRUMENT,
     _KLINE,
@@ -105,7 +127,22 @@ def snapshot_payload(instrument_id=7):
     return bytes(result)
 
 
-def tick_payload(sequence=1, instrument_id=7, kind=2, action=3):
+def tick_payload(
+    sequence=1,
+    instrument_id=7,
+    kind=2,
+    action=3,
+    *,
+    projection_flags=0,
+    raw_type=None,
+    raw_tick_flag=None,
+):
+    if raw_type is None:
+        raw_type = b"T" if kind == 2 else b""
+    if raw_tick_flag is None:
+        raw_tick_flag = b"B" if kind == 2 else b""
+    if len(raw_type) > 32 or len(raw_tick_flag) > 32:
+        raise ValueError("test raw payload exceeds fixed wire capacity")
     result = bytearray(TICK_BYTES)
     result[:128] = common_payload(
         TICK_BYTES,
@@ -118,7 +155,7 @@ def tick_payload(sequence=1, instrument_id=7, kind=2, action=3):
         result,
         128,
         0x3,
-        0,
+        projection_flags,
         5,
         77,
         0,
@@ -128,14 +165,14 @@ def tick_payload(sequence=1, instrument_id=7, kind=2, action=3):
         2,
         1,
         3,
-        1,
-        1,
+        len(raw_type),
+        len(raw_tick_flag),
         0,
     )
     struct.pack_into("<qqBBB5x", result, 168, 1234, 12_340_000, 2, 1, 0)
     struct.pack_into("<qBBB5x", result, 192, 100, 0, 1, 0)
-    result[272] = ord("T")
-    result[304] = ord("B")
+    result[272 : 272 + len(raw_type)] = raw_type
+    result[304 : 304 + len(raw_tick_flag)] = raw_tick_flag
     return bytes(result)
 
 
@@ -208,6 +245,7 @@ class FakeNative:
             1: tick_payload(1),
             2: tick_payload(2, kind=4, action=1),
         }
+        self.resolved_key_batches = []
 
     def session(self):
         return self.current_session
@@ -219,6 +257,27 @@ class FakeNative:
         if instrument_id != 7:
             raise ValueError("unknown")
         return Instrument(7, 1, 1, 1, 1, b"XSHG", b"600000")
+
+    def resolve_instruments(self, keys):
+        self.resolved_key_batches.append(tuple(keys))
+        statuses = []
+        instrument_ids = []
+        for key in keys:
+            if key.market not in (Market.SHANGHAI, Market.SHENZHEN):
+                status = InstrumentLookupStatus.INVALID_MARKET
+            elif not key.security_id:
+                status = InstrumentLookupStatus.EMPTY_SECURITY_ID
+            elif key == InstrumentKey(
+                Market.SHANGHAI, b"XSHG", b"600000"
+            ):
+                status = InstrumentLookupStatus.FOUND
+            else:
+                status = InstrumentLookupStatus.UNKNOWN
+            statuses.append(status)
+            instrument_ids.append(
+                7 if status is InstrumentLookupStatus.FOUND else 0
+            )
+        return tuple(statuses), tuple(instrument_ids)
 
     def latest_snapshots(self, instrument_ids):
         statuses = []
@@ -330,11 +389,71 @@ class WireModelTests(unittest.TestCase):
         self.assertIsInstance(snapshot.last_price.p6, int)
 
     def test_tick_preserves_mixed_kind_action_and_raw_bytes(self):
-        tick = parse_tick(tick_payload(2, kind=4, action=1))
-        self.assertEqual(tick.common.event_kind, MarketEventKind.SHENZHEN_ORDER)
+        tick = parse_tick(tick_payload(2, kind=2, action=1))
+        self.assertEqual(
+            tick.common.event_kind, MarketEventKind.SHANGHAI_TICK
+        )
         self.assertEqual(tick.action, TickAction.ADD)
+        self.assertEqual(tick.projection_flags, TickProjectionFlag.NONE)
         self.assertEqual(tick.raw_type, b"T")
         self.assertEqual(tick.raw_tick_flag, b"B")
+
+        order = parse_tick(tick_payload(2, kind=4, action=1))
+        self.assertEqual(
+            order.common.event_kind, MarketEventKind.SHENZHEN_ORDER
+        )
+        self.assertEqual(order.raw_type, b"")
+        self.assertEqual(order.raw_tick_flag, b"")
+
+    def test_tick_projection_flags_are_explicit_and_strict(self):
+        flags = (
+            TICK_PROJECTION_RAW_TYPE_OMITTED
+            | TICK_PROJECTION_RAW_TICK_FLAG_OMITTED
+        )
+        omitted = parse_tick(
+            tick_payload(
+                projection_flags=flags,
+                raw_type=b"",
+                raw_tick_flag=b"",
+            )
+        )
+        self.assertTrue(omitted.raw_type_omitted)
+        self.assertTrue(omitted.raw_tick_flag_omitted)
+        self.assertEqual(
+            omitted.projection_flags,
+            TickProjectionFlag.RAW_TYPE_OMITTED
+            | TickProjectionFlag.RAW_TICK_FLAG_OMITTED,
+        )
+
+        with self.assertRaisesRegex(WireFormatError, "unknown"):
+            parse_tick(tick_payload(projection_flags=1 << 31))
+        with self.assertRaisesRegex(WireFormatError, "conflicts"):
+            parse_tick(
+                tick_payload(
+                    projection_flags=(
+                        TICK_PROJECTION_RAW_TYPE_OMITTED
+                    )
+                )
+            )
+        with self.assertRaisesRegex(WireFormatError, "require Shanghai"):
+            parse_tick(
+                tick_payload(
+                    kind=4,
+                    projection_flags=(
+                        TICK_PROJECTION_RAW_TYPE_OMITTED
+                    ),
+                    raw_type=b"",
+                    raw_tick_flag=b"",
+                )
+            )
+        with self.assertRaisesRegex(WireFormatError, "Shanghai raw"):
+            parse_tick(
+                tick_payload(
+                    kind=4,
+                    raw_type=b"T",
+                    raw_tick_flag=b"",
+                )
+            )
 
     def test_common_rejects_event_kind_source_slot_mismatch(self):
         malformed = bytearray(tick_payload())
@@ -349,6 +468,93 @@ class WireModelTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_exact_symbol_resolution_batch_and_point(self):
+        native = FakeNative()
+        client = L2FlowClient(native)
+        self.addCleanup(client.close)
+        exact = InstrumentKey(
+            Market.SHANGHAI, b"XSHG", b"600000"
+        )
+        results = client.resolve_instruments(
+            [
+                exact,
+                exact,
+                InstrumentKey(
+                    Market.SHANGHAI, b"XSHG ", b"600000"
+                ),
+                InstrumentKey(
+                    Market.SHANGHAI, b"XSHG", b"600000\x00"
+                ),
+                InstrumentKey(Market.UNKNOWN, b"", b"600000"),
+                InstrumentKey(Market.SHANGHAI, b"XSHG", b""),
+            ]
+        )
+        self.assertEqual(
+            [result.status for result in results],
+            [
+                InstrumentLookupStatus.FOUND,
+                InstrumentLookupStatus.FOUND,
+                InstrumentLookupStatus.UNKNOWN,
+                InstrumentLookupStatus.UNKNOWN,
+                InstrumentLookupStatus.INVALID_MARKET,
+                InstrumentLookupStatus.EMPTY_SECURITY_ID,
+            ],
+        )
+        self.assertEqual(
+            [result.instrument_id for result in results],
+            [7, 7, None, None, None, None],
+        )
+        point = client.resolve_instrument(
+            Market.SHANGHAI, b"XSHG", b"600000"
+        )
+        self.assertTrue(point.found)
+        self.assertEqual(point.instrument_id, 7)
+        self.assertEqual(len(native.resolved_key_batches), 2)
+        self.assertEqual(len(native.resolved_key_batches[-1]), 1)
+
+        with self.assertRaisesRegex(TypeError, "exact bytes"):
+            client.resolve_instrument(
+                Market.SHANGHAI, "XSHG", b"600000"
+            )
+        with self.assertRaisesRegex(TypeError, "InstrumentKey"):
+            client.resolve_instruments(
+                [(Market.SHANGHAI, b"XSHG", b"600000")]
+            )
+
+    def test_symbol_resolution_empty_opaque_and_closed_boundaries(self):
+        native = FakeNative()
+        client = L2FlowClient(native)
+        self.assertEqual(client.resolve_instruments(()), ())
+        opaque = InstrumentKey(
+            Market.SHANGHAI, b"\xff\x00", b"600000"
+        )
+        result = client.resolve_instruments((opaque,))[0]
+        self.assertEqual(result.status, InstrumentLookupStatus.UNKNOWN)
+        self.assertEqual(
+            native.resolved_key_batches[-1],
+            (opaque,),
+        )
+        client.close()
+        with self.assertRaises(ClientClosedError):
+            client.resolve_instruments((opaque,))
+
+    def test_symbol_resolution_rejects_native_status_id_corruption(self):
+        native = FakeNative()
+        native.resolve_instruments = lambda _keys: (
+            (InstrumentLookupStatus.FOUND,),
+            (0,),
+        )
+        client = L2FlowClient(native)
+        self.addCleanup(client.close)
+        with self.assertRaises(WireFormatError):
+            client.resolve_instruments(
+                (
+                    InstrumentKey(
+                        Market.SHANGHAI, b"XSHG", b"600000"
+                    ),
+                )
+            )
+
     def test_latest_batch_order_duplicates_and_status(self):
         client = L2FlowClient(FakeNative())
         self.addCleanup(client.close)
@@ -419,6 +625,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(records["tick_stream_sequence"].tolist(), [1, 2])
         self.assertEqual(records["ingress_sequence"].tolist(), [11, 12])
         self.assertEqual(records["event_kind"].tolist(), [2, 4])
+        self.assertEqual(records["projection_flags"].tolist(), [0, 0])
         self.assertEqual(records["action"].tolist(), [3, 1])
         self.assertEqual(records["price_raw"].tolist(), [1234, 1234])
         self.assertEqual(records["price_p6"].tolist(), [12_340_000] * 2)
@@ -686,6 +893,802 @@ class ClientTests(unittest.TestCase):
             closed.read_ticks(0, 1)
 
 
+class HistoryProtocolTests(unittest.TestCase):
+    @staticmethod
+    def generation():
+        return HistoryGeneration(
+            run_id=b"0123456789abcdef",
+            session_epoch=5,
+            generation=1,
+            trade_date=20260727,
+            instrument_id=7,
+            registry_ordinal=0,
+            instrument_count=1,
+            ingress_sequence_exclusive=1,
+            recv_monotonic_cut_ns=123,
+            registry_version=3,
+            registry_sha256=b"r" * 32,
+            input_identity_sha256=b"i" * 32,
+            source_stream_ids=(31, 32, 33, 34),
+            source_sequence_exclusive=(1, 1, 1, 1),
+            source_record_counts=(0, 0, 0, 0),
+            total_record_count=0,
+            flags=HISTORY_GENERATION_RECORD_COVERAGE_COMPLETE,
+            payload_projection=1,
+        )
+
+    @staticmethod
+    def populated_generation():
+        return HistoryGeneration(
+            run_id=b"0123456789abcdef",
+            session_epoch=5,
+            generation=2,
+            trade_date=20260727,
+            instrument_id=7,
+            registry_ordinal=0,
+            instrument_count=1,
+            ingress_sequence_exclusive=2,
+            recv_monotonic_cut_ns=123,
+            registry_version=3,
+            registry_sha256=b"r" * 32,
+            input_identity_sha256=b"i" * 32,
+            source_stream_ids=(31, 32, 33, 34),
+            source_sequence_exclusive=(1, 2, 1, 1),
+            source_record_counts=(0, 1, 0, 0),
+            total_record_count=1,
+            flags=HISTORY_GENERATION_RECORD_COVERAGE_COMPLETE,
+            payload_projection=1,
+        )
+
+    @staticmethod
+    def history_tick_page(generation):
+        from l2flow_realtime import history as history_module
+
+        payload = bytearray(tick_payload(1, instrument_id=7))
+        struct.pack_into("<Q", payload, 16, 1)
+        struct.pack_into("<Q", payload, 24, 1)
+        struct.pack_into("<I", payload, 96, 32)
+        descriptor_offset = history_module.HISTORY_PAGE_HEADER_BYTES
+        snapshot_offset = (
+            descriptor_offset + history_module.HISTORY_DESCRIPTOR_BYTES
+        )
+        tick_offset = snapshot_offset
+        total_bytes = tick_offset + TICK_BYTES
+        page = bytearray(total_bytes)
+        history_module._PAGE_PREFIX.pack_into(
+            page,
+            0,
+            history_module.HISTORY_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            history_module.HISTORY_PAGE_HEADER_BYTES,
+            history_module.HISTORY_ENDIAN_MARKER,
+            0,
+            total_bytes,
+            0,
+            1,
+            history_module.HISTORY_DESCRIPTOR_BYTES,
+            descriptor_offset,
+            snapshot_offset,
+            0,
+            SNAPSHOT_BYTES,
+            tick_offset,
+            1,
+            TICK_BYTES,
+            1,
+            1,
+        )
+        history_module._GENERATION_INFO.pack_into(
+            page,
+            104,
+            generation.run_id,
+            generation.session_epoch,
+            generation.generation,
+            generation.trade_date,
+            generation.instrument_id,
+            generation.registry_ordinal,
+            generation.instrument_count,
+            generation.ingress_sequence_exclusive,
+            generation.recv_monotonic_cut_ns,
+            generation.registry_version,
+            generation.registry_sha256,
+            generation.input_identity_sha256,
+            *generation.source_stream_ids,
+            *generation.source_sequence_exclusive,
+            *generation.source_record_counts,
+            generation.total_record_count,
+            generation.flags,
+            generation.payload_projection,
+            0,
+            0,
+            0,
+        )
+        history_module._DESCRIPTOR.pack_into(
+            page,
+            descriptor_offset,
+            1,
+            1,
+            1,
+            0,
+            0,
+            history_module.HISTORY_PAYLOAD_TICK,
+            int(MarketEventKind.SHANGHAI_TICK),
+            1,
+            0,
+            0,
+        )
+        page[tick_offset:] = payload
+        return bytes(page)
+
+    def test_history_page_refactor_preserves_decode_result_and_boundary(self):
+        from l2flow_realtime import history as history_module
+
+        if not hasattr(os, "memfd_create"):
+            self.skipTest("memfd_create is unavailable")
+        generation = self.populated_generation()
+        page = self.history_tick_page(generation)
+        layout = history_module._validate_page_header(
+            page,
+            expected_bytes=len(page),
+            expected_records=1,
+            expected_page_index=0,
+            generation=generation,
+            prior_ingress_sequence=0,
+        )
+        expected = history_module._decode_page_objects(
+            page,
+            layout=layout,
+            generation=generation,
+            prior_ingress_sequence=0,
+            prior_source_sequences=(0, 0, 0, 0),
+        )
+
+        writable_fd = os.memfd_create(
+            "l2flow-history-python-test",
+            getattr(os, "MFD_CLOEXEC", 0x0001)
+            | getattr(os, "MFD_ALLOW_SEALING", 0x0002),
+        )
+        self.addCleanup(lambda: os.close(writable_fd))
+        self.assertEqual(os.write(writable_fd, page), len(page))
+        seals = (
+            getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+            | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+            | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+            | getattr(fcntl, "F_SEAL_SEAL", 0x0001)
+        )
+        fcntl.fcntl(
+            writable_fd,
+            getattr(fcntl, "F_ADD_SEALS", 1033),
+            seals,
+        )
+        readonly_fd = os.open(
+            f"/proc/self/fd/{writable_fd}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        self.addCleanup(lambda: os.close(readonly_fd))
+        with mock.patch.object(
+            history_module,
+            "_decode_page_objects",
+            wraps=history_module._decode_page_objects,
+        ) as decode:
+            actual = history_module._parse_page(
+                readonly_fd,
+                expected_bytes=len(page),
+                expected_records=1,
+                expected_page_index=0,
+                generation=generation,
+                prior_ingress_sequence=0,
+                prior_source_sequences=(0, 0, 0, 0),
+            )
+        self.assertEqual(actual, expected)
+        decode.assert_called_once()
+
+        malformed = bytearray(page)
+        malformed[0] ^= 0xFF
+        with self.assertRaisesRegex(WireFormatError, "magic mismatch"):
+            history_module._validate_page_header(
+                malformed,
+                expected_bytes=len(malformed),
+                expected_records=1,
+                expected_page_index=0,
+                generation=generation,
+                prior_ingress_sequence=0,
+            )
+
+    def test_close_interrupts_timeout_none_blocking_read(self):
+        client_socket, server_socket = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET
+        )
+        self.addCleanup(server_socket.close)
+        cursor = HistoryCursor(
+            _channel=client_socket,
+            generation=self.generation(),
+            requested_page_records=1,
+        )
+        self.addCleanup(cursor.close)
+        read_finished = threading.Event()
+        close_finished = threading.Event()
+        read_errors = []
+        read_pages = []
+        close_errors = []
+
+        def blocking_read():
+            try:
+                read_pages.append(cursor.read())
+            except BaseException as error:  # preserve the worker failure
+                read_errors.append(error)
+            finally:
+                read_finished.set()
+
+        def close_cursor():
+            try:
+                cursor.close()
+            except BaseException as error:  # preserve the worker failure
+                close_errors.append(error)
+            finally:
+                close_finished.set()
+
+        reader = threading.Thread(target=blocking_read, daemon=True)
+        reader.start()
+        server_socket.settimeout(1.0)
+        request = server_socket.recv(READ_HISTORY_REQUEST_BYTES)
+        if not request:
+            read_finished.wait(0.2)
+        self.assertEqual(
+            len(request),
+            READ_HISTORY_REQUEST_BYTES,
+            f"reader exited before sending a request: {read_errors!r}",
+        )
+
+        closer = threading.Thread(target=close_cursor, daemon=True)
+        closer.start()
+        closed_without_peer_response = close_finished.wait(1.0)
+        if not closed_without_peer_response:
+            # Ensure a regression fails promptly instead of leaving unittest
+            # blocked forever behind the cursor lock.
+            server_socket.close()
+            close_finished.wait(1.0)
+            read_finished.wait(1.0)
+            self.fail(
+                "close() did not interrupt a timeout=None history read"
+            )
+
+        self.assertTrue(
+            read_finished.wait(1.0),
+            "history read did not exit after concurrent close",
+        )
+        reader.join(1.0)
+        closer.join(1.0)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertFalse(close_errors)
+        self.assertEqual(len(read_errors), 1)
+        self.assertFalse(read_pages)
+        self.assertTrue(cursor.closed)
+        self.assertFalse(cursor.done)
+        cursor.close()  # repeated close remains harmless
+
+    def test_expected_generation_identity_mismatch_is_stale(self):
+        generation = self.generation()
+        expected = {
+            "instrument_id": generation.instrument_id,
+            "expected_run_id": generation.run_id,
+            "expected_session_epoch": generation.session_epoch,
+            "expected_trade_date": generation.trade_date,
+            "expected_instrument_count": generation.instrument_count,
+            "expected_registry_version": generation.registry_version,
+            "expected_registry_sha256": generation.registry_sha256,
+        }
+        _validate_expected_generation(generation, **expected)
+        mismatches = {
+            "expected_run_id": b"fedcba9876543210",
+            "expected_session_epoch": generation.session_epoch + 1,
+            "expected_trade_date": generation.trade_date + 1,
+            "expected_instrument_count": generation.instrument_count + 1,
+            "expected_registry_version": generation.registry_version + 1,
+            "expected_registry_sha256": b"s" * 32,
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                changed = dict(expected)
+                changed[field] = value
+                with self.assertRaises(StaleSessionError):
+                    _validate_expected_generation(
+                        generation, **changed
+                    )
+
+
+class HistoryBenchmarkToolTests(unittest.TestCase):
+    @staticmethod
+    def module():
+        tool_path = (
+            Path(__file__).resolve().parents[2]
+            / "tools"
+            / "benchmark_instrument_history_stages.py"
+        )
+        module_name = "benchmark_instrument_history_stages_test"
+        spec = importlib.util.spec_from_file_location(module_name, tool_path)
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load history benchmark tool")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_history_benchmark_arguments_and_csv_contract(self):
+        benchmark = self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            args = benchmark._parse_args(
+                [
+                    "/tmp/l2flow-history.sock",
+                    str(Path(__file__).resolve().parents[2] / "python"),
+                    str(output_dir),
+                    "--instrument-id",
+                    "7",
+                    "--benchmark-run-id",
+                    "91",
+                    "--page-records",
+                    "64",
+                    "--rounds",
+                    "2",
+                    "--warmups",
+                    "0",
+                    "--records",
+                    "17",
+                ]
+            )
+            self.assertEqual(args.instrument_id, 7)
+            self.assertEqual(args.benchmark_run_id, 91)
+            self.assertEqual(args.page_records, 64)
+            self.assertEqual(args.rounds, 2)
+            self.assertEqual(args.warmup_rounds, 0)
+            self.assertEqual(args.expected_records, 17)
+
+            page_path = output_dir / "client_pages.csv"
+            row = {name: 0 for name in benchmark.CLIENT_PAGE_FIELDS}
+            row.update(
+                {
+                    "benchmark_run_id": 91,
+                    "scan_id": 0,
+                    "phase": "measure",
+                    "read_request_id": 123,
+                }
+            )
+            benchmark._write_csv(
+                page_path,
+                benchmark.CLIENT_PAGE_FIELDS,
+                [row],
+            )
+            with page_path.open(newline="", encoding="utf-8") as source:
+                rows = list(csv.DictReader(source))
+            self.assertEqual(
+                tuple(rows[0]),
+                benchmark.CLIENT_PAGE_FIELDS,
+            )
+            self.assertEqual(rows[0]["benchmark_run_id"], "91")
+            self.assertEqual(rows[0]["read_request_id"], "123")
+
+
+class HistoryBenchmarkAnalyzerTests(unittest.TestCase):
+    @staticmethod
+    def module():
+        analyzer_path = (
+            Path(__file__).resolve().parents[2]
+            / "benchmarks"
+            / "analyze_single_instrument_history_stages.py"
+        )
+        module_name = "analyze_single_instrument_history_stages_test"
+        spec = importlib.util.spec_from_file_location(
+            module_name, analyzer_path
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load history benchmark analyzer")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _rows():
+        config = [
+            {
+                "schema_version": 1,
+                "benchmark_run_id": 42,
+                "records": 2,
+                "page_records": 2,
+                "rounds": 2,
+                "warmup_rounds": 1,
+                "snapshot_every": 0,
+                "seed": 7,
+                "workload": "tick_only",
+                "trade_date": 20260728,
+                "instrument_id": 1001,
+            }
+        ]
+        pages = []
+        scans = []
+        servers = []
+        phases = (("warmup", 0), ("measure", 0), ("measure", 1))
+        for scan_id, (phase, round_index) in enumerate(phases):
+            open_request_id = 100 + scan_id
+            read_request_id = 1000 + scan_id * 10
+            pages.extend(
+                [
+                    {
+                        "schema_version": 1,
+                        "benchmark_run_id": 42,
+                        "scan_id": scan_id,
+                        "phase": phase,
+                        "round_index": round_index,
+                        "open_request_id": open_request_id,
+                        "read_request_id": read_request_id,
+                        "generation": 1,
+                        "instrument_id": 1001,
+                        "page_index": 0,
+                        "eof": 0,
+                        "record_count": 2,
+                        "snapshot_count": 0,
+                        "tick_count": 2,
+                        "page_mapping_bytes": 4848,
+                        "read_wall_ns": 1000,
+                        "object_decode_ns": 200,
+                        "column_build_ns": 100,
+                        "cumulative_record_count": 2,
+                        "cumulative_source_count_0": 0,
+                        "cumulative_source_count_1": 2,
+                        "cumulative_source_count_2": 0,
+                        "cumulative_source_count_3": 0,
+                        "first_ingress_sequence": 1,
+                        "last_ingress_sequence": 2,
+                        "ingress_sequence_sum": 3,
+                        "ingress_sequence_xor": 3,
+                    },
+                    {
+                        "schema_version": 1,
+                        "benchmark_run_id": 42,
+                        "scan_id": scan_id,
+                        "phase": phase,
+                        "round_index": round_index,
+                        "open_request_id": open_request_id,
+                        "read_request_id": read_request_id + 1,
+                        "generation": 1,
+                        "instrument_id": 1001,
+                        "page_index": 1,
+                        "eof": 1,
+                        "record_count": 0,
+                        "snapshot_count": 0,
+                        "tick_count": 0,
+                        "page_mapping_bytes": 0,
+                        "read_wall_ns": 50,
+                        "object_decode_ns": 0,
+                        "column_build_ns": 0,
+                        "cumulative_record_count": 2,
+                        "cumulative_source_count_0": 0,
+                        "cumulative_source_count_1": 2,
+                        "cumulative_source_count_2": 0,
+                        "cumulative_source_count_3": 0,
+                        "first_ingress_sequence": 0,
+                        "last_ingress_sequence": 0,
+                        "ingress_sequence_sum": 0,
+                        "ingress_sequence_xor": 0,
+                    },
+                ]
+            )
+            scans.append(
+                {
+                    "schema_version": 1,
+                    "benchmark_run_id": 42,
+                    "scan_id": scan_id,
+                    "phase": phase,
+                    "round_index": round_index,
+                    "open_request_id": open_request_id,
+                    "generation": 1,
+                    "instrument_id": 1001,
+                    "requested_page_records": 2,
+                    "open_wall_ns": 100,
+                    "scan_wall_ns": 1300,
+                    "data_page_read_wall_ns": 1000,
+                    "eof_read_wall_ns": 50,
+                    "object_decode_ns": 200,
+                    "column_build_ns": 100,
+                    "data_page_count": 1,
+                    "read_request_count": 2,
+                    "page_mapping_bytes": 4848,
+                    "total_record_count": 2,
+                    "source_record_count_0": 0,
+                    "source_record_count_1": 2,
+                    "source_record_count_2": 0,
+                    "source_record_count_3": 0,
+                    "generation_total_record_count": 2,
+                    "generation_source_record_count_0": 0,
+                    "generation_source_record_count_1": 2,
+                    "generation_source_record_count_2": 0,
+                    "generation_source_record_count_3": 0,
+                    "first_ingress_sequence": 1,
+                    "last_ingress_sequence": 2,
+                    "ingress_sequence_sum": 3,
+                    "ingress_sequence_xor": 3,
+                    "eof_seen": 1,
+                }
+            )
+            servers.append(
+                {
+                    "schema_version": 1,
+                    "benchmark_run_id": 42,
+                    "open_request_id": open_request_id,
+                    "read_request_id": read_request_id,
+                    "generation": 1,
+                    "instrument_id": 1001,
+                    "page_index": 0,
+                    "record_count": 2,
+                    "snapshot_count": 0,
+                    "tick_count": 2,
+                    "page_mapping_bytes": 4848,
+                    "clock_read_failures": 0,
+                    "cursor_read_ns": 10,
+                    "classify_layout_ns": 10,
+                    "memfd_prepare_ns": 50,
+                    "projection_ns": 20,
+                    "memfd_finalize_ns": 50,
+                    "build_total_ns": 150,
+                    "token_ns": 10,
+                    "send_ns": 10,
+                }
+            )
+        return config, pages, scans, servers
+
+    @staticmethod
+    def _write(module, directory, rows):
+        config, pages, scans, servers = rows
+        module._write_csv(
+            directory / "benchmark_config.csv",
+            module.CONFIG_FIELDS,
+            config,
+        )
+        module._write_csv(
+            directory / "client_pages.csv",
+            module.CLIENT_PAGE_FIELDS,
+            pages,
+        )
+        module._write_csv(
+            directory / "client_scans.csv",
+            module.CLIENT_SCAN_FIELDS,
+            scans,
+        )
+        module._write_csv(
+            directory / "server_pages.csv",
+            module.SERVER_PAGE_FIELDS,
+            servers,
+        )
+
+    def test_analyzer_validates_all_phases_and_excludes_warmup(self):
+        analyzer = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self._write(analyzer, directory, self._rows())
+            result = analyzer.analyze(directory)
+            self.assertEqual(result["benchmark"]["measured_scans"], 2)
+            self.assertEqual(result["aggregate"]["total_records"], 4)
+            self.assertEqual(
+                result["distributions"]["scan_wall_ns"]["samples"], 2
+            )
+            self.assertEqual(
+                result["benchmark"]["config"]["warmup_rounds"], 1
+            )
+
+    def test_analyzer_rejects_identity_cumulative_fixture_and_join_tampering(self):
+        analyzer = self.module()
+        cases = (
+            "page_identity",
+            "page_cumulative",
+            "fixture_fingerprint",
+            "missing_warmup_server",
+            "negative_data_residual",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                config, pages, scans, servers = self._rows()
+                if case == "page_identity":
+                    pages[2]["scan_id"] = 99
+                elif case == "page_cumulative":
+                    pages[2]["cumulative_record_count"] = 1
+                elif case == "fixture_fingerprint":
+                    pages[2]["ingress_sequence_sum"] = 4
+                    scans[1]["ingress_sequence_sum"] = 4
+                elif case == "missing_warmup_server":
+                    del servers[0]
+                elif case == "negative_data_residual":
+                    servers[1]["memfd_prepare_ns"] = 800
+                    servers[1]["memfd_finalize_ns"] = 300
+                    servers[1]["build_total_ns"] = 1150
+                    scans[1]["scan_wall_ns"] = 3000
+                directory = Path(temporary)
+                self._write(
+                    analyzer,
+                    directory,
+                    (config, pages, scans, servers),
+                )
+                with self.assertRaises(ValueError):
+                    analyzer.analyze(directory)
+
+
+class HistoryBenchmarkSummarizerTests(unittest.TestCase):
+    @staticmethod
+    def module():
+        summarizer_path = (
+            Path(__file__).resolve().parents[2]
+            / "benchmarks"
+            / "summarize_single_instrument_history_runs.py"
+        )
+        module_name = "summarize_single_instrument_history_runs_test"
+        spec = importlib.util.spec_from_file_location(
+            module_name, summarizer_path
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("cannot load history benchmark summarizer")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _document(run_id):
+        scans = []
+        for round_index in range(2):
+            scans.append(
+                {
+                    "benchmark_run_id": run_id,
+                    "generation": 1,
+                    "instrument_id": 1001,
+                    "scan_id": round_index + 1,
+                    "round_index": round_index,
+                    "workload": "tick_only",
+                    "record_count": 2,
+                    "snapshot_count": 0,
+                    "tick_count": 2,
+                    "scan_wall_ns": 1000,
+                    "memfd_ns": 0,
+                    "object_decode_ns": 200,
+                    "column_build_ns": 100,
+                    "requested_stage_ns": 300,
+                    "requested_residual_full_ns": 700,
+                }
+            )
+        return {
+            "schema_version": 1,
+            "benchmark": {
+                "benchmark_run_id": run_id,
+                "workload": "tick_only",
+                "measured_scans": 2,
+                "records_per_scan": 2,
+                "pages_per_scan": [1],
+                "requested_page_records": [2],
+                "snapshot_count_per_scan": [0],
+                "tick_count_per_scan": [2],
+                "config": {
+                    "benchmark_run_id": run_id,
+                    "records": 2,
+                    "page_records": 2,
+                    "rounds": 2,
+                    "warmup_rounds": 1,
+                    "snapshot_every": 0,
+                    "seed": run_id,
+                    "workload": "tick_only",
+                    "trade_date": 20260728,
+                    "instrument_id": 1001,
+                },
+            },
+            "definitions": {"distribution_quantiles": "R-7"},
+            "aggregate": {
+                "total_records": 4,
+                "total_scan_wall_ns": 2000,
+                "total_requested_stage_ns": 600,
+                "requested_residual_full_ns": 1400,
+                "requested_residual_share_full_scan": 0.7,
+                "stages": [
+                    {
+                        "stage": "memfd",
+                        "total_ns": 0,
+                        "ns_per_record": 0.0,
+                        "share_full_scan": 0.0,
+                        "share_requested_mix": 0.0,
+                    },
+                    {
+                        "stage": "object_decode",
+                        "total_ns": 400,
+                        "ns_per_record": 100.0,
+                        "share_full_scan": 0.2,
+                        "share_requested_mix": 2.0 / 3.0,
+                    },
+                    {
+                        "stage": "column_build",
+                        "total_ns": 200,
+                        "ns_per_record": 50.0,
+                        "share_full_scan": 0.1,
+                        "share_requested_mix": 1.0 / 3.0,
+                    },
+                ],
+            },
+            "scans": scans,
+            "sources": {
+                "fixture.cpp": {
+                    "bytes": 1,
+                    "sha256": "a" * 64,
+                }
+            },
+        }
+
+    @staticmethod
+    def _write(root, documents):
+        for document in documents:
+            run_id = document["benchmark"]["benchmark_run_id"]
+            directory = root / f"run-{run_id}"
+            directory.mkdir()
+            (directory / "analysis.json").write_text(
+                json.dumps(document, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+    def test_summarizer_reconciles_runs_and_accepts_zero_stage(self):
+        summarizer = self.module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write(
+                root,
+                (self._document(41), self._document(42)),
+            )
+            result = summarizer.summarize(root, 2)
+            workload = result["workloads"][0]
+            self.assertEqual(workload["process_runs"], 2)
+            self.assertEqual(workload["measured_scans"], 4)
+            self.assertEqual(workload["scan_wall_p50_ns"], 1000.0)
+            stages = {
+                stage["stage"]: stage for stage in workload["stages"]
+            }
+            self.assertEqual(stages["memfd"]["total_ns"], 0)
+            csv_path = root / "comparison.csv"
+            json_path = root / "comparison.json"
+            self.assertTrue(csv_path.is_file())
+            self.assertTrue(json_path.is_file())
+            completed = json.loads(json_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                completed["outputs"]["comparison_csv"]["sha256"],
+                summarizer._sha256(csv_path),
+            )
+            self.assertFalse(list(root.glob(".comparison.*.tmp")))
+
+    def test_summarizer_rejects_scan_and_aggregate_tampering(self):
+        summarizer = self.module()
+        cases = (
+            "scan_count",
+            "scan_wall",
+            "scan_records",
+            "stage_share",
+            "requested_total",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                first = self._document(41)
+                second = self._document(42)
+                if case == "scan_count":
+                    second["scans"].pop()
+                elif case == "scan_wall":
+                    second["scans"][0]["scan_wall_ns"] = 999
+                elif case == "scan_records":
+                    second["scans"][0]["record_count"] = 3
+                elif case == "stage_share":
+                    second["aggregate"]["stages"][1][
+                        "share_full_scan"
+                    ] = 0.9
+                elif case == "requested_total":
+                    second["aggregate"]["total_requested_stage_ns"] = 601
+                root = Path(temporary)
+                self._write(root, (first, second))
+                with self.assertRaises(ValueError):
+                    summarizer.summarize(root, 2)
+
+
 class ControlTests(unittest.TestCase):
     _RESPONSE = struct.Struct("<8sHHHHIIQQQQQ")
 
@@ -700,8 +1703,8 @@ class ControlTests(unittest.TestCase):
         request_id = 91
         response = self._RESPONSE.pack(
             CONTROL_MAGIC,
-            1,
-            0,
+            WIRE_MAJOR,
+            WIRE_MINOR,
             0,
             0,
             RESPONSE_BYTES,

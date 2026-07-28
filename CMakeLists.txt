@@ -8,6 +8,8 @@ option(L2FLOW_BUILD_FEEDER_PROBE
        "Build the opt-in standalone SDK feeder diagnostic" OFF)
 option(L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER
        "Build the optional market decoder libFuzzer target" OFF)
+option(L2FLOW_BUILD_BENCHMARKS
+       "Build opt-in operator-run performance benchmarks" OFF)
 option(L2FLOW_ENABLE_ASAN_UBSAN
        "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(L2FLOW_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
@@ -199,6 +201,31 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 set_target_properties(accept_realtime_pipeline PROPERTIES
     OUTPUT_NAME "accept-realtime-pipeline")
+
+if(L2FLOW_BUILD_BENCHMARKS)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR
+            "L2FLOW_BUILD_BENCHMARKS currently requires Linux")
+    endif()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(benchmark_single_instrument_history_stages
+        benchmarks/benchmark_single_instrument_history_stages.cpp)
+    l2flow_configure_target(
+        benchmark_single_instrument_history_stages)
+    target_link_libraries(
+        benchmark_single_instrument_history_stages
+        PRIVATE L2Flow::ipc)
+    target_compile_definitions(
+        benchmark_single_instrument_history_stages
+        PRIVATE
+            L2FLOW_HISTORY_BENCHMARK_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+            L2FLOW_HISTORY_BENCHMARK_PYTHON_PROBE="${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_instrument_history_stages.py"
+            L2FLOW_HISTORY_BENCHMARK_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python")
+    set_target_properties(
+        benchmark_single_instrument_history_stages
+        PROPERTIES
+            OUTPUT_NAME "benchmark-single-instrument-history-stages")
+endif()
 
 if(L2FLOW_BUILD_FEEDER_PROBE)
     add_executable(mdl_sdk_feeder_probe tools/mdl_sdk_feeder_probe.cpp)

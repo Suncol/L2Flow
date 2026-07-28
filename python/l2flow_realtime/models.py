@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from typing import Generic, Optional, Tuple, TypeVar
 
 
@@ -71,6 +71,19 @@ class LatestStatus(IntEnum):
     INVALID_INSTRUMENT_ID = 3
     UNKNOWN_WINDOW = 4
     INVALID_WINDOW_ID = 5
+
+
+class InstrumentLookupStatus(IntEnum):
+    FOUND = 0
+    UNKNOWN = 1
+    INVALID_MARKET = 2
+    EMPTY_SECURITY_ID = 3
+
+
+class TickProjectionFlag(IntFlag):
+    NONE = 0
+    RAW_TYPE_OMITTED = 1 << 0
+    RAW_TICK_FLAG_OMITTED = 1 << 1
 
 
 class ServerState(IntEnum):
@@ -220,6 +233,58 @@ class Instrument:
 
 
 @dataclass(frozen=True, slots=True)
+class InstrumentKey:
+    """An exact opaque-byte registry key."""
+
+    market: Market
+    security_id_source: bytes
+    security_id: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.market, int)
+            or isinstance(self.market, bool)
+        ):
+            raise TypeError("market must be a Market or integer enum value")
+        try:
+            market = Market(self.market)
+        except ValueError as error:
+            raise ValueError("market is not a supported enum value") from error
+        if not isinstance(self.security_id_source, bytes):
+            raise TypeError("security_id_source must be exact bytes")
+        if not isinstance(self.security_id, bytes):
+            raise TypeError("security_id must be exact bytes")
+        object.__setattr__(self, "market", market)
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentLookupResult:
+    key: InstrumentKey
+    status: InstrumentLookupStatus
+    instrument_id: Optional[int]
+
+    def __post_init__(self) -> None:
+        if self.status is InstrumentLookupStatus.FOUND:
+            if (
+                not isinstance(self.instrument_id, int)
+                or isinstance(self.instrument_id, bool)
+                or self.instrument_id <= 0
+                or self.instrument_id > 0xFFFFFFFF
+            ):
+                raise ValueError(
+                    "a found instrument must contain a positive uint32 ID"
+                )
+        elif self.instrument_id is not None:
+            raise ValueError(
+                "a non-found instrument cannot contain an instrument ID"
+            )
+
+    @property
+    def found(self) -> bool:
+        return self.status is InstrumentLookupStatus.FOUND
+
+
+@dataclass(frozen=True, slots=True)
 class DecimalValue:
     raw: int
     normalized_p6: int
@@ -323,6 +388,7 @@ class Snapshot:
 class Tick:
     common: CommonRecord
     validity_bitmap: int
+    projection_flags: TickProjectionFlag
     channel: int
     native_event_sequence: int
     source_raw_code_1: int
@@ -341,6 +407,20 @@ class Tick:
     sell_order_id: int
     raw_type: bytes
     raw_tick_flag: bytes
+
+    @property
+    def raw_type_omitted(self) -> bool:
+        return (
+            self.projection_flags
+            & TickProjectionFlag.RAW_TYPE_OMITTED
+        ) != 0
+
+    @property
+    def raw_tick_flag_omitted(self) -> bool:
+        return (
+            self.projection_flags
+            & TickProjectionFlag.RAW_TICK_FLAG_OMITTED
+        ) != 0
 
 
 @dataclass(frozen=True, slots=True)

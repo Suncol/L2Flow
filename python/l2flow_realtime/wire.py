@@ -21,18 +21,25 @@ from .models import (
     Snapshot,
     Tick,
     TickAction,
+    TickProjectionFlag,
     TradingPhase,
     WireFormatError,
 )
 
 
 WIRE_MAJOR = 1
-WIRE_MINOR = 0
+WIRE_MINOR = 1
 CONTROL_MAGIC = b"L2FCTL1\x00"
 SNAPSHOT_BYTES = 3104
 TICK_BYTES = 336
 KLINE_BYTES = 192
 INSTRUMENT_BYTES = 64
+TICK_PROJECTION_RAW_TYPE_OMITTED = 1 << 0
+TICK_PROJECTION_RAW_TICK_FLAG_OMITTED = 1 << 1
+_TICK_PROJECTION_KNOWN_FLAGS = (
+    TICK_PROJECTION_RAW_TYPE_OMITTED
+    | TICK_PROJECTION_RAW_TICK_FLAG_OMITTED
+)
 
 _INSTRUMENT = struct.Struct("<IBBBBQIIQIIQQQ")
 _DECIMAL = struct.Struct("<qqBBB5x")
@@ -350,12 +357,45 @@ def parse_tick(data: bytes) -> Tick:
     if common.market is not expected_market:
         raise WireFormatError("tick event kind and market disagree")
     fields = _TICK_HEAD.unpack_from(data, 128)
+    projection_flags = fields[1]
     raw_type_length = fields[11]
     raw_tick_flag_length = fields[12]
     if raw_type_length > 32 or raw_tick_flag_length > 32:
         raise WireFormatError("tick raw byte length exceeds wire capacity")
-    if fields[1] != 0 or fields[13] != 0:
+    if projection_flags & ~_TICK_PROJECTION_KNOWN_FLAGS:
+        raise WireFormatError("tick contains unknown projection flags")
+    if (
+        projection_flags != 0
+        and common.event_kind is not MarketEventKind.SHANGHAI_TICK
+    ):
+        raise WireFormatError(
+            "tick raw-string omission flags require Shanghai tick"
+        )
+    if (
+        common.event_kind is not MarketEventKind.SHANGHAI_TICK
+        and (
+            raw_type_length != 0
+            or raw_tick_flag_length != 0
+            or any(data[272:336])
+        )
+    ):
+        raise WireFormatError(
+            "Shenzhen tick payload contains Shanghai raw strings"
+        )
+    if fields[13] != 0:
         raise WireFormatError("tick reserved fields are nonzero")
+    if (
+        projection_flags & TICK_PROJECTION_RAW_TYPE_OMITTED
+    ) and (raw_type_length != 0 or any(data[272:304])):
+        raise WireFormatError(
+            "tick raw_type omission flag conflicts with payload"
+        )
+    if (
+        projection_flags & TICK_PROJECTION_RAW_TICK_FLAG_OMITTED
+    ) and (raw_tick_flag_length != 0 or any(data[304:336])):
+        raise WireFormatError(
+            "tick raw_tick_flag omission flag conflicts with payload"
+        )
     if any(data[272 + raw_type_length : 304]) or any(
         data[304 + raw_tick_flag_length : 336]
     ):
@@ -363,6 +403,7 @@ def parse_tick(data: bytes) -> Tick:
     return Tick(
         common=common,
         validity_bitmap=fields[0],
+        projection_flags=TickProjectionFlag(projection_flags),
         channel=fields[2],
         native_event_sequence=fields[3],
         source_raw_code_1=fields[4],

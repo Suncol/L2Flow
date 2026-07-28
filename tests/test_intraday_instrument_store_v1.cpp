@@ -702,6 +702,43 @@ bool CheckCreationAndInvalidConfiguration(
     return ok;
 }
 
+bool CheckStoreSessionProvenance(
+    const market::InstrumentRegistryV1& registry) {
+    bool ok = true;
+    auto first_store = CreateStore(
+        registry,
+        2U,
+        StoreConfig(),
+        "first provenance-test store creation",
+        &ok);
+    auto second_store = CreateStore(
+        registry,
+        2U,
+        StoreConfig(),
+        "second provenance-test store creation",
+        &ok);
+    if (first_store == nullptr || second_store == nullptr) {
+        return false;
+    }
+
+    const auto first_generation = BuildStoreGeneration(
+        first_store.get(), registry, 2U, 1U, {1U, 1U, 1U, 1U}, &ok);
+    const auto second_generation = BuildStoreGeneration(
+        second_store.get(), registry, 2U, 1U, {1U, 1U, 1U, 1U}, &ok);
+    if (first_generation == nullptr || second_generation == nullptr) {
+        return false;
+    }
+    ok &= Expect(
+        first_generation->store_session_epoch() != 0U &&
+            second_generation->store_session_epoch() != 0U,
+        "successful Store sessions expose nonzero provenance");
+    ok &= Expect(
+        first_generation->store_session_epoch() !=
+            second_generation->store_session_epoch(),
+        "distinct Store sessions have process-unique provenance");
+    return ok;
+}
+
 bool CheckGenerationQueriesAndLifetime(
     const market::InstrumentRegistryV1& registry) {
     bool ok = true;
@@ -770,7 +807,8 @@ bool CheckGenerationQueriesAndLifetime(
             first->watermark().ingress_sequence_exclusive == 9U &&
             first->instrument_count() == 4U &&
             first->record_count() == 8U &&
-            first->coverage_from_open(),
+            first->coverage_from_open() &&
+            first->store_session_epoch() != 0U,
         "generation carries exact fixed universe and global cut");
 
     const std::array<std::uint32_t, 4U> expected_instrument_ids{
@@ -1122,6 +1160,10 @@ bool CheckGenerationQueriesAndLifetime(
     if (second == nullptr) {
         return false;
     }
+    ok &= Expect(
+        second->store_session_epoch() ==
+            first->store_session_epoch(),
+        "successive generations preserve Store-session provenance");
 
     market::IntradayInstrumentSummaryV1 first_after_append{};
     market::IntradayInstrumentSummaryV1 second_summary{};
@@ -1944,6 +1986,7 @@ int main() {
 
     bool ok = true;
     ok &= CheckCreationAndInvalidConfiguration(*registry);
+    ok &= CheckStoreSessionProvenance(*registry);
     ok &= CheckGenerationQueriesAndLifetime(*registry);
     ok &= CheckRolloverCapsAndWorkerOwnership(*registry);
     ok &= CheckLiveTailGenerationIsolation(*registry);

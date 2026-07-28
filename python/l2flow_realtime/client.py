@@ -9,9 +9,14 @@ from typing import Optional, Sequence, Union
 
 from .batch import LatestBatch, TickBatch, TickColumnBatch
 from .control import discover_session_fd
+from .history import open_history_cursor
 from .models import (
     ClientClosedError,
+    InstrumentKey,
+    InstrumentLookupResult,
+    InstrumentLookupStatus,
     LatestResult,
+    Market,
     ServerState,
     SessionIdentity,
     StaleSessionError,
@@ -66,6 +71,8 @@ class L2FlowClient:
         *,
         stale_after_ns: Optional[int] = DEFAULT_STALE_AFTER_NS,
         expected_identity: Optional[SessionIdentity] = None,
+        control_socket_path: Optional[Union[str, os.PathLike]] = None,
+        control_timeout: Optional[float] = 1.0,
     ) -> None:
         if stale_after_ns is not None:
             _positive_uint64(stale_after_ns, "stale_after_ns")
@@ -74,6 +81,12 @@ class L2FlowClient:
         self._lock = threading.RLock()
         self._closed = False
         self._instrument_cache = {}
+        self._control_socket_path = (
+            None
+            if control_socket_path is None
+            else os.fspath(control_socket_path)
+        )
+        self._control_timeout = control_timeout
         try:
             initial = native_reader.session()
             self._identity = initial.identity
@@ -130,6 +143,8 @@ class L2FlowClient:
                 native,
                 stale_after_ns=stale_after_ns,
                 expected_identity=session.identity,
+                control_socket_path=control_socket_path,
+                control_timeout=timeout,
             )
         except Exception:
             native.close()
@@ -214,6 +229,142 @@ class L2FlowClient:
             self._checked_session()
             self._instrument_cache[instrument_id] = result
             return result
+
+    def resolve_instrument(
+        self,
+        market: Union[Market, int],
+        security_id_source: bytes,
+        security_id: bytes,
+    ) -> InstrumentLookupResult:
+        """Resolve one exact (market, source, security ID) byte key."""
+
+        key = InstrumentKey(
+            market=market,
+            security_id_source=security_id_source,
+            security_id=security_id,
+        )
+        return self.resolve_instruments((key,))[0]
+
+    def resolve_instruments(
+        self, keys: Sequence[InstrumentKey]
+    ) -> tuple[InstrumentLookupResult, ...]:
+        """Resolve exact registry keys while preserving order and duplicates."""
+
+        if isinstance(keys, (str, bytes, bytearray)):
+            raise TypeError("keys must be a sequence of InstrumentKey values")
+        keys = tuple(keys)
+        for key in keys:
+            if not isinstance(key, InstrumentKey):
+                raise TypeError("each key must be an InstrumentKey")
+        with self._lock:
+            self._checked_session()
+            statuses, instrument_ids = self._native.resolve_instruments(
+                keys
+            )
+            self._checked_session()
+        if len(statuses) != len(keys) or len(instrument_ids) != len(keys):
+            raise WireFormatError(
+                "native instrument lookup batch length mismatch"
+            )
+        results = []
+        for key, status, instrument_id in zip(
+            keys, statuses, instrument_ids
+        ):
+            if not isinstance(status, InstrumentLookupStatus):
+                raise WireFormatError(
+                    "native instrument lookup returned an invalid status"
+                )
+            if (
+                status is InstrumentLookupStatus.FOUND
+            ) != (instrument_id != 0):
+                raise WireFormatError(
+                    "native instrument lookup status/ID mismatch"
+                )
+            results.append(
+                InstrumentLookupResult(
+                    key,
+                    status,
+                    instrument_id
+                    if status is InstrumentLookupStatus.FOUND
+                    else None,
+                )
+            )
+        return tuple(results)
+
+    def open_instrument_history(
+        self,
+        instrument_id: int,
+        *,
+        requested_page_records: int = 4096,
+        timeout: Optional[float] = None,
+    ):
+        """Pin and stream one instrument's complete latest Store generation.
+
+        The cursor is an independent read-only UDS session. Its generation is
+        fixed at open time, so later realtime generation publication cannot
+        mix records into an in-progress scan.
+        """
+
+        instrument_id = _uint32(instrument_id, "instrument_id")
+        if instrument_id == 0:
+            raise ValueError("instrument_id must be nonzero")
+        with self._lock:
+            session = self._checked_session()
+            control_socket_path = self._control_socket_path
+            if control_socket_path is None:
+                raise UnavailableError(
+                    "this client was not created from a control socket"
+                )
+            effective_timeout = (
+                self._control_timeout if timeout is None else timeout
+            )
+        cursor = open_history_cursor(
+            control_socket_path,
+            instrument_id,
+            requested_page_records=requested_page_records,
+            timeout=effective_timeout,
+            expected_run_id=session.run_id,
+            expected_session_epoch=session.session_epoch,
+            expected_trade_date=session.trade_date,
+            expected_instrument_count=session.instrument_count,
+            expected_registry_version=session.registry_version,
+            expected_registry_sha256=session.registry_sha256,
+        )
+        try:
+            with self._lock:
+                current = self._checked_session()
+                if current.identity != session.identity:
+                    raise StaleSessionError(
+                        "realtime session changed while opening history"
+                    )
+                if (
+                    current.registry_version !=
+                        session.registry_version
+                    or current.registry_sha256 !=
+                        session.registry_sha256
+                ):
+                    raise StaleSessionError(
+                        "registry changed while opening history"
+                    )
+            return cursor
+        except Exception:
+            cursor.close()
+            raise
+
+    def open_history(
+        self,
+        instrument_id: int,
+        *,
+        requested_page_records: int = 4096,
+        timeout: Optional[float] = None,
+    ):
+        """Alias for :meth:`open_instrument_history`."""
+
+        return self.open_instrument_history(
+            instrument_id,
+            requested_page_records=requested_page_records,
+            timeout=timeout,
+        )
 
     def get_latest_snapshot(self, instrument_id: int):
         return self.get_latest_snapshots((instrument_id,))[0]

@@ -21,6 +21,17 @@ namespace l2flow::ipc {
     std::size_t registry_ordinal,
     RealtimeWireTickPayloadV1* output) noexcept;
 
+// History preserves one CoreV1 payload for every valid Store tick record.
+// Unlike the latest/ring projection above, a zero standalone-seam
+// tick_stream_sequence is representable. Both projections retain ticks whose
+// SH raw strings exceed the fixed inline capacity and expose explicit
+// omission flags instead of dropping the record.
+[[nodiscard]] bool ProjectHistoryTickWireV1(
+    const l2flow::market::RealtimeHistoryRecordV1& record,
+    std::size_t registry_ordinal,
+    RealtimeWireTickPayloadV1* output,
+    std::uint32_t* projection_flags) noexcept;
+
 [[nodiscard]] bool ProjectKLineWireV1(
     std::uint64_t generation,
     const l2flow::market::KLineBarV1& bar,

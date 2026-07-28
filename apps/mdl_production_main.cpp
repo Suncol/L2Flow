@@ -835,15 +835,26 @@ int Run(const Options& options) {
             break;
         }
 #if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
-        if (ipc_service != nullptr && cut.kline_enabled &&
-            (cut.kline_generation == nullptr ||
-             !ipc_service->PublishKLineGeneration(
-                 *cut.kline_generation))) {
-            std::cerr
-                << "mdl-production-router: IPC KLine publication "
-                   "failed\n";
-            exit_code = 1;
-            break;
+        if (ipc_service != nullptr) {
+            if (cut.store_generation == nullptr ||
+                !ipc_service->PublishStoreGeneration(
+                    cut.store_generation)) {
+                std::cerr
+                    << "mdl-production-router: IPC Store generation "
+                       "publication failed\n";
+                exit_code = 1;
+                break;
+            }
+            if (cut.kline_enabled &&
+                (cut.kline_generation == nullptr ||
+                 !ipc_service->PublishKLineGeneration(
+                     *cut.kline_generation))) {
+                std::cerr
+                    << "mdl-production-router: IPC KLine publication "
+                       "failed\n";
+                exit_code = 1;
+                break;
+            }
         }
 #endif
         report_wal_coverage();
@@ -866,15 +877,24 @@ int Run(const Options& options) {
             exit_code = 1;
         }
 #if defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V1)
-        else if (
-            ipc_service != nullptr && final_cut.kline_enabled &&
-            (final_cut.kline_generation == nullptr ||
-             !ipc_service->PublishKLineGeneration(
-                 *final_cut.kline_generation))) {
-            std::cerr
-                << "mdl-production-router: final IPC KLine "
-                   "publication failed\n";
-            exit_code = 1;
+        else if (ipc_service != nullptr) {
+            if (final_cut.store_generation == nullptr ||
+                !ipc_service->PublishStoreGeneration(
+                    final_cut.store_generation)) {
+                std::cerr
+                    << "mdl-production-router: final IPC Store generation "
+                       "publication failed\n";
+                exit_code = 1;
+            } else if (
+                final_cut.kline_enabled &&
+                (final_cut.kline_generation == nullptr ||
+                 !ipc_service->PublishKLineGeneration(
+                     *final_cut.kline_generation))) {
+                std::cerr
+                    << "mdl-production-router: final IPC KLine "
+                       "publication failed\n";
+                exit_code = 1;
+            }
         }
 #endif
     } else {

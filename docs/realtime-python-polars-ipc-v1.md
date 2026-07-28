@@ -18,6 +18,12 @@ Vendor SDK
   native C reader
   -> Python client
   -> optional PyArrow / Polars micro-batches
+
+immutable Store generation
+  -> per-instrument oldest-first cursor
+  -> sealed read-only history-page memfd
+  -> Python history cursor
+  -> optional PyArrow / Polars page batches
 ```
 
 IPC 层只投影已经成功应用到 Store 的记录，不创建第二条接入、解码或
@@ -30,6 +36,10 @@ V1 数据面已经提供：
 - 上交所/深交所最新 snapshot 的单标的和批量查询；
 - 每个标的的最新 mixed `latest_tick` 的单标的和批量查询；
 - 每个 `instrument_id × window_id` 的最新 K 线查询；
+- 按 `(market, SecurityIDSource, SecurityID)` 不透明字节组合键精确反查
+  `instrument_id`；
+- 打开时固定一个最新已发布 Store generation，并按 instrument 分页读取
+  该 generation 的全部记录；
 - 一个带全局单调序列的有界 mixed tick ring，以及独立 consumer cursor；
 - session、registry identity、server state、coverage flag、K 线 generation 和
   heartbeat；
@@ -152,7 +162,8 @@ fail-closed 处理。
 
 ## 4. 控制面与只读数据面
 
-控制面是 `AF_UNIX/SOCK_SEQPACKET`。V1 只有一个 `GET_SESSION` opcode。
+控制面是 `AF_UNIX/SOCK_SEQPACKET`。V1 支持一次性 `GET_SESSION`，以及在
+独立连接上使用的 `OPEN_HISTORY`/`READ_HISTORY`。
 服务用 `SO_PEERCRED` 校验客户端 effective UID；不同 UID 不会收到
 descriptor。响应使用 `SCM_RIGHTS` 发送 memfd 的只读 open-file
 description。
@@ -171,17 +182,33 @@ Python 进程收到的只是只读 descriptor。native reader 再次验证
 `O_RDONLY` 和全部必需 seal，并使用 `PROT_READ | MAP_SHARED` 映射。
 调用方可在 reader 创建成功后关闭收到的 fd；mapping 拥有独立生命周期。
 
+history 不放进持续变化的 latest mapping。服务端在 `OPEN_HISTORY` 时用
+`shared_ptr` 固定一个 immutable Store generation；每次 `READ_HISTORY`
+构造一个完成后的页，移除可写 mapping，加入
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`，再把重新打开的
+`O_RDONLY` fd 传给 Python。Python 校验 fd 类型、大小、只读模式和全部
+seal 后才映射该页。显式的零行 EOF 不携带 fd。open 响应给出随机初始
+read token，每个数据页响应都会轮换 token；下一次 READ 必须回显刚收到
+的 token。因此，在没有猜中新的 64-bit token 的前提下，客户端不能在
+收到当前页响应之前预先排队一条有效的后续 READ；这是一项概率性协议约束，
+不是数学上不可猜测或永不重复的证明。
+
 这些约束防止普通 consumer 改写或调整数据面，但它们不是跨用户认证或
 远程安全协议。同一 UID 下的进程属于同一信任边界。
 
 ## 5. Wire ABI
 
-Wire ABI 的唯一源码定义是
-[`realtime_wire_v1.h`](../include/l2flow/ipc/realtime_wire_v1.h)，投影逻辑
-在
+latest/ring 固定 ABI 的权威定义是
+[`realtime_wire_v1.h`](../include/l2flow/ipc/realtime_wire_v1.h)，history
+控制面和页 ABI 的权威定义是
+[`realtime_history_wire_v1.h`](../include/l2flow/ipc/realtime_history_wire_v1.h)。
+投影逻辑在
 [`realtime_wire_projection_v1.cpp`](../src/ipc/realtime_wire_projection_v1.cpp)。
 V1 使用固定宽度、小端字段；共享内存中不放置 C++ enum、`bool`、pointer、
 `string`、`variant`、`span`、`size_t` 或 `std::atomic` 对象。
+当前协议/ABI 版本是 1.1：minor 1 把 tick payload offset 132 原先的保留
+word 定义为 `projection_flags`。1.0 reader 必须在握手时拒绝 1.1，
+不能把非零 flag 误判成普通空字符串。
 
 关键固定尺寸为：
 
@@ -194,6 +221,10 @@ V1 使用固定宽度、小端字段；共享内存中不放置 C++ enum、`bool
 | latest tick / tick-ring slot | 512 bytes |
 | latest KLine slot | 256 bytes |
 | control request / response | 40 / 64 bytes |
+| history open request / response | 64 / 296 bytes |
+| history read request / response | 48 / 64 bytes |
+| history page header | 4096 bytes |
+| history record descriptor | 40 bytes |
 
 header 的 9 个 region descriptor 描述 registry rows、registry key blob、
 KLine windows、latest snapshots、latest ticks、latest KLines、tick ring
@@ -233,6 +264,23 @@ quality flags 和 market notices。价格同时保留 raw、scale、p6
 payload 是适用于所有 mixed tick 类型的扁平 superset；K 线 payload
 包含 OHLC p6、volume、trade count、revision 和首末事件元数据。
 
+latest tick、tick ring 和 history 共用同一套 tick projection flags。
+上交所 `raw_type`/`raw_tick_flag` 超过 32-byte inline 容量时，不截断、
+不丢记录：inline 长度和内容置零，并设置对应 omission bit。真实空字符串
+是 `length=0, flag=0`，因此不会与 omitted 混淆。Python 对象通过
+`Tick.projection_flags`、`raw_type_omitted` 和
+`raw_tick_flag_omitted` 暴露该状态；NumPy/Arrow/Polars tick 列也包含
+`projection_flags`。
+
+history 页复用固定大小的 snapshot/tick payload，并用 descriptor 保存
+Store 的稀疏 `ingress_sequence`、source sequence、mixed-tick sequence、
+event kind 和 payload index。`core_v1` 保证所选 instrument 在固定
+generation 中的记录覆盖完整，但不保证 C++ Store event 的字段无损：
+generation 的 `record_coverage_complete=true`，
+`field_complete=false`。跨 source 的原始混合顺序只能按
+`ingress_sequence` 恢复。history descriptor 的 omission flags 必须与
+对应 tick payload 完全相同。
+
 ABI major 或 layout 不匹配、fd 不是只读、seal 不完整、region
 越界/重叠或 registry/window 排序非法时，native reader 拒绝建立 reader，
 而不是尝试猜测布局。
@@ -253,12 +301,22 @@ ABI major 或 layout 不匹配、fd 不是只读、seal 不完整、region
 l2flow_shm_reader_open_fd_v1(...)
 l2flow_shm_reader_session_v1(...)
 l2flow_shm_reader_instrument_v1(...)
+l2flow_shm_reader_resolve_instruments_v1(...)
 l2flow_shm_reader_latest_snapshots_v1(...)
 l2flow_shm_reader_latest_ticks_v1(...)
 l2flow_shm_reader_latest_klines_v1(...)
 l2flow_shm_reader_ticks_v1(...)
 l2flow_shm_reader_close_v1(...)
 ```
+
+`resolve_instruments` 对
+`(market, security_id_source bytes, security_id bytes)` 做精确比较，
+不 trim、不做大小写折叠、不转码，也不根据代码前缀猜市场或 source。
+请求顺序和重复 key 保持不变；每项返回 `FOUND`、`UNKNOWN`、
+`INVALID_MARKET` 或 `EMPTY_SECURITY_ID`，非 `FOUND` 项的 ID 恒为零。
+market 校验先于 empty-ID 校验。C 调用方必须使用互不重叠的输入/输出
+数组，并在所有 reader 调用结束后才能调用 `close`；Python wrapper 已用
+同一把锁串行化调用和关闭。
 
 latest 批量接口保持请求顺序和重复 ID，并为每一项返回独立状态：
 
@@ -319,10 +377,34 @@ finally:
 ```
 
 示例中的数字是 registry 的稳定 `instrument_id`，不是证券代码字符串。
-consumer 应加载同一份 registry，并在连接后核对
-`registry_version/registry_sha256`；`get_instrument(instrument_id)` 可返回
-该 ID 的 market、SecurityIDSource 和 SecurityID。V1 client 不提供从
-SecurityID 字符串反查或枚举全 registry 的接口。
+consumer 应在连接后核对 `registry_version/registry_sha256`。
+`get_instrument(instrument_id)` 可返回该 ID 的 market、
+SecurityIDSource 和 SecurityID；反向查询必须把 registry 中的三个 key
+分量原样传回：
+
+```python
+from l2flow_realtime import InstrumentKey, Market
+
+entry = client.get_instrument(600000)
+key = InstrumentKey(
+    Market(entry.market),
+    entry.security_id_source,
+    entry.security_id,
+)
+resolved = client.resolve_instruments([key, key])
+assert resolved[0].found
+assert resolved[0].instrument_id == entry.instrument_id
+assert resolved[1] == resolved[0]  # duplicate input is preserved
+
+one = client.resolve_instrument(
+    key.market, key.security_id_source, key.security_id
+)
+```
+
+这里的 bytes 可能包含尾空格或其他不透明字节；调用方不能自行
+`strip()`。当前接口支持按 key 反查，不提供一次性枚举全 registry 的新
+方法；已知 `instrument_id` 仍可用现有 `get_instrument` 读取。当前
+Python API 不提供按 registry ordinal 读取 instrument 的方法。
 
 可用的 point/batch 方法为：
 
@@ -333,6 +415,9 @@ get_latest_tick(instrument_id)
 get_latest_ticks(instrument_ids)
 get_latest_kline(instrument_id, window_id)
 get_latest_klines(instrument_ids, window_ids)
+resolve_instrument(market, security_id_source, security_id)
+resolve_instruments(instrument_keys)
+open_instrument_history(instrument_id, requested_page_records=...)
 ```
 
 point 方法复用同一套 batch/native 实现，不建立另一套读取语义。latest
@@ -342,7 +427,124 @@ Cartesian product；传入一个标量 `window_id` 时会对全部 instrument
 `to_polars()`；后两者缺少相应可选依赖时会明确报错，不影响核心 client
 使用。
 
-### 7.1 latest snapshot 占位因子
+### 7.1 完整记录覆盖的 Instrument Store history
+
+history cursor 固定打开瞬间“最近一次已发布”的 Store generation；后续
+generation 发布不会混入当前扫描。要声明客户端已完整读取，必须一直读到
+显式 EOF，让客户端同时核对 generation 总记录数和四路 source 记录数：
+
+```python
+with client.open_instrument_history(
+    one.instrument_id,
+    requested_page_records=4096,
+) as history:
+    generation = history.generation
+    assert generation.record_coverage_complete
+    assert not generation.field_complete
+
+    for page in history.pages():
+        if page.eof:
+            continue
+        frames = page.to_polars_by_kind()
+        snapshot_frame = frames["snapshots"]
+        tick_frame = frames["ticks"]
+        # 两张同质表可分别计算；需要恢复 mixed Store 顺序时按
+        # ingress_sequence 合并。
+```
+
+`pages()` 会返回最后一个零行 `eof=True` 页；成功读取该页后 cursor
+自动关闭本地 socket。`records()` 是不把全部历史物化进内存的逐记录
+迭代器；完整耗尽该迭代器同样会读取并校验 EOF。若提前 `break`，只能
+说明已读取一个前缀，不能声称完成。
+
+每个数据页可用 `to_columns_by_kind()`、`to_arrow_by_kind()` 或
+`to_polars_by_kind()` 拆成 snapshot/tick 两个同质因子列子集。列中明确携带
+`store_generation`、registry/input identity、`payload_projection`、
+逐记录 `projection_flags`、`record_coverage_complete` 和
+`field_complete`。`HistoryRecord.value` 的 Python 对象保留收到的完整
+CoreV1 payload；列适配器为了因子计算只展开常用标量，并不展开盘口队列
+header/50 个队列数量、所有 decimal 的 raw/scale/valid/null 或全部 common
+字段。需要这些 CoreV1 字段时应直接读取对象模型或扩展版本化列 schema。
+
+这条接口完成的是“全部记录可验证地读取”，不是 C++ Store event 的字段
+无损序列化；因子若需要 core_v1 未暴露的 Store 字段，必须扩展版本化 wire
+schema。`input_identity_sha256` 绑定 run、generation、trade date、ingress
+cut、registry 和四路 source watermark；它不是页内容或 Store payload 的
+摘要。完整性判断来自固定 generation、严格序列、计数对账和显式 EOF，
+不能拿该 SHA 当逐记录内容校验值。
+
+已注册但该 generation 中没有记录的 instrument 会直接得到合法 EOF；
+未注册 ID 返回 `HistoryNotFoundError`。每个 cursor 占用一个有界服务端
+reader slot，并受 idle timeout 限制，应尽量用 context manager 或显式
+`close()`。同 UID 是既有信任边界：除非猜中 64-bit token，轮换 token
+会拒绝未接收当前响应就提前发送的下一条 READ；但一个已收到 fd 的同 UID
+进程仍可故意长期保留页面。页大小/readers 配置不声称限制这种受信任
+客户端自身保留的内核内存。
+
+### 7.2 Instrument Store history 延迟 benchmark
+
+仓库提供一个 opt-in、operator-run 的单 instrument 合成 benchmark。它不接
+vendor feed，也不修改生产热路径的默认配置；只有显式设置
+`L2FLOW_BUILD_BENCHMARKS=ON` 的 benchmark 进程才安装 process-local stage
+observer。建议使用独立的新输出目录，并用 Release 构建：
+
+```bash
+cmake -S . -B build-history-benchmark \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DL2FLOW_BUILD_TESTS=OFF \
+  -DL2FLOW_BUILD_BENCHMARKS=ON
+cmake --build build-history-benchmark \
+  --target benchmark_single_instrument_history_stages -j
+
+./build-history-benchmark/benchmark-single-instrument-history-stages \
+  --output-dir /tmp/l2flow-history-benchmark-tick \
+  --records 100000 \
+  --page-records 4096 \
+  --warmups 5 \
+  --rounds 50 \
+  --snapshot-every 0
+
+python3 benchmarks/analyze_single_instrument_history_stages.py \
+  /tmp/l2flow-history-benchmark-tick
+```
+
+`snapshot-every=0` 是纯 tick，`1` 是纯 snapshot，`N>1` 表示从第 0 条开始
+每隔 N 条放一个 snapshot。合成 fixture 只有一个 instrument，全局
+`ingress_sequence` 精确为 `1..records`；analyzer 会用首末值、等差数列
+求和、`xor(1..N)`、四路 source count 和逐页 cumulative count 验证每次
+扫描，而不是只相信 CSV 自报的总数。
+
+一次成功运行产生：
+
+- `benchmark_config.csv`：本次固定 workload、records、分页和
+  warmup/measure 数量；
+- `client_pages.csv`：每个 READ 一行，包括不携带 memfd 的显式 EOF；
+- `client_scans.csv`：从 open 开始、读到 EOF 为止的每次完整扫描；
+- `server_pages.csv`：每个成功发送的非 EOF 数据页的 C++ stage；
+- analyzer 生成的 `summary_scans.csv`、`summary_stages.csv` 和
+  `analysis.json`。
+
+数据页通过
+`(benchmark_run_id, open_request_id, generation, page_index)` 精确 join，
+并再次核对 `read_request_id` 和行数/类型/字节数；EOF 没有对应 server
+stage。warmup 的 scan/page/server 也必须完整 join 和通过语义校验，但不会
+进入分布统计。`object_decode_ns` 是 page header/mmap 之后的 Python
+descriptor/payload 校验、payload bytes copy、对象解析与
+`HistoryRecord` 创建；`column_build_ns` 只覆盖
+`_history_columns_by_kind` 的 Python list 构造，不含 Arrow/Polars
+materialization。`memfd_ns` 是服务端 prepare 与 finalize 之和，不包含
+projection。
+
+`analysis.json` 的 p50/p90/p95/p99 使用 Hyndman-Fan type 7（R-7）线性
+插值，并明确记录样本数。少量 round 的 p99 只是对这些完整扫描样本的描述性
+插值，不能当作生产尾延迟置信度；正式比较应增加 `--rounds`，固定 CPU/
+NUMA/频率和系统负载，并保留 config、原始 CSV、输入哈希、源码哈希与环境
+信息。`fully_accounted_residual_ns` 只是 duration-sum 诊断：`sendmsg`
+和 `recvmsg` 的尾部可能重叠，因此它不是严格的 wall-time 分解，也可能略
+小于零。相反，`requested_residual_data_ns` 使用不重叠的 memfd、
+object-decode 和 column-build 子区间，负数会使 analyzer 拒绝该次运行。
+
+### 7.3 latest snapshot 占位因子
 
 若当前只需要验证 Python 因子访问链路，可以直接把 snapshot 的最新价
 复制为占位因子，不必使用逐 tick cursor。仓库提供了可运行示例：
@@ -558,6 +760,12 @@ buffer，但这不代表从 mutable shared memory 到 Arrow 是零拷贝。
   单条 tick 热路径变成长扫描。终止校验前会在非热路径同步完成剩余推进。
 - latest KLine 只表示最近一次已发布 generation 中该窗口的最新 bar，
   不是 K 线全历史，也不会在每个 tick 后立即刷新。
+- history cursor 是周期性 Store generation 的完整记录扫描，不是逐 tick
+  热流；需要新到一条即可见仍应使用 tick ring，需要当前值则使用 latest。
+- history 页内和跨页都要求 `ingress_sequence` 严格递增，同时分别要求
+  四路 `source_sequence` 严格递增；到达 EOF 时还会核对总数和分 source
+  计数。`record_coverage_complete` 不等价于 `coverage_from_open`，也不
+  证明上游 vendor feed 自身没有缺失。
 - latest batch 只保证逐 row 一致，不保证跨 instrument 原子；要做同一
   市场截面的严格比较，应在因子中携带 sequence/time 并定义容忍窗口，
   或回到 C++ immutable generation。
@@ -574,6 +782,8 @@ buffer，但这不代表从 mutable shared memory 到 Arrow 是零拷贝。
   [`realtime_shared_service_v1.h`](../include/l2flow/ipc/realtime_shared_service_v1.h)
 - wire schema：
   [`realtime_wire_v1.h`](../include/l2flow/ipc/realtime_wire_v1.h)
+- history wire schema：
+  [`realtime_history_wire_v1.h`](../include/l2flow/ipc/realtime_history_wire_v1.h)
 - native C reader：
   [`realtime_shm_reader_c_v1.h`](../include/l2flow/ipc/realtime_shm_reader_c_v1.h)
 - production 组合和 `--ipc-*`：

@@ -9,6 +9,7 @@ from typing import Dict, Generic, Iterator, Mapping, Sequence, Tuple, TypeVar
 from .models import (
     KLine,
     LatestResult,
+    LatestStatus,
     OptionalDependencyError,
     SessionIdentity,
     Snapshot,
@@ -86,6 +87,7 @@ for _side in ("bid", "ask"):
 _TICK_TYPES = {
     **_COMMON_TYPES,
     "validity_bitmap": "u32",
+    "projection_flags": "u32",
     "channel": "i64",
     "native_event_sequence": "i64",
     "source_raw_code_1": "i32",
@@ -138,6 +140,19 @@ _KLINE_TYPES = {
     "last_event_sequence": "u64",
     "last_source_sequence": "u64",
     "last_ingress_sequence": "u64",
+}
+
+_HISTORY_TYPES = {
+    "store_generation": "u64",
+    "registry_version": "u64",
+    "registry_sha256": "binary",
+    "input_identity_sha256": "binary",
+    "payload_projection": "u32",
+    "history_page_index": "u64",
+    "projection_flags": "u32",
+    "record_coverage_complete": "u8",
+    "field_complete": "u8",
+    "coverage_from_open": "u8",
 }
 
 
@@ -303,6 +318,7 @@ def _tick_columns_from_values(
         _append_common(columns, identity, status, requested_id, value)
         attributes = {
             "validity_bitmap": "validity_bitmap",
+            "projection_flags": "projection_flags",
             "channel": "channel",
             "native_event_sequence": "native_event_sequence",
             "source_raw_code_1": "source_raw_code_1",
@@ -384,6 +400,72 @@ def _kline_columns(
                 getattr(value, name) if value is not None else None
             )
     return columns
+
+
+def _history_columns_by_kind(records, generation, page_index: int):
+    """Build two homogeneous tables while preserving ingress for re-merge."""
+
+    identity = SessionIdentity(
+        generation.run_id, generation.session_epoch
+    )
+    snapshots = tuple(
+        record
+        for record in records
+        if isinstance(record.value, Snapshot)
+    )
+    ticks = tuple(
+        record for record in records if isinstance(record.value, Tick)
+    )
+    snapshot_results = tuple(
+        LatestResult(
+            generation.instrument_id,
+            LatestStatus.AVAILABLE,
+            record.value,
+        )
+        for record in snapshots
+    )
+    columns_by_kind = {
+        "snapshots": (
+            _snapshot_columns(snapshot_results, identity),
+            {**_SNAPSHOT_TYPES, **_HISTORY_TYPES},
+            snapshots,
+        ),
+        "ticks": (
+            _tick_columns_from_values(
+                [record.value for record in ticks],
+                identity,
+                [int(LatestStatus.AVAILABLE)] * len(ticks),
+                [generation.instrument_id] * len(ticks),
+            ),
+            {**_TICK_TYPES, **_HISTORY_TYPES},
+            ticks,
+        ),
+    }
+    for columns, _types, selected in columns_by_kind.values():
+        count = len(selected)
+        columns["store_generation"] = [generation.generation] * count
+        columns["registry_version"] = [generation.registry_version] * count
+        columns["registry_sha256"] = [generation.registry_sha256] * count
+        columns["input_identity_sha256"] = [
+            generation.input_identity_sha256
+        ] * count
+        columns["payload_projection"] = [
+            generation.payload_projection
+        ] * count
+        columns["history_page_index"] = [page_index] * count
+        columns["projection_flags"] = [
+            record.projection_flags for record in selected
+        ]
+        columns["record_coverage_complete"] = [
+            int(generation.record_coverage_complete)
+        ] * count
+        columns["field_complete"] = [
+            int(generation.field_complete)
+        ] * count
+        columns["coverage_from_open"] = [
+            int(generation.coverage_from_open)
+        ] * count
+    return columns_by_kind
 
 
 def _arrow_type(module, tag: str):
@@ -584,7 +666,7 @@ class TickColumnBatch:
                         "security_type",
                         "asset_scope",
                         "validity_bitmap",
-                        "tick_reserved_u32",
+                        "projection_flags",
                         "channel",
                         "native_event_sequence",
                         "source_raw_code_1",

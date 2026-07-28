@@ -48,7 +48,30 @@ bool Common(
             static_cast<std::size_t>(
                 std::numeric_limits<std::uint32_t>::max()) ||
         common.instrument_id != record.instrument_id() ||
-        common.kind != record.kind()) {
+        common.registry_ordinal != registry_ordinal ||
+        common.kind != record.kind() ||
+        common.origin.source_stream_id !=
+            record.source_stream_id() ||
+        common.origin.source_sequence != record.source_sequence() ||
+        static_cast<std::uint8_t>(common.quantity_unit) >
+            static_cast<std::uint8_t>(
+                market::QuantityUnitV1::kIndexUnit) ||
+        static_cast<std::uint8_t>(common.security_type) >
+            static_cast<std::uint8_t>(
+                market::SecurityTypeV1::kOption) ||
+        static_cast<std::uint8_t>(common.asset_scope) >
+            static_cast<std::uint8_t>(
+                market::AssetScopeV1::kOutsideDocumentedCore)) {
+        return false;
+    }
+    const market::MarketV1 expected_market =
+        record.kind() ==
+                    market::MarketEventKindV1::kShanghaiSnapshot ||
+                record.kind() ==
+                    market::MarketEventKindV1::kShanghaiTick
+            ? market::MarketV1::kShanghai
+            : market::MarketV1::kShenzhen;
+    if (common.market != expected_market) {
         return false;
     }
     RealtimeWireCommonRecordV1 result{};
@@ -130,6 +153,35 @@ void Book(
     }
 }
 
+bool BookRepresentable(
+    const market::SnapshotBookV1& book) noexcept {
+    return book.retained_bid_depth <= book.bids.size() &&
+           book.retained_ask_depth <= book.asks.size() &&
+           book.bid1_queue.retained_count <=
+               book.bid1_queue.quantities.size() &&
+           book.ask1_queue.retained_count <=
+               book.ask1_queue.quantities.size();
+}
+
+bool TickFieldsRepresentable(
+    const market::TickFieldsV1& fields) noexcept {
+    return static_cast<std::uint8_t>(fields.action) <=
+               static_cast<std::uint8_t>(
+                   market::TickActionV1::kStatus) &&
+           static_cast<std::uint8_t>(fields.side) <=
+               static_cast<std::uint8_t>(
+                   market::SideV1::kLend) &&
+           static_cast<std::uint8_t>(fields.order_type) <=
+               static_cast<std::uint8_t>(
+                   market::OrderTypeV1::kSameSideBest) &&
+           static_cast<std::uint8_t>(fields.aggressor) <=
+               static_cast<std::uint8_t>(
+                   market::AggressorV1::kNeutral) &&
+           static_cast<std::uint8_t>(fields.phase) <=
+               static_cast<std::uint8_t>(
+                   market::TradingPhaseV1::kEnd);
+}
+
 void TickFields(
     const market::TickFieldsV1& source,
     RealtimeWireTickPayloadV1* output) noexcept {
@@ -153,11 +205,20 @@ void TickFields(
 bool CopyRaw(
     const std::string& source,
     std::array<std::uint8_t, 32U>* destination,
-    std::uint8_t* length) noexcept {
+    std::uint8_t* length,
+    std::uint32_t omission_flag,
+    std::uint32_t* projection_flags) noexcept {
     if (destination == nullptr || length == nullptr ||
-        source.size() > destination->size()) {
+        projection_flags == nullptr) {
         return false;
     }
+    if (source.size() > destination->size()) {
+        destination->fill(0U);
+        *length = 0U;
+        *projection_flags |= omission_flag;
+        return true;
+    }
+    destination->fill(0U);
     std::transform(
         source.begin(),
         source.end(),
@@ -167,6 +228,118 @@ bool CopyRaw(
                 static_cast<unsigned char>(value));
         });
     *length = static_cast<std::uint8_t>(source.size());
+    return true;
+}
+
+bool ProjectTickCore(
+    const market::RealtimeHistoryRecordV1& record,
+    std::size_t registry_ordinal,
+    RealtimeWireTickPayloadV1* output,
+    std::uint32_t* projection_flags) noexcept {
+    if (output == nullptr || projection_flags == nullptr ||
+        !market::IsTickEventKindV1(record.kind())) {
+        return false;
+    }
+    RealtimeWireTickPayloadV1 projected{};
+    std::uint32_t projected_flags = 0U;
+    const bool ok = std::visit(
+        [&](const auto* event) noexcept -> bool {
+            using Pointer = std::decay_t<decltype(event)>;
+            using Event = std::remove_cv_t<
+                std::remove_pointer_t<Pointer>>;
+            if (event == nullptr) {
+                return false;
+            }
+            if constexpr (
+                std::is_same_v<Event, market::ShanghaiTickV1>) {
+                if (record.kind() !=
+                        market::MarketEventKindV1::kShanghaiTick ||
+                    !TickFieldsRepresentable(event->fields) ||
+                    !Common(
+                        record,
+                        registry_ordinal,
+                        event->common,
+                        static_cast<std::uint32_t>(
+                            sizeof(projected)),
+                        &projected.common) ||
+                    !CopyRaw(
+                        event->raw_type,
+                        &projected.raw_type,
+                        &projected.raw_type_length,
+                        kRealtimeWireTickRawTypeOmittedV1,
+                        &projected_flags) ||
+                    !CopyRaw(
+                        event->raw_tick_flag,
+                        &projected.raw_tick_flag,
+                        &projected.raw_tick_flag_length,
+                        kRealtimeWireTickRawTickFlagOmittedV1,
+                        &projected_flags)) {
+                    return false;
+                }
+                projected.channel =
+                    static_cast<std::int64_t>(event->channel);
+                projected.native_event_sequence =
+                    event->business_index;
+                TickFields(event->fields, &projected);
+                return true;
+            } else if constexpr (
+                std::is_same_v<Event, market::ShenzhenOrderV1>) {
+                if (record.kind() !=
+                        market::MarketEventKindV1::kShenzhenOrder ||
+                    !TickFieldsRepresentable(event->fields) ||
+                    !Common(
+                        record,
+                        registry_ordinal,
+                        event->common,
+                        static_cast<std::uint32_t>(
+                            sizeof(projected)),
+                        &projected.common)) {
+                    return false;
+                }
+                projected.channel =
+                    static_cast<std::int64_t>(event->channel);
+                projected.native_event_sequence =
+                    event->application_sequence;
+                projected.source_raw_code_1 = event->raw_side;
+                projected.source_raw_code_2 = event->raw_order_type;
+                TickFields(event->fields, &projected);
+                return true;
+            } else if constexpr (
+                std::is_same_v<
+                    Event,
+                    market::ShenzhenTransactionV1>) {
+                if (record.kind() !=
+                        market::MarketEventKindV1::
+                            kShenzhenTransaction ||
+                    !TickFieldsRepresentable(event->fields) ||
+                    !Common(
+                        record,
+                        registry_ordinal,
+                        event->common,
+                        static_cast<std::uint32_t>(
+                            sizeof(projected)),
+                        &projected.common)) {
+                    return false;
+                }
+                projected.channel =
+                    static_cast<std::int64_t>(event->channel);
+                projected.native_event_sequence =
+                    event->application_sequence;
+                projected.source_raw_code_1 =
+                    event->raw_execution_type;
+                TickFields(event->fields, &projected);
+                return true;
+            } else {
+                return false;
+            }
+        },
+        record.event());
+    if (!ok) {
+        return false;
+    }
+    projected.projection_flags = projected_flags;
+    *output = projected;
+    *projection_flags = projected_flags;
     return true;
 }
 
@@ -191,7 +364,10 @@ bool ProjectSnapshotWireV1(
             }
             if constexpr (
                 std::is_same_v<Event, market::ShanghaiSnapshotV1>) {
-                if (!Common(
+                if (record.kind() !=
+                        market::MarketEventKindV1::kShanghaiSnapshot ||
+                    !BookRepresentable(event->book) ||
+                    !Common(
                         record,
                         registry_ordinal,
                         event->common,
@@ -226,7 +402,10 @@ bool ProjectSnapshotWireV1(
                 return true;
             } else if constexpr (
                 std::is_same_v<Event, market::ShenzhenSnapshotV1>) {
-                if (!Common(
+                if (record.kind() !=
+                        market::MarketEventKindV1::kShenzhenSnapshot ||
+                    !BookRepresentable(event->book) ||
+                    !Common(
                         record,
                         registry_ordinal,
                         event->common,
@@ -282,88 +461,24 @@ bool ProjectTickWireV1(
         record.tick_stream_sequence() == 0U) {
         return false;
     }
-    RealtimeWireTickPayloadV1 projected{};
-    const bool ok = std::visit(
-        [&](const auto* event) noexcept -> bool {
-            using Pointer = std::decay_t<decltype(event)>;
-            using Event = std::remove_cv_t<
-                std::remove_pointer_t<Pointer>>;
-            if (event == nullptr) {
-                return false;
-            }
-            if constexpr (
-                std::is_same_v<Event, market::ShanghaiTickV1>) {
-                if (!Common(
-                        record,
-                        registry_ordinal,
-                        event->common,
-                        static_cast<std::uint32_t>(
-                            sizeof(projected)),
-                        &projected.common) ||
-                    !CopyRaw(
-                        event->raw_type,
-                        &projected.raw_type,
-                        &projected.raw_type_length) ||
-                    !CopyRaw(
-                        event->raw_tick_flag,
-                        &projected.raw_tick_flag,
-                        &projected.raw_tick_flag_length)) {
-                    return false;
-                }
-                projected.channel =
-                    static_cast<std::int64_t>(event->channel);
-                projected.native_event_sequence =
-                    event->business_index;
-                TickFields(event->fields, &projected);
-                return true;
-            } else if constexpr (
-                std::is_same_v<Event, market::ShenzhenOrderV1>) {
-                if (!Common(
-                        record,
-                        registry_ordinal,
-                        event->common,
-                        static_cast<std::uint32_t>(
-                            sizeof(projected)),
-                        &projected.common)) {
-                    return false;
-                }
-                projected.channel =
-                    static_cast<std::int64_t>(event->channel);
-                projected.native_event_sequence =
-                    event->application_sequence;
-                projected.source_raw_code_1 = event->raw_side;
-                projected.source_raw_code_2 = event->raw_order_type;
-                TickFields(event->fields, &projected);
-                return true;
-            } else if constexpr (
-                std::is_same_v<Event, market::ShenzhenTransactionV1>) {
-                if (!Common(
-                        record,
-                        registry_ordinal,
-                        event->common,
-                        static_cast<std::uint32_t>(
-                            sizeof(projected)),
-                        &projected.common)) {
-                    return false;
-                }
-                projected.channel =
-                    static_cast<std::int64_t>(event->channel);
-                projected.native_event_sequence =
-                    event->application_sequence;
-                projected.source_raw_code_1 =
-                    event->raw_execution_type;
-                TickFields(event->fields, &projected);
-                return true;
-            } else {
-                return false;
-            }
-        },
-        record.event());
-    if (!ok) {
-        return false;
-    }
-    *output = projected;
-    return true;
+    std::uint32_t projection_flags = 0U;
+    return ProjectTickCore(
+        record,
+        registry_ordinal,
+        output,
+        &projection_flags);
+}
+
+bool ProjectHistoryTickWireV1(
+    const market::RealtimeHistoryRecordV1& record,
+    std::size_t registry_ordinal,
+    RealtimeWireTickPayloadV1* output,
+    std::uint32_t* projection_flags) noexcept {
+    return ProjectTickCore(
+        record,
+        registry_ordinal,
+        output,
+        projection_flags);
 }
 
 bool ProjectKLineWireV1(

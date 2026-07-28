@@ -13,7 +13,10 @@ inline constexpr std::array<std::uint8_t, 8U> kRealtimeShmMagicV1{
 inline constexpr std::array<std::uint8_t, 8U> kRealtimeControlMagicV1{
     'L', '2', 'F', 'C', 'T', 'L', '1', '\0'};
 inline constexpr std::uint16_t kRealtimeWireMajorV1 = 1U;
-inline constexpr std::uint16_t kRealtimeWireMinorV1 = 0U;
+// Minor 1 assigns the formerly-reserved tick word at offset 132 to explicit
+// projection flags. A 1.0 reader must reject 1.1 during handshake rather than
+// silently interpret an omitted raw field as a genuine empty value.
+inline constexpr std::uint16_t kRealtimeWireMinorV1 = 1U;
 inline constexpr std::uint32_t kRealtimeLittleEndianMarkerV1 =
     0x01020304U;
 inline constexpr std::size_t kRealtimeWireRegionCountV1 = 9U;
@@ -36,6 +39,15 @@ enum class RealtimeServerStateV1 : std::uint32_t {
 enum RealtimeHeaderFlagV1 : std::uint32_t {
     kRealtimeHeaderCoverageLostV1 = 1U << 0U,
     kRealtimeHeaderKLineEnabledV1 = 1U << 1U,
+};
+
+// The fixed tick payload keeps only 32 inline bytes for each Shanghai raw
+// text field. Oversized retained Store strings are represented by an empty
+// inline value plus one of these explicit flags; the tick record itself is
+// still published to latest, ring, and history.
+enum RealtimeWireTickProjectionFlagV1 : std::uint32_t {
+    kRealtimeWireTickRawTypeOmittedV1 = 1U << 0U,
+    kRealtimeWireTickRawTickFlagOmittedV1 = 1U << 1U,
 };
 
 enum class RealtimeRegionKindV1 : std::uint32_t {
@@ -253,7 +265,7 @@ static_assert(
 struct RealtimeWireTickPayloadV1 final {
     RealtimeWireCommonRecordV1 common{};
     std::uint32_t validity_bitmap = 0U;
-    std::uint32_t reserved_channel = 0U;
+    std::uint32_t projection_flags = 0U;
     std::int64_t channel = 0;
     std::int64_t native_event_sequence = 0;
     std::int32_t source_raw_code_1 = 0;
@@ -277,6 +289,8 @@ struct RealtimeWireTickPayloadV1 final {
     std::array<std::uint8_t, 32U> raw_tick_flag{};
 };
 static_assert(sizeof(RealtimeWireTickPayloadV1) == 336U);
+static_assert(
+    offsetof(RealtimeWireTickPayloadV1, projection_flags) == 132U);
 static_assert(
     sizeof(RealtimeWireTickPayloadV1) <=
     kRealtimeTickSlotBytesV1 - 64U);

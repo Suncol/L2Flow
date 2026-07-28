@@ -14,6 +14,8 @@ from typing import Iterable, Optional, Sequence, Tuple, Union
 from .models import (
     ClientClosedError,
     InconsistentReadError,
+    InstrumentKey,
+    InstrumentLookupStatus,
     LatestStatus,
     NativeReaderError,
     ServerState,
@@ -142,6 +144,19 @@ def _bind_library(library) -> None:
         ctypes.POINTER(ctypes.c_size_t),
     ]
     library.l2flow_shm_reader_instrument_v1.restype = ctypes.c_int
+    byte_pointer = ctypes.POINTER(ctypes.c_uint8)
+    library.l2flow_shm_reader_resolve_instruments_v1.argtypes = [
+        handle,
+        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.POINTER(byte_pointer),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(byte_pointer),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint8),
+    ]
+    library.l2flow_shm_reader_resolve_instruments_v1.restype = ctypes.c_int
     for name in (
         "l2flow_shm_reader_latest_snapshots_v1",
         "l2flow_shm_reader_latest_ticks_v1",
@@ -371,6 +386,94 @@ class NativeReader:
                 bytes(source) if source is not None else b"",
                 bytes(security) if security is not None else b"",
             )
+
+    def resolve_instruments(
+        self, keys: Sequence[InstrumentKey]
+    ) -> Tuple[Tuple[InstrumentLookupStatus, ...], Tuple[int, ...]]:
+        if isinstance(keys, (str, bytes, bytearray)):
+            raise TypeError("keys must be a sequence of InstrumentKey values")
+        keys = tuple(keys)
+        if len(keys) > _C_SIZE_MAX:
+            raise ValueError("keys is too large")
+        for key in keys:
+            if not isinstance(key, InstrumentKey):
+                raise TypeError("each key must be an InstrumentKey")
+        count = len(keys)
+        if count == 0:
+            with self._lock:
+                self._require_open()
+            return (), ()
+
+        byte_pointer = ctypes.POINTER(ctypes.c_uint8)
+        markets = (ctypes.c_uint8 * count)(
+            *(int(key.market) for key in keys)
+        )
+        source_pointers = (byte_pointer * count)()
+        source_lengths = (ctypes.c_size_t * count)()
+        security_pointers = (byte_pointer * count)()
+        security_lengths = (ctypes.c_size_t * count)()
+        # Keep every client-owned byte array alive through the native call.
+        source_buffers = []
+        security_buffers = []
+        for index, key in enumerate(keys):
+            source_lengths[index] = len(key.security_id_source)
+            if key.security_id_source:
+                source_buffer = (
+                    ctypes.c_uint8 * len(key.security_id_source)
+                ).from_buffer_copy(key.security_id_source)
+                source_buffers.append(source_buffer)
+                source_pointers[index] = ctypes.cast(
+                    source_buffer, byte_pointer
+                )
+            security_lengths[index] = len(key.security_id)
+            if key.security_id:
+                security_buffer = (
+                    ctypes.c_uint8 * len(key.security_id)
+                ).from_buffer_copy(key.security_id)
+                security_buffers.append(security_buffer)
+                security_pointers[index] = ctypes.cast(
+                    security_buffer, byte_pointer
+                )
+
+        instrument_ids = (ctypes.c_uint32 * count)()
+        statuses = (ctypes.c_uint8 * count)()
+        with self._lock:
+            self._require_open()
+            code = (
+                self._library.l2flow_shm_reader_resolve_instruments_v1(
+                    self._handle,
+                    markets,
+                    source_pointers,
+                    source_lengths,
+                    security_pointers,
+                    security_lengths,
+                    count,
+                    instrument_ids,
+                    statuses,
+                )
+            )
+            _raise_native("resolve_instruments", code)
+
+        parsed_statuses = []
+        parsed_ids = []
+        for status_value, instrument_id in zip(
+            statuses, instrument_ids
+        ):
+            try:
+                status = InstrumentLookupStatus(status_value)
+            except ValueError as error:
+                raise WireFormatError(
+                    f"unsupported instrument lookup status {status_value}"
+                ) from error
+            if (
+                status is InstrumentLookupStatus.FOUND
+            ) != (instrument_id != 0):
+                raise WireFormatError(
+                    "instrument lookup status/ID mismatch"
+                )
+            parsed_statuses.append(status)
+            parsed_ids.append(instrument_id)
+        return tuple(parsed_statuses), tuple(parsed_ids)
 
     def _latest(
         self,

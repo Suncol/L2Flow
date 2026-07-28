@@ -1230,6 +1230,12 @@ bool IntradayInstrumentStoreGenerationV1::coverage_from_open()
     return impl_->data->coverage_from_open;
 }
 
+std::uint64_t
+IntradayInstrumentStoreGenerationV1::store_session_epoch()
+    const noexcept {
+    return impl_->data->session->session_epoch;
+}
+
 IntradayInstrumentStoreQueryErrorV1
 IntradayInstrumentStoreGenerationV1::Find(
     std::uint32_t instrument_id,

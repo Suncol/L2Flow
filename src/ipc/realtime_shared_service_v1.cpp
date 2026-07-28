@@ -1,5 +1,6 @@
 #include "l2flow/ipc/realtime_shared_service_v1.h"
 
+#include "l2flow/ipc/realtime_history_wire_v1.h"
 #include "l2flow/ipc/realtime_wire_projection_v1.h"
 #include "l2flow/ipc/realtime_wire_v1.h"
 
@@ -9,12 +10,15 @@
 #include <bit>
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <span>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -24,6 +28,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -44,6 +49,10 @@ namespace market = l2flow::market;
 constexpr std::uint64_t kPageBytes = 4096U;
 constexpr std::size_t kHotPrefixAdvanceBudget = 64U;
 constexpr std::size_t kControlPrefixAdvanceBudget = 4096U;
+constexpr std::uint32_t kMaximumHistoryReadersHardLimit = 256U;
+constexpr std::uint32_t kMaximumHistoryPageRecordsHardLimit =
+    1024U * 1024U;
+constexpr std::uint64_t kMinimumHistoryPageBytes = 8192U;
 
 void SetSystemError(int* output, int value) noexcept {
     if (output != nullptr) {
@@ -114,6 +123,18 @@ bool StateAcceptsPublication(std::uint32_t state) noexcept {
            state ==
                static_cast<std::uint32_t>(
                    RealtimeServerStateV1::kDraining);
+}
+
+bool StateAcceptsHistoryRead(std::uint32_t state) noexcept {
+    return state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV1::kActive) ||
+           state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV1::kDraining) ||
+           state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV1::kStoppedClean);
 }
 
 template <typename Slot, typename Payload>
@@ -255,6 +276,238 @@ bool ValidSocketPath(const std::filesystem::path& path) noexcept {
     }
 }
 
+bool MonotonicNowNanoseconds(std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    timespec now{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        now.tv_sec < 0 || now.tv_nsec < 0) {
+        return false;
+    }
+    constexpr std::uint64_t nanoseconds_per_second =
+        1'000'000'000ULL;
+    const std::uint64_t seconds =
+        static_cast<std::uint64_t>(now.tv_sec);
+    const std::uint64_t nanoseconds =
+        static_cast<std::uint64_t>(now.tv_nsec);
+    if (seconds >
+        (std::numeric_limits<std::uint64_t>::max() - nanoseconds) /
+            nanoseconds_per_second) {
+        return false;
+    }
+    *output = seconds * nanoseconds_per_second + nanoseconds;
+    return true;
+}
+
+class HistoryStageTimer final {
+public:
+    using DurationMember =
+        std::uint64_t RealtimeHistoryPageStageTimingV1::*;
+
+    HistoryStageTimer(
+        RealtimeHistoryPageStageTimingV1* timing,
+        DurationMember duration_member) noexcept
+        : timing_(timing),
+          duration_(
+              timing == nullptr ? nullptr
+                                : &(timing->*duration_member)) {
+        if (timing_ == nullptr) {
+            return;
+        }
+        if (!MonotonicNowNanoseconds(&start_ns_)) {
+            RecordClockFailure();
+            return;
+        }
+        active_ = true;
+    }
+
+    HistoryStageTimer(const HistoryStageTimer&) = delete;
+    HistoryStageTimer& operator=(const HistoryStageTimer&) = delete;
+
+    ~HistoryStageTimer() {
+        if (!active_) {
+            return;
+        }
+        std::uint64_t end_ns = 0U;
+        if (!MonotonicNowNanoseconds(&end_ns) ||
+            end_ns < start_ns_) {
+            RecordClockFailure();
+            return;
+        }
+        const std::uint64_t elapsed_ns = end_ns - start_ns_;
+        if (*duration_ >
+            std::numeric_limits<std::uint64_t>::max() - elapsed_ns) {
+            *duration_ = std::numeric_limits<std::uint64_t>::max();
+            RecordClockFailure();
+            return;
+        }
+        *duration_ += elapsed_ns;
+    }
+
+private:
+    void RecordClockFailure() noexcept {
+        if (timing_ != nullptr &&
+            timing_->clock_read_failures !=
+                std::numeric_limits<std::uint32_t>::max()) {
+            ++timing_->clock_read_failures;
+        }
+    }
+
+    RealtimeHistoryPageStageTimingV1* timing_ = nullptr;
+    std::uint64_t* duration_ = nullptr;
+    std::uint64_t start_ns_ = 0U;
+    bool active_ = false;
+};
+
+bool MonotonicDeadline(
+    int timeout_ms,
+    std::uint64_t* output) noexcept {
+    std::uint64_t now = 0U;
+    if (timeout_ms <= 0 || output == nullptr ||
+        !MonotonicNowNanoseconds(&now)) {
+        return false;
+    }
+    constexpr std::uint64_t nanoseconds_per_millisecond =
+        1'000'000ULL;
+    const std::uint64_t delta =
+        static_cast<std::uint64_t>(timeout_ms) *
+        nanoseconds_per_millisecond;
+    *output =
+        now > std::numeric_limits<std::uint64_t>::max() - delta
+            ? std::numeric_limits<std::uint64_t>::max()
+            : now + delta;
+    return true;
+}
+
+int RemainingPollMilliseconds(
+    std::uint64_t deadline_ns) noexcept {
+    std::uint64_t now = 0U;
+    if (!MonotonicNowNanoseconds(&now) || now >= deadline_ns) {
+        return 0;
+    }
+    constexpr std::uint64_t nanoseconds_per_millisecond =
+        1'000'000ULL;
+    const std::uint64_t remaining_ns = deadline_ns - now;
+    const std::uint64_t rounded_up =
+        remaining_ns / nanoseconds_per_millisecond +
+        (remaining_ns % nanoseconds_per_millisecond != 0U ? 1U : 0U);
+    return static_cast<int>(std::min<std::uint64_t>(
+        rounded_up,
+        static_cast<std::uint64_t>(
+            std::numeric_limits<int>::max())));
+}
+
+bool SendPacket(
+    int socket_fd,
+    const void* data,
+    std::size_t bytes,
+    int attached_fd,
+    int timeout_ms) noexcept {
+    if (socket_fd < 0 || data == nullptr || bytes == 0U ||
+        timeout_ms <= 0) {
+        return false;
+    }
+    std::uint64_t deadline_ns = 0U;
+    if (!MonotonicDeadline(timeout_ms, &deadline_ns)) {
+        return false;
+    }
+    iovec vector{};
+    vector.iov_base = const_cast<void*>(data);
+    vector.iov_len = bytes;
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1U;
+    std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
+    if (attached_fd >= 0) {
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        cmsghdr* const rights = CMSG_FIRSTHDR(&message);
+        if (rights == nullptr) {
+            return false;
+        }
+        rights->cmsg_level = SOL_SOCKET;
+        rights->cmsg_type = SCM_RIGHTS;
+        rights->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(CMSG_DATA(rights), &attached_fd, sizeof(attached_fd));
+    }
+    for (;;) {
+        const ssize_t sent =
+            ::sendmsg(socket_fd, &message, MSG_NOSIGNAL);
+        if (sent == static_cast<ssize_t>(bytes)) {
+            return true;
+        }
+        if (sent >= 0) {
+            return false;
+        }
+        if (errno == EINTR) {
+            if (RemainingPollMilliseconds(deadline_ns) == 0) {
+                return false;
+            }
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return false;
+        }
+        pollfd descriptor{};
+        descriptor.fd = socket_fd;
+        descriptor.events = static_cast<short>(POLLOUT);
+        int ready = -1;
+        do {
+            const int remaining_ms =
+                RemainingPollMilliseconds(deadline_ns);
+            if (remaining_ms == 0) {
+                return false;
+            }
+            ready = ::poll(
+                &descriptor, 1U, remaining_ms);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0 ||
+            (descriptor.revents &
+             (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+            (descriptor.revents & POLLOUT) == 0) {
+            return false;
+        }
+    }
+}
+
+void CloseDescriptor(int* descriptor) noexcept {
+    if (descriptor != nullptr && *descriptor >= 0) {
+        static_cast<void>(::close(*descriptor));
+        *descriptor = -1;
+    }
+}
+
+bool GenerateReadToken(
+    std::uint64_t forbidden,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    for (std::size_t attempt = 0U; attempt < 4U; ++attempt) {
+        std::uint64_t token = 0U;
+        auto* bytes = reinterpret_cast<std::byte*>(&token);
+        std::size_t filled = 0U;
+        while (filled < sizeof(token)) {
+            const ssize_t result = ::getrandom(
+                bytes + filled, sizeof(token) - filled, 0U);
+            if (result > 0) {
+                filled += static_cast<std::size_t>(result);
+                continue;
+            }
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (token != 0U && token != forbidden) {
+            *output = token;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 std::string_view RealtimeSharedServiceCreateErrorNameV1(
@@ -290,6 +543,13 @@ std::string_view RealtimeSharedServiceCreateErrorNameV1(
 
 class RealtimeSharedMarketServiceV1::Impl final {
 public:
+    struct HistoryWorkerSlot final {
+        std::mutex socket_mutex;
+        int client_fd = -1;
+        std::atomic<bool> running{false};
+        std::thread thread;
+    };
+
     explicit Impl(RealtimeSharedServiceConfigV1 config)
         : config_(std::move(config)) {}
 
@@ -328,6 +588,23 @@ public:
             common::IsZeroIdentity(config_.run_id) ||
             config_.session_epoch == 0U || config_.trade_date == 0U ||
             config_.tick_ring_capacity == 0U ||
+            config_.maximum_history_readers == 0U ||
+            config_.maximum_history_readers >
+                kMaximumHistoryReadersHardLimit ||
+            config_.maximum_history_page_records == 0U ||
+            config_.maximum_history_page_records >
+                kMaximumHistoryPageRecordsHardLimit ||
+            config_.maximum_history_page_bytes <
+                kMinimumHistoryPageBytes ||
+            config_.maximum_history_page_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            config_.maximum_history_page_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max()) ||
+            config_.history_reader_idle_timeout.count() <= 0 ||
+            config_.history_reader_idle_timeout.count() >
+                std::numeric_limits<int>::max() ||
             config_.maximum_mapping_bytes <
                 sizeof(RealtimeWireHeaderV1) ||
             !ValidSocketPath(config_.control_socket_path) ||
@@ -526,6 +803,8 @@ public:
                 ring_locks_[static_cast<std::size_t>(index)]
                     .flag.clear(std::memory_order_relaxed);
             }
+            history_workers_ = std::make_unique<HistoryWorkerSlot[]>(
+                config_.maximum_history_readers);
         } catch (...) {
             return RealtimeSharedServiceCreateErrorV1::
                 kResourceExhausted;
@@ -757,6 +1036,175 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool PublishStoreGeneration(
+        std::shared_ptr<const market::
+                            IntradayInstrumentStoreGenerationV1>
+            generation) noexcept {
+        if (store_publication_in_progress_.test_and_set(
+                std::memory_order_acquire)) {
+            MarkCoverageLost();
+            return false;
+        }
+        struct PublicationGuard final {
+            std::atomic_flag& flag;
+            ~PublicationGuard() {
+                flag.clear(std::memory_order_release);
+            }
+        } publication_guard{store_publication_in_progress_};
+
+        if (generation == nullptr || header_ == nullptr ||
+            !StateAcceptsPublication(
+                Atomic(header_->server_state)
+                    .load(std::memory_order_acquire))) {
+            MarkCoverageLost();
+            return false;
+        }
+        const market::RealtimeHistoryWatermarkV1& watermark =
+            generation->watermark();
+        if (watermark.run_id != config_.run_id ||
+            watermark.trade_date != config_.trade_date ||
+            watermark.registry_version !=
+                config_.registry->registry_version() ||
+            watermark.registry_sha256 !=
+                config_.registry->registry_sha256() ||
+            watermark.generation == 0U ||
+            watermark.ingress_sequence_exclusive == 0U ||
+            generation->store_session_epoch() == 0U ||
+            generation->instrument_count() !=
+                config_.registry->size() ||
+            generation->record_count() !=
+                watermark.ingress_sequence_exclusive - 1U) {
+            MarkCoverageLost();
+            return false;
+        }
+        const std::shared_ptr<const market::
+                                  IntradayInstrumentStoreGenerationV1>
+            previous =
+                std::atomic_load_explicit(
+                    &store_generation_, std::memory_order_acquire);
+        const std::uint64_t previous_generation =
+            previous == nullptr ? 0U : previous->watermark().generation;
+        if (previous_generation ==
+                std::numeric_limits<std::uint64_t>::max() ||
+            watermark.generation != previous_generation + 1U) {
+            MarkCoverageLost();
+            return false;
+        }
+        if (previous != nullptr) {
+            const market::RealtimeHistoryWatermarkV1&
+                previous_watermark = previous->watermark();
+            if (generation->store_session_epoch() !=
+                    previous->store_session_epoch() ||
+                generation->coverage_from_open() !=
+                    previous->coverage_from_open() ||
+                watermark.ingress_sequence_exclusive <
+                    previous_watermark.ingress_sequence_exclusive ||
+                watermark.recv_monotonic_cut_ns <
+                    previous_watermark.recv_monotonic_cut_ns ||
+                generation->record_count() <
+                    previous->record_count()) {
+                MarkCoverageLost();
+                return false;
+            }
+            for (std::size_t source = 0U;
+                 source < watermark.sources.size();
+                 ++source) {
+                if (watermark.sources[source].source_stream_id !=
+                        previous_watermark.sources[source]
+                            .source_stream_id ||
+                    watermark.sources[source].sequence_exclusive <
+                        previous_watermark.sources[source]
+                            .sequence_exclusive) {
+                    MarkCoverageLost();
+                    return false;
+                }
+            }
+        }
+
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            source_totals{};
+        std::uint64_t record_total = 0U;
+        for (std::size_t ordinal = 0U;
+             ordinal < config_.registry->size();
+             ++ordinal) {
+            market::IntradayInstrumentSummaryV1 summary{};
+            if (generation->SummaryAt(ordinal, &summary) !=
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+                summary.instrument_id !=
+                    instrument_rows()[ordinal].instrument_id) {
+                MarkCoverageLost();
+                return false;
+            }
+            market::IntradayInstrumentSummaryV1 previous_summary{};
+            if (previous != nullptr &&
+                (previous->SummaryAt(ordinal, &previous_summary) !=
+                     market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+                 previous_summary.instrument_id !=
+                     summary.instrument_id ||
+                 previous_summary.record_count >
+                     summary.record_count)) {
+                MarkCoverageLost();
+                return false;
+            }
+            std::uint64_t row_total = 0U;
+            for (std::size_t source = 0U;
+                 source < source_totals.size();
+                 ++source) {
+                if ((previous != nullptr &&
+                     previous_summary.source_record_counts[source] >
+                         summary.source_record_counts[source]) ||
+                    !CheckedAdd(
+                        row_total,
+                        summary.source_record_counts[source],
+                        &row_total) ||
+                    !CheckedAdd(
+                        source_totals[source],
+                        summary.source_record_counts[source],
+                        &source_totals[source])) {
+                    MarkCoverageLost();
+                    return false;
+                }
+            }
+            if (row_total != summary.record_count ||
+                !CheckedAdd(
+                    record_total,
+                    summary.record_count,
+                    &record_total)) {
+                MarkCoverageLost();
+                return false;
+            }
+        }
+        if (record_total != generation->record_count()) {
+            MarkCoverageLost();
+            return false;
+        }
+        for (std::size_t source = 0U;
+             source < source_totals.size();
+             ++source) {
+            if (watermark.sources[source].source_stream_id == 0U ||
+                watermark.sources[source].sequence_exclusive == 0U ||
+                source_totals[source] !=
+                    watermark.sources[source].sequence_exclusive - 1U) {
+                MarkCoverageLost();
+                return false;
+            }
+        }
+        if (!StateAcceptsPublication(
+                Atomic(header_->server_state)
+                    .load(std::memory_order_acquire)) ||
+            (Atomic(header_->flags).load(std::memory_order_acquire) &
+             kRealtimeHeaderCoverageLostV1) != 0U) {
+            MarkCoverageLost();
+            return false;
+        }
+        std::atomic_store_explicit(
+            &store_generation_,
+            std::move(generation),
+            std::memory_order_release);
+        return true;
+    }
+
     void MarkDraining() noexcept {
         if (header_ == nullptr) {
             return;
@@ -795,17 +1243,36 @@ public:
             MarkCoverageLost();
             return false;
         }
-        Atomic(header_->server_state)
-            .store(
+        std::uint32_t expected_state =
+            static_cast<std::uint32_t>(
+                RealtimeServerStateV1::kDraining);
+        if (!Atomic(header_->server_state)
+                 .compare_exchange_strong(
+                     expected_state,
+                     static_cast<std::uint32_t>(
+                         RealtimeServerStateV1::kStoppedClean),
+                     std::memory_order_release,
+                     std::memory_order_acquire)) {
+            MarkCoverageLost();
+            return false;
+        }
+        if ((Atomic(header_->flags).load(std::memory_order_acquire) &
+             kRealtimeHeaderCoverageLostV1) != 0U ||
+            Atomic(header_->server_state)
+                    .load(std::memory_order_acquire) !=
                 static_cast<std::uint32_t>(
-                    RealtimeServerStateV1::kStoppedClean),
-                std::memory_order_release);
+                    RealtimeServerStateV1::kStoppedClean)) {
+            MarkCoverageLost();
+            return false;
+        }
         return true;
     }
 
     void MarkFailed() noexcept { MarkCoverageLost(); }
 
     void StopControl() noexcept {
+        std::lock_guard<std::mutex> stop_lock(
+            control_stop_mutex_);
         if (header_ != nullptr) {
             const std::uint32_t state =
                 Atomic(header_->server_state)
@@ -830,6 +1297,7 @@ public:
             if (control_thread_.joinable()) {
                 control_thread_.join();
             }
+            StopHistoryWorkers();
             return;
         }
         if (stop_event_fd_ >= 0) {
@@ -847,6 +1315,7 @@ public:
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
+        StopHistoryWorkers();
     }
 
     [[nodiscard]] std::uint64_t mapping_bytes() const noexcept {
@@ -869,6 +1338,213 @@ public:
     }
 
 private:
+    struct HistoryPageLayout final {
+        std::uint64_t descriptor_offset = 0U;
+        std::uint64_t snapshot_offset = 0U;
+        std::uint64_t tick_offset = 0U;
+        std::uint64_t total_bytes = 0U;
+    };
+
+    struct BuiltHistoryPage final {
+        int read_only_fd = -1;
+        std::uint64_t mapping_bytes = 0U;
+        std::uint32_t record_count = 0U;
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            source_counts{};
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            last_source_sequences{};
+        std::uint64_t first_ingress_sequence = 0U;
+        std::uint64_t last_ingress_sequence = 0U;
+    };
+
+    enum class HistoryPageBuildError : std::uint8_t {
+        kNone = 0U,
+        kResourceExhausted,
+        kQueryFailure,
+        kProjectionFailure,
+    };
+
+    [[nodiscard]] bool HistoryHealthy() const noexcept {
+        return header_ != nullptr &&
+               StateAcceptsHistoryRead(
+                   Atomic(header_->server_state)
+                       .load(std::memory_order_acquire)) &&
+               (Atomic(header_->flags).load(std::memory_order_acquire) &
+                kRealtimeHeaderCoverageLostV1) == 0U;
+    }
+
+    [[nodiscard]] bool ComputeHistoryPageLayout(
+        std::uint64_t record_count,
+        std::uint64_t snapshot_count,
+        std::uint64_t tick_count,
+        HistoryPageLayout* output) const noexcept {
+        std::uint64_t combined_count = 0U;
+        if (output == nullptr ||
+            snapshot_count > record_count ||
+            tick_count > record_count ||
+            !CheckedAdd(
+                snapshot_count, tick_count, &combined_count) ||
+            combined_count != record_count) {
+            return false;
+        }
+        std::uint64_t descriptor_bytes = 0U;
+        std::uint64_t snapshot_bytes = 0U;
+        std::uint64_t tick_bytes = 0U;
+        std::uint64_t descriptor_end = 0U;
+        std::uint64_t snapshot_end = 0U;
+        std::uint64_t tick_end = 0U;
+        HistoryPageLayout result{};
+        result.descriptor_offset =
+            sizeof(RealtimeHistoryPageHeaderV1);
+        if (!CheckedMultiply(
+                record_count,
+                sizeof(RealtimeHistoryRecordDescriptorV1),
+                &descriptor_bytes) ||
+            !CheckedAdd(
+                result.descriptor_offset,
+                descriptor_bytes,
+                &descriptor_end)) {
+            return false;
+        }
+        result.snapshot_offset = descriptor_end;
+        if (!CheckedMultiply(
+                snapshot_count,
+                sizeof(RealtimeWireSnapshotPayloadV1),
+                &snapshot_bytes) ||
+            !CheckedAdd(
+                result.snapshot_offset,
+                snapshot_bytes,
+                &snapshot_end)) {
+            return false;
+        }
+        result.tick_offset = snapshot_end;
+        if (!CheckedMultiply(
+                tick_count,
+                sizeof(RealtimeWireTickPayloadV1),
+                &tick_bytes) ||
+            !CheckedAdd(result.tick_offset, tick_bytes, &tick_end)) {
+            return false;
+        }
+        result.total_bytes = tick_end;
+        if (
+            result.total_bytes >
+                config_.maximum_history_page_bytes ||
+            result.total_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            result.total_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max())) {
+            return false;
+        }
+        *output = result;
+        return true;
+    }
+
+    [[nodiscard]] bool FillHistoryGenerationInfo(
+        const market::IntradayInstrumentStoreGenerationV1& generation,
+        std::size_t registry_ordinal,
+        const market::IntradayInstrumentSummaryV1& summary,
+        RealtimeHistoryGenerationInfoV1* output) const noexcept {
+        if (output == nullptr ||
+            registry_ordinal >= config_.registry->size() ||
+            registry_ordinal >
+                static_cast<std::size_t>(
+                    std::numeric_limits<std::uint32_t>::max()) ||
+            summary.instrument_id == 0U ||
+            instrument_rows()[registry_ordinal].instrument_id !=
+                summary.instrument_id) {
+            return false;
+        }
+        std::uint64_t summary_total = 0U;
+        for (const std::uint64_t count :
+             summary.source_record_counts) {
+            if (!CheckedAdd(summary_total, count, &summary_total)) {
+                return false;
+            }
+        }
+        if (summary_total != summary.record_count) {
+            return false;
+        }
+        const market::RealtimeHistoryWatermarkV1& watermark =
+            generation.watermark();
+        RealtimeHistoryGenerationInfoV1 result{};
+        for (std::size_t index = 0U;
+             index < watermark.run_id.size();
+             ++index) {
+            result.run_id[index] =
+                std::to_integer<std::uint8_t>(
+                    watermark.run_id[index]);
+        }
+        result.session_epoch = config_.session_epoch;
+        result.generation = watermark.generation;
+        result.trade_date = watermark.trade_date;
+        result.instrument_id = summary.instrument_id;
+        result.registry_ordinal =
+            static_cast<std::uint32_t>(registry_ordinal);
+        result.instrument_count =
+            static_cast<std::uint32_t>(
+                generation.instrument_count());
+        result.ingress_sequence_exclusive =
+            watermark.ingress_sequence_exclusive;
+        result.recv_monotonic_cut_ns =
+            watermark.recv_monotonic_cut_ns;
+        result.registry_version = watermark.registry_version;
+        for (std::size_t index = 0U;
+             index < result.registry_sha256.size();
+             ++index) {
+            result.registry_sha256[index] =
+                std::to_integer<std::uint8_t>(
+                    watermark.registry_sha256[index]);
+            result.input_identity_sha256[index] =
+                std::to_integer<std::uint8_t>(
+                    watermark.input_identity_sha256[index]);
+        }
+        for (std::size_t source = 0U;
+             source < summary.source_record_counts.size();
+             ++source) {
+            result.source_stream_ids[source] =
+                watermark.sources[source].source_stream_id;
+            result.source_sequence_exclusive[source] =
+                watermark.sources[source].sequence_exclusive;
+            result.instrument_source_record_counts[source] =
+                summary.source_record_counts[source];
+        }
+        result.instrument_record_count = summary.record_count;
+        result.flags =
+            kRealtimeHistoryRecordCoverageCompleteV1 |
+            (generation.coverage_from_open()
+                 ? kRealtimeHistoryCoverageFromOpenV1
+                 : 0U);
+        result.payload_projection =
+            static_cast<std::uint32_t>(
+                RealtimeHistoryPayloadProjectionV1::kCoreV1);
+        *output = result;
+        return true;
+    }
+
+    [[nodiscard]] std::size_t HistoryPageRecordCapacity(
+        std::uint32_t requested) const noexcept {
+        const std::uint64_t upper = std::min<std::uint64_t>(
+            requested, config_.maximum_history_page_records);
+        std::uint64_t low = 0U;
+        std::uint64_t high = upper + 1U;
+        while (low + 1U < high) {
+            const std::uint64_t middle =
+                low + (high - low) / 2U;
+            HistoryPageLayout ignored{};
+            if (ComputeHistoryPageLayout(
+                    middle, middle, 0U, &ignored)) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        return static_cast<std::size_t>(low);
+    }
+
     void InitializeHeader() noexcept {
         header_->magic = kRealtimeShmMagicV1;
         header_->abi_major = kRealtimeWireMajorV1;
@@ -1125,6 +1801,1028 @@ private:
         socket_bound_ = false;
     }
 
+    void StopHistoryWorkers() noexcept {
+        if (history_workers_ == nullptr) {
+            return;
+        }
+        for (std::uint32_t index = 0U;
+             index < config_.maximum_history_readers;
+             ++index) {
+            HistoryWorkerSlot& slot = history_workers_[index];
+            std::lock_guard<std::mutex> lock(slot.socket_mutex);
+            if (slot.client_fd >= 0) {
+                static_cast<void>(
+                    ::shutdown(slot.client_fd, SHUT_RDWR));
+            }
+        }
+        for (std::uint32_t index = 0U;
+             index < config_.maximum_history_readers;
+             ++index) {
+            if (history_workers_[index].thread.joinable()) {
+                history_workers_[index].thread.join();
+            }
+        }
+    }
+
+    [[nodiscard]] HistoryPageBuildError BuildHistoryPage(
+        market::IntradayInstrumentCursorV1& cursor,
+        std::size_t registry_ordinal,
+        const RealtimeHistoryGenerationInfoV1& generation_info,
+        std::uint64_t page_index,
+        std::size_t* page_capacity,
+        std::uint64_t previous_ingress_sequence,
+        const std::array<
+            std::uint64_t,
+            market::kIntradayInstrumentStoreSourceCountV1>&
+            previous_source_sequences,
+        BuiltHistoryPage* output,
+        RealtimeHistoryPageStageTimingV1* timing) noexcept {
+        if (page_capacity == nullptr || *page_capacity == 0U ||
+            output == nullptr || output->read_only_fd >= 0) {
+            return HistoryPageBuildError::kQueryFailure;
+        }
+        *output = BuiltHistoryPage{};
+        std::vector<const market::RealtimeHistoryRecordV1*> records;
+        try {
+            records.resize(*page_capacity);
+        } catch (...) {
+            return HistoryPageBuildError::kResourceExhausted;
+        }
+
+        std::size_t written = 0U;
+        market::IntradayInstrumentStoreQueryErrorV1 query_error =
+            market::IntradayInstrumentStoreQueryErrorV1::
+                kBatchLimitExceeded;
+        while (query_error ==
+               market::IntradayInstrumentStoreQueryErrorV1::
+                   kBatchLimitExceeded) {
+            {
+                HistoryStageTimer cursor_read_timer(
+                    timing,
+                    &RealtimeHistoryPageStageTimingV1::
+                        cursor_read_ns);
+                query_error = cursor.ReadBatch(
+                    std::span<
+                        const market::RealtimeHistoryRecordV1*>(
+                        records.data(), *page_capacity),
+                    &written);
+            }
+            if (query_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded) {
+                break;
+            }
+            if (*page_capacity == 1U) {
+                return HistoryPageBuildError::kQueryFailure;
+            }
+            *page_capacity = std::max<std::size_t>(
+                1U, *page_capacity / 2U);
+            records.resize(*page_capacity);
+        }
+        if (query_error ==
+            market::IntradayInstrumentStoreQueryErrorV1::
+                kResourceExhausted) {
+            return HistoryPageBuildError::kResourceExhausted;
+        }
+        if (query_error !=
+            market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            written > *page_capacity) {
+            return HistoryPageBuildError::kQueryFailure;
+        }
+        if (written == 0U) {
+            return cursor.done()
+                       ? HistoryPageBuildError::kNone
+                       : HistoryPageBuildError::kQueryFailure;
+        }
+
+        std::uint64_t snapshot_count = 0U;
+        std::uint64_t tick_count = 0U;
+        HistoryPageLayout layout{};
+        {
+            HistoryStageTimer classify_layout_timer(
+                timing,
+                &RealtimeHistoryPageStageTimingV1::
+                    classify_layout_ns);
+            for (std::size_t index = 0U; index < written; ++index) {
+                if (records[index] == nullptr) {
+                    MarkCoverageLost();
+                    return HistoryPageBuildError::kProjectionFailure;
+                }
+                if (market::IsSnapshotEventKindV1(
+                        records[index]->kind())) {
+                    ++snapshot_count;
+                } else if (market::IsTickEventKindV1(
+                               records[index]->kind())) {
+                    ++tick_count;
+                } else {
+                    MarkCoverageLost();
+                    return HistoryPageBuildError::kProjectionFailure;
+                }
+            }
+            if (!ComputeHistoryPageLayout(
+                    written,
+                    snapshot_count,
+                    tick_count,
+                    &layout)) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+        }
+        if (timing != nullptr) {
+            timing->record_count =
+                static_cast<std::uint32_t>(written);
+            timing->snapshot_count =
+                static_cast<std::uint32_t>(snapshot_count);
+            timing->tick_count =
+                static_cast<std::uint32_t>(tick_count);
+            timing->page_mapping_bytes = layout.total_bytes;
+        }
+
+        struct PageResources final {
+            int writable_fd = -1;
+            void* mapping = MAP_FAILED;
+            std::size_t mapping_bytes = 0U;
+            ~PageResources() {
+                if (mapping != MAP_FAILED) {
+                    static_cast<void>(
+                        ::munmap(mapping, mapping_bytes));
+                }
+                CloseDescriptor(&writable_fd);
+            }
+        } resources;
+        {
+            HistoryStageTimer memfd_prepare_timer(
+                timing,
+                &RealtimeHistoryPageStageTimingV1::
+                    memfd_prepare_ns);
+            resources.mapping_bytes =
+                static_cast<std::size_t>(layout.total_bytes);
+            resources.writable_fd = ::memfd_create(
+                "l2flow-history-page-v1",
+                MFD_CLOEXEC | MFD_ALLOW_SEALING);
+            if (resources.writable_fd < 0 ||
+                ::ftruncate(
+                    resources.writable_fd,
+                    static_cast<off_t>(layout.total_bytes)) != 0) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+            resources.mapping = ::mmap(
+                nullptr,
+                resources.mapping_bytes,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                resources.writable_fd,
+                0);
+            if (resources.mapping == MAP_FAILED) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+            std::memset(
+                resources.mapping, 0, resources.mapping_bytes);
+        }
+
+        {
+            HistoryStageTimer projection_timer(
+                timing,
+                &RealtimeHistoryPageStageTimingV1::projection_ns);
+            auto* const page = static_cast<RealtimeHistoryPageHeaderV1*>(
+                resources.mapping);
+            page->magic = kRealtimeHistoryMagicV1;
+            page->abi_major = kRealtimeWireMajorV1;
+            page->abi_minor = kRealtimeWireMinorV1;
+            page->header_bytes =
+                static_cast<std::uint32_t>(
+                    sizeof(RealtimeHistoryPageHeaderV1));
+            page->endian_marker = kRealtimeLittleEndianMarkerV1;
+            page->total_mapping_bytes = layout.total_bytes;
+            page->page_index = page_index;
+            page->record_count =
+                static_cast<std::uint32_t>(written);
+            page->record_descriptor_bytes =
+                static_cast<std::uint32_t>(
+                    sizeof(RealtimeHistoryRecordDescriptorV1));
+            page->record_descriptors_offset =
+                layout.descriptor_offset;
+            page->snapshot_payloads_offset =
+                layout.snapshot_offset;
+            page->snapshot_count =
+                static_cast<std::uint32_t>(snapshot_count);
+            page->snapshot_payload_bytes =
+                static_cast<std::uint32_t>(
+                    sizeof(RealtimeWireSnapshotPayloadV1));
+            page->tick_payloads_offset = layout.tick_offset;
+            page->tick_count =
+                static_cast<std::uint32_t>(tick_count);
+            page->tick_payload_bytes =
+                static_cast<std::uint32_t>(
+                    sizeof(RealtimeWireTickPayloadV1));
+            page->generation = generation_info;
+
+            auto* const descriptors =
+                reinterpret_cast<RealtimeHistoryRecordDescriptorV1*>(
+                    static_cast<std::byte*>(resources.mapping) +
+                    layout.descriptor_offset);
+            auto* const snapshots =
+                reinterpret_cast<RealtimeWireSnapshotPayloadV1*>(
+                    static_cast<std::byte*>(resources.mapping) +
+                    layout.snapshot_offset);
+            auto* const ticks =
+                reinterpret_cast<RealtimeWireTickPayloadV1*>(
+                    static_cast<std::byte*>(resources.mapping) +
+                    layout.tick_offset);
+            std::uint32_t snapshot_index = 0U;
+            std::uint32_t tick_index = 0U;
+            std::uint64_t prior_ingress =
+                previous_ingress_sequence;
+            auto prior_source_sequences =
+                previous_source_sequences;
+            for (std::size_t index = 0U; index < written; ++index) {
+                const market::RealtimeHistoryRecordV1& record =
+                    *records[index];
+                if (record.instrument_id() !=
+                        generation_info.instrument_id ||
+                    record.source_slot() >=
+                        generation_info.source_stream_ids.size() ||
+                    record.source_stream_id() !=
+                        generation_info.source_stream_ids[
+                            record.source_slot()] ||
+                    record.source_sequence() == 0U ||
+                    record.source_sequence() >=
+                        generation_info.source_sequence_exclusive[
+                            record.source_slot()] ||
+                    record.source_sequence() <=
+                        prior_source_sequences[record.source_slot()] ||
+                    record.ingress_sequence() <= prior_ingress ||
+                    record.ingress_sequence() >=
+                        generation_info.ingress_sequence_exclusive) {
+                    MarkCoverageLost();
+                    return HistoryPageBuildError::kProjectionFailure;
+                }
+                RealtimeHistoryRecordDescriptorV1& descriptor =
+                    descriptors[index];
+                descriptor.ingress_sequence =
+                    record.ingress_sequence();
+                descriptor.source_sequence =
+                    record.source_sequence();
+                descriptor.tick_stream_sequence =
+                    record.tick_stream_sequence();
+                descriptor.event_kind =
+                    static_cast<std::uint8_t>(record.kind());
+                descriptor.source_slot = record.source_slot();
+                const std::size_t source = record.source_slot();
+                if (output->source_counts[source] ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    MarkCoverageLost();
+                    return HistoryPageBuildError::kProjectionFailure;
+                }
+                ++output->source_counts[source];
+
+                const RealtimeWireCommonRecordV1* common = nullptr;
+                if (market::IsSnapshotEventKindV1(record.kind())) {
+                    descriptor.payload_kind =
+                        static_cast<std::uint8_t>(
+                            RealtimeHistoryPayloadKindV1::kSnapshot);
+                    descriptor.payload_index = snapshot_index;
+                    if (!ProjectSnapshotWireV1(
+                            record,
+                            registry_ordinal,
+                            &snapshots[snapshot_index])) {
+                        MarkCoverageLost();
+                        return HistoryPageBuildError::kProjectionFailure;
+                    }
+                    common = &snapshots[snapshot_index].common;
+                    ++snapshot_index;
+                } else {
+                    descriptor.payload_kind =
+                        static_cast<std::uint8_t>(
+                            RealtimeHistoryPayloadKindV1::kTick);
+                    descriptor.payload_index = tick_index;
+                    std::uint32_t projection_flags = 0U;
+                    if (!ProjectHistoryTickWireV1(
+                            record,
+                            registry_ordinal,
+                            &ticks[tick_index],
+                            &projection_flags) ||
+                        ticks[tick_index].projection_flags !=
+                            projection_flags) {
+                        MarkCoverageLost();
+                        return HistoryPageBuildError::kProjectionFailure;
+                    }
+                    descriptor.projection_flags = projection_flags;
+                    common = &ticks[tick_index].common;
+                    ++tick_index;
+                }
+                if (common == nullptr ||
+                    common->instrument_id != record.instrument_id() ||
+                    common->registry_ordinal != registry_ordinal ||
+                    common->source_sequence != record.source_sequence() ||
+                    common->ingress_sequence !=
+                        record.ingress_sequence() ||
+                    common->tick_stream_sequence !=
+                        record.tick_stream_sequence() ||
+                    common->source_slot != record.source_slot() ||
+                    common->event_kind != descriptor.event_kind ||
+                    common->trade_date != generation_info.trade_date) {
+                    MarkCoverageLost();
+                    return HistoryPageBuildError::kProjectionFailure;
+                }
+                prior_source_sequences[source] =
+                    record.source_sequence();
+                prior_ingress = record.ingress_sequence();
+            }
+            if (snapshot_index != snapshot_count ||
+                tick_index != tick_count) {
+                MarkCoverageLost();
+                return HistoryPageBuildError::kProjectionFailure;
+            }
+            page->first_ingress_sequence =
+                descriptors[0U].ingress_sequence;
+            page->last_ingress_sequence =
+                descriptors[written - 1U].ingress_sequence;
+            output->first_ingress_sequence =
+                page->first_ingress_sequence;
+            output->last_ingress_sequence =
+                page->last_ingress_sequence;
+            output->last_source_sequences =
+                prior_source_sequences;
+        }
+
+        int read_only_fd = -1;
+        {
+            HistoryStageTimer memfd_finalize_timer(
+                timing,
+                &RealtimeHistoryPageStageTimingV1::
+                    memfd_finalize_ns);
+            if (::munmap(
+                    resources.mapping, resources.mapping_bytes) != 0) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+            resources.mapping = MAP_FAILED;
+            const int seals =
+                F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK |
+                F_SEAL_SEAL;
+            if (::fcntl(
+                    resources.writable_fd, F_ADD_SEALS, seals) != 0 ||
+                ::fcntl(resources.writable_fd, F_GET_SEALS) != seals) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+            std::array<char, 64U> proc_path{};
+            const int path_bytes = std::snprintf(
+                proc_path.data(),
+                proc_path.size(),
+                "/proc/self/fd/%d",
+                resources.writable_fd);
+            if (path_bytes <= 0 ||
+                static_cast<std::size_t>(path_bytes) >=
+                    proc_path.size()) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+            read_only_fd =
+                ::open(proc_path.data(), O_RDONLY | O_CLOEXEC);
+            if (read_only_fd < 0) {
+                return HistoryPageBuildError::kResourceExhausted;
+            }
+        }
+        output->read_only_fd = read_only_fd;
+        output->mapping_bytes = layout.total_bytes;
+        output->record_count =
+            static_cast<std::uint32_t>(written);
+        return HistoryPageBuildError::kNone;
+    }
+
+    [[nodiscard]] bool SendHistoryOpenResponse(
+        int client,
+        std::uint64_t request_id,
+        RealtimeHistoryControlStatusV1 status,
+        const RealtimeHistoryGenerationInfoV1* generation,
+        std::uint64_t initial_read_token = 0U) const
+        noexcept {
+        RealtimeHistoryOpenResponseV1 response{};
+        response.magic = kRealtimeControlMagicV1;
+        response.protocol_major = kRealtimeWireMajorV1;
+        response.protocol_minor = kRealtimeWireMinorV1;
+        response.status = static_cast<std::uint16_t>(status);
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.request_id = request_id;
+        if (status == RealtimeHistoryControlStatusV1::kOk) {
+            if (generation == nullptr || initial_read_token == 0U) {
+                return false;
+            }
+            response.initial_read_token = initial_read_token;
+            response.generation = *generation;
+        } else if (
+            generation != nullptr || initial_read_token != 0U) {
+            return false;
+        }
+        return SendPacket(
+            client,
+            &response,
+            sizeof(response),
+            -1,
+            static_cast<int>(
+                config_.history_reader_idle_timeout.count()));
+    }
+
+    [[nodiscard]] bool SendHistoryReadResponse(
+        int client,
+        std::uint64_t request_id,
+        RealtimeHistoryControlStatusV1 status,
+        std::uint16_t response_flags,
+        std::uint32_t record_count,
+        std::uint64_t page_mapping_bytes,
+        std::uint64_t page_index,
+        std::uint64_t generation,
+        int page_fd,
+        std::uint64_t next_read_token = 0U) const noexcept {
+        const bool success =
+            status == RealtimeHistoryControlStatusV1::kOk;
+        const bool terminal =
+            (response_flags &
+             kRealtimeHistoryResponseTerminalV1) != 0U;
+        if ((!success &&
+             (response_flags != 0U || record_count != 0U ||
+              page_mapping_bytes != 0U || page_index != 0U ||
+              generation != 0U || page_fd >= 0 ||
+              next_read_token != 0U)) ||
+            (success && terminal &&
+             (response_flags !=
+                  kRealtimeHistoryResponseTerminalV1 ||
+              record_count != 0U || page_mapping_bytes != 0U ||
+              page_fd >= 0 || next_read_token != 0U)) ||
+            (success && !terminal &&
+             (response_flags != 0U || record_count == 0U ||
+              page_mapping_bytes <
+                  sizeof(RealtimeHistoryPageHeaderV1) ||
+              page_fd < 0 || next_read_token == 0U))) {
+            return false;
+        }
+        RealtimeHistoryReadResponseV1 response{};
+        response.magic = kRealtimeControlMagicV1;
+        response.protocol_major = kRealtimeWireMajorV1;
+        response.protocol_minor = kRealtimeWireMinorV1;
+        response.status = static_cast<std::uint16_t>(status);
+        response.flags = response_flags;
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.record_count = record_count;
+        response.request_id = request_id;
+        response.page_mapping_bytes = page_mapping_bytes;
+        response.page_index = page_index;
+        response.generation = generation;
+        response.next_read_token = next_read_token;
+        return SendPacket(
+            client,
+            &response,
+            sizeof(response),
+            page_fd,
+            static_cast<int>(
+                config_.history_reader_idle_timeout.count()));
+    }
+
+    [[nodiscard]] bool ReceiveHistoryReadRequest(
+        int client,
+        RealtimeHistoryReadRequestV1* output) const noexcept {
+        if (output == nullptr) {
+            return false;
+        }
+        *output = RealtimeHistoryReadRequestV1{};
+        pollfd descriptor{};
+        descriptor.fd = client;
+        descriptor.events = static_cast<short>(POLLIN);
+        std::uint64_t deadline_ns = 0U;
+        if (!MonotonicDeadline(
+                static_cast<int>(
+                    config_.history_reader_idle_timeout.count()),
+                &deadline_ns)) {
+            return false;
+        }
+        int ready = -1;
+        do {
+            const int remaining_ms =
+                RemainingPollMilliseconds(deadline_ns);
+            if (remaining_ms == 0) {
+                return false;
+            }
+            ready = ::poll(
+                &descriptor,
+                1U,
+                remaining_ms);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0 ||
+            (descriptor.revents &
+             (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+            (descriptor.revents & POLLIN) == 0) {
+            return false;
+        }
+        ssize_t received = -1;
+        do {
+            received =
+                ::recv(client, output, sizeof(*output), MSG_TRUNC);
+        } while (
+            received < 0 && errno == EINTR &&
+            RemainingPollMilliseconds(deadline_ns) != 0);
+        return received ==
+               static_cast<ssize_t>(sizeof(*output));
+    }
+
+    void HistoryClientLoop(
+        int client,
+        RealtimeHistoryOpenRequestV1 request) noexcept {
+        const auto send_open_error =
+            [&](RealtimeHistoryControlStatusV1 status) noexcept {
+                static_cast<void>(SendHistoryOpenResponse(
+                    client,
+                    request.request_id,
+                    status,
+                    nullptr));
+            };
+        if (request.magic != kRealtimeControlMagicV1 ||
+            request.message_bytes != sizeof(request) ||
+            request.opcode != static_cast<std::uint16_t>(
+                                  RealtimeHistoryControlOpcodeV1::
+                                      kOpenHistory) ||
+            request.flags != 0U || request.reserved0 != 0U ||
+            request.reserved1 != 0U ||
+            std::any_of(
+                request.reserved2.begin(),
+                request.reserved2.end(),
+                [](std::uint64_t value) noexcept {
+                    return value != 0U;
+                }) ||
+            request.request_id == 0U ||
+            request.instrument_id == 0U ||
+            request.requested_page_records == 0U) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kInvalidRequest);
+            return;
+        }
+        if (request.protocol_major != kRealtimeWireMajorV1 ||
+            request.protocol_minor != kRealtimeWireMinorV1) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::
+                    kUnsupportedVersion);
+            return;
+        }
+        if (!HistoryHealthy()) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kUnavailable);
+            return;
+        }
+        const std::shared_ptr<const market::
+                                  IntradayInstrumentStoreGenerationV1>
+            generation = std::atomic_load_explicit(
+                &store_generation_, std::memory_order_acquire);
+        if (generation == nullptr) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kUnavailable);
+            return;
+        }
+        const market::InstrumentRegistryLookupResultV1 lookup =
+            config_.registry->LookupById(request.instrument_id);
+        if (!lookup.known()) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kNotFound);
+            return;
+        }
+        market::IntradayInstrumentSummaryV1 summary{};
+        const market::IntradayInstrumentStoreQueryErrorV1 find_error =
+            generation->Find(request.instrument_id, &summary);
+        if (find_error ==
+            market::IntradayInstrumentStoreQueryErrorV1::kNotFound) {
+            MarkCoverageLost();
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kInternalFailure);
+            return;
+        }
+        if (find_error !=
+            market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+            if (find_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::
+                    kResourceExhausted) {
+                MarkCoverageLost();
+            }
+            send_open_error(
+                find_error ==
+                        market::IntradayInstrumentStoreQueryErrorV1::
+                            kResourceExhausted
+                    ? RealtimeHistoryControlStatusV1::
+                          kResourceExhausted
+                    : RealtimeHistoryControlStatusV1::
+                          kInternalFailure);
+            return;
+        }
+        RealtimeHistoryGenerationInfoV1 generation_info{};
+        if (!FillHistoryGenerationInfo(
+                *generation,
+                lookup.registry_ordinal,
+                summary,
+                &generation_info)) {
+            MarkCoverageLost();
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kInternalFailure);
+            return;
+        }
+        std::size_t page_capacity =
+            HistoryPageRecordCapacity(
+                request.requested_page_records);
+        if (page_capacity == 0U) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::
+                    kResourceExhausted);
+            return;
+        }
+        market::IntradayInstrumentScanOptionsV1 options{};
+        options.ingress_sequence_begin_inclusive = 1U;
+        options.ingress_sequence_end_exclusive =
+            std::numeric_limits<std::uint64_t>::max();
+        options.maximum_records =
+            std::numeric_limits<std::uint64_t>::max();
+        options.direction =
+            market::IntradayInstrumentScanDirectionV1::
+                kOldestFirst;
+        std::unique_ptr<market::IntradayInstrumentCursorV1> cursor;
+        const market::IntradayInstrumentStoreQueryErrorV1 open_error =
+            generation->OpenInstrumentCursor(
+                request.instrument_id, options, &cursor);
+        if (open_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            cursor == nullptr) {
+            if ((open_error ==
+                     market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                 cursor == nullptr) ||
+                (open_error !=
+                     market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                 open_error !=
+                     market::IntradayInstrumentStoreQueryErrorV1::
+                         kResourceExhausted)) {
+                MarkCoverageLost();
+            }
+            send_open_error(
+                open_error ==
+                        market::IntradayInstrumentStoreQueryErrorV1::
+                            kResourceExhausted
+                    ? RealtimeHistoryControlStatusV1::
+                          kResourceExhausted
+                    : RealtimeHistoryControlStatusV1::
+                          kInternalFailure);
+            return;
+        }
+        if (!HistoryHealthy()) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::kUnavailable);
+            return;
+        }
+        std::uint64_t read_token = 0U;
+        if (!GenerateReadToken(0U, &read_token)) {
+            send_open_error(
+                RealtimeHistoryControlStatusV1::
+                    kResourceExhausted);
+            return;
+        }
+        if (!SendHistoryOpenResponse(
+                client,
+                request.request_id,
+                RealtimeHistoryControlStatusV1::kOk,
+                &generation_info,
+                read_token)) {
+            return;
+        }
+
+        std::uint64_t page_index = 0U;
+        std::uint64_t emitted_records = 0U;
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            emitted_source_counts{};
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            last_source_sequences{};
+        std::uint64_t last_ingress_sequence = 0U;
+        for (;;) {
+            if (control_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                return;
+            }
+            RealtimeHistoryReadRequestV1 read_request{};
+            if (!ReceiveHistoryReadRequest(
+                    client, &read_request)) {
+                return;
+            }
+            const auto send_read_error =
+                [&](RealtimeHistoryControlStatusV1 status) noexcept {
+                    static_cast<void>(SendHistoryReadResponse(
+                        client,
+                        read_request.request_id,
+                        status,
+                        0U,
+                        0U,
+                        0U,
+                        0U,
+                        0U,
+                        -1));
+                };
+            if (read_request.magic !=
+                    kRealtimeControlMagicV1 ||
+                read_request.message_bytes !=
+                    sizeof(read_request) ||
+                read_request.opcode !=
+                    static_cast<std::uint16_t>(
+                        RealtimeHistoryControlOpcodeV1::
+                            kReadHistory) ||
+                read_request.flags != 0U ||
+                read_request.reserved0 != 0U ||
+                read_request.request_id == 0U ||
+                read_request.expected_page_index != page_index ||
+                read_request.read_token != read_token) {
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kInvalidRequest);
+                return;
+            }
+            if (read_request.protocol_major !=
+                    kRealtimeWireMajorV1 ||
+                read_request.protocol_minor !=
+                    kRealtimeWireMinorV1) {
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kUnsupportedVersion);
+                return;
+            }
+            if (!HistoryHealthy()) {
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kUnavailable);
+                return;
+            }
+            if (cursor->done()) {
+                if (emitted_records != summary.record_count ||
+                    emitted_source_counts !=
+                        summary.source_record_counts) {
+                    MarkCoverageLost();
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kInternalFailure);
+                    return;
+                }
+                if (!HistoryHealthy()) {
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kUnavailable);
+                    return;
+                }
+                static_cast<void>(SendHistoryReadResponse(
+                    client,
+                    read_request.request_id,
+                    RealtimeHistoryControlStatusV1::kOk,
+                    kRealtimeHistoryResponseTerminalV1,
+                    0U,
+                    0U,
+                    page_index,
+                    generation_info.generation,
+                    -1));
+                return;
+            }
+
+            BuiltHistoryPage page{};
+            RealtimeHistoryPageStageTimingV1 page_timing{};
+            RealtimeHistoryPageStageTimingV1* const timing =
+                config_.history_stage_observer == nullptr
+                    ? nullptr
+                    : &page_timing;
+            if (timing != nullptr) {
+                timing->open_request_id = request.request_id;
+                timing->read_request_id = read_request.request_id;
+                timing->generation = generation_info.generation;
+                timing->instrument_id =
+                    generation_info.instrument_id;
+                timing->page_index = page_index;
+            }
+            HistoryPageBuildError build_error =
+                HistoryPageBuildError::kQueryFailure;
+            {
+                HistoryStageTimer build_total_timer(
+                    timing,
+                    &RealtimeHistoryPageStageTimingV1::
+                        build_total_ns);
+                build_error = BuildHistoryPage(
+                    *cursor,
+                    lookup.registry_ordinal,
+                    generation_info,
+                    page_index,
+                    &page_capacity,
+                    last_ingress_sequence,
+                    last_source_sequences,
+                    &page,
+                    timing);
+            }
+            if (build_error != HistoryPageBuildError::kNone) {
+                if (build_error ==
+                    HistoryPageBuildError::
+                        kResourceExhausted) {
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kResourceExhausted);
+                } else {
+                    MarkCoverageLost();
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kInternalFailure);
+                }
+                CloseDescriptor(&page.read_only_fd);
+                return;
+            }
+            if (page.record_count == 0U) {
+                if (!cursor->done() ||
+                    emitted_records != summary.record_count ||
+                    emitted_source_counts !=
+                        summary.source_record_counts) {
+                    MarkCoverageLost();
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kInternalFailure);
+                    return;
+                }
+                if (!HistoryHealthy()) {
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kUnavailable);
+                    return;
+                }
+                static_cast<void>(SendHistoryReadResponse(
+                    client,
+                    read_request.request_id,
+                    RealtimeHistoryControlStatusV1::kOk,
+                    kRealtimeHistoryResponseTerminalV1,
+                    0U,
+                    0U,
+                    page_index,
+                    generation_info.generation,
+                    -1));
+                return;
+            }
+            if (!HistoryHealthy()) {
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kUnavailable);
+                return;
+            }
+            std::uint64_t next_emitted = 0U;
+            if (!CheckedAdd(
+                    emitted_records,
+                    page.record_count,
+                    &next_emitted) ||
+                next_emitted > summary.record_count) {
+                MarkCoverageLost();
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kInternalFailure);
+                return;
+            }
+            auto next_source_counts = emitted_source_counts;
+            for (std::size_t source = 0U;
+                 source < next_source_counts.size();
+                 ++source) {
+                if (!CheckedAdd(
+                        next_source_counts[source],
+                        page.source_counts[source],
+                        &next_source_counts[source]) ||
+                    next_source_counts[source] >
+                        summary.source_record_counts[source]) {
+                    MarkCoverageLost();
+                    CloseDescriptor(&page.read_only_fd);
+                    send_read_error(
+                        RealtimeHistoryControlStatusV1::
+                            kInternalFailure);
+                    return;
+                }
+            }
+            std::uint64_t next_read_token = 0U;
+            bool token_generated = false;
+            {
+                HistoryStageTimer token_timer(
+                    timing,
+                    &RealtimeHistoryPageStageTimingV1::token_ns);
+                token_generated = GenerateReadToken(
+                    read_token, &next_read_token);
+            }
+            if (!token_generated) {
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kResourceExhausted);
+                return;
+            }
+            if (!HistoryHealthy()) {
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeHistoryControlStatusV1::
+                        kUnavailable);
+                return;
+            }
+            bool sent = false;
+            {
+                HistoryStageTimer send_timer(
+                    timing,
+                    &RealtimeHistoryPageStageTimingV1::send_ns);
+                sent = SendHistoryReadResponse(
+                    client,
+                    read_request.request_id,
+                    RealtimeHistoryControlStatusV1::kOk,
+                    0U,
+                    page.record_count,
+                    page.mapping_bytes,
+                    page_index,
+                    generation_info.generation,
+                    page.read_only_fd,
+                    next_read_token);
+            }
+            CloseDescriptor(&page.read_only_fd);
+            if (!sent) {
+                return;
+            }
+            emitted_records = next_emitted;
+            emitted_source_counts = next_source_counts;
+            last_ingress_sequence =
+                page.last_ingress_sequence;
+            last_source_sequences =
+                page.last_source_sequences;
+            read_token = next_read_token;
+            if (timing != nullptr) {
+                config_.history_stage_observer
+                    ->ObserveHistoryPageStageTiming(page_timing);
+            }
+            if (page_index ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                MarkCoverageLost();
+                return;
+            }
+            ++page_index;
+        }
+    }
+
+    [[nodiscard]] bool DispatchHistoryClient(
+        int client,
+        const RealtimeHistoryOpenRequestV1& request) noexcept {
+        if (client < 0 || history_workers_ == nullptr) {
+            return false;
+        }
+        for (std::uint32_t index = 0U;
+             index < config_.maximum_history_readers;
+             ++index) {
+            HistoryWorkerSlot& slot = history_workers_[index];
+            if (slot.running.load(std::memory_order_acquire)) {
+                continue;
+            }
+            if (slot.thread.joinable()) {
+                slot.thread.join();
+            }
+            {
+                std::lock_guard<std::mutex> lock(slot.socket_mutex);
+                if (slot.client_fd >= 0) {
+                    continue;
+                }
+                slot.client_fd = client;
+            }
+            slot.running.store(true, std::memory_order_release);
+            try {
+                slot.thread = std::thread(
+                    [this, &slot, client, request]() noexcept {
+                        HistoryClientLoop(client, request);
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                slot.socket_mutex);
+                            if (slot.client_fd == client) {
+                                CloseDescriptor(&slot.client_fd);
+                            }
+                        }
+                        slot.running.store(
+                            false, std::memory_order_release);
+                    });
+                return true;
+            } catch (...) {
+                slot.running.store(
+                    false, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(slot.socket_mutex);
+                if (slot.client_fd == client) {
+                    slot.client_fd = -1;
+                }
+                static_cast<void>(SendHistoryOpenResponse(
+                    client,
+                    request.request_id,
+                    RealtimeHistoryControlStatusV1::
+                        kResourceExhausted,
+                    nullptr));
+                return false;
+            }
+        }
+        static_cast<void>(SendHistoryOpenResponse(
+            client,
+            request.request_id,
+            RealtimeHistoryControlStatusV1::kResourceExhausted,
+            nullptr));
+        return false;
+    }
+
     [[nodiscard]] bool PublishRing(
         const RealtimeWireTickPayloadV1& payload) noexcept {
         const std::uint64_t sequence =
@@ -1326,8 +3024,9 @@ private:
                     return;
                 }
                 UpdateHeartbeatNow();
-                HandleClient(client);
-                static_cast<void>(::close(client));
+                if (!HandleClient(client)) {
+                    static_cast<void>(::close(client));
+                }
                 UpdateHeartbeatNow();
             }
         }
@@ -1362,7 +3061,7 @@ private:
                 std::memory_order_release);
     }
 
-    void HandleClient(int client) noexcept {
+    [[nodiscard]] bool HandleClient(int client) noexcept {
         ucred credentials{};
         socklen_t credentials_size =
             static_cast<socklen_t>(sizeof(credentials));
@@ -1374,18 +3073,51 @@ private:
                 &credentials_size) != 0 ||
             credentials_size != sizeof(credentials) ||
             credentials.uid != ::geteuid()) {
-            return;
+            return false;
         }
         pollfd descriptor{};
         descriptor.fd = client;
         descriptor.events = static_cast<short>(POLLIN);
         const int ready = ::poll(&descriptor, 1U, 250);
         if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
-            return;
+            return false;
         }
-        RealtimeControlRequestV1 request{};
+        std::array<std::byte,
+                   sizeof(RealtimeHistoryOpenRequestV1)>
+            request_bytes{};
         const ssize_t received = ::recv(
-            client, &request, sizeof(request), MSG_TRUNC);
+            client,
+            request_bytes.data(),
+            request_bytes.size(),
+            MSG_TRUNC);
+        RealtimeControlRequestV1 request{};
+        if (received >=
+            static_cast<ssize_t>(sizeof(request))) {
+            std::memcpy(
+                &request, request_bytes.data(), sizeof(request));
+        }
+        if (request.opcode ==
+            static_cast<std::uint16_t>(
+                RealtimeHistoryControlOpcodeV1::kOpenHistory)) {
+            if (received != static_cast<ssize_t>(
+                                sizeof(
+                                    RealtimeHistoryOpenRequestV1))) {
+                static_cast<void>(SendHistoryOpenResponse(
+                    client,
+                    request.request_id,
+                    RealtimeHistoryControlStatusV1::
+                        kInvalidRequest,
+                    nullptr));
+                return false;
+            }
+            RealtimeHistoryOpenRequestV1 history_request{};
+            std::memcpy(
+                &history_request,
+                request_bytes.data(),
+                sizeof(history_request));
+            return DispatchHistoryClient(
+                client, history_request);
+        }
         RealtimeControlResponseV1 response{};
         response.magic = kRealtimeControlMagicV1;
         response.protocol_major = kRealtimeWireMajorV1;
@@ -1417,27 +3149,14 @@ private:
                 RealtimeControlStatusV1::kOk);
             send_fd = true;
         }
-        iovec vector{};
-        vector.iov_base = &response;
-        vector.iov_len = sizeof(response);
-        msghdr message{};
-        message.msg_iov = &vector;
-        message.msg_iovlen = 1U;
-        std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
-        if (send_fd) {
-            message.msg_control = control.data();
-            message.msg_controllen = control.size();
-            cmsghdr* const rights = CMSG_FIRSTHDR(&message);
-            if (rights == nullptr) {
-                return;
-            }
-            rights->cmsg_level = SOL_SOCKET;
-            rights->cmsg_type = SCM_RIGHTS;
-            rights->cmsg_len = CMSG_LEN(sizeof(int));
-            std::memcpy(CMSG_DATA(rights), &read_only_fd_, sizeof(int));
-        }
         static_cast<void>(
-            ::sendmsg(client, &message, MSG_NOSIGNAL));
+            SendPacket(
+                client,
+                &response,
+                sizeof(response),
+                send_fd ? read_only_fd_ : -1,
+                250));
+        return false;
     }
 
     [[nodiscard]] RealtimeWireInstrumentV1* instrument_rows()
@@ -1486,6 +3205,11 @@ private:
     std::unique_ptr<RingSlotLock[]> ring_locks_;
     std::atomic_flag kline_publication_in_progress_ =
         ATOMIC_FLAG_INIT;
+    std::atomic_flag store_publication_in_progress_ =
+        ATOMIC_FLAG_INIT;
+    std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
+        store_generation_;
+    std::unique_ptr<HistoryWorkerSlot[]> history_workers_;
 
     int listener_fd_ = -1;
     int stop_event_fd_ = -1;
@@ -1495,6 +3219,7 @@ private:
     bool socket_bound_ = false;
     std::atomic<bool> prefix_notification_pending_{false};
     std::atomic<bool> control_stop_requested_{false};
+    std::mutex control_stop_mutex_;
     std::thread control_thread_;
 };
 
@@ -1556,6 +3281,14 @@ bool RealtimeSharedMarketServiceV1::PublishKLineGeneration(
     const market::RealtimeKLineGenerationV1& generation) noexcept {
     return impl_ != nullptr &&
            impl_->PublishKLineGeneration(generation);
+}
+
+bool RealtimeSharedMarketServiceV1::PublishStoreGeneration(
+    std::shared_ptr<const market::
+                        IntradayInstrumentStoreGenerationV1>
+        generation) noexcept {
+    return impl_ != nullptr &&
+           impl_->PublishStoreGeneration(std::move(generation));
 }
 
 void RealtimeSharedMarketServiceV1::MarkDraining() noexcept {

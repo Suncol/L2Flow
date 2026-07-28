@@ -228,6 +228,15 @@ public:
     [[nodiscard]] std::uint64_t accounted_record_bytes() const noexcept;
     [[nodiscard]] std::uint64_t allocated_index_bytes() const noexcept;
     [[nodiscard]] bool coverage_from_open() const noexcept;
+    // Process-local provenance of the Store session that owns every retained
+    // segment in this generation. It is not the realtime IPC session epoch
+    // and must never be serialized as one. Successive generations from the
+    // same IntradayInstrumentStoreV1 return the same nonzero value. Distinct
+    // successfully created Store sessions receive distinct values for the
+    // lifetime of this process; values are never reused. Exhausting this
+    // identity space makes IntradayInstrumentStoreV1::Create fail with
+    // kResourceExhausted.
+    [[nodiscard]] std::uint64_t store_session_epoch() const noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 Find(
         std::uint32_t instrument_id,

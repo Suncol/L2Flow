@@ -39,6 +39,13 @@ enum l2flow_latest_status_v1 {
     L2FLOW_LATEST_INVALID_WINDOW_ID_V1 = 5,
 };
 
+enum l2flow_instrument_lookup_status_v1 {
+    L2FLOW_INSTRUMENT_LOOKUP_FOUND_V1 = 0,
+    L2FLOW_INSTRUMENT_LOOKUP_UNKNOWN_V1 = 1,
+    L2FLOW_INSTRUMENT_LOOKUP_INVALID_MARKET_V1 = 2,
+    L2FLOW_INSTRUMENT_LOOKUP_EMPTY_SECURITY_ID_V1 = 3,
+};
+
 typedef struct l2flow_shm_session_info_v1 {
     uint8_t run_id[16];
     uint64_t session_epoch;
@@ -63,6 +70,8 @@ typedef struct l2flow_shm_session_info_v1 {
 L2FLOW_SHM_READER_API_V1 int l2flow_shm_reader_open_fd_v1(
     int fd,
     l2flow_shm_reader_v1** output);
+// The caller owns external synchronization: close is permitted only after
+// every in-flight call using this reader has returned.
 L2FLOW_SHM_READER_API_V1 void l2flow_shm_reader_close_v1(
     l2flow_shm_reader_v1* reader);
 
@@ -85,6 +94,26 @@ L2FLOW_SHM_READER_API_V1 int l2flow_shm_reader_instrument_v1(
     uint8_t* security_id_output,
     size_t security_id_capacity,
     size_t* security_id_written);
+
+// Resolves exact opaque-byte registry keys. The composite key is
+// (market, security_id_source, security_id); the reader never trims,
+// case-folds, transcodes, or infers any component. Input order and duplicate
+// keys are preserved. A null per-item byte pointer is legal only when its
+// corresponding length is zero. Non-FOUND items always return instrument ID
+// zero and are described by their per-item status. Input arrays, output
+// arrays, and the two output arrays must not overlap. As with every reader
+// call, the caller must finish all in-flight calls before closing the reader.
+L2FLOW_SHM_READER_API_V1 int
+l2flow_shm_reader_resolve_instruments_v1(
+    const l2flow_shm_reader_v1* reader,
+    const uint8_t* markets,
+    const uint8_t* const* security_id_sources,
+    const size_t* security_id_source_lengths,
+    const uint8_t* const* security_ids,
+    const size_t* security_id_lengths,
+    size_t count,
+    uint32_t* instrument_ids,
+    uint8_t* item_statuses);
 
 // outputs is count fixed-stride records. Each successful item is a consistent
 // client-owned copy. Item status preserves input order and duplicate IDs.

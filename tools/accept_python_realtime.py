@@ -512,6 +512,54 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raw_bytes = np.frombuffer(
                     batch.wire_records, dtype=np.uint8
                 ).reshape(len(batch), 336)
+                projection_flags = records["projection_flags"]
+                raw_type_lengths = records["raw_type_length"]
+                raw_tick_flag_lengths = records[
+                    "raw_tick_flag_length"
+                ]
+                raw_offsets = np.arange(32, dtype=np.uint8)[None, :]
+                raw_type_bytes = raw_bytes[:, 272:304]
+                raw_tick_flag_bytes = raw_bytes[:, 304:336]
+                non_shanghai = records["event_kind"] != 2
+                raw_type_omitted = (
+                    projection_flags & np.uint32(1)
+                ) != 0
+                raw_tick_flag_omitted = (
+                    projection_flags & np.uint32(2)
+                ) != 0
+                projection_invalid = (
+                    np.any(
+                        projection_flags & np.uint32(~3 & _UINT32_MAX)
+                    )
+                    or np.any(raw_type_lengths > 32)
+                    or np.any(raw_tick_flag_lengths > 32)
+                    or np.any(
+                        non_shanghai
+                        & (
+                            (projection_flags != 0)
+                            | (raw_type_lengths != 0)
+                            | (raw_tick_flag_lengths != 0)
+                        )
+                    )
+                    or np.any(
+                        raw_type_omitted & (raw_type_lengths != 0)
+                    )
+                    or np.any(
+                        raw_tick_flag_omitted
+                        & (raw_tick_flag_lengths != 0)
+                    )
+                    or np.any(
+                        (raw_offsets >= raw_type_lengths[:, None])
+                        & (raw_type_bytes != 0)
+                    )
+                    or np.any(
+                        (
+                            raw_offsets
+                            >= raw_tick_flag_lengths[:, None]
+                        )
+                        & (raw_tick_flag_bytes != 0)
+                    )
+                )
                 if (
                     np.any(records["record_schema_version"] != 1)
                     or np.any(records["record_bytes"] != 336)
@@ -519,8 +567,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     or np.any(records["ingress_sequence"] == 0)
                     or np.any(records["tick_stream_sequence"] == 0)
                     or np.any(records["common_reserved"] != 0)
-                    or np.any(records["tick_reserved_u32"] != 0)
                     or np.any(records["tick_reserved_u8"] != 0)
+                    or projection_invalid
                     or np.any(raw_bytes[:, 118:128] != 0)
                     or np.any(raw_bytes[:, 187:192] != 0)
                     or np.any(raw_bytes[:, 203:208] != 0)

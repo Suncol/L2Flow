@@ -113,6 +113,58 @@ bool CommonRecordIdentityValid(
     }
 }
 
+bool TickPayloadProjectionValid(
+    const RealtimeWireTickPayloadV1& payload) noexcept {
+    constexpr std::uint32_t known_flags =
+        l2flow::ipc::kRealtimeWireTickRawTypeOmittedV1 |
+        l2flow::ipc::kRealtimeWireTickRawTickFlagOmittedV1;
+    if ((payload.projection_flags & ~known_flags) != 0U ||
+        payload.raw_type_length > payload.raw_type.size() ||
+        payload.raw_tick_flag_length >
+            payload.raw_tick_flag.size() ||
+        payload.reserved0 != 0U) {
+        return false;
+    }
+    const bool raw_type_zero =
+        !AnyNonzero(payload.raw_type);
+    const bool raw_tick_flag_zero =
+        !AnyNonzero(payload.raw_tick_flag);
+    if (payload.common.event_kind != 2U) {
+        return payload.projection_flags == 0U &&
+               payload.raw_type_length == 0U &&
+               payload.raw_tick_flag_length == 0U &&
+               raw_type_zero && raw_tick_flag_zero;
+    }
+    const bool raw_type_omitted =
+        (payload.projection_flags &
+         l2flow::ipc::kRealtimeWireTickRawTypeOmittedV1) != 0U;
+    const bool raw_tick_flag_omitted =
+        (payload.projection_flags &
+         l2flow::ipc::
+             kRealtimeWireTickRawTickFlagOmittedV1) != 0U;
+    if ((raw_type_omitted &&
+         (payload.raw_type_length != 0U || !raw_type_zero)) ||
+        (raw_tick_flag_omitted &&
+         (payload.raw_tick_flag_length != 0U ||
+          !raw_tick_flag_zero))) {
+        return false;
+    }
+    return std::all_of(
+               payload.raw_type.begin() +
+                   payload.raw_type_length,
+               payload.raw_type.end(),
+               [](std::uint8_t byte) noexcept {
+                   return byte == 0U;
+               }) &&
+           std::all_of(
+               payload.raw_tick_flag.begin() +
+                   payload.raw_tick_flag_length,
+               payload.raw_tick_flag.end(),
+               [](std::uint8_t byte) noexcept {
+                   return byte == 0U;
+               });
+}
+
 enum class SlotCopyResult : std::uint8_t {
     kCopied = 0U,
     kNeverPublished,
@@ -169,6 +221,9 @@ struct l2flow_shm_reader_v1 final {
     const RealtimeWireTickSlotV1* tick_ring = nullptr;
     std::uint64_t kline_slots_per_table = 0U;
     std::uint64_t tick_ring_capacity = 0U;
+    // Registry rows must remain in instrument-ID/slot ordinal order. This
+    // reader-owned permutation supplies the independent exact-key order.
+    std::uint32_t* instrument_key_ordinals = nullptr;
 };
 
 namespace {
@@ -249,6 +304,132 @@ bool ReservedRegionValid(
            region->reserved == 0U;
 }
 
+int CompareOpaqueBytes(
+    const std::byte* left,
+    std::size_t left_size,
+    const std::byte* right,
+    std::size_t right_size) noexcept {
+    const std::size_t common_size = std::min(left_size, right_size);
+    for (std::size_t index = 0U; index < common_size; ++index) {
+        const std::uint8_t left_byte =
+            std::to_integer<std::uint8_t>(left[index]);
+        const std::uint8_t right_byte =
+            std::to_integer<std::uint8_t>(right[index]);
+        if (left_byte < right_byte) {
+            return -1;
+        }
+        if (left_byte > right_byte) {
+            return 1;
+        }
+    }
+    if (left_size < right_size) {
+        return -1;
+    }
+    if (left_size > right_size) {
+        return 1;
+    }
+    return 0;
+}
+
+int CompareInstrumentRowToKey(
+    const l2flow_shm_reader_v1& reader,
+    std::size_t ordinal,
+    std::uint8_t market,
+    const std::uint8_t* security_id_source,
+    std::size_t security_id_source_length,
+    const std::uint8_t* security_id,
+    std::size_t security_id_length) noexcept {
+    const RealtimeWireInstrumentV1& row =
+        reader.instruments[ordinal];
+    if (row.market < market) {
+        return -1;
+    }
+    if (row.market > market) {
+        return 1;
+    }
+    const int source_order = CompareOpaqueBytes(
+        reader.key_blob + row.security_id_source_offset,
+        row.security_id_source_length,
+        reinterpret_cast<const std::byte*>(security_id_source),
+        security_id_source_length);
+    if (source_order != 0) {
+        return source_order;
+    }
+    return CompareOpaqueBytes(
+        reader.key_blob + row.security_id_offset,
+        row.security_id_length,
+        reinterpret_cast<const std::byte*>(security_id),
+        security_id_length);
+}
+
+int CompareInstrumentRows(
+    const l2flow_shm_reader_v1& reader,
+    std::size_t left_ordinal,
+    std::size_t right_ordinal) noexcept {
+    const RealtimeWireInstrumentV1& right =
+        reader.instruments[right_ordinal];
+    return CompareInstrumentRowToKey(
+        reader,
+        left_ordinal,
+        right.market,
+        reinterpret_cast<const std::uint8_t*>(
+            reader.key_blob + right.security_id_source_offset),
+        right.security_id_source_length,
+        reinterpret_cast<const std::uint8_t*>(
+            reader.key_blob + right.security_id_offset),
+        right.security_id_length);
+}
+
+enum class InstrumentKeyIndexResult : std::uint8_t {
+    kOk = 0U,
+    kResourceExhausted,
+    kDuplicateKey,
+};
+
+InstrumentKeyIndexResult BuildInstrumentKeyIndex(
+    l2flow_shm_reader_v1* reader) noexcept {
+    if (reader == nullptr || reader->header == nullptr ||
+        reader->instruments == nullptr || reader->key_blob == nullptr ||
+        reader->instrument_key_ordinals != nullptr) {
+        return InstrumentKeyIndexResult::kResourceExhausted;
+    }
+    const std::size_t count = reader->header->instrument_count;
+    if (count == 0U ||
+        count >
+            std::numeric_limits<std::size_t>::max() /
+                sizeof(std::uint32_t)) {
+        return InstrumentKeyIndexResult::kResourceExhausted;
+    }
+    try {
+        reader->instrument_key_ordinals =
+            new (std::nothrow) std::uint32_t[count];
+        if (reader->instrument_key_ordinals == nullptr) {
+            return InstrumentKeyIndexResult::kResourceExhausted;
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            reader->instrument_key_ordinals[index] =
+                static_cast<std::uint32_t>(index);
+        }
+        std::sort(
+            reader->instrument_key_ordinals,
+            reader->instrument_key_ordinals + count,
+            [reader](std::uint32_t left, std::uint32_t right) noexcept {
+                return CompareInstrumentRows(*reader, left, right) < 0;
+            });
+    } catch (...) {
+        return InstrumentKeyIndexResult::kResourceExhausted;
+    }
+    for (std::size_t index = 1U; index < count; ++index) {
+        if (CompareInstrumentRows(
+                *reader,
+                reader->instrument_key_ordinals[index - 1U],
+                reader->instrument_key_ordinals[index]) >= 0) {
+            return InstrumentKeyIndexResult::kDuplicateKey;
+        }
+    }
+    return InstrumentKeyIndexResult::kOk;
+}
+
 std::size_t FindInstrumentOrdinal(
     const l2flow_shm_reader_v1& reader,
     std::uint32_t instrument_id) noexcept {
@@ -268,6 +449,49 @@ std::size_t FindInstrumentOrdinal(
                    reader.instruments[begin].instrument_id ==
                        instrument_id
                ? begin
+               : std::numeric_limits<std::size_t>::max();
+}
+
+std::size_t FindInstrumentOrdinalByKey(
+    const l2flow_shm_reader_v1& reader,
+    std::uint8_t market,
+    const std::uint8_t* security_id_source,
+    std::size_t security_id_source_length,
+    const std::uint8_t* security_id,
+    std::size_t security_id_length) noexcept {
+    std::size_t begin = 0U;
+    std::size_t end = reader.header->instrument_count;
+    while (begin < end) {
+        const std::size_t middle = begin + (end - begin) / 2U;
+        const std::size_t ordinal =
+            reader.instrument_key_ordinals[middle];
+        const int order = CompareInstrumentRowToKey(
+            reader,
+            ordinal,
+            market,
+            security_id_source,
+            security_id_source_length,
+            security_id,
+            security_id_length);
+        if (order < 0) {
+            begin = middle + 1U;
+        } else {
+            end = middle;
+        }
+    }
+    if (begin >= reader.header->instrument_count) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    const std::size_t ordinal = reader.instrument_key_ordinals[begin];
+    return CompareInstrumentRowToKey(
+               reader,
+               ordinal,
+               market,
+               security_id_source,
+               security_id_source_length,
+               security_id,
+               security_id_length) == 0
+               ? ordinal
                : std::numeric_limits<std::size_t>::max();
 }
 
@@ -600,6 +824,10 @@ extern "C" int l2flow_shm_reader_open_fd_v1(
             (index != 0U &&
              reader->instruments[index - 1U].instrument_id >=
                  row.instrument_id) ||
+            (row.market != 1U && row.market != 2U) ||
+            row.quantity_unit > 5U || row.security_type > 7U ||
+            row.asset_scope > 2U ||
+            row.security_id_length == 0U ||
             row.reserved0 != 0U || row.reserved1 != 0U ||
             std::any_of(
                 row.reserved.begin(),
@@ -630,6 +858,15 @@ extern "C" int l2flow_shm_reader_open_fd_v1(
         l2flow_shm_reader_close_v1(reader);
         return L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
     }
+    const InstrumentKeyIndexResult key_index_result =
+        BuildInstrumentKeyIndex(reader);
+    if (key_index_result != InstrumentKeyIndexResult::kOk) {
+        l2flow_shm_reader_close_v1(reader);
+        return key_index_result ==
+                       InstrumentKeyIndexResult::kDuplicateKey
+                   ? L2FLOW_SHM_READER_LAYOUT_INVALID_V1
+                   : L2FLOW_SHM_READER_SYSTEM_ERROR_V1;
+    }
     for (std::size_t index = 0U; index < header->window_count;
          ++index) {
         if (reader->windows[index].window_id == 0U ||
@@ -651,6 +888,8 @@ extern "C" void l2flow_shm_reader_close_v1(
     if (reader == nullptr) {
         return;
     }
+    delete[] reader->instrument_key_ordinals;
+    reader->instrument_key_ordinals = nullptr;
     if (reader->mapping != MAP_FAILED) {
         static_cast<void>(::munmap(
             const_cast<void*>(reader->mapping),
@@ -757,6 +996,71 @@ extern "C" int l2flow_shm_reader_instrument_v1(
     return L2FLOW_SHM_READER_OK_V1;
 }
 
+extern "C" int l2flow_shm_reader_resolve_instruments_v1(
+    const l2flow_shm_reader_v1* reader,
+    const std::uint8_t* markets,
+    const std::uint8_t* const* security_id_sources,
+    const std::size_t* security_id_source_lengths,
+    const std::uint8_t* const* security_ids,
+    const std::size_t* security_id_lengths,
+    std::size_t count,
+    std::uint32_t* instrument_ids,
+    std::uint8_t* item_statuses) {
+    if (reader == nullptr ||
+        (count != 0U &&
+         (markets == nullptr || security_id_sources == nullptr ||
+          security_id_source_lengths == nullptr ||
+          security_ids == nullptr ||
+          security_id_lengths == nullptr ||
+          instrument_ids == nullptr || item_statuses == nullptr)) ||
+        (count != 0U && reader->instrument_key_ordinals == nullptr)) {
+        return L2FLOW_SHM_READER_INVALID_ARGUMENT_V1;
+    }
+    // Validate every pointer/length pair before mutating any output.
+    for (std::size_t index = 0U; index < count; ++index) {
+        if ((security_id_source_lengths[index] != 0U &&
+             security_id_sources[index] == nullptr) ||
+            (security_id_lengths[index] != 0U &&
+             security_ids[index] == nullptr)) {
+            return L2FLOW_SHM_READER_INVALID_ARGUMENT_V1;
+        }
+    }
+    for (std::size_t index = 0U; index < count; ++index) {
+        instrument_ids[index] = 0U;
+        if (markets[index] != 1U && markets[index] != 2U) {
+            item_statuses[index] =
+                L2FLOW_INSTRUMENT_LOOKUP_INVALID_MARKET_V1;
+            continue;
+        }
+        if (security_id_lengths[index] == 0U) {
+            item_statuses[index] =
+                L2FLOW_INSTRUMENT_LOOKUP_EMPTY_SECURITY_ID_V1;
+            continue;
+        }
+        const std::size_t ordinal = FindInstrumentOrdinalByKey(
+            *reader,
+            markets[index],
+            security_id_sources[index],
+            security_id_source_lengths[index],
+            security_ids[index],
+            security_id_lengths[index]);
+        if (ordinal == std::numeric_limits<std::size_t>::max()) {
+            item_statuses[index] =
+                L2FLOW_INSTRUMENT_LOOKUP_UNKNOWN_V1;
+            continue;
+        }
+        const std::uint32_t instrument_id =
+            reader->instruments[ordinal].instrument_id;
+        if (instrument_id == 0U) {
+            return L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+        }
+        instrument_ids[index] = instrument_id;
+        item_statuses[index] =
+            L2FLOW_INSTRUMENT_LOOKUP_FOUND_V1;
+    }
+    return L2FLOW_SHM_READER_OK_V1;
+}
+
 extern "C" int l2flow_shm_reader_latest_snapshots_v1(
     const l2flow_shm_reader_v1* reader,
     const std::uint32_t* instrument_ids,
@@ -816,6 +1120,7 @@ extern "C" int l2flow_shm_reader_latest_ticks_v1(
                    (payload.common.event_kind == 2U ||
                     payload.common.event_kind == 4U ||
                     payload.common.event_kind == 5U) &&
+                   TickPayloadProjectionValid(payload) &&
                    payload.common.instrument_id == instrument_id &&
                    payload.common.registry_ordinal == ordinal &&
                    payload.common.tick_stream_sequence != 0U;
@@ -999,6 +1304,7 @@ extern "C" int l2flow_shm_reader_ticks_v1(
             (payload.common.event_kind != 2U &&
              payload.common.event_kind != 4U &&
              payload.common.event_kind != 5U) ||
+            !TickPayloadProjectionValid(payload) ||
             payload.common.registry_ordinal >=
                 reader->header->instrument_count ||
             reader

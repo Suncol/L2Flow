@@ -1,10 +1,12 @@
 #pragma once
 
 #include "l2flow/common/identity128.h"
+#include "l2flow/market/intraday_instrument_store_v1.h"
 #include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/market/realtime_kline_v1.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +15,40 @@
 #include <vector>
 
 namespace l2flow::ipc {
+
+// Optional, process-local benchmark telemetry. This is deliberately not part
+// of the history wire ABI. Durations use CLOCK_MONOTONIC and cover one
+// successfully sent nonterminal history page. Observers can be invoked
+// concurrently by independent history-reader workers.
+struct RealtimeHistoryPageStageTimingV1 final {
+    std::uint64_t open_request_id = 0U;
+    std::uint64_t read_request_id = 0U;
+    std::uint64_t generation = 0U;
+    std::uint32_t instrument_id = 0U;
+    std::uint32_t reserved0 = 0U;
+    std::uint64_t page_index = 0U;
+    std::uint32_t record_count = 0U;
+    std::uint32_t snapshot_count = 0U;
+    std::uint32_t tick_count = 0U;
+    std::uint32_t clock_read_failures = 0U;
+    std::uint64_t page_mapping_bytes = 0U;
+    std::uint64_t cursor_read_ns = 0U;
+    std::uint64_t classify_layout_ns = 0U;
+    std::uint64_t memfd_prepare_ns = 0U;
+    std::uint64_t projection_ns = 0U;
+    std::uint64_t memfd_finalize_ns = 0U;
+    std::uint64_t build_total_ns = 0U;
+    std::uint64_t token_ns = 0U;
+    std::uint64_t send_ns = 0U;
+};
+
+class RealtimeHistoryPageStageObserverV1 {
+public:
+    virtual ~RealtimeHistoryPageStageObserverV1() = default;
+
+    virtual void ObserveHistoryPageStageTiming(
+        const RealtimeHistoryPageStageTimingV1& timing) noexcept = 0;
+};
 
 struct RealtimeSharedServiceConfigV1 final {
     l2flow::common::Identity128 run_id{};
@@ -25,6 +61,21 @@ struct RealtimeSharedServiceConfigV1 final {
     std::uint64_t tick_ring_capacity = 262'144U;
     std::uint64_t maximum_mapping_bytes = 2ULL * 1024ULL * 1024ULL *
                                           1024ULL;
+    // History readers pin one immutable Store generation for the lifetime of
+    // a cursor. These limits bound pinned generations, worker threads, and
+    // each completed sealed page; they do not limit total history length or
+    // pages intentionally retained by a same-UID client after SCM_RIGHTS
+    // transfer. The V1 trust boundary treats same-UID clients as trusted.
+    std::uint32_t maximum_history_readers = 8U;
+    std::uint32_t maximum_history_page_records = 4096U;
+    std::uint64_t maximum_history_page_bytes =
+        64ULL * 1024ULL * 1024ULL;
+    std::chrono::milliseconds history_reader_idle_timeout{
+        std::chrono::seconds(30)};
+    // Optional non-owning observer for benchmark-only stage timing. It must
+    // outlive the service and remain safe for concurrent noexcept callbacks.
+    // A null observer adds no benchmark clock reads to the history path.
+    RealtimeHistoryPageStageObserverV1* history_stage_observer = nullptr;
     // Absolute path below an operator-owned directory. V1 never unlinks a
     // pre-existing path.
     std::filesystem::path control_socket_path;
@@ -87,7 +138,18 @@ public:
         const l2flow::market::RealtimeKLineGenerationV1& generation)
         noexcept;
 
+    // Publishes the next exact immutable generation from one Store session for
+    // future history cursors. Generation numbers, cuts, source identities, and
+    // per-instrument counts must not regress. Existing cursors retain the
+    // generation acquired when opened.
+    [[nodiscard]] bool PublishStoreGeneration(
+        std::shared_ptr<const l2flow::market::
+                            IntradayInstrumentStoreGenerationV1>
+            generation) noexcept;
+
     void MarkDraining() noexcept;
+    // Call only after MarkDraining and after every producer has joined.
+    // FAILED is terminal and can never be overwritten by STOPPED_CLEAN.
     [[nodiscard]] bool MarkStoppedClean(
         std::uint64_t final_admitted_tick_sequence) noexcept;
     void MarkFailed() noexcept;
