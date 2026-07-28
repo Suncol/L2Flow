@@ -191,6 +191,12 @@ add_executable(accept_realtime_pipeline
     tools/accept_realtime_pipeline.cpp)
 l2flow_configure_target(accept_realtime_pipeline)
 target_link_libraries(accept_realtime_pipeline PRIVATE L2Flow::realtime)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(
+        accept_realtime_pipeline
+        PRIVATE L2FLOW_HAS_LINUX_REALTIME_IPC_V1=1)
+    target_link_libraries(accept_realtime_pipeline PRIVATE L2Flow::ipc)
+endif()
 set_target_properties(accept_realtime_pipeline PROPERTIES
     OUTPUT_NAME "accept-realtime-pipeline")
 

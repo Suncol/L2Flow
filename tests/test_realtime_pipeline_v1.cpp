@@ -697,6 +697,18 @@ int main() {
                 after_final.ingress_pool.maximum_inflight_messages &&
             after_final.store.allocated_segments == 1U,
         "WAL-on ingress pool and byte-target store remain within their hard bounds");
+    const runtime::RealtimePipelineIngressResultV1 post_cut_ingress =
+        pipeline->InjectSdkMessageForTest(&transaction_message);
+    const runtime::RealtimePipelineSnapshotV1 after_post_cut =
+        pipeline->Snapshot();
+    test.Expect(
+        post_cut_ingress.error ==
+                runtime::RealtimePipelineIngressErrorV1::kStopped &&
+            after_post_cut.post_cut_messages == 1U &&
+            after_post_cut.rejected_messages == 0U &&
+            after_post_cut.accepted_messages == after_final.accepted_messages,
+        "callbacks after the clean terminal cut are accounted outside the "
+        "accepted prefix without being mislabeled as malformed data");
     const runtime::RealtimePipelineStageLatencySnapshotV1 latency =
         pipeline->LatencySnapshot();
     test.Expect(
@@ -710,9 +722,13 @@ int main() {
             latency.sdk_local_to_append_complete.samples == 2U &&
             latency.callback_entry_to_success.samples == 2U &&
             latency.callback_entry_to_append_complete.samples == 2U &&
+            latency.callback_entry_to_inprocess_latest_read.samples ==
+                2U &&
             latency.append_call.samples == 2U &&
             latency.callback_entry_to_success.minimum_ns >= 0 &&
             latency.callback_entry_to_append_complete.minimum_ns >= 0 &&
+            latency.callback_entry_to_inprocess_latest_read.minimum_ns >=
+                latency.callback_entry_to_append_complete.minimum_ns &&
             latency.append_call.minimum_ns >= 0,
         "stage-latency mode accounts for callback and successful append boundaries");
     pipeline->StopAndDrain();

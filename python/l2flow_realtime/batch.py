@@ -14,10 +14,12 @@ from .models import (
     Snapshot,
     Tick,
 )
+from .wire import TICK_BYTES
 
 
 RecordT = TypeVar("RecordT")
 ColumnDict = Dict[str, list]
+_TICK_COLUMN_NUMPY_DTYPE = None
 
 _COMMON_TYPES = {
     "run_id": "binary",
@@ -521,3 +523,134 @@ class TickBatch:
 
     def to_polars(self):
         return _to_polars(self.to_columns(), _TICK_TYPES)
+
+
+@dataclass(frozen=True, slots=True)
+class TickColumnBatch:
+    """Client-owned contiguous tick block for high-rate columnar analysis.
+
+    ``numpy_records()`` returns a read-only structured view over the copied
+    V1 wire block. It avoids constructing one Python dataclass graph per tick;
+    the ordinary :class:`TickBatch` remains the fully decoded object API.
+    """
+
+    session_identity: SessionIdentity
+    first_sequence: int
+    next_sequence: int
+    wire_records: bytes
+
+    def __post_init__(self) -> None:
+        if self.first_sequence <= 0:
+            raise ValueError("first_sequence must be positive")
+        if len(self.wire_records) % TICK_BYTES != 0:
+            raise ValueError("tick column block is not record-aligned")
+        if self.next_sequence != self.first_sequence + len(self):
+            raise ValueError("tick column batch cursor is not contiguous")
+
+    def __len__(self) -> int:
+        return len(self.wire_records) // TICK_BYTES
+
+    def numpy_records(self):
+        """Return a zero-copy, read-only NumPy structured wire view."""
+
+        global _TICK_COLUMN_NUMPY_DTYPE
+        numpy = importlib.import_module("numpy")
+        if _TICK_COLUMN_NUMPY_DTYPE is None:
+            _TICK_COLUMN_NUMPY_DTYPE = numpy.dtype(
+                {
+                    "names": [
+                        "record_schema_version",
+                        "record_bytes",
+                        "instrument_id",
+                        "registry_ordinal",
+                        "source_sequence",
+                        "ingress_sequence",
+                        "tick_stream_sequence",
+                        "vendor_sequence_id",
+                        "event_time_unix_ns",
+                        "recv_realtime_ns",
+                        "recv_monotonic_ns",
+                        "exchange_time_ns_since_midnight",
+                        "quality_flags",
+                        "market_notices",
+                        "source_stream_id",
+                        "trade_date",
+                        "vendor_local_time_raw",
+                        "common_reserved",
+                        "source_slot",
+                        "event_kind",
+                        "market",
+                        "quantity_unit",
+                        "security_type",
+                        "asset_scope",
+                        "validity_bitmap",
+                        "tick_reserved_u32",
+                        "channel",
+                        "native_event_sequence",
+                        "source_raw_code_1",
+                        "source_raw_code_2",
+                        "action",
+                        "side",
+                        "order_type",
+                        "aggressor",
+                        "phase",
+                        "raw_type_length",
+                        "raw_tick_flag_length",
+                        "tick_reserved_u8",
+                        "price_raw",
+                        "price_p6",
+                        "price_scale",
+                        "price_valid",
+                        "price_is_null",
+                        "quantity_raw",
+                        "quantity_scale",
+                        "quantity_valid",
+                        "quantity_is_null",
+                        "trade_amount_raw",
+                        "trade_amount_p6",
+                        "trade_amount_scale",
+                        "trade_amount_valid",
+                        "trade_amount_is_null",
+                        "matched_quantity_raw",
+                        "matched_quantity_scale",
+                        "matched_quantity_valid",
+                        "matched_quantity_is_null",
+                        "primary_order_id",
+                        "buy_order_id",
+                        "sell_order_id",
+                    ],
+                    "formats": [
+                        "<u4", "<u4", "<u4", "<u4",
+                        "<u8", "<u8", "<u8", "<u8",
+                        "<i8", "<i8", "<i8", "<u8",
+                        "<u8", "<u8", "<u4", "<u4",
+                        "<u4", "<u4",
+                        "u1", "u1", "u1", "u1", "u1", "u1",
+                        "<u4", "<u4", "<i8", "<i8", "<i4", "<i4",
+                        "u1", "u1", "u1", "u1", "u1", "u1", "u1",
+                        "u1", "<i8", "<i8", "u1", "u1", "u1",
+                        "<i8", "u1", "u1", "u1",
+                        "<i8", "<i8", "u1", "u1", "u1",
+                        "<i8", "u1", "u1", "u1",
+                        "<i8", "<i8", "<i8",
+                    ],
+                    "offsets": [
+                        0, 4, 8, 12, 16, 24, 32, 40,
+                        48, 56, 64, 72, 80, 88, 96, 100, 104, 108,
+                        112, 113, 114, 115, 116, 117,
+                        128, 132, 136, 144, 152, 156,
+                        160, 161, 162, 163, 164, 165, 166, 167,
+                        168, 176, 184, 185, 186,
+                        192, 200, 201, 202,
+                        208, 216, 224, 225, 226,
+                        232, 240, 241, 242,
+                        248, 256, 264,
+                    ],
+                    "itemsize": TICK_BYTES,
+                }
+            )
+        return numpy.frombuffer(
+            self.wire_records,
+            dtype=_TICK_COLUMN_NUMPY_DTYPE,
+            count=len(self),
+        )

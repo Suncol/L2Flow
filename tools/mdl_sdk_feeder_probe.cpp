@@ -54,12 +54,12 @@ void PrintUsage(std::ostream& output) {
            " (default 10)\n"
         << "  --market-timeout-seconds N"
            " wait until the minimum arrives, 1..3600 (default 60)\n"
-        << "  --monitor-seconds N       always monitor for N seconds, 1..3600"
+        << "  --monitor-seconds N       always monitor for N seconds, 1..86400"
            " (disabled by default)\n"
         << "  --minimum-market-messages N"
            " required data messages, 0..100000 (default 1)\n"
         << "  --maximum-captured-records N"
-           " capture capacity, 1..200000000 (default 100000)\n"
+           " capture capacity, 1..450000000 (default 100000)\n"
         << "  --capture-csv PATH        write normalized captured records after"
            " clean SDK shutdown\n"
         << "  --help                    show this help\n\n"
@@ -171,9 +171,9 @@ bool ParseOptions(int argc,
                 }
                 options->market_timeout_seconds = parsed;
             } else if (option == "--monitor-seconds") {
-                if (parsed == 0U || parsed > 3600U) {
+                if (parsed == 0U || parsed > 86'400U) {
                     *error =
-                        "--monitor-seconds must be from 1 through 3600";
+                        "--monitor-seconds must be from 1 through 86400";
                     return false;
                 }
                 options->monitor_seconds = parsed;
@@ -185,10 +185,10 @@ bool ParseOptions(int argc,
                 }
                 options->minimum_market_messages = parsed;
             } else {
-                if (parsed == 0U || parsed > 200000000U) {
+                if (parsed == 0U || parsed > 450000000U) {
                     *error =
                         "--maximum-captured-records must be from 1 through "
-                        "200000000";
+                        "450000000";
                     return false;
                 }
                 options->maximum_captured_records = parsed;

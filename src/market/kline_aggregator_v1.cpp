@@ -164,8 +164,7 @@ struct SnapshotSeries final {
         common.origin.source_sequence == 0U ||
         ingress_sequence == 0U || common.instrument_id == 0U ||
         common.registry_ordinal ==
-            std::numeric_limits<std::size_t>::max() ||
-        common.quantity_unit == QuantityUnitV1::kUnknown) {
+            std::numeric_limits<std::size_t>::max()) {
         return KLineTradeProjectionV1::kInvalidTrade;
     }
     KLineTradeV1 projected{};
@@ -180,6 +179,9 @@ struct SnapshotSeries final {
     projected.quantity_raw =
         static_cast<std::uint64_t>(fields.quantity.raw);
     projected.quantity_scale = fields.quantity.scale;
+    // The decoded raw quantity and its scale remain exact even when the
+    // registry deliberately declines to infer an economic unit. Preserve
+    // kUnknown instead of inventing shares/lots or dropping a valid trade.
     projected.quantity_unit = common.quantity_unit;
     projected.event_sequence =
         native_event_sequence == 0U
@@ -535,8 +537,7 @@ public:
             trade.event_time_ns_since_midnight >=
                 kKLineNanosecondsPerDayV1 ||
             trade.quantity_raw == 0U || trade.source_sequence == 0U ||
-            trade.ingress_sequence == 0U ||
-            trade.quantity_unit == QuantityUnitV1::kUnknown) {
+            trade.ingress_sequence == 0U) {
             failed_ = true;
             return KLineAppendErrorV1::kInvalidTrade;
         }

@@ -466,6 +466,12 @@ exact store generation, so consumers should acquire the KLine handle and use
 `input_store()` rather than combining two independently acquired latest
 handles.
 
+Volume retains the decoded vendor `raw` value and `scale`. When the registry
+deliberately leaves `quantity_unit` unknown, KLine preserves that unknown label
+instead of inferring shares/lots or rejecting an otherwise valid trade. A
+series still fails closed if later trades for the same instrument/window
+change either the raw scale or the declared unit.
+
 Bucket selection and OHLC open/close ordering use the decoded message's
 exchange timestamp. Callback receive clocks, SDK `LocalTime`, and the local
 server's seconds do not participate. The configured process `trade_date`

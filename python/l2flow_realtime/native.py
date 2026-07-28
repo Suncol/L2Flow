@@ -75,6 +75,14 @@ class NativeTickRead:
     observed_sequence: int
 
 
+@dataclass(frozen=True, slots=True)
+class NativeTickBlockRead:
+    data: bytes
+    record_count: int
+    next_sequence: int
+    observed_sequence: int
+
+
 def _candidate_library_paths() -> Iterable[str]:
     configured = os.environ.get("L2FLOW_SHM_READER_LIBRARY")
     if configured:
@@ -216,6 +224,8 @@ class NativeReader:
         self._library = library
         self._handle = handle
         self._lock = threading.RLock()
+        self._tick_output = None
+        self._tick_output_bytes = 0
 
     @classmethod
     def open_fd(
@@ -477,9 +487,9 @@ class NativeReader:
                 payloads.append(None)
         return tuple(parsed_statuses), tuple(payloads)
 
-    def read_ticks(
+    def read_tick_block(
         self, expected_sequence: int, maximum_records: int
-    ) -> NativeTickRead:
+    ) -> NativeTickBlockRead:
         if (
             not isinstance(expected_sequence, int)
             or isinstance(expected_sequence, bool)
@@ -496,24 +506,27 @@ class NativeReader:
         if maximum_records == 0:
             with self._lock:
                 self._require_open()
-            return NativeTickRead((), expected_sequence, 0)
+            return NativeTickBlockRead(b"", 0, expected_sequence, 0)
         if (
             maximum_records > sys.maxsize // TICK_BYTES
             or maximum_records > _C_SIZE_MAX // TICK_BYTES
         ):
             raise ValueError("maximum_records is too large")
-        outputs = (
-            ctypes.c_uint8 * (maximum_records * TICK_BYTES)
-        )()
+        required_bytes = maximum_records * TICK_BYTES
         written = ctypes.c_size_t()
         next_sequence = ctypes.c_uint64(expected_sequence)
         observed_sequence = ctypes.c_uint64()
         with self._lock:
             self._require_open()
+            if self._tick_output_bytes < required_bytes:
+                self._tick_output = (
+                    ctypes.c_uint8 * required_bytes
+                )()
+                self._tick_output_bytes = required_bytes
             code = self._library.l2flow_shm_reader_ticks_v1(
                 self._handle,
                 expected_sequence,
-                outputs,
+                self._tick_output,
                 TICK_BYTES,
                 maximum_records,
                 ctypes.byref(written),
@@ -525,17 +538,37 @@ class NativeReader:
                     expected_sequence, observed_sequence.value
                 )
             _raise_native("read_ticks", code)
-        if written.value > maximum_records:
-            raise WireFormatError("native tick reader exceeded output bound")
-        if next_sequence.value != expected_sequence + written.value:
-            raise WireFormatError("native tick reader returned a bad cursor")
-        raw = bytes(outputs)
+            if written.value > maximum_records:
+                raise WireFormatError(
+                    "native tick reader exceeded output bound"
+                )
+            if next_sequence.value != expected_sequence + written.value:
+                raise WireFormatError(
+                    "native tick reader returned a bad cursor"
+                )
+            raw = ctypes.string_at(
+                self._tick_output,
+                written.value * TICK_BYTES,
+            )
+        return NativeTickBlockRead(
+            raw,
+            written.value,
+            next_sequence.value,
+            observed_sequence.value,
+        )
+
+    def read_ticks(
+        self, expected_sequence: int, maximum_records: int
+    ) -> NativeTickRead:
+        block = self.read_tick_block(expected_sequence, maximum_records)
         payloads = tuple(
-            raw[index * TICK_BYTES : (index + 1) * TICK_BYTES]
-            for index in range(written.value)
+            block.data[
+                index * TICK_BYTES : (index + 1) * TICK_BYTES
+            ]
+            for index in range(block.record_count)
         )
         return NativeTickRead(
             payloads,
-            next_sequence.value,
-            observed_sequence.value,
+            block.next_sequence,
+            block.observed_sequence,
         )

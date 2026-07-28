@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Optional, Sequence, Union
 
-from .batch import LatestBatch, TickBatch
+from .batch import LatestBatch, TickBatch, TickColumnBatch
 from .control import discover_session_fd
 from .models import (
     ClientClosedError,
@@ -410,6 +410,46 @@ class TickCursor:
                 first,
                 native_batch.next_sequence,
                 ticks,
+            )
+            self._next_sequence = native_batch.next_sequence
+            return batch
+
+    def read_columns(self, max_records: int = 4096) -> TickColumnBatch:
+        """Copy one contiguous block without per-row Python model creation.
+
+        The returned client-owned block exposes a zero-copy structured NumPy
+        view through :meth:`TickColumnBatch.numpy_records`. Cursor/session and
+        overrun behavior is identical to :meth:`read`.
+        """
+
+        if not isinstance(max_records, int) or isinstance(max_records, bool):
+            raise TypeError("max_records must be an integer")
+        if max_records < 0 or max_records > MAX_BATCH_RECORDS:
+            raise ValueError(
+                f"max_records must be between 0 and {MAX_BATCH_RECORDS}"
+            )
+        with self._lock:
+            self._require_open()
+            with self._client._lock:
+                session = self._client._checked_session()
+                if session.identity != self._identity:
+                    raise StaleSessionError(
+                        "tick cursor belongs to another session"
+                    )
+                first = self._next_sequence
+                native_batch = self._client._native.read_tick_block(
+                    first, max_records
+                )
+                session = self._client._checked_session()
+                if session.identity != self._identity:
+                    raise StaleSessionError(
+                        "tick cursor session changed during read"
+                    )
+            batch = TickColumnBatch(
+                self._identity,
+                first,
+                native_batch.next_sequence,
+                native_batch.data,
             )
             self._next_sequence = native_batch.next_sequence
             return batch

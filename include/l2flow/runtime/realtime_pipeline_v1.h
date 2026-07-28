@@ -139,9 +139,14 @@ struct RealtimePipelineStageLatencySnapshotV1 final {
     // clock observation made by OnMessage (or the injection seam); callback
     // success is the first observation after successful admission and optional
     // WAL enqueue.  append_complete is the first observation after the store's
-    // Append returned kNone.
+    // Append returned kNone.  inprocess_latest_read is observed only after an
+    // allocation-free acquire-read through the live latest model has returned
+    // and been verified to expose the exact Store-owned record just appended;
+    // it does not wait for or acquire an immutable generation.
     RealtimeLatencyDistributionV1 callback_entry_to_success{};
     RealtimeLatencyDistributionV1 callback_entry_to_append_complete{};
+    RealtimeLatencyDistributionV1
+        callback_entry_to_inprocess_latest_read{};
     // Starts immediately before the successful-path input/route validation
     // and ends at the first observation after Append returns.  This is a tight
     // upper bound for the store call rather than an isolated function-body
@@ -258,6 +263,9 @@ struct RealtimePipelineCutResultV1 final {
 struct RealtimePipelineSnapshotV1 final {
     std::uint64_t accepted_messages = 0U;
     std::uint64_t ignored_messages = 0U;
+    // SDK callbacks that crossed the clean terminal admission cut. They are
+    // outside the published prefix and are not malformed/rejected data.
+    std::uint64_t post_cut_messages = 0U;
     std::uint64_t rejected_messages = 0U;
     std::uint64_t decoded_messages = 0U;
     std::uint64_t global_ingress_sequence = 0U;

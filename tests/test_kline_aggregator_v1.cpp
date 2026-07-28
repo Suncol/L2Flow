@@ -52,7 +52,7 @@ market::KLineTradeV1 Trade(
     trade.price_p6 = price;
     trade.quantity_raw = quantity;
     trade.quantity_scale = 0U;
-    trade.quantity_unit = market::QuantityUnitV1::kShare;
+    trade.quantity_unit = market::QuantityUnitV1::kUnknown;
     trade.source_sequence = source_sequence;
     trade.ingress_sequence = ingress_sequence;
     return trade;
@@ -106,7 +106,7 @@ int main() {
     projected_tick.common.instrument_id = 9U;
     projected_tick.common.registry_ordinal = 0U;
     projected_tick.common.quantity_unit =
-        market::QuantityUnitV1::kShare;
+        market::QuantityUnitV1::kUnknown;
     projected_tick.common.exchange_time.valid = true;
     projected_tick.common.exchange_time.unix_nanoseconds_valid = true;
     projected_tick.common.exchange_time.nanoseconds_since_midnight =
@@ -132,8 +132,9 @@ int main() {
                 market::KLineTradeProjectionV1::kTrade &&
             projected.event_time_ns_since_midnight ==
                 TimeNs(9U, 30U, 0U, 800U) &&
-            projected.ingress_sequence == 3U,
-        "projection uses decoded exchange time");
+            projected.ingress_sequence == 3U &&
+            projected.quantity_unit == market::QuantityUnitV1::kUnknown,
+        "projection uses decoded exchange time and preserves an unknown unit");
 
     market::KLineAggregatorConfigV1 config{};
     config.trade_date = 20260724U;
@@ -254,6 +255,8 @@ int main() {
         old_bars.size() == 1U &&
             old_bars[0U].open_price_p6 == 10'000'000 &&
             old_bars[0U].volume_raw == 2U &&
+            old_bars[0U].quantity_unit ==
+                market::QuantityUnitV1::kUnknown &&
             old_bars[0U].trade_count == 1U,
         "old snapshot remains unchanged after late trade");
     market::KLineBarV1 first_latest{};

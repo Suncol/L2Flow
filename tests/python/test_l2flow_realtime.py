@@ -6,6 +6,7 @@ import importlib.util
 import os
 import socket
 import struct
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -35,7 +36,11 @@ from l2flow_realtime.control import (
     receive_session_fd,
 )
 from l2flow_realtime.models import Instrument
-from l2flow_realtime.native import NativeReader, NativeTickRead
+from l2flow_realtime.native import (
+    NativeReader,
+    NativeTickBlockRead,
+    NativeTickRead,
+)
 from l2flow_realtime.wire import (
     KLINE_BYTES,
     SNAPSHOT_BYTES,
@@ -280,6 +285,15 @@ class FakeNative:
             sequence += 1
         return NativeTickRead(tuple(payloads), sequence, 0)
 
+    def read_tick_block(self, expected_sequence, maximum_records):
+        result = self.read_ticks(expected_sequence, maximum_records)
+        return NativeTickBlockRead(
+            b"".join(result.payloads),
+            len(result.payloads),
+            result.next_sequence,
+            result.observed_sequence,
+        )
+
 
 class WireModelTests(unittest.TestCase):
     def test_instrument_opaque_keys_and_reserved_validation(self):
@@ -383,6 +397,32 @@ class ClientTests(unittest.TestCase):
         latest = client.open_tick_cursor("latest")
         self.assertEqual(latest.next_sequence, 3)
         self.assertEqual(len(latest.read(8)), 0)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("numpy") is not None,
+        "NumPy is optional",
+    )
+    def test_column_cursor_exposes_exact_wire_offsets_without_objects(self):
+        client = L2FlowClient(FakeNative())
+        self.addCleanup(client.close)
+        cursor = client.open_tick_cursor("earliest")
+        batch = cursor.read_columns(8)
+        records = batch.numpy_records()
+        self.assertEqual(len(batch), 2)
+        self.assertEqual(batch.first_sequence, 1)
+        self.assertEqual(batch.next_sequence, 3)
+        self.assertEqual(cursor.next_sequence, 3)
+        self.assertFalse(records.flags.writeable)
+        self.assertEqual(records.dtype.itemsize, TICK_BYTES)
+        self.assertEqual(records["record_schema_version"].tolist(), [1, 1])
+        self.assertEqual(records["record_bytes"].tolist(), [336, 336])
+        self.assertEqual(records["tick_stream_sequence"].tolist(), [1, 2])
+        self.assertEqual(records["ingress_sequence"].tolist(), [11, 12])
+        self.assertEqual(records["event_kind"].tolist(), [2, 4])
+        self.assertEqual(records["action"].tolist(), [3, 1])
+        self.assertEqual(records["price_raw"].tolist(), [1234, 1234])
+        self.assertEqual(records["price_p6"].tolist(), [12_340_000] * 2)
+        self.assertEqual(records["quantity_raw"].tolist(), [100, 100])
 
     def test_overrun_does_not_advance_cursor(self):
         native = FakeNative()
@@ -690,26 +730,27 @@ class ControlTests(unittest.TestCase):
             discover_session_fd("relative.sock")
 
     def test_connect_fake_native_seam_closes_received_python_fd(self):
-        mapping = os.memfd_create("l2flow-python-test")
-        os.ftruncate(mapping, 4096)
-        factory_fd = []
+        with tempfile.TemporaryFile() as mapping:
+            mapping.truncate(4096)
+            control_fd = os.dup(mapping.fileno())
+            factory_fd = []
 
-        def factory(fd):
-            os.fstat(fd)
-            factory_fd.append(fd)
-            return FakeNative()
+            def factory(fd):
+                os.fstat(fd)
+                factory_fd.append(fd)
+                return FakeNative()
 
-        control = ControlSession(mapping, 11, 5, 4096)
-        with mock.patch(
-            "l2flow_realtime.client.discover_session_fd",
-            return_value=control,
-        ):
-            client = L2FlowClient.connect(
-                "/unused/control.sock", _native_factory=factory
-            )
-        with self.assertRaises(OSError):
-            os.fstat(factory_fd[0])
-        client.close()
+            control = ControlSession(control_fd, 11, 5, 4096)
+            with mock.patch(
+                "l2flow_realtime.client.discover_session_fd",
+                return_value=control,
+            ):
+                client = L2FlowClient.connect(
+                    "/unused/control.sock", _native_factory=factory
+                )
+            with self.assertRaises(OSError):
+                os.fstat(factory_fd[0])
+            client.close()
 
 
 if __name__ == "__main__":

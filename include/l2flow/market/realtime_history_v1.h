@@ -276,11 +276,16 @@ private:
 using RealtimeHistoryCommitActionV1 = void (*)(void* context) noexcept;
 
 // Optional measurement hook invoked by the permanent owner worker only after
-// IntradayInstrumentStoreV1::Append has returned kNone.  The first monotonic
-// clock read after that return defines append_complete_monotonic_ns; the
-// realtime observation follows it.  The hook runs after both observations, so
-// its own aggregation cost is excluded from the measured append boundary.
-// It must be allocation-free, nonblocking, and noexcept.
+// IntradayInstrumentStoreV1::Append has returned kNone and an immediate
+// acquire-read of the matching Store-owned record through the live latest
+// model has succeeded.  The first monotonic clock read after Append defines
+// append_complete_monotonic_ns; the realtime observation follows it.
+// inprocess_latest_read_complete_monotonic_ns is observed only after the
+// immediate read has returned and its exact record pointer, instrument,
+// category, and ingress sequence have been verified.  No immutable generation
+// is cut or acquired for this read.  The hook runs after these observations,
+// so its own aggregation cost is excluded from both measured boundaries.  It
+// must be allocation-free, nonblocking, and noexcept.
 struct RealtimeHistoryAppendObservationV1 final {
     std::uint32_t worker = 0U;
     std::uint8_t source_slot = 0U;
@@ -291,7 +296,9 @@ struct RealtimeHistoryAppendObservationV1 final {
     std::uint64_t append_start_monotonic_ns = 0U;
     std::uint64_t append_complete_monotonic_ns = 0U;
     std::uint64_t append_complete_realtime_ns = 0U;
+    std::uint64_t inprocess_latest_read_complete_monotonic_ns = 0U;
     bool clock_observation_valid = false;
+    bool inprocess_latest_read_observation_valid = false;
 };
 
 using RealtimeHistoryAppendObserverV1 = void (*)(

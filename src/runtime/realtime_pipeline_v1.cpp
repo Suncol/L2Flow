@@ -490,6 +490,8 @@ public:
           callback_entry_to_success_(0, 20'000'000LL, 50ULL),
           callback_entry_to_append_complete_(
               0, 5'000'000'000LL, 5'000ULL),
+          callback_entry_to_inprocess_latest_read_(
+              0, 5'000'000'000LL, 5'000ULL),
           append_call_(0, 20'000'000LL, 50ULL) {
         trade_date_valid_ =
             FixedUtc8MidnightNs(trade_date_, &fixed_utc8_midnight_ns_);
@@ -559,6 +561,18 @@ public:
         } else {
             append_call_.AddInvalid();
         }
+        if (observation.inprocess_latest_read_observation_valid &&
+            observation.recv_monotonic_ns >= 0 &&
+            UnsignedElapsed(
+                static_cast<std::uint64_t>(
+                    observation.recv_monotonic_ns),
+                observation
+                    .inprocess_latest_read_complete_monotonic_ns,
+                &elapsed)) {
+            callback_entry_to_inprocess_latest_read_.Add(elapsed);
+        } else {
+            callback_entry_to_inprocess_latest_read_.AddInvalid();
+        }
         std::int64_t vendor_realtime_ns = 0;
         std::int64_t sdk_age = 0;
         if (observation.clock_observation_valid &&
@@ -598,6 +612,8 @@ public:
             callback_entry_to_success_.Snapshot();
         result.callback_entry_to_append_complete =
             callback_entry_to_append_complete_.Snapshot();
+        result.callback_entry_to_inprocess_latest_read =
+            callback_entry_to_inprocess_latest_read_.Snapshot();
         result.append_call = append_call_.Snapshot();
         return result;
     }
@@ -647,6 +663,8 @@ private:
     ConcurrentLinearLatencyHistogram sdk_local_to_append_complete_;
     ConcurrentLinearLatencyHistogram callback_entry_to_success_;
     ConcurrentLinearLatencyHistogram callback_entry_to_append_complete_;
+    ConcurrentLinearLatencyHistogram
+        callback_entry_to_inprocess_latest_read_;
     ConcurrentLinearLatencyHistogram append_call_;
 };
 
@@ -1226,7 +1244,7 @@ public:
         }
         if (!accepting_.load(std::memory_order_acquire)) {
             result.error = RealtimePipelineIngressErrorV1::kStopped;
-            ++rejected_messages_;
+            ++post_cut_messages_;
             return result;
         }
         if (message == nullptr) {
@@ -1732,6 +1750,7 @@ public:
             std::lock_guard<std::mutex> admission(admission_mutex_);
             result.accepted_messages = accepted_messages_;
             result.ignored_messages = ignored_messages_;
+            result.post_cut_messages = post_cut_messages_;
             result.rejected_messages = rejected_messages_;
             result.global_ingress_sequence = global_ingress_sequence_;
             result.tick_stream_sequence = tick_stream_sequence_;
@@ -2160,6 +2179,7 @@ private:
         source_sequences_{};
     std::uint64_t accepted_messages_ = 0U;
     std::uint64_t ignored_messages_ = 0U;
+    std::uint64_t post_cut_messages_ = 0U;
     std::uint64_t rejected_messages_ = 0U;
     std::uint64_t last_started_generation_ = 0U;
     std::optional<std::uint64_t> clean_admission_cut_ns_;

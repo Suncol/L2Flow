@@ -1,6 +1,6 @@
 """Low-latency, read-only Python client for L2Flow realtime market data."""
 
-from .batch import LatestBatch, TickBatch
+from .batch import LatestBatch, TickBatch, TickColumnBatch
 from .client import (
     DEFAULT_STALE_AFTER_NS,
     L2FlowClient,
@@ -79,6 +79,7 @@ __all__ = [
     "Tick",
     "TickAction",
     "TickBatch",
+    "TickColumnBatch",
     "TickCursor",
     "TickFactorRunner",
     "TickOverrunError",

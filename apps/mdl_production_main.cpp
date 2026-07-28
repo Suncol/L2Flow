@@ -134,6 +134,7 @@ struct Options final {
     std::uint32_t intraday_store_segment_kib = 64U;
     std::uint32_t intraday_store_batch_records = 64U * 1024U;
     bool intraday_store_from_open = false;
+    bool intraday_store_partial_session = false;
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
     // Each duration in milliseconds is also its stable public window_id.
@@ -161,12 +162,15 @@ void PrintUsage(std::ostream& output) {
         << "  --registry-sha256 HEX64       canonical registry identity\n"
         << "  --trade-date YYYYMMDD         decoder trading date\n"
         << "  --server-address HOST:PORT    vendor endpoint\n"
-        << "  --user-name VALUE             vendor user/token field\n"
+        << "  --user-name VALUE             nonempty vendor user/token field\n"
         << "  --intraday-store-max-records N\n"
         << "                                positive u64 session record cap\n"
         << "  --intraday-store-memory-gib N positive u64 logical total GiB cap\n"
+        << "Coverage mode (choose exactly one):\n"
         << "  --intraday-store-from-open    require continuous coverage from "
            "market open\n"
+        << "  --partial-session             mid-session diagnostic; does not "
+           "claim coverage from open\n"
         << "Optional:\n"
         << "  --sdk-log-prefix PATH         default l2flow-realtime\n"
         << "  --wal-path PATH               enable independent audit WAL\n"
@@ -329,6 +333,14 @@ bool ParseOptions(
                 return false;
             }
             parsed.intraday_store_from_open = true;
+            continue;
+        }
+        if (option == "--partial-session") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate --partial-session";
+                return false;
+            }
+            parsed.intraday_store_partial_session = true;
             continue;
         }
         if (option != "--sdk-library" &&
@@ -530,12 +542,17 @@ bool ParseOptions(
     }
 #endif
     if (!parsed.intraday_store_maximum_records_set ||
-        !parsed.intraday_store_memory_set ||
-        !parsed.intraday_store_from_open) {
+        !parsed.intraday_store_memory_set) {
         *error =
             "store-only production requires explicit positive "
-            "--intraday-store-max-records, --intraday-store-memory-gib, "
-            "and --intraday-store-from-open";
+            "--intraday-store-max-records and --intraday-store-memory-gib";
+        return false;
+    }
+    if (parsed.intraday_store_from_open ==
+        parsed.intraday_store_partial_session) {
+        *error =
+            "choose exactly one of --intraday-store-from-open and "
+            "--partial-session";
         return false;
     }
     *output = std::move(parsed);

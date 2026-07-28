@@ -1467,11 +1467,6 @@ public:
         }
         const bool released =
             HandoffPool(source, worker).ReleaseFromConsumer(slot);
-        if (observe &&
-            error == IntradayInstrumentStoreAppendErrorV1::kNone) {
-            config_.append_observer(
-                config_.append_observer_context, observation);
-        }
         if (!released) {
             MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
@@ -1498,6 +1493,40 @@ public:
             // transitions the complete History/Store chain to fatal.
             MarkLatestCoverageLost();
             return false;
+        }
+        if (observe) {
+            const RealtimeLatestRecordKindV1 latest_kind =
+                IsSnapshotEventKindV1(appended_record->kind())
+                    ? RealtimeLatestRecordKindV1::kSnapshot
+                    : RealtimeLatestRecordKindV1::kTick;
+            RealtimeLatestRecordViewV1 latest_view{};
+            const RealtimeLatestQueryErrorV1 read_error =
+                latest_read_model_->GetLatest(
+                    latest_kind,
+                    appended_record->instrument_id(),
+                    &latest_view);
+            const bool exact_record_read =
+                read_error == RealtimeLatestQueryErrorV1::kNone &&
+                latest_view.available() &&
+                latest_view.instrument_id ==
+                    appended_record->instrument_id() &&
+                latest_view.record == appended_record &&
+                latest_view.record->ingress_sequence() ==
+                    appended_record->ingress_sequence();
+            const bool read_clock_valid =
+                exact_record_read &&
+                ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &observation
+                         .inprocess_latest_read_complete_monotonic_ns);
+            observation.inprocess_latest_read_observation_valid =
+                observation.clock_observation_valid && read_clock_valid;
+            config_.append_observer(
+                config_.append_observer_context, observation);
+            if (!exact_record_read) {
+                MarkLatestCoverageLost();
+                return false;
+            }
         }
         if (config_.applied_record_sink != nullptr &&
             !config_.applied_record_sink->PublishApplied(
