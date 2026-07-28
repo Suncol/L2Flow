@@ -342,6 +342,51 @@ Cartesian product；传入一个标量 `window_id` 时会对全部 instrument
 `to_polars()`；后两者缺少相应可选依赖时会明确报错，不影响核心 client
 使用。
 
+### 7.1 latest snapshot 占位因子
+
+若当前只需要验证 Python 因子访问链路，可以直接把 snapshot 的最新价
+复制为占位因子，不必使用逐 tick cursor。仓库提供了可运行示例：
+
+```bash
+python3 -m pip install -e './python[polars]'
+
+python3 python/examples/latest_snapshot_factor.py \
+  --control-socket "${L2FLOW_IPC_SOCKET}" \
+  --native-reader "${PWD}/build/libl2flow_shm_reader.so" \
+  --instrument-ids 1001,2002 \
+  --iterations 1
+```
+
+`1001,2002` 只是命令格式示例，必须替换为当前 registry 中的稳定
+`instrument_id`。示例只执行一次批量 native read，然后在 Polars 中生成：
+
+```text
+placeholder_factor_p6 = last_price_p6
+```
+
+因子列保持 nullable `Int64` 和 p6 整数精度；非 `AVAILABLE` 行以及
+snapshot 本身没有有效最新价的行不会被填成零。输出还保留 status、
+ingress sequence、事件时间、接收时间和 `snapshot_age_ns`，方便核对读到
+的是哪一版 latest 值。
+
+持续轮询可使用：
+
+```bash
+python3 python/examples/latest_snapshot_factor.py \
+  --control-socket "${L2FLOW_IPC_SOCKET}" \
+  --native-reader "${PWD}/build/libl2flow_shm_reader.so" \
+  --instrument-ids 1001,2002 \
+  --iterations 0 \
+  --interval-ms 10
+```
+
+这仍然是 latest-value polling：两次读取之间的中间 snapshot 可以被覆盖，
+不能把它描述为逐 snapshot 不漏消费。多标的应保持一次批量调用；低间隔
+轮询时，终端打印和 Polars DataFrame 构造也会进入观测延迟。服务进入
+`STOPPED_CLEAN` 后，示例会输出最后一批并退出；heartbeat stale、
+coverage lost 或 `FAILED` 会由 client fail-closed，而不是继续计算旧
+mapping。
+
 ## 8. 逐 tick cursor
 
 `tick_stream_sequence` 是 callback admission 分配的、从 1 开始的全局

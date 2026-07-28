@@ -72,6 +72,38 @@ def main(argv: list[str]) -> int:
             == [1_234_000, 2_234_000],
             "SH/SZ snapshot columns are wrong",
         )
+        require_polars = (
+            os.environ.get("L2FLOW_IPC_E2E_REQUIRE_POLARS") == "1"
+        )
+        try:
+            import polars as pl  # pylint: disable=import-outside-toplevel
+        except ImportError:
+            _require(
+                not require_polars,
+                "Polars is required for the latest-value factor probe",
+            )
+        else:
+            factor_frame = snapshots.to_polars().with_columns(
+                pl.when(
+                    pl.col("status") == int(LatestStatus.AVAILABLE)
+                )
+                .then(pl.col("last_price_p6"))
+                .otherwise(None)
+                .alias("placeholder_factor_p6")
+            )
+            _require(
+                factor_frame["instrument_id"].to_list()
+                == instrument_ids
+                and factor_frame["placeholder_factor_p6"].to_list()
+                == [1_234_000, 2_234_000],
+                "latest snapshot Polars placeholder factor is wrong",
+            )
+            _require(
+                factor_frame.schema["instrument_id"] == pl.UInt32
+                and factor_frame.schema["placeholder_factor_p6"]
+                == pl.Int64,
+                "latest snapshot Polars factor dtypes are wrong",
+            )
 
         latest_ticks = client.get_latest_ticks(instrument_ids)
         _require(

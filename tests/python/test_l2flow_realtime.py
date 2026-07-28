@@ -8,6 +8,7 @@ import socket
 import struct
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from l2flow_realtime import (
@@ -465,7 +466,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(tick_frame["price_p6"].sum(), 24_680_000)
 
         snapshot = parse_snapshot(snapshot_payload())
-        snapshot_frame = LatestBatch(
+        snapshot_batch = LatestBatch(
             "snapshot",
             identity,
             (
@@ -475,10 +476,53 @@ class ClientTests(unittest.TestCase):
                     snapshot,
                 ),
             ),
-        ).to_polars()
+        )
+        snapshot_frame = snapshot_batch.to_polars()
         self.assertEqual(
             snapshot_frame["last_price_p6"].item(),
             12_340_000,
+        )
+        example_path = (
+            Path(__file__).resolve().parents[2]
+            / "python"
+            / "examples"
+            / "latest_snapshot_factor.py"
+        )
+        example_spec = importlib.util.spec_from_file_location(
+            "latest_snapshot_factor_example",
+            example_path,
+        )
+        self.assertIsNotNone(example_spec)
+        self.assertIsNotNone(example_spec.loader)
+        example_module = importlib.util.module_from_spec(example_spec)
+        example_spec.loader.exec_module(example_module)
+        factor_input = LatestBatch(
+            "snapshot",
+            identity,
+            (
+                LatestResult(
+                    7,
+                    LatestStatus.AVAILABLE,
+                    snapshot,
+                ),
+                LatestResult(
+                    8,
+                    LatestStatus.NOT_YET_OBSERVED,
+                    None,
+                ),
+            ),
+        )
+        factor_frame = example_module.calculate_placeholder_factor(
+            factor_input,
+            time.monotonic_ns(),
+        )
+        self.assertEqual(
+            factor_frame["placeholder_factor_p6"].to_list(),
+            [12_340_000, None],
+        )
+        self.assertEqual(
+            factor_frame.schema["placeholder_factor_p6"],
+            pl.Int64,
         )
 
         kline = parse_kline(kline_payload())
