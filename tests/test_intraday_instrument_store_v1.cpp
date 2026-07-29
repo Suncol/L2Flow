@@ -1,4 +1,5 @@
 #include "l2flow/market/intraday_instrument_store_v1.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <algorithm>
@@ -50,46 +51,61 @@ std::vector<std::byte> Bytes(std::string_view text) {
     return {bytes.begin(), bytes.end()};
 }
 
-std::unique_ptr<market::InstrumentRegistryV1> MakeRegistry() {
-    std::vector<market::InstrumentRegistryEntryV1> entries;
-    for (std::uint32_t instrument_id : {9U, 2U, 7U, 5U}) {
-        market::InstrumentRegistryEntryV1 entry{};
-        entry.instrument_id = instrument_id;
-        entry.key.market = market::MarketV1::kShanghai;
-        entry.key.security_id_source = Bytes("101");
-        switch (instrument_id) {
-            case 2U:
-                entry.key.security_id = Bytes("600002");
-                break;
-            case 5U:
-                entry.key.security_id = Bytes("600005");
-                break;
-            case 7U:
-                entry.key.security_id = Bytes("600007");
-                break;
-            case 9U:
-                entry.key.security_id = Bytes("600009");
-                break;
-            default:
-                return nullptr;
-        }
-        entry.quantity_unit = market::QuantityUnitV1::kShare;
-        entry.security_type = market::SecurityTypeV1::kEquity;
-        entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-        entries.push_back(std::move(entry));
-    }
-
-    std::unique_ptr<market::InstrumentRegistryV1> registry;
-    if (market::InstrumentRegistryV1::Create(
-            17U, entries, &registry) !=
-        market::InstrumentRegistryCreateErrorV1::kNone) {
+std::unique_ptr<market::ObservedInstrumentDirectoryV2>
+MakeDirectory(
+    std::size_t capacity = 9U,
+    std::size_t bound_count = 9U,
+    std::uint64_t session_epoch = 17U) {
+    if (capacity == 0U || bound_count > capacity ||
+        bound_count > 9U) {
         return nullptr;
     }
-    return registry;
+    market::ObservedInstrumentDirectoryConfigV2 config{};
+    config.capacity = capacity;
+    config.session_epoch = session_epoch;
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    if (market::ObservedInstrumentDirectoryV2::Create(
+            config, &directory) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone) {
+        return nullptr;
+    }
+    constexpr std::array<std::string_view, 9U> security_ids{
+        "600001",
+        "600002",
+        "600003",
+        "600004",
+        "600005",
+        "600006",
+        "600007",
+        "600008",
+        "600009"};
+    const market::ObservedInstrumentMetadataV2 metadata{
+        market::QuantityUnitV1::kShare,
+        market::SecurityTypeV1::kEquity,
+        market::AssetScopeV1::kDocumentedCore};
+    for (std::size_t ordinal = 0U;
+         ordinal < bound_count;
+         ++ordinal) {
+        market::InstrumentKeyV1 key{};
+        key.market = market::MarketV1::kShanghai;
+        key.security_id_source = Bytes("101");
+        key.security_id = Bytes(security_ids[ordinal]);
+        market::ObservedInstrumentBindResultV2 result{};
+        if (directory->BindOrGet(
+                key, metadata, ordinal + 1U, &result) !=
+                market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            !result.newly_bound ||
+            result.entry.ordinal != ordinal ||
+            result.entry.instrument_id !=
+                static_cast<std::uint32_t>(ordinal + 1U)) {
+            return nullptr;
+        }
+    }
+    return directory;
 }
 
 void FillCommon(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentDirectoryV2& directory,
     market::DecodedMarketCommonV1* common,
     market::MarketEventKindV1 kind,
     market::MarketV1 venue,
@@ -107,8 +123,11 @@ void FillCommon(
     common->origin.recv_monotonic_ns =
         static_cast<std::int64_t>(ingress_sequence * 10U);
     common->instrument_id = instrument_id;
-    const auto lookup = registry.LookupById(instrument_id);
-    common->registry_ordinal = lookup.registry_ordinal;
+    market::ObservedInstrumentEntryViewV2 lookup{};
+    if (directory.LookupById(instrument_id, &lookup) ==
+        market::ObservedInstrumentDirectoryErrorV2::kNone) {
+        common->ordinal = lookup.ordinal;
+    }
 }
 
 template <typename Event>
@@ -118,7 +137,12 @@ std::unique_ptr<market::RealtimeHistoryEventInputV1> OwnInput(
     Event event) {
     market::DecodedMarketEventV1 decoded(std::move(event));
     auto input = market::RealtimeHistoryEventInputV1::Create(
-        source_slot, ingress_sequence, std::move(decoded));
+        source_slot,
+        ingress_sequence,
+        std::move(decoded),
+        source_slot == 1U || source_slot == 3U
+            ? ingress_sequence
+            : 0U);
     if (!input.has_value()) {
         return nullptr;
     }
@@ -127,7 +151,7 @@ std::unique_ptr<market::RealtimeHistoryEventInputV1> OwnInput(
 }
 
 std::unique_ptr<market::RealtimeHistoryEventInputV1> MakeInput(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentDirectoryV2& registry,
     std::uint8_t source_slot,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
@@ -222,7 +246,7 @@ market::IntradayInstrumentStoreAppendErrorV1 AppendInput(
     }
     market::InstrumentRouteTokenV1 route{};
     if (store->ResolveRouteToken(
-            input->registry_ordinal(),
+            input->ordinal(),
             input->instrument_id(),
             &route) !=
         market::IntradayInstrumentStoreQueryErrorV1::kNone) {
@@ -232,8 +256,10 @@ market::IntradayInstrumentStoreAppendErrorV1 AppendInput(
     return store->Append(worker, route, std::move(*input));
 }
 
-market::RealtimeHistoryWatermarkV1 MakeWatermark(
-    const market::InstrumentRegistryV1& registry,
+market::RealtimeHistoryWatermarkV1 MakeWatermarkForSnapshot(
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot,
     std::uint64_t generation,
     std::array<std::uint64_t, 4U> source_sequence_exclusive) {
     common::Identity128 run_id{};
@@ -254,19 +280,45 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
     }
 
     market::RealtimeHistoryWatermarkV1 watermark{};
+    if (catalog_snapshot == nullptr) {
+        return {};
+    }
+    l2flow::realtime::ProcessingProgressV2 progress{};
+    progress.accepted_sequence = ingress_sequence_exclusive - 1U;
+    progress.durable_sequence = ingress_sequence_exclusive - 1U;
+    progress.applied_sequence = ingress_sequence_exclusive - 1U;
     if (market::BuildRealtimeHistoryWatermarkV1(
             run_id,
             generation,
             kTradeDate,
             ingress_sequence_exclusive,
             10'000U + generation,
-            registry,
+            std::move(catalog_snapshot),
+            progress,
             sources,
             &watermark) !=
         market::RealtimeHistoryWatermarkErrorV1::kNone) {
         return {};
     }
     return watermark;
+}
+
+market::RealtimeHistoryWatermarkV1 MakeWatermark(
+    const market::ObservedInstrumentDirectoryV2& registry,
+    std::uint64_t generation,
+    std::array<std::uint64_t, 4U> source_sequence_exclusive) {
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
+    if (registry.AcquireSnapshot(&catalog_snapshot) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+        catalog_snapshot == nullptr) {
+        return {};
+    }
+    return MakeWatermarkForSnapshot(
+        std::move(catalog_snapshot),
+        generation,
+        source_sequence_exclusive);
 }
 
 market::IntradayInstrumentStoreConfigV1 StoreConfig(
@@ -283,7 +335,7 @@ market::IntradayInstrumentStoreConfigV1 StoreConfig(
 }
 
 std::unique_ptr<market::IntradayInstrumentStoreV1> CreateStore(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentDirectoryV2& registry,
     std::uint32_t worker_count,
     market::IntradayInstrumentStoreConfigV1 config,
     std::string_view message,
@@ -301,7 +353,7 @@ std::unique_ptr<market::IntradayInstrumentStoreV1> CreateStore(
 std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
 BuildStoreGeneration(
     market::IntradayInstrumentStoreV1* store,
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentDirectoryV2& registry,
     std::uint32_t worker_count,
     std::uint64_t generation,
     std::array<std::uint64_t, 4U> source_sequence_exclusive,
@@ -320,7 +372,11 @@ BuildStoreGeneration(
         slices(worker_count);
     for (std::uint32_t worker = 0U; worker < worker_count; ++worker) {
         const auto error =
-            store->CaptureWorker(worker, generation, &slices[worker]);
+            store->CaptureWorker(
+                worker,
+                generation,
+                watermark.catalog_snapshot,
+                &slices[worker]);
         *ok &= Expect(
             error ==
                     market::IntradayInstrumentStoreGenerationErrorV1::
@@ -392,6 +448,384 @@ std::vector<const market::RealtimeHistoryRecordV1*> DrainCursor(
     }
     *ok &= Expect(false, "cursor terminates in bounded iterations");
     return records;
+}
+
+bool CheckObservedCatalogPrefixAndRouting() {
+    bool ok = true;
+    auto directory = MakeDirectory(6U, 2U, 71U);
+    ok &= Expect(
+        directory != nullptr,
+        "create partially bound fixed-capacity directory");
+    if (directory == nullptr) {
+        return false;
+    }
+    auto store = CreateStore(
+        *directory,
+        3U,
+        StoreConfig(),
+        "create capacity-backed Store",
+        &ok);
+    if (store == nullptr) {
+        return false;
+    }
+
+    market::InstrumentRouteTokenV1 route{};
+    ok &= Expect(
+        store->ResolveRouteToken(0U, 1U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            route.ordinal == 0U && route.instrument_id == 1U &&
+            route.worker == 0U &&
+            store->ResolveRouteToken(1U, 2U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            route.ordinal == 1U && route.worker == 1U,
+        "bound IDs resolve by exact ordinal with ordinal-modulo owners");
+    ok &= Expect(
+        store->ResolveRouteToken(2U, 3U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNotFound &&
+            store->ResolveRouteToken(0U, 2U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
+        "route resolution rejects unbound and mismatched identities");
+
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        first_catalog;
+    ok &= Expect(
+        directory->AcquireSnapshot(&first_catalog) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            first_catalog != nullptr &&
+            first_catalog->bound_count() == 2U,
+        "freeze two-instrument catalog cut");
+    if (first_catalog == nullptr) {
+        return false;
+    }
+
+    market::InstrumentKeyV1 third_key{};
+    third_key.market = market::MarketV1::kShanghai;
+    third_key.security_id_source = Bytes("101");
+    third_key.security_id = Bytes("600003");
+    const market::ObservedInstrumentMetadataV2 metadata{
+        market::QuantityUnitV1::kShare,
+        market::SecurityTypeV1::kEquity,
+        market::AssetScopeV1::kDocumentedCore};
+    market::ObservedInstrumentBindResultV2 third{};
+    ok &= Expect(
+        directory->BindOrGet(
+            third_key, metadata, 3U, &third) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            third.newly_bound && third.entry.ordinal == 2U &&
+            third.entry.instrument_id == 3U &&
+            store->ResolveRouteToken(2U, 3U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            route.worker == 2U,
+        "prebuilt physical row becomes routable after one-way binding");
+
+    const market::RealtimeHistoryWatermarkV1 first_watermark =
+        MakeWatermarkForSnapshot(
+            first_catalog, 1U, {1U, 1U, 1U, 1U});
+    std::vector<
+        std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
+        first_slices(3U);
+    for (std::uint32_t worker = 0U; worker < 3U; ++worker) {
+        ok &= Expect(
+            store->CaptureWorker(
+                worker,
+                1U,
+                first_catalog,
+                &first_slices[worker]) ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone,
+            "capture capacity-backed worker slice");
+    }
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        first_generation;
+    ok &= Expect(
+        store->BuildGeneration(
+            first_watermark,
+            std::move(first_slices),
+            &first_generation) ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
+            first_generation != nullptr &&
+            first_generation->catalog_snapshot() == first_catalog &&
+            first_generation->watermark().catalog_snapshot ==
+                first_catalog &&
+            first_generation->instrument_count() == 2U,
+        "generation retains the exact earlier catalog snapshot");
+    if (first_generation == nullptr) {
+        return false;
+    }
+    for (std::size_t ordinal = 0U; ordinal < 2U; ++ordinal) {
+        market::IntradayInstrumentSummaryV1 summary{};
+        ok &= Expect(
+            first_generation->SummaryAt(ordinal, &summary) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                summary.instrument_id == ordinal + 1U &&
+                summary.record_count == 0U &&
+                summary.latest_snapshot == nullptr &&
+                summary.latest_tick == nullptr,
+            "bound-no-data identities remain present in the cut");
+    }
+    market::IntradayInstrumentSummaryV1 outside_cut{};
+    ok &= Expect(
+        first_generation->SummaryAt(2U, &outside_cut) ==
+            market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
+        "post-cut binding is absent from an older generation");
+
+    ok &= Expect(
+        store->PublishGeneration(first_generation) ==
+            market::IntradayInstrumentStoreGenerationErrorV1::kNone,
+        "publish first catalog-bound generation");
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        second_catalog;
+    ok &= Expect(
+        directory->AcquireSnapshot(&second_catalog) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            second_catalog != nullptr &&
+            second_catalog->bound_count() == 3U,
+        "freeze expanded catalog cut");
+    std::vector<
+        std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
+        second_slices(3U);
+    for (std::uint32_t worker = 0U; worker < 3U; ++worker) {
+        ok &= Expect(
+            store->CaptureWorker(
+                worker,
+                2U,
+                second_catalog,
+                &second_slices[worker]) ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone,
+            "capture expanded catalog worker slice");
+    }
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        second_generation;
+    const market::RealtimeHistoryWatermarkV1 second_watermark =
+        MakeWatermarkForSnapshot(
+            second_catalog, 2U, {1U, 1U, 1U, 1U});
+    ok &= Expect(
+        store->BuildGeneration(
+            second_watermark,
+            std::move(second_slices),
+            &second_generation) ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
+            second_generation != nullptr &&
+            second_generation->catalog_snapshot() == second_catalog &&
+            second_generation->instrument_count() == 3U,
+        "next generation exposes the expanded bound prefix");
+    return ok;
+}
+
+bool CheckGenerationCaptureUsesOnlyBoundPrefix() {
+    bool ok = true;
+    constexpr std::size_t kCapacity =
+        market::kObservedInstrumentDirectoryDefaultCapacityV2;
+    constexpr std::size_t kBoundCount = 3U;
+    constexpr std::uint32_t kWorkerCount = 8U;
+    auto directory =
+        MakeDirectory(kCapacity, kBoundCount, 72U);
+    ok &= Expect(
+        directory != nullptr &&
+            directory->capacity() == kCapacity,
+        "create production-capacity sparse observed directory");
+    if (directory == nullptr) {
+        return false;
+    }
+    auto store = CreateStore(
+        *directory,
+        kWorkerCount,
+        StoreConfig(),
+        "create production-capacity sparse Store",
+        &ok);
+    if (store == nullptr) {
+        return false;
+    }
+
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
+    ok &= Expect(
+        directory->AcquireSnapshot(&catalog_snapshot) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            catalog_snapshot != nullptr &&
+            catalog_snapshot->capacity() == kCapacity &&
+            catalog_snapshot->bound_count() == kBoundCount,
+        "freeze sparse three-instrument catalog");
+    if (catalog_snapshot == nullptr) {
+        return false;
+    }
+    const market::RealtimeHistoryWatermarkV1 watermark =
+        MakeWatermarkForSnapshot(
+            catalog_snapshot, 1U, {1U, 1U, 1U, 1U});
+    ok &= Expect(
+        watermark.generation == 1U,
+        "build sparse generation watermark");
+
+    std::vector<
+        std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
+        slices(kWorkerCount);
+    std::size_t captured_instrument_count = 0U;
+    for (std::uint32_t worker = 0U;
+         worker < kWorkerCount;
+         ++worker) {
+        const auto error = store->CaptureWorker(
+            worker,
+            watermark.generation,
+            catalog_snapshot,
+            &slices[worker]);
+        ok &= Expect(
+            error ==
+                    market::IntradayInstrumentStoreGenerationErrorV1::
+                        kNone &&
+                slices[worker] != nullptr,
+            "capture sparse worker slice");
+        if (slices[worker] == nullptr) {
+            return false;
+        }
+        const std::size_t expected =
+            worker < kBoundCount ? 1U : 0U;
+        ok &= Expect(
+            slices[worker]->captured_instrument_count() == expected,
+            "worker slice token represents only its bound-prefix rows");
+        captured_instrument_count +=
+            slices[worker]->captured_instrument_count();
+    }
+    ok &= Expect(
+        captured_instrument_count == kBoundCount &&
+            captured_instrument_count != kCapacity,
+        "total token rows equal bound_count, not capacity");
+
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        generation;
+    ok &= Expect(
+        store->BuildGeneration(
+            watermark, std::move(slices), &generation) ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
+            generation != nullptr &&
+            generation->instrument_count() == kBoundCount &&
+            generation->catalog_snapshot() == catalog_snapshot,
+        "sparse generation outputs exactly the bound prefix");
+    if (generation != nullptr) {
+        for (std::size_t ordinal = 0U;
+             ordinal < kBoundCount;
+             ++ordinal) {
+            market::IntradayInstrumentSummaryV1 summary{};
+            ok &= Expect(
+                generation->SummaryAt(ordinal, &summary) ==
+                        market::IntradayInstrumentStoreQueryErrorV1::
+                            kNone &&
+                    summary.instrument_id == ordinal + 1U,
+                "sparse generation SummaryAt preserves dense bound order");
+        }
+        market::IntradayInstrumentSummaryV1 unbound{};
+        ok &= Expect(
+            generation->SummaryAt(kBoundCount, &unbound) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNotFound &&
+                unbound.instrument_id == 0U,
+            "sparse generation never outputs an unbound capacity slot");
+    }
+    return ok;
+}
+
+bool CheckLazyPostCutRowFreeze() {
+    bool ok = true;
+    constexpr std::size_t kCapacity =
+        market::kObservedInstrumentDirectoryDefaultCapacityV2;
+    constexpr std::uint32_t kWorkerCount = 4U;
+    auto directory = MakeDirectory(kCapacity, 1U, 73U);
+    ok &= Expect(
+        directory != nullptr,
+        "create production-capacity lazy-freeze directory");
+    if (directory == nullptr) {
+        return false;
+    }
+    auto store = CreateStore(
+        *directory,
+        kWorkerCount,
+        StoreConfig(),
+        "create production-capacity lazy-freeze Store",
+        &ok);
+    if (store == nullptr) {
+        return false;
+    }
+
+    auto first = MakeInput(*directory, 0U, 1U, 1U, 1U);
+    ok &= Expect(
+        first != nullptr &&
+            AppendInput(store.get(), 0U, first.get()) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+        "append record before lazy generation fence");
+
+    const market::RealtimeHistoryWatermarkV1 first_watermark =
+        MakeWatermark(*directory, 1U, {2U, 1U, 1U, 1U});
+    std::vector<
+        std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
+        first_slices(kWorkerCount);
+    for (std::uint32_t worker = 0U;
+         worker < kWorkerCount;
+         ++worker) {
+        ok &= Expect(
+            store->CaptureWorker(
+                worker,
+                1U,
+                first_watermark.catalog_snapshot,
+                &first_slices[worker]) ==
+                    market::IntradayInstrumentStoreGenerationErrorV1::
+                        kNone &&
+                first_slices[worker] != nullptr,
+            "publish constant-work generation token");
+    }
+
+    // This append deliberately occurs before BuildGeneration. Its row owner
+    // must preserve generation 1 lazily while the live latest path advances.
+    auto second = MakeInput(*directory, 0U, 2U, 2U, 1U);
+    ok &= Expect(
+        second != nullptr &&
+            AppendInput(store.get(), 0U, second.get()) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone,
+        "post-cut append proceeds before background materialization");
+
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        generation_one;
+    ok &= Expect(
+        store->BuildGeneration(
+            first_watermark,
+            std::move(first_slices),
+            &generation_one) ==
+                market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
+            generation_one != nullptr &&
+            generation_one->record_count() == 1U,
+        "background builder uses the lazily frozen pre-cut endpoint");
+    market::IntradayInstrumentSummaryV1 first_summary{};
+    ok &= Expect(
+        generation_one != nullptr &&
+            generation_one->Find(1U, &first_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            first_summary.record_count == 1U &&
+            first_summary.latest_snapshot != nullptr &&
+            first_summary.latest_snapshot->ingress_sequence() == 1U,
+        "generation one excludes the already-visible post-cut record");
+
+    const auto generation_two = BuildStoreGeneration(
+        store.get(),
+        *directory,
+        kWorkerCount,
+        2U,
+        {3U, 1U, 1U, 1U},
+        &ok);
+    market::IntradayInstrumentSummaryV1 second_summary{};
+    ok &= Expect(
+        generation_two != nullptr &&
+            generation_two->Find(1U, &second_summary) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            generation_two->record_count() == 2U &&
+            second_summary.record_count == 2U &&
+            second_summary.latest_snapshot != nullptr &&
+            second_summary.latest_snapshot->ingress_sequence() == 2U,
+        "next generation includes the post-cut record exactly once");
+    return ok;
 }
 
 std::vector<std::uint64_t> IngressSequences(
@@ -590,7 +1024,7 @@ std::vector<std::uint32_t> InstrumentIds(
 }
 
 bool CheckCreationAndInvalidConfiguration(
-    const market::InstrumentRegistryV1& registry) {
+    const market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     const auto valid = StoreConfig();
     ok &= Expect(
@@ -612,7 +1046,7 @@ bool CheckCreationAndInvalidConfiguration(
             valid, 2U, kSourceStreamIds, nullptr, &store) ==
             market::IntradayInstrumentStoreCreateErrorV1::
                 kInvalidConfiguration,
-        "store rejects null registry");
+        "store rejects null directory");
     auto invalid_source_ids = kSourceStreamIds;
     invalid_source_ids[2U] = 0U;
     ok &= Expect(
@@ -696,15 +1130,15 @@ bool CheckCreationAndInvalidConfiguration(
                 snapshot.appended_records == 0U,
             "new store exposes configured healthy coverage");
         ok &= Expect(
-            store->WorkerForInstrument(2U) == 0U &&
-                store->WorkerForInstrument(5U) == 1U,
-            "store uses permanent modulo instrument ownership");
+            store->WorkerForInstrument(2U) == 1U &&
+                store->WorkerForInstrument(5U) == 0U,
+            "store uses permanent ordinal-modulo ownership");
     }
     return ok;
 }
 
 bool CheckStoreSessionProvenance(
-    const market::InstrumentRegistryV1& registry) {
+    const market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     auto first_store = CreateStore(
         registry,
@@ -741,7 +1175,7 @@ bool CheckStoreSessionProvenance(
 }
 
 bool CheckGenerationQueriesAndLifetime(
-    const market::InstrumentRegistryV1& registry) {
+    const market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     auto store = CreateStore(
         registry,
@@ -804,16 +1238,18 @@ bool CheckGenerationQueriesAndLifetime(
         return false;
     }
     ok &= Expect(
-        first->watermark().generation == 1U &&
+            first->watermark().generation == 1U &&
             first->watermark().ingress_sequence_exclusive == 9U &&
-            first->instrument_count() == 4U &&
+            first->instrument_count() == registry.capacity() &&
+            first->catalog_snapshot() ==
+                first->watermark().catalog_snapshot &&
             first->record_count() == 8U &&
             first->coverage_from_open() &&
             first->store_session_epoch() != 0U,
         "generation carries exact fixed universe and global cut");
 
-    const std::array<std::uint32_t, 4U> expected_instrument_ids{
-        2U, 5U, 7U, 9U};
+    const std::array<std::uint32_t, 9U> expected_instrument_ids{
+        1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U};
     for (std::size_t ordinal = 0U;
          ordinal < expected_instrument_ids.size();
          ++ordinal) {
@@ -823,7 +1259,7 @@ bool CheckGenerationQueriesAndLifetime(
                     market::IntradayInstrumentStoreQueryErrorV1::kNone &&
                 ordinal_summary.instrument_id ==
                     expected_instrument_ids[ordinal],
-            "SummaryAt exposes fixed universe in instrument-id order");
+            "SummaryAt exposes the exact bound prefix in ID order");
     }
     market::IntradayInstrumentSummaryV1 invalid_ordinal_summary{};
     invalid_ordinal_summary.instrument_id = 123U;
@@ -880,7 +1316,7 @@ bool CheckGenerationQueriesAndLifetime(
     ok &= Expect(
         first->Find(99U, &empty_summary) ==
             market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
-        "Find rejects instrument outside registry");
+        "Find rejects instrument outside the bound catalog");
 
     std::unique_ptr<market::IntradayInstrumentCursorV1> all_cursor;
     ok &= Expect(
@@ -1031,7 +1467,7 @@ bool CheckGenerationQueriesAndLifetime(
             99U, 1U, &empty_tick_delta) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNotFound &&
             empty_tick_delta == nullptr,
-        "tick delta rejects an instrument outside the registry");
+        "tick delta rejects an instrument outside the bound catalog");
     ok &= Expect(
         first->OpenInstrumentTickDeltaCursor(5U, 1U, nullptr) ==
             market::IntradayInstrumentStoreQueryErrorV1::kNullOutput,
@@ -1147,9 +1583,9 @@ bool CheckGenerationQueriesAndLifetime(
     std::vector<const market::RealtimeHistoryRecordV1*>
         ranged_universe_records;
     const std::array<std::array<std::size_t, 2U>, 3U> ranges{{
-        {0U, 1U},
-        {1U, 3U},
-        {3U, 4U},
+        {0U, 3U},
+        {3U, 6U},
+        {6U, 9U},
     }};
     for (const auto& range_ordinals : ranges) {
         std::unique_ptr<market::IntradayUniverseCursorV1> range_universe;
@@ -1220,10 +1656,10 @@ bool CheckGenerationQueriesAndLifetime(
         first->OpenUniverseCursor(limited_options, &limited_full) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             first->OpenUniverseRangeCursor(
-                0U, 1U, limited_options, &limited_first_range) ==
+                0U, 2U, limited_options, &limited_first_range) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             first->OpenUniverseRangeCursor(
-                1U,
+                2U,
                 first->instrument_count(),
                 limited_options,
                 &limited_second_range) ==
@@ -1294,7 +1730,7 @@ bool CheckGenerationQueriesAndLifetime(
     const auto ingress9 = MakeInput(registry, 0U, 3U, 9U, 5U);
     ok &= Expect(
         ingress9 != nullptr &&
-            AppendInput(store.get(), 1U, ingress9.get()) ==
+            AppendInput(store.get(), 0U, ingress9.get()) ==
                 market::IntradayInstrumentStoreAppendErrorV1::kNone,
         "append record after generation-1 cut");
     const auto second = BuildStoreGeneration(
@@ -1383,7 +1819,7 @@ bool CheckGenerationQueriesAndLifetime(
 }
 
 bool CheckRolloverCapsAndWorkerOwnership(
-    const market::InstrumentRegistryV1& registry) {
+    const market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     constexpr std::uint64_t kMaximumFixtureRecords = 64U;
 
@@ -1472,7 +1908,7 @@ bool CheckRolloverCapsAndWorkerOwnership(
     if (wrong_worker != nullptr && wrong_worker_record != nullptr) {
         ok &= Expect(
             AppendInput(
-                wrong_worker.get(), 0U, wrong_worker_record.get()) ==
+                wrong_worker.get(), 1U, wrong_worker_record.get()) ==
                 market::IntradayInstrumentStoreAppendErrorV1::kWrongWorker,
             "append rejects non-owner worker");
     } else {
@@ -1492,7 +1928,7 @@ bool CheckRolloverCapsAndWorkerOwnership(
         foreign_route_input != nullptr) {
         ok &= Expect(
             wrong_worker->ResolveRouteToken(
-                foreign_route_input->registry_ordinal(),
+                foreign_route_input->ordinal(),
                 foreign_route_input->instrument_id(),
                 &foreign_route) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone,
@@ -1709,19 +2145,19 @@ bool CheckRolloverCapsAndWorkerOwnership(
         ok &= Expect(
             AppendInput(
                 cross_worker_record_cap.get(),
-                0U,
+                1U,
                 worker0_first.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::kNone &&
                 AppendInput(
                     cross_worker_record_cap.get(),
-                    1U,
+                    0U,
                     worker1_first.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::kNone,
             "second owner reclaims record credits and uses the exact small cap");
         ok &= Expect(
             AppendInput(
                 cross_worker_record_cap.get(),
-                0U,
+                1U,
                 worker0_over_cap.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::
                         kRecordCapacity,
@@ -1751,12 +2187,12 @@ bool CheckRolloverCapsAndWorkerOwnership(
             worker0 != nullptr && worker1 != nullptr &&
                 AppendInput(
                     cross_worker_byte_sizing.get(),
-                    0U,
+                    1U,
                     worker0.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::kNone &&
                 AppendInput(
                     cross_worker_byte_sizing.get(),
-                    1U,
+                    0U,
                     worker1.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::kNone,
             "measure two-worker byte budget");
@@ -1788,19 +2224,19 @@ bool CheckRolloverCapsAndWorkerOwnership(
                 over_cap != nullptr &&
                 AppendInput(
                     cross_worker_byte_cap.get(),
-                    0U,
+                    1U,
                     worker0.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::kNone &&
                 AppendInput(
                     cross_worker_byte_cap.get(),
-                    1U,
+                    0U,
                     worker1.get()) ==
                     market::IntradayInstrumentStoreAppendErrorV1::kNone,
             "second owner reclaims byte credits and uses the exact small cap");
         ok &= Expect(
             AppendInput(
                 cross_worker_byte_cap.get(),
-                0U,
+                1U,
                 over_cap.get()) ==
                 market::IntradayInstrumentStoreAppendErrorV1::
                     kByteCapacity,
@@ -1817,7 +2253,7 @@ bool CheckRolloverCapsAndWorkerOwnership(
 }
 
 bool CheckLiveTailGenerationIsolation(
-    const market::InstrumentRegistryV1& registry) {
+    const market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     constexpr std::uint64_t final_sequence = 5'000U;
     std::uint64_t full_tail_records = 0U;
@@ -1985,14 +2421,14 @@ bool CheckLiveTailGenerationIsolation(
 }
 
 bool CheckRuntimeStoreGenerationPublication(
-    const market::InstrumentRegistryV1& registry) {
+    market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = kSourceStreamIds;
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 32U;
     config.intraday_store = StoreConfig(32U, 1U << 20U);
-    config.registry = &registry;
+    config.directory = &registry;
 
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
     ok &= Expect(
@@ -2051,12 +2487,13 @@ bool CheckRuntimeStoreGenerationPublication(
             generation->watermark().generation == 1U &&
                 generation->watermark().ingress_sequence_exclusive == 5U &&
                 generation->record_count() == 4U &&
-                generation->instrument_count() == registry.size() &&
+                generation->instrument_count() ==
+                    registry.capacity() &&
                 generation->coverage_from_open(),
             "store generation carries the exact joint fence identity");
 
-        const std::array<std::uint32_t, 4U> expected_ids{
-            2U, 5U, 7U, 9U};
+        const std::array<std::uint32_t, 9U> expected_ids{
+            1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U};
         for (std::size_t ordinal = 0U; ordinal < expected_ids.size();
              ++ordinal) {
             market::IntradayInstrumentSummaryV1 ordinal_summary{};
@@ -2104,14 +2541,14 @@ bool CheckRuntimeStoreGenerationPublication(
 }
 
 bool CheckRuntimeStoreFailureFailClosed(
-    const market::InstrumentRegistryV1& registry) {
+    market::ObservedInstrumentDirectoryV2& registry) {
     bool ok = true;
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = kSourceStreamIds;
     config.worker_count = 1U;
     config.queue_capacity_per_source_worker = 16U;
     config.intraday_store = StoreConfig(1U, 1U << 20U);
-    config.registry = &registry;
+    config.directory = &registry;
     const market::RealtimeHistoryWatermarkV1 watermark =
         MakeWatermark(registry, 1U, {3U, 1U, 1U, 1U});
 
@@ -2175,13 +2612,16 @@ bool CheckRuntimeStoreFailureFailClosed(
 }  // namespace
 
 int main() {
-    const std::unique_ptr<market::InstrumentRegistryV1> registry =
-        MakeRegistry();
-    if (!Expect(registry != nullptr, "instrument registry creation")) {
+    const std::unique_ptr<market::ObservedInstrumentDirectoryV2>
+        registry = MakeDirectory();
+    if (!Expect(registry != nullptr, "instrument directory creation")) {
         return 1;
     }
 
     bool ok = true;
+    ok &= CheckObservedCatalogPrefixAndRouting();
+    ok &= CheckGenerationCaptureUsesOnlyBoundPrefix();
+    ok &= CheckLazyPostCutRowFreeze();
     ok &= CheckCreationAndInvalidConfiguration(*registry);
     ok &= CheckStoreSessionProvenance(*registry);
     ok &= CheckGenerationQueriesAndLifetime(*registry);

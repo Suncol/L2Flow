@@ -1,10 +1,11 @@
 #include "l2flow/factor/realtime_factor_engine_v1.h"
 
 #include "l2flow/common/identity128.h"
-#include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_types_v1.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -26,75 +27,110 @@ namespace market = l2flow::market;
 
 namespace {
 
+using namespace std::chrono_literals;
+
+constexpr std::array<std::uint32_t,
+                     market::kRealtimeHistorySourceCountV1>
+    kSourceStreamIds{{101U, 102U, 103U, 104U}};
+constexpr std::uint32_t kTradeDate = 20260729U;
+
 struct TestContext final {
     int failures = 0;
 
     void Expect(bool condition, std::string_view message) {
-        if (!condition) {
-            ++failures;
-            std::cerr << "FAIL: " << message << '\n';
+        if (condition) {
+            return;
         }
+        ++failures;
+        std::cerr << "FAIL: " << message << '\n';
     }
 };
 
-std::vector<std::byte> Bytes(std::string_view text) {
+[[nodiscard]] std::vector<std::byte> Bytes(std::string_view text) {
     const std::span<const char> characters(text.data(), text.size());
-    const std::span<const std::byte> bytes = std::as_bytes(characters);
+    const std::span<const std::byte> bytes =
+        std::as_bytes(characters);
     return {bytes.begin(), bytes.end()};
 }
 
-market::InstrumentRegistryEntryV1 RegistryEntry(
-    std::uint32_t instrument_id,
+[[nodiscard]] market::InstrumentKeyV1 InstrumentKey(
+    market::MarketV1 venue,
+    std::string_view security_id_source,
     std::string_view security_id) {
-    market::InstrumentRegistryEntryV1 entry{};
-    entry.instrument_id = instrument_id;
-    entry.key.market = market::MarketV1::kShanghai;
-    entry.key.security_id_source = Bytes("101");
-    entry.key.security_id = Bytes(security_id);
-    entry.quantity_unit = market::QuantityUnitV1::kShare;
-    entry.security_type = market::SecurityTypeV1::kEquity;
-    entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-    return entry;
+    market::InstrumentKeyV1 result{};
+    result.market = venue;
+    result.security_id_source = Bytes(security_id_source);
+    result.security_id = Bytes(security_id);
+    return result;
 }
 
-market::InstrumentRegistryEntryV1 ShenzhenRegistryEntry(
-    std::uint32_t instrument_id,
-    std::string_view security_id) {
-    market::InstrumentRegistryEntryV1 entry{};
-    entry.instrument_id = instrument_id;
-    entry.key.market = market::MarketV1::kShenzhen;
-    // Production publishes this opaque source identifier as four exact bytes;
-    // it must not be trimmed to "102" in registry fixtures.
-    entry.key.security_id_source = Bytes("102 ");
-    entry.key.security_id = Bytes(security_id);
-    entry.quantity_unit = market::QuantityUnitV1::kShare;
-    entry.security_type = market::SecurityTypeV1::kEquity;
-    entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-    return entry;
+[[nodiscard]] market::ObservedInstrumentMetadataV2 EquityMetadata() {
+    return {
+        market::QuantityUnitV1::kShare,
+        market::SecurityTypeV1::kEquity,
+        market::AssetScopeV1::kDocumentedCore};
 }
 
-std::unique_ptr<market::InstrumentRegistryV1> MakeRegistry(
+[[nodiscard]] std::unique_ptr<
+    market::ObservedInstrumentDirectoryV2>
+MakeDirectory(
     TestContext* test,
-    std::span<const market::InstrumentRegistryEntryV1> entries) {
-    std::unique_ptr<market::InstrumentRegistryV1> registry;
-    const auto error = market::InstrumentRegistryV1::Create(
-        17U, entries, &registry);
+    std::size_t capacity,
+    std::uint64_t session_epoch) {
+    market::ObservedInstrumentDirectoryConfigV2 config{};
+    config.capacity = capacity;
+    config.session_epoch = session_epoch;
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> result;
+    const auto error =
+        market::ObservedInstrumentDirectoryV2::Create(
+            config, &result);
     test->Expect(
-        error == market::InstrumentRegistryCreateErrorV1::kNone &&
-            registry != nullptr,
-        "test instrument registry creates");
-    return registry;
+        error ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            result != nullptr,
+        "observed instrument directory creates");
+    return result;
 }
 
-std::unique_ptr<market::RealtimeHistoryRuntimeV1> MakeRuntime(
+[[nodiscard]] std::uint32_t BindInstrument(
     TestContext* test,
-    const market::InstrumentRegistryV1* registry,
+    market::ObservedInstrumentDirectoryV2* directory,
+    const market::InstrumentKeyV1& key,
+    std::uint64_t capture_sequence) {
+    market::ObservedInstrumentBindResultV2 result{};
+    const auto error = directory == nullptr
+                           ? market::ObservedInstrumentDirectoryErrorV2::
+                                 kNullOutput
+                           : directory->BindOrGet(
+                                 key,
+                                 EquityMetadata(),
+                                 capture_sequence,
+                                 &result);
+    test->Expect(
+        error ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            result.newly_bound && result.entry.bound() &&
+            result.entry.instrument_id ==
+                static_cast<std::uint32_t>(
+                    result.entry.ordinal + 1U),
+        "observed instrument binds to its capture-ordered ID");
+    return error ==
+                       market::ObservedInstrumentDirectoryErrorV2::
+                           kNone
+               ? result.entry.instrument_id
+               : 0U;
+}
+
+[[nodiscard]] std::unique_ptr<market::RealtimeHistoryRuntimeV1>
+MakeRuntime(
+    TestContext* test,
+    market::ObservedInstrumentDirectoryV2* directory,
     std::uint64_t maximum_session_records = 1024U) {
     market::RealtimeHistoryRuntimeConfigV1 config{};
-    config.source_stream_ids = {101U, 102U, 103U, 104U};
+    config.source_stream_ids = kSourceStreamIds;
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 64U;
-    config.registry = registry;
+    config.directory = directory;
     config.intraday_store.segment_target_bytes =
         market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     config.intraday_store.maximum_session_records =
@@ -102,158 +138,253 @@ std::unique_ptr<market::RealtimeHistoryRuntimeV1> MakeRuntime(
     config.intraday_store.maximum_session_accounted_bytes = 1U << 30U;
     config.intraday_store.maximum_records_per_batch = 64U;
     config.intraday_store.coverage_from_open = true;
-    std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> result;
     const auto error =
-        market::RealtimeHistoryRuntimeV1::Create(config, &runtime);
+        market::RealtimeHistoryRuntimeV1::Create(config, &result);
     test->Expect(
         error == market::RealtimeHistoryCreateErrorV1::kNone &&
-            runtime != nullptr,
-        "test history runtime creates");
-    return runtime;
+            result != nullptr,
+        "observed-universe history runtime creates");
+    return result;
 }
 
-l2flow::common::Identity128 RunId() {
-    l2flow::common::Identity128 run_id{};
-    for (std::size_t index = 0U; index < run_id.size(); ++index) {
-        run_id[index] = static_cast<std::byte>(index + 1U);
+[[nodiscard]] l2flow::common::Identity128 RunId() {
+    l2flow::common::Identity128 result{};
+    for (std::size_t index = 0U; index < result.size(); ++index) {
+        result[index] = static_cast<std::byte>(index + 1U);
     }
-    return run_id;
+    return result;
 }
 
-std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
+void FillCommon(
+    const market::ObservedInstrumentDirectoryV2& directory,
+    market::DecodedMarketCommonV1* common,
+    market::MarketEventKindV1 kind,
+    market::MarketV1 venue,
+    std::uint8_t source_slot,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint32_t instrument_id) {
+    *common = market::DecodedMarketCommonV1{};
+    common->kind = kind;
+    common->market = venue;
+    common->origin.source_stream_id =
+        kSourceStreamIds[source_slot];
+    common->origin.trade_date = kTradeDate;
+    common->origin.source_sequence = source_sequence;
+    common->origin.recv_realtime_ns =
+        static_cast<std::int64_t>(ingress_sequence * 100U);
+    common->origin.recv_monotonic_ns =
+        static_cast<std::int64_t>(ingress_sequence * 10U);
+    common->instrument_id = instrument_id;
+    market::ObservedInstrumentEntryViewV2 identity{};
+    if (directory.LookupById(instrument_id, &identity) ==
+            market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        identity.bound()) {
+        common->ordinal = identity.ordinal;
+    }
+}
+
+struct SnapshotPrice final {
+    std::int64_t normalized_p6 = 0;
+    bool valid = false;
+    bool is_null = false;
+};
+
+[[nodiscard]] bool SubmitSnapshot(
+    market::RealtimeHistoryRuntimeV1* runtime,
+    const market::ObservedInstrumentDirectoryV2& directory,
+    market::MarketV1 venue,
+    std::uint32_t instrument_id,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    SnapshotPrice price) {
+    const std::uint8_t source_slot =
+        venue == market::MarketV1::kShanghai ? 0U : 2U;
+    const auto fill = [&](auto* event) {
+        FillCommon(
+            directory,
+            &event->common,
+            venue == market::MarketV1::kShanghai
+                ? market::MarketEventKindV1::kShanghaiSnapshot
+                : market::MarketEventKindV1::kShenzhenSnapshot,
+            venue,
+            source_slot,
+            source_sequence,
+            ingress_sequence,
+            instrument_id);
+        event->last_price.raw = price.normalized_p6;
+        event->last_price.normalized_p6 = price.normalized_p6;
+        event->last_price.scale = 6U;
+        event->last_price.valid = price.valid;
+        event->last_price.is_null = price.is_null;
+    };
+    market::DecodedMarketEventV1 decoded =
+        [&]() -> market::DecodedMarketEventV1 {
+        if (venue == market::MarketV1::kShanghai) {
+            market::ShanghaiSnapshotV1 event{};
+            fill(&event);
+            return market::DecodedMarketEventV1(std::move(event));
+        }
+        market::ShenzhenSnapshotV1 event{};
+        fill(&event);
+        return market::DecodedMarketEventV1(std::move(event));
+    }();
+    auto input = market::RealtimeHistoryEventInputV1::Create(
+        source_slot, ingress_sequence, std::move(decoded));
+    return runtime != nullptr && input.has_value() &&
+           runtime->TrySubmit(std::move(*input)) ==
+               market::RealtimeHistorySubmitErrorV1::kNone;
+}
+
+[[nodiscard]] bool SubmitShanghaiTick(
+    market::RealtimeHistoryRuntimeV1* runtime,
+    const market::ObservedInstrumentDirectoryV2& directory,
+    std::uint32_t instrument_id,
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence) {
+    market::ShanghaiTickV1 tick{};
+    FillCommon(
+        directory,
+        &tick.common,
+        market::MarketEventKindV1::kShanghaiTick,
+        market::MarketV1::kShanghai,
+        1U,
+        source_sequence,
+        ingress_sequence,
+        instrument_id);
+    tick.fields.action = market::TickActionV1::kStatus;
+    market::DecodedMarketEventV1 decoded(std::move(tick));
+    auto input = market::RealtimeHistoryEventInputV1::Create(
+        1U,
+        ingress_sequence,
+        std::move(decoded),
+        tick_stream_sequence);
+    return runtime != nullptr && input.has_value() &&
+           runtime->TrySubmit(std::move(*input)) ==
+               market::RealtimeHistorySubmitErrorV1::kNone;
+}
+
+[[nodiscard]] bool WaitUntilApplied(
+    const market::ObservedInstrumentDirectoryV2& directory,
+    std::uint32_t instrument_id,
+    std::uint64_t ingress_sequence,
+    bool factor_eligible,
+    bool has_tick = false,
+    std::chrono::seconds timeout = 5s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        market::ObservedInstrumentEntryViewV2 entry{};
+        if (directory.LookupById(instrument_id, &entry) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            entry.last_ingress_sequence >= ingress_sequence &&
+            entry.has_snapshot &&
+            entry.has_tick == has_tick &&
+            entry.factor_eligible == factor_eligible) {
+            return true;
+        }
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+[[nodiscard]] std::shared_ptr<
+    const market::IntradayInstrumentStoreGenerationV1>
 PublishStoreGeneration(
     TestContext* test,
     market::RealtimeHistoryRuntimeV1* runtime,
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentDirectoryV2& directory,
     std::uint64_t generation,
-    std::uint64_t ingress_sequence_exclusive,
-    std::array<std::uint64_t, market::kRealtimeHistorySourceCountV1>
-        source_sequence_exclusive) {
+    std::array<std::uint64_t,
+               market::kRealtimeHistorySourceCountV1>
+        source_sequence_exclusive,
+    std::uint64_t durable_sequence) {
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
+    test->Expect(
+        directory.AcquireSnapshot(&catalog_snapshot) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            catalog_snapshot != nullptr,
+        "exact observed CatalogSnapshot freezes");
+    if (catalog_snapshot == nullptr || runtime == nullptr) {
+        return nullptr;
+    }
+
     std::array<market::RealtimeSourceWatermarkV1,
                market::kRealtimeHistorySourceCountV1>
         source_watermarks{};
-    const auto source_ids = runtime->config().source_stream_ids;
-    for (std::size_t source = 0U; source < source_watermarks.size(); ++source) {
-        source_watermarks[source].source_stream_id = source_ids[source];
+    std::uint64_t ingress_sequence_exclusive = 1U;
+    for (std::size_t source = 0U;
+         source < source_watermarks.size();
+         ++source) {
+        source_watermarks[source].source_stream_id =
+            kSourceStreamIds[source];
         source_watermarks[source].sequence_exclusive =
             source_sequence_exclusive[source];
+        ingress_sequence_exclusive +=
+            source_sequence_exclusive[source] - 1U;
     }
+    const std::uint64_t applied_sequence =
+        ingress_sequence_exclusive - 1U;
+    l2flow::realtime::ProcessingProgressV2 progress{};
+    progress.applied_sequence = applied_sequence;
+    progress.durable_sequence =
+        std::max(durable_sequence, applied_sequence);
+    progress.accepted_sequence = progress.durable_sequence;
 
     market::RealtimeHistoryWatermarkV1 watermark{};
     test->Expect(
         market::BuildRealtimeHistoryWatermarkV1(
             RunId(),
             generation,
-            20260724U,
+            kTradeDate,
             ingress_sequence_exclusive,
             1000U + generation,
-            registry,
+            catalog_snapshot,
+            progress,
             source_watermarks,
             &watermark) ==
             market::RealtimeHistoryWatermarkErrorV1::kNone,
-        "store watermark builds");
+        "observed store watermark builds");
+    if (watermark.generation == 0U) {
+        return nullptr;
+    }
     test->Expect(
         runtime->BeginGeneration(watermark) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
-        "store generation begins");
+        "observed store generation begins");
     for (std::uint8_t source = 0U;
          source < market::kRealtimeHistorySourceCountV1;
          ++source) {
         test->Expect(
             runtime->SealSource(source, generation) ==
                 market::RealtimeHistoryGenerationErrorV1::kNone,
-            "store source fence seals");
+            "observed store source fence seals");
     }
 
     std::shared_ptr<
         const market::IntradayInstrumentStoreGenerationV1>
         result;
     test->Expect(
-        runtime->WaitForGeneration(
-            generation, std::chrono::seconds(5), &result) ==
+        runtime->WaitForGeneration(generation, 5s, &result) ==
                 market::RealtimeHistoryGenerationErrorV1::kNone &&
             result != nullptr,
-        "complete store generation publishes");
+        "complete observed store generation publishes");
     return result;
 }
 
-bool SubmitShanghaiSnapshot(
-    market::RealtimeHistoryRuntimeV1* runtime,
-    std::uint32_t instrument_id,
-    std::uint64_t source_sequence,
-    std::uint64_t ingress_sequence,
-    std::int64_t normalized_last_price_p6) {
-    market::ShanghaiSnapshotV1 snapshot{};
-    snapshot.common.kind = market::MarketEventKindV1::kShanghaiSnapshot;
-    snapshot.common.market = market::MarketV1::kShanghai;
-    snapshot.common.origin.source_stream_id = 101U;
-    snapshot.common.origin.source_sequence = source_sequence;
-    snapshot.common.instrument_id = instrument_id;
-    if (runtime == nullptr || runtime->config().registry == nullptr) {
-        return false;
-    }
-    const auto lookup =
-        runtime->config().registry->LookupById(instrument_id);
-    if (!lookup.known()) {
-        return false;
-    }
-    snapshot.common.registry_ordinal = lookup.registry_ordinal;
-    snapshot.common.origin.recv_realtime_ns = 100;
-    snapshot.common.origin.recv_monotonic_ns = 90;
-    snapshot.last_price.raw = normalized_last_price_p6 / 1000;
-    snapshot.last_price.normalized_p6 = normalized_last_price_p6;
-    snapshot.last_price.scale = 3U;
-    snapshot.last_price.valid = true;
-
-    market::DecodedMarketEventV1 decoded(std::move(snapshot));
-    auto input = market::RealtimeHistoryEventInputV1::Create(
-        0U, ingress_sequence, std::move(decoded));
-    if (!input.has_value()) {
-        return false;
-    }
-    return runtime->TrySubmit(std::move(*input)) ==
-           market::RealtimeHistorySubmitErrorV1::kNone;
+template <typename Value>
+[[nodiscard]] bool SameSharedOwnerAndPointer(
+    const std::shared_ptr<const Value>& left,
+    const std::shared_ptr<const Value>& right) noexcept {
+    return left.get() == right.get() &&
+           !left.owner_before(right) &&
+           !right.owner_before(left);
 }
 
-bool SubmitShenzhenSnapshot(
-    market::RealtimeHistoryRuntimeV1* runtime,
-    std::uint32_t instrument_id,
-    std::uint64_t source_sequence,
-    std::uint64_t ingress_sequence,
-    std::int64_t normalized_last_price_p6) {
-    market::ShenzhenSnapshotV1 snapshot{};
-    snapshot.common.kind = market::MarketEventKindV1::kShenzhenSnapshot;
-    snapshot.common.market = market::MarketV1::kShenzhen;
-    snapshot.common.origin.source_stream_id = 103U;
-    snapshot.common.origin.source_sequence = source_sequence;
-    snapshot.common.instrument_id = instrument_id;
-    if (runtime == nullptr || runtime->config().registry == nullptr) {
-        return false;
-    }
-    const auto lookup =
-        runtime->config().registry->LookupById(instrument_id);
-    if (!lookup.known()) {
-        return false;
-    }
-    snapshot.common.registry_ordinal = lookup.registry_ordinal;
-    snapshot.common.origin.recv_realtime_ns = 200;
-    snapshot.common.origin.recv_monotonic_ns = 190;
-    snapshot.last_price.raw = normalized_last_price_p6 / 1000;
-    snapshot.last_price.normalized_p6 = normalized_last_price_p6;
-    snapshot.last_price.scale = 3U;
-    snapshot.last_price.valid = true;
-
-    market::DecodedMarketEventV1 decoded(std::move(snapshot));
-    auto input = market::RealtimeHistoryEventInputV1::Create(
-        2U, ingress_sequence, std::move(decoded));
-    if (!input.has_value()) {
-        return false;
-    }
-    return runtime->TrySubmit(std::move(*input)) ==
-           market::RealtimeHistorySubmitErrorV1::kNone;
-}
-
-bool WatermarkExactEqual(
+[[nodiscard]] bool WatermarkExactEqual(
     const market::RealtimeHistoryWatermarkV1& left,
     const market::RealtimeHistoryWatermarkV1& right) {
     if (left.run_id != right.run_id ||
@@ -262,8 +393,14 @@ bool WatermarkExactEqual(
         left.ingress_sequence_exclusive !=
             right.ingress_sequence_exclusive ||
         left.recv_monotonic_cut_ns != right.recv_monotonic_cut_ns ||
-        left.registry_version != right.registry_version ||
-        left.registry_sha256 != right.registry_sha256 ||
+        !SameSharedOwnerAndPointer(
+            left.catalog_snapshot, right.catalog_snapshot) ||
+        left.processing_progress.accepted_sequence !=
+            right.processing_progress.accepted_sequence ||
+        left.processing_progress.durable_sequence !=
+            right.processing_progress.durable_sequence ||
+        left.processing_progress.applied_sequence !=
+            right.processing_progress.applied_sequence ||
         left.input_identity_sha256 != right.input_identity_sha256) {
         return false;
     }
@@ -278,9 +415,33 @@ bool WatermarkExactEqual(
     return true;
 }
 
+[[nodiscard]] std::vector<std::uint32_t> EligibleIds(
+    const market::IntradayInstrumentStoreGenerationV1& store) {
+    std::vector<std::uint32_t> result;
+    const auto& catalog = store.catalog_snapshot();
+    if (catalog == nullptr) {
+        return result;
+    }
+    result.reserve(catalog->factor_eligible_count());
+    for (std::size_t ordinal = 0U;
+         ordinal < catalog->bound_count();
+         ++ordinal) {
+        market::ObservedInstrumentEntryViewV2 entry{};
+        if (catalog->EntryAt(ordinal, &entry) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone) {
+            return {};
+        }
+        if (entry.factor_eligible) {
+            result.push_back(entry.instrument_id);
+        }
+    }
+    return result;
+}
+
 enum class BadOutputMode : std::uint8_t {
     kGood = 0U,
     kMissingRow,
+    kExtraBoundRow,
     kReversedRows,
     kNan,
     kInfinity,
@@ -306,29 +467,37 @@ public:
             return factor::RealtimeFactorCalculatorErrorV1::kNullOutput;
         }
         try {
+            const std::vector<std::uint32_t> eligible =
+                EligibleIds(store);
             std::vector<factor::RealtimeFactorPointV1> points;
-            points.reserve(store.instrument_count());
-            for (std::size_t ordinal = 0U;
-                 ordinal < store.instrument_count();
-                 ++ordinal) {
-                market::IntradayInstrumentSummaryV1 instrument{};
-                if (store.SummaryAt(ordinal, &instrument) !=
-                    market::IntradayInstrumentStoreQueryErrorV1::kNone) {
-                    return factor::RealtimeFactorCalculatorErrorV1::
-                        kInvalidStore;
-                }
+            points.reserve(eligible.size() + 1U);
+            for (const std::uint32_t instrument_id : eligible) {
                 factor::RealtimeFactorPointV1 point{};
-                point.instrument_id = instrument.instrument_id;
-                point.values.push_back(factor::RealtimeFactorValueV1{
-                    static_cast<double>(instrument.instrument_id), true});
+                point.instrument_id = instrument_id;
+                point.values.push_back(
+                    factor::RealtimeFactorValueV1{
+                        static_cast<double>(instrument_id), true});
                 points.push_back(std::move(point));
             }
-            if (mode_ == BadOutputMode::kMissingRow && !points.empty()) {
+            if (mode_ == BadOutputMode::kMissingRow &&
+                !points.empty()) {
                 points.pop_back();
+            } else if (mode_ == BadOutputMode::kExtraBoundRow) {
+                factor::RealtimeFactorPointV1 extra{};
+                extra.instrument_id = 2U;
+                extra.values.push_back(
+                    factor::RealtimeFactorValueV1{2.0, true});
+                points.insert(
+                    points.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            std::min<std::size_t>(
+                                1U, points.size())),
+                    std::move(extra));
             } else if (mode_ == BadOutputMode::kReversedRows &&
                        points.size() > 1U) {
                 std::swap(points.front(), points.back());
-            } else if (mode_ == BadOutputMode::kNan && !points.empty()) {
+            } else if (mode_ == BadOutputMode::kNan &&
+                       !points.empty()) {
                 points.front().values.front().value =
                     std::numeric_limits<double>::quiet_NaN();
             } else if (mode_ == BadOutputMode::kInfinity &&
@@ -356,11 +525,14 @@ public:
 
 private:
     std::array<factor::RealtimeFactorDefinitionV1, 1U> definitions_{{
-        {"test_projection", "v1", "test-only instrument-id projection"}}};
+        {"test_projection",
+         "v2",
+         "test-only factor-eligible instrument-id projection"}}};
     BadOutputMode mode_ = BadOutputMode::kGood;
 };
 
-class BlockingCalculator final : public factor::RealtimeFactorCalculatorV1 {
+class BlockingCalculator final
+    : public factor::RealtimeFactorCalculatorV1 {
 public:
     std::span<const factor::RealtimeFactorDefinitionV1> definitions()
         const noexcept override {
@@ -382,18 +554,10 @@ public:
         }
         try {
             std::vector<factor::RealtimeFactorPointV1> points;
-            points.reserve(store.instrument_count());
-            for (std::size_t ordinal = 0U;
-                 ordinal < store.instrument_count();
-                 ++ordinal) {
-                market::IntradayInstrumentSummaryV1 instrument{};
-                if (store.SummaryAt(ordinal, &instrument) !=
-                    market::IntradayInstrumentStoreQueryErrorV1::kNone) {
-                    return factor::RealtimeFactorCalculatorErrorV1::
-                        kInvalidStore;
-                }
+            for (const std::uint32_t instrument_id :
+                 EligibleIds(store)) {
                 factor::RealtimeFactorPointV1 point{};
-                point.instrument_id = instrument.instrument_id;
+                point.instrument_id = instrument_id;
                 point.values.push_back(
                     factor::RealtimeFactorValueV1{1.0, true});
                 points.push_back(std::move(point));
@@ -406,7 +570,8 @@ public:
         }
     }
 
-    bool WaitUntilEntered(std::chrono::seconds timeout) const {
+    [[nodiscard]] bool WaitUntilEntered(
+        std::chrono::seconds timeout) const {
         std::unique_lock<std::mutex> lock(mutex_);
         return condition_.wait_for(
             lock, timeout, [this] { return entered_; });
@@ -420,318 +585,456 @@ public:
 
 private:
     std::array<factor::RealtimeFactorDefinitionV1, 1U> definitions_{{
-        {"blocking_test_projection", "v1", "test-only constant projection"}}};
+        {"blocking_test_projection",
+         "v2",
+         "test-only factor-eligible constant projection"}}};
     mutable std::mutex mutex_;
     mutable std::condition_variable condition_;
     mutable bool entered_ = false;
     mutable bool released_ = false;
 };
 
-std::unique_ptr<factor::RealtimeFactorEngineV1> MakeFactorEngine(
+[[nodiscard]] std::unique_ptr<factor::RealtimeFactorEngineV1>
+MakeFactorEngine(
     TestContext* test,
-    const market::InstrumentRegistryV1* registry,
     const market::RealtimeHistoryRuntimeV1* runtime,
-    std::shared_ptr<const factor::RealtimeFactorCalculatorV1> calculator) {
+    std::shared_ptr<const factor::RealtimeFactorCalculatorV1>
+        calculator) {
     factor::RealtimeFactorEngineConfigV1 config{};
-    config.registry = registry;
     config.generation_runtime = runtime;
     config.calculator = std::move(calculator);
-    std::unique_ptr<factor::RealtimeFactorEngineV1> engine;
+    std::unique_ptr<factor::RealtimeFactorEngineV1> result;
     test->Expect(
         factor::RealtimeFactorEngineV1::Create(
-            std::move(config), &engine) ==
+            std::move(config), &result) ==
                 factor::RealtimeFactorEngineCreateErrorV1::kNone &&
-            engine != nullptr,
-        "factor engine creates");
-    return engine;
+            result != nullptr,
+        "observed-universe factor engine creates");
+    return result;
 }
 
-void CheckProjectionAndWholeGenerationLifetime(TestContext* test) {
-    const std::array<market::InstrumentRegistryEntryV1, 2U> entries{
-        RegistryEntry(20U, "600020"),
-        RegistryEntry(3U, "600003")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
+void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
+    auto directory = MakeDirectory(test, 8U, 71U);
+    if (directory == nullptr) {
         return;
     }
-    auto runtime = MakeRuntime(test, registry.get());
+    std::array<std::uint32_t, 5U> ids{};
+    for (std::size_t index = 0U; index < ids.size(); ++index) {
+        const std::string_view security_id =
+            std::array<std::string_view, 5U>{{
+                "600001", "600002", "600003", "600004", "600005"}}[
+                index];
+        ids[index] = BindInstrument(
+            test,
+            directory.get(),
+            InstrumentKey(
+                market::MarketV1::kShanghai,
+                "101",
+                security_id),
+            static_cast<std::uint64_t>(index + 1U));
+    }
+    auto runtime = MakeRuntime(test, directory.get());
     if (runtime == nullptr) {
         return;
     }
+
+    const std::array<SnapshotPrice, 5U> prices{{
+        {1'000'000, false, false},
+        {1'000'000, true, true},
+        {0, true, false},
+        {-1'000'000, true, false},
+        {12'345'600, true, false},
+    }};
+    for (std::size_t index = 0U; index < ids.size(); ++index) {
+        test->Expect(
+            SubmitSnapshot(
+                runtime.get(),
+                *directory,
+                market::MarketV1::kShanghai,
+                ids[index],
+                static_cast<std::uint64_t>(index + 1U),
+                static_cast<std::uint64_t>(index + 1U),
+                prices[index]),
+            "eligibility-domain snapshot reaches Store");
+    }
     test->Expect(
-        SubmitShanghaiSnapshot(runtime.get(), 3U, 1U, 1U, 12'345'600),
-        "valid snapshot reaches store worker");
+        SubmitShanghaiTick(
+            runtime.get(), *directory, ids[0U], 1U, 6U, 1U),
+        "tick availability input reaches Store");
+    for (std::size_t index = 0U; index < ids.size(); ++index) {
+        const std::uint64_t expected_ingress =
+            index == 0U ? 6U
+                        : static_cast<std::uint64_t>(index + 1U);
+        test->Expect(
+            WaitUntilApplied(
+                *directory,
+                ids[index],
+                expected_ingress,
+                index == 4U,
+                index == 0U),
+            "directory observes each fully applied input");
+    }
+
     auto store1 = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 2U, {2U, 1U, 1U, 1U});
+        test,
+        runtime.get(),
+        *directory,
+        1U,
+        {6U, 2U, 1U, 1U},
+        10U);
     if (store1 == nullptr) {
         return;
     }
-
     auto calculator =
         std::make_shared<factor::SnapshotLastPriceProjectionV1>();
-    auto engine = MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
+    auto engine =
+        MakeFactorEngine(test, runtime.get(), calculator);
     if (engine == nullptr) {
         return;
     }
-    const factor::RealtimeFactorPublishResultV1 first =
-        engine->CalculateAndPublish(store1);
-    test->Expect(first.published(), "complete factor generation publishes");
+    const auto first = engine->CalculateAndPublish(store1);
+    test->Expect(
+        first.published(),
+        "eligible-only factor generation publishes");
     if (!first.published()) {
         return;
     }
+
+    const auto& catalog1 = store1->catalog_snapshot();
     test->Expect(
         WatermarkExactEqual(
             first.generation->watermark(), store1->watermark()) &&
-            first.generation->input_store().get() == store1.get() &&
-            !first.generation->input_store().owner_before(store1) &&
-            !store1.owner_before(first.generation->input_store()),
-        "factor publication retains the exact store watermark and handle");
+            SameSharedOwnerAndPointer(
+                first.generation->input_store(), store1) &&
+            SameSharedOwnerAndPointer(
+                first.generation->catalog_snapshot(), catalog1),
+        "factor generation retains the exact Store and CatalogSnapshot");
     test->Expect(
-        first.generation->points().size() == 2U &&
-            first.generation->points()[0U].instrument_id == 3U &&
-            first.generation->points()[1U].instrument_id == 20U,
-        "factor rows use the exact ascending fixed universe");
-    const auto* observed = first.generation->Find(3U);
+        first.generation->catalog_scope() ==
+                market::ObservedInstrumentCatalogScopeV2::
+                    kObservedOnly &&
+            first.generation->catalog_generation() == 5U &&
+            first.generation->catalog_digest() ==
+                catalog1->catalog_digest() &&
+            first.generation->bound_count() == 5U &&
+            first.generation->available_count() == 5U &&
+            first.generation->snapshot_available_count() == 5U &&
+            first.generation->tick_available_count() == 1U &&
+            first.generation->factor_eligible_count() == 1U &&
+            first.generation->capture_accepted_sequence() == 10U &&
+            first.generation->capture_durable_sequence() == 10U &&
+            first.generation->input_applied_sequence() == 6U &&
+            first.generation->processing_lag_records() == 4U &&
+            first.generation->durability_lag_records() == 0U,
+        "factor envelope exposes exact observed counts, identity, and "
+        "processing lag");
     test->Expect(
-        observed != nullptr && observed->values.size() == 1U &&
-            observed->values[0U].valid &&
-            std::abs(observed->values[0U].value - 12.3456) < 1.0e-12,
-        "snapshot calculator literally projects normalized p6 price");
-    observed = first.generation->Find(20U);
+        first.generation->points().size() ==
+                first.generation->factor_eligible_count() &&
+            first.generation->points()[0U].instrument_id == ids[4U] &&
+            first.generation->Find(ids[0U]) == nullptr &&
+            first.generation->Find(ids[1U]) == nullptr &&
+            first.generation->Find(ids[2U]) == nullptr &&
+            first.generation->Find(ids[3U]) == nullptr,
+        "invalid, null, zero, and negative latest prices produce no "
+        "factor row");
+    const factor::RealtimeFactorPointV1* positive =
+        first.generation->Find(ids[4U]);
     test->Expect(
-        observed != nullptr && !observed->values[0U].valid &&
-            observed->values[0U].value == 0.0 &&
-            !std::signbit(observed->values[0U].value),
-        "missing snapshot is explicit canonical invalid, not NaN");
+        positive != nullptr && positive->values.size() == 1U &&
+            positive->values[0U].valid &&
+            std::abs(positive->values[0U].value - 12.3456) <
+                1.0e-12,
+        "positive normalized p6 price is divided by exactly one "
+        "million");
 
-    const auto old_generation = first.generation;
+    test->Expect(
+        SubmitSnapshot(
+            runtime.get(),
+            *directory,
+            market::MarketV1::kShanghai,
+            ids[3U],
+            6U,
+            7U,
+            SnapshotPrice{2'500'000, true, false}) &&
+            WaitUntilApplied(*directory, ids[3U], 7U, true),
+        "new positive latest snapshot reverses eligibility");
     auto store2 = PublishStoreGeneration(
-        test, runtime.get(), *registry, 2U, 2U, {2U, 1U, 1U, 1U});
+        test,
+        runtime.get(),
+        *directory,
+        2U,
+        {7U, 2U, 1U, 1U},
+        7U);
     if (store2 == nullptr) {
         return;
     }
     const auto second = engine->CalculateAndPublish(store2);
     test->Expect(
         second.published() &&
+            second.generation->points().size() == 2U &&
+            second.generation->factor_eligible_count() == 2U &&
+            second.generation->points()[0U].instrument_id == ids[3U] &&
+            second.generation->points()[1U].instrument_id == ids[4U],
+        "new generation emits exactly eligible IDs in ascending order");
+    test->Expect(
+        first.generation->factor_eligible_count() == 1U &&
+            first.generation->points().size() == 1U &&
+            first.generation->Find(ids[3U]) == nullptr &&
             engine->AcquireLatestGeneration().get() ==
                 second.generation.get(),
-        "one atomic handle replaces the whole factor generation");
-    test->Expect(
-        old_generation->watermark().generation == 1U &&
-            old_generation->Find(3U) != nullptr &&
-            old_generation->Find(3U)->values[0U].valid &&
-            old_generation.get() != second.generation.get(),
-        "reader-held old generation survives a newer publication intact");
+        "reader-held old CatalogSnapshot and factor generation stay "
+        "immutable after eligibility changes");
 }
 
-void CheckDefaultProjectionEconomicDomain(TestContext* test) {
-    constexpr std::uint32_t shanghai_instrument = 30U;
-    constexpr std::uint32_t shenzhen_instrument = 4U;
-    const std::array<market::InstrumentRegistryEntryV1, 2U> entries{
-        RegistryEntry(shanghai_instrument, "600030"),
-        ShenzhenRegistryEntry(shenzhen_instrument, "000004")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
+void CheckEmptyBoundAndEmptyEligibleGenerations(TestContext* test) {
+    auto directory = MakeDirectory(test, 4U, 72U);
+    auto runtime = MakeRuntime(test, directory.get());
+    if (directory == nullptr || runtime == nullptr) {
         return;
     }
-    auto runtime = MakeRuntime(test, registry.get());
-    if (runtime == nullptr) {
-        return;
-    }
-    test->Expect(
-        SubmitShanghaiSnapshot(
-            runtime.get(), shanghai_instrument, 1U, 1U, 0),
-        "valid zero Shanghai snapshot reaches store");
-    test->Expect(
-        SubmitShenzhenSnapshot(
-            runtime.get(), shenzhen_instrument, 1U, 2U, -1'000'000),
-        "valid negative Shenzhen snapshot reaches store");
-    auto store = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 3U, {2U, 1U, 2U, 1U});
-    if (store == nullptr) {
-        return;
-    }
-
-    market::IntradayInstrumentSummaryV1 shanghai_row{};
-    market::IntradayInstrumentSummaryV1 shenzhen_row{};
-    test->Expect(
-        store->Find(shanghai_instrument, &shanghai_row) ==
-                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
-            store->Find(shenzhen_instrument, &shenzhen_row) ==
-                market::IntradayInstrumentStoreQueryErrorV1::kNone,
-        "store summaries expose both snapshot instruments");
-    const auto* shanghai_snapshot =
-        shanghai_row.latest_snapshot == nullptr
-            ? nullptr
-            : market::StoredMarketEventGetV1<
-                  market::ShanghaiSnapshotV1>(
-                  shanghai_row.latest_snapshot->event());
-    const auto* shenzhen_snapshot =
-        shenzhen_row.latest_snapshot == nullptr
-            ? nullptr
-            : market::StoredMarketEventGetV1<
-                  market::ShenzhenSnapshotV1>(
-                  shenzhen_row.latest_snapshot->event());
-    test->Expect(
-        shanghai_snapshot != nullptr &&
-            shanghai_snapshot->last_price.valid &&
-            shanghai_snapshot->last_price.normalized_p6 == 0,
-        "Shanghai economic-domain input is a present valid zero price");
-    test->Expect(
-        shenzhen_snapshot != nullptr &&
-            shenzhen_snapshot->last_price.valid &&
-            shenzhen_snapshot->last_price.normalized_p6 < 0,
-        "Shenzhen economic-domain input is a present valid negative price");
-
     auto calculator =
         std::make_shared<factor::SnapshotLastPriceProjectionV1>();
     auto engine =
-        MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
+        MakeFactorEngine(test, runtime.get(), calculator);
     if (engine == nullptr) {
         return;
     }
-    const factor::RealtimeFactorPublishResultV1 result =
-        engine->CalculateAndPublish(store);
-    test->Expect(
-        result.published(),
-        "non-positive snapshot domain publishes a complete generation");
-    if (!result.published()) {
+
+    auto empty_store = PublishStoreGeneration(
+        test,
+        runtime.get(),
+        *directory,
+        1U,
+        {1U, 1U, 1U, 1U},
+        0U);
+    if (empty_store == nullptr) {
         return;
     }
+    const auto empty = engine->CalculateAndPublish(empty_store);
+    test->Expect(
+        empty.published() && empty.generation->bound_count() == 0U &&
+            empty.generation->available_count() == 0U &&
+            empty.generation->factor_eligible_count() == 0U &&
+            empty.generation->points().empty() &&
+            empty.generation->input_applied_sequence() == 0U &&
+            empty.generation->capture_durable_sequence() == 0U,
+        "an empty observed catalog is a legal factor generation");
 
-    const auto canonical_invalid =
-        [](const factor::RealtimeFactorPointV1* point) {
-            return point != nullptr && point->values.size() == 1U &&
-                   !point->values[0U].valid &&
-                   point->values[0U].value == 0.0 &&
-                   !std::signbit(point->values[0U].value);
-        };
+    const std::uint32_t first = BindInstrument(
+        test,
+        directory.get(),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "101", "601001"),
+        1U);
+    const std::uint32_t second = BindInstrument(
+        test,
+        directory.get(),
+        InstrumentKey(
+            market::MarketV1::kShenzhen, "102 ", "001002"),
+        2U);
+    auto bound_no_data_store = PublishStoreGeneration(
+        test,
+        runtime.get(),
+        *directory,
+        2U,
+        {1U, 1U, 1U, 1U},
+        0U);
+    if (bound_no_data_store == nullptr) {
+        return;
+    }
+    const auto bound_no_data =
+        engine->CalculateAndPublish(bound_no_data_store);
     test->Expect(
-        canonical_invalid(result.generation->Find(shanghai_instrument)),
-        "zero Shanghai price publishes canonical {+0.0,false}");
-    test->Expect(
-        canonical_invalid(result.generation->Find(shenzhen_instrument)),
-        "negative Shenzhen price publishes canonical {+0.0,false}");
+        first == 1U && second == 2U &&
+            bound_no_data.published() &&
+            bound_no_data.generation->catalog_generation() == 2U &&
+            bound_no_data.generation->bound_count() == 2U &&
+            bound_no_data.generation->available_count() == 0U &&
+            bound_no_data.generation->snapshot_available_count() ==
+                0U &&
+            bound_no_data.generation->tick_available_count() == 0U &&
+            bound_no_data.generation->factor_eligible_count() == 0U &&
+            bound_no_data.generation->points().empty() &&
+            bound_no_data.generation->Find(first) == nullptr &&
+            bound_no_data.generation->Find(second) == nullptr,
+        "bound instruments with no eligible snapshot legally publish "
+        "an empty factor batch");
 }
 
-void CheckInvalidOutputDenied(TestContext* test) {
-    const std::array<market::InstrumentRegistryEntryV1, 2U> entries{
-        RegistryEntry(9U, "600009"),
-        RegistryEntry(2U, "600002")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
+void CheckInvalidCalculatorOutputDenied(TestContext* test) {
+    auto directory = MakeDirectory(test, 4U, 73U);
+    if (directory == nullptr) {
         return;
     }
-    auto runtime = MakeRuntime(test, registry.get());
+    const std::uint32_t first = BindInstrument(
+        test,
+        directory.get(),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "101", "602001"),
+        1U);
+    const std::uint32_t ineligible = BindInstrument(
+        test,
+        directory.get(),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "101", "602002"),
+        2U);
+    const std::uint32_t third = BindInstrument(
+        test,
+        directory.get(),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "101", "602003"),
+        3U);
+    auto runtime = MakeRuntime(test, directory.get());
     if (runtime == nullptr) {
         return;
     }
+    test->Expect(
+        SubmitSnapshot(
+            runtime.get(),
+            *directory,
+            market::MarketV1::kShanghai,
+            first,
+            1U,
+            1U,
+            SnapshotPrice{1'000'000, true, false}) &&
+            SubmitSnapshot(
+                runtime.get(),
+                *directory,
+                market::MarketV1::kShanghai,
+                third,
+                2U,
+                2U,
+                SnapshotPrice{3'000'000, true, false}) &&
+            WaitUntilApplied(*directory, first, 1U, true) &&
+            WaitUntilApplied(*directory, third, 2U, true),
+        "two eligible calculator-validation inputs apply");
     auto store = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 1U, {1U, 1U, 1U, 1U});
+        test,
+        runtime.get(),
+        *directory,
+        1U,
+        {3U, 1U, 1U, 1U},
+        2U);
     if (store == nullptr) {
         return;
     }
+    test->Expect(
+        first == 1U && ineligible == 2U && third == 3U &&
+            store->catalog_snapshot()->factor_eligible_count() == 2U,
+        "calculator validation fixture has a sparse eligible subset");
 
-    constexpr std::array<BadOutputMode, 7U> bad_modes{
+    constexpr std::array<BadOutputMode, 8U> bad_modes{{
         BadOutputMode::kMissingRow,
+        BadOutputMode::kExtraBoundRow,
         BadOutputMode::kReversedRows,
         BadOutputMode::kNan,
         BadOutputMode::kInfinity,
         BadOutputMode::kInvalidNonzero,
         BadOutputMode::kInvalidNegativeZero,
-        BadOutputMode::kWrongColumnCount};
-    for (BadOutputMode mode : bad_modes) {
+        BadOutputMode::kWrongColumnCount,
+    }};
+    for (const BadOutputMode mode : bad_modes) {
         auto calculator = std::make_shared<TestCalculator>(mode);
         auto engine =
-            MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
+            MakeFactorEngine(test, runtime.get(), calculator);
         if (engine == nullptr) {
             continue;
         }
         const auto result = engine->CalculateAndPublish(store);
         test->Expect(
             result.error ==
-                    factor::RealtimeFactorPublishErrorV1::kInvalidFactorOutput &&
+                    factor::RealtimeFactorPublishErrorV1::
+                        kInvalidFactorOutput &&
+                result.generation == nullptr &&
                 engine->AcquireLatestGeneration() == nullptr,
-            "partial, reordered, nonfinite, wrong-shape, and noncanonical invalid output fail closed");
+            "missing, extra-bound, reordered, nonfinite, wrong-shape, "
+            "and noncanonical output fail closed");
+    }
+
+    auto good_calculator =
+        std::make_shared<TestCalculator>(BadOutputMode::kGood);
+    auto good_engine =
+        MakeFactorEngine(test, runtime.get(), good_calculator);
+    if (good_engine != nullptr) {
+        const auto good = good_engine->CalculateAndPublish(store);
+        test->Expect(
+            good.published() &&
+                good.generation->points().size() == 2U &&
+                good.generation->points()[0U].instrument_id == first &&
+                good.generation->points()[1U].instrument_id == third,
+            "calculator may publish exactly the sparse eligible IDs");
     }
 }
 
 void CheckForgedStoreOwnerDenied(TestContext* test) {
-    const std::array<market::InstrumentRegistryEntryV1, 1U> entries{
-        RegistryEntry(13U, "600013")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
-        return;
-    }
-    auto runtime = MakeRuntime(test, registry.get());
-    if (runtime == nullptr) {
+    auto directory = MakeDirectory(test, 2U, 74U);
+    auto runtime = MakeRuntime(test, directory.get());
+    if (directory == nullptr || runtime == nullptr) {
         return;
     }
     auto store = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 1U, {1U, 1U, 1U, 1U});
+        test,
+        runtime.get(),
+        *directory,
+        1U,
+        {1U, 1U, 1U, 1U},
+        0U);
     if (store == nullptr) {
         return;
     }
 
     const std::shared_ptr<
         const market::IntradayInstrumentStoreGenerationV1>
-        forged_owner(
+        forged(
             store.get(),
-            [](const market::IntradayInstrumentStoreGenerationV1*) noexcept {
-            });
+            [](const market::IntradayInstrumentStoreGenerationV1*)
+                noexcept {});
     test->Expect(
-        forged_owner.get() == store.get() &&
-            (forged_owner.owner_before(store) ||
-             store.owner_before(forged_owner)) &&
-            !runtime->IsGenerationCurrentAndHealthy(forged_owner),
-        "same raw pointer with a different control block is not the current store owner");
-    bool commit_action_invoked = false;
-    test->Expect(
-        !runtime->CommitIfCurrentAndHealthy(
-            forged_owner,
-            [](void* context) noexcept {
-                *static_cast<bool*>(context) = true;
-            },
-            &commit_action_invoked) &&
-            !commit_action_invoked,
-        "commit guard rejects a forged owner without invoking its action");
+        forged.get() == store.get() &&
+            (forged.owner_before(store) ||
+             store.owner_before(forged)) &&
+            !runtime->IsGenerationCurrentAndHealthy(forged),
+        "same raw Store pointer with a forged owner is not current");
 
-    auto calculator = std::make_shared<TestCalculator>(BadOutputMode::kGood);
+    auto calculator =
+        std::make_shared<TestCalculator>(BadOutputMode::kGood);
     auto engine =
-        MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
+        MakeFactorEngine(test, runtime.get(), calculator);
     if (engine == nullptr) {
         return;
     }
-    const factor::RealtimeFactorPublishResultV1 result =
-        engine->CalculateAndPublish(forged_owner);
+    const auto result = engine->CalculateAndPublish(forged);
     test->Expect(
         result.error ==
                 factor::RealtimeFactorPublishErrorV1::
                     kStoreNotCurrentOrHealthy &&
             result.generation == nullptr &&
             engine->AcquireLatestGeneration() == nullptr,
-        "factor engine rejects a forged shared owner before dereferencing it");
+        "factor engine rejects a forged Store owner before use");
 }
 
-void CheckGenerationChangeDuringCalculationDenied(TestContext* test) {
-    const std::array<market::InstrumentRegistryEntryV1, 1U> entries{
-        RegistryEntry(7U, "600007")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
-        return;
-    }
-    auto runtime = MakeRuntime(test, registry.get());
-    if (runtime == nullptr) {
+void CheckGenerationChangeDuringCalculationDenied(
+    TestContext* test) {
+    auto directory = MakeDirectory(test, 2U, 75U);
+    auto runtime = MakeRuntime(test, directory.get());
+    if (directory == nullptr || runtime == nullptr) {
         return;
     }
     auto store1 = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 1U, {1U, 1U, 1U, 1U});
+        test,
+        runtime.get(),
+        *directory,
+        1U,
+        {1U, 1U, 1U, 1U},
+        0U);
     if (store1 == nullptr) {
         return;
     }
 
     auto calculator = std::make_shared<BlockingCalculator>();
-    auto engine = MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
+    auto engine =
+        MakeFactorEngine(test, runtime.get(), calculator);
     if (engine == nullptr) {
         return;
     }
@@ -739,133 +1042,172 @@ void CheckGenerationChangeDuringCalculationDenied(TestContext* test) {
     std::thread calculation([&] {
         result = engine->CalculateAndPublish(store1);
     });
-    const bool entered = calculator->WaitUntilEntered(std::chrono::seconds(5));
-    test->Expect(entered, "blocking calculator entered");
+    const bool entered = calculator->WaitUntilEntered(5s);
+    test->Expect(entered, "blocking observed calculator enters");
     if (entered) {
         const auto store2 = PublishStoreGeneration(
-            test, runtime.get(), *registry, 2U, 1U, {1U, 1U, 1U, 1U});
+            test,
+            runtime.get(),
+            *directory,
+            2U,
+            {1U, 1U, 1U, 1U},
+            0U);
         test->Expect(
             store2 != nullptr,
-            "new store generation supersedes factor input");
+            "new exact Store generation supersedes factor input");
     }
     calculator->Release();
     calculation.join();
     test->Expect(
-        result.error == factor::RealtimeFactorPublishErrorV1::
-                            kStoreNotCurrentOrHealthy &&
+        result.error ==
+                factor::RealtimeFactorPublishErrorV1::
+                    kStoreNotCurrentOrHealthy &&
+            result.generation == nullptr &&
             engine->AcquireLatestGeneration() == nullptr,
-        "generation change during factor calculation denies commit");
+        "Store generation change during calculation denies commit");
 }
 
-void CheckFatalDuringCalculationDenied(TestContext* test) {
-    const std::array<market::InstrumentRegistryEntryV1, 1U> entries{
-        RegistryEntry(11U, "600011")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
-        return;
-    }
-    auto runtime = MakeRuntime(test, registry.get());
-    if (runtime == nullptr) {
-        return;
-    }
-    auto store = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 1U, {1U, 1U, 1U, 1U});
-    if (store == nullptr) {
-        return;
-    }
-
-    auto calculator = std::make_shared<BlockingCalculator>();
-    auto engine = MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
-    if (engine == nullptr) {
-        return;
-    }
-    factor::RealtimeFactorPublishResultV1 result{};
-    std::thread calculation([&] {
-        result = engine->CalculateAndPublish(store);
-    });
-    const bool entered = calculator->WaitUntilEntered(std::chrono::seconds(5));
-    test->Expect(entered, "fatal test calculator entered");
-    if (entered) {
-        runtime->MarkFatal();
-    }
-    calculator->Release();
-    calculation.join();
-    test->Expect(
-        result.error == factor::RealtimeFactorPublishErrorV1::
-                            kStoreNotCurrentOrHealthy &&
-            engine->AcquireLatestGeneration() == nullptr,
-        "store fatal transition during calculation denies commit");
-}
-
-void CheckStoreFailureDuringCalculationDenied(TestContext* test) {
-    const std::array<market::InstrumentRegistryEntryV1, 1U> entries{
-        RegistryEntry(17U, "600017")};
-    auto registry = MakeRegistry(test, entries);
-    if (registry == nullptr) {
-        return;
-    }
-    auto runtime = MakeRuntime(test, registry.get(), 1U);
-    if (runtime == nullptr) {
-        return;
-    }
-    test->Expect(
-        SubmitShanghaiSnapshot(runtime.get(), 17U, 1U, 1U, 1'000'000),
-        "capacity test first record reaches the store");
-    auto store = PublishStoreGeneration(
-        test, runtime.get(), *registry, 1U, 2U, {2U, 1U, 1U, 1U});
-    if (store == nullptr) {
-        return;
-    }
-
-    auto calculator = std::make_shared<BlockingCalculator>();
-    auto engine =
-        MakeFactorEngine(test, registry.get(), runtime.get(), calculator);
-    if (engine == nullptr) {
-        return;
-    }
-    factor::RealtimeFactorPublishResultV1 result{};
-    std::thread calculation([&] {
-        result = engine->CalculateAndPublish(store);
-    });
-    const bool entered = calculator->WaitUntilEntered(std::chrono::seconds(5));
-    test->Expect(entered, "store-failure test calculator entered");
-    if (entered) {
+void CheckFatalAndStoreFailureDuringCalculationDenied(
+    TestContext* test) {
+    {
+        auto directory = MakeDirectory(test, 2U, 76U);
+        auto runtime = MakeRuntime(test, directory.get());
+        if (directory == nullptr || runtime == nullptr) {
+            return;
+        }
+        auto store = PublishStoreGeneration(
+            test,
+            runtime.get(),
+            *directory,
+            1U,
+            {1U, 1U, 1U, 1U},
+            0U);
+        if (store == nullptr) {
+            return;
+        }
+        auto calculator = std::make_shared<BlockingCalculator>();
+        auto engine =
+            MakeFactorEngine(test, runtime.get(), calculator);
+        if (engine == nullptr) {
+            return;
+        }
+        factor::RealtimeFactorPublishResultV1 result{};
+        std::thread calculation([&] {
+            result = engine->CalculateAndPublish(store);
+        });
+        const bool entered = calculator->WaitUntilEntered(5s);
+        test->Expect(entered, "fatal test calculator enters");
+        if (entered) {
+            runtime->MarkFatal();
+        }
+        calculator->Release();
+        calculation.join();
         test->Expect(
-            SubmitShanghaiSnapshot(
-                runtime.get(), 17U, 2U, 2U, 2'000'000),
-            "post-cut record is admitted before the store capacity failure");
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (!runtime->StoreSnapshot().coverage_lost &&
-               std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
+            result.error ==
+                    factor::RealtimeFactorPublishErrorV1::
+                        kStoreNotCurrentOrHealthy &&
+                engine->AcquireLatestGeneration() == nullptr,
+            "fatal transition during calculation denies commit");
+    }
+
+    {
+        auto directory = MakeDirectory(test, 2U, 77U);
+        if (directory == nullptr) {
+            return;
+        }
+        const std::uint32_t instrument_id = BindInstrument(
+            test,
+            directory.get(),
+            InstrumentKey(
+                market::MarketV1::kShanghai,
+                "101",
+                "603001"),
+            1U);
+        auto runtime = MakeRuntime(test, directory.get(), 1U);
+        if (runtime == nullptr) {
+            return;
         }
         test->Expect(
-            runtime->StoreSnapshot().coverage_lost,
-            "post-cut append makes store coverage loss observable");
+            SubmitSnapshot(
+                runtime.get(),
+                *directory,
+                market::MarketV1::kShanghai,
+                instrument_id,
+                1U,
+                1U,
+                SnapshotPrice{1'000'000, true, false}) &&
+                WaitUntilApplied(
+                    *directory, instrument_id, 1U, true),
+            "capacity fixture first eligible snapshot applies");
+        auto store = PublishStoreGeneration(
+            test,
+            runtime.get(),
+            *directory,
+            1U,
+            {2U, 1U, 1U, 1U},
+            1U);
+        if (store == nullptr) {
+            return;
+        }
+        auto calculator = std::make_shared<BlockingCalculator>();
+        auto engine =
+            MakeFactorEngine(test, runtime.get(), calculator);
+        if (engine == nullptr) {
+            return;
+        }
+        factor::RealtimeFactorPublishResultV1 result{};
+        std::thread calculation([&] {
+            result = engine->CalculateAndPublish(store);
+        });
+        const bool entered = calculator->WaitUntilEntered(5s);
+        test->Expect(
+            entered, "Store-failure test calculator enters");
+        if (entered) {
+            test->Expect(
+                SubmitSnapshot(
+                    runtime.get(),
+                    *directory,
+                    market::MarketV1::kShanghai,
+                    instrument_id,
+                    2U,
+                    2U,
+                    SnapshotPrice{2'000'000, true, false}),
+                "post-cut record is admitted before Store capacity "
+                "failure");
+            const auto deadline =
+                std::chrono::steady_clock::now() + 5s;
+            while (!runtime->StoreSnapshot().coverage_lost &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+            test->Expect(
+                runtime->StoreSnapshot().coverage_lost,
+                "post-cut Store capacity failure becomes observable");
+        }
+        calculator->Release();
+        calculation.join();
+        test->Expect(
+            result.error ==
+                    factor::RealtimeFactorPublishErrorV1::
+                        kStoreNotCurrentOrHealthy &&
+                engine->AcquireLatestGeneration() == nullptr,
+            "Store failure during calculation denies factor commit");
     }
-    calculator->Release();
-    calculation.join();
-    test->Expect(
-        result.error == factor::RealtimeFactorPublishErrorV1::
-                            kStoreNotCurrentOrHealthy &&
-            engine->AcquireLatestGeneration() == nullptr,
-        "observable post-cut store failure denies the pending factor commit");
 }
 
 }  // namespace
 
 int main() {
     TestContext test;
-    CheckProjectionAndWholeGenerationLifetime(&test);
-    CheckDefaultProjectionEconomicDomain(&test);
-    CheckInvalidOutputDenied(&test);
+    CheckEligibilityCountsProjectionAndLifetime(&test);
+    CheckEmptyBoundAndEmptyEligibleGenerations(&test);
+    CheckInvalidCalculatorOutputDenied(&test);
     CheckForgedStoreOwnerDenied(&test);
     CheckGenerationChangeDuringCalculationDenied(&test);
-    CheckFatalDuringCalculationDenied(&test);
-    CheckStoreFailureDuringCalculationDenied(&test);
+    CheckFatalAndStoreFailureDuringCalculationDenied(&test);
     if (test.failures != 0) {
-        std::cerr << test.failures << " realtime factor test(s) failed\n";
+        std::cerr << test.failures
+                  << " realtime factor test(s) failed\n";
         return 1;
     }
     std::cout << "realtime factor engine tests passed\n";

@@ -1,4 +1,5 @@
 #include "l2flow/market/realtime_history_v1.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 
 #include <array>
 #include <chrono>
@@ -24,50 +25,77 @@ std::vector<std::byte> Bytes(std::string_view text) {
     return {bytes.begin(), bytes.end()};
 }
 
-std::unique_ptr<market::InstrumentRegistryV1> MakeRegistry() {
-    std::vector<market::InstrumentRegistryEntryV1> entries;
-    for (std::uint32_t instrument_id : {1U, 2U, 9U}) {
-        market::InstrumentRegistryEntryV1 entry{};
-        entry.instrument_id = instrument_id;
-        entry.key.market = market::MarketV1::kShanghai;
-        entry.key.security_id_source = Bytes("101");
-        entry.key.security_id = Bytes(
-            instrument_id == 1U
-                ? "600001"
-                : instrument_id == 2U ? "600002" : "600009");
-        entry.quantity_unit = market::QuantityUnitV1::kShare;
-        entry.security_type = market::SecurityTypeV1::kEquity;
-        entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-        entries.push_back(std::move(entry));
-    }
-    std::unique_ptr<market::InstrumentRegistryV1> registry;
-    if (market::InstrumentRegistryV1::Create(
-            7U, entries, &registry) !=
-        market::InstrumentRegistryCreateErrorV1::kNone) {
+struct ObservedDirectoryFixture final {
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    std::array<market::ObservedInstrumentBindResultV2, 3U> bindings{};
+};
+
+std::unique_ptr<ObservedDirectoryFixture> MakeDirectory() {
+    auto fixture = std::make_unique<ObservedDirectoryFixture>();
+    market::ObservedInstrumentDirectoryConfigV2 config{};
+    config.capacity = 4U;
+    config.session_epoch = 7U;
+    if (market::ObservedInstrumentDirectoryV2::Create(
+            config, &fixture->directory) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+        fixture->directory == nullptr) {
         return nullptr;
     }
-    return registry;
+
+    constexpr std::array<std::string_view, 3U> security_ids{
+        "600001", "600002", "600009"};
+    const market::ObservedInstrumentMetadataV2 metadata{
+        market::QuantityUnitV1::kShare,
+        market::SecurityTypeV1::kEquity,
+        market::AssetScopeV1::kDocumentedCore};
+    for (std::size_t index = 0U;
+         index < fixture->bindings.size();
+         ++index) {
+        market::InstrumentKeyV1 key{};
+        key.market = market::MarketV1::kShanghai;
+        key.security_id_source = Bytes("101");
+        key.security_id = Bytes(security_ids[index]);
+        market::ObservedInstrumentBindResultV2& binding =
+            fixture->bindings[index];
+        if (fixture->directory->BindOrGet(
+                key,
+                metadata,
+                static_cast<std::uint64_t>(index) + 1U,
+                &binding) !=
+                market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            !binding.newly_bound || !binding.entry.bound() ||
+            binding.entry.instrument_id !=
+                static_cast<std::uint32_t>(index) + 1U ||
+            binding.entry.ordinal != index) {
+            return nullptr;
+        }
+    }
+    return fixture;
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentBindResultV2& binding,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
-    std::uint32_t instrument_id,
     std::int64_t price,
     std::uint64_t tick_stream_sequence = 0U) {
+    if (!binding.entry.bound()) {
+        return std::nullopt;
+    }
     market::ShanghaiSnapshotV1 snapshot{};
     snapshot.common.kind = market::MarketEventKindV1::kShanghaiSnapshot;
     snapshot.common.market = market::MarketV1::kShanghai;
     snapshot.common.origin.source_stream_id = 11U;
     snapshot.common.origin.trade_date = 20260724U;
     snapshot.common.origin.source_sequence = source_sequence;
-    snapshot.common.instrument_id = instrument_id;
-    const auto lookup = registry.LookupById(instrument_id);
-    if (!lookup.known()) {
-        return std::nullopt;
-    }
-    snapshot.common.registry_ordinal = lookup.registry_ordinal;
+    snapshot.common.instrument_id = binding.entry.instrument_id;
+    snapshot.common.ordinal = binding.entry.ordinal;
+    snapshot.common.quantity_unit =
+        binding.entry.metadata.quantity_unit;
+    snapshot.common.security_type =
+        binding.entry.metadata.security_type;
+    snapshot.common.asset_scope =
+        binding.entry.metadata.asset_scope;
     snapshot.last_price.valid = true;
     snapshot.last_price.raw = price;
     snapshot.last_price.normalized_p6 = price;
@@ -82,24 +110,28 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentBindResultV2& binding,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
-    std::uint32_t instrument_id,
     std::int64_t price,
-    std::uint64_t tick_stream_sequence = 0U) {
+    std::uint64_t tick_stream_sequence) {
+    if (!binding.entry.bound()) {
+        return std::nullopt;
+    }
     market::ShanghaiTickV1 tick{};
     tick.common.kind = market::MarketEventKindV1::kShanghaiTick;
     tick.common.market = market::MarketV1::kShanghai;
     tick.common.origin.source_stream_id = 12U;
     tick.common.origin.trade_date = 20260724U;
     tick.common.origin.source_sequence = source_sequence;
-    tick.common.instrument_id = instrument_id;
-    const auto lookup = registry.LookupById(instrument_id);
-    if (!lookup.known()) {
-        return std::nullopt;
-    }
-    tick.common.registry_ordinal = lookup.registry_ordinal;
+    tick.common.instrument_id = binding.entry.instrument_id;
+    tick.common.ordinal = binding.entry.ordinal;
+    tick.common.quantity_unit =
+        binding.entry.metadata.quantity_unit;
+    tick.common.security_type =
+        binding.entry.metadata.security_type;
+    tick.common.asset_scope =
+        binding.entry.metadata.asset_scope;
     tick.fields.price.valid = true;
     tick.fields.price.raw = price;
     tick.fields.price.normalized_p6 = price;
@@ -129,16 +161,18 @@ constexpr std::uint64_t TimeSinceMidnightNs(
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentBindResultV2& binding,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
-    std::uint32_t instrument_id,
     std::uint32_t raw_exchange_time,
     std::uint64_t exchange_time_ns_since_midnight,
     std::int64_t price_p6,
     std::int64_t quantity,
     std::int64_t recv_realtime_ns,
     std::int64_t recv_monotonic_ns) {
+    if (!binding.entry.bound()) {
+        return std::nullopt;
+    }
     market::ShanghaiTickV1 tick{};
     tick.common.kind = market::MarketEventKindV1::kShanghaiTick;
     tick.common.market = market::MarketV1::kShanghai;
@@ -147,20 +181,21 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
     tick.common.origin.source_sequence = source_sequence;
     tick.common.origin.recv_realtime_ns = recv_realtime_ns;
     tick.common.origin.recv_monotonic_ns = recv_monotonic_ns;
-    tick.common.instrument_id = instrument_id;
-    const auto lookup = registry.LookupById(instrument_id);
-    if (!lookup.known() ||
-        exchange_time_ns_since_midnight >
+    tick.common.instrument_id = binding.entry.instrument_id;
+    if (exchange_time_ns_since_midnight >
             static_cast<std::uint64_t>(
                 std::numeric_limits<std::int64_t>::max()) ||
         exchange_time_ns_since_midnight >=
             market::kKLineNanosecondsPerDayV1) {
         return std::nullopt;
     }
-    tick.common.registry_ordinal = lookup.registry_ordinal;
-    tick.common.quantity_unit = lookup.quantity_unit;
-    tick.common.security_type = lookup.security_type;
-    tick.common.asset_scope = lookup.asset_scope;
+    tick.common.ordinal = binding.entry.ordinal;
+    tick.common.quantity_unit =
+        binding.entry.metadata.quantity_unit;
+    tick.common.security_type =
+        binding.entry.metadata.security_type;
+    tick.common.asset_scope =
+        binding.entry.metadata.asset_scope;
     tick.common.exchange_time.raw_hhmmssmmm = raw_exchange_time;
     tick.common.exchange_time.nanoseconds_since_midnight =
         exchange_time_ns_since_midnight;
@@ -184,7 +219,10 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
 
     market::DecodedMarketEventV1 decoded(std::move(tick));
     return market::RealtimeHistoryEventInputV1::Create(
-        1U, ingress_sequence, std::move(decoded));
+        1U,
+        ingress_sequence,
+        std::move(decoded),
+        ingress_sequence);
 }
 
 market::RealtimeHistorySubmitErrorV1 Submit(
@@ -197,11 +235,22 @@ market::RealtimeHistorySubmitErrorV1 Submit(
 }
 
 market::RealtimeHistoryWatermarkV1 MakeWatermark(
-    const market::InstrumentRegistryV1& registry,
+    const market::ObservedInstrumentDirectoryV2& directory,
     std::uint64_t generation,
     std::uint64_t ingress_exclusive,
     std::uint64_t sh_snapshot_exclusive,
     std::uint64_t sh_tick_exclusive) {
+    if (ingress_exclusive == 0U) {
+        return {};
+    }
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
+    if (directory.AcquireSnapshot(&catalog_snapshot) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+        catalog_snapshot == nullptr) {
+        return {};
+    }
     common::Identity128 run_id{};
     run_id[0] = std::byte{0x42U};
     const std::array<market::RealtimeSourceWatermarkV1, 4U> sources{{
@@ -210,6 +259,10 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
         {13U, 1U},
         {14U, 1U},
     }};
+    const std::uint64_t applied_sequence =
+        ingress_exclusive - 1U;
+    const l2flow::realtime::ProcessingProgressV2 progress{
+        applied_sequence, applied_sequence, applied_sequence};
     market::RealtimeHistoryWatermarkV1 watermark{};
     if (market::BuildRealtimeHistoryWatermarkV1(
             run_id,
@@ -217,7 +270,8 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
             20260724U,
             ingress_exclusive,
             1000U + generation,
-            registry,
+            std::move(catalog_snapshot),
+            progress,
             sources,
             &watermark) !=
         market::RealtimeHistoryWatermarkErrorV1::kNone) {
@@ -326,10 +380,17 @@ bool Expect(bool condition, std::string_view message) {
 }  // namespace
 
 int main() {
-    std::unique_ptr<market::InstrumentRegistryV1> registry = MakeRegistry();
-    if (!Expect(registry != nullptr, "registry creation")) {
+    std::unique_ptr<ObservedDirectoryFixture> fixture =
+        MakeDirectory();
+    if (!Expect(
+            fixture != nullptr && fixture->directory != nullptr,
+            "observed directory creation and ordered binding")) {
         return 1;
     }
+    const market::ObservedInstrumentBindResultV2& instrument1 =
+        fixture->bindings[0U];
+    const market::ObservedInstrumentBindResultV2& instrument2 =
+        fixture->bindings[1U];
 
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = {11U, 12U, 13U, 14U};
@@ -341,7 +402,7 @@ int main() {
     config.intraday_store.maximum_session_accounted_bytes = 1U << 20U;
     config.intraday_store.maximum_records_per_batch = 4U;
     config.intraday_store.coverage_from_open = true;
-    config.registry = registry.get();
+    config.directory = fixture->directory.get();
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
     if (!Expect(
             market::RealtimeHistoryRuntimeV1::Create(config, &runtime) ==
@@ -350,16 +411,20 @@ int main() {
         return 1;
     }
     bool ok = true;
-    ok &= Expect(runtime->WorkerForInstrument(1U) == 1U,
-                 "instrument 1 has fixed worker 1");
-    ok &= Expect(runtime->WorkerForInstrument(2U) == 0U,
-                 "instrument 2 has fixed worker 0");
+    ok &= Expect(runtime->WorkerForInstrument(1U) == 0U,
+                 "instrument 1 ordinal has fixed worker 0");
+    ok &= Expect(runtime->WorkerForInstrument(2U) == 1U,
+                 "instrument 2 ordinal has fixed worker 1");
+    ok &= Expect(runtime->WorkerForInstrument(3U) == 0U,
+                 "instrument 3 ordinal has fixed worker 0");
     ok &= Expect(
-        MakeWatermark(*registry, 99U, 4U, 2U, 2U).generation == 0U,
+        MakeWatermark(
+            *fixture->directory, 99U, 4U, 2U, 2U)
+                .generation == 0U,
         "watermark rejects contradictory global/source prefix counts");
     ok &= Expect(
         MakeWatermark(
-            *registry,
+            *fixture->directory,
             99U,
             std::numeric_limits<std::uint64_t>::max(),
             std::numeric_limits<std::uint64_t>::max(),
@@ -367,26 +432,29 @@ int main() {
         "UINT64_MAX remains representable as an exclusive cut");
     ok &= Expect(
         !MakeRecord(
-            *registry,
+            instrument1,
             std::numeric_limits<std::uint64_t>::max(),
-            1U,
             1U,
             1'000'000).has_value() &&
             !MakeRecord(
-                *registry,
+                instrument1,
                 1U,
                 std::numeric_limits<std::uint64_t>::max(),
-                1U,
                 1'000'000).has_value(),
         "message records reject the reserved sequence sentinel");
     ok &= Expect(
-        !MakeRecord(*registry, 1U, 1U, 1U, 1'000'000, 1U)
+        !MakeRecord(instrument1, 1U, 1U, 1'000'000, 1U)
              .has_value() &&
-            !MakeTickRecord(*registry, 1U, 1U, 1U, 900'000, 2U)
+            !MakeTickRecord(
+                instrument1, 1U, 1U, 900'000, 0U)
+                 .has_value() &&
+            !MakeTickRecord(
+                instrument1, 1U, 1U, 900'000, 2U)
                  .has_value(),
         "snapshot/tick stream sequence consistency is validated");
 
-    const auto generation1 = MakeWatermark(*registry, 1U, 4U, 3U, 2U);
+    const auto generation1 = MakeWatermark(
+        *fixture->directory, 1U, 4U, 3U, 2U);
     ok &= Expect(
         runtime->BeginGeneration(generation1) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
@@ -394,15 +462,15 @@ int main() {
     ok &= Expect(
         Submit(
             runtime.get(),
-            MakeRecord(*registry, 1U, 2U, 1U, 1'000'001)) ==
+            MakeRecord(instrument1, 1U, 2U, 1'000'001)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
-        "submit later snapshot to generation-1 worker 1");
+        "submit later snapshot to generation-1 worker 0");
     ok &= Expect(
         Submit(
             runtime.get(),
-            MakeRecord(*registry, 2U, 3U, 2U, 1'000'002)) ==
+            MakeRecord(instrument2, 2U, 3U, 1'000'002)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
-        "submit generation-1 worker-0 record");
+        "submit generation-1 worker-1 record");
     // Source decoders may reach a worker in a different order from the
     // serialized callback. This earlier global record is deliberately
     // submitted after the later snapshot above.
@@ -410,7 +478,7 @@ int main() {
         Submit(
             runtime.get(),
             MakeTickRecord(
-                *registry, 1U, 1U, 1U, 900'001, 1U)) ==
+                instrument1, 1U, 1U, 900'001, 1U)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit earlier cross-source tick after later snapshot");
 
@@ -453,7 +521,7 @@ int main() {
         "latest snapshot/tick are visible after apply without waiting for a generation");
 
     const std::array<std::uint32_t, 5U> live_ids{
-        1U, 2U, 9U, 999U, 0U};
+        1U, 2U, 3U, 4U, 0U};
     std::array<market::RealtimeLatestRecordViewV1, 5U>
         live_snapshots{};
     ok &= Expect(
@@ -465,14 +533,14 @@ int main() {
             live_snapshots[1U].record->ingress_sequence() == 3U &&
             live_snapshots[2U].status ==
                 market::RealtimeLatestRecordStatusV1::
-                    kNotYetObserved &&
+                    kBoundNoTypeData &&
             live_snapshots[3U].status ==
                 market::RealtimeLatestRecordStatusV1::
-                    kUnknownInstrument &&
+                    kUnbound &&
             live_snapshots[4U].status ==
                 market::RealtimeLatestRecordStatusV1::
                     kInvalidInstrumentId,
-        "batch latest snapshots preserve request order and observation status");
+        "batch latest snapshots distinguish bound-no-data and unbound slots");
 
     // Source 0 is fenced first. Its next record is legal realtime work, but
     // every worker must park it until all four generation-1 fences arrive.
@@ -483,7 +551,7 @@ int main() {
     ok &= Expect(
         Submit(
             runtime.get(),
-            MakeRecord(*registry, 3U, 4U, 1U, 2'000'001)) ==
+            MakeRecord(instrument1, 3U, 4U, 2'000'001)) ==
             market::RealtimeHistorySubmitErrorV1::kNone,
         "submit post-fence source record");
     for (std::uint8_t source = 1U; source < 4U; ++source) {
@@ -501,9 +569,9 @@ int main() {
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "wait generation 1");
     ok &= Expect(first != nullptr && first->instrument_count() == 3U,
-                 "generation 1 has exact fixed universe");
+                 "generation 1 has exact bound observed universe");
     if (first != nullptr) {
-        const std::array<std::uint32_t, 3U> expected_ids{1U, 2U, 9U};
+        const std::array<std::uint32_t, 3U> expected_ids{1U, 2U, 3U};
         for (std::size_t ordinal = 0U; ordinal < expected_ids.size();
              ++ordinal) {
             market::IntradayInstrumentSummaryV1 ordinal_summary{};
@@ -511,7 +579,7 @@ int main() {
                 first->SummaryAt(ordinal, &ordinal_summary) ==
                         market::IntradayInstrumentStoreQueryErrorV1::kNone &&
                     ordinal_summary.instrument_id == expected_ids[ordinal],
-                "SummaryAt exposes the sorted fixed universe");
+                "SummaryAt exposes the capture-ordered bound universe");
         }
         market::IntradayInstrumentSummaryV1 first_summary{};
         ok &= Expect(
@@ -531,18 +599,19 @@ int main() {
             "other worker is same generation");
         market::IntradayInstrumentSummaryV1 empty{};
         ok &= Expect(
-            first->Find(9U, &empty) ==
+            first->Find(3U, &empty) ==
                     market::IntradayInstrumentStoreQueryErrorV1::kNone &&
                 empty.latest_snapshot == nullptr &&
                 empty.latest_tick == nullptr && empty.record_count == 0U,
-            "unobserved fixed-universe instrument remains empty");
+            "bound instrument with no applied data remains empty");
         ok &= Expect(
             first->SummaryAt(first->instrument_count(), &empty) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
-            "SummaryAt rejects an ordinal outside the fixed universe");
+            "SummaryAt rejects an ordinal outside the bound universe");
     }
 
-    const auto generation2 = MakeWatermark(*registry, 2U, 5U, 4U, 2U);
+    const auto generation2 = MakeWatermark(
+        *fixture->directory, 2U, 5U, 4U, 2U);
     ok &= Expect(
         runtime->BeginGeneration(generation2) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
@@ -610,7 +679,7 @@ int main() {
     };
     // Leave maximum_bars at zero so history derives the bounded capacity
     // from its retained-record limit and the two configured windows.
-    kline_config.registry = registry.get();
+    kline_config.directory = fixture->directory.get();
 
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> kline_runtime;
     ok &= Expect(
@@ -645,7 +714,8 @@ int main() {
         TimeSinceMidnightNs(14U, 59U, 59U, 0U);
 
     const auto kline_generation1_watermark =
-        MakeWatermark(*registry, 1U, 6U, 1U, 6U);
+        MakeWatermark(
+            *fixture->directory, 1U, 6U, 1U, 6U);
     ok &= Expect(
         kline_runtime->BeginGeneration(
             kline_generation1_watermark) ==
@@ -706,10 +776,9 @@ int main() {
             Submit(
                 kline_runtime.get(),
                 MakeKLineTradeRecord(
-                    *registry,
+                    instrument1,
                     sequence,
                     sequence,
-                    1U,
                     trade.raw_exchange_time,
                     trade.exchange_time_ns_since_midnight,
                     trade.price_p6,
@@ -730,10 +799,9 @@ int main() {
         Submit(
             kline_runtime.get(),
             MakeKLineTradeRecord(
-                *registry,
+                instrument1,
                 6U,
                 6U,
-                1U,
                 93'000'100U,
                 k093000100,
                 9'000'000,
@@ -867,7 +935,8 @@ int main() {
     }
 
     const auto kline_generation2_watermark =
-        MakeWatermark(*registry, 2U, 7U, 1U, 7U);
+        MakeWatermark(
+            *fixture->directory, 2U, 7U, 1U, 7U);
     ok &= Expect(
         kline_runtime->BeginGeneration(
             kline_generation2_watermark) ==

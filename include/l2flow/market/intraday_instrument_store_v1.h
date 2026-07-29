@@ -11,7 +11,8 @@
 
 namespace l2flow::market {
 
-class InstrumentRegistryV1;
+class ObservedInstrumentCatalogSnapshotV2;
+class ObservedInstrumentDirectoryV2;
 class RealtimeHistoryEventInputV1;
 class RealtimeHistoryRecordV1;
 struct RealtimeHistoryWatermarkV1;
@@ -47,13 +48,13 @@ struct IntradayInstrumentStoreConfigV1 final {
     bool coverage_from_open = false;
 };
 
-// The decoder resolves the immutable registry ordinal once. The history
-// runtime carries this value through its source×worker queue so append does
-// not repeat an ID lookup. A token is valid only for the Store session epoch
-// that created it.
+// The decoder resolves the directory ordinal once. The history runtime
+// carries this value through its source×worker queue so append does not
+// repeat an ID lookup. A token is valid only for the Store session epoch that
+// created it.
 struct InstrumentRouteTokenV1 final {
     std::uint32_t instrument_id = 0U;
-    std::size_t registry_ordinal = std::numeric_limits<std::size_t>::max();
+    std::size_t ordinal = std::numeric_limits<std::size_t>::max();
     std::uint32_t worker = std::numeric_limits<std::uint32_t>::max();
     std::size_t worker_local_row = std::numeric_limits<std::size_t>::max();
     std::uint64_t session_epoch = 0U;
@@ -285,6 +286,11 @@ public:
     // identity space makes IntradayInstrumentStoreV1::Create fail with
     // kResourceExhausted.
     [[nodiscard]] std::uint64_t store_session_epoch() const noexcept;
+    // This is the exact CatalogSnapshot carried by the matching watermark,
+    // not a later snapshot acquired while the generation was built.
+    [[nodiscard]] const std::shared_ptr<
+        const ObservedInstrumentCatalogSnapshotV2>&
+    catalog_snapshot() const noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 Find(
         std::uint32_t instrument_id,
@@ -349,9 +355,11 @@ private:
     friend class IntradayUniverseCursorV1::Impl;
 };
 
-// One slice is captured by its owning worker only after all four source
-// fences for a generation have arrived. It contains lane endpoints and latest
-// locators, never record-handle copies.
+// One lightweight slice token is published by its owning worker only after
+// all four source fences for a generation have arrived. Publishing the token
+// is O(1): endpoint rows are materialized by the background generation
+// builder. A row changed after the fence lazily preserves its constant-size
+// pre-cut endpoint on that row's first post-cut append.
 class IntradayInstrumentStoreWorkerSliceV1 final {
 public:
     IntradayInstrumentStoreWorkerSliceV1(
@@ -359,6 +367,12 @@ public:
     IntradayInstrumentStoreWorkerSliceV1& operator=(
         const IntradayInstrumentStoreWorkerSliceV1&) = delete;
     ~IntradayInstrumentStoreWorkerSliceV1();
+
+    // Number of catalog rows represented by this worker's token. Summing this
+    // value across the complete worker set equals the exact snapshot's
+    // bound_count(), never Store capacity. It is not work performed on the
+    // marker path.
+    [[nodiscard]] std::size_t captured_instrument_count() const noexcept;
 
 private:
     class Impl;
@@ -371,13 +385,14 @@ private:
 
 // This required store is the sole retained session-history authority. It owns
 // no worker threads: the routing runtime invokes Append and CaptureWorker from
-// each permanent instrument owner, so every lane has one writer and no append
-// lock. Append is deliberately a trusted-runtime boundary: admission must
-// provide globally dense/unique ingress sequences and dense/unique per-source
-// sequences. The store validates lane monotonicity and generation totals but
-// does not create a second global sequencing authority. Any append, capture,
-// or build error means complete coverage can no longer be proven and the
-// owner must fail closed.
+// each permanent instrument owner, so every lane has one writer. The normal
+// append path is lock-free; only the first append to a row after a generation
+// fence takes that row's short endpoint-freeze lock. Append is deliberately a
+// trusted-runtime boundary: admission must provide globally dense/unique
+// ingress sequences and dense/unique per-source sequences. The store validates
+// lane monotonicity and generation totals but does not create a second global
+// sequencing authority. Any append, capture, or build error means complete
+// coverage can no longer be proven and the owner must fail closed.
 class IntradayInstrumentStoreV1 final {
 public:
     IntradayInstrumentStoreV1(
@@ -397,11 +412,11 @@ public:
         std::array<std::uint32_t,
                    kIntradayInstrumentStoreSourceCountV1>
             source_stream_ids,
-        const InstrumentRegistryV1* registry,
+        const ObservedInstrumentDirectoryV2* directory,
         std::unique_ptr<IntradayInstrumentStoreV1>* output) noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 ResolveRouteToken(
-        std::size_t registry_ordinal,
+        std::size_t ordinal,
         std::uint32_t instrument_id,
         InstrumentRouteTokenV1* output) const noexcept;
 
@@ -423,6 +438,8 @@ public:
     [[nodiscard]] IntradayInstrumentStoreGenerationErrorV1 CaptureWorker(
         std::uint32_t worker,
         std::uint64_t generation,
+        const std::shared_ptr<
+            const ObservedInstrumentCatalogSnapshotV2>& catalog_snapshot,
         std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>* output)
         noexcept;
 

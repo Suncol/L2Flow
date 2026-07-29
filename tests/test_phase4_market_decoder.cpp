@@ -1,5 +1,4 @@
 #include "l2flow/control/quality_flags_v1.h"
-#include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_decoder.h"
 #include "l2flow/market/market_types_v1.h"
 
@@ -545,12 +544,10 @@ std::vector<std::byte> MakeShenzhenSnapshotWire() {
     return std::move(writer).Take();
 }
 
-market::MarketDecoderV1 MakeDecoder(
-    const market::InstrumentRegistryV1* registry = nullptr) {
+market::MarketDecoderV1 MakeDecoder() {
     market::MarketDecoderConfigV1 config;
     config.trade_date = kTradeDate;
     config.source_stream_id = kSourceStreamId;
-    config.instrument_registry = registry;
     return market::MarketDecoderV1(config);
 }
 
@@ -590,28 +587,6 @@ bool HasNotice(
     market::MarketNoticeV1 notice) {
     return (common.market_notices & market::MarketNoticeBitV1(notice)) !=
            0U;
-}
-
-std::vector<std::byte> Bytes(std::string_view value) {
-    const std::span<const char> characters(value.data(), value.size());
-    const std::span<const std::byte> bytes =
-        std::as_bytes(characters);
-    return std::vector<std::byte>(bytes.begin(), bytes.end());
-}
-
-market::InstrumentRegistryEntryV1 ShenzhenRegistryEntry(
-    std::uint32_t instrument_id,
-    std::string_view security_id_source,
-    std::string_view security_id) {
-    market::InstrumentRegistryEntryV1 entry;
-    entry.instrument_id = instrument_id;
-    entry.key.market = market::MarketV1::kShenzhen;
-    entry.key.security_id_source = Bytes(security_id_source);
-    entry.key.security_id = Bytes(security_id);
-    entry.quantity_unit = market::QuantityUnitV1::kShare;
-    entry.security_type = market::SecurityTypeV1::kEquity;
-    entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-    return entry;
 }
 
 market::DecodedMarketEventV1 SentinelOutput() {
@@ -697,7 +672,7 @@ void TestFixedLowerBoundsAndSchemaGate(TestContext* context) {
             context->Expect(
                 common.origin.body.empty() &&
                     common.origin.body.data() == nullptr &&
-                    common.registry_ordinal ==
+                    common.ordinal ==
                         std::numeric_limits<std::size_t>::max(),
                 std::string(test_case.label) +
                     " output retains neither body span nor registry route");
@@ -1086,181 +1061,6 @@ void TestShenzhenOrderEnumsAndPriceValidity(TestContext* context) {
                     order->common.origin.body.data() == nullptr,
                 "decoded output owns text and retains no body span");
         }
-    }
-}
-
-void TestIdentityValidityGatesInstrumentRegistry(TestContext* context) {
-    std::string nonprinting_security_id = "000001";
-    nonprinting_security_id[2] = '\x01';
-    std::string nonprinting_security_id_source = "102";
-    nonprinting_security_id_source[1] = '\x02';
-
-    std::vector<market::InstrumentRegistryEntryV1> entries;
-    entries.push_back(ShenzhenRegistryEntry(501U, "102", "000001"));
-    // Deliberately put the exact invalid byte keys into the registry.  A
-    // decoder that looks up raw text without first checking its validity
-    // would incorrectly resolve these two entries.
-    entries.push_back(ShenzhenRegistryEntry(
-        502U,
-        "102",
-        nonprinting_security_id));
-    entries.push_back(ShenzhenRegistryEntry(
-        503U,
-        nonprinting_security_id_source,
-        "000001"));
-    std::unique_ptr<market::InstrumentRegistryV1> registry;
-    context->Expect(
-        market::InstrumentRegistryV1::Create(
-            9U,
-            entries,
-            &registry) ==
-                market::InstrumentRegistryCreateErrorV1::kNone &&
-            registry != nullptr,
-        "test registry accepts three distinct opaque exact-byte keys");
-    if (registry == nullptr) {
-        return;
-    }
-
-    market::MarketDecoderV1 decoder = MakeDecoder(registry.get());
-    std::uint64_t sequence = 270U;
-    ShenzhenOrderSpec spec;
-    std::vector<std::byte> body = MakeShenzhenOrderWire(spec);
-    market::DecodedMarketEventV1 event;
-    context->Expect(
-        decoder.Decode(
-            Message(
-                kShenzhenService,
-                kShenzhenOrderMessage,
-                body,
-                sequence++),
-            &event) == market::MarketDecodeErrorV1::kNone,
-        "normal exact SZ identity decodes against registry");
-    const auto* order = std::get_if<market::ShenzhenOrderV1>(&event);
-    if (order != nullptr) {
-        const market::DecodedMarketCommonV1& common = order->common;
-        context->Expect(
-            common.security_id_valid &&
-                common.security_id_source_valid &&
-                common.md_stream_id_valid &&
-                common.instrument_id == 501U &&
-                common.registry_ordinal == 0U &&
-                common.quantity_unit == market::QuantityUnitV1::kShare &&
-                common.security_type == market::SecurityTypeV1::kEquity &&
-                common.asset_scope ==
-                    market::AssetScopeV1::kDocumentedCore &&
-                !HasQuality(
-                    common,
-                    control::QualityFlagV1::kInstrumentUnknown) &&
-                !HasQuality(
-                    common,
-                    control::QualityFlagV1::kQtyUnitUnknown),
-            "normal exact identity publishes explicit registry metadata");
-    }
-
-    spec.security_id = "000002";
-    body = MakeShenzhenOrderWire(spec);
-    context->Expect(
-        decoder.Decode(
-            Message(
-                kShenzhenService,
-                kShenzhenOrderMessage,
-                body,
-                sequence++),
-            &event) == market::MarketDecodeErrorV1::kNone,
-        "valid unregistered SZ identity remains a decoded message");
-    order = std::get_if<market::ShenzhenOrderV1>(&event);
-    if (order != nullptr) {
-        const market::DecodedMarketCommonV1& common = order->common;
-        context->Expect(
-            common.security_id_valid &&
-                common.security_id_source_valid &&
-                common.instrument_id == 0U &&
-                common.registry_ordinal ==
-                    std::numeric_limits<std::size_t>::max() &&
-                common.quantity_unit == market::QuantityUnitV1::kUnknown &&
-                common.security_type == market::SecurityTypeV1::kUnknown &&
-                common.asset_scope == market::AssetScopeV1::kUnknown &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kInstrumentUnknown) &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kQtyUnitUnknown),
-            "valid unknown identity retains the unknown registry ordinal");
-    }
-
-    spec.security_id = nonprinting_security_id;
-    body = MakeShenzhenOrderWire(spec);
-    context->Expect(
-        decoder.Decode(
-            Message(
-                kShenzhenService,
-                kShenzhenOrderMessage,
-                body,
-                sequence++),
-            &event) == market::MarketDecodeErrorV1::kNone,
-        "non-printing SecurityID remains an owned decoded message");
-    order = std::get_if<market::ShenzhenOrderV1>(&event);
-    if (order != nullptr) {
-        const market::DecodedMarketCommonV1& common = order->common;
-        context->Expect(
-            common.security_id == nonprinting_security_id &&
-                !common.security_id_valid &&
-                common.security_id_source_valid &&
-                common.instrument_id == 0U &&
-                common.registry_ordinal ==
-                    std::numeric_limits<std::size_t>::max() &&
-                common.quantity_unit == market::QuantityUnitV1::kUnknown &&
-                common.security_type == market::SecurityTypeV1::kUnknown &&
-                common.asset_scope == market::AssetScopeV1::kUnknown &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kDecodeTextInvalid) &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kInstrumentUnknown) &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kQtyUnitUnknown),
-            "invalid SecurityID cannot hit an exact opaque registry key");
-    }
-
-    spec.security_id = "000001";
-    spec.security_id_source = nonprinting_security_id_source;
-    body = MakeShenzhenOrderWire(spec);
-    context->Expect(
-        decoder.Decode(
-            Message(
-                kShenzhenService,
-                kShenzhenOrderMessage,
-                body,
-                sequence++),
-            &event) == market::MarketDecodeErrorV1::kNone,
-        "non-printing SZ SecurityIDSource remains a decoded message");
-    order = std::get_if<market::ShenzhenOrderV1>(&event);
-    if (order != nullptr) {
-        const market::DecodedMarketCommonV1& common = order->common;
-        context->Expect(
-            common.security_id_valid &&
-                common.security_id_source ==
-                    nonprinting_security_id_source &&
-                !common.security_id_source_valid &&
-                common.instrument_id == 0U &&
-                common.registry_ordinal ==
-                    std::numeric_limits<std::size_t>::max() &&
-                common.quantity_unit == market::QuantityUnitV1::kUnknown &&
-                common.security_type == market::SecurityTypeV1::kUnknown &&
-                common.asset_scope == market::AssetScopeV1::kUnknown &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kDecodeTextInvalid) &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kInstrumentUnknown) &&
-                HasQuality(
-                    common,
-                    control::QualityFlagV1::kQtyUnitUnknown),
-            "invalid SZ SecurityIDSource cannot hit exact registry bytes");
     }
 }
 
@@ -2879,69 +2679,6 @@ void TestMaximumDurationSentinel(TestContext* context) {
         "SH ask sentinel does not invalidate the independent bid duration");
 }
 
-void TestProductApplicabilityNotInferredFromSecurityType(
-    TestContext* context) {
-    const std::vector<market::SecurityTypeV1> security_types = {
-        market::SecurityTypeV1::kEquity,
-        market::SecurityTypeV1::kFund,
-    };
-    std::uint64_t sequence = 720U;
-    for (market::SecurityTypeV1 security_type : security_types) {
-        market::InstrumentRegistryEntryV1 entry;
-        entry.instrument_id =
-            security_type == market::SecurityTypeV1::kEquity ? 801U : 802U;
-        entry.key.market = market::MarketV1::kShanghai;
-        entry.key.security_id = Bytes("600000");
-        entry.quantity_unit = market::QuantityUnitV1::kShare;
-        entry.security_type = security_type;
-        entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-        std::unique_ptr<market::InstrumentRegistryV1> registry;
-        context->Expect(
-            market::InstrumentRegistryV1::Create(
-                31U,
-                std::span<const market::InstrumentRegistryEntryV1>(
-                    &entry, 1U),
-                &registry) ==
-                    market::InstrumentRegistryCreateErrorV1::kNone &&
-                registry != nullptr,
-            "SH applicability test registry creates");
-        if (registry == nullptr) {
-            continue;
-        }
-
-        market::MarketDecoderV1 decoder = MakeDecoder(registry.get());
-        const std::vector<std::byte> body = MakeShanghaiSnapshotWire();
-        market::DecodedMarketEventV1 event;
-        context->Expect(
-            decoder.Decode(
-                Message(
-                    kShanghaiService,
-                    kShanghaiSnapshotMessage,
-                    body,
-                    sequence++),
-                &event) == market::MarketDecodeErrorV1::kNone,
-            "SH snapshot resolves coarse registry security type");
-        const auto* const snapshot =
-            std::get_if<market::ShanghaiSnapshotV1>(&event);
-        context->Expect(
-            snapshot != nullptr &&
-                snapshot->common.security_type == security_type &&
-                !snapshot->vendor_etf_buy_count.valid &&
-                !snapshot->vendor_etf_buy_quantity.valid &&
-                !snapshot->vendor_etf_buy_amount.valid &&
-                !snapshot->vendor_etf_sell_count.valid &&
-                !snapshot->vendor_etf_sell_quantity.valid &&
-                !snapshot->vendor_etf_sell_amount.valid &&
-                !snapshot->yield_to_maturity.valid &&
-                !snapshot->total_warrant_exercise_quantity.valid &&
-                !snapshot->iopv.valid &&
-                HasNotice(
-                    snapshot->common,
-                    market::MarketNoticeV1::kProductApplicabilityUnknown),
-            "coarse equity/fund metadata never guesses ETF or product-field applicability");
-    }
-}
-
 void TestSnapshotNestedListsAndPublicCaps(TestContext* context) {
     market::MarketDecoderV1 decoder = MakeDecoder();
     std::vector<std::byte> sh_body = MakeShanghaiSnapshotWire();
@@ -3161,7 +2898,6 @@ int main() {
     TestFixedLowerBoundsAndSchemaGate(&context);
     TestShanghaiTickValidityMatrix(&context);
     TestShenzhenOrderEnumsAndPriceValidity(&context);
-    TestIdentityValidityGatesInstrumentRegistry(&context);
     TestShenzhenTransactionMatrix(&context);
     TestIgnoredNumericOverflowAndPhaseHistory(&context);
     TestMatchedQuantityDomainAndFailureAtomicity(&context);
@@ -3171,7 +2907,6 @@ int main() {
     TestTimeNullInvalidAndBoundaries(&context);
     TestAbsolutePriceDomains(&context);
     TestMaximumDurationSentinel(&context);
-    TestProductApplicabilityNotInferredFromSecurityType(&context);
     TestSnapshotNestedListsAndPublicCaps(&context);
     TestDecoderTradeDateDomain(&context);
 

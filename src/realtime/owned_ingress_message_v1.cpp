@@ -93,8 +93,39 @@ static_assert(
     if (!IsValidMaximumMessageBytes(config.maximum_message_bytes) ||
         config.maximum_inflight_messages == 0U ||
         config.maximum_inflight_messages >
-            kOwnedIngressMaximumInflightMessagesV1) {
+            kOwnedIngressMaximumInflightMessagesV1 ||
+        (config.prewarm_message_bytes == 0U) !=
+            (config.prewarm_message_count == 0U) ||
+        config.prewarm_message_bytes > config.maximum_message_bytes ||
+        config.prewarm_message_count >
+            config.maximum_inflight_messages) {
         return false;
+    }
+    if (config.prewarm_message_count != 0U &&
+        !IsValidMaximumMessageBytes(
+            config.prewarm_message_bytes)) {
+        return false;
+    }
+
+    if (config.prewarm_message_count != 0U) {
+        const std::size_t prewarm_body_bytes =
+            static_cast<std::size_t>(
+                config.prewarm_message_bytes) -
+            l2flow::sdk::kVendorHeadBytes;
+        std::uint8_t prewarm_size_class = 0U;
+        if (!FindSizeClass(
+                sizeof(OwnedIngressMessageV1) +
+                    prewarm_body_bytes,
+                &prewarm_size_class)) {
+            return false;
+        }
+        const std::size_t prewarm_block_bytes =
+            SizeClassBytes(prewarm_size_class);
+        if (config.prewarm_message_count >
+            kOwnedIngressMaximumPrewarmBytesV1 /
+                prewarm_block_bytes) {
+            return false;
+        }
     }
 
     const std::size_t maximum_body_bytes =
@@ -133,6 +164,46 @@ public:
         const OwnedIngressMessagePoolStateV1&) = delete;
     OwnedIngressMessagePoolStateV1& operator=(
         const OwnedIngressMessagePoolStateV1&) = delete;
+
+    [[nodiscard]] bool Prewarm() noexcept {
+        if (config_.prewarm_message_count == 0U) {
+            return true;
+        }
+
+        const std::size_t prewarm_body_bytes =
+            static_cast<std::size_t>(
+                config_.prewarm_message_bytes) -
+            l2flow::sdk::kVendorHeadBytes;
+        std::uint8_t size_class = 0U;
+        if (!FindSizeClass(
+                sizeof(OwnedIngressMessageV1) +
+                    prewarm_body_bytes,
+                &size_class) ||
+            size_class > maximum_size_class_) {
+            return false;
+        }
+
+        const std::size_t block_bytes =
+            SizeClassBytes(size_class);
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (std::size_t index = 0U;
+             index < config_.prewarm_message_count;
+             ++index) {
+            void* const block =
+                ::operator new(block_bytes, std::nothrow);
+            if (block == nullptr) {
+                return false;
+            }
+            // Creation runs before SDK Connect. Touch every byte now so the
+            // first opening-burst memcpy cannot inherit demand-zero page
+            // faults from an otherwise only virtually allocated block.
+            std::memset(block, 0, block_bytes);
+            PushFreeBlockLocked(size_class, block);
+            ++allocated_blocks_;
+            allocated_bytes_ += block_bytes;
+        }
+        return true;
+    }
 
     [[nodiscard]] OwnedIngressMessageErrorV1 Acquire(
         const OwnedIngressMessageInspectionV1& inspection,
@@ -320,6 +391,10 @@ public:
             config_.maximum_message_bytes;
         result.maximum_inflight_messages =
             config_.maximum_inflight_messages;
+        result.prewarm_message_bytes =
+            config_.prewarm_message_bytes;
+        result.prewarm_message_count =
+            config_.prewarm_message_count;
         result.active_messages = active_messages_;
         result.allocated_blocks = allocated_blocks_;
         result.cached_blocks = cached_blocks_;
@@ -379,6 +454,8 @@ private:
         }
         const l2flow::sdk::VendorHeadView head(
             inspection.vendor_head_bytes_);
+        OwnedIngressSourceV1 classified_source =
+            OwnedIngressSourceV1::kShanghaiSnapshot;
         return head.head_size() == l2flow::sdk::kVendorHeadBytes &&
                head.message_size() == inspection.wire_size_ &&
                head.message_encoding() ==
@@ -389,7 +466,11 @@ private:
                    head.service_version(),
                    head.message_id()} &&
                inspection.source_slot() <
-                   kOwnedIngressSourceCountV1;
+                   kOwnedIngressSourceCountV1 &&
+               ClassifyOwnedIngressMessageKeyV1(
+                   inspection.key_, &classified_source) ==
+                   OwnedIngressKeyErrorV1::kNone &&
+               inspection.source_ == classified_source;
     }
 
     [[nodiscard]] void* PopFreeBlockLocked(
@@ -768,6 +849,11 @@ OwnedIngressMessageErrorV1 OwnedIngressMessagePoolV1::Create(
         OwnedIngressMessagePoolStateV1(
             config, maximum_size_class, maximum_pool_bytes);
     if (state == nullptr) {
+        return OwnedIngressMessageErrorV1::kResourceExhausted;
+    }
+    if (!state->Prewarm()) {
+        state->Retire();
+        state->ReleaseLifetimeReference();
         return OwnedIngressMessageErrorV1::kResourceExhausted;
     }
     auto* const pool = new (std::nothrow)

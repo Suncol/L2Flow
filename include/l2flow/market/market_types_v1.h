@@ -38,8 +38,8 @@ enum class SecurityTypeV1 : std::uint8_t {
     kOption,
 };
 
-// Scope is explicit registry data.  The decoder never guesses it from a
-// security-code prefix.
+// Scope is explicit observed-directory metadata. The decoder never guesses it
+// from a security-code prefix.
 enum class AssetScopeV1 : std::uint8_t {
     kUnknown = 0U,
     kDocumentedCore = 1U,
@@ -137,7 +137,7 @@ struct DecimalValueV1 final {
 struct QuantityValueV1 final {
     // Quantities retain their native vendor scale.  A scale of zero is an
     // integer native quantity.  The decoder does not assume that the unit is
-    // shares; quantity_unit comes from the instrument registry.
+    // shares; quantity_unit comes from observed-directory metadata.
     std::int64_t raw = 0;
     std::uint8_t scale = 0U;
     bool valid = false;
@@ -166,7 +166,7 @@ struct MarketMessageViewV1 final {
     std::uint32_t source_stream_id = 0U;
     std::uint32_t trade_date = 0U;
     // A caller-owned, dense per-source ingress order. Zero is not accepted;
-    // the value has no WAL-position or exchange-time meaning.
+    // the value has no Journal-position or exchange-time meaning.
     std::uint64_t source_sequence = 0U;
     std::uint8_t service_id = 0U;
     std::uint16_t service_version = 0U;
@@ -222,10 +222,10 @@ struct DecodedMarketCommonV1 final {
     bool security_id_source_valid = false;
     bool md_stream_id_valid = false;
     std::uint32_t instrument_id = 0U;
-    // Stable ordinal in InstrumentRegistryV1's instrument-id ordering.  The
-    // decoder obtains it in the same exact-key lookup that resolves
-    // instrument_id; downstream routing must not perform another ID lookup.
-    std::size_t registry_ordinal =
+    // Stable ordinal in the session's observed directory. The capture-ordered
+    // in-memory dispatcher obtains it with instrument_id; downstream routing
+    // does not perform another key lookup.
+    std::size_t ordinal =
         std::numeric_limits<std::size_t>::max();
     QuantityUnitV1 quantity_unit = QuantityUnitV1::kUnknown;
     SecurityTypeV1 security_type = SecurityTypeV1::kUnknown;
@@ -286,8 +286,9 @@ struct ShanghaiSnapshotV1 final {
     // asserting subscription/redemption semantics absent a versioned field
     // dictionary.
     // No versioned instrument-capability table currently proves that this
-    // vendor ETF group applies to a registry row.  V1 retains exact raw values
-    // but publishes every member invalid, even for coarse SecurityType::kFund.
+    // vendor ETF group applies to an observed instrument. V1 retains exact
+    // raw values but publishes every member invalid, even for coarse
+    // SecurityType::kFund.
     UnsignedValueV1 vendor_etf_buy_count{};
     QuantityValueV1 vendor_etf_buy_quantity{};
     DecimalValueV1 vendor_etf_buy_amount{};
@@ -384,8 +385,8 @@ struct ShenzhenSnapshotV1 final {
     QuantityValueV1 total_bid_quantity{};
     DecimalValueV1 weighted_average_bid_price{};
     // Sentinel interpretation is intentionally delegated to versioned
-    // registry/reference data.  Until such policy is supplied, raw/scale are
-    // preserved, DecimalValueV1::valid is false, and semantics is unknown.
+    // versioned reference metadata. Until such policy is supplied, raw/scale
+    // are preserved, DecimalValueV1::valid is false, and semantics is unknown.
     DecimalValueV1 high_limit_price{};
     DecimalValueV1 low_limit_price{};
     LimitPriceSemanticsV1 high_limit_semantics =

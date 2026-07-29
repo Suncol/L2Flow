@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -19,10 +20,13 @@
 #include <utility>
 #include <vector>
 
+#include <stdlib.h>
+
 namespace {
 
 namespace market = l2flow::market;
 namespace mdl = datayes::mdl;
+namespace realtime = l2flow::realtime;
 namespace runtime = l2flow::runtime;
 namespace sdk = l2flow::sdk;
 
@@ -417,41 +421,49 @@ private:
     std::vector<std::byte> body_;
 };
 
-std::vector<std::byte> Bytes(std::string_view text) {
-    const auto bytes = std::as_bytes(std::span(text));
-    return {bytes.begin(), bytes.end()};
-}
-
-std::unique_ptr<market::InstrumentRegistryV1> MakeRegistry() {
-    market::InstrumentRegistryEntryV1 entry{};
-    entry.instrument_id = 18U;
-    entry.key.market = market::MarketV1::kShenzhen;
-    entry.key.security_id_source = Bytes("102 ");
-    entry.key.security_id = Bytes("000001");
-    entry.quantity_unit = market::QuantityUnitV1::kShare;
-    entry.security_type = market::SecurityTypeV1::kEquity;
-    entry.asset_scope = market::AssetScopeV1::kDocumentedCore;
-
-    std::unique_ptr<market::InstrumentRegistryV1> registry;
-    if (market::InstrumentRegistryV1::Create(
-            171U,
-            std::span<const market::InstrumentRegistryEntryV1>(&entry, 1U),
-            &registry) !=
-        market::InstrumentRegistryCreateErrorV1::kNone) {
-        return nullptr;
+class TemporaryDirectory final {
+public:
+    TemporaryDirectory() {
+        std::array<char, 64U> pattern{};
+        constexpr char literal[] =
+            "/tmp/l2flow-pipeline-lifecycle-v2-XXXXXX";
+        static_assert(sizeof(literal) <= pattern.size());
+        std::memcpy(pattern.data(), literal, sizeof(literal));
+        char* const created = ::mkdtemp(pattern.data());
+        if (created != nullptr) {
+            path_ = created;
+        }
     }
-    return registry;
-}
+
+    ~TemporaryDirectory() {
+        if (!path_.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove_all(path_, ignored);
+        }
+    }
+
+    TemporaryDirectory(const TemporaryDirectory&) = delete;
+    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
 
 runtime::RealtimePipelineConfigV1 MakeConfig(
-    const market::InstrumentRegistryV1* registry) {
+    market::ObservedInstrumentDirectoryV2* directory,
+    const std::filesystem::path& journal_path) {
     runtime::RealtimePipelineConfigV1 config{};
     config.run_id[0U] = std::byte{0x51U};
     config.run_id[15U] = std::byte{0xa7U};
     config.trade_date = 20260724U;
-    config.registry = registry;
+    config.directory = directory;
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.maximum_sdk_message_bytes = 4096U;
+    config.processing_queue_capacity = 16U;
     config.decoder_queue_capacity_per_source = 16U;
     config.store_worker_count = 1U;
     config.store_queue_capacity_per_source_worker = 16U;
@@ -465,6 +477,10 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
         market::KLineWindowSpecV1{
             1U, market::kKLineNanosecondsPerSecondV1});
     config.enforce_receive_trade_date = false;
+    config.journal.path = journal_path.string();
+    config.journal.queue_capacity = 16U;
+    config.journal.max_batch_records = 4U;
+    config.journal.max_batch_delay = 50us;
     config.sdk.enabled = true;
     config.sdk.server_address = "127.0.0.1:9112";
     config.sdk.user_name = "lifecycle-test";
@@ -487,9 +503,40 @@ std::size_t EventIndex(
 
 int main() {
     TestContext test;
-    std::unique_ptr<market::InstrumentRegistryV1> registry = MakeRegistry();
-    test.Expect(registry != nullptr, "registry creation");
-    if (registry == nullptr) {
+
+    {
+        std::unique_ptr<realtime::OwnedIngressMessagePoolV1> oversized;
+        constexpr std::size_t kPrewarmBlockBytes = 8192U;
+        const std::size_t excessive_count =
+            realtime::kOwnedIngressMaximumPrewarmBytesV1 /
+                kPrewarmBlockBytes +
+            1U;
+        const realtime::OwnedIngressMessageErrorV1 error =
+            realtime::OwnedIngressMessagePoolV1::Create(
+                realtime::OwnedIngressMessagePoolConfigV1{
+                    4096U,
+                    excessive_count,
+                    4096U,
+                    excessive_count},
+                &oversized);
+        test.Expect(
+            error ==
+                    realtime::OwnedIngressMessageErrorV1::
+                        kInvalidPoolConfiguration &&
+                oversized == nullptr,
+            "prewarm rejects an eager reservation above its byte cap");
+    }
+    TemporaryDirectory temporary;
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    test.Expect(
+        !temporary.path().empty() &&
+            market::ObservedInstrumentDirectoryV2::Create(
+                market::ObservedInstrumentDirectoryConfigV2{8U, 171U},
+                &directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            directory != nullptr,
+        "observed directory and Journal directory creation");
+    if (directory == nullptr || temporary.path().empty()) {
         return 1;
     }
 
@@ -498,7 +545,9 @@ int main() {
     std::string detail;
     test.Expect(
         runtime::RealtimePipelineV1::CreateForTest(
-            MakeConfig(registry.get()),
+            MakeConfig(
+                directory.get(),
+                temporary.path() / "capture.journal"),
             std::make_shared<RecordingFactory>(state),
             &pipeline,
             &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&
@@ -571,7 +620,7 @@ int main() {
             terminal.store_generation->watermark();
         market::IntradayInstrumentSummaryV1 row{};
         const bool row_found =
-            terminal.store_generation->Find(18U, &row) ==
+            terminal.store_generation->Find(1U, &row) ==
             market::IntradayInstrumentStoreQueryErrorV1::kNone;
         test.Expect(
             watermark.ingress_sequence_exclusive == 2U &&
@@ -588,7 +637,7 @@ int main() {
             row_found && row.latest_tick != nullptr &&
                 row.record_count == 1U &&
                 terminal.store_generation->OpenTailCursor(
-                    18U, row.record_count, &tail) ==
+                    1U, row.record_count, &tail) ==
                     market::IntradayInstrumentStoreQueryErrorV1::kNone &&
                 tail != nullptr &&
                 tail->ReadBatch(records, &written) ==
@@ -611,7 +660,7 @@ int main() {
                 terminal.kline_generation->input_store() ==
                     terminal.store_generation &&
                 terminal.kline_generation->OpenInstrumentCursor(
-                    18U, 1U, &kline_cursor) ==
+                    1U, 1U, &kline_cursor) ==
                     market::KLineQueryErrorV1::kNone &&
                 kline_cursor != nullptr &&
                 kline_cursor->ReadBatch(bars, &bars_written) ==
@@ -639,12 +688,19 @@ int main() {
             !pipeline_snapshot.fatal,
         "terminal state is the complete non-fatal one-message prefix");
     test.Expect(
-        pipeline_snapshot.ingress_pool.maximum_inflight_messages == 69U &&
+        pipeline_snapshot.ingress_pool.maximum_inflight_messages != 0U &&
+            pipeline_snapshot.ingress_pool.prewarm_message_bytes == 4096U &&
+            pipeline_snapshot.ingress_pool.prewarm_message_count ==
+                pipeline_snapshot.ingress_pool
+                    .maximum_inflight_messages &&
             pipeline_snapshot.ingress_pool.active_messages == 0U &&
+            pipeline_snapshot.ingress_pool.allocated_blocks ==
+                pipeline_snapshot.ingress_pool.prewarm_message_count &&
             pipeline_snapshot.ingress_pool.allocated_blocks <=
                 pipeline_snapshot.ingress_pool
                     .maximum_inflight_messages,
-        "callback/stop race stays within the bounded owned-ingress pool");
+        "pool is prewarmed before callbacks and callback/stop race stays "
+        "within its bounded storage");
 
     const LifecycleSnapshot lifecycle = state->Snapshot();
     const std::size_t callback_exit = EventIndex(

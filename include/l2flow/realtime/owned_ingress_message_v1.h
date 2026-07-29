@@ -22,6 +22,8 @@ inline constexpr std::uint32_t kOwnedIngressMaximumMessageBytesV1 =
     16U * 1024U * 1024U;
 inline constexpr std::size_t
     kOwnedIngressMaximumInflightMessagesV1 = 10'000'000U;
+inline constexpr std::size_t kOwnedIngressMaximumPrewarmBytesV1 =
+    256U * 1024U * 1024U;
 static_assert(kRequiredOwnedIngressMessageCountV1 == 5U);
 
 // These are the only market messages admitted by the production realtime
@@ -59,9 +61,11 @@ enum class OwnedIngressKeyErrorV1 : std::uint8_t {
     OwnedIngressSourceV1* output) noexcept;
 
 // Sequence values are assigned by the single serialized subscription
-// callback. They describe prefixes owned by this process, not vendor event
-// time and not WAL durability. A successful message owns its sequence values
-// exactly once; a rejected callback must not advance any counter.
+// callback. They describe prefixes admitted by the Mandatory Journal, not
+// vendor event time and not Journal durability. Journal admission owns its
+// sequence exactly once. If the following processing-queue admission fails,
+// the callback is terminally rejected but that already-owned accepted
+// sequence is intentionally retained.
 // tick_stream_sequence is one dense order shared by Shanghai tick, Shenzhen
 // order, and Shenzhen transaction. Snapshot messages carry zero. UINT64_MAX
 // is reserved as the exhaustion sentinel so an exclusive generation cut can
@@ -205,7 +209,7 @@ private:
 };
 
 // Immutable ownership boundary between the vendor callback and downstream
-// decoder/WAL consumers. Object storage and body bytes occupy one size-class
+// Journal/decoder consumers. Object storage and body bytes occupy one size-class
 // pool block; the body starts immediately after this object.
 class OwnedIngressMessageV1 final {
 public:
@@ -297,11 +301,21 @@ private:
 struct OwnedIngressMessagePoolConfigV1 final {
     std::uint32_t maximum_message_bytes = 0U;
     std::size_t maximum_inflight_messages = 0U;
+    // Creation-time hot-set reservation. Both fields are zero to disable it,
+    // or both are nonzero. Blocks are allocated and physically touched before
+    // SDK Connect. At most prewarm_message_count simultaneously retained
+    // messages no larger than prewarm_message_bytes avoid both allocator
+    // entry and first-touch page faults in the callback. Larger legal
+    // messages use the bounded size-class fallback.
+    std::uint32_t prewarm_message_bytes = 0U;
+    std::size_t prewarm_message_count = 0U;
 };
 
 struct OwnedIngressMessagePoolSnapshotV1 final {
     std::uint32_t maximum_message_bytes = 0U;
     std::size_t maximum_inflight_messages = 0U;
+    std::uint32_t prewarm_message_bytes = 0U;
+    std::size_t prewarm_message_count = 0U;
     std::size_t active_messages = 0U;
     std::size_t allocated_blocks = 0U;
     std::size_t cached_blocks = 0U;

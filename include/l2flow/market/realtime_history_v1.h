@@ -3,10 +3,11 @@
 #include "l2flow/common/identity128.h"
 #include "l2flow/common/sha256.h"
 #include "l2flow/market/intraday_instrument_store_v1.h"
-#include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_types_v1.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_kline_v1.h"
 #include "l2flow/market/realtime_latest_read_model_v1.h"
+#include "l2flow/realtime/processing_progress_v2.h"
 
 #include <array>
 #include <chrono>
@@ -23,25 +24,27 @@ namespace l2flow::market {
 inline constexpr std::size_t kRealtimeHistorySourceCountV1 = 4U;
 
 // A source cut is an exclusive prefix of the sequence assigned by this
-// process.  It is intentionally unrelated to vendor sequence numbers and WAL
-// offsets: source_sequence < sequence_exclusive belongs to this generation.
+// process. It is intentionally unrelated to vendor sequence numbers or
+// Journal byte offsets: source_sequence < sequence_exclusive belongs to this
+// generation.
 struct RealtimeSourceWatermarkV1 final {
     std::uint32_t source_stream_id = 0U;
     std::uint64_t sequence_exclusive = 0U;
 };
 
-// Immutable identity of one complete market-history generation.  The ingress
-// sequence vector is the completeness authority.  recv_monotonic_cut_ns is an
-// observation timestamp for latency/staleness only; it is not presented as an
-// exchange-event-time completeness proof.
+// Immutable identity of one processed observed-universe generation. The
+// source sequence vector proves the process-owned input prefix, while the
+// exact CatalogSnapshot fixes the bound set and its observed-only semantics.
+// It never claims that the exchange's authoritative universe is complete.
 struct RealtimeHistoryWatermarkV1 final {
     l2flow::common::Identity128 run_id{};
     std::uint64_t generation = 0U;
     std::uint32_t trade_date = 0U;
     std::uint64_t ingress_sequence_exclusive = 0U;
     std::uint64_t recv_monotonic_cut_ns = 0U;
-    std::uint64_t registry_version = 0U;
-    l2flow::common::Sha256Digest registry_sha256{};
+    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
+    l2flow::realtime::ProcessingProgressV2 processing_progress{};
     std::array<RealtimeSourceWatermarkV1,
                kRealtimeHistorySourceCountV1>
         sources{};
@@ -55,7 +58,8 @@ enum class RealtimeHistoryWatermarkErrorV1 : std::uint8_t {
     kInvalidGeneration,
     kInvalidTradeDate,
     kInvalidIngressCut,
-    kInvalidRegistry,
+    kInvalidCatalog,
+    kInvalidProgress,
     kInvalidSource,
     kDuplicateSource,
     kHashFailure,
@@ -71,7 +75,9 @@ BuildRealtimeHistoryWatermarkV1(
     std::uint32_t trade_date,
     std::uint64_t ingress_sequence_exclusive,
     std::uint64_t recv_monotonic_cut_ns,
-    const InstrumentRegistryV1& registry,
+    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot,
+    l2flow::realtime::ProcessingProgressV2 processing_progress,
     std::span<const RealtimeSourceWatermarkV1,
               kRealtimeHistorySourceCountV1> sources,
     RealtimeHistoryWatermarkV1* output) noexcept;
@@ -160,7 +166,7 @@ public:
     virtual ~RealtimeAppliedRecordSinkV1() = default;
 
     [[nodiscard]] virtual bool PublishApplied(
-        std::size_t registry_ordinal,
+        std::size_t ordinal,
         const RealtimeHistoryRecordV1& record) noexcept = 0;
     virtual void MarkCoverageLost() noexcept = 0;
 };
@@ -204,8 +210,8 @@ public:
     [[nodiscard]] std::uint32_t instrument_id() const noexcept {
         return instrument_id_;
     }
-    [[nodiscard]] std::size_t registry_ordinal() const noexcept {
-        return registry_ordinal_;
+    [[nodiscard]] std::size_t ordinal() const noexcept {
+        return ordinal_;
     }
     [[nodiscard]] MarketEventKindV1 kind() const noexcept { return kind_; }
     [[nodiscard]] std::int64_t event_time_ns() const noexcept {
@@ -240,7 +246,7 @@ private:
         std::uint64_t ingress_sequence,
         std::uint64_t tick_stream_sequence,
         std::uint32_t instrument_id,
-        std::size_t registry_ordinal,
+        std::size_t ordinal,
         MarketEventKindV1 kind,
         std::int64_t event_time_ns,
         std::int64_t recv_realtime_ns,
@@ -255,7 +261,7 @@ private:
     std::uint64_t ingress_sequence_ = 0U;
     std::uint64_t tick_stream_sequence_ = 0U;
     std::uint32_t instrument_id_ = 0U;
-    std::size_t registry_ordinal_ =
+    std::size_t ordinal_ =
         std::numeric_limits<std::size_t>::max();
     MarketEventKindV1 kind_ = MarketEventKindV1::kShanghaiSnapshot;
     std::int64_t event_time_ns_ = 0;
@@ -305,6 +311,14 @@ using RealtimeHistoryAppendObserverV1 = void (*)(
     void* context,
     const RealtimeHistoryAppendObservationV1& observation) noexcept;
 
+// Called only after Store, KLine, latest projection, required external
+// projection, and directory availability have all succeeded. The callback
+// advances the global contiguous applied prefix; it must be nonblocking,
+// allocation-free, and noexcept.
+using RealtimeHistoryAppliedObserverV2 = bool (*)(
+    void* context,
+    std::uint64_t ingress_sequence) noexcept;
+
 struct RealtimeHistoryRuntimeConfigV1 final {
     std::array<std::uint32_t, kRealtimeHistorySourceCountV1>
         source_stream_ids{};
@@ -312,7 +326,9 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     // Maximum in-flight record handoffs per source×worker. The command ring
     // reserves one additional internal slot for the generation fence.
     std::size_t queue_capacity_per_source_worker = 0U;
-    const InstrumentRegistryV1* registry = nullptr;
+    // Borrowed stable directory. It owns all capacity slots for the complete
+    // runtime lifetime; Store and latest reads use the same fixed ordinals.
+    ObservedInstrumentDirectoryV2* directory = nullptr;
     IntradayInstrumentStoreConfigV1 intraday_store{};
     // Empty windows disable KLine aggregation. When enabled, trade_date must
     // be the server/operator date used by the decoder. maximum_bars may be
@@ -322,6 +338,8 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     std::shared_ptr<RealtimeAppliedRecordSinkV1> applied_record_sink;
     RealtimeHistoryAppendObserverV1 append_observer = nullptr;
     void* append_observer_context = nullptr;
+    RealtimeHistoryAppliedObserverV2 applied_observer = nullptr;
+    void* applied_observer_context = nullptr;
 };
 
 enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
@@ -375,9 +393,9 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
 // runtime validates per-source order and generation cuts; it does not invent
 // a second cross-source sequence authority. Internally there is one SPSC queue
 // per source×worker. An instrument is permanently owned by
-// instrument_id % worker_count, and IntradayInstrumentStoreV1 is the only
-// retained record container. The immutable registry referenced by config must
-// outlive the runtime and all generations/cursors derived from it.
+// ordinal % worker_count, and IntradayInstrumentStoreV1 is the only retained
+// record container. The observed directory referenced by config must outlive
+// the runtime and every snapshot/generation derived from it.
 class RealtimeHistoryRuntimeV1 final {
 public:
     RealtimeHistoryRuntimeV1(const RealtimeHistoryRuntimeV1&) = delete;

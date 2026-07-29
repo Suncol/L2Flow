@@ -1,8 +1,11 @@
 #include "l2flow/market/kline_aggregator_v1.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <new>
 #include <tuple>
 #include <type_traits>
@@ -109,6 +112,14 @@ struct SnapshotSeries final {
     std::shared_ptr<const BarSeries> series;
 };
 
+struct KLineCaptureIdentity final {};
+
+struct OwnerRowCaptureState final {
+    std::mutex mutex;
+    std::uint64_t frozen_generation = 0U;
+    std::uint32_t frozen_instrument_id = 0U;
+};
+
 [[nodiscard]] const SnapshotSeries* FindSnapshotSeries(
     const std::vector<SnapshotSeries>& series,
     const SeriesKey& key) noexcept {
@@ -163,14 +174,14 @@ struct SnapshotSeries final {
         common.origin.trade_date == 0U ||
         common.origin.source_sequence == 0U ||
         ingress_sequence == 0U || common.instrument_id == 0U ||
-        common.registry_ordinal ==
+        common.ordinal ==
             std::numeric_limits<std::size_t>::max()) {
         return KLineTradeProjectionV1::kInvalidTrade;
     }
     KLineTradeV1 projected{};
     projected.trade_date = common.origin.trade_date;
     projected.instrument_id = common.instrument_id;
-    projected.registry_ordinal = common.registry_ordinal;
+    projected.ordinal = common.ordinal;
     projected.event_time_ns_since_midnight =
         common.exchange_time.nanoseconds_since_midnight;
     projected.event_time_unix_ns =
@@ -180,8 +191,9 @@ struct SnapshotSeries final {
         static_cast<std::uint64_t>(fields.quantity.raw);
     projected.quantity_scale = fields.quantity.scale;
     // The decoded raw quantity and its scale remain exact even when the
-    // registry deliberately declines to infer an economic unit. Preserve
-    // kUnknown instead of inventing shares/lots or dropping a valid trade.
+    // observed directory has no reference metadata from which to infer an
+    // economic unit. Preserve kUnknown instead of inventing shares/lots or
+    // dropping a valid trade.
     projected.quantity_unit = common.quantity_unit;
     projected.event_sequence =
         native_event_sequence == 0U
@@ -433,11 +445,25 @@ public:
     std::uint64_t bar_count = 0U;
 };
 
+class KLineAggregatorCutV1::Impl final {
+public:
+    std::shared_ptr<const KLineCaptureIdentity> identity;
+    std::uint64_t generation = 0U;
+    std::uint64_t bar_count = 0U;
+    std::size_t represented_owner_rows = 0U;
+};
+
 KLineAggregatorSnapshotV1::KLineAggregatorSnapshotV1(
     std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 
 KLineAggregatorSnapshotV1::~KLineAggregatorSnapshotV1() = default;
+
+KLineAggregatorCutV1::KLineAggregatorCutV1(
+    std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+KLineAggregatorCutV1::~KLineAggregatorCutV1() = default;
 
 std::uint32_t KLineAggregatorSnapshotV1::trade_date() const noexcept {
     return impl_ == nullptr ? 0U : impl_->config.trade_date;
@@ -515,7 +541,8 @@ public:
         KLineAggregatorConfigV1 config,
         std::int64_t midnight_unix_ns)
         : config_(std::move(config)),
-          midnight_unix_ns_(midnight_unix_ns) {
+          midnight_unix_ns_(midnight_unix_ns),
+          capture_identity_(std::make_shared<KLineCaptureIdentity>()) {
         if (config_.instrument_capacity != 0U) {
             hot_instrument_ids_.resize(
                 config_.instrument_capacity, 0U);
@@ -523,6 +550,12 @@ public:
                 config_.instrument_capacity *
                     config_.windows.size(),
                 nullptr);
+            owner_row_capture_states_ =
+                std::make_unique<OwnerRowCaptureState[]>(
+                    config_.instrument_capacity);
+            frozen_series_.resize(
+                config_.instrument_capacity *
+                config_.windows.size());
         }
     }
 
@@ -554,21 +587,38 @@ public:
         const bool use_owner_index =
             owner_local_row !=
             std::numeric_limits<std::size_t>::max();
+        const bool owner_index_configured =
+            config_.instrument_capacity != 0U;
+        if (use_owner_index != owner_index_configured) {
+            // Production owner-index state and standalone generic state are
+            // intentionally disjoint. Mixing the two would create series
+            // that an exact owner cut cannot enumerate.
+            failed_ = true;
+            return KLineAppendErrorV1::kInvalidTrade;
+        }
         if (use_owner_index) {
             if (owner_local_row >=
                     config_.instrument_capacity ||
                 hot_instrument_ids_.size() !=
-                    config_.instrument_capacity) {
+                    config_.instrument_capacity ||
+                owner_row_capture_states_ == nullptr ||
+                frozen_series_.size() != hot_series_.size()) {
                 failed_ = true;
                 return KLineAppendErrorV1::kInvalidTrade;
             }
             std::uint32_t& indexed_instrument =
                 hot_instrument_ids_[owner_local_row];
-            if (indexed_instrument == 0U) {
-                indexed_instrument = trade.instrument_id;
-            } else if (indexed_instrument != trade.instrument_id) {
+            if (indexed_instrument != 0U &&
+                indexed_instrument != trade.instrument_id) {
                 failed_ = true;
                 return KLineAppendErrorV1::kInvalidTrade;
+            }
+            if (!FreezeOwnerRowIfNeeded(owner_local_row)) {
+                failed_ = true;
+                return KLineAppendErrorV1::kResourceExhausted;
+            }
+            if (indexed_instrument == 0U) {
+                indexed_instrument = trade.instrument_id;
             }
         }
 
@@ -603,6 +653,55 @@ public:
         } catch (...) {
             failed_ = true;
             return KLineAppendErrorV1::kResourceExhausted;
+        }
+    }
+
+    [[nodiscard]] bool FreezeOwnerRowIfNeeded(
+        std::size_t owner_local_row) noexcept {
+        const std::uint64_t generation =
+            active_capture_generation_.load(std::memory_order_acquire);
+        if (generation == 0U) {
+            return true;
+        }
+        OwnerRowCaptureState& capture =
+            owner_row_capture_states_[owner_local_row];
+        if (capture.frozen_generation == generation) {
+            return true;
+        }
+        try {
+            std::array<std::shared_ptr<BarSeries>,
+                       kKLineMaximumWindowsV1>
+                retired;
+            {
+                std::lock_guard<std::mutex> lock(capture.mutex);
+                if (capture.frozen_generation == generation) {
+                    return true;
+                }
+                capture.frozen_instrument_id =
+                    hot_instrument_ids_[owner_local_row];
+                const std::size_t row_offset =
+                    owner_local_row * config_.windows.size();
+                for (std::size_t window = 0U;
+                     window < config_.windows.size();
+                     ++window) {
+                    const std::size_t offset = row_offset + window;
+                    retired[window] =
+                        std::move(frozen_series_[offset]);
+                    const std::shared_ptr<BarSeries>* const holder =
+                        hot_series_[offset];
+                    frozen_series_[offset] =
+                        holder == nullptr
+                            ? std::shared_ptr<BarSeries>{}
+                            : *holder;
+                }
+                capture.frozen_generation = generation;
+            }
+            // Release superseded cut references outside the row critical
+            // section. The still-published prior generation owns its own
+            // references, so this is normally only a bounded refcount drop.
+            return true;
+        } catch (...) {
+            return false;
         }
     }
 
@@ -895,9 +994,15 @@ public:
 
     KLineAggregatorConfigV1 config_;
     std::int64_t midnight_unix_ns_ = 0;
+    std::shared_ptr<const KLineCaptureIdentity> capture_identity_;
     std::map<SeriesKey, std::shared_ptr<BarSeries>> series_;
     std::vector<std::uint32_t> hot_instrument_ids_;
     std::vector<std::shared_ptr<BarSeries>*> hot_series_;
+    std::unique_ptr<OwnerRowCaptureState[]> owner_row_capture_states_;
+    std::vector<std::shared_ptr<BarSeries>> frozen_series_;
+    std::atomic<std::uint64_t> active_capture_generation_{0U};
+    std::atomic<std::uint64_t> materialized_capture_generation_{0U};
+    std::uint64_t last_captured_generation_ = 0U;
     std::uint64_t bar_count_ = 0U;
     bool failed_ = false;
 };
@@ -966,6 +1071,13 @@ KLineCaptureErrorV1 KLineAggregatorV1::Capture(
     if (impl_ == nullptr || impl_->failed_) {
         return KLineCaptureErrorV1::kFailed;
     }
+    if (impl_->config_.instrument_capacity != 0U) {
+        // Owner-index production capture must use the constant-work marker
+        // API. Falling back to map enumeration would put O(active-series)
+        // work back on the realtime owner.
+        impl_->failed_ = true;
+        return KLineCaptureErrorV1::kFailed;
+    }
     try {
         auto snapshot_impl =
             std::make_unique<KLineAggregatorSnapshotV1::Impl>();
@@ -983,6 +1095,194 @@ KLineCaptureErrorV1 KLineAggregatorV1::Capture(
         return KLineCaptureErrorV1::kNone;
     } catch (...) {
         impl_->failed_ = true;
+        return KLineCaptureErrorV1::kResourceExhausted;
+    }
+}
+
+KLineCaptureErrorV1 KLineAggregatorV1::CaptureOwnerCut(
+    std::uint64_t generation,
+    std::size_t represented_owner_rows,
+    std::unique_ptr<KLineAggregatorCutV1>* output) noexcept {
+    if (output == nullptr) {
+        return KLineCaptureErrorV1::kNullOutput;
+    }
+    output->reset();
+    if (impl_ == nullptr || impl_->failed_ ||
+        impl_->config_.instrument_capacity == 0U ||
+        impl_->owner_row_capture_states_ == nullptr ||
+        generation == 0U ||
+        generation <= impl_->last_captured_generation_ ||
+        represented_owner_rows >
+            impl_->config_.instrument_capacity) {
+        return KLineCaptureErrorV1::kFailed;
+    }
+    const std::uint64_t active =
+        impl_->active_capture_generation_.load(
+            std::memory_order_acquire);
+    if (active !=
+        impl_->materialized_capture_generation_.load(
+            std::memory_order_acquire)) {
+        // One frozen slot exists per row. A later cut cannot overwrite it
+        // until the prior token has been materialized into independently
+        // owning shared_ptrs.
+        return KLineCaptureErrorV1::kFailed;
+    }
+    try {
+        auto cut_impl = std::make_unique<KLineAggregatorCutV1::Impl>();
+        cut_impl->identity = impl_->capture_identity_;
+        cut_impl->generation = generation;
+        cut_impl->bar_count = impl_->bar_count_;
+        cut_impl->represented_owner_rows = represented_owner_rows;
+        auto cut = std::unique_ptr<KLineAggregatorCutV1>(
+            new KLineAggregatorCutV1(std::move(cut_impl)));
+
+        impl_->active_capture_generation_.store(
+            generation, std::memory_order_release);
+        impl_->last_captured_generation_ = generation;
+        *output = std::move(cut);
+        return KLineCaptureErrorV1::kNone;
+    } catch (...) {
+        impl_->failed_ = true;
+        return KLineCaptureErrorV1::kResourceExhausted;
+    }
+}
+
+KLineCaptureErrorV1 KLineAggregatorV1::MaterializeOwnerCut(
+    const KLineAggregatorCutV1& cut,
+    std::shared_ptr<const KLineAggregatorSnapshotV1>* output)
+    noexcept {
+    if (output == nullptr) {
+        return KLineCaptureErrorV1::kNullOutput;
+    }
+    output->reset();
+    if (impl_ == nullptr || cut.impl_ == nullptr ||
+        impl_->config_.instrument_capacity == 0U ||
+        impl_->owner_row_capture_states_ == nullptr ||
+        cut.impl_->identity == nullptr ||
+        cut.impl_->identity.get() != impl_->capture_identity_.get() ||
+        cut.impl_->identity.owner_before(impl_->capture_identity_) ||
+        impl_->capture_identity_.owner_before(cut.impl_->identity) ||
+        cut.impl_->generation == 0U ||
+        cut.impl_->represented_owner_rows >
+            impl_->config_.instrument_capacity ||
+        impl_->active_capture_generation_.load(
+            std::memory_order_acquire) != cut.impl_->generation) {
+        return KLineCaptureErrorV1::kFailed;
+    }
+
+    try {
+        auto snapshot_impl =
+            std::make_unique<KLineAggregatorSnapshotV1::Impl>();
+        snapshot_impl->config = impl_->config_;
+        snapshot_impl->bar_count = cut.impl_->bar_count;
+        snapshot_impl->series.reserve(
+            cut.impl_->represented_owner_rows *
+            impl_->config_.windows.size());
+
+        std::uint64_t materialized_bar_count = 0U;
+        for (std::size_t row = 0U;
+             row < cut.impl_->represented_owner_rows;
+             ++row) {
+            std::uint32_t instrument_id = 0U;
+            std::array<std::shared_ptr<const BarSeries>,
+                       kKLineMaximumWindowsV1>
+                captured_series;
+            {
+                OwnerRowCaptureState& capture =
+                    impl_->owner_row_capture_states_[row];
+                std::lock_guard<std::mutex> lock(capture.mutex);
+                if (capture.frozen_generation ==
+                    cut.impl_->generation) {
+                    instrument_id = capture.frozen_instrument_id;
+                    const std::size_t row_offset =
+                        row * impl_->config_.windows.size();
+                    for (std::size_t window = 0U;
+                         window < impl_->config_.windows.size();
+                         ++window) {
+                        captured_series[window] =
+                            impl_->frozen_series_[
+                                row_offset + window];
+                    }
+                } else {
+                    if (capture.frozen_generation >
+                        cut.impl_->generation) {
+                        return KLineCaptureErrorV1::kFailed;
+                    }
+                    instrument_id =
+                        impl_->hot_instrument_ids_[row];
+                    const std::size_t row_offset =
+                        row * impl_->config_.windows.size();
+                    for (std::size_t window = 0U;
+                         window < impl_->config_.windows.size();
+                         ++window) {
+                        const std::shared_ptr<BarSeries>* const holder =
+                            impl_->hot_series_[row_offset + window];
+                        if (holder != nullptr) {
+                            captured_series[window] = *holder;
+                        }
+                    }
+                }
+            }
+
+            bool any_series = false;
+            for (std::size_t window = 0U;
+                 window < impl_->config_.windows.size();
+                 ++window) {
+                const auto& series = captured_series[window];
+                if (series == nullptr) {
+                    continue;
+                }
+                any_series = true;
+                if (instrument_id == 0U || series->bar_count == 0U ||
+                    materialized_bar_count >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            series->bar_count) {
+                    return KLineCaptureErrorV1::kFailed;
+                }
+                materialized_bar_count += series->bar_count;
+                SnapshotSeries item{};
+                item.key = SeriesKey{
+                    instrument_id,
+                    impl_->config_.windows[window].window_id};
+                item.series = series;
+                snapshot_impl->series.push_back(std::move(item));
+            }
+            if (instrument_id == 0U && any_series) {
+                return KLineCaptureErrorV1::kFailed;
+            }
+        }
+        if (materialized_bar_count != cut.impl_->bar_count) {
+            return KLineCaptureErrorV1::kFailed;
+        }
+        std::sort(
+            snapshot_impl->series.begin(),
+            snapshot_impl->series.end(),
+            [](const SnapshotSeries& left,
+               const SnapshotSeries& right) noexcept {
+                return left.key < right.key;
+            });
+        for (std::size_t index = 1U;
+             index < snapshot_impl->series.size();
+             ++index) {
+            const SeriesKey& previous =
+                snapshot_impl->series[index - 1U].key;
+            const SeriesKey& current =
+                snapshot_impl->series[index].key;
+            if (previous.instrument_id == current.instrument_id &&
+                previous.window_id == current.window_id) {
+                return KLineCaptureErrorV1::kFailed;
+            }
+        }
+
+        std::shared_ptr<const KLineAggregatorSnapshotV1> snapshot(
+            new KLineAggregatorSnapshotV1(
+                std::move(snapshot_impl)));
+        *output = std::move(snapshot);
+        impl_->materialized_capture_generation_.store(
+            cut.impl_->generation, std::memory_order_release);
+        return KLineCaptureErrorV1::kNone;
+    } catch (...) {
+        output->reset();
         return KLineCaptureErrorV1::kResourceExhausted;
     }
 }

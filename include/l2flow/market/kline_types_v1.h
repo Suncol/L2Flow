@@ -63,7 +63,7 @@ struct KLineEventOrderV1 final {
 struct KLineTradeV1 final {
     std::uint32_t trade_date = 0U;
     std::uint32_t instrument_id = 0U;
-    std::size_t registry_ordinal = 0U;
+    std::size_t ordinal = 0U;
     std::uint64_t event_time_ns_since_midnight = 0U;
     std::int64_t event_time_unix_ns = 0;
     std::int64_t price_p6 = 0;

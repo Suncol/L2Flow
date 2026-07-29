@@ -151,7 +151,7 @@ KLineQueryErrorV1 RealtimeKLineGenerationV1::GetLatestBar(
         return KLineQueryErrorV1::kInvalidArgument;
     }
     const std::uint32_t worker =
-        instrument_id % impl_->worker_count;
+        (instrument_id - 1U) % impl_->worker_count;
     if (worker >= impl_->worker_snapshots.size() ||
         impl_->worker_snapshots[worker] == nullptr) {
         return KLineQueryErrorV1::kNotFound;
@@ -173,7 +173,7 @@ KLineQueryErrorV1 RealtimeKLineGenerationV1::OpenInstrumentCursor(
         return KLineQueryErrorV1::kInvalidArgument;
     }
     const std::uint32_t worker =
-        instrument_id % impl_->worker_count;
+        (instrument_id - 1U) % impl_->worker_count;
     if (worker >= impl_->worker_snapshots.size() ||
         impl_->worker_snapshots[worker] == nullptr) {
         return KLineQueryErrorV1::kNotFound;

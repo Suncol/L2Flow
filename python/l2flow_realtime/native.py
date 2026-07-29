@@ -1,24 +1,31 @@
-"""ctypes wrapper around the stable, Python-independent native reader C ABI."""
+"""ctypes wrapper around the sealed realtime shared-memory C ABI V2."""
 
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
 import os
-import sys
 import threading
-import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple, Union
+from typing import Iterable, Optional, Sequence, Union
 
 from .models import (
+    CatalogScope,
     ClientClosedError,
     InconsistentReadError,
+    Instrument,
     InstrumentKey,
+    InstrumentLookupResult,
     InstrumentLookupStatus,
+    InstrumentStatus,
+    LatestKLine,
+    LatestSnapshot,
     LatestStatus,
+    LatestTick,
     NativeReaderError,
+    SelectionEnvelope,
+    SelectionScope,
     ServerState,
     SessionInfo,
     TickOverrunError,
@@ -31,6 +38,9 @@ from .wire import (
     SNAPSHOT_BYTES,
     TICK_BYTES,
     parse_instrument,
+    parse_kline_payload,
+    parse_snapshot_payload,
+    parse_tick_payload,
 )
 
 
@@ -43,81 +53,103 @@ UNAVAILABLE = 5
 OVERRUN = 6
 BUFFER_TOO_SMALL = 7
 INCONSISTENT_READ = 8
-_UINT32_MAX = 0xFFFFFFFF
-_UINT64_MAX = 0xFFFFFFFFFFFFFFFF
-_C_SIZE_MAX = ctypes.c_size_t(-1).value
-_INSTRUMENT_DELTA_PAGE_HEADER_BYTES = 4096
-_INSTRUMENT_DELTA_METADATA_BYTES = 736
-_PY_BYTES_FROM_STRING_AND_SIZE = (
-    ctypes.pythonapi.PyBytes_FromStringAndSize
-)
-_PY_BYTES_FROM_STRING_AND_SIZE.argtypes = [
-    ctypes.c_char_p,
-    ctypes.c_ssize_t,
-]
-_PY_BYTES_FROM_STRING_AND_SIZE.restype = ctypes.py_object
-_PY_BYTES_AS_STRING = ctypes.pythonapi.PyBytes_AsString
-_PY_BYTES_AS_STRING.argtypes = [ctypes.py_object]
-_PY_BYTES_AS_STRING.restype = ctypes.c_void_p
+
+MAX_BATCH_RECORDS = 1_048_576
 
 
 class _SessionInfoC(ctypes.Structure):
     _fields_ = [
         ("run_id", ctypes.c_uint8 * 16),
+        ("layout_digest", ctypes.c_uint8 * 32),
+        ("catalog_digest", ctypes.c_uint8 * 32),
         ("session_epoch", ctypes.c_uint64),
-        ("registry_version", ctypes.c_uint64),
-        ("registry_sha256", ctypes.c_uint8 * 32),
+        ("catalog_generation", ctypes.c_uint64),
+        ("data_state_generation", ctypes.c_uint64),
+        ("accepted_sequence", ctypes.c_uint64),
+        ("durable_sequence", ctypes.c_uint64),
+        ("applied_sequence", ctypes.c_uint64),
+        ("processing_lag_records", ctypes.c_uint64),
+        ("durability_lag_records", ctypes.c_uint64),
         ("tick_ring_capacity", ctypes.c_uint64),
         ("tick_highest_published_sequence", ctypes.c_uint64),
         ("tick_contiguous_published_sequence", ctypes.c_uint64),
         ("kline_generation", ctypes.c_uint64),
         ("heartbeat_monotonic_ns", ctypes.c_uint64),
+        ("published_records", ctypes.c_uint64),
         ("trade_date", ctypes.c_uint32),
         ("server_state", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
-        ("instrument_count", ctypes.c_uint32),
+        ("capacity", ctypes.c_uint32),
         ("window_count", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
+        ("catalog_scope", ctypes.c_uint32),
+        ("coverage_complete", ctypes.c_uint32),
+        ("bound_count", ctypes.c_uint32),
+        ("available_count", ctypes.c_uint32),
+        ("snapshot_available_count", ctypes.c_uint32),
+        ("tick_available_count", ctypes.c_uint32),
+        ("factor_eligible_count", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 4),
     ]
 
 
-assert ctypes.sizeof(_SessionInfoC) == 128
-
-
-class _InstrumentTickDeltaPageResultC(ctypes.Structure):
+class _SelectionEnvelopeC(ctypes.Structure):
     _fields_ = [
-        ("source_counts", ctypes.c_uint64 * 4),
-        ("last_ingress_sequence", ctypes.c_uint64),
-        ("last_tick_stream_sequence", ctypes.c_uint64),
-        ("last_source_sequences", ctypes.c_uint64 * 4),
+        ("run_id", ctypes.c_uint8 * 16),
+        ("catalog_digest", ctypes.c_uint8 * 32),
+        ("session_epoch", ctypes.c_uint64),
+        ("catalog_generation", ctypes.c_uint64),
+        ("data_state_generation", ctypes.c_uint64),
+        ("accepted_sequence", ctypes.c_uint64),
+        ("durable_sequence", ctypes.c_uint64),
+        ("applied_sequence", ctypes.c_uint64),
+        ("processing_lag_records", ctypes.c_uint64),
+        ("durability_lag_records", ctypes.c_uint64),
+        ("capacity", ctypes.c_uint32),
+        ("catalog_scope", ctypes.c_uint32),
+        ("coverage_complete", ctypes.c_uint32),
+        ("bound_count", ctypes.c_uint32),
+        ("available_count", ctypes.c_uint32),
+        ("snapshot_available_count", ctypes.c_uint32),
+        ("tick_available_count", ctypes.c_uint32),
+        ("factor_eligible_count", ctypes.c_uint32),
+        ("selection_scope", ctypes.c_uint32),
+        ("returned_row_count", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 2),
     ]
 
 
-assert ctypes.sizeof(_InstrumentTickDeltaPageResultC) == 80
+class _HealthC(ctypes.Structure):
+    _fields_ = [
+        ("session_epoch", ctypes.c_uint64),
+        ("heartbeat_monotonic_ns", ctypes.c_uint64),
+        ("server_state", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 2),
+    ]
+
+
+assert ctypes.sizeof(_SessionInfoC) == 256
+assert ctypes.sizeof(_SelectionEnvelopeC) == 160
+assert ctypes.sizeof(_HealthC) == 32
 
 
 @dataclass(frozen=True, slots=True)
 class NativeTickRead:
-    payloads: Tuple[bytes, ...]
+    payloads: tuple[bytes, ...]
     next_sequence: int
     observed_sequence: int
 
 
 @dataclass(frozen=True, slots=True)
-class NativeTickBlockRead:
-    data: bytes
-    record_count: int
-    next_sequence: int
-    observed_sequence: int
+class NativeSessionHealth:
+    session_epoch: int
+    heartbeat_monotonic_ns: int
+    server_state: ServerState
+    flags: int
 
-
-@dataclass(frozen=True, slots=True)
-class NativeInstrumentTickDeltaPageRead:
-    wire_records: bytes
-    source_counts: Tuple[int, int, int, int]
-    last_ingress_sequence: int
-    last_tick_stream_sequence: int
-    last_source_sequences: Tuple[int, int, int, int]
+    @property
+    def coverage_lost(self) -> bool:
+        return bool(self.flags & 0x1)
 
 
 def _candidate_library_paths() -> Iterable[str]:
@@ -128,8 +160,8 @@ def _candidate_library_paths() -> Iterable[str]:
     if discovered:
         yield discovered
     repository = Path(__file__).resolve().parents[2]
-    yield str(repository / "build-live-latest" / "libl2flow_shm_reader.so")
-    yield str(Path.cwd() / "build-live-latest" / "libl2flow_shm_reader.so")
+    for build_name in ("build", "build-live-latest"):
+        yield str(repository / build_name / "libl2flow_shm_reader.so")
 
 
 def load_native_library(
@@ -145,7 +177,6 @@ def load_native_library(
         try:
             library = ctypes.CDLL(candidate, use_errno=True)
             _bind_library(library)
-            _bind_instrument_delta_library(library)
             return library
         except (OSError, AttributeError) as error:
             failures.append(f"{candidate}: {error}")
@@ -155,47 +186,54 @@ def load_native_library(
 
 def _bind_library(library) -> None:
     handle = ctypes.c_void_p
-    library.l2flow_shm_reader_open_fd_v1.argtypes = [
+    byte_pointer = ctypes.POINTER(ctypes.c_uint8)
+
+    library.l2flow_shm_reader_open_fd_v2.argtypes = [
         ctypes.c_int,
         ctypes.POINTER(handle),
     ]
-    library.l2flow_shm_reader_open_fd_v1.restype = ctypes.c_int
-    library.l2flow_shm_reader_close_v1.argtypes = [handle]
-    library.l2flow_shm_reader_close_v1.restype = None
-    library.l2flow_shm_reader_session_v1.argtypes = [
+    library.l2flow_shm_reader_open_fd_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_close_v2.argtypes = [handle]
+    library.l2flow_shm_reader_close_v2.restype = None
+    library.l2flow_shm_reader_session_v2.argtypes = [
         handle,
         ctypes.POINTER(_SessionInfoC),
     ]
-    library.l2flow_shm_reader_session_v1.restype = ctypes.c_int
-    library.l2flow_shm_reader_instrument_v1.argtypes = [
+    library.l2flow_shm_reader_session_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_health_v2.argtypes = [
+        handle,
+        ctypes.POINTER(_HealthC),
+    ]
+    library.l2flow_shm_reader_health_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_instrument_v2.argtypes = [
         handle,
         ctypes.c_uint32,
         ctypes.c_void_p,
         ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_uint8),
+        byte_pointer,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+        byte_pointer,
         ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.POINTER(ctypes.c_uint8),
-        ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_size_t),
     ]
-    library.l2flow_shm_reader_instrument_v1.restype = ctypes.c_int
-    byte_pointer = ctypes.POINTER(ctypes.c_uint8)
-    library.l2flow_shm_reader_resolve_instruments_v1.argtypes = [
+    library.l2flow_shm_reader_instrument_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_resolve_instruments_v2.argtypes = [
         handle,
-        ctypes.POINTER(ctypes.c_uint8),
+        byte_pointer,
         ctypes.POINTER(byte_pointer),
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.POINTER(byte_pointer),
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_uint32),
-        ctypes.POINTER(ctypes.c_uint8),
+        byte_pointer,
     ]
-    library.l2flow_shm_reader_resolve_instruments_v1.restype = ctypes.c_int
+    library.l2flow_shm_reader_resolve_instruments_v2.restype = ctypes.c_int
     for name in (
-        "l2flow_shm_reader_latest_snapshots_v1",
-        "l2flow_shm_reader_latest_ticks_v1",
+        "l2flow_shm_reader_latest_snapshots_v2",
+        "l2flow_shm_reader_latest_ticks_v2",
     ):
         function = getattr(library, name)
         function.argtypes = [
@@ -204,20 +242,20 @@ def _bind_library(library) -> None:
             ctypes.c_size_t,
             ctypes.c_void_p,
             ctypes.c_size_t,
-            ctypes.POINTER(ctypes.c_uint8),
+            byte_pointer,
         ]
         function.restype = ctypes.c_int
-    library.l2flow_shm_reader_latest_klines_v1.argtypes = [
+    library.l2flow_shm_reader_latest_klines_v2.argtypes = [
         handle,
         ctypes.POINTER(ctypes.c_uint32),
         ctypes.POINTER(ctypes.c_uint32),
         ctypes.c_size_t,
         ctypes.c_void_p,
         ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_uint8),
+        byte_pointer,
     ]
-    library.l2flow_shm_reader_latest_klines_v1.restype = ctypes.c_int
-    library.l2flow_shm_reader_ticks_v1.argtypes = [
+    library.l2flow_shm_reader_latest_klines_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_ticks_v2.argtypes = [
         handle,
         ctypes.c_uint64,
         ctypes.c_void_p,
@@ -227,28 +265,16 @@ def _bind_library(library) -> None:
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.POINTER(ctypes.c_uint64),
     ]
-    library.l2flow_shm_reader_ticks_v1.restype = ctypes.c_int
-
-
-def _bind_instrument_delta_library(library) -> None:
-    function = (
-        library.l2flow_shm_reader_instrument_tick_delta_page_v2
-    )
-    function.argtypes = [
-        ctypes.c_int,
-        ctypes.c_uint64,
+    library.l2flow_shm_reader_ticks_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_select_instruments_v2.argtypes = [
+        handle,
         ctypes.c_uint32,
-        ctypes.c_uint64,
-        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
         ctypes.c_size_t,
-        ctypes.c_uint64,
-        ctypes.c_uint64,
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.POINTER(_InstrumentTickDeltaPageResultC),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(_SelectionEnvelopeC),
     ]
-    function.restype = ctypes.c_int
+    library.l2flow_shm_reader_select_instruments_v2.restype = ctypes.c_int
 
 
 def _raise_native(operation: str, code: int) -> None:
@@ -260,185 +286,137 @@ def _raise_native(operation: str, code: int) -> None:
         )
     if code == INCONSISTENT_READ:
         raise InconsistentReadError(
-            f"{operation}: no stable copy within the native retry bound"
+            f"{operation}: no coherent copy within the retry bound"
         )
-    detail = ""
-    if code == SYSTEM_ERROR:
-        error_number = ctypes.get_errno()
-        if error_number:
-            detail = os.strerror(error_number)
-    raise NativeReaderError(operation, code, detail)
-
-
-def _raise_delta_page_native(code: int) -> None:
     if code in (ABI_MISMATCH, LAYOUT_INVALID):
         raise WireFormatError(
-            "instrument delta page failed native wire validation"
+            f"{operation}: native reader rejected Wire V2 layout ({code})"
         )
-    _raise_native("instrument_tick_delta_page", code)
+    raise NativeReaderError(operation, code)
 
 
-def _close_native_handle(library, handle: ctypes.c_void_p) -> None:
-    address = handle.value
-    if not address:
-        return
-    handle.value = None
-    library.l2flow_shm_reader_close_v1(ctypes.c_void_p(address))
-
-
-def _validate_uint32(value, field: str, *, allow_zero: bool = True) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise TypeError(f"{field} must be an integer")
-    minimum = 0 if allow_zero else 1
-    if value < minimum or value > _UINT32_MAX:
-        qualifier = "uint32" if allow_zero else "positive uint32"
-        raise ValueError(f"{field} must be a {qualifier}")
-    return value
-
-
-def _validate_uint32_sequence(values: Sequence[int], field: str):
-    if isinstance(values, (str, bytes, bytearray)):
-        raise TypeError(f"{field} must be a sequence of integers")
-    result = tuple(_validate_uint32(value, field) for value in values)
-    if len(result) > _C_SIZE_MAX:
-        raise ValueError(f"{field} is too large")
-    return result
-
-
-def _validate_uint64(value, field: str) -> int:
+def _uint32(value, field: str) -> int:
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
         or value < 0
-        or value > _UINT64_MAX
+        or value > 0xFFFFFFFF
     ):
-        raise ValueError(f"{field} must fit uint64")
+        raise ValueError(f"{field} must fit uint32")
     return value
 
 
-class NativeInstrumentTickDeltaPageValidator:
-    """Validate one sealed V2 page and copy its wire rows into bytes."""
+def _batch(values: Sequence[int], field: str) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes, bytearray)):
+        raise TypeError(f"{field} must be a sequence of uint32 values")
+    result = tuple(_uint32(value, field) for value in values)
+    if len(result) > MAX_BATCH_RECORDS:
+        raise ValueError(
+            f"{field} exceeds the {MAX_BATCH_RECORDS}-record limit"
+        )
+    return result
 
-    def __init__(
-        self,
-        *,
-        library_path: Optional[Union[str, os.PathLike]] = None,
-        library=None,
-    ) -> None:
-        self._library = (
-            library
-            if library is not None
-            else load_native_library(library_path)
-        )
-        _bind_instrument_delta_library(self._library)
 
-    def validate(
-        self,
-        page_fd: int,
-        *,
-        expected_mapping_bytes: int,
-        expected_record_count: int,
-        expected_page_index: int,
-        expected_metadata: bytes,
-        prior_ingress_sequence: int,
-        prior_tick_stream_sequence: int,
-        prior_source_sequences: Sequence[int],
-    ) -> NativeInstrumentTickDeltaPageRead:
-        if (
-            not isinstance(page_fd, int)
-            or isinstance(page_fd, bool)
-            or page_fd < 0
-        ):
-            raise ValueError("page_fd must be a nonnegative integer")
-        expected_mapping_bytes = _validate_uint64(
-            expected_mapping_bytes, "expected_mapping_bytes"
-        )
-        expected_record_count = _validate_uint32(
-            expected_record_count,
-            "expected_record_count",
-            allow_zero=False,
-        )
-        expected_page_index = _validate_uint64(
-            expected_page_index, "expected_page_index"
-        )
-        if (
-            not isinstance(expected_metadata, bytes)
-            or len(expected_metadata) != _INSTRUMENT_DELTA_METADATA_BYTES
-        ):
-            raise ValueError("expected_metadata must be exactly 736 bytes")
-        prior_ingress_sequence = _validate_uint64(
-            prior_ingress_sequence, "prior_ingress_sequence"
-        )
-        prior_tick_stream_sequence = _validate_uint64(
-            prior_tick_stream_sequence,
-            "prior_tick_stream_sequence",
-        )
-        prior_sources = tuple(
-            _validate_uint64(value, "prior_source_sequences")
-            for value in prior_source_sequences
-        )
-        if len(prior_sources) != 4:
-            raise ValueError(
-                "prior_source_sequences must contain four values"
-            )
-        if (
-            expected_record_count > _C_SIZE_MAX // TICK_BYTES
-            or expected_record_count > sys.maxsize // TICK_BYTES
-        ):
-            raise ValueError("expected_record_count is too large")
-        output_bytes = expected_record_count * TICK_BYTES
-        expected_size = (
-            _INSTRUMENT_DELTA_PAGE_HEADER_BYTES + output_bytes
-        )
-        if expected_mapping_bytes != expected_size:
-            raise ValueError(
-                "expected_mapping_bytes is not canonical"
-            )
+def _bytes(array) -> bytes:
+    return bytes(bytearray(array))
 
-        wire_records = _PY_BYTES_FROM_STRING_AND_SIZE(None, output_bytes)
-        output_pointer = _PY_BYTES_AS_STRING(wire_records)
-        metadata_pointer = ctypes.c_char_p(expected_metadata)
-        prior_array = (ctypes.c_uint64 * 4)(*prior_sources)
-        result = _InstrumentTickDeltaPageResultC()
-        code = (
-            self._library
-            .l2flow_shm_reader_instrument_tick_delta_page_v2(
-                page_fd,
-                expected_mapping_bytes,
-                expected_record_count,
-                expected_page_index,
-                metadata_pointer,
-                len(expected_metadata),
-                prior_ingress_sequence,
-                prior_tick_stream_sequence,
-                prior_array,
-                output_pointer,
-                output_bytes,
-                ctypes.byref(result),
-            )
+
+def _session_from_c(value: _SessionInfoC) -> SessionInfo:
+    if any(value.reserved):
+        raise WireFormatError("session C result reserved fields are nonzero")
+    if value.coverage_complete != 0:
+        raise WireFormatError("Wire V2 coverage_complete must be zero")
+    if value.flags & ~0x3:
+        raise WireFormatError("session C result has unknown flags")
+    try:
+        return SessionInfo(
+            run_id=_bytes(value.run_id),
+            layout_digest=_bytes(value.layout_digest),
+            catalog_digest=_bytes(value.catalog_digest),
+            session_epoch=value.session_epoch,
+            catalog_generation=value.catalog_generation,
+            data_state_generation=value.data_state_generation,
+            accepted_sequence=value.accepted_sequence,
+            durable_sequence=value.durable_sequence,
+            applied_sequence=value.applied_sequence,
+            processing_lag_records=value.processing_lag_records,
+            durability_lag_records=value.durability_lag_records,
+            tick_ring_capacity=value.tick_ring_capacity,
+            tick_highest_published_sequence=(
+                value.tick_highest_published_sequence
+            ),
+            tick_contiguous_published_sequence=(
+                value.tick_contiguous_published_sequence
+            ),
+            kline_generation=value.kline_generation,
+            heartbeat_monotonic_ns=value.heartbeat_monotonic_ns,
+            published_records=value.published_records,
+            trade_date=value.trade_date,
+            server_state=ServerState(value.server_state),
+            flags=value.flags,
+            capacity=value.capacity,
+            window_count=value.window_count,
+            catalog_scope=CatalogScope(value.catalog_scope),
+            coverage_complete=False,
+            bound_count=value.bound_count,
+            available_count=value.available_count,
+            snapshot_available_count=value.snapshot_available_count,
+            tick_available_count=value.tick_available_count,
+            factor_eligible_count=value.factor_eligible_count,
         )
-        _raise_delta_page_native(code)
-        return NativeInstrumentTickDeltaPageRead(
-            wire_records=wire_records,
-            source_counts=tuple(result.source_counts),
-            last_ingress_sequence=result.last_ingress_sequence,
-            last_tick_stream_sequence=result.last_tick_stream_sequence,
-            last_source_sequences=tuple(result.last_source_sequences),
+    except ValueError as error:
+        raise WireFormatError(f"invalid session C result: {error}") from error
+
+
+def _selection_from_c(
+    value: _SelectionEnvelopeC,
+    instrument_ids: tuple[int, ...],
+) -> SelectionEnvelope:
+    if any(value.reserved):
+        raise WireFormatError(
+            "selection C result reserved fields are nonzero"
         )
+    if value.coverage_complete != 0:
+        raise WireFormatError("Wire V2 coverage_complete must be zero")
+    try:
+        return SelectionEnvelope(
+            run_id=_bytes(value.run_id),
+            catalog_digest=_bytes(value.catalog_digest),
+            session_epoch=value.session_epoch,
+            catalog_generation=value.catalog_generation,
+            data_state_generation=value.data_state_generation,
+            accepted_sequence=value.accepted_sequence,
+            durable_sequence=value.durable_sequence,
+            applied_sequence=value.applied_sequence,
+            processing_lag_records=value.processing_lag_records,
+            durability_lag_records=value.durability_lag_records,
+            capacity=value.capacity,
+            catalog_scope=CatalogScope(value.catalog_scope),
+            coverage_complete=False,
+            bound_count=value.bound_count,
+            available_count=value.available_count,
+            snapshot_available_count=value.snapshot_available_count,
+            tick_available_count=value.tick_available_count,
+            factor_eligible_count=value.factor_eligible_count,
+            selection_scope=SelectionScope(value.selection_scope),
+            returned_row_count=value.returned_row_count,
+            instrument_ids=instrument_ids,
+        )
+    except ValueError as error:
+        raise WireFormatError(
+            f"invalid selection C result: {error}"
+        ) from error
 
 
 class NativeReader:
-    """Owns one native read-only mmap handle."""
+    """One read-only Wire V2 mapping; close waits for in-flight methods."""
 
     def __init__(self, library, handle: ctypes.c_void_p) -> None:
         self._library = library
         self._handle = handle
         self._lock = threading.RLock()
-        self._tick_output = None
-        self._tick_output_bytes = 0
-        self._finalizer = weakref.finalize(
-            self, _close_native_handle, library, handle
-        )
+        self._closed = False
+        self._session_epoch: Optional[int] = None
 
     @classmethod
     def open_fd(
@@ -450,42 +428,47 @@ class NativeReader:
     ) -> "NativeReader":
         if not isinstance(fd, int) or isinstance(fd, bool) or fd < 0:
             raise ValueError("fd must be a nonnegative integer")
-        loaded = library if library is not None else load_native_library(
-            library_path
+        native_library = (
+            load_native_library(library_path)
+            if library is None
+            else library
         )
         if library is not None:
-            _bind_library(loaded)
+            _bind_library(native_library)
         handle = ctypes.c_void_p()
-        code = loaded.l2flow_shm_reader_open_fd_v1(
+        code = native_library.l2flow_shm_reader_open_fd_v2(
             fd, ctypes.byref(handle)
         )
+        _raise_native("open_fd_v2", code)
+        if not handle.value:
+            raise WireFormatError("open_fd_v2 returned a null reader")
+        reader = cls(native_library, handle)
         try:
-            _raise_native("open_fd", code)
-            if not handle.value:
-                raise NativeReaderError(
-                    "open_fd", LAYOUT_INVALID, "native handle is null"
-                )
-            return cls(loaded, handle)
+            reader.session()
+            return reader
         except BaseException:
-            _close_native_handle(loaded, handle)
+            reader.close()
             raise
 
     @property
     def closed(self) -> bool:
-        return not bool(self._handle.value)
+        return self._closed
 
     def _require_open(self) -> None:
-        if self.closed:
+        if self._closed:
             raise ClientClosedError("native reader is closed")
+
+    def _epoch(self) -> int:
+        if self._session_epoch is None:
+            return self.session().session_epoch
+        return self._session_epoch
 
     def close(self) -> None:
         with self._lock:
-            try:
-                _close_native_handle(self._library, self._handle)
-                self._finalizer.detach()
-            finally:
-                self._tick_output = None
-                self._tick_output_bytes = 0
+            if not self._closed:
+                self._library.l2flow_shm_reader_close_v2(self._handle)
+                self._handle = ctypes.c_void_p()
+                self._closed = True
 
     def __enter__(self) -> "NativeReader":
         self._require_open()
@@ -494,347 +477,528 @@ class NativeReader:
     def __exit__(self, _type, _value, _traceback) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
     def session(self) -> SessionInfo:
         with self._lock:
             self._require_open()
             output = _SessionInfoC()
-            code = self._library.l2flow_shm_reader_session_v1(
+            code = self._library.l2flow_shm_reader_session_v2(
                 self._handle, ctypes.byref(output)
             )
-            _raise_native("session", code)
+            _raise_native("session_v2", code)
+            result = _session_from_c(output)
+            if (
+                self._session_epoch is not None
+                and result.session_epoch != self._session_epoch
+            ):
+                raise WireFormatError(
+                    "mapped session_epoch changed in place"
+                )
+            self._session_epoch = result.session_epoch
+            return result
+
+    def health(self) -> NativeSessionHealth:
+        with self._lock:
+            self._require_open()
+            output = _HealthC()
+            code = self._library.l2flow_shm_reader_health_v2(
+                self._handle, ctypes.byref(output)
+            )
+            _raise_native("health_v2", code)
+            if (
+                any(output.reserved)
+                or output.flags & ~0x3
+                or output.session_epoch == 0
+            ):
+                raise WireFormatError(
+                    "health_v2 returned noncanonical fields"
+                )
             try:
-                server_state = ServerState(output.server_state)
+                state = ServerState(output.server_state)
             except ValueError as error:
                 raise WireFormatError(
-                    f"unsupported server_state {output.server_state}"
+                    f"health_v2 returned state {output.server_state}"
                 ) from error
             if (
-                output.reserved != 0
-                or not any(output.run_id)
-                or output.session_epoch == 0
-                or output.registry_version == 0
-                or output.tick_ring_capacity == 0
-                or output.tick_contiguous_published_sequence
-                > output.tick_highest_published_sequence
+                self._session_epoch is not None
+                and output.session_epoch != self._session_epoch
             ):
-                raise WireFormatError("native session metadata is invalid")
-            return SessionInfo(
-                run_id=bytes(output.run_id),
+                raise WireFormatError(
+                    "mapped session_epoch changed in place"
+                )
+            self._session_epoch = output.session_epoch
+            return NativeSessionHealth(
                 session_epoch=output.session_epoch,
-                registry_version=output.registry_version,
-                registry_sha256=bytes(output.registry_sha256),
-                tick_ring_capacity=output.tick_ring_capacity,
-                tick_highest_published_sequence=(
-                    output.tick_highest_published_sequence
-                ),
-                tick_contiguous_published_sequence=(
-                    output.tick_contiguous_published_sequence
-                ),
-                kline_generation=output.kline_generation,
                 heartbeat_monotonic_ns=output.heartbeat_monotonic_ns,
-                trade_date=output.trade_date,
-                server_state=server_state,
+                server_state=state,
                 flags=output.flags,
-                instrument_count=output.instrument_count,
-                window_count=output.window_count,
             )
 
-    def instrument(self, instrument_id: int):
-        instrument_id = _validate_uint32(
-            instrument_id, "instrument_id", allow_zero=False
-        )
+    def instrument(self, instrument_id: int) -> Instrument:
+        instrument_id = _uint32(instrument_id, "instrument_id")
         with self._lock:
             self._require_open()
             row = ctypes.create_string_buffer(INSTRUMENT_BYTES)
-            source_size = ctypes.c_size_t()
-            security_size = ctypes.c_size_t()
-            code = self._library.l2flow_shm_reader_instrument_v1(
+            source_written = ctypes.c_size_t()
+            id_written = ctypes.c_size_t()
+            item_status = ctypes.c_uint8()
+            function = self._library.l2flow_shm_reader_instrument_v2
+            code = function(
                 self._handle,
                 instrument_id,
                 row,
                 INSTRUMENT_BYTES,
                 None,
                 0,
-                ctypes.byref(source_size),
+                ctypes.byref(source_written),
                 None,
                 0,
-                ctypes.byref(security_size),
+                ctypes.byref(id_written),
+                ctypes.byref(item_status),
             )
-            if code not in (OK, BUFFER_TOO_SMALL):
-                _raise_native("instrument", code)
-            source = (
-                (ctypes.c_uint8 * source_size.value)()
-                if source_size.value
-                else None
-            )
-            security = (
-                (ctypes.c_uint8 * security_size.value)()
-                if security_size.value
-                else None
-            )
-            if code == BUFFER_TOO_SMALL:
-                code = self._library.l2flow_shm_reader_instrument_v1(
-                    self._handle,
-                    instrument_id,
-                    row,
-                    INSTRUMENT_BYTES,
-                    source,
-                    source_size.value,
-                    ctypes.byref(source_size),
-                    security,
-                    security_size.value,
-                    ctypes.byref(security_size),
+            if code == OK:
+                try:
+                    status = InstrumentStatus(item_status.value)
+                except ValueError as error:
+                    raise WireFormatError(
+                        f"instrument_v2 returned status {item_status.value}"
+                    ) from error
+                if status not in (
+                    InstrumentStatus.UNBOUND,
+                    InstrumentStatus.INVALID_ID,
+                ):
+                    raise WireFormatError(
+                        "bound instrument returned without its key buffers"
+                    )
+                return Instrument(
+                    session_epoch=self._epoch(),
+                    instrument_id=instrument_id,
+                    status=status,
                 )
-                _raise_native("instrument", code)
+            if code != BUFFER_TOO_SMALL:
+                _raise_native("instrument_v2", code)
+            try:
+                status = InstrumentStatus(item_status.value)
+            except ValueError as error:
+                raise WireFormatError(
+                    f"instrument_v2 returned status {item_status.value}"
+                ) from error
+            if status not in (
+                InstrumentStatus.AVAILABLE,
+                InstrumentStatus.BOUND_NO_DATA,
+            ):
+                raise WireFormatError(
+                    "BUFFER_TOO_SMALL returned for an unbound instrument"
+                )
+            source = (
+                (ctypes.c_uint8 * source_written.value)()
+                if source_written.value
+                else None
+            )
+            security_id = (
+                (ctypes.c_uint8 * id_written.value)()
+                if id_written.value
+                else None
+            )
+            second_source_written = ctypes.c_size_t()
+            second_id_written = ctypes.c_size_t()
+            second_status = ctypes.c_uint8()
+            code = function(
+                self._handle,
+                instrument_id,
+                row,
+                INSTRUMENT_BYTES,
+                source,
+                source_written.value,
+                ctypes.byref(second_source_written),
+                security_id,
+                id_written.value,
+                ctypes.byref(second_id_written),
+                ctypes.byref(second_status),
+            )
+            _raise_native("instrument_v2", code)
+            if (
+                second_source_written.value != source_written.value
+                or second_id_written.value != id_written.value
+            ):
+                raise WireFormatError(
+                    "instrument identity changed between two-pass reads"
+                )
+            try:
+                final_status = InstrumentStatus(second_status.value)
+            except ValueError as error:
+                raise WireFormatError(
+                    "instrument_v2 returned an invalid second-pass status"
+                ) from error
+            if final_status not in (
+                status,
+                InstrumentStatus.AVAILABLE,
+            ) or (
+                status is InstrumentStatus.AVAILABLE
+                and final_status is not InstrumentStatus.AVAILABLE
+            ):
+                raise WireFormatError(
+                    "instrument binding state regressed between reads"
+                )
             return parse_instrument(
-                row.raw,
-                bytes(source) if source is not None else b"",
-                bytes(security) if security is not None else b"",
+                bytes(row.raw),
+                b"" if source is None else _bytes(source),
+                b"" if security_id is None else _bytes(security_id),
+                session_epoch=self._epoch(),
+                requested_instrument_id=instrument_id,
+                status=final_status,
             )
 
     def resolve_instruments(
         self, keys: Sequence[InstrumentKey]
-    ) -> Tuple[Tuple[InstrumentLookupStatus, ...], Tuple[int, ...]]:
+    ) -> tuple[InstrumentLookupResult, ...]:
         if isinstance(keys, (str, bytes, bytearray)):
             raise TypeError("keys must be a sequence of InstrumentKey values")
         keys = tuple(keys)
-        if len(keys) > _C_SIZE_MAX:
-            raise ValueError("keys is too large")
-        for key in keys:
-            if not isinstance(key, InstrumentKey):
-                raise TypeError("each key must be an InstrumentKey")
+        if len(keys) > MAX_BATCH_RECORDS:
+            raise ValueError("key batch exceeds the record limit")
+        if any(not isinstance(key, InstrumentKey) for key in keys):
+            raise TypeError("every key must be an InstrumentKey")
+        if not keys:
+            return ()
         count = len(keys)
-        if count == 0:
-            with self._lock:
-                self._require_open()
-            return (), ()
-
-        byte_pointer = ctypes.POINTER(ctypes.c_uint8)
         markets = (ctypes.c_uint8 * count)(
-            *(int(key.market) for key in keys)
+            *(key.market for key in keys)
         )
-        source_pointers = (byte_pointer * count)()
-        source_lengths = (ctypes.c_size_t * count)()
-        security_pointers = (byte_pointer * count)()
-        security_lengths = (ctypes.c_size_t * count)()
-        # Keep every client-owned byte array alive through the native call.
-        source_buffers = []
-        security_buffers = []
-        for index, key in enumerate(keys):
-            source_lengths[index] = len(key.security_id_source)
-            if key.security_id_source:
-                source_buffer = (
-                    ctypes.c_uint8 * len(key.security_id_source)
-                ).from_buffer_copy(key.security_id_source)
-                source_buffers.append(source_buffer)
-                source_pointers[index] = ctypes.cast(
-                    source_buffer, byte_pointer
-                )
-            security_lengths[index] = len(key.security_id)
-            if key.security_id:
-                security_buffer = (
-                    ctypes.c_uint8 * len(key.security_id)
-                ).from_buffer_copy(key.security_id)
-                security_buffers.append(security_buffer)
-                security_pointers[index] = ctypes.cast(
-                    security_buffer, byte_pointer
-                )
-
+        byte_pointer = ctypes.POINTER(ctypes.c_uint8)
+        source_buffers = [
+            (ctypes.c_uint8 * len(key.security_id_source)).from_buffer_copy(
+                key.security_id_source
+            )
+            if key.security_id_source
+            else None
+            for key in keys
+        ]
+        id_buffers = [
+            (ctypes.c_uint8 * len(key.security_id)).from_buffer_copy(
+                key.security_id
+            )
+            if key.security_id
+            else None
+            for key in keys
+        ]
+        source_pointers = (byte_pointer * count)(
+            *(
+                ctypes.cast(value, byte_pointer) if value is not None else None
+                for value in source_buffers
+            )
+        )
+        id_pointers = (byte_pointer * count)(
+            *(
+                ctypes.cast(value, byte_pointer) if value is not None else None
+                for value in id_buffers
+            )
+        )
+        source_lengths = (ctypes.c_size_t * count)(
+            *(len(key.security_id_source) for key in keys)
+        )
+        id_lengths = (ctypes.c_size_t * count)(
+            *(len(key.security_id) for key in keys)
+        )
         instrument_ids = (ctypes.c_uint32 * count)()
         statuses = (ctypes.c_uint8 * count)()
         with self._lock:
             self._require_open()
-            code = (
-                self._library.l2flow_shm_reader_resolve_instruments_v1(
-                    self._handle,
-                    markets,
-                    source_pointers,
-                    source_lengths,
-                    security_pointers,
-                    security_lengths,
-                    count,
-                    instrument_ids,
-                    statuses,
-                )
-            )
-            _raise_native("resolve_instruments", code)
-
-        parsed_statuses = []
-        parsed_ids = []
-        for status_value, instrument_id in zip(
-            statuses, instrument_ids
-        ):
-            try:
-                status = InstrumentLookupStatus(status_value)
-            except ValueError as error:
-                raise WireFormatError(
-                    f"unsupported instrument lookup status {status_value}"
-                ) from error
-            if (
-                status is InstrumentLookupStatus.FOUND
-            ) != (instrument_id != 0):
-                raise WireFormatError(
-                    "instrument lookup status/ID mismatch"
-                )
-            parsed_statuses.append(status)
-            parsed_ids.append(instrument_id)
-        return tuple(parsed_statuses), tuple(parsed_ids)
-
-    def _latest(
-        self,
-        function_name: str,
-        instrument_ids: Sequence[int],
-        payload_bytes: int,
-    ) -> Tuple[Tuple[LatestStatus, ...], Tuple[Optional[bytes], ...]]:
-        instrument_ids = _validate_uint32_sequence(
-            instrument_ids, "instrument_id"
-        )
-        count = len(instrument_ids)
-        if count == 0:
-            with self._lock:
-                self._require_open()
-            return (), ()
-        if count > _C_SIZE_MAX // payload_bytes:
-            raise ValueError("latest batch byte size is too large")
-        ids = (ctypes.c_uint32 * count)(*instrument_ids)
-        outputs = (ctypes.c_uint8 * (count * payload_bytes))()
-        statuses = (ctypes.c_uint8 * count)()
-        with self._lock:
-            self._require_open()
-            function = getattr(self._library, function_name)
-            code = function(
+            code = self._library.l2flow_shm_reader_resolve_instruments_v2(
                 self._handle,
-                ids,
+                markets,
+                source_pointers,
+                source_lengths,
+                id_pointers,
+                id_lengths,
                 count,
-                outputs,
-                payload_bytes,
+                instrument_ids,
                 statuses,
             )
-            _raise_native(function_name, code)
-        parsed_statuses = []
-        payloads = []
-        raw = bytes(outputs)
-        for index, status_value in enumerate(statuses):
-            try:
-                status = LatestStatus(status_value)
-            except ValueError as error:
-                raise WireFormatError(
-                    f"unsupported latest status {status_value}"
-                ) from error
-            parsed_statuses.append(status)
-            if status is LatestStatus.AVAILABLE:
-                begin = index * payload_bytes
-                payloads.append(raw[begin : begin + payload_bytes])
-            else:
-                payloads.append(None)
-        return tuple(parsed_statuses), tuple(payloads)
+            _raise_native("resolve_instruments_v2", code)
+            epoch = self._epoch()
+            results = []
+            for index, key in enumerate(keys):
+                try:
+                    status = InstrumentLookupStatus(statuses[index])
+                    results.append(
+                        InstrumentLookupResult(
+                            session_epoch=epoch,
+                            key=key,
+                            status=status,
+                            instrument_id=instrument_ids[index],
+                        )
+                    )
+                except ValueError as error:
+                    raise WireFormatError(
+                        "invalid resolve_instruments_v2 item result"
+                    ) from error
+            return tuple(results)
 
-    def latest_snapshots(self, instrument_ids: Sequence[int]):
-        return self._latest(
-            "l2flow_shm_reader_latest_snapshots_v1",
-            instrument_ids,
+    def latest_snapshots(
+        self, instrument_ids: Sequence[int]
+    ) -> tuple[LatestSnapshot, ...]:
+        ids = _batch(instrument_ids, "instrument_id")
+        return self._latest_snapshots(ids)
+
+    def _latest_snapshots(
+        self, ids: tuple[int, ...]
+    ) -> tuple[LatestSnapshot, ...]:
+        raw, statuses, epoch = self._latest_records(
+            "latest_snapshots_v2",
+            self._library.l2flow_shm_reader_latest_snapshots_v2,
+            ids,
             SNAPSHOT_BYTES,
         )
+        results = []
+        for index, instrument_id in enumerate(ids):
+            status = _latest_status(statuses[index])
+            if status is LatestStatus.AVAILABLE:
+                payload = raw[
+                    index * SNAPSHOT_BYTES : (index + 1) * SNAPSHOT_BYTES
+                ]
+                common, last_price = parse_snapshot_payload(
+                    payload, instrument_id
+                )
+                results.append(
+                    LatestSnapshot(
+                        epoch,
+                        instrument_id,
+                        status,
+                        common,
+                        last_price,
+                        payload,
+                    )
+                )
+            else:
+                results.append(
+                    LatestSnapshot(epoch, instrument_id, status)
+                )
+        return tuple(results)
 
-    def latest_ticks(self, instrument_ids: Sequence[int]):
-        return self._latest(
-            "l2flow_shm_reader_latest_ticks_v1",
-            instrument_ids,
+    def latest_ticks(
+        self, instrument_ids: Sequence[int]
+    ) -> tuple[LatestTick, ...]:
+        ids = _batch(instrument_ids, "instrument_id")
+        raw, statuses, epoch = self._latest_records(
+            "latest_ticks_v2",
+            self._library.l2flow_shm_reader_latest_ticks_v2,
+            ids,
             TICK_BYTES,
         )
+        results = []
+        for index, instrument_id in enumerate(ids):
+            status = _latest_status(statuses[index])
+            if status is LatestStatus.AVAILABLE:
+                payload = raw[index * TICK_BYTES : (index + 1) * TICK_BYTES]
+                (
+                    common,
+                    price,
+                    quantity,
+                    action,
+                    side,
+                    projection_flags,
+                ) = parse_tick_payload(payload, instrument_id)
+                results.append(
+                    LatestTick(
+                        epoch,
+                        instrument_id,
+                        status,
+                        common,
+                        price,
+                        quantity,
+                        action,
+                        side,
+                        projection_flags,
+                        payload,
+                    )
+                )
+            else:
+                results.append(LatestTick(epoch, instrument_id, status))
+        return tuple(results)
 
     def latest_klines(
         self,
         instrument_ids: Sequence[int],
         window_ids: Sequence[int],
-    ):
-        instrument_ids = _validate_uint32_sequence(
-            instrument_ids, "instrument_id"
-        )
-        window_ids = _validate_uint32_sequence(window_ids, "window_id")
-        count = len(instrument_ids)
-        if count != len(window_ids):
-            raise ValueError("instrument_ids and window_ids must match")
-        if count == 0:
-            with self._lock:
-                self._require_open()
-            return (), ()
-        if count > _C_SIZE_MAX // KLINE_BYTES:
-            raise ValueError("KLine batch byte size is too large")
-        ids = (ctypes.c_uint32 * count)(*instrument_ids)
-        windows = (ctypes.c_uint32 * count)(*window_ids)
+    ) -> tuple[LatestKLine, ...]:
+        ids = _batch(instrument_ids, "instrument_id")
+        windows = _batch(window_ids, "window_id")
+        if len(ids) != len(windows):
+            raise ValueError("instrument_ids and window_ids lengths differ")
+        if not ids:
+            return ()
+        count = len(ids)
+        ids_c = (ctypes.c_uint32 * count)(*ids)
+        windows_c = (ctypes.c_uint32 * count)(*windows)
         outputs = (ctypes.c_uint8 * (count * KLINE_BYTES))()
         statuses = (ctypes.c_uint8 * count)()
         with self._lock:
             self._require_open()
-            code = self._library.l2flow_shm_reader_latest_klines_v1(
+            code = self._library.l2flow_shm_reader_latest_klines_v2(
                 self._handle,
-                ids,
-                windows,
+                ids_c,
+                windows_c,
                 count,
                 outputs,
                 KLINE_BYTES,
                 statuses,
             )
-            _raise_native("latest_klines", code)
-        raw = bytes(outputs)
-        parsed_statuses = []
-        payloads = []
-        for index, status_value in enumerate(statuses):
-            try:
-                status = LatestStatus(status_value)
-            except ValueError as error:
-                raise WireFormatError(
-                    f"unsupported latest status {status_value}"
-                ) from error
-            parsed_statuses.append(status)
+            _raise_native("latest_klines_v2", code)
+            epoch = self._epoch()
+            raw = _bytes(outputs)
+        results = []
+        for index, (instrument_id, window_id) in enumerate(
+            zip(ids, windows)
+        ):
+            status = _latest_status(statuses[index])
             if status is LatestStatus.AVAILABLE:
-                begin = index * KLINE_BYTES
-                payloads.append(raw[begin : begin + KLINE_BYTES])
+                payload = raw[
+                    index * KLINE_BYTES : (index + 1) * KLINE_BYTES
+                ]
+                fields = parse_kline_payload(
+                    payload, instrument_id, window_id
+                )
+                results.append(
+                    LatestKLine(
+                        session_epoch=epoch,
+                        instrument_id=instrument_id,
+                        window_id=window_id,
+                        status=status,
+                        wire_payload=payload,
+                        **fields,
+                    )
+                )
             else:
-                payloads.append(None)
-        return tuple(parsed_statuses), tuple(payloads)
+                results.append(
+                    LatestKLine(epoch, instrument_id, window_id, status)
+                )
+        return tuple(results)
 
-    def read_tick_block(
+    def _latest_records(
+        self,
+        operation: str,
+        function,
+        ids: tuple[int, ...],
+        stride: int,
+    ) -> tuple[bytes, ctypes.Array, int]:
+        if not ids:
+            return b"", (ctypes.c_uint8 * 0)(), self._epoch()
+        count = len(ids)
+        ids_c = (ctypes.c_uint32 * count)(*ids)
+        outputs = (ctypes.c_uint8 * (count * stride))()
+        statuses = (ctypes.c_uint8 * count)()
+        with self._lock:
+            self._require_open()
+            code = function(
+                self._handle,
+                ids_c,
+                count,
+                outputs,
+                stride,
+                statuses,
+            )
+            _raise_native(operation, code)
+            return _bytes(outputs), statuses, self._epoch()
+
+    def select_instruments(
+        self, scope: Union[SelectionScope, int]
+    ) -> SelectionEnvelope:
+        try:
+            selection_scope = SelectionScope(scope)
+        except (TypeError, ValueError) as error:
+            raise ValueError("scope is not a Wire V2 selection") from error
+        with self._lock:
+            self._require_open()
+            function = (
+                self._library.l2flow_shm_reader_select_instruments_v2
+            )
+            for _attempt in range(4):
+                required = ctypes.c_size_t()
+                envelope = _SelectionEnvelopeC()
+                code = function(
+                    self._handle,
+                    int(selection_scope),
+                    None,
+                    0,
+                    ctypes.byref(required),
+                    ctypes.byref(envelope),
+                )
+                if code == OK:
+                    if required.value != 0:
+                        raise WireFormatError(
+                            "selection succeeded without a sufficient buffer"
+                        )
+                    return _selection_from_c(envelope, ())
+                if code != BUFFER_TOO_SMALL:
+                    _raise_native("select_instruments_v2", code)
+                if required.value > MAX_BATCH_RECORDS:
+                    raise WireFormatError(
+                        "selection exceeds the Python record limit"
+                    )
+                ids = (ctypes.c_uint32 * required.value)()
+                second_required = ctypes.c_size_t()
+                second_envelope = _SelectionEnvelopeC()
+                code = function(
+                    self._handle,
+                    int(selection_scope),
+                    ids,
+                    required.value,
+                    ctypes.byref(second_required),
+                    ctypes.byref(second_envelope),
+                )
+                if code == BUFFER_TOO_SMALL:
+                    continue
+                _raise_native("select_instruments_v2", code)
+                if second_required.value > required.value:
+                    raise WireFormatError(
+                        "selection wrote beyond the supplied capacity"
+                    )
+                result_ids = tuple(
+                    ids[index]
+                    for index in range(second_required.value)
+                )
+                return _selection_from_c(second_envelope, result_ids)
+            raise InconsistentReadError(
+                "select_instruments_v2 changed across four two-pass reads"
+            )
+
+    def ticks(
         self, expected_sequence: int, maximum_records: int
-    ) -> NativeTickBlockRead:
+    ) -> NativeTickRead:
         if (
             not isinstance(expected_sequence, int)
             or isinstance(expected_sequence, bool)
             or expected_sequence <= 0
-            or expected_sequence > _UINT64_MAX
+            or expected_sequence > 0xFFFFFFFFFFFFFFFF
         ):
             raise ValueError("expected_sequence must be a positive uint64")
         if (
             not isinstance(maximum_records, int)
             or isinstance(maximum_records, bool)
             or maximum_records < 0
+            or maximum_records > MAX_BATCH_RECORDS
         ):
-            raise ValueError("maximum_records must be a nonnegative integer")
-        if maximum_records == 0:
-            with self._lock:
-                self._require_open()
-            return NativeTickBlockRead(b"", 0, expected_sequence, 0)
-        if (
-            maximum_records > sys.maxsize // TICK_BYTES
-            or maximum_records > _C_SIZE_MAX // TICK_BYTES
-        ):
-            raise ValueError("maximum_records is too large")
-        required_bytes = maximum_records * TICK_BYTES
+            raise ValueError("maximum_records is outside the record limit")
+        outputs = (
+            (ctypes.c_uint8 * (maximum_records * TICK_BYTES))()
+            if maximum_records
+            else None
+        )
         written = ctypes.c_size_t()
         next_sequence = ctypes.c_uint64(expected_sequence)
         observed_sequence = ctypes.c_uint64()
         with self._lock:
             self._require_open()
-            if self._tick_output_bytes < required_bytes:
-                self._tick_output = (
-                    ctypes.c_uint8 * required_bytes
-                )()
-                self._tick_output_bytes = required_bytes
-            code = self._library.l2flow_shm_reader_ticks_v1(
+            code = self._library.l2flow_shm_reader_ticks_v2(
                 self._handle,
                 expected_sequence,
-                self._tick_output,
+                outputs,
                 TICK_BYTES,
                 maximum_records,
                 ctypes.byref(written),
@@ -845,38 +1009,25 @@ class NativeReader:
                 raise TickOverrunError(
                     expected_sequence, observed_sequence.value
                 )
-            _raise_native("read_ticks", code)
+            _raise_native("ticks_v2", code)
             if written.value > maximum_records:
-                raise WireFormatError(
-                    "native tick reader exceeded output bound"
-                )
-            if next_sequence.value != expected_sequence + written.value:
-                raise WireFormatError(
-                    "native tick reader returned a bad cursor"
-                )
-            raw = ctypes.string_at(
-                self._tick_output,
-                written.value * TICK_BYTES,
+                raise WireFormatError("ticks_v2 exceeded output capacity")
+            raw = b"" if outputs is None else _bytes(outputs)
+            payloads = tuple(
+                raw[index * TICK_BYTES : (index + 1) * TICK_BYTES]
+                for index in range(written.value)
             )
-        return NativeTickBlockRead(
-            raw,
-            written.value,
-            next_sequence.value,
-            observed_sequence.value,
-        )
+            return NativeTickRead(
+                payloads,
+                next_sequence.value,
+                observed_sequence.value,
+            )
 
-    def read_ticks(
-        self, expected_sequence: int, maximum_records: int
-    ) -> NativeTickRead:
-        block = self.read_tick_block(expected_sequence, maximum_records)
-        payloads = tuple(
-            block.data[
-                index * TICK_BYTES : (index + 1) * TICK_BYTES
-            ]
-            for index in range(block.record_count)
-        )
-        return NativeTickRead(
-            payloads,
-            block.next_sequence,
-            block.observed_sequence,
-        )
+
+def _latest_status(value: int) -> LatestStatus:
+    try:
+        return LatestStatus(value)
+    except ValueError as error:
+        raise WireFormatError(
+            f"latest reader returned unsupported status {value}"
+        ) from error

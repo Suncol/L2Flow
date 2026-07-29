@@ -4,14 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "l2flow-realtime"
-version = "0.1.0"
-description = "Read-only shared-memory client for L2Flow realtime market data"
+version = "2.0.0"
+description = "Observed-universe read-only client for L2Flow Wire V2"
 requires-python = ">=3.10"
 dependencies = []
-
-[project.optional-dependencies]
-arrow = ["pyarrow"]
-polars = ["polars"]
 
 [tool.setuptools]
 packages = ["l2flow_realtime"]

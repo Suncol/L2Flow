@@ -1,6 +1,6 @@
 #include "l2flow/market/intraday_instrument_store_v1.h"
 
-#include "l2flow/market/instrument_registry.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/market_types_v1.h"
 #include "l2flow/market/realtime_history_v1.h"
 
@@ -130,6 +130,18 @@ static_assert(
     }
     *output = left + right;
     return true;
+}
+
+[[nodiscard]] std::size_t BoundRowsForWorker(
+    std::size_t bound_count,
+    std::uint32_t worker,
+    std::uint32_t worker_count) noexcept {
+    if (worker_count == 0U || worker >= worker_count ||
+        bound_count <= worker) {
+        return 0U;
+    }
+    return 1U +
+           (bound_count - 1U - worker) / worker_count;
 }
 
 [[nodiscard]] constexpr std::size_t AlignUp(
@@ -409,29 +421,6 @@ struct MutableInstrumentRow final {
     const RealtimeHistoryRecordV1* latest_tick = nullptr;
 };
 
-struct alignas(64) WorkerAccounting final {
-    // Credits are normally touched by this worker only. Another worker may
-    // atomically reclaim unused credits on the rare global-cap slow path.
-    std::atomic<std::uint64_t> record_credits{0U};
-    std::atomic<std::uint64_t> byte_credits{0U};
-    std::atomic<std::uint64_t> appended_records{0U};
-    std::atomic<std::uint64_t> accounted_record_bytes{0U};
-    std::atomic<std::uint64_t> allocated_segment_bytes{0U};
-    std::atomic<std::uint64_t> allocated_segments{0U};
-};
-
-struct WorkerState final {
-    std::vector<MutableInstrumentRow> rows;
-    std::uint64_t last_captured_generation = 0U;
-    WorkerAccounting accounting;
-};
-
-struct OrdinalEntry final {
-    std::uint32_t instrument_id = 0U;
-    std::uint32_t worker = 0U;
-    std::size_t local_index = 0U;
-};
-
 struct CapturedLane final {
     const ArenaSegment* head = nullptr;
     const ArenaSegment* tail = nullptr;
@@ -450,18 +439,78 @@ struct CapturedInstrumentRow final {
     const RealtimeHistoryRecordV1* latest_tick = nullptr;
 };
 
+void CaptureMutableRow(
+    const MutableInstrumentRow& row,
+    CapturedInstrumentRow* output) noexcept {
+    *output = CapturedInstrumentRow{};
+    output->instrument_id = row.instrument_id;
+    output->ordinal = row.ordinal;
+    output->latest_snapshot = row.latest_snapshot;
+    output->latest_tick = row.latest_tick;
+    for (std::size_t source = 0U;
+         source < row.lanes.size();
+         ++source) {
+        const MutableLane& lane = row.lanes[source];
+        output->lanes[source] = CapturedLane{
+            lane.head,
+            lane.tail,
+            lane.tail == nullptr ? 0U : lane.tail->header_count,
+            lane.record_count,
+            lane.accounted_bytes,
+            lane.allocated_segment_bytes,
+            lane.segment_count};
+    }
+}
+
+struct alignas(64) WorkerAccounting final {
+    // Credits are normally touched by this worker only. Another worker may
+    // atomically reclaim unused credits on the rare global-cap slow path.
+    std::atomic<std::uint64_t> record_credits{0U};
+    std::atomic<std::uint64_t> byte_credits{0U};
+    std::atomic<std::uint64_t> appended_records{0U};
+    std::atomic<std::uint64_t> accounted_record_bytes{0U};
+    std::atomic<std::uint64_t> allocated_segment_bytes{0U};
+    std::atomic<std::uint64_t> allocated_segments{0U};
+};
+
+struct WorkerState final {
+    std::vector<MutableInstrumentRow> rows;
+    std::uint64_t last_captured_generation = 0U;
+    // CaptureWorker advances this only after all four cut fences have reached
+    // the owner. The owner then preserves each row lazily on its first
+    // post-cut append instead of stopping to copy its whole bound partition.
+    std::atomic<std::uint64_t> active_capture_generation{0U};
+    WorkerAccounting accounting;
+};
+
+struct OrdinalEntry final {
+    std::uint32_t instrument_id = 0U;
+    std::uint32_t worker = 0U;
+    std::size_t local_index = 0U;
+};
+
+struct RowCaptureState final {
+    std::mutex mutex;
+    std::uint64_t frozen_generation = 0U;
+    CapturedInstrumentRow frozen{};
+};
+
 struct SessionState final {
     IntradayInstrumentStoreConfigV1 config{};
     std::uint32_t worker_count = 0U;
-    const InstrumentRegistryV1* registry = nullptr;
-    std::uint64_t registry_version = 0U;
-    l2flow::common::Sha256Digest registry_sha256{};
+    const ObservedInstrumentDirectoryV2* directory = nullptr;
+    std::uint64_t directory_session_epoch = 0U;
+    std::size_t capacity = 0U;
     std::uint64_t session_epoch = 0U;
     std::array<std::uint32_t, kIntradayInstrumentStoreSourceCountV1>
         source_stream_ids{};
     std::vector<std::unique_ptr<WorkerState>> workers;
-    // Exact registry-ordinal order: ascending instrument_id.
+    // Exact directory-ordinal order: instrument_id == ordinal + 1.
     std::vector<OrdinalEntry> ordinals;
+    // Fixed capacity storage allocated before ingress starts. The generation
+    // builder and one permanent row owner synchronize only for a constant-size
+    // endpoint copy; no worker performs an O(bound_count) marker capture.
+    std::unique_ptr<RowCaptureState[]> row_capture_states;
     // These authorities include both consumed quota and outstanding
     // worker-local credits. Hot appends consume local credits; the global
     // atomics and quota mutex are touched only on block refill/reclaim.
@@ -582,14 +631,18 @@ void ReturnQuota(
 
 struct WorkerSliceData final {
     std::shared_ptr<SessionState> session;
+    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
     std::uint32_t worker = 0U;
     std::uint64_t generation = 0U;
-    std::vector<CapturedInstrumentRow> rows;
+    std::size_t catalog_row_count = 0U;
 };
 
 struct GenerationData final {
     RealtimeHistoryWatermarkV1 watermark{};
     std::shared_ptr<const SessionState> session;
+    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot;
     std::vector<CapturedInstrumentRow> rows;
     std::uint64_t record_count = 0U;
     std::uint64_t accounted_record_bytes = 0U;
@@ -657,8 +710,13 @@ void FillSummary(
            left.ingress_sequence_exclusive ==
                right.ingress_sequence_exclusive &&
            left.recv_monotonic_cut_ns == right.recv_monotonic_cut_ns &&
-           left.registry_version == right.registry_version &&
-           left.registry_sha256 == right.registry_sha256 &&
+           left.catalog_snapshot == right.catalog_snapshot &&
+           left.processing_progress.accepted_sequence ==
+               right.processing_progress.accepted_sequence &&
+           left.processing_progress.durable_sequence ==
+               right.processing_progress.durable_sequence &&
+           left.processing_progress.applied_sequence ==
+               right.processing_progress.applied_sequence &&
            same_sources &&
            left.input_identity_sha256 == right.input_identity_sha256;
 }
@@ -1481,6 +1539,12 @@ IntradayInstrumentStoreGenerationV1::store_session_epoch()
     return impl_->data->session->session_epoch;
 }
 
+const std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>&
+IntradayInstrumentStoreGenerationV1::catalog_snapshot()
+    const noexcept {
+    return impl_->data->catalog_snapshot;
+}
+
 IntradayInstrumentStoreQueryErrorV1
 IntradayInstrumentStoreGenerationV1::Find(
     std::uint32_t instrument_id,
@@ -1658,6 +1722,11 @@ IntradayInstrumentStoreWorkerSliceV1::
 IntradayInstrumentStoreWorkerSliceV1::
     ~IntradayInstrumentStoreWorkerSliceV1() = default;
 
+std::size_t IntradayInstrumentStoreWorkerSliceV1::
+    captured_instrument_count() const noexcept {
+    return impl_ == nullptr ? 0U : impl_->data.catalog_row_count;
+}
+
 IntradayInstrumentStoreV1::IntradayInstrumentStoreV1(
     std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -1671,7 +1740,7 @@ IntradayInstrumentStoreV1::Create(
     std::array<std::uint32_t,
                kIntradayInstrumentStoreSourceCountV1>
         source_stream_ids,
-    const InstrumentRegistryV1* registry,
+    const ObservedInstrumentDirectoryV2* directory,
     std::unique_ptr<IntradayInstrumentStoreV1>* output) noexcept {
     if (output == nullptr) {
         return IntradayInstrumentStoreCreateErrorV1::kNullOutput;
@@ -1690,7 +1759,10 @@ IntradayInstrumentStoreV1::Create(
         }
     }
     if (worker_count == 0U || worker_count > 256U ||
-        registry == nullptr || registry->empty() ||
+        directory == nullptr || directory->capacity() == 0U ||
+        directory->capacity() >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max()) ||
         !valid_source_ids ||
         config.segment_target_bytes <
             kIntradayInstrumentStoreMinimumSegmentBytesV1 ||
@@ -1715,9 +1787,10 @@ IntradayInstrumentStoreV1::Create(
         auto session = std::make_shared<SessionState>();
         session->config = config;
         session->worker_count = worker_count;
-        session->registry = registry;
-        session->registry_version = registry->registry_version();
-        session->registry_sha256 = registry->registry_sha256();
+        session->directory = directory;
+        session->directory_session_epoch =
+            directory->session_epoch();
+        session->capacity = directory->capacity();
         session->session_epoch = session_epoch;
         session->source_stream_ids = source_stream_ids;
         session->workers.reserve(worker_count);
@@ -1725,34 +1798,15 @@ IntradayInstrumentStoreV1::Create(
             session->workers.push_back(std::make_unique<WorkerState>());
         }
 
-        session->ordinals.reserve(registry->size());
-        for (const InstrumentRegistryEntryV1& entry :
-             registry->entries()) {
-            session->ordinals.push_back(
-                OrdinalEntry{entry.instrument_id, 0U, 0U});
-        }
-        std::sort(
-            session->ordinals.begin(),
-            session->ordinals.end(),
-            [](const OrdinalEntry& left,
-               const OrdinalEntry& right) noexcept {
-                return left.instrument_id < right.instrument_id;
-            });
-
+        session->ordinals.resize(session->capacity);
+        session->row_capture_states =
+            std::make_unique<RowCaptureState[]>(
+                session->capacity);
         std::vector<std::size_t> worker_sizes(worker_count, 0U);
-        for (std::size_t registry_ordinal = 0U;
-             registry_ordinal < session->ordinals.size();
-             ++registry_ordinal) {
-            const OrdinalEntry& ordinal =
-                session->ordinals[registry_ordinal];
-            const InstrumentRegistryLookupResultV1 lookup =
-                registry->LookupById(ordinal.instrument_id);
-            if (!lookup.known() ||
-                lookup.registry_ordinal != registry_ordinal) {
-                return IntradayInstrumentStoreCreateErrorV1::
-                    kInvalidConfiguration;
-            }
-            ++worker_sizes[ordinal.instrument_id % worker_count];
+        for (std::size_t ordinal = 0U;
+             ordinal < session->capacity;
+             ++ordinal) {
+            ++worker_sizes[ordinal % worker_count];
         }
         for (std::uint32_t worker = 0U; worker < worker_count; ++worker) {
             session->workers[worker]->rows.reserve(worker_sizes[worker]);
@@ -1761,7 +1815,10 @@ IntradayInstrumentStoreV1::Create(
              ordinal_index < session->ordinals.size();
              ++ordinal_index) {
             OrdinalEntry& ordinal = session->ordinals[ordinal_index];
-            ordinal.worker = ordinal.instrument_id % worker_count;
+            ordinal.instrument_id =
+                static_cast<std::uint32_t>(ordinal_index + 1U);
+            ordinal.worker = static_cast<std::uint32_t>(
+                ordinal_index % worker_count);
             WorkerState& worker = *session->workers[ordinal.worker];
             ordinal.local_index = worker.rows.size();
             worker.rows.emplace_back(
@@ -1784,7 +1841,8 @@ IntradayInstrumentStoreV1::Create(
                     session->ordinals.size()),
                 static_cast<std::uint64_t>(
                     sizeof(OrdinalEntry) +
-                    sizeof(MutableInstrumentRow)),
+                    sizeof(MutableInstrumentRow) +
+                    sizeof(RowCaptureState)),
                 &term) ||
             !CheckedAdd(base_bytes, term, &base_bytes)) {
             return IntradayInstrumentStoreCreateErrorV1::
@@ -1811,7 +1869,7 @@ IntradayInstrumentStoreV1::Create(
 
 IntradayInstrumentStoreQueryErrorV1
 IntradayInstrumentStoreV1::ResolveRouteToken(
-    std::size_t registry_ordinal,
+    std::size_t ordinal,
     std::uint32_t instrument_id,
     InstrumentRouteTokenV1* output) const noexcept {
     if (output == nullptr) {
@@ -1822,15 +1880,22 @@ IntradayInstrumentStoreV1::ResolveRouteToken(
         return IntradayInstrumentStoreQueryErrorV1::kInvalidArgument;
     }
     const SessionState& session = *impl_->session;
-    if (registry_ordinal >= session.ordinals.size() ||
-        session.ordinals[registry_ordinal].instrument_id !=
-            instrument_id) {
+    if (ordinal >= session.capacity ||
+        instrument_id !=
+            static_cast<std::uint32_t>(ordinal + 1U)) {
         return IntradayInstrumentStoreQueryErrorV1::kNotFound;
     }
-    const OrdinalEntry& entry = session.ordinals[registry_ordinal];
+    std::size_t resolved_ordinal = 0U;
+    if (session.directory->ResolveBoundId(
+            instrument_id, &resolved_ordinal) !=
+            ObservedInstrumentDirectoryErrorV2::kNone ||
+        resolved_ordinal != ordinal) {
+        return IntradayInstrumentStoreQueryErrorV1::kNotFound;
+    }
+    const OrdinalEntry& entry = session.ordinals[ordinal];
     *output = InstrumentRouteTokenV1{
         entry.instrument_id,
-        registry_ordinal,
+        ordinal,
         entry.worker,
         entry.local_index,
         session.session_epoch};
@@ -1869,7 +1934,7 @@ IntradayInstrumentStoreV1::Append(
         input.ingress_sequence() ==
             std::numeric_limits<std::uint64_t>::max() ||
         input.instrument_id() == 0U ||
-        input.registry_ordinal() ==
+        input.ordinal() ==
             std::numeric_limits<std::size_t>::max() ||
         input.accounted_record_bytes() == 0U ||
         !KindBelongsToSource(input.kind(), input.source_slot()) ||
@@ -1880,9 +1945,9 @@ IntradayInstrumentStoreV1::Append(
         input.source_stream_id() !=
             session.source_stream_ids[input.source_slot()] ||
         route.session_epoch != session.session_epoch ||
-        route.registry_ordinal != input.registry_ordinal() ||
+        route.ordinal != input.ordinal() ||
         route.instrument_id != input.instrument_id() ||
-        route.registry_ordinal >= session.ordinals.size()) {
+        route.ordinal >= session.ordinals.size()) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
     }
@@ -1893,7 +1958,7 @@ IntradayInstrumentStoreV1::Append(
     }
 
     const OrdinalEntry& ordinal =
-        session.ordinals[route.registry_ordinal];
+        session.ordinals[route.ordinal];
     if (ordinal.instrument_id != route.instrument_id ||
         ordinal.worker != route.worker ||
         ordinal.local_index != route.worker_local_row) {
@@ -1908,10 +1973,12 @@ IntradayInstrumentStoreV1::Append(
     MutableInstrumentRow& row =
         worker_state.rows[route.worker_local_row];
     if (row.instrument_id != input.instrument_id() ||
-        row.ordinal != input.registry_ordinal()) {
+        row.ordinal != input.ordinal()) {
         return impl_->FailAppend(
             IntradayInstrumentStoreAppendErrorV1::kInvalidRecord);
     }
+    RowCaptureState& capture_state =
+        session.row_capture_states[row.ordinal];
     MutableLane& lane = row.lanes[input.source_slot()];
     if (lane.record_count != 0U &&
         (input.source_sequence() <= lane.last_source_sequence ||
@@ -2005,6 +2072,25 @@ IntradayInstrumentStoreV1::Append(
     const std::uint64_t accounted_record_bytes =
         input.accounted_record_bytes();
 
+    const std::uint64_t capture_generation =
+        worker_state.active_capture_generation.load(
+            std::memory_order_acquire);
+    if (capture_generation != 0U &&
+        capture_state.frozen_generation != capture_generation) {
+        // Only the permanent row owner writes frozen_generation. The builder
+        // takes this same mutex and never writes the tag. Rechecking under
+        // the lock linearizes the builder-first and owner-first cases; all
+        // later appends in this generation stay on the zero-lock fast path.
+        std::lock_guard<std::mutex> row_capture_lock(
+            capture_state.mutex);
+        if (capture_state.frozen_generation !=
+            capture_generation) {
+            CaptureMutableRow(row, &capture_state.frozen);
+            capture_state.frozen_generation =
+                capture_generation;
+        }
+    }
+
     std::visit(
         [&placement](auto&& value) noexcept {
             using Event = std::decay_t<decltype(value)>;
@@ -2080,6 +2166,8 @@ IntradayInstrumentStoreGenerationErrorV1
 IntradayInstrumentStoreV1::CaptureWorker(
     std::uint32_t worker,
     std::uint64_t generation,
+    const std::shared_ptr<
+        const ObservedInstrumentCatalogSnapshotV2>& catalog_snapshot,
     std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>* output)
     noexcept {
     if (output == nullptr) {
@@ -2093,6 +2181,14 @@ IntradayInstrumentStoreV1::CaptureWorker(
     if (worker >= session.worker_count) {
         return IntradayInstrumentStoreGenerationErrorV1::kInvalidWorker;
     }
+    if (catalog_snapshot == nullptr ||
+        catalog_snapshot->session_epoch() !=
+            session.directory_session_epoch ||
+        catalog_snapshot->capacity() != session.capacity ||
+        catalog_snapshot->bound_count() > session.capacity) {
+        return IntradayInstrumentStoreGenerationErrorV1::
+            kInvalidWatermark;
+    }
     WorkerState& worker_state = *session.workers[worker];
     if (generation == 0U ||
         generation <= worker_state.last_captured_generation) {
@@ -2103,38 +2199,27 @@ IntradayInstrumentStoreV1::CaptureWorker(
     try {
         WorkerSliceData slice{};
         slice.session = impl_->session;
+        slice.catalog_snapshot = catalog_snapshot;
         slice.worker = worker;
         slice.generation = generation;
-        slice.rows.reserve(worker_state.rows.size());
-        for (const MutableInstrumentRow& row : worker_state.rows) {
-            CapturedInstrumentRow captured{};
-            captured.instrument_id = row.instrument_id;
-            captured.ordinal = row.ordinal;
-            captured.latest_snapshot = row.latest_snapshot;
-            captured.latest_tick = row.latest_tick;
-            for (std::size_t source = 0U;
-                 source < row.lanes.size();
-                 ++source) {
-                const MutableLane& lane = row.lanes[source];
-                captured.lanes[source] = CapturedLane{
-                    lane.head,
-                    lane.tail,
-                    lane.tail == nullptr
-                        ? 0U
-                        : lane.tail->header_count,
-                    lane.record_count,
-                    lane.accounted_bytes,
-                    lane.allocated_segment_bytes,
-                    lane.segment_count};
-            }
-            slice.rows.push_back(captured);
-        }
+        const std::size_t bound_count =
+            catalog_snapshot->bound_count();
+        slice.catalog_row_count =
+            BoundRowsForWorker(
+                bound_count, worker, session.worker_count);
         auto slice_impl =
             std::make_unique<
                 IntradayInstrumentStoreWorkerSliceV1::Impl>(
                 std::move(slice));
         output->reset(new IntradayInstrumentStoreWorkerSliceV1(
             std::move(slice_impl)));
+        // All four source fences for this worker have arrived. From this
+        // release onward, the first post-cut append to a row preserves its
+        // constant-size pre-cut endpoint before mutating live state. The
+        // generation builder can therefore materialize all rows off-owner
+        // without pausing this worker.
+        worker_state.active_capture_generation.store(
+            generation, std::memory_order_release);
         worker_state.last_captured_generation = generation;
         return IntradayInstrumentStoreGenerationErrorV1::kNone;
     } catch (...) {
@@ -2169,6 +2254,14 @@ IntradayInstrumentStoreV1::BuildGeneration(
             kIncompleteWorkerSet;
     }
 
+    if (watermark.catalog_snapshot == nullptr ||
+        watermark.catalog_snapshot->session_epoch() !=
+            session.directory_session_epoch ||
+        watermark.catalog_snapshot->capacity() != session.capacity) {
+        return IntradayInstrumentStoreGenerationErrorV1::
+            kInvalidWatermark;
+    }
+
     RealtimeHistoryWatermarkV1 rebuilt{};
     if (BuildRealtimeHistoryWatermarkV1(
             watermark.run_id,
@@ -2176,13 +2269,12 @@ IntradayInstrumentStoreV1::BuildGeneration(
             watermark.trade_date,
             watermark.ingress_sequence_exclusive,
             watermark.recv_monotonic_cut_ns,
-            *session.registry,
+            watermark.catalog_snapshot,
+            watermark.processing_progress,
             watermark.sources,
             &rebuilt) !=
             RealtimeHistoryWatermarkErrorV1::kNone ||
-        !SameWatermark(watermark, rebuilt) ||
-        watermark.registry_version != session.registry_version ||
-        watermark.registry_sha256 != session.registry_sha256) {
+        !SameWatermark(watermark, rebuilt)) {
         return IntradayInstrumentStoreGenerationErrorV1::
             kInvalidWatermark;
     }
@@ -2211,7 +2303,9 @@ IntradayInstrumentStoreV1::BuildGeneration(
         auto generation = std::make_shared<GenerationData>();
         generation->watermark = watermark;
         generation->session = impl_->session;
-        generation->rows.resize(session.ordinals.size());
+        generation->catalog_snapshot = watermark.catalog_snapshot;
+        generation->rows.resize(
+            watermark.catalog_snapshot->bound_count());
         generation->maximum_records_per_batch =
             session.config.maximum_records_per_batch;
         generation->coverage_from_open =
@@ -2234,20 +2328,74 @@ IntradayInstrumentStoreV1::BuildGeneration(
             }
             const WorkerSliceData& slice = owner->impl_->data;
             if (slice.session.get() != &session ||
+                slice.catalog_snapshot.get() !=
+                    watermark.catalog_snapshot.get() ||
+                slice.catalog_snapshot.owner_before(
+                    watermark.catalog_snapshot) ||
+                watermark.catalog_snapshot.owner_before(
+                    slice.catalog_snapshot) ||
                 slice.worker != worker ||
                 slice.generation != watermark.generation ||
-                slice.rows.size() !=
-                    session.workers[worker]->rows.size()) {
+                slice.catalog_row_count !=
+                    BoundRowsForWorker(
+                        watermark.catalog_snapshot->bound_count(),
+                        static_cast<std::uint32_t>(worker),
+                        session.worker_count)) {
                 return IntradayInstrumentStoreGenerationErrorV1::
                     kIncompleteWorkerSet;
             }
-            for (const CapturedInstrumentRow& row : slice.rows) {
+            WorkerState& worker_state =
+                *session.workers[worker];
+            if (worker_state.active_capture_generation.load(
+                    std::memory_order_acquire) !=
+                watermark.generation) {
+                return IntradayInstrumentStoreGenerationErrorV1::
+                    kIncompleteWorkerSet;
+            }
+            std::size_t materialized_rows = 0U;
+            for (const MutableInstrumentRow& mutable_row :
+                 worker_state.rows) {
+                if (mutable_row.ordinal >=
+                    watermark.catalog_snapshot->bound_count()) {
+                    break;
+                }
+                CapturedInstrumentRow row{};
+                {
+                    RowCaptureState& capture_state =
+                        session.row_capture_states[
+                            mutable_row.ordinal];
+                    std::lock_guard<std::mutex> row_lock(
+                        capture_state.mutex);
+                    if (capture_state.frozen_generation ==
+                        watermark.generation) {
+                        row = capture_state.frozen;
+                    } else {
+                        CaptureMutableRow(mutable_row, &row);
+                    }
+                }
                 if (row.instrument_id == 0U ||
-                    row.ordinal >= generation->rows.size() ||
-                    generation->rows[row.ordinal].instrument_id != 0U ||
+                    row.ordinal >= session.capacity ||
+                    row.instrument_id !=
+                        static_cast<std::uint32_t>(
+                            row.ordinal + 1U) ||
                     session.ordinals[row.ordinal].instrument_id !=
                         row.instrument_id ||
                     session.ordinals[row.ordinal].worker != worker) {
+                    return IntradayInstrumentStoreGenerationErrorV1::
+                        kIncompleteWorkerSet;
+                }
+                if (row.ordinal >= generation->rows.size()) {
+                    return IntradayInstrumentStoreGenerationErrorV1::
+                        kIncompleteWorkerSet;
+                }
+                ObservedInstrumentEntryViewV2 catalog_entry{};
+                if (watermark.catalog_snapshot->EntryAt(
+                        row.ordinal, &catalog_entry) !=
+                        ObservedInstrumentDirectoryErrorV2::kNone ||
+                    !catalog_entry.bound() ||
+                    catalog_entry.instrument_id != row.instrument_id ||
+                    catalog_entry.ordinal != row.ordinal ||
+                    generation->rows[row.ordinal].instrument_id != 0U) {
                     return IntradayInstrumentStoreGenerationErrorV1::
                         kIncompleteWorkerSet;
                 }
@@ -2293,6 +2441,21 @@ IntradayInstrumentStoreV1::BuildGeneration(
                         kInvalidWatermark;
                 }
                 generation->rows[row.ordinal] = row;
+                ++materialized_rows;
+            }
+            if (materialized_rows != slice.catalog_row_count) {
+                return IntradayInstrumentStoreGenerationErrorV1::
+                    kIncompleteWorkerSet;
+            }
+        }
+
+        for (std::size_t ordinal = 0U;
+             ordinal < generation->rows.size();
+             ++ordinal) {
+            if (generation->rows[ordinal].instrument_id !=
+                static_cast<std::uint32_t>(ordinal + 1U)) {
+                return IntradayInstrumentStoreGenerationErrorV1::
+                    kIncompleteWorkerSet;
             }
         }
 
@@ -2434,10 +2597,15 @@ bool IntradayInstrumentStoreV1::coverage_lost() const noexcept {
 
 std::uint32_t IntradayInstrumentStoreV1::WorkerForInstrument(
     std::uint32_t instrument_id) const noexcept {
-    if (impl_ == nullptr || impl_->session->worker_count == 0U) {
+    if (impl_ == nullptr || impl_->session->worker_count == 0U ||
+        instrument_id == 0U ||
+        static_cast<std::size_t>(instrument_id) >
+            impl_->session->capacity) {
         return std::numeric_limits<std::uint32_t>::max();
     }
-    return instrument_id % impl_->session->worker_count;
+    return static_cast<std::uint32_t>(
+        static_cast<std::size_t>(instrument_id - 1U) %
+        impl_->session->worker_count);
 }
 
 const IntradayInstrumentStoreConfigV1&

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <array>
@@ -59,14 +58,11 @@ enum class RealtimeFactorCalculatorErrorV1 : std::uint8_t {
 [[nodiscard]] std::string_view RealtimeFactorCalculatorErrorNameV1(
     RealtimeFactorCalculatorErrorV1 error) noexcept;
 
-// A calculator is a pure, non-reentrant full-generation transformation. It
-// receives one immutable, generation-barrier-complete intraday store view and
-// must return exactly one row for every input instrument in the same order.
-// The engine validates that contract and owns publication; a calculator
-// cannot publish a partial result or choose its own watermark. Calculate must
-// not call the owning pipeline's cut/stop/publication APIs or generation
-// lifecycle APIs, and a production implementation must enforce a strict
-// execution-time bound.
+// A calculator is a pure, non-reentrant observed-universe transformation. It
+// receives one immutable Store generation and must return exactly one row,
+// in ascending ID order, for each instrument marked factor_eligible in that
+// generation's exact CatalogSnapshot. It must not infer an authoritative
+// exchange-wide denominator from this subset.
 class RealtimeFactorCalculatorV1 {
 public:
     virtual ~RealtimeFactorCalculatorV1() = default;
@@ -87,9 +83,8 @@ public:
 // as alpha, fair value, microprice, imbalance, or any other financial model.
 // It projects the latest valid, strictly positive decoded snapshot
 // last_price.normalized_p6 into decimal price units by dividing by 1,000,000.
-// Instruments without a positive snapshot last price produce
-// {value=+0.0, valid=false}; in particular, pre-trade zero is not advertised
-// as a formed market price.
+// Instruments without a positive snapshot last price are outside the
+// factor-eligible input set and therefore produce no row.
 class SnapshotLastPriceProjectionV1 final
     : public RealtimeFactorCalculatorV1 {
 public:
@@ -105,11 +100,9 @@ private:
     std::array<RealtimeFactorDefinitionV1, 1U> definitions_;
 };
 
-// One immutable full-universe publication. Its watermark is copied verbatim
-// from input_store and the shared input handle is retained for auditability
-// and borrowed-record lifetime safety. There is no per-worker or
-// per-instrument current slot: readers acquire this single object once and
-// therefore cannot observe a half-old/half-new market cross-section.
+// One immutable observed-universe publication. Its watermark and exact
+// CatalogSnapshot are retained through input_store. Readers acquire this
+// object once and cannot observe mismatched catalog/count/factor generations.
 class RealtimeFactorGenerationV1 final {
 public:
     [[nodiscard]] const l2flow::market::RealtimeHistoryWatermarkV1&
@@ -131,6 +124,70 @@ public:
     input_store() const noexcept {
         return input_store_;
     }
+    [[nodiscard]] const std::shared_ptr<const
+        l2flow::market::ObservedInstrumentCatalogSnapshotV2>&
+    catalog_snapshot() const noexcept {
+        return input_store_->catalog_snapshot();
+    }
+    [[nodiscard]] l2flow::market::ObservedInstrumentCatalogScopeV2
+    catalog_scope() const noexcept {
+        return catalog_snapshot()->catalog_scope();
+    }
+    [[nodiscard]] bool coverage_complete() const noexcept {
+        return catalog_snapshot()->coverage_complete();
+    }
+    [[nodiscard]] std::uint64_t session_epoch() const noexcept {
+        return catalog_snapshot()->session_epoch();
+    }
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return catalog_snapshot()->capacity();
+    }
+    [[nodiscard]] std::uint64_t catalog_generation() const noexcept {
+        return catalog_snapshot()->catalog_generation();
+    }
+    [[nodiscard]] std::uint64_t data_state_generation() const noexcept {
+        return catalog_snapshot()->data_state_generation();
+    }
+    [[nodiscard]] const l2flow::common::Sha256Digest& catalog_digest()
+        const noexcept {
+        return catalog_snapshot()->catalog_digest();
+    }
+    [[nodiscard]] std::size_t bound_count() const noexcept {
+        return catalog_snapshot()->bound_count();
+    }
+    [[nodiscard]] std::size_t universe_count() const noexcept {
+        return bound_count();
+    }
+    [[nodiscard]] std::size_t available_count() const noexcept {
+        return catalog_snapshot()->available_count();
+    }
+    [[nodiscard]] std::size_t snapshot_available_count() const noexcept {
+        return catalog_snapshot()->snapshot_available_count();
+    }
+    [[nodiscard]] std::size_t tick_available_count() const noexcept {
+        return catalog_snapshot()->tick_available_count();
+    }
+    [[nodiscard]] std::size_t factor_eligible_count() const noexcept {
+        return catalog_snapshot()->factor_eligible_count();
+    }
+    [[nodiscard]] std::uint64_t input_applied_sequence() const noexcept {
+        return watermark_.processing_progress.applied_sequence;
+    }
+    [[nodiscard]] std::uint64_t capture_accepted_sequence()
+        const noexcept {
+        return watermark_.processing_progress.accepted_sequence;
+    }
+    [[nodiscard]] std::uint64_t capture_durable_sequence() const noexcept {
+        return watermark_.processing_progress.durable_sequence;
+    }
+    [[nodiscard]] std::uint64_t processing_lag_records()
+        const noexcept {
+        return watermark_.processing_progress.processing_lag_records();
+    }
+    [[nodiscard]] std::uint64_t durability_lag_records()
+        const noexcept {
+        return watermark_.processing_progress.durability_lag_records();
+    }
 
 private:
     friend class RealtimeFactorEngineV1;
@@ -151,9 +208,8 @@ private:
 };
 
 struct RealtimeFactorEngineConfigV1 final {
-    // registry and generation_runtime must outlive the engine. The calculator
-    // is shared-owned because a calculation may be deliberately long-running.
-    const l2flow::market::InstrumentRegistryV1* registry = nullptr;
+    // generation_runtime must outlive the engine. The calculator is
+    // shared-owned because a calculation may be deliberately long-running.
     const l2flow::market::RealtimeHistoryRuntimeV1* generation_runtime =
         nullptr;
     std::shared_ptr<const RealtimeFactorCalculatorV1> calculator;
@@ -227,12 +283,10 @@ public:
 private:
     RealtimeFactorEngineV1(
         RealtimeFactorEngineConfigV1 config,
-        std::vector<RealtimeFactorDefinitionV1> definitions,
-        std::vector<std::uint32_t> instrument_ids) noexcept;
+        std::vector<RealtimeFactorDefinitionV1> definitions) noexcept;
 
     RealtimeFactorEngineConfigV1 config_;
     std::vector<RealtimeFactorDefinitionV1> definitions_;
-    std::vector<std::uint32_t> instrument_ids_;
     mutable std::mutex publish_mutex_;
     // Use the standardized shared_ptr atomic free functions. This preserves
     // the same acquire/release publication contract on libstdc++ versions

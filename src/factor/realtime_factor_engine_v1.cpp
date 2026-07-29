@@ -82,30 +82,107 @@ template <typename Value>
            !right.owner_before(left);
 }
 
-[[nodiscard]] bool StoreMatchesRegistry(
+[[nodiscard]] const l2flow::market::DecimalValueV1* SnapshotLastPrice(
+    const l2flow::market::RealtimeHistoryRecordV1* record) noexcept {
+    if (record == nullptr) {
+        return nullptr;
+    }
+    const l2flow::market::StoredMarketEventViewV1 event = record->event();
+    const auto* shanghai =
+        l2flow::market::StoredMarketEventGetV1<
+            l2flow::market::ShanghaiSnapshotV1>(event);
+    if (shanghai != nullptr) {
+        return &shanghai->last_price;
+    }
+    const auto* shenzhen =
+        l2flow::market::StoredMarketEventGetV1<
+            l2flow::market::ShenzhenSnapshotV1>(event);
+    return shenzhen == nullptr ? nullptr : &shenzhen->last_price;
+}
+
+[[nodiscard]] bool SnapshotFactorEligible(
+    const l2flow::market::RealtimeHistoryRecordV1* record) noexcept {
+    const l2flow::market::DecimalValueV1* const last_price =
+        SnapshotLastPrice(record);
+    return last_price != nullptr && last_price->valid &&
+           !last_price->is_null &&
+           last_price->normalized_p6 > 0;
+}
+
+[[nodiscard]] bool StoreMatchesObservedCatalog(
     const l2flow::market::IntradayInstrumentStoreGenerationV1& store,
-    const l2flow::market::InstrumentRegistryV1& registry,
-    std::span<const std::uint32_t> instrument_ids) noexcept {
+    std::vector<std::uint32_t>* eligible_instrument_ids) {
+    if (eligible_instrument_ids == nullptr) {
+        return false;
+    }
+    eligible_instrument_ids->clear();
     const l2flow::market::RealtimeHistoryWatermarkV1& watermark =
         store.watermark();
-    if (watermark.generation == 0U ||
-        watermark.registry_version != registry.registry_version() ||
-        watermark.registry_sha256 != registry.registry_sha256()) {
+    const auto& catalog = store.catalog_snapshot();
+    if (watermark.generation == 0U || catalog == nullptr ||
+        !SameSharedOwnerAndPointer(
+            watermark.catalog_snapshot, catalog) ||
+        catalog->catalog_scope() !=
+            l2flow::market::ObservedInstrumentCatalogScopeV2::
+                kObservedOnly ||
+        catalog->coverage_complete() ||
+        catalog->session_epoch() == 0U ||
+        catalog->capacity() == 0U ||
+        catalog->bound_count() > catalog->capacity() ||
+        catalog->catalog_generation() !=
+            static_cast<std::uint64_t>(catalog->bound_count()) ||
+        !watermark.processing_progress.valid() ||
+        watermark.processing_progress.applied_sequence !=
+            watermark.ingress_sequence_exclusive - 1U ||
+        store.instrument_count() != catalog->bound_count()) {
         return false;
     }
 
-    if (store.instrument_count() != instrument_ids.size()) {
-        return false;
-    }
-    for (std::size_t index = 0U; index < instrument_ids.size(); ++index) {
+    eligible_instrument_ids->reserve(
+        catalog->factor_eligible_count());
+    std::size_t available_count = 0U;
+    std::size_t snapshot_available_count = 0U;
+    std::size_t tick_available_count = 0U;
+    std::size_t factor_eligible_count = 0U;
+    for (std::size_t index = 0U;
+         index < store.instrument_count();
+         ++index) {
         l2flow::market::IntradayInstrumentSummaryV1 summary{};
+        l2flow::market::ObservedInstrumentEntryViewV2 entry{};
         if (store.SummaryAt(index, &summary) !=
                 l2flow::market::IntradayInstrumentStoreQueryErrorV1::kNone ||
-            summary.instrument_id != instrument_ids[index]) {
+            catalog->EntryAt(index, &entry) !=
+                l2flow::market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            !entry.bound() || entry.ordinal != index ||
+            entry.instrument_id != summary.instrument_id ||
+            entry.instrument_id !=
+                static_cast<std::uint32_t>(index + 1U) ||
+            entry.has_snapshot !=
+                (summary.latest_snapshot != nullptr) ||
+            entry.has_tick != (summary.latest_tick != nullptr) ||
+            entry.factor_eligible !=
+                SnapshotFactorEligible(summary.latest_snapshot) ||
+            entry.available() !=
+                (summary.latest_snapshot != nullptr ||
+                 summary.latest_tick != nullptr)) {
             return false;
         }
+        available_count += entry.available() ? 1U : 0U;
+        snapshot_available_count += entry.has_snapshot ? 1U : 0U;
+        tick_available_count += entry.has_tick ? 1U : 0U;
+        if (entry.factor_eligible) {
+            eligible_instrument_ids->push_back(entry.instrument_id);
+            ++factor_eligible_count;
+        }
     }
-    return true;
+    return available_count == catalog->available_count() &&
+           snapshot_available_count ==
+               catalog->snapshot_available_count() &&
+           tick_available_count == catalog->tick_available_count() &&
+           factor_eligible_count ==
+               catalog->factor_eligible_count() &&
+           eligible_instrument_ids->size() ==
+               factor_eligible_count;
 }
 
 [[nodiscard]] bool FactorOutputValid(
@@ -132,24 +209,6 @@ template <typename Value>
         }
     }
     return true;
-}
-
-[[nodiscard]] const l2flow::market::DecimalValueV1* SnapshotLastPrice(
-    const l2flow::market::RealtimeHistoryRecordV1* record) noexcept {
-    if (record == nullptr) {
-        return nullptr;
-    }
-    const l2flow::market::StoredMarketEventViewV1 event = record->event();
-    const auto* shanghai =
-        l2flow::market::StoredMarketEventGetV1<
-            l2flow::market::ShanghaiSnapshotV1>(event);
-    if (shanghai != nullptr) {
-        return &shanghai->last_price;
-    }
-    const auto* shenzhen =
-        l2flow::market::StoredMarketEventGetV1<
-            l2flow::market::ShenzhenSnapshotV1>(event);
-    return shenzhen == nullptr ? nullptr : &shenzhen->last_price;
 }
 
 }  // namespace
@@ -201,29 +260,47 @@ SnapshotLastPriceProjectionV1::Calculate(
     }
     try {
         std::vector<RealtimeFactorPointV1> candidate;
-        candidate.reserve(store.instrument_count());
+        const auto& catalog = store.catalog_snapshot();
+        if (catalog == nullptr ||
+            catalog->bound_count() != store.instrument_count()) {
+            return RealtimeFactorCalculatorErrorV1::kInvalidStore;
+        }
+        candidate.reserve(catalog->factor_eligible_count());
         for (std::size_t ordinal = 0U;
              ordinal < store.instrument_count();
              ++ordinal) {
             l2flow::market::IntradayInstrumentSummaryV1 instrument{};
+            l2flow::market::ObservedInstrumentEntryViewV2 entry{};
             if (store.SummaryAt(ordinal, &instrument) !=
-                l2flow::market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+                    l2flow::market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone ||
+                catalog->EntryAt(ordinal, &entry) !=
+                    l2flow::market::
+                        ObservedInstrumentDirectoryErrorV2::kNone ||
+                entry.instrument_id != instrument.instrument_id) {
                 return RealtimeFactorCalculatorErrorV1::kInvalidStore;
+            }
+            if (!entry.factor_eligible) {
+                continue;
             }
             RealtimeFactorPointV1 point{};
             point.instrument_id = instrument.instrument_id;
             point.values.resize(1U);
             const l2flow::market::DecimalValueV1* last_price =
                 SnapshotLastPrice(instrument.latest_snapshot);
-            if (last_price != nullptr && last_price->valid &&
-                !last_price->is_null &&
-                last_price->normalized_p6 > 0) {
-                point.values[0U].value =
-                    static_cast<double>(last_price->normalized_p6) /
-                    kNormalizedP6Divisor;
-                point.values[0U].valid = true;
+            if (last_price == nullptr || !last_price->valid ||
+                last_price->is_null ||
+                last_price->normalized_p6 <= 0) {
+                return RealtimeFactorCalculatorErrorV1::kInvalidStore;
             }
+            point.values[0U].value =
+                static_cast<double>(last_price->normalized_p6) /
+                kNormalizedP6Divisor;
+            point.values[0U].valid = true;
             candidate.push_back(std::move(point));
+        }
+        if (candidate.size() != catalog->factor_eligible_count()) {
+            return RealtimeFactorCalculatorErrorV1::kInvalidStore;
         }
         *output = std::move(candidate);
         return RealtimeFactorCalculatorErrorV1::kNone;
@@ -313,11 +390,9 @@ std::string_view RealtimeFactorPublishErrorNameV1(
 
 RealtimeFactorEngineV1::RealtimeFactorEngineV1(
     RealtimeFactorEngineConfigV1 config,
-    std::vector<RealtimeFactorDefinitionV1> definitions,
-    std::vector<std::uint32_t> instrument_ids) noexcept
+    std::vector<RealtimeFactorDefinitionV1> definitions) noexcept
     : config_(std::move(config)),
       definitions_(std::move(definitions)),
-      instrument_ids_(std::move(instrument_ids)),
       latest_(std::shared_ptr<const RealtimeFactorGenerationV1>{}) {}
 
 RealtimeFactorEngineCreateErrorV1 RealtimeFactorEngineV1::Create(
@@ -327,8 +402,8 @@ RealtimeFactorEngineCreateErrorV1 RealtimeFactorEngineV1::Create(
         return RealtimeFactorEngineCreateErrorV1::kNullOutput;
     }
     output->reset();
-    if (config.registry == nullptr || config.generation_runtime == nullptr ||
-        config.calculator == nullptr || config.registry->empty()) {
+    if (config.generation_runtime == nullptr ||
+        config.calculator == nullptr) {
         return RealtimeFactorEngineCreateErrorV1::kInvalidConfiguration;
     }
 
@@ -341,18 +416,10 @@ RealtimeFactorEngineCreateErrorV1 RealtimeFactorEngineV1::Create(
     try {
         std::vector<RealtimeFactorDefinitionV1> definitions(
             live_definitions.begin(), live_definitions.end());
-        std::vector<std::uint32_t> instrument_ids;
-        instrument_ids.reserve(config.registry->size());
-        for (const l2flow::market::InstrumentRegistryEntryV1& entry :
-             config.registry->entries()) {
-            instrument_ids.push_back(entry.instrument_id);
-        }
-        std::sort(instrument_ids.begin(), instrument_ids.end());
 
         output->reset(new RealtimeFactorEngineV1(
             std::move(config),
-            std::move(definitions),
-            std::move(instrument_ids)));
+            std::move(definitions)));
         return RealtimeFactorEngineCreateErrorV1::kNone;
     } catch (const std::bad_alloc&) {
         return RealtimeFactorEngineCreateErrorV1::kResourceExhausted;
@@ -382,8 +449,9 @@ RealtimeFactorEngineV1::CalculateAndPublish(
                 kStoreNotCurrentOrHealthy;
             return result;
         }
-        if (!StoreMatchesRegistry(
-                *store, *config_.registry, instrument_ids_)) {
+        std::vector<std::uint32_t> eligible_instrument_ids;
+        if (!StoreMatchesObservedCatalog(
+                *store, &eligible_instrument_ids)) {
             result.error = RealtimeFactorPublishErrorV1::kInvalidStore;
             return result;
         }
@@ -430,7 +498,9 @@ RealtimeFactorEngineV1::CalculateAndPublish(
             return result;
         }
         if (!FactorOutputValid(
-                points, instrument_ids_, definitions_.size())) {
+                points,
+                eligible_instrument_ids,
+                definitions_.size())) {
             result.error = RealtimeFactorPublishErrorV1::
                 kInvalidFactorOutput;
             return result;

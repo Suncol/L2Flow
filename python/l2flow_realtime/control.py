@@ -128,7 +128,7 @@ def receive_session_fd(
                 raise ProtocolError("control request was rejected as invalid")
             if status == CONTROL_UNSUPPORTED_VERSION:
                 raise ProtocolError(
-                    "control service does not support wire protocol V1"
+                    "control service does not support wire protocol V2"
                 )
             raise ProtocolError(f"unknown control response status {status}")
 

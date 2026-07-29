@@ -1,7 +1,7 @@
 #include "l2flow/market/realtime_latest_read_model_v1.h"
 
-#include "l2flow/market/instrument_registry.h"
 #include "l2flow/market/market_types_v1.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <algorithm>
@@ -79,6 +79,8 @@ std::string_view RealtimeLatestPublishErrorNameV1(
             return "null_record";
         case RealtimeLatestPublishErrorV1::kInvalidOrdinal:
             return "invalid_ordinal";
+        case RealtimeLatestPublishErrorV1::kUnboundInstrument:
+            return "unbound_instrument";
         case RealtimeLatestPublishErrorV1::kInstrumentMismatch:
             return "instrument_mismatch";
         case RealtimeLatestPublishErrorV1::kInvalidRecordKind:
@@ -116,12 +118,10 @@ public:
     };
 
     Impl(
-        const InstrumentRegistryV1* registry,
+        const ObservedInstrumentDirectoryV2* directory,
         std::size_t slot_count)
-        : registry_(registry),
+        : directory_(directory),
           slot_count_(slot_count),
-          instrument_ids_(
-              std::make_unique<std::uint32_t[]>(slot_count)),
           snapshot_slots_(
               std::make_unique<PublishedSlot[]>(slot_count)),
           tick_slots_(
@@ -129,16 +129,16 @@ public:
 
     [[nodiscard]] std::atomic<const RealtimeHistoryRecordV1*>*
     Target(
-        std::size_t registry_ordinal,
+        std::size_t ordinal,
         RealtimeLatestRecordKindV1 kind) noexcept {
-        if (registry_ordinal >= slot_count_) {
+        if (ordinal >= slot_count_) {
             return nullptr;
         }
         switch (kind) {
             case RealtimeLatestRecordKindV1::kSnapshot:
-                return &snapshot_slots_[registry_ordinal].record;
+                return &snapshot_slots_[ordinal].record;
             case RealtimeLatestRecordKindV1::kTick:
-                return &tick_slots_[registry_ordinal].record;
+                return &tick_slots_[ordinal].record;
         }
         return nullptr;
     }
@@ -146,16 +146,16 @@ public:
     [[nodiscard]] const std::atomic<
         const RealtimeHistoryRecordV1*>*
     Target(
-        std::size_t registry_ordinal,
+        std::size_t ordinal,
         RealtimeLatestRecordKindV1 kind) const noexcept {
-        if (registry_ordinal >= slot_count_) {
+        if (ordinal >= slot_count_) {
             return nullptr;
         }
         switch (kind) {
             case RealtimeLatestRecordKindV1::kSnapshot:
-                return &snapshot_slots_[registry_ordinal].record;
+                return &snapshot_slots_[ordinal].record;
             case RealtimeLatestRecordKindV1::kTick:
-                return &tick_slots_[registry_ordinal].record;
+                return &tick_slots_[ordinal].record;
         }
         return nullptr;
     }
@@ -166,45 +166,36 @@ public:
         RealtimeLatestRecordViewV1* output) const noexcept {
         *output = RealtimeLatestRecordViewV1{};
         output->instrument_id = instrument_id;
-        if (instrument_id == 0U) {
+        if (instrument_id == 0U ||
+            static_cast<std::size_t>(instrument_id) > slot_count_) {
             output->status =
                 RealtimeLatestRecordStatusV1::kInvalidInstrumentId;
             return;
         }
 
-        const InstrumentRegistryLookupResultV1 lookup =
-            registry_->LookupById(instrument_id);
-        if (!lookup.known() ||
-            lookup.registry_ordinal >= slot_count_) {
-            output->status =
-                RealtimeLatestRecordStatusV1::kUnknownInstrument;
-            return;
-        }
-
-        if (instrument_ids_[lookup.registry_ordinal] !=
-            instrument_id) {
-            output->status =
-                RealtimeLatestRecordStatusV1::kUnknownInstrument;
+        std::size_t ordinal = 0U;
+        if (directory_->ResolveBoundId(instrument_id, &ordinal) !=
+            ObservedInstrumentDirectoryErrorV2::kNone) {
+            output->status = RealtimeLatestRecordStatusV1::kUnbound;
             return;
         }
         const std::atomic<const RealtimeHistoryRecordV1*>* const
-            target = Target(lookup.registry_ordinal, kind);
+            target = Target(ordinal, kind);
         const RealtimeHistoryRecordV1* const record =
             target == nullptr
                 ? nullptr
                 : target->load(std::memory_order_acquire);
         if (record == nullptr) {
             output->status =
-                RealtimeLatestRecordStatusV1::kNotYetObserved;
+                RealtimeLatestRecordStatusV1::kBoundNoTypeData;
             return;
         }
         output->status = RealtimeLatestRecordStatusV1::kAvailable;
         output->record = record;
     }
 
-    const InstrumentRegistryV1* registry_ = nullptr;
+    const ObservedInstrumentDirectoryV2* directory_ = nullptr;
     std::size_t slot_count_ = 0U;
-    std::unique_ptr<std::uint32_t[]> instrument_ids_;
     std::unique_ptr<PublishedSlot[]> snapshot_slots_;
     std::unique_ptr<PublishedSlot[]> tick_slots_;
     std::atomic<bool> coverage_lost_{false};
@@ -218,13 +209,13 @@ RealtimeLatestReadModelV1::~RealtimeLatestReadModelV1() = default;
 
 RealtimeLatestReadModelCreateErrorV1
 RealtimeLatestReadModelV1::Create(
-    const InstrumentRegistryV1* registry,
+    const ObservedInstrumentDirectoryV2* directory,
     std::unique_ptr<RealtimeLatestReadModelV1>* output) noexcept {
     if (output == nullptr) {
         return RealtimeLatestReadModelCreateErrorV1::kNullOutput;
     }
     output->reset();
-    if (registry == nullptr || registry->empty()) {
+    if (directory == nullptr || directory->capacity() == 0U) {
         return RealtimeLatestReadModelCreateErrorV1::
             kInvalidConfiguration;
     }
@@ -232,29 +223,7 @@ RealtimeLatestReadModelV1::Create(
     try {
         auto impl =
             std::make_unique<RealtimeLatestReadModelV1::Impl>(
-                registry, registry->size());
-        for (const InstrumentRegistryEntryV1& entry :
-             registry->entries()) {
-            const InstrumentRegistryLookupResultV1 lookup =
-                registry->LookupById(entry.instrument_id);
-            if (!lookup.known() ||
-                lookup.registry_ordinal >= impl->slot_count_ ||
-                impl->instrument_ids_[lookup.registry_ordinal] !=
-                    0U) {
-                return RealtimeLatestReadModelCreateErrorV1::
-                    kInvalidConfiguration;
-            }
-            impl->instrument_ids_[lookup.registry_ordinal] =
-                entry.instrument_id;
-        }
-        for (std::size_t ordinal = 0U;
-             ordinal < impl->slot_count_;
-             ++ordinal) {
-            if (impl->instrument_ids_[ordinal] == 0U) {
-                return RealtimeLatestReadModelCreateErrorV1::
-                    kInvalidConfiguration;
-            }
-        }
+                directory, directory->capacity());
         output->reset(new RealtimeLatestReadModelV1(std::move(impl)));
         return RealtimeLatestReadModelCreateErrorV1::kNone;
     } catch (...) {
@@ -266,7 +235,7 @@ RealtimeLatestReadModelV1::Create(
 
 RealtimeLatestPublishErrorV1
 RealtimeLatestReadModelV1::PublishApplied(
-    std::size_t registry_ordinal,
+    std::size_t ordinal,
     const RealtimeHistoryRecordV1* record,
     bool* updated) noexcept {
     if (updated != nullptr) {
@@ -278,12 +247,19 @@ RealtimeLatestReadModelV1::PublishApplied(
     if (record == nullptr) {
         return RealtimeLatestPublishErrorV1::kNullRecord;
     }
-    if (registry_ordinal >= impl_->slot_count_) {
+    if (ordinal >= impl_->slot_count_) {
         return RealtimeLatestPublishErrorV1::kInvalidOrdinal;
     }
-    if (impl_->instrument_ids_[registry_ordinal] == 0U ||
-        record->instrument_id() !=
-            impl_->instrument_ids_[registry_ordinal]) {
+    ObservedInstrumentEntryViewV2 entry{};
+    if (impl_->directory_->LookupByOrdinal(ordinal, &entry) !=
+            ObservedInstrumentDirectoryErrorV2::kNone ||
+        !entry.bound()) {
+        return RealtimeLatestPublishErrorV1::kUnboundInstrument;
+    }
+    if (entry.ordinal != ordinal ||
+        entry.instrument_id !=
+            static_cast<std::uint32_t>(ordinal + 1U) ||
+        record->instrument_id() != entry.instrument_id) {
         return RealtimeLatestPublishErrorV1::kInstrumentMismatch;
     }
     RealtimeLatestRecordKindV1 kind =
@@ -292,7 +268,7 @@ RealtimeLatestReadModelV1::PublishApplied(
         return RealtimeLatestPublishErrorV1::kInvalidRecordKind;
     }
     std::atomic<const RealtimeHistoryRecordV1*>* const target =
-        impl_->Target(registry_ordinal, kind);
+        impl_->Target(ordinal, kind);
     if (target == nullptr || record->ingress_sequence() == 0U) {
         return RealtimeLatestPublishErrorV1::kInvalidRecordKind;
     }
@@ -313,7 +289,7 @@ RealtimeLatestReadModelV1::PublishApplied(
     if (current == record) {
         return RealtimeLatestPublishErrorV1::kNone;
     }
-    // Exactly one permanent owner publishes a registry ordinal. Readers use
+    // Exactly one permanent owner publishes a directory ordinal. Readers use
     // acquire loads; a release store is sufficient and avoids a locked RMW on
     // every market event.
     target->store(record, std::memory_order_release);

@@ -80,8 +80,30 @@ private:
     friend class KLineAggregatorV1;
 };
 
-// One history owner worker is the sole caller of Append and Capture. The
-// class therefore has no append lock. Captures share immutable chunks; a
+// Internal exact-cut token used by the owner-index runtime. The permanent
+// owner publishes one token only after all source fences for the generation
+// have arrived. Publishing the token never enumerates instruments or series;
+// the background generation builder materializes the immutable snapshot.
+class KLineAggregatorCutV1 final {
+public:
+    KLineAggregatorCutV1(const KLineAggregatorCutV1&) = delete;
+    KLineAggregatorCutV1& operator=(const KLineAggregatorCutV1&) = delete;
+    KLineAggregatorCutV1(KLineAggregatorCutV1&&) = delete;
+    KLineAggregatorCutV1& operator=(KLineAggregatorCutV1&&) = delete;
+    ~KLineAggregatorCutV1();
+
+private:
+    class Impl;
+    explicit KLineAggregatorCutV1(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+
+    friend class KLineAggregatorV1;
+};
+
+// One history owner worker is the sole append writer. Generic captures are
+// eager and owner-local. Production owner-index cuts use a per-row lock only
+// for the first post-cut update or a concurrent background materialization;
+// ordinary appends remain lock-free. Captures share immutable chunks, so a
 // later append clones only the touched series metadata and chunk.
 class KLineAggregatorV1 final {
 public:
@@ -100,7 +122,25 @@ public:
     [[nodiscard]] KLineAppendErrorV1 Append(
         const KLineTradeV1& trade,
         std::size_t owner_local_row) noexcept;
+    // Standalone generic mode (instrument_capacity == 0) retains eager
+    // immutable capture. Owner-index mode deliberately rejects this API so
+    // production cannot accidentally perform an O(active-series) owner
+    // capture.
     [[nodiscard]] KLineCaptureErrorV1 Capture(
+        std::shared_ptr<const KLineAggregatorSnapshotV1>* output)
+        noexcept;
+
+    // Production owner-index capture is two-phase. CaptureOwnerCut runs on
+    // the permanent owner after its source fences and performs constant work.
+    // MaterializeOwnerCut runs on the background generation builder while the
+    // owner continues appending. represented_owner_rows is the exact bound
+    // catalog prefix assigned to this owner at the cut.
+    [[nodiscard]] KLineCaptureErrorV1 CaptureOwnerCut(
+        std::uint64_t generation,
+        std::size_t represented_owner_rows,
+        std::unique_ptr<KLineAggregatorCutV1>* output) noexcept;
+    [[nodiscard]] KLineCaptureErrorV1 MaterializeOwnerCut(
+        const KLineAggregatorCutV1& cut,
         std::shared_ptr<const KLineAggregatorSnapshotV1>* output)
         noexcept;
 

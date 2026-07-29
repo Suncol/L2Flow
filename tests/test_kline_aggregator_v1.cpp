@@ -44,7 +44,7 @@ market::KLineTradeV1 Trade(
     market::KLineTradeV1 trade{};
     trade.trade_date = 20260724U;
     trade.instrument_id = 9U;
-    trade.registry_ordinal = 0U;
+    trade.ordinal = 0U;
     trade.event_time_ns_since_midnight = event_time;
     trade.event_time_unix_ns =
         kTradeDateMidnightUnixNs +
@@ -104,7 +104,7 @@ int main() {
     projected_tick.common.origin.recv_realtime_ns = -99;
     projected_tick.common.origin.recv_monotonic_ns = 8;
     projected_tick.common.instrument_id = 9U;
-    projected_tick.common.registry_ordinal = 0U;
+    projected_tick.common.ordinal = 0U;
     projected_tick.common.quantity_unit =
         market::QuantityUnitV1::kUnknown;
     projected_tick.common.exchange_time.valid = true;
@@ -379,6 +379,156 @@ int main() {
                     tie_bars[0U].close_price_p6 == 20'000'000,
                 "native event sequence orders equal exchange timestamps");
         }
+    }
+
+    // Production owner-index capture publishes only a constant-work token at
+    // the fence. A post-cut append is allowed to advance immediately while
+    // the background builder materializes the 65,536-row-capacity cut.
+    market::KLineAggregatorConfigV1 owner_config{};
+    owner_config.trade_date = 20260724U;
+    owner_config.windows = {
+        {1U, market::kKLineNanosecondsPerSecondV1}};
+    owner_config.maximum_bars = 16U;
+    owner_config.instrument_capacity = 65'536U;
+    owner_config.bars_per_chunk = 2U;
+    owner_config.maximum_bars_per_read = 2U;
+    std::unique_ptr<market::KLineAggregatorV1> owner_aggregator;
+    ok &= Expect(
+        market::KLineAggregatorV1::Create(
+            owner_config, &owner_aggregator) ==
+                market::KLineCreateErrorV1::kNone &&
+            owner_aggregator != nullptr,
+        "create production-capacity owner-index KLine aggregator");
+    if (owner_aggregator != nullptr) {
+        market::KLineTradeV1 before_cut = Trade(
+            1U,
+            1U,
+            TimeNs(9U, 30U, 0U, 100U),
+            10'000'000,
+            2U);
+        before_cut.instrument_id = 1U;
+        before_cut.ordinal = 0U;
+        ok &= Expect(
+            owner_aggregator->Append(before_cut, 0U) ==
+                market::KLineAppendErrorV1::kNone,
+            "append owner-index trade before cut");
+
+        std::unique_ptr<market::KLineAggregatorCutV1> first_cut;
+        ok &= Expect(
+            owner_aggregator->CaptureOwnerCut(
+                1U, 2U, &first_cut) ==
+                    market::KLineCaptureErrorV1::kNone &&
+                first_cut != nullptr,
+            "publish constant-work owner-index cut token");
+
+        market::KLineTradeV1 after_cut = Trade(
+            2U,
+            2U,
+            TimeNs(9U, 30U, 0U, 200U),
+            12'000'000,
+            3U);
+        after_cut.instrument_id = 1U;
+        after_cut.ordinal = 0U;
+        market::KLineTradeV1 newly_active = Trade(
+            3U,
+            3U,
+            TimeNs(9U, 30U, 0U, 300U),
+            20'000'000,
+            4U);
+        newly_active.instrument_id = 2U;
+        newly_active.ordinal = 1U;
+        ok &= Expect(
+            owner_aggregator->Append(after_cut, 0U) ==
+                    market::KLineAppendErrorV1::kNone &&
+                owner_aggregator->Append(newly_active, 1U) ==
+                    market::KLineAppendErrorV1::kNone,
+            "post-cut owner-index rows advance before materialization");
+
+        std::shared_ptr<const market::KLineAggregatorSnapshotV1>
+            first_owner_snapshot;
+        ok &= Expect(
+            first_cut != nullptr &&
+                owner_aggregator->MaterializeOwnerCut(
+                    *first_cut, &first_owner_snapshot) ==
+                    market::KLineCaptureErrorV1::kNone &&
+                first_owner_snapshot != nullptr &&
+                first_owner_snapshot->bar_count() == 1U,
+            "background materialization retains exact pre-cut bar count");
+        if (first_owner_snapshot != nullptr) {
+            market::KLineBarV1 first_bar{};
+            market::KLineBarV1 absent_bar{};
+            ok &= Expect(
+                first_owner_snapshot->GetLatestBar(
+                    1U, 1U, &first_bar) ==
+                        market::KLineQueryErrorV1::kNone &&
+                    first_bar.volume_raw == 2U &&
+                    first_bar.trade_count == 1U &&
+                    first_bar.close_price_p6 == 10'000'000 &&
+                    first_owner_snapshot->GetLatestBar(
+                        2U, 1U, &absent_bar) ==
+                        market::KLineQueryErrorV1::kNotFound,
+                "first owner cut excludes same-row and newly-active post-cut trades");
+        }
+
+        std::unique_ptr<market::KLineAggregatorCutV1> second_cut;
+        std::shared_ptr<const market::KLineAggregatorSnapshotV1>
+            second_owner_snapshot;
+        ok &= Expect(
+            owner_aggregator->CaptureOwnerCut(
+                2U, 2U, &second_cut) ==
+                    market::KLineCaptureErrorV1::kNone &&
+                second_cut != nullptr &&
+                owner_aggregator->MaterializeOwnerCut(
+                    *second_cut, &second_owner_snapshot) ==
+                    market::KLineCaptureErrorV1::kNone &&
+                second_owner_snapshot != nullptr &&
+                second_owner_snapshot->bar_count() == 2U,
+            "next owner cut includes both post-cut rows exactly once");
+        if (second_owner_snapshot != nullptr) {
+            market::KLineBarV1 updated{};
+            market::KLineBarV1 added{};
+            ok &= Expect(
+                second_owner_snapshot->GetLatestBar(
+                    1U, 1U, &updated) ==
+                        market::KLineQueryErrorV1::kNone &&
+                    updated.volume_raw == 5U &&
+                    updated.trade_count == 2U &&
+                    updated.close_price_p6 == 12'000'000 &&
+                    second_owner_snapshot->GetLatestBar(
+                        2U, 1U, &added) ==
+                        market::KLineQueryErrorV1::kNone &&
+                    added.volume_raw == 4U &&
+                    added.trade_count == 1U,
+                "second owner cut exposes exact accumulated KLine state");
+        }
+    }
+
+    market::KLineAggregatorConfigV1 strict_owner_config{};
+    strict_owner_config.trade_date = 20260724U;
+    strict_owner_config.windows = {
+        {1U, market::kKLineNanosecondsPerSecondV1}};
+    strict_owner_config.maximum_bars = 4U;
+    strict_owner_config.instrument_capacity = 1U;
+    std::unique_ptr<market::KLineAggregatorV1> strict_owner;
+    ok &= Expect(
+        market::KLineAggregatorV1::Create(
+            strict_owner_config, &strict_owner) ==
+                market::KLineCreateErrorV1::kNone &&
+            strict_owner != nullptr,
+        "create strict owner-index mode");
+    if (strict_owner != nullptr) {
+        market::KLineTradeV1 invalid_generic = Trade(
+            1U,
+            1U,
+            TimeNs(9U, 30U, 0U, 100U),
+            10'000'000,
+            1U);
+        invalid_generic.instrument_id = 1U;
+        invalid_generic.ordinal = 0U;
+        ok &= Expect(
+            strict_owner->Append(invalid_generic) ==
+                market::KLineAppendErrorV1::kInvalidTrade,
+            "owner-index mode rejects generic append");
     }
 
     return ok ? 0 : 1;

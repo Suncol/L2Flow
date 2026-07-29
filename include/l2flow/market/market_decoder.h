@@ -4,12 +4,32 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
+#include <span>
 #include <string>
 
 namespace l2flow::market {
 
-class InstrumentRegistryV1;
+// Borrowed exact identity extracted from one of the five production message
+// bodies. The spans point into MarketMessageViewV1::body and are valid only
+// while that body remains alive. Extraction performs no allocation and is
+// used by the ordered in-memory dispatcher to serialize first binding in
+// capture order.
+struct ObservedInstrumentKeyViewV2 final {
+    MarketV1 market = MarketV1::kUnknown;
+    std::span<const std::byte> security_id_source{};
+    std::span<const std::byte> security_id{};
+};
+
+struct ObservedInstrumentIdentityViewV2 final {
+    ObservedInstrumentKeyViewV2 key{};
+    std::uint32_t instrument_id = 0U;
+    std::size_t ordinal = std::numeric_limits<std::size_t>::max();
+    QuantityUnitV1 quantity_unit = QuantityUnitV1::kUnknown;
+    SecurityTypeV1 security_type = SecurityTypeV1::kUnknown;
+    AssetScopeV1 asset_scope = AssetScopeV1::kUnknown;
+};
 
 enum class MarketDecodeErrorV1 : std::uint8_t {
     kNone = 0U,
@@ -48,9 +68,6 @@ struct MarketDecoderConfigV1 final {
     // model older Asia/Shanghai DST history.
     std::uint32_t trade_date = 0U;
     std::uint32_t source_stream_id = 0U;
-    // Borrowed immutable registry. When non-null, it must outlive this
-    // decoder.
-    const InstrumentRegistryV1* instrument_registry = nullptr;
     MarketDecoderLimitsV1 limits{};
 };
 
@@ -94,5 +111,21 @@ private:
 
 [[nodiscard]] std::uint64_t MarketDecodeQualityFlagsV1(
     MarketDecodeErrorV1 error) noexcept;
+
+// This parses only the exact security key descriptors. It deliberately does
+// not perform a second full market decode and therefore keeps the ordered
+// dispatcher work bounded. The later source decoder remains the single
+// authority for the complete body/schema validation.
+[[nodiscard]] MarketDecodeErrorV1 ExtractObservedInstrumentKeyV2(
+    const MarketMessageViewV1& input,
+    std::size_t maximum_text_bytes,
+    ObservedInstrumentKeyViewV2* output) noexcept;
+
+// Applies the binding selected by the capture-ordered in-memory dispatcher to
+// the decoded event. It verifies that the decoder produced the same exact
+// key; no second directory lookup occurs on a decoder lane.
+[[nodiscard]] bool ApplyObservedInstrumentIdentityV2(
+    const ObservedInstrumentIdentityViewV2& identity,
+    DecodedMarketEventV1* event) noexcept;
 
 }  // namespace l2flow::market

@@ -2,7 +2,6 @@
 
 #include "l2flow/control/checked_body_view.h"
 #include "l2flow/control/quality_flags_v1.h"
-#include "l2flow/market/instrument_registry.h"
 
 #include "mdl_shl2_msg.h"
 #include "mdl_szl2_msg.h"
@@ -711,35 +710,12 @@ DecodedMarketCommonV1 MakeCommon(
     return common;
 }
 
-void ResolveInstrument(
-    const InstrumentRegistryV1* registry,
+void MarkInstrumentPendingObservedBinding(
     DecodedMarketCommonV1* common) noexcept {
-    const bool exact_key_valid =
-        common->security_id_valid &&
-        (common->market == MarketV1::kShanghai ||
-         (common->market == MarketV1::kShenzhen &&
-          common->security_id_source_valid));
-    if (registry != nullptr && exact_key_valid) {
-        const InstrumentRegistryLookupResultV1 lookup = registry->Lookup(
-            common->market,
-            common->security_id_source,
-            common->security_id);
-        if (lookup.known()) {
-            common->instrument_id = lookup.instrument_id;
-            common->registry_ordinal = lookup.registry_ordinal;
-            common->quantity_unit = lookup.quantity_unit;
-            common->security_type = lookup.security_type;
-            common->asset_scope = lookup.asset_scope;
-        }
-    }
-    if (common->instrument_id == 0U) {
-        common->quality_flags |=
-            QualityBit(QualityFlagV1::kInstrumentUnknown);
-    }
-    if (common->quantity_unit == QuantityUnitV1::kUnknown) {
-        common->quality_flags |=
-            QualityBit(QualityFlagV1::kQtyUnitUnknown);
-    }
+    common->quality_flags |=
+        QualityBit(QualityFlagV1::kInstrumentUnknown);
+    common->quality_flags |=
+        QualityBit(QualityFlagV1::kQtyUnitUnknown);
 }
 
 MarketDecodeErrorV1 DecodeShLevel(
@@ -1141,7 +1117,7 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
     }
     ApplyDepthQuality(bids.count, asks.count, &decoded.common);
     ApplyBodyNotices(view, &decoded.common);
-    ResolveInstrument(config.instrument_registry, &decoded.common);
+    MarkInstrumentPendingObservedBinding(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 #undef L2FLOW_DECODE_OR_RETURN
@@ -1424,7 +1400,7 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
     }
 
     ApplyBodyNotices(view, &decoded.common);
-    ResolveInstrument(config.instrument_registry, &decoded.common);
+    MarkInstrumentPendingObservedBinding(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 }
@@ -1612,7 +1588,7 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
     }
     ApplyDepthQuality(bids.count, asks.count, &decoded.common);
     ApplyBodyNotices(view, &decoded.common);
-    ResolveInstrument(config.instrument_registry, &decoded.common);
+    MarkInstrumentPendingObservedBinding(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 #undef L2FLOW_DECODE_OR_RETURN
@@ -1769,7 +1745,7 @@ MarketDecodeErrorV1 DecodeShenzhenOrder(
         }
     }
     ApplyBodyNotices(view, &decoded.common);
-    ResolveInstrument(config.instrument_registry, &decoded.common);
+    MarkInstrumentPendingObservedBinding(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 }
@@ -1887,7 +1863,7 @@ MarketDecodeErrorV1 DecodeShenzhenTransaction(
             QualityBit(QualityFlagV1::kUnknownEnum);
     }
     ApplyBodyNotices(view, &decoded.common);
-    ResolveInstrument(config.instrument_registry, &decoded.common);
+    MarkInstrumentPendingObservedBinding(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 }
@@ -1904,7 +1880,232 @@ bool RecognizedCoreMessage(
              message_id == sz::Transaction300191_v2::MessageID));
 }
 
+[[nodiscard]] bool ReadU16Little(
+    std::span<const std::byte> body,
+    std::size_t offset,
+    std::uint16_t* output) noexcept {
+    if (output == nullptr || offset > body.size() ||
+        sizeof(std::uint16_t) > body.size() - offset) {
+        return false;
+    }
+    *output =
+        std::to_integer<std::uint16_t>(body[offset]) |
+        static_cast<std::uint16_t>(
+            std::to_integer<std::uint16_t>(body[offset + 1U]) << 8U);
+    return true;
+}
+
+[[nodiscard]] bool ReadU32Little(
+    std::span<const std::byte> body,
+    std::size_t offset,
+    std::uint32_t* output) noexcept {
+    if (output == nullptr || offset > body.size() ||
+        sizeof(std::uint32_t) > body.size() - offset) {
+        return false;
+    }
+    std::uint32_t value = 0U;
+    for (std::size_t index = 0U; index < sizeof(value); ++index) {
+        value |= std::to_integer<std::uint32_t>(body[offset + index])
+                 << static_cast<unsigned int>(index * 8U);
+    }
+    *output = value;
+    return true;
+}
+
+[[nodiscard]] MarketDecodeErrorV1 ReadObservedKeyString(
+    std::span<const std::byte> body,
+    std::size_t descriptor_offset,
+    std::size_t fixed_bytes,
+    std::size_t maximum_text_bytes,
+    std::span<const std::byte>* output) noexcept {
+    if (output == nullptr) {
+        return MarketDecodeErrorV1::kNullOutput;
+    }
+    *output = {};
+    if (body.size() < fixed_bytes) {
+        return MarketDecodeErrorV1::kTruncated;
+    }
+    std::uint16_t length = 0U;
+    std::uint32_t relative_offset = 0U;
+    if (!ReadU16Little(body, descriptor_offset, &length) ||
+        !ReadU32Little(
+            body, descriptor_offset + sizeof(length), &relative_offset)) {
+        return MarketDecodeErrorV1::kTruncated;
+    }
+    const std::size_t size = static_cast<std::size_t>(length);
+    if (size == 0U || size > maximum_text_bytes) {
+        return size == 0U
+                   ? MarketDecodeErrorV1::kTextInvalid
+                   : MarketDecodeErrorV1::kCountExceeded;
+    }
+    if (relative_offset < 6U ||
+        static_cast<std::size_t>(relative_offset) >
+            std::numeric_limits<std::size_t>::max() - descriptor_offset) {
+        return MarketDecodeErrorV1::kOffsetInvalid;
+    }
+    const std::size_t start =
+        descriptor_offset + static_cast<std::size_t>(relative_offset);
+    if (start < fixed_bytes || start > body.size() ||
+        size > body.size() - start) {
+        return MarketDecodeErrorV1::kOffsetInvalid;
+    }
+    const std::span<const std::byte> value = body.subspan(start, size);
+    if (!IsPrintableAscii(value)) {
+        return MarketDecodeErrorV1::kTextInvalid;
+    }
+    *output = value;
+    return MarketDecodeErrorV1::kNone;
+}
+
+[[nodiscard]] bool SpansOverlap(
+    std::span<const std::byte> left,
+    std::span<const std::byte> right) noexcept {
+    if (left.empty() || right.empty()) {
+        return false;
+    }
+    const std::byte* const left_end = left.data() + left.size();
+    const std::byte* const right_end = right.data() + right.size();
+    return left.data() < right_end && right.data() < left_end;
+}
+
+[[nodiscard]] bool StringEqualsBytes(
+    const std::string& text,
+    std::span<const std::byte> bytes) noexcept {
+    return text.size() == bytes.size() &&
+           std::equal(
+               text.begin(),
+               text.end(),
+               reinterpret_cast<const char*>(bytes.data()));
+}
+
 }  // namespace
+
+MarketDecodeErrorV1 ExtractObservedInstrumentKeyV2(
+    const MarketMessageViewV1& input,
+    std::size_t maximum_text_bytes,
+    ObservedInstrumentKeyViewV2* output) noexcept {
+    if (output == nullptr) {
+        return MarketDecodeErrorV1::kNullOutput;
+    }
+    *output = {};
+    if (maximum_text_bytes == 0U ||
+        !RecognizedCoreMessage(input.service_id, input.message_id)) {
+        return maximum_text_bytes == 0U
+                   ? MarketDecodeErrorV1::kInvalidInput
+                   : MarketDecodeErrorV1::kUnsupportedMessage;
+    }
+    if (input.service_version != kCoreServiceVersion) {
+        return MarketDecodeErrorV1::kUnsupportedServiceVersion;
+    }
+
+    std::size_t fixed_bytes = 0U;
+    std::size_t security_id_offset = 0U;
+    std::size_t source_offset = 0U;
+    MarketV1 market = MarketV1::kUnknown;
+    if (input.service_id == sh::SHL2MarketData::ServiceID &&
+        input.message_id == sh::SHL2MarketData::MessageID) {
+        fixed_bytes = sizeof(sh::SHL2MarketData);
+        security_id_offset = 4U;
+        market = MarketV1::kShanghai;
+    } else if (
+        input.service_id == sh::NGTSTick::ServiceID &&
+        input.message_id == sh::NGTSTick::MessageID) {
+        fixed_bytes = sizeof(sh::NGTSTick);
+        security_id_offset = 12U;
+        market = MarketV1::kShanghai;
+    } else if (
+        input.message_id == sz::Snapshot300111_v2::MessageID) {
+        fixed_bytes = sizeof(sz::Snapshot300111_v2);
+        security_id_offset = 14U;
+        source_offset = 20U;
+        market = MarketV1::kShenzhen;
+    } else if (input.message_id == sz::Order300192_v2::MessageID) {
+        fixed_bytes = sizeof(sz::Order300192_v2);
+        security_id_offset = 18U;
+        source_offset = 24U;
+        market = MarketV1::kShenzhen;
+    } else {
+        fixed_bytes = sizeof(sz::Transaction300191_v2);
+        security_id_offset = 34U;
+        source_offset = 40U;
+        market = MarketV1::kShenzhen;
+    }
+
+    ObservedInstrumentKeyViewV2 extracted{};
+    extracted.market = market;
+    MarketDecodeErrorV1 error = ReadObservedKeyString(
+        input.body,
+        security_id_offset,
+        fixed_bytes,
+        maximum_text_bytes,
+        &extracted.security_id);
+    if (error != MarketDecodeErrorV1::kNone) {
+        return error;
+    }
+    if (market == MarketV1::kShenzhen) {
+        error = ReadObservedKeyString(
+            input.body,
+            source_offset,
+            fixed_bytes,
+            maximum_text_bytes,
+            &extracted.security_id_source);
+        if (error != MarketDecodeErrorV1::kNone) {
+            return error;
+        }
+        if (SpansOverlap(
+                extracted.security_id_source,
+                extracted.security_id)) {
+            return MarketDecodeErrorV1::kRangeOverlap;
+        }
+    }
+    *output = extracted;
+    return MarketDecodeErrorV1::kNone;
+}
+
+bool ApplyObservedInstrumentIdentityV2(
+    const ObservedInstrumentIdentityViewV2& identity,
+    DecodedMarketEventV1* event) noexcept {
+    if (event == nullptr || identity.instrument_id == 0U ||
+        identity.ordinal == std::numeric_limits<std::size_t>::max() ||
+        identity.ordinal >=
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max()) ||
+        identity.instrument_id !=
+            static_cast<std::uint32_t>(identity.ordinal + 1U)) {
+        return false;
+    }
+
+    bool applied = false;
+    std::visit(
+        [&](auto& value) noexcept {
+            DecodedMarketCommonV1& common = value.common;
+            if (common.market != identity.key.market ||
+                !common.security_id_valid ||
+                !StringEqualsBytes(
+                    common.security_id, identity.key.security_id) ||
+                (common.market == MarketV1::kShenzhen &&
+                 (!common.security_id_source_valid ||
+                  !StringEqualsBytes(
+                      common.security_id_source,
+                      identity.key.security_id_source)))) {
+                return;
+            }
+            common.instrument_id = identity.instrument_id;
+            common.ordinal = identity.ordinal;
+            common.quantity_unit = identity.quantity_unit;
+            common.security_type = identity.security_type;
+            common.asset_scope = identity.asset_scope;
+            common.quality_flags &=
+                ~QualityBit(QualityFlagV1::kInstrumentUnknown);
+            if (identity.quantity_unit != QuantityUnitV1::kUnknown) {
+                common.quality_flags &=
+                    ~QualityBit(QualityFlagV1::kQtyUnitUnknown);
+            }
+            applied = true;
+        },
+        *event);
+    return applied;
+}
 
 MarketDecoderV1::MarketDecoderV1(
     MarketDecoderConfigV1 config) noexcept

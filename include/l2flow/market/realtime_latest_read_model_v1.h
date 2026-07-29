@@ -8,7 +8,7 @@
 
 namespace l2flow::market {
 
-class InstrumentRegistryV1;
+class ObservedInstrumentDirectoryV2;
 class RealtimeHistoryRecordV1;
 
 // The live read model deliberately has only two record classes.  "Tick"
@@ -21,8 +21,8 @@ enum class RealtimeLatestRecordKindV1 : std::uint8_t {
 
 enum class RealtimeLatestRecordStatusV1 : std::uint8_t {
     kAvailable = 0U,
-    kNotYetObserved,
-    kUnknownInstrument,
+    kBoundNoTypeData,
+    kUnbound,
     kInvalidInstrumentId,
 };
 
@@ -38,6 +38,7 @@ enum class RealtimeLatestPublishErrorV1 : std::uint8_t {
     kCoverageLost,
     kNullRecord,
     kInvalidOrdinal,
+    kUnboundInstrument,
     kInstrumentMismatch,
     kInvalidRecordKind,
     kIngressConflict,
@@ -78,14 +79,14 @@ struct RealtimeLatestRecordViewV1 final {
 
 // Allocation occurs only in Create.  PublishApplied is invoked by the one
 // permanent instrument owner after the matching Store/KLine applied boundary;
-// concurrent publishers for one registry ordinal are outside this contract.
+// concurrent publishers for one directory ordinal are outside this contract.
 // Queries are read-only, allocation-free acquire loads.  A batch is coherent
 // per returned row, not a cross-instrument generation cut; consumers needing
 // one exact market-wide prefix must use IntradayInstrumentStoreGenerationV1.
 // This is a latest-point cache: a slower polling consumer is not guaranteed to
 // observe every intermediate record.
 //
-// The immutable registry must outlive this object.  The Store session must
+// The stable directory must outlive this object. The Store session must
 // outlive this object and every borrowed record returned by it.
 class RealtimeLatestReadModelV1 final {
 public:
@@ -100,7 +101,7 @@ public:
     ~RealtimeLatestReadModelV1();
 
     [[nodiscard]] static RealtimeLatestReadModelCreateErrorV1 Create(
-        const InstrumentRegistryV1* registry,
+        const ObservedInstrumentDirectoryV2* directory,
         std::unique_ptr<RealtimeLatestReadModelV1>* output) noexcept;
 
     // An older ingress sequence is ignored defensively: kNone is returned
@@ -108,7 +109,7 @@ public:
     // The fixed-owner production topology normally publishes one slot in
     // increasing ingress order. updated may be null.
     [[nodiscard]] RealtimeLatestPublishErrorV1 PublishApplied(
-        std::size_t registry_ordinal,
+        std::size_t ordinal,
         const RealtimeHistoryRecordV1* record,
         bool* updated = nullptr) noexcept;
 

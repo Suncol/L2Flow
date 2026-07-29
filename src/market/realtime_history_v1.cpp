@@ -17,8 +17,8 @@
 namespace l2flow::market {
 namespace {
 
-constexpr std::string_view kWatermarkHashDomainV1 =
-    "L2FLOW_REALTIME_HISTORY_WATERMARK_V1";
+constexpr std::string_view kWatermarkHashDomainV2 =
+    "L2FLOW_OBSERVED_HISTORY_WATERMARK_V2";
 
 [[nodiscard]] bool ReadClockNs(
     clockid_t clock,
@@ -105,8 +105,8 @@ bool ComputeWatermarkIdentity(
     std::uint64_t generation,
     std::uint32_t trade_date,
     std::uint64_t ingress_sequence_exclusive,
-    std::uint64_t registry_version,
-    const l2flow::common::Sha256Digest& registry_sha256,
+    const ObservedInstrumentCatalogSnapshotV2& catalog,
+    l2flow::realtime::ProcessingProgressV2 progress,
     std::span<const RealtimeSourceWatermarkV1,
               kRealtimeHistorySourceCountV1> sources,
     l2flow::common::Sha256Digest* output) noexcept {
@@ -115,7 +115,7 @@ bool ComputeWatermarkIdentity(
     }
     l2flow::common::Sha256Hasher hasher;
     const auto domain = std::span<const char>(
-        kWatermarkHashDomainV1.data(), kWatermarkHashDomainV1.size());
+        kWatermarkHashDomainV2.data(), kWatermarkHashDomainV2.size());
     constexpr std::array<std::byte, 1U> separator{std::byte{0U}};
     if (!hasher.Update(std::as_bytes(domain)) ||
         !hasher.Update(separator) ||
@@ -123,8 +123,37 @@ bool ComputeWatermarkIdentity(
         !HashU64(&hasher, generation) ||
         !HashU32(&hasher, trade_date) ||
         !HashU64(&hasher, ingress_sequence_exclusive) ||
-        !HashU64(&hasher, registry_version) ||
-        !hasher.Update(registry_sha256)) {
+        !HashU64(&hasher, catalog.session_epoch()) ||
+        !HashU64(
+            &hasher, static_cast<std::uint64_t>(catalog.capacity())) ||
+        !HashU32(
+            &hasher,
+            static_cast<std::uint32_t>(catalog.catalog_scope())) ||
+        !HashU32(&hasher, catalog.coverage_complete() ? 1U : 0U) ||
+        !HashU64(&hasher, catalog.catalog_generation()) ||
+        !HashU64(&hasher, catalog.data_state_generation()) ||
+        !hasher.Update(catalog.catalog_digest()) ||
+        !HashU64(
+            &hasher,
+            static_cast<std::uint64_t>(catalog.bound_count())) ||
+        !HashU64(
+            &hasher,
+            static_cast<std::uint64_t>(catalog.available_count())) ||
+        !HashU64(
+            &hasher,
+            static_cast<std::uint64_t>(
+                catalog.snapshot_available_count())) ||
+        !HashU64(
+            &hasher,
+            static_cast<std::uint64_t>(
+                catalog.tick_available_count())) ||
+        !HashU64(
+            &hasher,
+            static_cast<std::uint64_t>(
+                catalog.factor_eligible_count())) ||
+        !HashU64(&hasher, progress.accepted_sequence) ||
+        !HashU64(&hasher, progress.durable_sequence) ||
+        !HashU64(&hasher, progress.applied_sequence)) {
         return false;
     }
     for (const RealtimeSourceWatermarkV1& source : sources) {
@@ -182,6 +211,28 @@ DecodedEventDescription Describe(
         event);
 }
 
+[[nodiscard]] bool SnapshotFactorEligible(
+    const RealtimeHistoryRecordV1& record) noexcept {
+    if (!IsSnapshotEventKindV1(record.kind())) {
+        return false;
+    }
+    return std::visit(
+        [](const auto* value) noexcept {
+            using Event = std::remove_cv_t<
+                std::remove_pointer_t<decltype(value)>>;
+            if constexpr (
+                std::is_same_v<Event, ShanghaiSnapshotV1> ||
+                std::is_same_v<Event, ShenzhenSnapshotV1>) {
+                return value != nullptr && value->last_price.valid &&
+                       !value->last_price.is_null &&
+                       value->last_price.normalized_p6 > 0;
+            } else {
+                return false;
+            }
+        },
+        record.event());
+}
+
 bool KindBelongsToSource(
     MarketEventKindV1 kind,
     std::uint8_t source_slot) noexcept {
@@ -200,9 +251,6 @@ bool KindBelongsToSource(
     }
 }
 
-// A zero mixed-tick sequence remains accepted at this standalone C++ Create
-// seam for source compatibility. The production OwnedIngress boundary
-// requires a positive dense value for every tick source.
 bool TickStreamSequenceConsistent(
     MarketEventKindV1 kind,
     std::uint64_t ingress_sequence,
@@ -211,6 +259,7 @@ bool TickStreamSequenceConsistent(
         return tick_stream_sequence == 0U;
     }
     return IsTickEventKindV1(kind) &&
+           tick_stream_sequence != 0U &&
            tick_stream_sequence !=
                std::numeric_limits<std::uint64_t>::max() &&
            tick_stream_sequence <= ingress_sequence;
@@ -389,8 +438,10 @@ std::string_view RealtimeHistoryWatermarkErrorNameV1(
             return "invalid_trade_date";
         case RealtimeHistoryWatermarkErrorV1::kInvalidIngressCut:
             return "invalid_ingress_cut";
-        case RealtimeHistoryWatermarkErrorV1::kInvalidRegistry:
-            return "invalid_registry";
+        case RealtimeHistoryWatermarkErrorV1::kInvalidCatalog:
+            return "invalid_catalog";
+        case RealtimeHistoryWatermarkErrorV1::kInvalidProgress:
+            return "invalid_progress";
         case RealtimeHistoryWatermarkErrorV1::kInvalidSource:
             return "invalid_source";
         case RealtimeHistoryWatermarkErrorV1::kDuplicateSource:
@@ -407,7 +458,9 @@ RealtimeHistoryWatermarkErrorV1 BuildRealtimeHistoryWatermarkV1(
     std::uint32_t trade_date,
     std::uint64_t ingress_sequence_exclusive,
     std::uint64_t recv_monotonic_cut_ns,
-    const InstrumentRegistryV1& registry,
+    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+        catalog_snapshot,
+    l2flow::realtime::ProcessingProgressV2 processing_progress,
     std::span<const RealtimeSourceWatermarkV1,
               kRealtimeHistorySourceCountV1> sources,
     RealtimeHistoryWatermarkV1* output) noexcept {
@@ -426,9 +479,22 @@ RealtimeHistoryWatermarkErrorV1 BuildRealtimeHistoryWatermarkV1(
     if (ingress_sequence_exclusive == 0U) {
         return RealtimeHistoryWatermarkErrorV1::kInvalidIngressCut;
     }
-    if (registry.registry_version() == 0U || registry.empty() ||
-        !DigestNonzero(registry.registry_sha256())) {
-        return RealtimeHistoryWatermarkErrorV1::kInvalidRegistry;
+    if (catalog_snapshot == nullptr ||
+        catalog_snapshot->session_epoch() == 0U ||
+        catalog_snapshot->capacity() == 0U ||
+        catalog_snapshot->catalog_scope() !=
+            ObservedInstrumentCatalogScopeV2::kObservedOnly ||
+        catalog_snapshot->coverage_complete() ||
+        catalog_snapshot->catalog_generation() !=
+            static_cast<std::uint64_t>(
+                catalog_snapshot->bound_count()) ||
+        !DigestNonzero(catalog_snapshot->catalog_digest())) {
+        return RealtimeHistoryWatermarkErrorV1::kInvalidCatalog;
+    }
+    if (!processing_progress.valid() ||
+        processing_progress.applied_sequence !=
+            ingress_sequence_exclusive - 1U) {
+        return RealtimeHistoryWatermarkErrorV1::kInvalidProgress;
     }
     std::uint64_t source_message_count = 0U;
     for (std::size_t index = 0U; index < sources.size(); ++index) {
@@ -466,16 +532,16 @@ RealtimeHistoryWatermarkErrorV1 BuildRealtimeHistoryWatermarkV1(
     candidate.ingress_sequence_exclusive =
         ingress_sequence_exclusive;
     candidate.recv_monotonic_cut_ns = recv_monotonic_cut_ns;
-    candidate.registry_version = registry.registry_version();
-    candidate.registry_sha256 = registry.registry_sha256();
+    candidate.catalog_snapshot = std::move(catalog_snapshot);
+    candidate.processing_progress = processing_progress;
     std::copy(sources.begin(), sources.end(), candidate.sources.begin());
     if (!ComputeWatermarkIdentity(
             run_id,
             generation,
             trade_date,
             ingress_sequence_exclusive,
-            candidate.registry_version,
-            candidate.registry_sha256,
+            *candidate.catalog_snapshot,
+            candidate.processing_progress,
             candidate.sources,
             &candidate.input_identity_sha256) ||
         !DigestNonzero(candidate.input_identity_sha256)) {
@@ -573,7 +639,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
     std::uint64_t ingress_sequence,
     std::uint64_t tick_stream_sequence,
     std::uint32_t instrument_id,
-    std::size_t registry_ordinal,
+    std::size_t ordinal,
     MarketEventKindV1 kind,
     std::int64_t event_time_ns,
     std::int64_t recv_realtime_ns,
@@ -587,7 +653,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
       ingress_sequence_(ingress_sequence),
       tick_stream_sequence_(tick_stream_sequence),
       instrument_id_(instrument_id),
-      registry_ordinal_(registry_ordinal),
+      ordinal_(ordinal),
       kind_(kind),
       event_time_ns_(event_time_ns),
       recv_realtime_ns_(recv_realtime_ns),
@@ -604,7 +670,7 @@ RealtimeHistoryEventInputV1::RealtimeHistoryEventInputV1(
       ingress_sequence_(other.ingress_sequence_),
       tick_stream_sequence_(other.tick_stream_sequence_),
       instrument_id_(other.instrument_id_),
-      registry_ordinal_(other.registry_ordinal_),
+      ordinal_(other.ordinal_),
       kind_(other.kind_),
       event_time_ns_(other.event_time_ns_),
       recv_realtime_ns_(other.recv_realtime_ns_),
@@ -627,7 +693,7 @@ RealtimeHistoryEventInputV1& RealtimeHistoryEventInputV1::operator=(
     ingress_sequence_ = other.ingress_sequence_;
     tick_stream_sequence_ = other.tick_stream_sequence_;
     instrument_id_ = other.instrument_id_;
-    registry_ordinal_ = other.registry_ordinal_;
+    ordinal_ = other.ordinal_;
     kind_ = other.kind_;
     event_time_ns_ = other.event_time_ns_;
     recv_realtime_ns_ = other.recv_realtime_ns_;
@@ -664,7 +730,7 @@ RealtimeHistoryEventInputV1::Create(
         description.common->origin.source_sequence ==
             std::numeric_limits<std::uint64_t>::max() ||
         description.common->instrument_id == 0U ||
-        description.common->registry_ordinal ==
+        description.common->ordinal ==
             std::numeric_limits<std::size_t>::max() ||
         !description.common->origin.body.empty()) {
         return std::nullopt;
@@ -692,7 +758,7 @@ RealtimeHistoryEventInputV1::Create(
         ingress_sequence,
         tick_stream_sequence,
         description.common->instrument_id,
-        description.common->registry_ordinal,
+        description.common->ordinal,
         description.kind,
         event_time_ns,
         description.common->origin.recv_realtime_ns,
@@ -804,9 +870,8 @@ public:
         std::vector<std::unique_ptr<
             IntradayInstrumentStoreWorkerSliceV1>>
             store_worker_slices;
-        std::vector<std::shared_ptr<
-            const KLineAggregatorSnapshotV1>>
-            kline_worker_snapshots;
+        std::vector<std::unique_ptr<KLineAggregatorCutV1>>
+            kline_worker_cuts;
         std::size_t completed_workers = 0U;
     };
 
@@ -886,7 +951,11 @@ public:
     }
 
     std::uint32_t WorkerFor(std::uint32_t instrument_id) const noexcept {
-        return instrument_id % config_.worker_count;
+        return instrument_id == 0U
+                   ? std::numeric_limits<std::uint32_t>::max()
+                   : static_cast<std::uint32_t>(
+                         (instrument_id - 1U) %
+                         config_.worker_count);
     }
 
     RealtimeLatestQueryErrorV1 GetLatest(
@@ -1064,7 +1133,7 @@ public:
 
         InstrumentRouteTokenV1 route{};
         if (store_->ResolveRouteToken(
-                input.registry_ordinal(),
+                input.ordinal(),
                 input.instrument_id(),
                 &route) != IntradayInstrumentStoreQueryErrorV1::kNone ||
             route.worker != WorkerFor(input.instrument_id())) {
@@ -1119,11 +1188,11 @@ public:
                 watermark.trade_date,
                 watermark.ingress_sequence_exclusive,
                 watermark.recv_monotonic_cut_ns,
-                *config_.registry,
+                watermark.catalog_snapshot,
+                watermark.processing_progress,
                 watermark.sources,
                 &rebuilt) != RealtimeHistoryWatermarkErrorV1::kNone ||
-            rebuilt.registry_version != watermark.registry_version ||
-            rebuilt.registry_sha256 != watermark.registry_sha256 ||
+            rebuilt.catalog_snapshot != watermark.catalog_snapshot ||
             rebuilt.input_identity_sha256 !=
                 watermark.input_identity_sha256 ||
             (config_.kline.enabled() &&
@@ -1164,7 +1233,7 @@ public:
             }
             pending->store_worker_slices.resize(config_.worker_count);
             if (config_.kline.enabled()) {
-                pending->kline_worker_snapshots.resize(
+                pending->kline_worker_cuts.resize(
                     config_.worker_count);
             }
             pending_ = std::move(pending);
@@ -1493,7 +1562,7 @@ public:
         }
         const RealtimeLatestPublishErrorV1 latest_error =
             latest_read_model_->PublishApplied(
-                route.registry_ordinal, appended_record);
+                route.ordinal, appended_record);
         if (latest_error != RealtimeLatestPublishErrorV1::kNone) {
             // A publish failure violates the required live-read projection.
             // Fail the projection closed before returning; WorkerLoop then
@@ -1537,7 +1606,40 @@ public:
         }
         if (config_.applied_record_sink != nullptr &&
             !config_.applied_record_sink->PublishApplied(
-                route.registry_ordinal, *appended_record)) {
+                route.ordinal, *appended_record)) {
+            MarkLatestCoverageLost();
+            return false;
+        }
+        if (config_.directory == nullptr) {
+            MarkLatestCoverageLost();
+            return false;
+        }
+        const ObservedInstrumentDataKindV2 data_kind =
+            IsSnapshotEventKindV1(appended_record->kind())
+                ? ObservedInstrumentDataKindV2::kSnapshot
+                : ObservedInstrumentDataKindV2::kTick;
+        if (config_.directory->MarkApplied(
+                route.ordinal,
+                appended_record->instrument_id(),
+                data_kind,
+                appended_record->ingress_sequence()) !=
+            ObservedInstrumentDirectoryErrorV2::kNone) {
+            MarkLatestCoverageLost();
+            return false;
+        }
+        if (data_kind == ObservedInstrumentDataKindV2::kSnapshot &&
+            config_.directory->SetFactorEligible(
+                route.ordinal,
+                appended_record->instrument_id(),
+                SnapshotFactorEligible(*appended_record)) !=
+                ObservedInstrumentDirectoryErrorV2::kNone) {
+            MarkLatestCoverageLost();
+            return false;
+        }
+        if (config_.applied_observer != nullptr &&
+            !config_.applied_observer(
+                config_.applied_observer_context,
+                appended_record->ingress_sequence())) {
             MarkLatestCoverageLost();
             return false;
         }
@@ -1638,9 +1740,29 @@ public:
                 store_failed_.store(true, std::memory_order_release);
                 return false;
             }
+            std::shared_ptr<
+                const ObservedInstrumentCatalogSnapshotV2>
+                catalog_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(generation_mutex_);
+                if (!admission_open_.load(std::memory_order_acquire) ||
+                    stopping_.load(std::memory_order_acquire) ||
+                    fatal_.load(std::memory_order_acquire) ||
+                    pending_ == nullptr ||
+                    pending_->watermark.generation != generation ||
+                    pending_->watermark.catalog_snapshot == nullptr) {
+                    return false;
+                }
+                catalog_snapshot =
+                    pending_->watermark.catalog_snapshot;
+            }
             std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1> slice;
             const IntradayInstrumentStoreGenerationErrorV1 error =
-                store_->CaptureWorker(worker, generation, &slice);
+                store_->CaptureWorker(
+                    worker,
+                    generation,
+                    catalog_snapshot,
+                    &slice);
             if (error !=
                     IntradayInstrumentStoreGenerationErrorV1::kNone ||
                 slice == nullptr) {
@@ -1648,15 +1770,16 @@ public:
                 store_failed_.store(true, std::memory_order_release);
                 return false;
             }
-            std::shared_ptr<const KLineAggregatorSnapshotV1>
-                kline_snapshot;
+            std::unique_ptr<KLineAggregatorCutV1> kline_cut;
             if (config_.kline.enabled()) {
                 if (worker >= kline_aggregators_.size() ||
                     kline_aggregators_[worker] == nullptr ||
-                    kline_aggregators_[worker]->Capture(
-                        &kline_snapshot) !=
+                    kline_aggregators_[worker]->CaptureOwnerCut(
+                        generation,
+                        slice->captured_instrument_count(),
+                        &kline_cut) !=
                         KLineCaptureErrorV1::kNone ||
-                    kline_snapshot == nullptr) {
+                    kline_cut == nullptr) {
                     MarkLatestCoverageLost();
                     kline_failed_.store(
                         true, std::memory_order_release);
@@ -1667,7 +1790,7 @@ public:
                 worker,
                 generation,
                 std::move(slice),
-                std::move(kline_snapshot));
+                std::move(kline_cut));
         } catch (...) {
             return false;
         }
@@ -1678,8 +1801,7 @@ public:
         std::uint64_t generation,
         std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>
             slice,
-        std::shared_ptr<const KLineAggregatorSnapshotV1>
-            kline_snapshot) noexcept {
+        std::unique_ptr<KLineAggregatorCutV1> kline_cut) noexcept {
         try {
             {
                 std::lock_guard<std::mutex> lock(generation_mutex_);
@@ -1693,19 +1815,19 @@ public:
                     pending_->store_worker_slices[worker] != nullptr ||
                     (config_.kline.enabled() &&
                      (worker >=
-                          pending_->kline_worker_snapshots.size() ||
-                      kline_snapshot == nullptr ||
-                      pending_->kline_worker_snapshots[worker] !=
+                          pending_->kline_worker_cuts.size() ||
+                      kline_cut == nullptr ||
+                      pending_->kline_worker_cuts[worker] !=
                           nullptr)) ||
                     (!config_.kline.enabled() &&
-                     kline_snapshot != nullptr) ||
+                     kline_cut != nullptr) ||
                     building_generation_ != 0U) {
                     return false;
                 }
                 pending_->store_worker_slices[worker] = std::move(slice);
                 if (config_.kline.enabled()) {
-                    pending_->kline_worker_snapshots[worker] =
-                        std::move(kline_snapshot);
+                    pending_->kline_worker_cuts[worker] =
+                        std::move(kline_cut);
                 }
                 ++pending_->completed_workers;
                 if (pending_->completed_workers != config_.worker_count) {
@@ -1724,9 +1846,10 @@ public:
                 building_generation_ = generation;
                 builder_job_ = std::move(pending_);
             }
-            // The dedicated builder owns the immutable endpoint slices from
+            // The dedicated builder owns the Store/KLine cut tokens from
             // here. This instrument worker immediately resumes post-cut
-            // append work; no owner is held behind the O(I) generation build.
+            // append work; lazy per-row freezing preserves the exact cut
+            // without holding the owner behind O(bound_count) materialization.
             builder_cv_.notify_one();
             return true;
         } catch (...) {
@@ -1790,7 +1913,7 @@ public:
         const std::uint64_t generation =
             building->watermark.generation;
         try {
-            // Captured lane endpoints are immutable. The O(I) validation and
+            // The O(bound_count) Store/KLine materialization, validation, and
             // index build run without the history commit mutex while decoder
             // and instrument-owner queues continue routing post-cut records.
             std::shared_ptr<const IntradayInstrumentStoreGenerationV1>
@@ -1811,16 +1934,43 @@ public:
                 kline_candidate;
             bool kline_build_failed = false;
             if (!build_failed && config_.kline.enabled()) {
-                const RealtimeKLineGenerationErrorV1 kline_error =
-                    RealtimeKLineGenerationV1::Build(
-                        candidate,
-                        std::move(
-                            building->kline_worker_snapshots),
-                        config_.worker_count,
-                        &kline_candidate);
+                std::vector<std::shared_ptr<
+                    const KLineAggregatorSnapshotV1>>
+                    kline_snapshots(config_.worker_count);
+                for (std::size_t worker = 0U;
+                     worker < kline_snapshots.size();
+                     ++worker) {
+                    if (worker >= kline_aggregators_.size() ||
+                        kline_aggregators_[worker] == nullptr ||
+                        worker >=
+                            building->kline_worker_cuts.size() ||
+                        building->kline_worker_cuts[worker] ==
+                            nullptr ||
+                        kline_aggregators_[worker]
+                                ->MaterializeOwnerCut(
+                                    *building
+                                         ->kline_worker_cuts[worker],
+                                    &kline_snapshots[worker]) !=
+                            KLineCaptureErrorV1::kNone ||
+                        kline_snapshots[worker] == nullptr) {
+                        kline_build_failed = true;
+                        break;
+                    }
+                }
+                RealtimeKLineGenerationErrorV1 kline_error =
+                    RealtimeKLineGenerationErrorV1::kInvalidInput;
+                if (!kline_build_failed) {
+                    kline_error =
+                        RealtimeKLineGenerationV1::Build(
+                            candidate,
+                            std::move(kline_snapshots),
+                            config_.worker_count,
+                            &kline_candidate);
+                }
                 kline_build_failed =
+                    kline_build_failed ||
                     kline_error !=
-                        RealtimeKLineGenerationErrorV1::kNone ||
+                            RealtimeKLineGenerationErrorV1::kNone ||
                     kline_candidate == nullptr;
                 if (kline_build_failed) {
                     MarkLatestCoverageLost();
@@ -2057,7 +2207,8 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
     if (output == nullptr) {
         return RealtimeHistoryCreateErrorV1::kNullOutput;
     }
-    if (config.registry == nullptr || config.registry->empty() ||
+    if (config.directory == nullptr ||
+        config.directory->capacity() == 0U ||
         config.worker_count == 0U || config.worker_count > 256U ||
         config.queue_capacity_per_source_worker == 0U ||
         config.queue_capacity_per_source_worker >
@@ -2102,7 +2253,7 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
                 config.intraday_store,
                 config.worker_count,
                 config.source_stream_ids,
-                config.registry,
+                config.directory,
                 &store);
         if (error != IntradayInstrumentStoreCreateErrorV1::kNone ||
             store == nullptr) {
@@ -2110,7 +2261,7 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
         }
         std::unique_ptr<RealtimeLatestReadModelV1> latest_read_model;
         if (RealtimeLatestReadModelV1::Create(
-                config.registry, &latest_read_model) !=
+                config.directory, &latest_read_model) !=
                 RealtimeLatestReadModelCreateErrorV1::kNone ||
             latest_read_model == nullptr) {
             return RealtimeHistoryCreateErrorV1::
@@ -2121,10 +2272,20 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
         if (config.kline.enabled()) {
             std::vector<std::size_t> worker_instrument_counts(
                 config.worker_count, 0U);
-            for (const InstrumentRegistryEntryV1& entry :
-                 config.registry->entries()) {
-                ++worker_instrument_counts[
-                    entry.instrument_id % config.worker_count];
+            const std::size_t base =
+                config.directory->capacity() /
+                static_cast<std::size_t>(config.worker_count);
+            const std::size_t remainder =
+                config.directory->capacity() %
+                static_cast<std::size_t>(config.worker_count);
+            for (std::uint32_t worker = 0U;
+                 worker < config.worker_count;
+                 ++worker) {
+                worker_instrument_counts[worker] =
+                    base +
+                    (static_cast<std::size_t>(worker) < remainder
+                         ? 1U
+                         : 0U);
             }
             kline_aggregators.reserve(config.worker_count);
             for (std::uint32_t worker = 0U;

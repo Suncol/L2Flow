@@ -1,5 +1,6 @@
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
+#include "l2flow/runtime/detail/closeable_publication_gate.h"
 #include "l2flow/sdk/direct_sdk_runtime_v1.h"
 #include "l2flow/sdk/production_subscription_v1.h"
 
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <semaphore>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -27,6 +29,8 @@ namespace sdk = l2flow::sdk;
 namespace mdl = datayes::mdl;
 
 constexpr auto kMaximumCutTimeout = std::chrono::hours(24);
+constexpr auto kProgressPublishMaximumDelay =
+    std::chrono::milliseconds(1);
 
 void ClearDetail(std::string* detail) noexcept {
     if (detail == nullptr) {
@@ -79,45 +83,6 @@ void SetDetailLiteral(std::string* detail, const char* message) noexcept {
            source_slot ==
                static_cast<std::uint8_t>(
                    realtime::OwnedIngressSourceV1::kShenzhenTick);
-}
-
-[[nodiscard]] bool ProductionRegistryValid(
-    const market::InstrumentRegistryV1& registry) noexcept {
-    constexpr std::array<std::byte, 4U> shenzhen_source{
-        std::byte{0x31U},
-        std::byte{0x30U},
-        std::byte{0x32U},
-        std::byte{0x20U}};
-    for (const market::InstrumentRegistryEntryV1& entry :
-         registry.entries()) {
-        const bool reachable_security_id = std::all_of(
-            entry.key.security_id.begin(),
-            entry.key.security_id.end(),
-            [](std::byte value) noexcept {
-                const std::uint8_t character =
-                    std::to_integer<std::uint8_t>(value);
-                return character >= 0x20U && character <= 0x7eU;
-            });
-        if (entry.key.security_id.empty() || !reachable_security_id) {
-            return false;
-        }
-        if (entry.key.market == market::MarketV1::kShanghai) {
-            if (!entry.key.security_id_source.empty()) {
-                return false;
-            }
-        } else if (entry.key.market == market::MarketV1::kShenzhen) {
-            if (!std::equal(
-                    entry.key.security_id_source.begin(),
-                    entry.key.security_id_source.end(),
-                    shenzhen_source.begin(),
-                    shenzhen_source.end())) {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    return true;
 }
 
 [[nodiscard]] bool ReadClockNs(clockid_t clock,
@@ -669,7 +634,7 @@ private:
     ConcurrentLinearLatencyHistogram append_call_;
 };
 
-[[nodiscard]] bool MaximumIngressPoolMessages(
+[[nodiscard]] bool BoundedAppliedWindowCapacity(
     const RealtimePipelineConfigV1& config,
     std::size_t* output) noexcept {
     if (output == nullptr ||
@@ -677,18 +642,39 @@ private:
             (std::numeric_limits<std::size_t>::max() - 4U) / 4U) {
         return false;
     }
-    // Four full decoder rings, one message currently owned by each decoder,
-    // and the callback's not-yet-enqueued message are simultaneously live.
-    std::size_t maximum =
+    // This explicit dispatcher-side gate, rather than any expectation about
+    // queue drain speed, bounds how far completion may run ahead of a missing
+    // applied sequence.
+    const std::size_t maximum =
         config.decoder_queue_capacity_per_source * 4U + 4U + 1U;
-    if (config.wal.enabled) {
-        // WAL may independently retain a full queue plus the record currently
-        // owned by its writer, with no overlap available as a proof.
-        if (config.wal.queue_capacity >
-            std::numeric_limits<std::size_t>::max() - maximum - 1U) {
+    if (maximum == 0U ||
+        maximum > realtime::kOwnedIngressMaximumInflightMessagesV1) {
+        return false;
+    }
+    *output = maximum;
+    return true;
+}
+
+[[nodiscard]] bool BoundedIngressPoolCapacity(
+    const RealtimePipelineConfigV1& config,
+    std::size_t applied_window,
+    std::size_t* output) noexcept {
+    if (output == nullptr || applied_window == 0U) {
+        return false;
+    }
+    std::size_t maximum = applied_window;
+    constexpr std::size_t callback_owner = 1U;
+    const std::array<std::size_t, 4U> additions{
+        config.processing_queue_capacity,
+        config.journal.queue_capacity,
+        config.journal.max_batch_records,
+        callback_owner};
+    for (const std::size_t addition : additions) {
+        if (addition >
+            std::numeric_limits<std::size_t>::max() - maximum) {
             return false;
         }
-        maximum += config.wal.queue_capacity + 1U;
+        maximum += addition;
     }
     if (maximum == 0U ||
         maximum > realtime::kOwnedIngressMaximumInflightMessagesV1) {
@@ -698,7 +684,22 @@ private:
     return true;
 }
 
+inline constexpr std::uint32_t kIngressPrewarmMessageBytes = 4096U;
+static_assert(
+    sizeof(realtime::OwnedIngressMessageV1) +
+            kIngressPrewarmMessageBytes -
+            l2flow::sdk::kVendorHeadBytes <=
+        8192U);
+inline constexpr std::size_t kIngressPrewarmMaximumBlocks =
+    l2flow::realtime::kOwnedIngressMaximumPrewarmBytesV1 / 8192U;
+
 }  // namespace
+
+bool RealtimePipelineAppliedWindowCapacityV1(
+    const RealtimePipelineConfigV1& config,
+    std::size_t* output) noexcept {
+    return BoundedAppliedWindowCapacity(config, output);
+}
 
 std::string_view RealtimePipelineCreateErrorNameV1(
     RealtimePipelineCreateErrorV1 error) noexcept {
@@ -716,10 +717,16 @@ std::string_view RealtimePipelineCreateErrorNameV1(
         case RealtimePipelineCreateErrorV1::
             kLatestReadModelCreateFailed:
             return "latest_read_model_create_failed";
-        case RealtimePipelineCreateErrorV1::kWalCreateFailed:
-            return "wal_create_failed";
+        case RealtimePipelineCreateErrorV1::kJournalCreateFailed:
+            return "journal_create_failed";
         case RealtimePipelineCreateErrorV1::kFactorCreateFailed:
             return "factor_create_failed";
+        case RealtimePipelineCreateErrorV1::
+            kProgressThreadStartFailed:
+            return "progress_thread_start_failed";
+        case RealtimePipelineCreateErrorV1::
+            kProcessingThreadStartFailed:
+            return "processing_thread_start_failed";
         case RealtimePipelineCreateErrorV1::kDecoderThreadStartFailed:
             return "decoder_thread_start_failed";
         case RealtimePipelineCreateErrorV1::kSdkLoadFailed:
@@ -761,8 +768,11 @@ std::string_view RealtimePipelineIngressErrorNameV1(
             return "owned_message_rejected";
         case RealtimePipelineIngressErrorV1::kForbiddenCombinedTick:
             return "forbidden_combined_tick";
-        case RealtimePipelineIngressErrorV1::kDecoderQueueFull:
-            return "decoder_queue_full";
+        case RealtimePipelineIngressErrorV1::kJournalAdmissionFailed:
+            return "journal_admission_failed";
+        case RealtimePipelineIngressErrorV1::
+            kProcessingAdmissionFailed:
+            return "processing_admission_failed";
         case RealtimePipelineIngressErrorV1::kStopped:
             return "stopped";
         case RealtimePipelineIngressErrorV1::kFatal:
@@ -788,6 +798,8 @@ std::string_view RealtimePipelineCutErrorNameV1(
             return "clock_failure";
         case RealtimePipelineCutErrorV1::kWatermarkFailed:
             return "watermark_failed";
+        case RealtimePipelineCutErrorV1::kProcessingBarrierFailed:
+            return "processing_barrier_failed";
         case RealtimePipelineCutErrorV1::kGenerationBeginFailed:
             return "generation_begin_failed";
         case RealtimePipelineCutErrorV1::kMarkerAdmissionFailed:
@@ -818,7 +830,116 @@ public:
     struct DecoderCommand final {
         CommandKind kind = CommandKind::kMessage;
         realtime::OwnedIngressMessageHandleV1 message;
+        market::ObservedInstrumentIdentityViewV2 identity{};
         std::uint64_t generation = 0U;
+    };
+
+    class ProcessingQueue final {
+    public:
+        explicit ProcessingQueue(std::size_t capacity)
+            : slots_(capacity + 1U) {}
+
+        ProcessingQueue(const ProcessingQueue&) = delete;
+        ProcessingQueue& operator=(const ProcessingQueue&) = delete;
+
+        [[nodiscard]] bool TryPush(
+            realtime::OwnedIngressMessageHandleV1 message) noexcept {
+            if (!message) {
+                return false;
+            }
+            detail::CloseablePublicationGate::Lease publication =
+                publication_gate_.TryAcquire();
+            if (!publication) {
+                return false;
+            }
+            const std::size_t tail =
+                tail_.load(std::memory_order_relaxed);
+            const std::size_t next = Increment(tail);
+            if (next == head_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            slots_[tail] = std::move(message);
+            tail_.store(next, std::memory_order_release);
+            WakeConsumer();
+            return true;
+        }
+
+        [[nodiscard]] bool Pop(
+            realtime::OwnedIngressMessageHandleV1* output) noexcept {
+            if (output == nullptr) {
+                return false;
+            }
+            output->reset();
+            for (;;) {
+                if (TryPop(output)) {
+                    return true;
+                }
+                if (publication_gate_.closed_and_quiesced()) {
+                    return false;
+                }
+                consumer_sleeping_.store(
+                    true, std::memory_order_release);
+                if (!Empty() ||
+                    publication_gate_.closed_and_quiesced()) {
+                    consumer_sleeping_.store(
+                        false, std::memory_order_release);
+                    continue;
+                }
+                consumer_sleeping_.wait(
+                    true, std::memory_order_acquire);
+            }
+        }
+
+        void RequestStop() noexcept {
+            // A callback that already crossed TryAcquire() must publish its
+            // tail before close returns. The callback itself never waits:
+            // only the closing thread waits for that bounded memory section.
+            publication_gate_.CloseAndWait();
+            consumer_sleeping_.store(
+                false, std::memory_order_release);
+            consumer_sleeping_.notify_all();
+        }
+
+    private:
+        [[nodiscard]] bool TryPop(
+            realtime::OwnedIngressMessageHandleV1* output) noexcept {
+            const std::size_t head =
+                head_.load(std::memory_order_relaxed);
+            const std::size_t tail =
+                tail_.load(std::memory_order_acquire);
+            if (head == tail) {
+                return false;
+            }
+            *output = std::move(slots_[head]);
+            slots_[head].reset();
+            head_.store(Increment(head), std::memory_order_release);
+            return static_cast<bool>(*output);
+        }
+
+        [[nodiscard]] bool Empty() const noexcept {
+            return head_.load(std::memory_order_acquire) ==
+                   tail_.load(std::memory_order_acquire);
+        }
+
+        void WakeConsumer() noexcept {
+            if (!consumer_sleeping_.exchange(
+                    false, std::memory_order_acq_rel)) {
+                return;
+            }
+            consumer_sleeping_.notify_one();
+        }
+
+        [[nodiscard]] std::size_t Increment(
+            std::size_t value) const noexcept {
+            ++value;
+            return value == slots_.size() ? 0U : value;
+        }
+
+        std::vector<realtime::OwnedIngressMessageHandleV1> slots_;
+        alignas(64) std::atomic<std::size_t> head_{0U};
+        alignas(64) std::atomic<std::size_t> tail_{0U};
+        detail::CloseablePublicationGate publication_gate_;
+        std::atomic<bool> consumer_sleeping_{false};
     };
 
     class DecoderQueue final {
@@ -830,7 +951,9 @@ public:
         DecoderQueue& operator=(const DecoderQueue&) = delete;
 
         [[nodiscard]] bool TryPush(DecoderCommand&& command) noexcept {
-            if (stop_requested_.load(std::memory_order_acquire)) {
+            detail::CloseablePublicationGate::Lease publication =
+                publication_gate_.TryAcquire();
+            if (!publication) {
                 return false;
             }
             const std::size_t tail =
@@ -855,7 +978,7 @@ public:
                     if (TryPush(std::move(command))) {
                         return true;
                     }
-                    if (stop_requested_.load(std::memory_order_acquire)) {
+                    if (publication_gate_.close_requested()) {
                         return false;
                     }
                     std::unique_lock<std::mutex> lock(wait_mutex_);
@@ -867,8 +990,7 @@ public:
                         continue;
                     }
                     const auto ready = [this] {
-                        return stop_requested_.load(
-                                   std::memory_order_acquire) ||
+                        return publication_gate_.close_requested() ||
                                !producer_waiting_.load(
                                    std::memory_order_acquire);
                     };
@@ -877,7 +999,7 @@ public:
                             false, std::memory_order_release);
                         return false;
                     }
-                    if (stop_requested_.load(std::memory_order_acquire)) {
+                    if (publication_gate_.close_requested()) {
                         return false;
                     }
                 }
@@ -895,7 +1017,7 @@ public:
                     if (TryPop(output)) {
                         return true;
                     }
-                    if (stop_requested_.load(std::memory_order_acquire)) {
+                    if (publication_gate_.closed_and_quiesced()) {
                         return false;
                     }
                     std::unique_lock<std::mutex> lock(wait_mutex_);
@@ -907,8 +1029,8 @@ public:
                         continue;
                     }
                     not_empty_.wait(lock, [this] {
-                        return stop_requested_.load(
-                                   std::memory_order_acquire) ||
+                        return publication_gate_
+                                   .closed_and_quiesced() ||
                                !consumer_sleeping_.load(
                                    std::memory_order_acquire);
                     });
@@ -919,7 +1041,9 @@ public:
         }
 
         void RequestStop() noexcept {
-            stop_requested_.store(true, std::memory_order_release);
+            // Marker/message producers that already passed admission publish
+            // before consumers are allowed to interpret closed+empty.
+            publication_gate_.CloseAndWait();
             consumer_sleeping_.store(false, std::memory_order_release);
             producer_waiting_.store(false, std::memory_order_release);
             std::lock_guard<std::mutex> lock(wait_mutex_);
@@ -988,7 +1112,7 @@ public:
         std::vector<std::optional<DecoderCommand>> slots_;
         alignas(64) std::atomic<std::size_t> head_{0U};
         alignas(64) std::atomic<std::size_t> tail_{0U};
-        std::atomic<bool> stop_requested_{false};
+        detail::CloseablePublicationGate publication_gate_;
         std::atomic<bool> consumer_sleeping_{false};
         std::atomic<bool> producer_waiting_{false};
         std::mutex wait_mutex_;
@@ -1004,6 +1128,42 @@ public:
         DecoderQueue queue;
         market::MarketDecoderV1 decoder;
         std::thread thread;
+    };
+
+    class DispatchBarrierLease final {
+    public:
+        explicit DispatchBarrierLease(Impl* owner) noexcept
+            : owner_(owner) {}
+
+        DispatchBarrierLease(const DispatchBarrierLease&) = delete;
+        DispatchBarrierLease& operator=(
+            const DispatchBarrierLease&) = delete;
+
+        ~DispatchBarrierLease() {
+            if (armed_) {
+                owner_->ReleaseDispatchBarrier();
+            }
+        }
+
+        [[nodiscard]] bool Arm(std::uint64_t sequence) noexcept {
+            if (armed_ || owner_ == nullptr ||
+                !owner_->ArmDispatchBarrier(sequence)) {
+                return false;
+            }
+            armed_ = true;
+            return true;
+        }
+
+        void Release() noexcept {
+            if (armed_) {
+                owner_->ReleaseDispatchBarrier();
+                armed_ = false;
+            }
+        }
+
+    private:
+        Impl* owner_ = nullptr;
+        bool armed_ = false;
     };
 
     Impl(RealtimePipelineConfigV1 config,
@@ -1023,6 +1183,45 @@ public:
         }
     }
 
+    static void ObserveDurableSequence(
+        void* context,
+        std::uint64_t durable_sequence) noexcept {
+        auto* const owner = static_cast<Impl*>(context);
+        if (owner != nullptr) {
+            std::uint64_t accepted =
+                owner->accepted_sequence_.load(
+                    std::memory_order_acquire);
+            while (accepted < durable_sequence &&
+                   !owner->accepted_sequence_.compare_exchange_weak(
+                       accepted,
+                       durable_sequence,
+                       std::memory_order_release,
+                       std::memory_order_acquire)) {
+            }
+            owner->durable_sequence_.store(
+                durable_sequence, std::memory_order_release);
+            owner->RequestProgressPublication();
+        }
+    }
+
+    static void ObserveJournalFailure(
+        void* context,
+        realtime::MandatoryJournalFailureKindV2,
+        int) noexcept {
+        auto* const owner = static_cast<Impl*>(context);
+        if (owner != nullptr) {
+            owner->MarkAsyncFatal();
+        }
+    }
+
+    static bool ObserveAppliedSequence(
+        void* context,
+        std::uint64_t ingress_sequence) noexcept {
+        auto* const owner = static_cast<Impl*>(context);
+        return owner != nullptr &&
+               owner->CompleteAppliedSequence(ingress_sequence);
+    }
+
     [[nodiscard]] RealtimePipelineCreateErrorV1 Initialize(
         bool factory_is_test_override,
         std::string* detail) noexcept {
@@ -1032,9 +1231,14 @@ public:
         }
 
         try {
+            std::size_t applied_window = 0U;
             std::size_t maximum_inflight_messages = 0U;
-            if (!MaximumIngressPoolMessages(
-                    config_, &maximum_inflight_messages)) {
+            if (!BoundedAppliedWindowCapacity(
+                    config_, &applied_window) ||
+                !BoundedIngressPoolCapacity(
+                    config_,
+                    applied_window,
+                    &maximum_inflight_messages)) {
                 SetDetailLiteral(
                     detail, "invalid ingress pool capacity");
                 return RealtimePipelineCreateErrorV1::
@@ -1045,6 +1249,21 @@ public:
                 config_.maximum_sdk_message_bytes;
             pool_config.maximum_inflight_messages =
                 maximum_inflight_messages;
+            pool_config.prewarm_message_bytes = std::min(
+                config_.maximum_sdk_message_bytes,
+                kIngressPrewarmMessageBytes);
+            // Reserve the complete bounded in-flight window before SDK
+            // Connect. Journal and processing can advance at different rates,
+            // so their retained sequence ranges need not overlap: limiting
+            // this reservation to the two ingress rings would reintroduce
+            // allocator entry and first-touch faults in the callback once
+            // decoder/applied backlog grows past that smaller hot set. A
+            // <=4096-byte wire message occupies at most the 8192-byte size
+            // class; the byte cap keeps unusually large configured windows
+            // from turning startup into an unbounded eager allocation.
+            pool_config.prewarm_message_count = std::min(
+                maximum_inflight_messages,
+                kIngressPrewarmMaximumBlocks);
             const realtime::OwnedIngressMessageErrorV1 pool_error =
                 realtime::OwnedIngressMessagePoolV1::Create(
                     pool_config, &ingress_pool_);
@@ -1072,6 +1291,21 @@ public:
                         config_.trade_date);
             }
 
+            if (realtime::ContiguousSequenceTrackerV2::Create(
+                    applied_window,
+                    &applied_tracker_) !=
+                    realtime::ContiguousSequenceTrackerCreateErrorV2::
+                        kNone ||
+                applied_tracker_ == nullptr) {
+                SetDetailLiteral(
+                    detail, "applied sequence tracker create failed");
+                return RealtimePipelineCreateErrorV1::
+                    kResourceExhausted;
+            }
+            applied_window_capacity_ = applied_window;
+            processing_queue_ = std::make_unique<ProcessingQueue>(
+                config_.processing_queue_capacity);
+
             market::RealtimeHistoryRuntimeConfigV1 history_config{};
             history_config.source_stream_ids = config_.source_stream_ids;
             history_config.worker_count = config_.store_worker_count;
@@ -1080,9 +1314,12 @@ public:
             history_config.intraday_store = config_.intraday_store;
             history_config.kline = config_.kline;
             history_config.kline.trade_date = config_.trade_date;
-            history_config.registry = config_.registry;
+            history_config.directory = config_.directory;
             history_config.applied_record_sink =
                 config_.applied_record_sink;
+            history_config.applied_observer =
+                &ObserveAppliedSequence;
+            history_config.applied_observer_context = this;
             if (latency_collector_ != nullptr) {
                 history_config.append_observer = &ObserveAppend;
                 history_config.append_observer_context = this;
@@ -1115,24 +1352,11 @@ public:
                     kStoreRuntimeCreateFailed;
             }
 
-            const realtime::OptionalWalCreateErrorV1 wal_error =
-                realtime::OptionalWalSinkV1::Create(config_.wal, &wal_);
-            if (wal_error != realtime::OptionalWalCreateErrorV1::kNone) {
-                SetDetail(
-                    detail,
-                    "optional WAL create failed: " +
-                        std::string(
-                            realtime::OptionalWalCreateErrorNameV1(
-                                wal_error)));
-                return RealtimePipelineCreateErrorV1::kWalCreateFailed;
-            }
-
             if (config_.factor_calculator == nullptr) {
                 config_.factor_calculator =
                     std::make_shared<factor::SnapshotLastPriceProjectionV1>();
             }
             factor::RealtimeFactorEngineConfigV1 factor_config{};
-            factor_config.registry = config_.registry;
             factor_config.generation_runtime = history_.get();
             factor_config.calculator = config_.factor_calculator;
             const factor::RealtimeFactorEngineCreateErrorV1 factor_error =
@@ -1156,7 +1380,6 @@ public:
                 decoder_config.trade_date = config_.trade_date;
                 decoder_config.source_stream_id =
                     config_.source_stream_ids[source];
-                decoder_config.instrument_registry = config_.registry;
                 decoder_config.limits = config_.decoder_limits;
                 lanes_[source] = std::make_unique<DecoderLane>(
                     config_.decoder_queue_capacity_per_source,
@@ -1173,7 +1396,46 @@ public:
                 return RealtimePipelineCreateErrorV1::
                     kDecoderThreadStartFailed;
             }
+            if (!StartProcessingThread()) {
+                SetDetailLiteral(
+                    detail,
+                    "cannot start ordered processing dispatcher");
+                return RealtimePipelineCreateErrorV1::
+                    kProcessingThreadStartFailed;
+            }
+            if (!StartProgressThread()) {
+                SetDetailLiteral(
+                    detail,
+                    "cannot start asynchronous progress publisher");
+                return RealtimePipelineCreateErrorV1::
+                    kProgressThreadStartFailed;
+            }
 
+            config_.journal.durable = &ObserveDurableSequence;
+            config_.journal.durable_context = this;
+            config_.journal.failure = &ObserveJournalFailure;
+            config_.journal.failure_context = this;
+            config_.journal.maximum_message_bytes =
+                config_.maximum_sdk_message_bytes;
+            int journal_errno = 0;
+            const realtime::MandatoryJournalCreateErrorV2 journal_error =
+                realtime::MandatoryJournalV2::Create(
+                    config_.journal,
+                    &journal_,
+                    &journal_errno);
+            if (journal_error !=
+                    realtime::MandatoryJournalCreateErrorV2::kNone ||
+                journal_ == nullptr) {
+                SetDetail(
+                    detail,
+                    "mandatory Journal create failed: " +
+                        std::string(
+                            realtime::MandatoryJournalCreateErrorNameV2(
+                                journal_error)) +
+                        " errno=" + std::to_string(journal_errno));
+                return RealtimePipelineCreateErrorV1::
+                    kJournalCreateFailed;
+            }
             const RealtimePipelineCreateErrorV1 sdk_error =
                 StartSdk(factory_is_test_override, detail);
             if (sdk_error != RealtimePipelineCreateErrorV1::kNone) {
@@ -1374,51 +1636,67 @@ public:
             return result;
         }
 
-        realtime::OwnedIngressMessageHandleV1 wal_message;
-        if (config_.wal.enabled) {
-            // WAL-on creates exactly one intrusive reference for its
-            // independent lifetime. WAL-off keeps the decoder as the unique
-            // owner and performs no atomic reference increment/decrement.
-            wal_message = owned;
-        }
-        DecoderCommand command{};
-        command.kind = CommandKind::kMessage;
-        command.message = std::move(owned);
-        if (!lanes_[source_slot]->queue.TryPush(std::move(command))) {
+        // The payload is copied exactly once into the pool. Journal and
+        // realtime processing retain separate intrusive references to those
+        // same immutable bytes.
+        realtime::OwnedIngressMessageHandleV1 processing_message = owned;
+        result.journal_result =
+            journal_->TryAppend(std::move(owned));
+        if (result.journal_result !=
+            realtime::MandatoryJournalAppendResultV2::kAccepted) {
             result.error =
-                RealtimePipelineIngressErrorV1::kDecoderQueueFull;
+                RealtimePipelineIngressErrorV1::
+                    kJournalAdmissionFailed;
             ReportPipelineFailure(
-                "decoder_queue_full",
+                "mandatory_journal_admission",
                 source_slot,
                 metadata.global_ingress_sequence,
-                0U);
+                static_cast<std::uint64_t>(
+                    result.journal_result));
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
             return result;
         }
 
+        // Journal admission cannot be rolled back. Publish the accepted
+        // capture prefix before the writer can report an equal durable
+        // prefix, then commit the serialized source counters.
+        accepted_sequence_.store(
+            metadata.global_ingress_sequence,
+            std::memory_order_release);
         global_ingress_sequence_ = metadata.global_ingress_sequence;
         source_sequences_[source_slot] = metadata.source_sequence;
         if (mixed_tick_source) {
             tick_stream_sequence_ = metadata.tick_stream_sequence;
         }
-        ++accepted_messages_;
         result.global_ingress_sequence = metadata.global_ingress_sequence;
         result.source_sequence = metadata.source_sequence;
         result.tick_stream_sequence = metadata.tick_stream_sequence;
+        ++accepted_messages_;
 
-        // WAL status is intentionally observed only after realtime admission.
-        if (config_.wal.enabled) {
-            result.wal_result =
-                wal_->TryEnqueue(std::move(wal_message));
-        } else {
-            result.wal_result =
-                realtime::OptionalWalEnqueueResultV1::kDisabled;
+        // Journal must accept first. Processing admission remains
+        // allocation-free and nonblocking; failure is terminal because the
+        // already-journaled sequence cannot be skipped or reordered.
+        if (processing_queue_ == nullptr ||
+            !processing_queue_->TryPush(
+                std::move(processing_message))) {
+            result.error =
+                RealtimePipelineIngressErrorV1::
+                    kProcessingAdmissionFailed;
+            ReportPipelineFailure(
+                "processing_queue_admission",
+                source_slot,
+                metadata.global_ingress_sequence,
+                config_.processing_queue_capacity);
+            ++rejected_messages_;
+            TripFatalWithAdmissionLockHeld();
+            return result;
         }
+
         // Successful admission is complete only after the serialized callback
         // authority has been released.  The completion clocks below therefore
-        // include owned-copy, decoder enqueue, optional WAL enqueue, and the
-        // admission critical section, but exclude histogram aggregation.
+        // include owned-copy, both in-memory queue enqueues, and the admission
+        // critical section, but no Journal write or fdatasync.
         admission.unlock();
         if (latency_collector_ != nullptr) {
             std::uint64_t success_monotonic_ns = 0U;
@@ -1496,9 +1774,9 @@ public:
             }
 
             // Shutdown is the callback-quiescence boundary. Every callback
-            // admitted before it is already represented by an owned decoder
-            // command; callbacks arriving after admission closure are not
-            // part of the accepted prefix.
+            // admitted before it owns a Journal sequence and either has an
+            // in-memory processing entry or has already failed the session
+            // closed; later callbacks are outside the accepted prefix.
             StopSdk();
             if (result.error == RealtimePipelineCutErrorV1::kNone) {
                 result = CutWithLock(timeout, true, terminal_cut_ns);
@@ -1528,6 +1806,12 @@ public:
         try {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             std::uint64_t generation = 0U;
+            std::uint64_t cut_sequence = 0U;
+            std::uint64_t monotonic_cut_ns = 0U;
+            std::array<market::RealtimeSourceWatermarkV1,
+                       market::kRealtimeHistorySourceCountV1>
+                sources{};
+            DispatchBarrierLease dispatch_barrier(this);
             {
                 std::unique_lock<std::mutex> admission(admission_mutex_);
                 const bool history_fatal = history_->fatal();
@@ -1563,7 +1847,8 @@ public:
                     return result;
                 }
 
-                std::uint64_t monotonic_cut_ns =
+                cut_sequence = global_ingress_sequence_;
+                monotonic_cut_ns =
                     preclosed_monotonic_cut_ns.value_or(0U);
                 if (!preclosed_monotonic_cut_ns.has_value() &&
                     !ReadClockNs(CLOCK_MONOTONIC, &monotonic_cut_ns)) {
@@ -1573,9 +1858,6 @@ public:
                     return result;
                 }
                 generation = last_started_generation_ + 1U;
-                std::array<market::RealtimeSourceWatermarkV1,
-                           market::kRealtimeHistorySourceCountV1>
-                    sources{};
                 for (std::size_t source = 0U;
                      source < sources.size();
                      ++source) {
@@ -1584,55 +1866,112 @@ public:
                     sources[source].sequence_exclusive =
                         source_sequences_[source] + 1U;
                 }
-
-                market::RealtimeHistoryWatermarkV1 watermark{};
-                result.watermark_error =
-                    market::BuildRealtimeHistoryWatermarkV1(
-                        config_.run_id,
-                        generation,
-                        config_.trade_date,
-                        global_ingress_sequence_ + 1U,
-                        monotonic_cut_ns,
-                        *config_.registry,
-                        sources,
-                        &watermark);
-                if (result.watermark_error !=
-                    market::RealtimeHistoryWatermarkErrorV1::kNone) {
-                    result.error =
-                        RealtimePipelineCutErrorV1::kWatermarkFailed;
+                // The barrier is armed while callback admission is
+                // serialized, so no sequence above this exact cut can reach
+                // Directory/Decoder/Store. Callbacks resume immediately and
+                // continue entering both asynchronous queues while cut work
+                // runs.
+                if (!dispatch_barrier.Arm(cut_sequence)) {
+                    result.error = RealtimePipelineCutErrorV1::
+                        kProcessingBarrierFailed;
                     TripFatalWithAdmissionLockHeld();
                     return result;
                 }
+            }
 
-                result.generation_error =
-                    history_->BeginGeneration(watermark);
-                if (result.generation_error !=
-                    market::RealtimeHistoryGenerationErrorV1::kNone) {
-                    result.error =
-                        RealtimePipelineCutErrorV1::
-                            kGenerationBeginFailed;
+            if (cut_sequence != 0U &&
+                !WaitAppliedThrough(cut_sequence, deadline)) {
+                result.error = RealtimePipelineCutErrorV1::
+                    kProcessingBarrierFailed;
+                TripFatal();
+                return result;
+            }
+
+            std::shared_ptr<const
+                market::ObservedInstrumentCatalogSnapshotV2>
+                catalog_snapshot;
+            if (config_.directory->AcquireSnapshot(
+                    &catalog_snapshot) !=
+                    market::ObservedInstrumentDirectoryErrorV2::kNone ||
+                catalog_snapshot == nullptr) {
+                result.error =
+                    RealtimePipelineCutErrorV1::kWatermarkFailed;
+                TripFatal();
+                return result;
+            }
+            const std::uint64_t durable_at_generation =
+                std::min(
+                    durable_sequence_.load(std::memory_order_acquire),
+                    cut_sequence);
+            // This immutable generation describes the exact accepted/applied
+            // prefix isolated by the processing barrier. Journal durability
+            // is sampled independently and capped to that prefix.
+            const realtime::ProcessingProgressV2 progress{
+                cut_sequence,
+                durable_at_generation,
+                cut_sequence};
+            market::RealtimeHistoryWatermarkV1 watermark{};
+            result.watermark_error =
+                market::BuildRealtimeHistoryWatermarkV1(
+                    config_.run_id,
+                    generation,
+                    config_.trade_date,
+                    cut_sequence + 1U,
+                    monotonic_cut_ns,
+                    std::move(catalog_snapshot),
+                    progress,
+                    sources,
+                    &watermark);
+            if (result.watermark_error !=
+                market::RealtimeHistoryWatermarkErrorV1::kNone) {
+                result.error =
+                    RealtimePipelineCutErrorV1::kWatermarkFailed;
+                TripFatal();
+                return result;
+            }
+
+            result.generation_error =
+                history_->BeginGeneration(watermark);
+            if (result.generation_error !=
+                market::RealtimeHistoryGenerationErrorV1::kNone) {
+                result.error = RealtimePipelineCutErrorV1::
+                    kGenerationBeginFailed;
+                TripFatal();
+                return result;
+            }
+            {
+                std::lock_guard<std::mutex> admission(
+                    admission_mutex_);
+                if (last_started_generation_ ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    last_started_generation_ + 1U != generation) {
+                    result.error = RealtimePipelineCutErrorV1::
+                        kGenerationBeginFailed;
                     TripFatalWithAdmissionLockHeld();
                     return result;
                 }
                 last_started_generation_ = generation;
+            }
 
-                // Admission stays locked until every marker is in its source
-                // queue. Therefore no post-cut callback can overtake a marker.
-                for (std::uint8_t source = 0U;
-                     source < market::kRealtimeHistorySourceCountV1;
-                     ++source) {
-                    DecoderCommand marker{};
-                    marker.kind = CommandKind::kGenerationMarker;
-                    marker.generation = generation;
-                    if (!lanes_[source]->queue.PushUntil(
-                            std::move(marker), deadline)) {
-                        result.error = RealtimePipelineCutErrorV1::
-                            kMarkerAdmissionFailed;
-                        TripFatalWithAdmissionLockHeld();
-                        return result;
-                    }
+            // Ordered in-memory processing is still paused immediately after
+            // the cut. Each source marker therefore follows all cut records
+            // and precedes every post-cut record without blocking SDK
+            // callbacks or the independent Journal writer.
+            for (std::uint8_t source = 0U;
+                 source < market::kRealtimeHistorySourceCountV1;
+                 ++source) {
+                DecoderCommand marker{};
+                marker.kind = CommandKind::kGenerationMarker;
+                marker.generation = generation;
+                if (!lanes_[source]->queue.PushUntil(
+                        std::move(marker), deadline)) {
+                    result.error = RealtimePipelineCutErrorV1::
+                        kMarkerAdmissionFailed;
+                    TripFatal();
+                    return result;
                 }
             }
+            dispatch_barrier.Release();
 
             result.generation_error = history_->WaitForGeneration(
                 generation,
@@ -1773,15 +2112,25 @@ public:
         if (ingress_pool_ != nullptr) {
             result.ingress_pool = ingress_pool_->Snapshot();
         }
-        if (wal_ != nullptr) {
-            result.wal = wal_->Snapshot();
+        if (journal_ != nullptr) {
+            result.journal = journal_->Snapshot();
         }
+        result.processing_progress.durable_sequence =
+            durable_sequence_.load(std::memory_order_acquire);
+        result.processing_progress.applied_sequence =
+            applied_sequence_.load(std::memory_order_acquire);
+        // Read downstream publications first. Their release chains originate
+        // after accepted publication, so the final accepted acquire cannot
+        // produce a torn downstream>accepted tuple.
+        result.processing_progress.accepted_sequence =
+            accepted_sequence_.load(std::memory_order_acquire);
         if (history_ != nullptr) {
             result.store = history_->StoreSnapshot();
         }
         result.accepting = accepting_.load(std::memory_order_acquire);
         result.fatal = fatal_.load(std::memory_order_acquire) ||
-                       (history_ != nullptr && history_->fatal());
+                       (history_ != nullptr && history_->fatal()) ||
+                       result.journal.failed();
         result.stopped = stopped_.load(std::memory_order_acquire);
         result.trade_date_boundary_reached =
             trade_date_boundary_reached_.load(std::memory_order_acquire);
@@ -1797,7 +2146,8 @@ public:
 
     [[nodiscard]] bool fatal() const noexcept {
         return fatal_.load(std::memory_order_acquire) ||
-               (history_ != nullptr && history_->fatal());
+               (history_ != nullptr && history_->fatal()) ||
+               (journal_ != nullptr && journal_->Snapshot().failed());
     }
 
     void StopAndDrain() noexcept {
@@ -1817,28 +2167,377 @@ public:
 
 private:
     void FinishStop() noexcept {
+        RequestProcessingStop();
+        if (journal_ != nullptr) {
+            journal_->StopAndDrain();
+        }
+        JoinProcessingThread();
         RequestDecoderStop();
         JoinDecoderThreads();
         if (history_ != nullptr) {
             history_->StopAndDrain();
         }
-        if (wal_ != nullptr) {
-            wal_->StopAndDrain();
-        }
+        RequestProgressStop();
+        JoinProgressThread();
         stopped_.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool RouteProcessingMessage(
+        realtime::OwnedIngressMessageHandleV1 message) noexcept {
+        if (!message ||
+            fatal_.load(std::memory_order_acquire) ||
+            config_.directory == nullptr) {
+            MarkAsyncFatal();
+            return false;
+        }
+        const std::uint8_t source = message->source_slot();
+        if (source >= market::kRealtimeHistorySourceCountV1 ||
+            lanes_[source] == nullptr ||
+            message->recv_realtime_ns() >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max()) ||
+            message->recv_monotonic_ns() >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max())) {
+            MarkAsyncFatal();
+            return false;
+        }
+        if (!WaitForDispatchBarrier(
+                message->global_ingress_sequence())) {
+            ReportPipelineFailure(
+                "generation_dispatch_barrier",
+                source,
+                message->global_ingress_sequence(),
+                dispatch_barrier_sequence_.load(
+                    std::memory_order_acquire));
+            MarkAsyncFatal();
+            return false;
+        }
+        if (!WaitForAppliedDispatchWindow(
+                message->global_ingress_sequence())) {
+            ReportPipelineFailure(
+                "applied_dispatch_window",
+                source,
+                message->global_ingress_sequence(),
+                applied_window_capacity_);
+            MarkAsyncFatal();
+            return false;
+        }
+
+        const sdk::VendorHeadView head = message->vendor_head();
+        market::MarketMessageViewV1 view{};
+        view.source_stream_id = config_.source_stream_ids[source];
+        view.trade_date = config_.trade_date;
+        view.source_sequence = message->source_sequence();
+        view.service_id = message->key().service_id;
+        view.service_version = message->key().service_version;
+        view.message_id = message->key().message_id;
+        view.message_encoding = head.message_encoding();
+        view.vendor_local_time_raw = head.local_time_raw();
+        view.vendor_sequence_id = head.sequence_id();
+        view.recv_realtime_ns =
+            static_cast<std::int64_t>(message->recv_realtime_ns());
+        view.recv_monotonic_ns =
+            static_cast<std::int64_t>(message->recv_monotonic_ns());
+        view.body = message->body();
+
+        market::ObservedInstrumentKeyViewV2 extracted{};
+        const market::MarketDecodeErrorV1 extraction_error =
+            market::ExtractObservedInstrumentKeyV2(
+                view,
+                config_.decoder_limits.maximum_text_bytes,
+                &extracted);
+        if (extraction_error != market::MarketDecodeErrorV1::kNone) {
+            last_decode_error_.store(
+                static_cast<std::uint8_t>(extraction_error),
+                std::memory_order_release);
+            ReportPipelineFailure(
+                "instrument_key_extract",
+                source,
+                message->global_ingress_sequence(),
+                static_cast<std::uint64_t>(extraction_error));
+            MarkAsyncFatal();
+            return false;
+        }
+
+        market::InstrumentKeyViewV1 key{
+            extracted.market,
+            extracted.security_id_source,
+            extracted.security_id};
+        market::ObservedInstrumentBindResultV2 binding{};
+        const market::ObservedInstrumentDirectoryErrorV2 bind_error =
+            config_.directory->BindOrGet(
+                key,
+                market::ObservedInstrumentMetadataV2{},
+                message->global_ingress_sequence(),
+                &binding);
+        if (bind_error !=
+                market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            !binding.entry.bound()) {
+            ReportPipelineFailure(
+                "instrument_bind",
+                source,
+                message->global_ingress_sequence(),
+                static_cast<std::uint64_t>(bind_error));
+            MarkAsyncFatal();
+            return false;
+        }
+        if (binding.newly_bound &&
+            config_.instrument_binding_sink != nullptr &&
+            !config_.instrument_binding_sink
+                 ->PublishObservedInstrumentBinding(binding)) {
+            ReportPipelineFailure(
+                "instrument_binding_projection",
+                source,
+                message->global_ingress_sequence(),
+                binding.entry.instrument_id);
+            MarkAsyncFatal();
+            return false;
+        }
+
+        DecoderCommand command{};
+        command.kind = CommandKind::kMessage;
+        command.message = std::move(message);
+        command.identity.key.market = binding.entry.key.market;
+        command.identity.key.security_id_source =
+            binding.entry.key.security_id_source;
+        command.identity.key.security_id =
+            binding.entry.key.security_id;
+        command.identity.instrument_id =
+            binding.entry.instrument_id;
+        command.identity.ordinal = binding.entry.ordinal;
+        command.identity.quantity_unit =
+            binding.entry.metadata.quantity_unit;
+        command.identity.security_type =
+            binding.entry.metadata.security_type;
+        command.identity.asset_scope =
+            binding.entry.metadata.asset_scope;
+        if (!lanes_[source]->queue.PushUntil(
+                std::move(command),
+                std::chrono::steady_clock::time_point::max())) {
+            MarkAsyncFatal();
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool CompleteAppliedSequence(
+        std::uint64_t ingress_sequence) noexcept {
+        if (applied_tracker_ == nullptr ||
+            applied_tracker_->MarkCompleted(ingress_sequence) !=
+                realtime::ContiguousSequenceMarkErrorV2::kNone) {
+            MarkAsyncFatal();
+            return false;
+        }
+        const std::uint64_t completed =
+            applied_tracker_->contiguous_sequence();
+        std::uint64_t published =
+            applied_sequence_.load(std::memory_order_acquire);
+        while (published < completed &&
+               !applied_sequence_.compare_exchange_weak(
+                   published,
+                   completed,
+                   std::memory_order_release,
+                   std::memory_order_acquire)) {
+        }
+        applied_progress_cv_.notify_all();
+        RequestProgressPublication();
+        return !fatal_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool ArmDispatchBarrier(
+        std::uint64_t sequence) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(
+                dispatch_barrier_mutex_);
+            if (dispatch_barrier_active_.load(
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            dispatch_barrier_sequence_.store(
+                sequence, std::memory_order_relaxed);
+            dispatch_barrier_active_.store(
+                true, std::memory_order_release);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void ReleaseDispatchBarrier() noexcept {
+        dispatch_barrier_active_.store(
+            false, std::memory_order_release);
+        dispatch_barrier_cv_.notify_all();
+    }
+
+    [[nodiscard]] bool WaitForDispatchBarrier(
+        std::uint64_t sequence) noexcept {
+        if (!dispatch_barrier_active_.load(
+                std::memory_order_acquire) ||
+            sequence <= dispatch_barrier_sequence_.load(
+                            std::memory_order_acquire)) {
+            return true;
+        }
+        try {
+            std::unique_lock<std::mutex> lock(
+                dispatch_barrier_mutex_);
+            dispatch_barrier_cv_.wait(lock, [this, sequence] {
+                return fatal_.load(std::memory_order_acquire) ||
+                       !dispatch_barrier_active_.load(
+                           std::memory_order_acquire) ||
+                       sequence <=
+                           dispatch_barrier_sequence_.load(
+                               std::memory_order_acquire);
+            });
+            return !fatal_.load(std::memory_order_acquire) &&
+                   (!dispatch_barrier_active_.load(
+                        std::memory_order_acquire) ||
+                    sequence <= dispatch_barrier_sequence_.load(
+                                    std::memory_order_acquire));
+        } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool WaitForAppliedDispatchWindow(
+        std::uint64_t sequence) noexcept {
+        if (sequence == 0U || applied_window_capacity_ == 0U) {
+            return false;
+        }
+        // Normal traffic stays lock-free. Only a real completion-window
+        // boundary enters the condition-variable path.
+        const std::uint64_t fast_applied =
+            applied_sequence_.load(std::memory_order_acquire);
+        if (!fatal_.load(std::memory_order_acquire) &&
+            sequence > fast_applied &&
+            sequence - fast_applied <=
+                static_cast<std::uint64_t>(
+                    applied_window_capacity_)) {
+            return true;
+        }
+        try {
+            std::unique_lock<std::mutex> lock(applied_progress_mutex_);
+            for (;;) {
+                const bool history_fatal =
+                    history_ != nullptr && history_->fatal();
+                if (fatal_.load(std::memory_order_acquire) ||
+                    history_fatal) {
+                    lock.unlock();
+                    if (history_fatal) {
+                        MarkAsyncFatal();
+                    }
+                    return false;
+                }
+                const std::uint64_t applied =
+                    applied_sequence_.load(std::memory_order_acquire);
+                if (sequence <= applied) {
+                    return false;
+                }
+                if (sequence - applied <=
+                    static_cast<std::uint64_t>(
+                        applied_window_capacity_)) {
+                    return true;
+                }
+                // Completion normally notifies immediately. The bounded wait
+                // also observes a History fatal that cannot itself call the
+                // applied observer, preventing dispatcher shutdown deadlock.
+                static_cast<void>(applied_progress_cv_.wait_for(
+                    lock, std::chrono::milliseconds(1)));
+            }
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void RequestProgressPublication() noexcept {
+        if (config_.processing_progress_sink != nullptr &&
+            !progress_wake_pending_.exchange(
+                true, std::memory_order_acq_rel)) {
+            progress_wake_.release();
+        }
+    }
+
+    [[nodiscard]] bool PublishProcessingProgressNow() noexcept {
+        if (config_.processing_progress_sink == nullptr) {
+            return true;
+        }
+        realtime::ProcessingProgressV2 progress{};
+        progress.durable_sequence =
+            durable_sequence_.load(std::memory_order_acquire);
+        progress.applied_sequence =
+            applied_sequence_.load(std::memory_order_acquire);
+        // Both downstream release chains begin after accepted publication.
+        // Reading accepted last prevents a concurrent completion from
+        // creating a transient downstream>accepted sample.
+        progress.accepted_sequence =
+            accepted_sequence_.load(std::memory_order_acquire);
+        if (!progress.valid() ||
+            !config_.processing_progress_sink
+                 ->PublishProcessingProgress(progress)) {
+            MarkAsyncFatal();
+            return false;
+        }
+        return true;
+    }
+
+    void MarkAsyncFatal() noexcept {
+        accepting_.store(false, std::memory_order_release);
+        fatal_.store(true, std::memory_order_release);
+        if (history_ != nullptr) {
+            history_->MarkFatal();
+        }
+        RequestProcessingStop();
+        RequestDecoderStop();
+        RequestProgressStop();
+        applied_progress_cv_.notify_all();
+        dispatch_barrier_cv_.notify_all();
+    }
+
+    [[nodiscard]] bool WaitAppliedThrough(
+        std::uint64_t target_sequence,
+        std::chrono::steady_clock::time_point deadline) noexcept {
+        if (applied_sequence_.load(std::memory_order_acquire) >=
+            target_sequence) {
+            return true;
+        }
+        try {
+            std::unique_lock<std::mutex> lock(applied_progress_mutex_);
+            const auto ready = [this, target_sequence] {
+                return applied_sequence_.load(
+                           std::memory_order_acquire) >= target_sequence ||
+                       fatal_.load(std::memory_order_acquire);
+            };
+            return (ready() ||
+                    applied_progress_cv_.wait_until(
+                        lock, deadline, ready)) &&
+                   applied_sequence_.load(std::memory_order_acquire) >=
+                       target_sequence;
+        } catch (...) {
+            return false;
+        }
     }
 
     [[nodiscard]] bool ValidateConfiguration(
         bool factory_is_test_override) const noexcept {
+        std::size_t applied_window = 0U;
         std::size_t maximum_inflight_messages = 0U;
-        if (config_.registry == nullptr || config_.registry->empty() ||
-            !ProductionRegistryValid(*config_.registry) ||
+        const bool before_sync_hook_is_paired =
+            (config_.journal.before_sync_for_test == nullptr) ==
+            (config_.journal.before_sync_context_for_test == nullptr);
+        if (config_.directory == nullptr ||
+            config_.directory->capacity() == 0U ||
+            config_.directory->session_epoch() == 0U ||
             l2flow::common::IsZeroIdentity(config_.run_id) ||
             config_.trade_date == 0U ||
             config_.maximum_sdk_message_bytes < sdk::kVendorHeadBytes ||
             config_.maximum_sdk_message_bytes >
                 realtime::kOwnedIngressMaximumMessageBytesV1 ||
+            config_.processing_queue_capacity == 0U ||
+            config_.processing_queue_capacity ==
+                std::numeric_limits<std::size_t>::max() ||
             config_.decoder_queue_capacity_per_source == 0U ||
+            config_.decoder_queue_capacity_per_source ==
+                std::numeric_limits<std::size_t>::max() ||
             config_.store_worker_count == 0U ||
             config_.store_queue_capacity_per_source_worker == 0U ||
             config_.intraday_store.segment_target_bytes <
@@ -1850,8 +2549,25 @@ private:
             config_.intraday_store.maximum_records_per_batch == 0U ||
             config_.intraday_store.maximum_records_per_batch >
                 market::kIntradayInstrumentStoreMaximumBatchRecordsV1 ||
-            !MaximumIngressPoolMessages(
-                config_, &maximum_inflight_messages)) {
+            config_.journal.path.empty() ||
+            config_.journal.path.find('\0') != std::string::npos ||
+            config_.journal.queue_capacity == 0U ||
+            config_.journal.max_batch_records == 0U ||
+            config_.journal.max_batch_records >
+                config_.journal.queue_capacity ||
+            config_.journal.max_batch_delay <=
+                std::chrono::microseconds::zero() ||
+            config_.journal.durable != nullptr ||
+            config_.journal.durable_context != nullptr ||
+            config_.journal.failure != nullptr ||
+            config_.journal.failure_context != nullptr ||
+            !before_sync_hook_is_paired ||
+            !BoundedAppliedWindowCapacity(
+                config_, &applied_window) ||
+            !BoundedIngressPoolCapacity(
+                config_,
+                applied_window,
+                &maximum_inflight_messages)) {
             return false;
         }
         const std::size_t maximum_body =
@@ -1875,6 +2591,9 @@ private:
         }
         if (!config_.sdk.enabled) {
             return !factory_is_test_override && sdk_factory_ == nullptr;
+        }
+        if (config_.journal.before_sync_for_test != nullptr) {
+            return false;
         }
         if (factory_is_test_override) {
             if (sdk_factory_ == nullptr) {
@@ -1912,6 +2631,107 @@ private:
             RequestDecoderStop();
             JoinDecoderThreads();
             return false;
+        }
+    }
+
+    [[nodiscard]] bool StartProcessingThread() noexcept {
+        if (processing_queue_ == nullptr ||
+            processing_thread_.joinable()) {
+            return false;
+        }
+        try {
+            processing_thread_ =
+                std::thread([this] { ProcessingLoop(); });
+            processing_thread_started_ = true;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool StartProgressThread() noexcept {
+        if (config_.processing_progress_sink == nullptr) {
+            return true;
+        }
+        if (progress_thread_.joinable()) {
+            return false;
+        }
+        try {
+            progress_thread_ =
+                std::thread([this] { ProgressLoop(); });
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void ProcessingLoop() noexcept {
+        realtime::OwnedIngressMessageHandleV1 message;
+        while (processing_queue_ != nullptr &&
+               processing_queue_->Pop(&message)) {
+            if (!fatal_.load(std::memory_order_acquire) &&
+                !RouteProcessingMessage(std::move(message))) {
+                MarkAsyncFatal();
+            }
+            message.reset();
+        }
+    }
+
+    void ProgressLoop() noexcept {
+        realtime::ProcessingProgressV2 last_published{};
+        for (;;) {
+            const auto publication_deadline =
+                std::chrono::steady_clock::now() +
+                kProgressPublishMaximumDelay;
+            const bool woke =
+                progress_wake_.try_acquire_until(
+                    publication_deadline);
+            if (woke) {
+                // Keep wake_pending set through the rest of this interval.
+                // accepted/applied/durable can advance on every record, but
+                // the IPC status tuple needs only a bounded-delay aggregate.
+                // This prevents the progress writer from repeatedly
+                // contending with early-session binding and first-availability
+                // publication while still bounding status lag to one
+                // interval.
+                std::this_thread::sleep_until(
+                    publication_deadline);
+                // Clear only after consuming the matching token. On a
+                // timeout a producer may already have changed pending from
+                // false to true but not yet released the semaphore; clearing
+                // in that race could let a second producer release into an
+                // already-full binary semaphore.
+                progress_wake_pending_.store(
+                    false, std::memory_order_release);
+            }
+            // A stop request is published only after every normal progress
+            // producer has drained. Acquire it before sampling so this
+            // iteration publishes the final tuple before exiting.
+            const bool stopping =
+                progress_stop_requested_.load(
+                    std::memory_order_acquire);
+
+            realtime::ProcessingProgressV2 current{};
+            current.durable_sequence =
+                durable_sequence_.load(std::memory_order_acquire);
+            current.applied_sequence =
+                applied_sequence_.load(std::memory_order_acquire);
+            current.accepted_sequence =
+                accepted_sequence_.load(std::memory_order_acquire);
+            if (current.accepted_sequence !=
+                    last_published.accepted_sequence ||
+                current.durable_sequence !=
+                    last_published.durable_sequence ||
+                current.applied_sequence !=
+                    last_published.applied_sequence) {
+                if (!PublishProcessingProgressNow()) {
+                    return;
+                }
+                last_published = current;
+            }
+            if (stopping) {
+                return;
+            }
         }
     }
 
@@ -2017,7 +2837,10 @@ private:
                     market::RealtimeHistoryGenerationErrorV1::kNone) {
                     TripFatal();
                 }
-            } else if (!DecodeOne(source, command.message)) {
+            } else if (!DecodeOne(
+                           source,
+                           command.message,
+                           command.identity)) {
                 TripFatal();
             }
             command = DecoderCommand{};
@@ -2026,7 +2849,9 @@ private:
 
     [[nodiscard]] bool DecodeOne(
         std::uint8_t source,
-        const realtime::OwnedIngressMessageHandleV1& message) noexcept {
+        const realtime::OwnedIngressMessageHandleV1& message,
+        const market::ObservedInstrumentIdentityViewV2& identity)
+        noexcept {
         if (!message || message->source_slot() != source ||
             IsMixedTickSourceSlot(source) !=
                 (message->tick_stream_sequence() != 0U) ||
@@ -2072,6 +2897,15 @@ private:
                 source,
                 message->global_ingress_sequence(),
                 static_cast<std::uint64_t>(decode_error));
+            return false;
+        }
+        if (!market::ApplyObservedInstrumentIdentityV2(
+                identity, &decoded)) {
+            ReportPipelineFailure(
+                "instrument_identity_apply",
+                source,
+                message->global_ingress_sequence(),
+                identity.instrument_id);
             return false;
         }
 
@@ -2122,7 +2956,7 @@ private:
                     "ingress_sequence=%llu tick_stream_sequence=%llu "
                     "common_kind=%u source_stream_id=%u "
                     "source_sequence=%llu instrument_id=%u "
-                    "registry_ordinal=%zu retained_body_bytes=%zu\n",
+                    "ordinal=%zu retained_body_bytes=%zu\n",
                     static_cast<unsigned>(source_slot),
                     static_cast<unsigned long long>(ingress_sequence),
                     static_cast<unsigned long long>(
@@ -2132,7 +2966,7 @@ private:
                     static_cast<unsigned long long>(
                         value.common.origin.source_sequence),
                     value.common.instrument_id,
-                    value.common.registry_ordinal,
+                    value.common.ordinal,
                     value.common.origin.body.size());
             },
             event);
@@ -2166,7 +3000,11 @@ private:
             history_->MarkFatal();
         }
         fatal_.store(true, std::memory_order_release);
+        RequestProcessingStop();
         RequestDecoderStop();
+        RequestProgressStop();
+        applied_progress_cv_.notify_all();
+        dispatch_barrier_cv_.notify_all();
     }
 
     void TripFatal() noexcept {
@@ -2179,6 +3017,34 @@ private:
             if (lane != nullptr) {
                 lane->queue.RequestStop();
             }
+        }
+    }
+
+    void RequestProcessingStop() noexcept {
+        if (processing_queue_ != nullptr) {
+            processing_queue_->RequestStop();
+        }
+    }
+
+    void RequestProgressStop() noexcept {
+        if (config_.processing_progress_sink == nullptr) {
+            return;
+        }
+        progress_stop_requested_.store(
+            true, std::memory_order_release);
+        RequestProgressPublication();
+    }
+
+    void JoinProcessingThread() noexcept {
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        processing_thread_started_ = false;
+    }
+
+    void JoinProgressThread() noexcept {
+        if (progress_thread_.joinable()) {
+            progress_thread_.join();
         }
     }
 
@@ -2231,9 +3097,17 @@ private:
 
     RealtimePipelineConfigV1 config_{};
     // Declared before every possible handle owner so pool state is retired
-    // only after decoder rings and WAL have released their handles.
+    // only after decoder rings and the mandatory Journal have released their
+    // handles.
     std::unique_ptr<realtime::OwnedIngressMessagePoolV1> ingress_pool_;
     std::unique_ptr<StageLatencyCollector> latency_collector_;
+    std::unique_ptr<ProcessingQueue> processing_queue_;
+    std::thread processing_thread_;
+    bool processing_thread_started_ = false;
+    std::thread progress_thread_;
+    std::binary_semaphore progress_wake_{0};
+    std::atomic<bool> progress_wake_pending_{false};
+    std::atomic<bool> progress_stop_requested_{false};
     std::array<std::unique_ptr<DecoderLane>,
                market::kRealtimeHistorySourceCountV1>
         lanes_{};
@@ -2241,7 +3115,19 @@ private:
 
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> history_;
     std::unique_ptr<factor::RealtimeFactorEngineV1> factor_;
-    std::unique_ptr<realtime::OptionalWalSinkV1> wal_;
+    std::unique_ptr<realtime::ContiguousSequenceTrackerV2>
+        applied_tracker_;
+    std::size_t applied_window_capacity_ = 0U;
+    std::unique_ptr<realtime::MandatoryJournalV2> journal_;
+    std::atomic<std::uint64_t> accepted_sequence_{0U};
+    std::atomic<std::uint64_t> durable_sequence_{0U};
+    std::atomic<std::uint64_t> applied_sequence_{0U};
+    std::mutex applied_progress_mutex_;
+    std::condition_variable applied_progress_cv_;
+    std::mutex dispatch_barrier_mutex_;
+    std::condition_variable dispatch_barrier_cv_;
+    std::atomic<std::uint64_t> dispatch_barrier_sequence_{0U};
+    std::atomic<bool> dispatch_barrier_active_{false};
 
     std::shared_ptr<sdk::SdkFactory> sdk_factory_;
     std::unique_ptr<sdk::SdkManager> sdk_manager_;

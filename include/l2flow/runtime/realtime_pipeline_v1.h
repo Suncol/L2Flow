@@ -3,9 +3,12 @@
 #include "l2flow/common/identity128.h"
 #include "l2flow/factor/realtime_factor_engine_v1.h"
 #include "l2flow/market/market_decoder.h"
+#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
-#include "l2flow/realtime/optional_wal_sink_v1.h"
+#include "l2flow/realtime/contiguous_sequence_tracker_v2.h"
+#include "l2flow/realtime/mandatory_journal_v2.h"
 #include "l2flow/realtime/owned_ingress_message_v1.h"
+#include "l2flow/realtime/processing_progress_v2.h"
 #include "l2flow/sdk/sdk_runtime.h"
 
 #include "mdl_api.h"
@@ -23,8 +26,8 @@
 namespace l2flow::runtime {
 
 struct RealtimePipelineSdkConfigV1 final {
-    // Disabled is an explicit injection-only mode for deterministic tests and
-    // offline replay. Production enables this and supplies library_path.
+    // Disabled is an explicit injection-only mode for deterministic tests.
+    // Production enables this and supplies library_path.
     bool enabled = false;
     std::filesystem::path library_path;
     int work_threads = 1;
@@ -47,13 +50,20 @@ struct RealtimePipelineSdkConfigV1 final {
 struct RealtimePipelineConfigV1 final {
     l2flow::common::Identity128 run_id{};
     std::uint32_t trade_date = 0U;
-    const l2flow::market::InstrumentRegistryV1* registry = nullptr;
+    // Borrowed runtime directory shared with Store/IPC. It starts empty,
+    // remains OBSERVED_ONLY, and owns one fixed-capacity session.
+    l2flow::market::ObservedInstrumentDirectoryV2* directory = nullptr;
     std::array<std::uint32_t,
                l2flow::market::kRealtimeHistorySourceCountV1>
         source_stream_ids{};
 
     std::uint32_t maximum_sdk_message_bytes =
         16U * 1024U * 1024U;
+    // One serialized, bounded callback handoff. After the pooled body copy,
+    // both queue operations are allocation-free. It preserves global capture
+    // order for first binding without coupling processing to Journal write or
+    // fdatasync latency.
+    std::size_t processing_queue_capacity = 4096U;
     std::size_t decoder_queue_capacity_per_source = 4096U;
     l2flow::market::MarketDecoderLimitsV1 decoder_limits{};
 
@@ -65,7 +75,7 @@ struct RealtimePipelineConfigV1 final {
     // Create() with a real SDK rejects a disabled guard.
     bool enforce_receive_trade_date = false;
 
-    l2flow::realtime::OptionalWalSinkConfigV1 wal{};
+    l2flow::realtime::MandatoryJournalConfigV2 journal{};
     // Null selects the literal SnapshotLastPriceProjectionV1. Production may
     // supply any calculator implementing the full-generation contract.
     std::shared_ptr<const l2flow::factor::RealtimeFactorCalculatorV1>
@@ -81,12 +91,29 @@ struct RealtimePipelineConfigV1 final {
     // boundary to History.
     std::shared_ptr<l2flow::market::RealtimeAppliedRecordSinkV1>
         applied_record_sink;
+    std::shared_ptr<l2flow::market::ObservedInstrumentBindingSinkV2>
+        instrument_binding_sink;
+    std::shared_ptr<l2flow::realtime::ProcessingProgressSinkV2>
+        processing_progress_sink;
     // Explicit test/diagnostic mode.  Disabled by default because the extra
     // clock reads and atomic histogram updates perturb the measured system.
     // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
     // append-stage distributions defined below.
     bool measure_stage_latency = false;
 };
+
+// Returns the finite completion window enforced by the ordered in-memory
+// processing dispatcher. A captured message with global sequence s is not
+// routed to its source decoder until:
+//
+//   0 < s - applied_sequence <= returned_capacity
+//
+// This is an explicit admission bound, not an inference from how quickly
+// decoder or Store queues are expected to drain. A mixed-tick ring receiving
+// this pipeline's applied records must have at least this many slots.
+[[nodiscard]] bool RealtimePipelineAppliedWindowCapacityV1(
+    const RealtimePipelineConfigV1& config,
+    std::size_t* output) noexcept;
 
 struct RealtimeLatencyQuantileV1 final {
     // The estimate is the midpoint of the containing linear histogram bucket.
@@ -137,8 +164,9 @@ struct RealtimePipelineStageLatencySnapshotV1 final {
 
     // Same-host CLOCK_MONOTONIC measurements.  callback_entry is the first
     // clock observation made by OnMessage (or the injection seam); callback
-    // success is the first observation after successful admission and optional
-    // WAL enqueue.  append_complete is the first observation after the store's
+    // success is the first observation after successful mandatory Journal and
+    // ordered-processing queue admission. append_complete is the first
+    // observation after the Store's
     // Append returned kNone.  inprocess_latest_read is observed only after an
     // allocation-free acquire-read through the live latest model has returned
     // and been verified to expose the exact Store-owned record just appended;
@@ -160,8 +188,10 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
     kInvalidConfiguration,
     kStoreRuntimeCreateFailed,
     kKLineRuntimeCreateFailed,
-    kWalCreateFailed,
+    kJournalCreateFailed,
     kFactorCreateFailed,
+    kProgressThreadStartFailed,
+    kProcessingThreadStartFailed,
     kDecoderThreadStartFailed,
     kSdkLoadFailed,
     kSdkManagerCreateFailed,
@@ -180,7 +210,7 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
 enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     kNone = 0U,
     // API/SYS and every tuple outside the five-message production catalog do
-    // not acquire ingress sequence numbers and do not enter WAL/store.
+    // not acquire ingress sequence numbers and do not enter Journal/Store.
     kIgnoredUnsupported,
     kNullMessage,
     kClockFailure,
@@ -188,7 +218,8 @@ enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     kSequenceExhausted,
     kOwnedMessageRejected,
     kForbiddenCombinedTick,
-    kDecoderQueueFull,
+    kJournalAdmissionFailed,
+    kProcessingAdmissionFailed,
     kStopped,
     kFatal,
 };
@@ -201,8 +232,8 @@ struct RealtimePipelineIngressResultV1 final {
         RealtimePipelineIngressErrorV1::kNone;
     l2flow::realtime::OwnedIngressMessageErrorV1 owned_error =
         l2flow::realtime::OwnedIngressMessageErrorV1::kNone;
-    l2flow::realtime::OptionalWalEnqueueResultV1 wal_result =
-        l2flow::realtime::OptionalWalEnqueueResultV1::kDisabled;
+    l2flow::realtime::MandatoryJournalAppendResultV2 journal_result =
+        l2flow::realtime::MandatoryJournalAppendResultV2::kStopped;
     std::uint64_t global_ingress_sequence = 0U;
     std::uint64_t source_sequence = 0U;
     // Zero for snapshots. Tick, order, and transaction share one dense
@@ -225,6 +256,7 @@ enum class RealtimePipelineCutErrorV1 : std::uint8_t {
     kSequenceExhausted,
     kClockFailure,
     kWatermarkFailed,
+    kProcessingBarrierFailed,
     kGenerationBeginFailed,
     kMarkerAdmissionFailed,
     kGenerationWaitFailed,
@@ -261,6 +293,9 @@ struct RealtimePipelineCutResultV1 final {
 };
 
 struct RealtimePipelineSnapshotV1 final {
+    // Exact count admitted by the mandatory Journal. It therefore matches
+    // global_ingress_sequence even if the subsequent processing admission
+    // fails closed.
     std::uint64_t accepted_messages = 0U;
     std::uint64_t ignored_messages = 0U;
     // SDK callbacks that crossed the clean terminal admission cut. They are
@@ -280,7 +315,8 @@ struct RealtimePipelineSnapshotV1 final {
     l2flow::market::MarketDecodeErrorV1 last_decode_error =
         l2flow::market::MarketDecodeErrorV1::kNone;
     l2flow::realtime::OwnedIngressMessagePoolSnapshotV1 ingress_pool{};
-    l2flow::realtime::OptionalWalSnapshotV1 wal{};
+    l2flow::realtime::MandatoryJournalSnapshotV2 journal{};
+    l2flow::realtime::ProcessingProgressV2 processing_progress{};
     bool accepting = false;
     bool fatal = false;
     bool stopped = false;
@@ -288,9 +324,10 @@ struct RealtimePipelineSnapshotV1 final {
     l2flow::market::IntradayInstrumentStoreSnapshotV1 store{};
 };
 
-// Owns the single production data chain. The registry and calculator backing
-// objects referenced by config must outlive this runtime. One physical SDK
-// manager and one physical Subscriber are created when sdk.enabled is true.
+// Owns the single production data chain. The observed directory and
+// calculator backing objects referenced by config must outlive this runtime.
+// One physical SDK manager and one physical Subscriber are created when
+// sdk.enabled is true.
 class RealtimePipelineV1 final {
 public:
     RealtimePipelineV1(const RealtimePipelineV1&) = delete;
@@ -330,13 +367,14 @@ public:
     // Terminal publication path. It first closes callback admission and
     // performs SDK Shutdown so no accepted message can appear after the cut.
     // It then releases the quiesced SDK objects, publishes the exact final
-    // accepted ingress prefix, drains the decoder/store/WAL workers, and
+    // accepted ingress prefix, drains Journal/decoder/Store workers, and
     // leaves the runtime stopped. This is the production shutdown path when a final
     // complete generation is required. Every normal return is destructive and
     // leaves the runtime stopped, including invalid timeout or publication
     // failure; a failed terminal publication cannot be retried in place. SDK Shutdown, user calculator work,
-    // worker joins, and optional WAL sync are lifecycle operations outside the
-    // barrier timeout and must have deployment-enforced execution bounds.
+    // worker joins and mandatory Journal synchronization are lifecycle
+    // operations outside the barrier timeout and must have
+    // deployment-enforced execution bounds.
     [[nodiscard]] RealtimePipelineCutResultV1
     StopAndPublishFinalGeneration(
         std::chrono::nanoseconds timeout) noexcept;
@@ -389,8 +427,8 @@ public:
     [[nodiscard]] bool fatal() const noexcept;
 
     // Idempotent terminal shutdown without creating another generation. SDK
-    // callbacks are stopped first, decoder queues are drained and joined
-    // next, then the store runtime and independent optional WAL stop.
+    // callbacks are stopped first, the mandatory Journal is durably drained,
+    // decoder queues are drained and joined next, then the Store runtime stops.
     void StopAndDrain() noexcept;
 
 private:

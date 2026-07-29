@@ -8,8 +8,6 @@ option(L2FLOW_BUILD_FEEDER_PROBE
        "Build the opt-in standalone SDK feeder diagnostic" OFF)
 option(L2FLOW_BUILD_MARKET_DECODER_LIBFUZZER
        "Build the optional market decoder libFuzzer target" OFF)
-option(L2FLOW_BUILD_BENCHMARKS
-       "Build opt-in operator-run performance benchmarks" OFF)
 option(L2FLOW_ENABLE_ASAN_UBSAN
        "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(L2FLOW_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
@@ -97,16 +95,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(l2flow_sdk PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-# Decoder, immutable registry, fixed-worker history, and whole-generation
-# market publication. It has no dependency on WAL or factor code.
+# Decoder, fixed-capacity observed directory, fixed-worker history, and
+# whole-generation market publication.
 add_library(l2flow_market STATIC
     src/control/checked_body_view.cpp
-    src/market/instrument_registry.cpp
-    src/market/instrument_registry_loader_v1.cpp
     src/market/intraday_instrument_store_v1.cpp
     src/market/kline_aggregator_v1.cpp
     src/market/market_decoder.cpp
     src/market/market_types_v1.cpp
+    src/market/observed_instrument_directory_v2.cpp
     src/market/realtime_history_v1.cpp
     src/market/realtime_kline_v1.cpp
     src/market/realtime_latest_read_model_v1.cpp)
@@ -115,11 +112,12 @@ l2flow_configure_target(l2flow_market)
 target_link_libraries(l2flow_market
     PUBLIC L2Flow::common Threads::Threads)
 
-# The ownership boundary and optional audit side branch. WAL consumes the
-# immutable ingress handle and has no edge back into decoder/history.
+# The single-copy ownership boundary, contiguous completion tracker, and
+# mandatory asynchronous Journal sink.
 add_library(l2flow_realtime_ingress STATIC
-    src/realtime/owned_ingress_message_v1.cpp
-    src/realtime/optional_wal_sink_v1.cpp)
+    src/realtime/contiguous_sequence_tracker_v2.cpp
+    src/realtime/mandatory_journal_v2.cpp
+    src/realtime/owned_ingress_message_v1.cpp)
 add_library(L2Flow::realtime_ingress ALIAS l2flow_realtime_ingress)
 l2flow_configure_target(l2flow_realtime_ingress)
 target_link_libraries(l2flow_realtime_ingress
@@ -133,9 +131,11 @@ add_library(L2Flow::factor ALIAS l2flow_factor)
 l2flow_configure_target(l2flow_factor)
 target_link_libraries(l2flow_factor PUBLIC L2Flow::market)
 
-# The only production composition:
-# SDK -> owned ingress -> optional WAL + decoder -> fixed worker history
-# -> generation barrier/watermark -> factor -> atomic publication.
+# The only production composition: callback admission gives one immutable
+# owned message to the mandatory Journal queue and the ordered in-memory
+# processing queue. The dispatcher drives Decoder -> fixed-worker History ->
+# generation barrier/watermark -> Factor, while the Journal writer advances
+# durability independently.
 add_library(l2flow_realtime STATIC
     src/runtime/realtime_pipeline_v1.cpp)
 add_library(L2Flow::realtime ALIAS l2flow_realtime)
@@ -153,8 +153,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # composition dependency; the core realtime pipeline has no edge back to
     # sockets, memfd, Python, Arrow, or Polars.
     add_library(l2flow_ipc STATIC
-        src/ipc/realtime_wire_projection_v1.cpp
-        src/ipc/realtime_shared_service_v1.cpp)
+        src/ipc/realtime_shared_service_v2.cpp)
     add_library(L2Flow::ipc ALIAS l2flow_ipc)
     l2flow_configure_target(l2flow_ipc)
     target_compile_definitions(l2flow_ipc PRIVATE _GNU_SOURCE)
@@ -164,13 +163,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Stable native acquire/seqcount helper. Python loads this with ctypes;
     # it has no Python, Arrow, or Polars build dependency.
     add_library(l2flow_shm_reader SHARED
-        src/ipc/realtime_shm_reader_c_v1.cpp)
+        src/ipc/realtime_shm_reader_c_v2.cpp)
     l2flow_configure_target(l2flow_shm_reader)
     target_compile_definitions(l2flow_shm_reader PRIVATE _GNU_SOURCE)
     set_target_properties(l2flow_shm_reader PROPERTIES
         OUTPUT_NAME "l2flow_shm_reader"
-        VERSION 1.0.0
-        SOVERSION 1
+        VERSION 2.0.0
+        SOVERSION 2
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN YES)
 endif()
@@ -181,51 +180,11 @@ target_link_libraries(mdl_production_router PRIVATE L2Flow::realtime)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(
         mdl_production_router
-        PRIVATE L2FLOW_HAS_LINUX_REALTIME_IPC_V1=1)
+        PRIVATE L2FLOW_HAS_LINUX_REALTIME_IPC_V2=1)
     target_link_libraries(mdl_production_router PRIVATE L2Flow::ipc)
 endif()
 set_target_properties(mdl_production_router PROPERTIES
     OUTPUT_NAME "mdl-production-router")
-
-# Operator-run acceptance probe. It uses the exact production composition but
-# keeps measurement/reporting code out of the latency-sensitive runtime.
-add_executable(accept_realtime_pipeline
-    tools/accept_realtime_pipeline.cpp)
-l2flow_configure_target(accept_realtime_pipeline)
-target_link_libraries(accept_realtime_pipeline PRIVATE L2Flow::realtime)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    target_compile_definitions(
-        accept_realtime_pipeline
-        PRIVATE L2FLOW_HAS_LINUX_REALTIME_IPC_V1=1)
-    target_link_libraries(accept_realtime_pipeline PRIVATE L2Flow::ipc)
-endif()
-set_target_properties(accept_realtime_pipeline PROPERTIES
-    OUTPUT_NAME "accept-realtime-pipeline")
-
-if(L2FLOW_BUILD_BENCHMARKS)
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        message(FATAL_ERROR
-            "L2FLOW_BUILD_BENCHMARKS currently requires Linux")
-    endif()
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    add_executable(benchmark_single_instrument_history_stages
-        benchmarks/benchmark_single_instrument_history_stages.cpp)
-    l2flow_configure_target(
-        benchmark_single_instrument_history_stages)
-    target_link_libraries(
-        benchmark_single_instrument_history_stages
-        PRIVATE L2Flow::ipc)
-    target_compile_definitions(
-        benchmark_single_instrument_history_stages
-        PRIVATE
-            L2FLOW_HISTORY_BENCHMARK_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
-            L2FLOW_HISTORY_BENCHMARK_PYTHON_PROBE="${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_instrument_history_stages.py"
-            L2FLOW_HISTORY_BENCHMARK_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python")
-    set_target_properties(
-        benchmark_single_instrument_history_stages
-        PROPERTIES
-            OUTPUT_NAME "benchmark-single-instrument-history-stages")
-endif()
 
 if(L2FLOW_BUILD_FEEDER_PROBE)
     add_executable(mdl_sdk_feeder_probe tools/mdl_sdk_feeder_probe.cpp)
@@ -275,12 +234,12 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_phase2_identity128.cpp L2Flow::common)
     l2flow_add_test(test_sha256
         tests/test_sha256.cpp L2Flow::common)
-    l2flow_add_test(test_instrument_registry
-        tests/test_phase4_instrument_registry.cpp L2Flow::market)
-    l2flow_add_test(test_instrument_registry_loader
-        tests/test_phase4_instrument_registry_loader_v1.cpp L2Flow::market)
     l2flow_add_test(test_market_decoder
         tests/test_phase4_market_decoder.cpp L2Flow::market)
+    l2flow_add_test(test_observed_instrument_directory
+        tests/test_observed_instrument_directory_v2.cpp L2Flow::market)
+    l2flow_add_test(test_observed_instrument_router
+        tests/test_observed_instrument_router_v2.cpp L2Flow::market)
 
     # A deterministic, compiler-independent fuzz smoke keeps all five decoder
     # selectors, schema gates, fixed-size boundaries, and 50k pseudorandom
@@ -317,8 +276,13 @@ if(L2FLOW_BUILD_TESTS)
         COMMAND test_sdk_direct_runtime
             $<TARGET_FILE:test_sdk_direct_runtime_dso>)
 
-    l2flow_add_test(test_owned_ingress_wal
-        tests/test_owned_ingress_wal_v1.cpp L2Flow::realtime_ingress)
+    l2flow_add_test(test_contiguous_sequence_tracker
+        tests/test_contiguous_sequence_tracker_v2.cpp
+        L2Flow::realtime_ingress)
+    l2flow_add_test(test_closeable_publication_gate
+        tests/test_closeable_publication_gate.cpp Threads::Threads)
+    l2flow_add_test(test_mandatory_journal
+        tests/test_mandatory_journal_v2.cpp L2Flow::realtime_ingress)
     l2flow_add_test(test_realtime_history
         tests/test_realtime_history_v1.cpp L2Flow::market)
     l2flow_add_test(test_realtime_latest_read_model
@@ -330,29 +294,33 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_realtime_factor_engine
         tests/test_realtime_factor_engine_v1.cpp L2Flow::factor)
     l2flow_add_test(test_realtime_pipeline
-        tests/test_realtime_pipeline_v1.cpp L2Flow::realtime)
+        tests/test_observed_universe_pipeline_v2.cpp L2Flow::realtime)
     l2flow_add_test(test_realtime_pipeline_lifecycle_concurrency
         tests/test_realtime_pipeline_lifecycle_concurrency_v1.cpp
         L2Flow::realtime)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        add_executable(test_realtime_ipc
-            tests/test_realtime_ipc_v1.cpp)
-        l2flow_configure_target(test_realtime_ipc)
-        target_link_libraries(test_realtime_ipc
-            PRIVATE L2Flow::ipc l2flow_shm_reader)
-        add_test(NAME test_realtime_ipc COMMAND test_realtime_ipc)
+        l2flow_add_test(test_realtime_wire_v2
+            tests/test_realtime_wire_v2.cpp L2Flow::common)
+        l2flow_add_test(test_realtime_shm_reader_v2
+            tests/test_realtime_shm_reader_v2.cpp
+            l2flow_shm_reader)
+        l2flow_add_test(test_realtime_shared_service_v2
+            tests/test_realtime_shared_service_v2.cpp
+            L2Flow::ipc)
+        target_link_libraries(test_realtime_shared_service_v2
+            PRIVATE L2Flow::realtime l2flow_shm_reader)
 
         # The Python client core and its regression suite are stdlib-only.
         # Missing Python, PyArrow, or Polars never blocks the C++ build.
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
             target_compile_definitions(
-                test_realtime_ipc
+                test_realtime_shared_service_v2
                 PRIVATE
-                    L2FLOW_IPC_E2E_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
-                    L2FLOW_IPC_E2E_PYTHON_PROBE="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_ipc_e2e_probe.py"
-                    L2FLOW_IPC_E2E_NATIVE_READER="$<TARGET_FILE:l2flow_shm_reader>"
-                    L2FLOW_IPC_E2E_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python")
+                    L2FLOW_V2_PYTHON_PROBE_EXECUTABLE="${Python3_EXECUTABLE}"
+                    L2FLOW_V2_PYTHON_PROBE_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_hot_read_probe.py"
+                    L2FLOW_V2_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python"
+                    L2FLOW_V2_PYTHON_READER_LIBRARY="$<TARGET_FILE:l2flow_shm_reader>")
             add_test(
                 NAME test_l2flow_realtime_python
                 COMMAND
