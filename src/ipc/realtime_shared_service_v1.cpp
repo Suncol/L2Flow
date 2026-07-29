@@ -886,11 +886,15 @@ public:
             !StateAcceptsPublication(
                 Atomic(header_->server_state)
                     .load(std::memory_order_acquire))) {
+            ReportPublishAppliedFailure(
+                "service_precondition", registry_ordinal, record);
             return false;
         }
         const RealtimeWireInstrumentV1& instrument =
             instrument_rows()[registry_ordinal];
         if (instrument.instrument_id != record.instrument_id()) {
+            ReportPublishAppliedFailure(
+                "instrument_identity", registry_ordinal, record);
             MarkCoverageLost();
             return false;
         }
@@ -898,22 +902,43 @@ public:
         bool published = false;
         if (market::IsSnapshotEventKindV1(record.kind())) {
             RealtimeWireSnapshotPayloadV1 payload{};
-            published =
-                record.tick_stream_sequence() == 0U &&
-                ProjectSnapshotWireV1(
-                    record, registry_ordinal, &payload) &&
-                PublishSlot(
-                    &snapshot_slots()[registry_ordinal], payload);
+            if (record.tick_stream_sequence() != 0U) {
+                ReportPublishAppliedFailure(
+                    "snapshot_tick_sequence", registry_ordinal, record);
+            } else if (!ProjectSnapshotWireV1(
+                           record, registry_ordinal, &payload)) {
+                ReportPublishAppliedFailure(
+                    "snapshot_projection", registry_ordinal, record);
+            } else if (!PublishSlot(
+                           &snapshot_slots()[registry_ordinal], payload)) {
+                ReportPublishAppliedFailure(
+                    "snapshot_slot", registry_ordinal, record);
+            } else {
+                published = true;
+            }
         } else if (market::IsTickEventKindV1(record.kind())) {
             RealtimeWireTickPayloadV1 payload{};
-            published =
-                record.tick_stream_sequence() != 0U &&
-                ProjectTickWireV1(
-                    record, registry_ordinal, &payload) &&
-                PublishRing(payload) &&
-                PublishSlot(
-                    &latest_tick_slots()[registry_ordinal],
-                    payload);
+            if (record.tick_stream_sequence() == 0U) {
+                ReportPublishAppliedFailure(
+                    "tick_sequence", registry_ordinal, record);
+            } else if (!ProjectTickWireV1(
+                           record, registry_ordinal, &payload)) {
+                ReportPublishAppliedFailure(
+                    "tick_projection", registry_ordinal, record);
+            } else if (!PublishRing(payload)) {
+                ReportPublishAppliedFailure(
+                    "tick_ring", registry_ordinal, record);
+            } else if (!PublishSlot(
+                           &latest_tick_slots()[registry_ordinal],
+                           payload)) {
+                ReportPublishAppliedFailure(
+                    "latest_tick_slot", registry_ordinal, record);
+            } else {
+                published = true;
+            }
+        } else {
+            ReportPublishAppliedFailure(
+                "event_kind", registry_ordinal, record);
         }
         if (!published) {
             MarkCoverageLost();
@@ -922,6 +947,43 @@ public:
         Atomic(header_->published_records)
             .fetch_add(1U, std::memory_order_release);
         return true;
+    }
+
+    void ReportPublishAppliedFailure(
+        const char* reason,
+        std::size_t registry_ordinal,
+        const market::RealtimeHistoryRecordV1& record) noexcept {
+        if (publish_applied_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        const std::uint32_t state =
+            header_ == nullptr
+                ? 0U
+                : Atomic(header_->server_state)
+                      .load(std::memory_order_relaxed);
+        const std::uint32_t flags =
+            header_ == nullptr
+                ? 0U
+                : Atomic(header_->flags)
+                      .load(std::memory_order_relaxed);
+        std::fprintf(
+            stderr,
+            "l2flow-ipc: PublishApplied failed reason=%s "
+            "registry_ordinal=%zu instrument_id=%u source_slot=%u "
+            "event_kind=%u ingress_sequence=%llu source_sequence=%llu "
+            "tick_stream_sequence=%llu server_state=%u flags=%u\n",
+            reason == nullptr ? "unknown" : reason,
+            registry_ordinal,
+            record.instrument_id(),
+            static_cast<unsigned>(record.source_slot()),
+            static_cast<unsigned>(record.kind()),
+            static_cast<unsigned long long>(record.ingress_sequence()),
+            static_cast<unsigned long long>(record.source_sequence()),
+            static_cast<unsigned long long>(
+                record.tick_stream_sequence()),
+            state,
+            flags);
     }
 
     void MarkCoverageLost() noexcept {
@@ -5027,6 +5089,8 @@ private:
     std::uint64_t mapping_bytes_ = 0U;
     RealtimeWireHeaderV1* header_ = nullptr;
     std::unique_ptr<RingSlotLock[]> ring_locks_;
+    std::atomic_flag publish_applied_failure_reported_ =
+        ATOMIC_FLAG_INIT;
     std::atomic_flag kline_publication_in_progress_ =
         ATOMIC_FLAG_INIT;
     std::atomic_flag store_publication_in_progress_ =

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <ctime>
 #include <limits>
 #include <mutex>
@@ -1386,6 +1387,11 @@ public:
         if (!lanes_[source_slot]->queue.TryPush(std::move(command))) {
             result.error =
                 RealtimePipelineIngressErrorV1::kDecoderQueueFull;
+            ReportPipelineFailure(
+                "decoder_queue_full",
+                source_slot,
+                metadata.global_ingress_sequence,
+                0U);
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
             return result;
@@ -2061,6 +2067,11 @@ private:
             static_cast<std::uint8_t>(decode_error),
             std::memory_order_release);
         if (decode_error != market::MarketDecodeErrorV1::kNone) {
+            ReportPipelineFailure(
+                "market_decode",
+                source,
+                message->global_ingress_sequence(),
+                static_cast<std::uint64_t>(decode_error));
             return false;
         }
 
@@ -2071,14 +2082,79 @@ private:
                 std::move(decoded),
                 message->tick_stream_sequence());
         if (!input.has_value()) {
+            ReportHistoryInputFailure(
+                source,
+                message->global_ingress_sequence(),
+                message->tick_stream_sequence(),
+                decoded);
             return false;
         }
-        if (history_->TrySubmit(std::move(*input)) !=
+        const market::RealtimeHistorySubmitErrorV1 submit_error =
+            history_->TrySubmit(std::move(*input));
+        if (submit_error !=
             market::RealtimeHistorySubmitErrorV1::kNone) {
+            ReportPipelineFailure(
+                "history_submit",
+                source,
+                message->global_ingress_sequence(),
+                static_cast<std::uint64_t>(submit_error));
             return false;
         }
         decoded_messages_.fetch_add(1U, std::memory_order_relaxed);
         return true;
+    }
+
+    void ReportHistoryInputFailure(
+        std::uint8_t source_slot,
+        std::uint64_t ingress_sequence,
+        std::uint64_t tick_stream_sequence,
+        const market::DecodedMarketEventV1& event) noexcept {
+        if (pipeline_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        std::visit(
+            [&](const auto& value) noexcept {
+                std::fprintf(
+                    stderr,
+                    "l2flow-pipeline: first fatal "
+                    "reason=history_input_create source_slot=%u "
+                    "ingress_sequence=%llu tick_stream_sequence=%llu "
+                    "common_kind=%u source_stream_id=%u "
+                    "source_sequence=%llu instrument_id=%u "
+                    "registry_ordinal=%zu retained_body_bytes=%zu\n",
+                    static_cast<unsigned>(source_slot),
+                    static_cast<unsigned long long>(ingress_sequence),
+                    static_cast<unsigned long long>(
+                        tick_stream_sequence),
+                    static_cast<unsigned>(value.common.kind),
+                    value.common.origin.source_stream_id,
+                    static_cast<unsigned long long>(
+                        value.common.origin.source_sequence),
+                    value.common.instrument_id,
+                    value.common.registry_ordinal,
+                    value.common.origin.body.size());
+            },
+            event);
+    }
+
+    void ReportPipelineFailure(
+        const char* reason,
+        std::uint8_t source_slot,
+        std::uint64_t ingress_sequence,
+        std::uint64_t detail) noexcept {
+        if (pipeline_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "l2flow-pipeline: first fatal reason=%s source_slot=%u "
+            "ingress_sequence=%llu detail=%llu\n",
+            reason == nullptr ? "unknown" : reason,
+            static_cast<unsigned>(source_slot),
+            static_cast<unsigned long long>(ingress_sequence),
+            static_cast<unsigned long long>(detail));
     }
 
     void TripFatalWithAdmissionLockHeld() noexcept {
@@ -2191,6 +2267,7 @@ private:
     std::atomic<std::uint8_t> last_callback_error_{
         static_cast<std::uint8_t>(
             RealtimePipelineIngressErrorV1::kNone)};
+    std::atomic_flag pipeline_failure_reported_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> accepting_{false};
     std::atomic<bool> fatal_{false};
     std::atomic<bool> stopped_{false};

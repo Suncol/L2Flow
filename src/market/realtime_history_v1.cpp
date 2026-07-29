@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <ctime>
 #include <limits>
 #include <mutex>
@@ -1398,6 +1399,10 @@ public:
                 input->event(),
                 input->ingress_sequence(),
                 &kline_trade);
+            if (kline_projection ==
+                KLineTradeProjectionV1::kInvalidTrade) {
+                ReportInvalidKLineProjection(*input);
+            }
         }
         RealtimeHistoryAppendObservationV1 observation{};
         const bool observe = config_.append_observer != nullptr;
@@ -1461,6 +1466,8 @@ public:
                 kline_error = KLineAppendErrorV1::kInvalidTrade;
             }
             if (kline_error != KLineAppendErrorV1::kNone) {
+                ReportKLineAppendFailure(
+                    kline_error, kline_trade, *appended_record);
                 MarkLatestCoverageLost();
                 kline_failed_.store(true, std::memory_order_release);
             }
@@ -1535,6 +1542,91 @@ public:
             return false;
         }
         return true;
+    }
+
+    void ReportInvalidKLineProjection(
+        const RealtimeHistoryEventInputV1& input) noexcept {
+        if (kline_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        std::visit(
+            [&](const auto& event) noexcept {
+                using Event = std::decay_t<decltype(event)>;
+                if constexpr (
+                    std::is_same_v<Event, ShanghaiTickV1> ||
+                    std::is_same_v<Event, ShenzhenTransactionV1>) {
+                    std::fprintf(
+                        stderr,
+                        "l2flow-kline: invalid projection "
+                        "instrument_id=%u event_kind=%u "
+                        "ingress_sequence=%llu source_sequence=%llu "
+                        "action=%u validity_bitmap=%u price_valid=%u "
+                        "quantity_valid=%u quantity_raw=%lld "
+                        "exchange_time_valid=%u unix_time_valid=%u "
+                        "exchange_ns_since_midnight=%llu trade_date=%u\n",
+                        event.common.instrument_id,
+                        static_cast<unsigned>(event.common.kind),
+                        static_cast<unsigned long long>(
+                            input.ingress_sequence()),
+                        static_cast<unsigned long long>(
+                            event.common.origin.source_sequence),
+                        static_cast<unsigned>(event.fields.action),
+                        event.fields.validity_bitmap,
+                        event.fields.price.valid ? 1U : 0U,
+                        event.fields.quantity.valid ? 1U : 0U,
+                        static_cast<long long>(
+                            event.fields.quantity.raw),
+                        event.common.exchange_time.valid ? 1U : 0U,
+                        event.common.exchange_time.unix_nanoseconds_valid
+                            ? 1U
+                            : 0U,
+                        static_cast<unsigned long long>(
+                            event.common.exchange_time
+                                .nanoseconds_since_midnight),
+                        event.common.origin.trade_date);
+                } else {
+                    std::fprintf(
+                        stderr,
+                        "l2flow-kline: invalid projection on non-trade "
+                        "event instrument_id=%u event_kind=%u "
+                        "ingress_sequence=%llu\n",
+                        input.instrument_id(),
+                        static_cast<unsigned>(input.kind()),
+                        static_cast<unsigned long long>(
+                            input.ingress_sequence()));
+                }
+            },
+            input.event());
+    }
+
+    void ReportKLineAppendFailure(
+        KLineAppendErrorV1 error,
+        const KLineTradeV1& trade,
+        const RealtimeHistoryRecordV1& record) noexcept {
+        if (kline_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "l2flow-kline: append failed error=%.*s instrument_id=%u "
+            "event_kind=%u ingress_sequence=%llu source_sequence=%llu "
+            "event_sequence=%llu event_time_ns=%llu price_p6=%lld "
+            "quantity_raw=%llu quantity_scale=%u quantity_unit=%u\n",
+            static_cast<int>(KLineAppendErrorNameV1(error).size()),
+            KLineAppendErrorNameV1(error).data(),
+            record.instrument_id(),
+            static_cast<unsigned>(record.kind()),
+            static_cast<unsigned long long>(record.ingress_sequence()),
+            static_cast<unsigned long long>(record.source_sequence()),
+            static_cast<unsigned long long>(trade.event_sequence),
+            static_cast<unsigned long long>(
+                trade.event_time_ns_since_midnight),
+            static_cast<long long>(trade.price_p6),
+            static_cast<unsigned long long>(trade.quantity_raw),
+            static_cast<unsigned>(trade.quantity_scale),
+            static_cast<unsigned>(trade.quantity_unit));
     }
 
     bool FreezeAndReport(
@@ -1929,6 +2021,7 @@ public:
     std::atomic<bool> fatal_{false};
     std::atomic<bool> store_failed_{false};
     std::atomic<bool> kline_failed_{false};
+    std::atomic_flag kline_failure_reported_ = ATOMIC_FLAG_INIT;
     std::array<SourceOwnerState, kRealtimeHistorySourceCountV1>
         source_owner_states_{};
 
