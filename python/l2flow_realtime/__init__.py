@@ -27,6 +27,16 @@ from .instrument_delta import (
     InstrumentTickDeltaSession,
     InstrumentTickDeltaSessionClosedError,
 )
+from .rolling import (
+    InstrumentTickColumns,
+    InstrumentTickRollingCommit,
+    InstrumentTickRollingFactor,
+    InstrumentTickRollingState,
+    InstrumentTickRollingStore,
+    InstrumentTickRollingTransaction,
+    InstrumentTickRollingUpdate,
+    InstrumentTickRollingWindow,
+)
 from .models import (
     Aggressor,
     AvailabilityFlag,
@@ -92,6 +102,14 @@ __all__ = [
     "InstrumentTickDeltaPage",
     "InstrumentTickDeltaSession",
     "InstrumentTickDeltaSessionClosedError",
+    "InstrumentTickColumns",
+    "InstrumentTickRollingCommit",
+    "InstrumentTickRollingFactor",
+    "InstrumentTickRollingState",
+    "InstrumentTickRollingStore",
+    "InstrumentTickRollingTransaction",
+    "InstrumentTickRollingUpdate",
+    "InstrumentTickRollingWindow",
     "InstrumentKey",
     "InstrumentLookupResult",
     "InstrumentLookupStatus",

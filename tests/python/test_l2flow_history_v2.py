@@ -31,10 +31,14 @@ from l2flow_realtime import (  # noqa: E402
     HistoryGenerationChangedError,
     HistoryPage,
     InstrumentTickDeltaBaseKind,
+    InstrumentTickDeltaCursor,
     InstrumentTickDeltaCursorClosedError,
     InstrumentTickDeltaGeneration,
+    InstrumentTickDeltaMetadata,
     InstrumentTickDeltaPage,
     InstrumentTickDeltaSessionClosedError,
+    InstrumentTickRollingStore,
+    InstrumentTickRollingUpdate,
     L2FlowClient,
     ProtocolError,
     StreamNotFoundError,
@@ -48,6 +52,7 @@ from l2flow_realtime._generation import (  # noqa: E402
     pack_generation_endpoint,
     validate_generation_endpoint,
 )
+from l2flow_realtime._history_columns import tick_columns  # noqa: E402
 from l2flow_realtime.checkpoint import (  # noqa: E402
     InstrumentTickDeltaCheckpoint,
 )
@@ -890,9 +895,10 @@ class DeltaCursorTests(unittest.TestCase):
                         (0, 2, 0, 0),
                     )
                     self.assertEqual(
-                        page.tick_columns["price_p6"],
+                        page.read_columns("price_p6")["price_p6"],
                         (101_000_000, 102_000_000),
                     )
+                    self.assertEqual(page.wire_records, b"".join(TICKS))
                     with self.assertRaises(
                         DeltaCheckpointUnverifiedError
                     ):
@@ -937,6 +943,617 @@ class DeltaCursorTests(unittest.TestCase):
                         ),
                         checkpoint,
                     )
+
+
+def _rolling_checkpoint(
+    *,
+    generation: int,
+    record_count: int,
+    recv_monotonic_ns: int,
+    published_monotonic_ns: int,
+) -> InstrumentTickDeltaCheckpoint:
+    endpoint = replace(
+        _endpoint(),
+        generation=generation,
+        data_state_generation=generation,
+        ingress_sequence_exclusive=record_count + 1,
+        tick_stream_sequence_exclusive=record_count + 1,
+        recv_monotonic_cut_ns=recv_monotonic_ns,
+        history_published_monotonic_ns=published_monotonic_ns,
+        accepted_sequence=record_count,
+        durable_sequence=max(0, record_count - 1),
+        applied_sequence=record_count,
+        source_sequence_exclusive=(
+            1,
+            record_count + 1,
+            1,
+            1,
+        ),
+    )
+    return InstrumentTickDeltaCheckpoint.from_endpoint(
+        endpoint,
+        instrument_id=1,
+        ordinal=0,
+        instrument_tick_source_record_counts=(
+            0,
+            record_count,
+            0,
+            0,
+        ),
+        payload_projection=1,
+        tick_record_coverage_complete=True,
+    )
+
+
+def _rolling_metadata(
+    base: InstrumentTickDeltaCheckpoint | None,
+    target: InstrumentTickDeltaCheckpoint,
+) -> InstrumentTickDeltaMetadata:
+    base_counts = (
+        (0, 0, 0, 0)
+        if base is None
+        else base.instrument_tick_source_record_counts
+    )
+    source_counts = tuple(
+        target_count - base_count
+        for target_count, base_count in zip(
+            target.instrument_tick_source_record_counts,
+            base_counts,
+        )
+    )
+    return InstrumentTickDeltaMetadata(
+        base_kind=(
+            InstrumentTickDeltaBaseKind.ORIGIN
+            if base is None
+            else InstrumentTickDeltaBaseKind.CHECKPOINT
+        ),
+        selected_source_mask=DELTA_SELECTED_SOURCE_MASK,
+        base_checkpoint=base,
+        target_checkpoint=target,
+        delta_tick_source_record_counts=source_counts,
+        delta_tick_record_count=sum(source_counts),
+        ingress_sequence_begin_inclusive=(
+            1 if base is None else base.ingress_sequence_exclusive
+        ),
+        ingress_sequence_end_exclusive=(
+            target.ingress_sequence_exclusive
+        ),
+        tick_stream_sequence_begin_inclusive=(
+            1
+            if base is None
+            else base.tick_stream_sequence_exclusive
+        ),
+        tick_stream_sequence_end_exclusive=(
+            target.tick_stream_sequence_exclusive
+        ),
+        tick_record_coverage_complete=True,
+        payload_projection=1,
+    )
+
+
+def _rolling_page(
+    metadata: InstrumentTickDeltaMetadata,
+    *,
+    page_index: int,
+    rows: tuple[bytes, ...],
+    cumulative_record_count: int,
+    eof: bool = False,
+) -> InstrumentTickDeltaPage:
+    payload = b"".join(rows)
+    if rows:
+        first_ingress = struct.unpack_from("<Q", rows[0], 24)[0]
+        last_ingress = struct.unpack_from("<Q", rows[-1], 24)[0]
+        first_tick = struct.unpack_from("<Q", rows[0], 32)[0]
+        last_tick = struct.unpack_from("<Q", rows[-1], 32)[0]
+    else:
+        first_ingress = 0
+        last_ingress = 0
+        first_tick = 0
+        last_tick = 0
+    return InstrumentTickDeltaPage(
+        generation=InstrumentTickDeltaGeneration(
+            metadata.target_checkpoint.endpoint
+        ),
+        metadata=metadata,
+        page_index=page_index,
+        tick_columns=tick_columns(payload),
+        first_ingress_sequence=first_ingress,
+        last_ingress_sequence=last_ingress,
+        first_tick_stream_sequence=first_tick,
+        last_tick_stream_sequence=last_tick,
+        mapping_bytes=(
+            0
+            if eof
+            else DELTA_PAGE_HEADER_BYTES + len(payload)
+        ),
+        eof=eof,
+        cumulative_record_count=cumulative_record_count,
+        cumulative_source_record_counts=(
+            0,
+            cumulative_record_count,
+            0,
+            0,
+        ),
+    )
+
+
+class _ScriptedDeltaCursor(InstrumentTickDeltaCursor):
+    """Concrete-cursor test double; rolling still rejects arbitrary objects."""
+
+    def __init__(
+        self,
+        metadata: InstrumentTickDeltaMetadata,
+        pages: tuple[InstrumentTickDeltaPage, ...],
+    ) -> None:
+        self._script_metadata = metadata
+        self._script_generation = InstrumentTickDeltaGeneration(
+            metadata.target_checkpoint.endpoint
+        )
+        self._script_pages = pages
+        self._script_offset = 0
+        self._script_count = 0
+        self._script_source_counts = (0, 0, 0, 0)
+        self._script_eof = False
+        self._script_closed = False
+        self._script_verified = None
+
+    @property
+    def metadata(self):
+        return self._script_metadata
+
+    @property
+    def generation(self):
+        return self._script_generation
+
+    @property
+    def instrument_id(self):
+        return self._script_metadata.instrument_id
+
+    @property
+    def base_checkpoint(self):
+        return self._script_metadata.base_checkpoint
+
+    @property
+    def expected_record_count(self):
+        return self._script_metadata.delta_tick_record_count
+
+    @property
+    def next_page_index(self):
+        return self._script_offset
+
+    @property
+    def cumulative_record_count(self):
+        return self._script_count
+
+    @property
+    def cumulative_source_record_counts(self):
+        return self._script_source_counts
+
+    @property
+    def closed(self):
+        return self._script_closed
+
+    @property
+    def eof(self):
+        return self._script_eof
+
+    @property
+    def done(self):
+        return self._script_eof
+
+    @property
+    def verified_checkpoint(self):
+        if self._script_verified is None:
+            raise DeltaCheckpointUnverifiedError(
+                "test checkpoint is not verified"
+            )
+        return self._script_verified
+
+    def read_page(self):
+        if self._script_closed:
+            raise InstrumentTickDeltaCursorClosedError(
+                "test cursor is closed"
+            )
+        if self._script_eof:
+            return None
+        if self._script_offset >= len(self._script_pages):
+            return None
+        page = self._script_pages[self._script_offset]
+        self._script_offset += 1
+        self._script_count = page.cumulative_record_count
+        self._script_source_counts = (
+            page.cumulative_source_record_counts
+        )
+        if page.eof:
+            self._script_eof = True
+            self._script_verified = (
+                self._script_metadata.target_checkpoint
+            )
+        return page
+
+    def close(self):
+        self._script_closed = True
+
+
+def _rolling_cursor(
+    base: InstrumentTickDeltaCheckpoint | None,
+    target: InstrumentTickDeltaCheckpoint,
+    page_rows: tuple[tuple[bytes, ...], ...],
+) -> tuple[
+    _ScriptedDeltaCursor, tuple[InstrumentTickDeltaPage, ...]
+]:
+    metadata = _rolling_metadata(base, target)
+    count = 0
+    pages: list[InstrumentTickDeltaPage] = []
+    for page_index, rows in enumerate(page_rows):
+        count += len(rows)
+        pages.append(
+            _rolling_page(
+                metadata,
+                page_index=page_index,
+                rows=rows,
+                cumulative_record_count=count,
+            )
+        )
+    pages.append(
+        _rolling_page(
+            metadata,
+            page_index=len(pages),
+            rows=(),
+            cumulative_record_count=count,
+            eof=True,
+        )
+    )
+    scripted = tuple(pages)
+    return _ScriptedDeltaCursor(metadata, scripted), scripted
+
+
+class _RollingPriceSum:
+    def update(
+        self, state: int, change: InstrumentTickRollingUpdate
+    ) -> tuple[int, int]:
+        appended = change.appended.read_columns("price_p6")[
+            "price_p6"
+        ]
+        evicted = change.evicted.read_columns("price_p6")[
+            "price_p6"
+        ]
+        next_state = state + sum(appended) - sum(evicted)
+        return next_state, next_state
+
+
+class _RaisingRollingFactor:
+    def update(self, state: list[int], change):
+        state.append(len(change.appended))
+        raise KeyboardInterrupt("factor interrupted")
+
+
+class RollingTransactionTests(unittest.TestCase):
+    def test_real_v2_cursor_is_consumed_through_terminal_eof(self):
+        with _SocketPairServer(_delta_server) as server, mock.patch(
+            "l2flow_realtime.instrument_delta.socket.socket",
+            return_value=server.client,
+        ):
+            with _open_instrument_tick_delta_session(
+                server.path,
+                expected_generation=9,
+                expected_run_id=RUN_ID,
+                expected_session_epoch=SESSION_EPOCH,
+                expected_trade_date=TRADE_DATE,
+                expected_capacity=CAPACITY,
+                timeout=1.0,
+            ) as session:
+                cursor = session.open_instrument(
+                    1, requested_page_records=4096
+                )
+                store = InstrumentTickRollingStore(
+                    1,
+                    1,
+                    factor=_RollingPriceSum(),
+                    initial_factor_state=0,
+                )
+                committed = store.update(cursor)
+                self.assertTrue(cursor.done)
+                self.assertEqual(
+                    committed.checkpoint, cursor.verified_checkpoint
+                )
+                self.assertEqual(committed.state.seen_count, 2)
+                self.assertEqual(
+                    committed.state.read_columns("price_p6")[
+                        "price_p6"
+                    ],
+                    (102_000_000,),
+                )
+                self.assertEqual(
+                    committed.state.factor_state, 102_000_000
+                )
+
+    def test_origin_delta_successor_delta_and_noop_are_atomic(self):
+        first_checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        second_checkpoint = _rolling_checkpoint(
+            generation=10,
+            record_count=4,
+            recv_monotonic_ns=12_000,
+            published_monotonic_ns=13_000,
+        )
+        store = InstrumentTickRollingStore(
+            1,
+            3,
+            factor=_RollingPriceSum(),
+            initial_factor_state=0,
+        )
+        first, first_pages = _rolling_cursor(
+            None,
+            first_checkpoint,
+            ((TICKS[0],), (TICKS[1],)),
+        )
+        first_commit = store.update(first)
+        self.assertTrue(first_commit.advanced)
+        self.assertEqual(first_commit.state.version, 1)
+        self.assertEqual(first_commit.state.seen_count, 2)
+        self.assertEqual(first_commit.factor_value, 203_000_000)
+        self.assertEqual(
+            first_commit.state.read_columns("price_p6")["price_p6"],
+            (101_000_000, 102_000_000),
+        )
+        self.assertTrue(first.done)
+        self.assertTrue(
+            all(
+                page.tick_columns.materialized_column_count == 0
+                for page in first_pages
+            )
+        )
+
+        second, _ = _rolling_cursor(
+            first_checkpoint,
+            second_checkpoint,
+            (
+                (
+                    _tick(3, 103_000_000),
+                    _tick(4, 104_000_000),
+                ),
+            ),
+        )
+        second_commit = store.update(second)
+        self.assertTrue(second_commit.advanced)
+        self.assertEqual(second_commit.state.version, 2)
+        self.assertEqual(second_commit.state.seen_count, 4)
+        self.assertEqual(second_commit.factor_value, 309_000_000)
+        self.assertEqual(second_commit.state.factor_state, 309_000_000)
+        self.assertEqual(
+            second_commit.state.read_columns("price_p6")["price_p6"],
+            (102_000_000, 103_000_000, 104_000_000),
+        )
+        self.assertLessEqual(
+            second_commit.state.columns.segment_count, 2
+        )
+
+        noop, _ = _rolling_cursor(
+            second_checkpoint, second_checkpoint, ()
+        )
+        noop_commit = store.update(noop)
+        self.assertFalse(noop_commit.advanced)
+        self.assertEqual(noop_commit.state.version, 2)
+        self.assertEqual(noop_commit.factor_value, None)
+        self.assertEqual(
+            noop_commit.state.read_columns("price_p6")["price_p6"],
+            (102_000_000, 103_000_000, 104_000_000),
+        )
+
+    def test_empty_new_generation_advances_checkpoint_only(self):
+        first_checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        next_checkpoint = _rolling_checkpoint(
+            generation=10,
+            record_count=2,
+            recv_monotonic_ns=12_000,
+            published_monotonic_ns=13_000,
+        )
+        store = InstrumentTickRollingStore(
+            1,
+            4,
+            factor=_RollingPriceSum(),
+            initial_factor_state=0,
+        )
+        first, _ = _rolling_cursor(
+            None, first_checkpoint, (TICKS,)
+        )
+        store.update(first)
+        empty, _ = _rolling_cursor(
+            first_checkpoint, next_checkpoint, ()
+        )
+        committed = store.update(empty)
+        self.assertTrue(committed.advanced)
+        self.assertEqual(committed.state.version, 2)
+        self.assertEqual(committed.checkpoint, next_checkpoint)
+        self.assertEqual(committed.state.seen_count, 2)
+        self.assertEqual(committed.state.factor_state, 203_000_000)
+        self.assertIsNone(committed.factor_value)
+
+    def test_commit_before_eof_aborts_without_publishing(self):
+        checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        store = InstrumentTickRollingStore(
+            1,
+            2,
+            factor=_RollingPriceSum(),
+            initial_factor_state=0,
+        )
+        cursor, _ = _rolling_cursor(
+            None, checkpoint, (TICKS,)
+        )
+        transaction = store.begin(cursor)
+        transaction.step()
+        with self.assertRaises(RuntimeError):
+            transaction.commit()
+        self.assertFalse(transaction.active)
+        self.assertTrue(cursor.closed)
+        self.assertEqual(store.state.version, 0)
+        self.assertIsNone(store.checkpoint)
+        self.assertEqual(store.state.seen_count, 0)
+
+        retry, _ = _rolling_cursor(None, checkpoint, (TICKS,))
+        with store.begin(retry) as retry_transaction:
+            retry_transaction.abort()
+
+    def test_factor_base_exception_does_not_mutate_committed_state(self):
+        checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        store = InstrumentTickRollingStore(
+            1,
+            2,
+            factor=_RaisingRollingFactor(),
+            initial_factor_state=[],
+        )
+        cursor, _ = _rolling_cursor(
+            None, checkpoint, (TICKS,)
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            store.update(cursor)
+        state = store.state
+        self.assertEqual(state.version, 0)
+        self.assertEqual(state.factor_state, [])
+        self.assertEqual(state.seen_count, 0)
+        self.assertIsNone(state.checkpoint)
+        self.assertTrue(cursor.closed)
+
+    def test_missing_explicit_eof_fails_closed_and_releases_writer(self):
+        checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        metadata = _rolling_metadata(None, checkpoint)
+        data_page = _rolling_page(
+            metadata,
+            page_index=0,
+            rows=TICKS,
+            cumulative_record_count=2,
+        )
+        cursor = _ScriptedDeltaCursor(metadata, (data_page,))
+        store = InstrumentTickRollingStore(
+            1,
+            2,
+            factor=_RollingPriceSum(),
+            initial_factor_state=0,
+        )
+        with self.assertRaisesRegex(
+            WireFormatError, "explicit EOF"
+        ):
+            store.update(cursor)
+        self.assertEqual(store.state.version, 0)
+        self.assertEqual(store.state.seen_count, 0)
+        self.assertIsNone(store.checkpoint)
+        self.assertTrue(cursor.closed)
+
+        replacement, _ = _rolling_cursor(
+            None, checkpoint, (TICKS,)
+        )
+        with store.begin(replacement) as transaction:
+            transaction.abort()
+
+    def test_abort_close_failure_does_not_mask_factor_exception(self):
+        checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        normal, pages = _rolling_cursor(
+            None, checkpoint, (TICKS,)
+        )
+
+        class CloseFailingCursor(_ScriptedDeltaCursor):
+            def close(self):
+                raise OSError("injected close failure")
+
+        cursor = CloseFailingCursor(normal.metadata, pages)
+        store = InstrumentTickRollingStore(
+            1,
+            2,
+            factor=_RaisingRollingFactor(),
+            initial_factor_state=[],
+        )
+        with self.assertRaisesRegex(
+            KeyboardInterrupt, "factor interrupted"
+        ):
+            store.update(cursor)
+        self.assertEqual(store.state.factor_state, [])
+        self.assertEqual(store.state.version, 0)
+
+        replacement, _ = _rolling_cursor(
+            None, checkpoint, (TICKS,)
+        )
+        with store.begin(replacement) as transaction:
+            transaction.abort()
+
+    def test_readers_observe_old_or_new_bundle_not_shadow_state(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingFactor(_RollingPriceSum):
+            def update(self, state, change):
+                entered.set()
+                if not release.wait(2):
+                    raise RuntimeError("test factor timed out")
+                return super().update(state, change)
+
+        checkpoint = _rolling_checkpoint(
+            generation=9,
+            record_count=2,
+            recv_monotonic_ns=10_000,
+            published_monotonic_ns=11_000,
+        )
+        store = InstrumentTickRollingStore(
+            1,
+            2,
+            factor=BlockingFactor(),
+            initial_factor_state=0,
+        )
+        cursor, _ = _rolling_cursor(
+            None, checkpoint, (TICKS,)
+        )
+        errors: list[BaseException] = []
+
+        def update() -> None:
+            try:
+                store.update(cursor)
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=update)
+        thread.start()
+        self.assertTrue(entered.wait(1))
+        old = store.state
+        self.assertEqual(old.version, 0)
+        self.assertEqual(old.seen_count, 0)
+        self.assertIsNone(old.checkpoint)
+        release.set()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        new = store.state
+        self.assertEqual(new.version, 1)
+        self.assertEqual(new.seen_count, 2)
+        self.assertEqual(new.checkpoint, checkpoint)
 
 
 class CursorCancellationTests(unittest.TestCase):

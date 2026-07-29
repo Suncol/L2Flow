@@ -11,13 +11,15 @@ from __future__ import annotations
 import struct
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable
 
 from .models import WireFormatError
 from .wire import SNAPSHOT_BYTES, TICK_BYTES
 
 
-_Extractor = Callable[[bytes, int], object]
+_WireBuffer = bytes | memoryview
+_Extractor = Callable[[_WireBuffer, int], object]
 _DECIMAL = struct.Struct("<qqBBB5x")
 _QUANTITY = struct.Struct("<qBBB5x")
 _TICK_HEAD = struct.Struct("<IIqqii8B")
@@ -26,6 +28,8 @@ _TICK_HEAD = struct.Struct("<IIqqii8B")
 @dataclass(frozen=True, slots=True)
 class _ColumnSpec:
     extract: _Extractor
+    scalar_format: str | None = None
+    scalar_offset: int = 0
 
 
 def _scalar(format_: str, offset: int) -> _ColumnSpec:
@@ -33,7 +37,9 @@ def _scalar(format_: str, offset: int) -> _ColumnSpec:
     return _ColumnSpec(
         lambda payload, base: unpacker.unpack_from(
             payload, base + offset
-        )[0]
+        )[0],
+        scalar_format=format_,
+        scalar_offset=offset,
     )
 
 
@@ -212,7 +218,7 @@ def _canonical_bool(value: int, field: str) -> None:
 
 
 def _validate_decimal(
-    payloads: bytes, base: int, field: str
+    payloads: _WireBuffer, base: int, field: str
 ) -> None:
     _raw, _normalized, _scale, valid, is_null = (
         _DECIMAL.unpack_from(payloads, base)
@@ -224,7 +230,7 @@ def _validate_decimal(
 
 
 def _validate_quantity(
-    payloads: bytes, base: int, field: str
+    payloads: _WireBuffer, base: int, field: str
 ) -> None:
     _raw, _scale, valid, is_null = _QUANTITY.unpack_from(
         payloads, base
@@ -236,7 +242,7 @@ def _validate_quantity(
 
 
 def _validate_common_projection(
-    payloads: bytes,
+    payloads: _WireBuffer,
     base: int,
     *,
     event_kind: int,
@@ -259,7 +265,7 @@ def _validate_common_projection(
 
 
 def validate_snapshot_payload_canonical(
-    payloads: bytes,
+    payloads: _WireBuffer,
     base: int,
     *,
     event_kind: int,
@@ -350,7 +356,7 @@ def validate_snapshot_payload_canonical(
 
 
 def validate_tick_payload_canonical(
-    payloads: bytes,
+    payloads: _WireBuffer,
     base: int,
     *,
     event_kind: int,
@@ -438,12 +444,24 @@ class LazyWireColumns(Mapping[str, tuple[object, ...]]):
 
     def __init__(
         self,
-        payloads: bytes,
+        payloads: _WireBuffer,
         record_bytes: int,
         specs: Mapping[str, _ColumnSpec],
     ) -> None:
-        if not isinstance(payloads, bytes):
-            raise TypeError("wire payload block must be bytes")
+        if isinstance(payloads, memoryview):
+            if (
+                not payloads.readonly
+                or not payloads.c_contiguous
+                or payloads.itemsize != 1
+            ):
+                raise TypeError(
+                    "wire payload view must be read-only contiguous bytes"
+                )
+            payloads = payloads.cast("B")
+        elif not isinstance(payloads, bytes):
+            raise TypeError(
+                "wire payload block must be bytes or a read-only view"
+            )
         if record_bytes <= 0 or len(payloads) % record_bytes:
             raise ValueError("wire payload block is not record-aligned")
         self._payloads = payloads
@@ -462,37 +480,127 @@ class LazyWireColumns(Mapping[str, tuple[object, ...]]):
     def materialized_column_count(self) -> int:
         return len(self._cache)
 
+    @property
+    def wire_records(self) -> bytes:
+        """Return the immutable dense wire rows owned by this page."""
+
+        if isinstance(self._payloads, bytes):
+            return self._payloads
+        return self._payloads.tobytes()
+
+    @property
+    def wire_view(self) -> memoryview:
+        """Return a read-only dense view without copying page-owned bytes."""
+
+        return memoryview(self._payloads)
+
     def __iter__(self) -> Iterator[str]:
         return iter(self._specs)
 
     def __getitem__(self, name: str) -> tuple[object, ...]:
-        try:
-            return self._cache[name]
-        except KeyError:
+        return self.read_columns(name)[name]
+
+    def read_columns(
+        self, *names: str
+    ) -> dict[str, tuple[object, ...]]:
+        """Materialize selected columns, fusing fixed scalars into one pass."""
+
+        if not names:
+            raise ValueError("at least one column name is required")
+        if any(not isinstance(name, str) for name in names):
+            raise TypeError("column names must be strings")
+        if len(set(names)) != len(names):
+            raise ValueError("column names must be unique")
+
+        missing: list[tuple[str, _ColumnSpec]] = []
+        for name in names:
+            if name in self._cache:
+                continue
             try:
-                spec = self._specs[name]
+                missing.append((name, self._specs[name]))
             except KeyError:
                 raise KeyError(name) from None
-            result = tuple(
+
+        scalar = [
+            item
+            for item in missing
+            if item[1].scalar_format is not None
+        ]
+        if scalar:
+            ordered = sorted(
+                scalar, key=lambda item: item[1].scalar_offset
+            )
+            layout = tuple(
+                (
+                    spec.scalar_format,
+                    spec.scalar_offset,
+                )
+                for _name, spec in ordered
+            )
+            unpacker = _scalar_row_unpacker(
+                self._record_bytes, layout
+            )
+            rows = unpacker.iter_unpack(self._payloads)
+            if len(ordered) == 1:
+                materialized = (tuple(row[0] for row in rows),)
+            else:
+                materialized = tuple(zip(*rows))
+            if not materialized:
+                materialized = tuple(() for _item in ordered)
+            for (name, _spec), values in zip(
+                ordered, materialized
+            ):
+                self._cache[name] = values
+
+        for name, spec in missing:
+            if name in self._cache:
+                continue
+            self._cache[name] = tuple(
                 spec.extract(self._payloads, base)
                 for base in range(
                     0, len(self._payloads), self._record_bytes
                 )
             )
-            self._cache[name] = result
-            return result
+
+        return {name: self._cache[name] for name in names}
 
     def materialize_all(self) -> dict[str, tuple[object, ...]]:
         """Force every V2 projected column and return a client-owned mapping."""
 
-        return {name: self[name] for name in self._specs}
+        return self.read_columns(*self._specs)
 
 
-def tick_columns(payloads: bytes) -> LazyWireColumns:
+@lru_cache(maxsize=256)
+def _scalar_row_unpacker(
+    record_bytes: int,
+    layout: tuple[tuple[str | None, int], ...],
+) -> struct.Struct:
+    format_parts = ["<"]
+    cursor = 0
+    for format_, offset in layout:
+        assert format_ is not None
+        scalar = struct.Struct("<" + format_)
+        if offset < cursor:
+            raise ValueError("scalar columns overlap or are unordered")
+        if offset > cursor:
+            format_parts.append(f"{offset - cursor}x")
+        format_parts.append(format_)
+        cursor = offset + scalar.size
+    if cursor > record_bytes:
+        raise ValueError("scalar column exceeds its wire record")
+    if cursor < record_bytes:
+        format_parts.append(f"{record_bytes - cursor}x")
+    unpacker = struct.Struct("".join(format_parts))
+    if unpacker.size != record_bytes:
+        raise AssertionError("scalar row unpacker has the wrong stride")
+    return unpacker
+
+
+def tick_columns(payloads: _WireBuffer) -> LazyWireColumns:
     return LazyWireColumns(payloads, TICK_BYTES, TICK_COLUMN_SPECS)
 
 
-def snapshot_columns(payloads: bytes) -> LazyWireColumns:
+def snapshot_columns(payloads: _WireBuffer) -> LazyWireColumns:
     return LazyWireColumns(
         payloads, SNAPSHOT_BYTES, SNAPSHOT_COLUMN_SPECS
     )

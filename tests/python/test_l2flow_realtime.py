@@ -618,15 +618,28 @@ class AbiContractTests(unittest.TestCase):
         self.assertTrue(
             hasattr(l2flow_realtime, "InstrumentTickDeltaCursor")
         )
+        self.assertTrue(
+            hasattr(l2flow_realtime, "InstrumentTickRollingStore")
+        )
         self.assertFalse(hasattr(l2flow_realtime, "LatestResult"))
+        self.assertFalse(hasattr(L2FlowClient, "open_tick_cursor"))
         history = importlib.import_module("l2flow_realtime.history")
         delta = importlib.import_module(
             "l2flow_realtime.instrument_delta"
+        )
+        rolling = importlib.import_module(
+            "l2flow_realtime.rolling"
         )
         self.assertFalse(hasattr(history, "connect"))
         self.assertFalse(hasattr(history, "open_history"))
         self.assertFalse(hasattr(delta, "connect"))
         self.assertFalse(hasattr(delta, "open_instrument_delta"))
+        self.assertFalse(
+            hasattr(rolling.InstrumentTickRollingState, "state_schema")
+        )
+        self.assertFalse(
+            hasattr(rolling.InstrumentTickRollingState, "factor_schema")
+        )
 
 
 class NativeReaderTests(unittest.TestCase):

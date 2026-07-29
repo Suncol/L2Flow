@@ -1030,6 +1030,12 @@ struct PythonHistoryCommandResult final {
     std::vector<std::uint64_t> scan_ns;
     std::vector<std::uint64_t> open_return_to_complete_ns;
     std::vector<std::uint64_t> checkpoint_access_ns;
+    std::vector<std::uint64_t> transaction_begin_ns;
+    std::vector<std::uint64_t> atomic_commit_ns;
+    std::vector<std::uint64_t> factor_update_ns;
+    std::vector<std::uint64_t> factor_column_ns;
+    std::vector<std::uint64_t> factor_math_ns;
+    std::vector<std::uint64_t> consume_nonfactor_ns;
 };
 
 [[nodiscard]] bool RunPythonHistoryCommand(
@@ -1153,6 +1159,111 @@ struct PythonHistoryCommandResult final {
             if (cursor_open_start < open_return ||
                 cursor_open_return < cursor_open_start ||
                 scan_start < cursor_open_return) {
+                return false;
+            }
+            if (sample == 0U) {
+                result.first_cursor_open_start_ns =
+                    cursor_open_start;
+                result.first_cursor_open_return_ns =
+                    cursor_open_return;
+            }
+        } else if (sample_tag == "ROLLING_SAMPLE") {
+            std::uint64_t session_open = 0U;
+            std::uint64_t cursor_open = 0U;
+            std::uint64_t cursor_open_start = 0U;
+            std::uint64_t cursor_open_return = 0U;
+            std::uint64_t begin_start = 0U;
+            std::uint64_t begin_return = 0U;
+            std::uint64_t consume_latency = 0U;
+            std::uint64_t commit_start = 0U;
+            std::uint64_t begin_latency = 0U;
+            std::uint64_t commit_latency = 0U;
+            std::uint64_t factor_update = 0U;
+            std::uint64_t factor_column = 0U;
+            std::uint64_t factor_math = 0U;
+            std::uint64_t consume_nonfactor = 0U;
+            std::uint64_t cursor_to_commit = 0U;
+            if (!ParseLineUnsignedField(
+                    line,
+                    "session_open_call_start_ns",
+                    &open_start) ||
+                !ParseLineUnsignedField(
+                    line, "session_open_return_ns", &open_return) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_call_start_ns",
+                    &cursor_open_start) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_return_ns",
+                    &cursor_open_return) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "transaction_begin_start_ns",
+                    &begin_start) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "transaction_begin_return_ns",
+                    &begin_return) ||
+                !ParseLineUnsignedField(
+                    line, "consume_start_ns", &scan_start) ||
+                !ParseLineUnsignedField(
+                    line, "commit_start_ns", &commit_start) ||
+                !ParseLineUnsignedField(
+                    line, "commit_return_ns", &complete) ||
+                !ParseLineUnsignedField(
+                    line, "session_open_ns", &session_open) ||
+                !ParseLineUnsignedField(
+                    line, "cursor_open_ns", &cursor_open) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "transaction_begin_ns",
+                    &begin_latency) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "consume_to_eof_ns",
+                    &consume_latency) ||
+                !ParseLineUnsignedField(
+                    line, "atomic_commit_ns", &commit_latency) ||
+                !ParseLineUnsignedField(
+                    line, "factor_update_ns", &factor_update) ||
+                !ParseLineUnsignedField(
+                    line, "factor_column_ns", &factor_column) ||
+                !ParseLineUnsignedField(
+                    line, "factor_math_ns", &factor_math) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "consume_nonfactor_ns",
+                    &consume_nonfactor) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_return_to_commit_ns",
+                    &cursor_to_commit)) {
+                return false;
+            }
+            result.session_open_ns.push_back(session_open);
+            result.cursor_open_ns.push_back(cursor_open);
+            result.scan_ns.push_back(consume_latency);
+            result.open_return_to_complete_ns.push_back(
+                cursor_to_commit);
+            result.transaction_begin_ns.push_back(begin_latency);
+            result.atomic_commit_ns.push_back(commit_latency);
+            result.factor_update_ns.push_back(factor_update);
+            result.factor_column_ns.push_back(factor_column);
+            result.factor_math_ns.push_back(factor_math);
+            result.consume_nonfactor_ns.push_back(
+                consume_nonfactor);
+            if (cursor_open_start < open_return ||
+                cursor_open_return < cursor_open_start ||
+                begin_start < cursor_open_return ||
+                begin_return < begin_start ||
+                scan_start < begin_return ||
+                commit_start < scan_start ||
+                complete < commit_start ||
+                factor_column > factor_update ||
+                factor_math > factor_update ||
+                factor_update > consume_latency ||
+                consume_nonfactor > consume_latency) {
                 return false;
             }
             if (sample == 0U) {
@@ -4331,6 +4442,26 @@ bool RunHistoryLatencyBenchmark() {
                         "verified_checkpoint_property_access",
                     result.checkpoint_access_ns);
             }
+            if (!result.transaction_begin_ns.empty()) {
+                PrintLatency(
+                    prefix + "python_transaction_begin",
+                    result.transaction_begin_ns);
+                PrintLatency(
+                    prefix + "python_factor_update",
+                    result.factor_update_ns);
+                PrintLatency(
+                    prefix + "python_factor_column_materialization",
+                    result.factor_column_ns);
+                PrintLatency(
+                    prefix + "python_factor_arithmetic",
+                    result.factor_math_ns);
+                PrintLatency(
+                    prefix + "python_consume_nonfactor",
+                    result.consume_nonfactor_ns);
+                PrintLatency(
+                    prefix + "python_atomic_commit",
+                    result.atomic_commit_ns);
+            }
             const LatencySummary scan =
                 SummarizeLatency(result.scan_ns);
             const long double records_per_second =
@@ -4683,6 +4814,124 @@ bool RunHistoryLatencyBenchmark() {
         delta_all,
         4'096U);
 
+    CallbackBoundary delta_validate_boundary{};
+    std::uint64_t delta_validate_generation = 0U;
+    if (!Expect(
+            cut_without_history(
+                77'824U,
+                &delta_validate_boundary,
+                &delta_validate_generation),
+            "publish 4,096-record validation-only delta target")) {
+        return false;
+    }
+    PythonHistoryCommandResult delta_validate{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "DELTA_FROM_VERIFIED " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(delta_validate_generation) +
+                " validate " + std::to_string(kPriceRepeats) +
+                " 4096",
+            "DELTA_SAMPLE",
+            kPriceRepeats,
+            4'096U,
+            &delta_validate)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "delta_verified_4096_validate",
+        history_stages.Take());
+    print_python_distribution(
+        "delta_verified_4096_validate",
+        delta_validate,
+        4'096U);
+
+    constexpr std::uint64_t kRollingWindowRecords = 4'096U;
+    PythonHistoryCommandResult rolling_origin{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "ROLLING_ORIGIN " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(delta_validate_generation) +
+                " price " + std::to_string(kPriceRepeats) +
+                " 77824 " +
+                std::to_string(kRollingWindowRecords),
+            "ROLLING_SAMPLE",
+            kPriceRepeats,
+            77'824U,
+            &rolling_origin)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "rolling_origin_77824_price",
+        history_stages.Take());
+    print_python_distribution(
+        "rolling_origin_77824_price",
+        rolling_origin,
+        77'824U);
+
+    CallbackBoundary rolling_boundary{};
+    std::uint64_t rolling_generation = 0U;
+    if (!Expect(
+            cut_without_history(
+                81'920U,
+                &rolling_boundary,
+                &rolling_generation),
+            "publish 4,096-record rolling delta target")) {
+        return false;
+    }
+    PythonHistoryCommandResult rolling_delta{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "ROLLING_FROM_VERIFIED " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(rolling_generation) +
+                " price " + std::to_string(kPriceRepeats) +
+                " 4096 " +
+                std::to_string(kRollingWindowRecords),
+            "ROLLING_SAMPLE",
+            kPriceRepeats,
+            4'096U,
+            &rolling_delta)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "rolling_verified_4096_price",
+        history_stages.Take());
+    print_python_distribution(
+        "rolling_verified_4096_price",
+        rolling_delta,
+        4'096U);
+    std::cout
+        << "ROLLING_BOUNDARY workload=verified_4096_price"
+        << " generation=" << rolling_generation
+        << " realtime_processing_ns="
+        << (rolling_boundary.applied_observed_ns -
+            rolling_boundary.callback_start_ns)
+        << " realtime_ipc_visibility_ns="
+        << (rolling_boundary.ipc_return_ns -
+            rolling_boundary.callback_start_ns)
+        << " generation_publish_wait_ns="
+        << (rolling_delta.published_ns -
+            rolling_boundary.applied_observed_ns)
+        << " t3_delta_session_open_return_ns="
+        << rolling_delta.first_open_return_ns
+        << " t3_delta_cursor_open_return_ns="
+        << rolling_delta.first_cursor_open_return_ns
+        << " publication_to_atomic_commit_ns="
+        << (rolling_delta.first_complete_ns -
+            rolling_delta.published_ns)
+        << " cursor_open_return_to_atomic_commit_ns="
+        << (rolling_delta.first_complete_ns -
+            rolling_delta.first_cursor_open_return_ns)
+        << " callback_to_atomic_commit_ns="
+        << (rolling_delta.first_complete_ns -
+            rolling_boundary.callback_start_ns)
+        << '\n';
+
     std::uint64_t mixed_tick_count = 0U;
     CallbackBoundary mixed_boundary{};
     if (!Expect(
@@ -4902,7 +5151,7 @@ bool RunHistoryLatencyBenchmark() {
             "START_HISTORY_LOOP " +
             std::to_string(kPureTickInstrument) + " " +
             std::to_string(mixed_generation) +
-            " all 73728")) {
+            " all 81920")) {
         return false;
     }
     if (!protocol->ReadLine(
@@ -4952,7 +5201,7 @@ bool RunHistoryLatencyBenchmark() {
             "START_HISTORY_LOOP " +
             std::to_string(kPureTickInstrument) + " " +
             std::to_string(mixed_generation) +
-            " all 73728") ||
+            " all 81920") ||
         !isolated_scan_protocol->ReadLine(
             std::chrono::seconds(120), &line) ||
         !line.starts_with("HISTORY_LOOP_STARTED ")) {

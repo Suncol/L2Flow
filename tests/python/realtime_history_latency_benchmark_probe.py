@@ -8,9 +8,16 @@ Invocation:
 After one ``READY`` line, stdin accepts these exact commands:
 
     HISTORY INSTRUMENT GENERATION price|all REPEATS EXPECTED_RECORDS
-    DELTA_ORIGIN INSTRUMENT GENERATION price|all REPEATS EXPECTED_RECORDS
+    DELTA_ORIGIN \
+        INSTRUMENT GENERATION validate|price|all REPEATS EXPECTED_RECORDS
     DELTA_FROM_VERIFIED \
-        INSTRUMENT GENERATION price|all REPEATS EXPECTED_RECORDS
+        INSTRUMENT GENERATION validate|price|all REPEATS EXPECTED_RECORDS
+    ROLLING_ORIGIN \
+        INSTRUMENT GENERATION count|price|all \
+        REPEATS EXPECTED_RECORDS WINDOW_RECORDS
+    ROLLING_FROM_VERIFIED \
+        INSTRUMENT GENERATION count|price|all \
+        REPEATS EXPECTED_RECORDS WINDOW_RECORDS
     START_HISTORY_LOOP \
         INSTRUMENT GENERATION price|all EXPECTED_RECORDS
     STOP_HISTORY_LOOP
@@ -81,7 +88,18 @@ def _decimal(
 
 
 def _projection(raw: str) -> str:
-    _require(raw in ("price", "all"), "projection must be price or all")
+    _require(
+        raw in ("validate", "price", "all"),
+        "projection must be validate, price, or all",
+    )
+    return raw
+
+
+def _factor_mode(raw: str) -> str:
+    _require(
+        raw in ("count", "price", "all"),
+        "factor must be count, price, or all",
+    )
     return raw
 
 
@@ -152,6 +170,90 @@ class _LoopSnapshot:
     scan_ns: int
     started_ns: int
     updated_ns: int
+
+
+@dataclass(slots=True)
+class _TimedRollingFactor:
+    mode: str
+    update_ns: int = 0
+    column_ns: int = 0
+    math_ns: int = 0
+    appended_records: int = 0
+    evicted_records: int = 0
+
+    def update(self, state, change):
+        update_start_ns = _now_ns()
+        appended_count = len(change.appended)
+        evicted_count = len(change.evicted)
+        column_start_ns = _now_ns()
+        if self.mode == "count":
+            appended_prices = ()
+            evicted_prices = ()
+        else:
+            if self.mode == "all":
+                change.appended.materialize_all()
+                change.evicted.materialize_all()
+            appended_prices = change.appended.read_columns(
+                "price_p6"
+            )["price_p6"]
+            evicted_prices = change.evicted.read_columns(
+                "price_p6"
+            )["price_p6"]
+        column_return_ns = _now_ns()
+
+        math_start_ns = column_return_ns
+        prior_count, prior_sum, prior_checksum = state
+        next_count = (
+            prior_count + appended_count - evicted_count
+        )
+        _require(
+            next_count == len(change.after),
+            "rolling factor count disagrees with the bounded window",
+        )
+        if self.mode == "count":
+            next_sum = 0
+            next_checksum = (
+                (
+                    prior_checksum * _CHECKSUM_PRIME
+                )
+                ^ appended_count
+                ^ (evicted_count << 32)
+            ) & _CHECKSUM_MASK
+        else:
+            next_sum = (
+                prior_sum
+                + sum(appended_prices)
+                - sum(evicted_prices)
+            )
+            next_checksum, appended_values = _fold_column(
+                prior_checksum,
+                appended_prices,
+                0x524F4C4C,
+            )
+            next_checksum, evicted_values = _fold_column(
+                next_checksum,
+                evicted_prices,
+                0x45564943,
+            )
+            _require(
+                appended_values == appended_count
+                and evicted_values == evicted_count,
+                "rolling factor price columns have the wrong size",
+            )
+        math_return_ns = _now_ns()
+        self.appended_records += appended_count
+        self.evicted_records += evicted_count
+        self.column_ns += column_return_ns - column_start_ns
+        self.math_ns += math_return_ns - math_start_ns
+        self.update_ns += math_return_ns - update_start_ns
+        next_state = (next_count, next_sum, next_checksum)
+        return next_state, next_checksum
+
+
+@dataclass(slots=True)
+class _RollingLane:
+    store: object
+    factor: _TimedRollingFactor
 
 
 def _consume_history_page(
@@ -394,6 +496,8 @@ def _consume_delta_page(
     projection: str,
     checksum: int,
 ) -> tuple[int, int]:
+    if projection == "validate":
+        return checksum, 0
     if projection == "all":
         page.materialize_all()
     checksum, count = _fold_column(
@@ -520,6 +624,10 @@ def _parse_history_loop(
         allow_zero=False,
     )
     projection = _projection(words[3])
+    _require(
+        projection in ("price", "all"),
+        "history loop projection must be price or all",
+    )
     expected_records = _decimal(
         words[4],
         "expected_records",
@@ -527,6 +635,54 @@ def _parse_history_loop(
         allow_zero=True,
     )
     return instrument_id, generation, projection, expected_records
+
+
+def _parse_rolling_measurement(
+    words: list[str],
+) -> tuple[int, int, str, int, int, int]:
+    _require(
+        len(words) == 7,
+        f"{words[0]} requires exactly six arguments",
+    )
+    instrument_id = _decimal(
+        words[1],
+        "instrument",
+        maximum=_UINT32_MAX,
+        allow_zero=False,
+    )
+    generation = _decimal(
+        words[2],
+        "generation",
+        maximum=_UINT64_MAX,
+        allow_zero=False,
+    )
+    mode = _factor_mode(words[3])
+    repeats = _decimal(
+        words[4],
+        "repeats",
+        maximum=_UINT32_MAX,
+        allow_zero=False,
+    )
+    expected_records = _decimal(
+        words[5],
+        "expected_records",
+        maximum=_UINT64_MAX,
+        allow_zero=True,
+    )
+    window_records = _decimal(
+        words[6],
+        "window_records",
+        maximum=_UINT64_MAX,
+        allow_zero=False,
+    )
+    return (
+        instrument_id,
+        generation,
+        mode,
+        repeats,
+        expected_records,
+        window_records,
+    )
 
 
 def _run_history(
@@ -539,6 +695,10 @@ def _run_history(
     repeats: int,
     expected_records: int,
 ) -> None:
+    _require(
+        projection in ("price", "all"),
+        "history projection must be price or all",
+    )
     for sample in range(repeats):
         open_start_ns = _now_ns()
         cursor = client.open_instrument_history(
@@ -760,6 +920,260 @@ def _run_delta(
             "DELTA_ORIGIN" if origin else "DELTA_FROM_VERIFIED"
         ),
         samples=repeats,
+        saved_generation=first_target.generation,
+        saved_tick_record_count=(
+            first_target.instrument_tick_record_count
+        ),
+    )
+
+
+def _run_rolling(
+    client,
+    rolling_lanes: dict[
+        tuple[int, str, int], list[_RollingLane]
+    ],
+    rolling_store_class,
+    *,
+    command_index: int,
+    origin: bool,
+    instrument_id: int,
+    expected_generation: int,
+    factor_mode: str,
+    repeats: int,
+    expected_records: int,
+    window_records: int,
+) -> None:
+    key = (instrument_id, factor_mode, window_records)
+    if origin:
+        _require(
+            key not in rolling_lanes,
+            "ROLLING_ORIGIN cannot replace existing rolling lanes",
+        )
+        lanes: list[_RollingLane] = []
+        for _sample in range(repeats):
+            factor = _TimedRollingFactor(factor_mode)
+            lanes.append(
+                _RollingLane(
+                    store=rolling_store_class(
+                        instrument_id,
+                        window_records,
+                        factor=factor,
+                        initial_factor_state=(
+                            0,
+                            0,
+                            _CHECKSUM_OFFSET,
+                        ),
+                    ),
+                    factor=factor,
+                )
+            )
+        rolling_lanes[key] = lanes
+    else:
+        _require(
+            key in rolling_lanes,
+            "ROLLING_FROM_VERIFIED has no initialized lanes",
+        )
+        lanes = rolling_lanes[key]
+        _require(
+            len(lanes) == repeats,
+            "rolling repeat count changed after origin",
+        )
+
+    targets: list[object] = []
+    for sample, lane in enumerate(lanes):
+        before = lane.store.state
+        base_checkpoint = before.checkpoint
+        _require(
+            (base_checkpoint is None) == origin,
+            "rolling lane base kind disagrees with the command",
+        )
+        factor_update_before = lane.factor.update_ns
+        factor_column_before = lane.factor.column_ns
+        factor_math_before = lane.factor.math_ns
+        appended_before = lane.factor.appended_records
+        evicted_before = lane.factor.evicted_records
+
+        session_open_start_ns = _now_ns()
+        session = client.open_instrument_tick_delta_session(
+            expected_generation=expected_generation
+        )
+        session_open_return_ns = _now_ns()
+        with session:
+            cursor_open_start_ns = _now_ns()
+            cursor = session.open_instrument(
+                instrument_id,
+                base_checkpoint=base_checkpoint,
+                requested_page_records=_PAGE_RECORDS,
+            )
+            cursor_open_return_ns = _now_ns()
+            with cursor:
+                begin_start_ns = _now_ns()
+                transaction = lane.store.begin(cursor)
+                begin_return_ns = _now_ns()
+                with transaction:
+                    consume_start_ns = _now_ns()
+                    transaction.consume()
+                    eof_verified_ns = _now_ns()
+                    commit_start_ns = _now_ns()
+                    commit = transaction.commit()
+                    commit_return_ns = _now_ns()
+
+        checkpoint = commit.checkpoint
+        _require(
+            checkpoint.generation == expected_generation,
+            "rolling checkpoint generation is unexpected",
+        )
+        base_tick_count = (
+            0
+            if base_checkpoint is None
+            else base_checkpoint.instrument_tick_record_count
+        )
+        _require(
+            checkpoint.instrument_tick_record_count
+            - base_tick_count
+            == expected_records,
+            "rolling checkpoint delta differs from expected_records",
+        )
+        _require(
+            transaction.delta_record_count == expected_records,
+            "rolling transaction count differs from expected_records",
+        )
+        expected_window_count = min(
+            checkpoint.instrument_tick_record_count,
+            window_records,
+        )
+        _require(
+            len(commit.state.columns) == expected_window_count
+            and commit.state.seen_count
+            == checkpoint.instrument_tick_record_count,
+            "rolling committed window/checkpoint counts disagree",
+        )
+        published_ns = checkpoint.history_published_monotonic_ns
+        _require(
+            published_ns <= session_open_return_ns,
+            "rolling publication timestamp is after session OPEN",
+        )
+
+        factor_update_ns = (
+            lane.factor.update_ns - factor_update_before
+        )
+        factor_column_ns = (
+            lane.factor.column_ns - factor_column_before
+        )
+        factor_math_ns = lane.factor.math_ns - factor_math_before
+        appended_records = (
+            lane.factor.appended_records - appended_before
+        )
+        evicted_records = (
+            lane.factor.evicted_records - evicted_before
+        )
+        consume_ns = eof_verified_ns - consume_start_ns
+        _require(
+            factor_update_ns <= consume_ns,
+            "rolling factor time exceeds transaction consume time",
+        )
+        data_page_count = cursor.next_page_index - 1
+        _require(
+            data_page_count >= 0 and cursor.done,
+            "rolling cursor did not consume one explicit EOF",
+        )
+        factor_value = (
+            commit.state.factor_state[2]
+            if commit.factor_value is None
+            else commit.factor_value
+        )
+        expected_evicted_records = max(
+            0,
+            len(before.columns)
+            + expected_records
+            - window_records,
+        )
+        _require(
+            appended_records == expected_records
+            and evicted_records == expected_evicted_records,
+            "rolling factor appended/evicted counts disagree",
+        )
+        targets.append(checkpoint)
+        _emit(
+            "ROLLING_SAMPLE",
+            command=command_index,
+            sample=sample,
+            mode="origin" if origin else "verified",
+            factor=factor_mode,
+            instrument_id=instrument_id,
+            window_records=window_records,
+            base_generation=(
+                0
+                if base_checkpoint is None
+                else base_checkpoint.generation
+            ),
+            expected_generation=expected_generation,
+            checkpoint_generation=checkpoint.generation,
+            expected_records=expected_records,
+            record_count=expected_records,
+            base_tick_record_count=base_tick_count,
+            checkpoint_tick_record_count=(
+                checkpoint.instrument_tick_record_count
+            ),
+            before_window_count=len(before.columns),
+            after_window_count=len(commit.state.columns),
+            appended_record_count=appended_records,
+            evicted_record_count=evicted_records,
+            page_count=cursor.next_page_index,
+            data_page_count=data_page_count,
+            terminal_page_count=1,
+            history_published_monotonic_ns=published_ns,
+            session_open_call_start_ns=session_open_start_ns,
+            session_open_return_ns=session_open_return_ns,
+            cursor_open_call_start_ns=cursor_open_start_ns,
+            cursor_open_return_ns=cursor_open_return_ns,
+            transaction_begin_start_ns=begin_start_ns,
+            transaction_begin_return_ns=begin_return_ns,
+            consume_start_ns=consume_start_ns,
+            eof_verified_ns=eof_verified_ns,
+            commit_start_ns=commit_start_ns,
+            commit_return_ns=commit_return_ns,
+            session_open_ns=(
+                session_open_return_ns - session_open_start_ns
+            ),
+            cursor_open_ns=(
+                cursor_open_return_ns - cursor_open_start_ns
+            ),
+            transaction_begin_ns=(
+                begin_return_ns - begin_start_ns
+            ),
+            consume_to_eof_ns=consume_ns,
+            atomic_commit_ns=(
+                commit_return_ns - commit_start_ns
+            ),
+            factor_update_ns=factor_update_ns,
+            factor_column_ns=factor_column_ns,
+            factor_math_ns=factor_math_ns,
+            consume_nonfactor_ns=consume_ns - factor_update_ns,
+            cursor_open_return_to_commit_ns=(
+                commit_return_ns - cursor_open_return_ns
+            ),
+            version=commit.state.version,
+            advanced=commit.advanced,
+            checksum=factor_value,
+        )
+
+    first_target = targets[0]
+    _require(
+        all(target == first_target for target in targets),
+        "repeated rolling lanes returned conflicting checkpoints",
+    )
+    _emit(
+        "DONE",
+        command=command_index,
+        operation=(
+            "ROLLING_ORIGIN"
+            if origin
+            else "ROLLING_FROM_VERIFIED"
+        ),
+        samples=repeats,
+        factor=factor_mode,
+        window_records=window_records,
         saved_generation=first_target.generation,
         saved_tick_record_count=(
             first_target.instrument_tick_record_count
@@ -1046,11 +1460,15 @@ def main(argv: list[str]) -> int:
 
     from l2flow_realtime import (  # pylint: disable=import-outside-toplevel
         InconsistentReadError,
+        InstrumentTickRollingStore,
         L2FlowClient,
         LatestStatus,
     )
 
     checkpoints: dict[int, object] = {}
+    rolling_lanes: dict[
+        tuple[int, str, int], list[_RollingLane]
+    ] = {}
     with L2FlowClient.connect(
         control_socket,
         native_library=native_library,
@@ -1061,7 +1479,7 @@ def main(argv: list[str]) -> int:
         clock = time.get_clock_info("monotonic")
         _emit(
             "READY",
-            protocol="wire_v2_history_latency_1",
+            protocol="wire_v2_history_latency_2",
             run_id=session.run_id.hex(),
             session_epoch=session.session_epoch,
             trade_date=session.trade_date,
@@ -1157,10 +1575,35 @@ def main(argv: list[str]) -> int:
                         "HISTORY",
                         "DELTA_ORIGIN",
                         "DELTA_FROM_VERIFIED",
+                        "ROLLING_ORIGIN",
+                        "ROLLING_FROM_VERIFIED",
                     ),
                     "unknown probe command",
                 )
                 command_index += 1
+                if operation.startswith("ROLLING_"):
+                    (
+                        instrument_id,
+                        generation,
+                        factor_mode,
+                        repeats,
+                        expected_records,
+                        window_records,
+                    ) = _parse_rolling_measurement(words)
+                    _run_rolling(
+                        client,
+                        rolling_lanes,
+                        InstrumentTickRollingStore,
+                        command_index=command_index,
+                        origin=operation == "ROLLING_ORIGIN",
+                        instrument_id=instrument_id,
+                        expected_generation=generation,
+                        factor_mode=factor_mode,
+                        repeats=repeats,
+                        expected_records=expected_records,
+                        window_records=window_records,
+                    )
+                    continue
                 (
                     instrument_id,
                     generation,

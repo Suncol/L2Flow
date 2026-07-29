@@ -18,7 +18,6 @@ from ._generation import (
 from ._history_columns import (
     LazyWireColumns,
     tick_columns,
-    validate_tick_payload_canonical,
 )
 from ._stream_control import (
     OK,
@@ -79,8 +78,13 @@ _READ_RESPONSE = struct.Struct("<8sHHHHIIQQQQQ")
 _METADATA_PREFIX = struct.Struct("<II")
 _METADATA_TAIL = struct.Struct("<4Q5QII8s")
 _PAGE_PREFIX = struct.Struct("<8sHHIIIQQIIQQQQQ")
-_PAYLOAD_COMMON = struct.Struct("<IIIIQQQ")
-_PAYLOAD_SOURCE = struct.Struct("<IIII6B")
+_TICK_DELTA_RECORD = struct.Struct(
+    "<IIIIQQQ56xIIII6B10s4xI24x8B"
+    "16x3B5s8x3B5s16x3B5s8x3B5s24x32s32s"
+)
+_ZERO5 = b"\x00" * 5
+_ZERO10 = b"\x00" * 10
+_ZERO32 = b"\x00" * 32
 
 assert _OPEN_SESSION_REQUEST.size == 40
 assert _OPEN_INSTRUMENT_PREFIX.size == 56
@@ -88,6 +92,7 @@ assert _READ_REQUEST.size == 48
 assert _READ_RESPONSE.size == 64
 assert _METADATA_TAIL.size == 88
 assert _PAGE_PREFIX.size == 88
+assert _TICK_DELTA_RECORD.size == TICK_BYTES
 
 
 class InstrumentTickDeltaBaseKind(IntEnum):
@@ -293,6 +298,19 @@ class InstrumentTickDeltaPage:
 
     def __len__(self) -> int:
         return self.record_count
+
+    @property
+    def wire_records(self) -> bytes:
+        """Return this page's client-owned dense Wire V2 tick rows."""
+
+        return self.tick_columns.wire_records
+
+    def read_columns(
+        self, *names: str
+    ) -> dict[str, tuple[object, ...]]:
+        """Materialize only selected columns, using a fused row scan."""
+
+        return self.tick_columns.read_columns(*names)
 
     def materialize_all(self) -> dict[str, tuple[object, ...]]:
         return self.tick_columns.materialize_all()
@@ -1014,14 +1032,17 @@ class InstrumentTickDeltaCursor:
             )
         finally:
             mapped.close()
-        ingress_values, tick_values = self._validate_payloads(
-            payload_block
-        )
+        (
+            payload_first_ingress,
+            payload_last_ingress,
+            payload_first_tick,
+            payload_last_tick,
+        ) = self._validate_payloads(payload_block)
         if (
-            first_ingress != ingress_values[0]
-            or last_ingress != ingress_values[-1]
-            or first_tick != tick_values[0]
-            or last_tick != tick_values[-1]
+            first_ingress != payload_first_ingress
+            or last_ingress != payload_last_ingress
+            or first_tick != payload_first_tick
+            or last_tick != payload_last_tick
         ):
             raise WireFormatError(
                 "tick delta page bounds disagree with payloads"
@@ -1060,10 +1081,41 @@ class InstrumentTickDeltaCursor:
 
     def _validate_payloads(
         self, payloads: bytes
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        ingress_values: list[int] = []
-        tick_values: list[int] = []
+    ) -> tuple[int, int, int, int]:
+        first_ingress = 0
+        last_ingress = 0
+        first_tick = 0
+        last_tick = 0
         target = self._metadata.target_checkpoint
+        ingress_begin = (
+            self._metadata.ingress_sequence_begin_inclusive
+        )
+        ingress_end = self._metadata.ingress_sequence_end_exclusive
+        tick_begin = (
+            self._metadata.tick_stream_sequence_begin_inclusive
+        )
+        tick_end = (
+            self._metadata.tick_stream_sequence_end_exclusive
+        )
+        target_source_ids = target.source_stream_ids
+        target_source_ends = target.source_sequence_exclusive
+        target_source_counts = (
+            self._metadata.delta_tick_source_record_counts
+        )
+        base = self._metadata.base_checkpoint
+        base_source_ends = (
+            (1, 1, 1, 1)
+            if base is None
+            else base.source_sequence_exclusive
+        )
+        target_instrument_id = target.instrument_id
+        target_ordinal = target.ordinal
+        target_trade_date = target.trade_date
+        source_counts = self._source_counts
+        last_sources = self._last_source
+        prior_ingress = self._last_ingress
+        prior_tick = self._last_tick
+
         for offset in range(0, len(payloads), TICK_BYTES):
             (
                 schema,
@@ -1073,8 +1125,6 @@ class InstrumentTickDeltaCursor:
                 source_sequence,
                 ingress,
                 tick_sequence,
-            ) = _PAYLOAD_COMMON.unpack_from(payloads, offset)
-            (
                 source_stream_id,
                 trade_date,
                 _vendor_time,
@@ -1085,78 +1135,153 @@ class InstrumentTickDeltaCursor:
                 quantity_unit,
                 security_type,
                 asset_scope,
-            ) = _PAYLOAD_SOURCE.unpack_from(payloads, offset + 96)
-            expected_slot = {2: 1, 4: 3, 5: 3}.get(event_kind)
-            expected_market = 1 if event_kind == 2 else 2
+                common_reserved,
+                projection_flags,
+                action,
+                side,
+                order_type,
+                aggressor,
+                phase,
+                raw_type_length,
+                raw_tick_flag_length,
+                tick_reserved,
+                _price_scale,
+                price_valid,
+                price_is_null,
+                price_reserved,
+                _quantity_scale,
+                quantity_valid,
+                quantity_is_null,
+                quantity_reserved,
+                _trade_amount_scale,
+                trade_amount_valid,
+                trade_amount_is_null,
+                trade_amount_reserved,
+                _matched_quantity_scale,
+                matched_quantity_valid,
+                matched_quantity_is_null,
+                matched_quantity_reserved,
+                raw_type,
+                raw_tick_flag,
+            ) = _TICK_DELTA_RECORD.unpack_from(payloads, offset)
+            if event_kind == 2:
+                expected_slot = 1
+                expected_market = 1
+            elif event_kind == 4 or event_kind == 5:
+                expected_slot = 3
+                expected_market = 2
+            else:
+                expected_slot = -1
+                expected_market = -1
             if (
                 schema != 2
                 or record_bytes != TICK_BYTES
-                or instrument_id != target.instrument_id
-                or ordinal != target.ordinal
-                or expected_slot is None
+                or instrument_id != target_instrument_id
+                or ordinal != target_ordinal
+                or expected_slot < 0
                 or source_slot != expected_slot
                 or source_stream_id
-                != target.source_stream_ids[source_slot]
-                or trade_date != target.trade_date
+                != target_source_ids[source_slot]
+                or trade_date != target_trade_date
                 or reserved != 0
                 or market != expected_market
                 or quantity_unit > 5
                 or security_type > 7
                 or asset_scope > 2
-                or ingress
-                < self._metadata.ingress_sequence_begin_inclusive
-                or ingress
-                >= self._metadata.ingress_sequence_end_exclusive
-                or tick_sequence
-                < self._metadata.tick_stream_sequence_begin_inclusive
-                or tick_sequence
-                >= self._metadata.tick_stream_sequence_end_exclusive
+                or common_reserved != _ZERO10
+                or ingress < ingress_begin
+                or ingress >= ingress_end
+                or tick_sequence < tick_begin
+                or tick_sequence >= tick_end
                 or tick_sequence > ingress
-                or source_sequence
-                < (
-                    1
-                    if self._metadata.base_checkpoint is None
-                    else self._metadata.base_checkpoint
-                    .source_sequence_exclusive[source_slot]
-                )
-                or source_sequence
-                >= target.source_sequence_exclusive[source_slot]
-                or any(payloads[offset + 118 : offset + 128])
+                or source_sequence < base_source_ends[source_slot]
+                or source_sequence >= target_source_ends[source_slot]
             ):
                 raise WireFormatError(
                     "tick delta payload identity/bounds are invalid"
                 )
-            validate_tick_payload_canonical(
-                payloads,
-                offset,
-                event_kind=event_kind,
-                trade_date=target.trade_date,
-            )
+
             if (
-                ingress <= self._last_ingress
-                or source_sequence
-                <= self._last_source[source_slot]
-                or tick_sequence <= self._last_tick
+                projection_flags & ~0x3
+                or action > 4
+                or side > 4
+                or order_type > 3
+                or aggressor > 3
+                or phase > 7
+                or raw_type_length > 32
+                or raw_tick_flag_length > 32
+                or tick_reserved != 0
+                or price_valid > 1
+                or price_is_null > 1
+                or price_reserved != _ZERO5
+                or quantity_valid > 1
+                or quantity_is_null > 1
+                or quantity_reserved != _ZERO5
+                or trade_amount_valid > 1
+                or trade_amount_is_null > 1
+                or trade_amount_reserved != _ZERO5
+                or matched_quantity_valid > 1
+                or matched_quantity_is_null > 1
+                or matched_quantity_reserved != _ZERO5
+                or raw_type[raw_type_length:]
+                != _ZERO32[: 32 - raw_type_length]
+                or raw_tick_flag[raw_tick_flag_length:]
+                != _ZERO32[: 32 - raw_tick_flag_length]
+                or (
+                    projection_flags & 0x1
+                    and (raw_type_length or raw_type != _ZERO32)
+                )
+                or (
+                    projection_flags & 0x2
+                    and (
+                        raw_tick_flag_length
+                        or raw_tick_flag != _ZERO32
+                    )
+                )
+                or (
+                    event_kind != 2
+                    and (
+                        projection_flags
+                        or raw_type_length
+                        or raw_tick_flag_length
+                        or raw_type != _ZERO32
+                        or raw_tick_flag != _ZERO32
+                    )
+                )
+            ):
+                raise WireFormatError(
+                    "tick delta payload projection is noncanonical"
+                )
+            if (
+                ingress <= prior_ingress
+                or source_sequence <= last_sources[source_slot]
+                or tick_sequence <= prior_tick
             ):
                 raise WireFormatError(
                     "tick delta sequences are not strictly increasing"
                 )
-            self._last_ingress = ingress
-            self._last_source[source_slot] = source_sequence
-            self._last_tick = tick_sequence
-            self._source_counts[source_slot] += 1
+            prior_ingress = ingress
+            last_sources[source_slot] = source_sequence
+            prior_tick = tick_sequence
+            source_counts[source_slot] += 1
             if (
-                self._source_counts[source_slot]
-                > self._metadata.delta_tick_source_record_counts[
-                    source_slot
-                ]
+                source_counts[source_slot]
+                > target_source_counts[source_slot]
             ):
                 raise WireFormatError(
                     "tick delta source pages exceed declared count"
                 )
-            ingress_values.append(ingress)
-            tick_values.append(tick_sequence)
-        return tuple(ingress_values), tuple(tick_values)
+            if first_ingress == 0:
+                first_ingress = ingress
+                first_tick = tick_sequence
+            last_ingress = ingress
+            last_tick = tick_sequence
+
+        self._last_ingress = prior_ingress
+        self._last_tick = prior_tick
+        if first_ingress == 0:
+            raise WireFormatError("tick delta data page has no payload")
+        return first_ingress, last_ingress, first_tick, last_tick
 
     def _verify_eof(self) -> None:
         if (
