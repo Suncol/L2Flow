@@ -7,18 +7,26 @@
 #include "l2flow/sdk/market_message_catalog_v1.h"
 #include "l2flow/sdk/vendor_head_view.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <poll.h>
+#include <sched.h>
+#include <sstream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -34,6 +42,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char** environ;
@@ -212,7 +221,8 @@ private:
     std::vector<std::byte> bytes_;
 };
 
-std::vector<std::byte> PipelineShenzhenSnapshotBody() {
+std::vector<std::byte> PipelineShenzhenSnapshotBody(
+    std::string_view security_id = "000001") {
     PipelineWireWriter writer(224U);
     writer.StoreU32(0U, 93'000'123U);
     writer.StoreU32(4U, 12U);
@@ -222,10 +232,25 @@ std::vector<std::byte> PipelineShenzhenSnapshotBody() {
     writer.StoreU64(56U, 1'234'560U);
     writer.StoreU64(64U, 12'345'600U);
     writer.StoreString(8U, "010");
-    writer.StoreString(14U, "000001");
+    writer.StoreString(14U, security_id);
     writer.StoreString(20U, "102 ");
     writer.StoreString(26U, "T");
     return std::move(writer).Take();
+}
+
+[[nodiscard]] std::string SixDigitSecurityId(
+    std::uint32_t value) {
+    if (value == 0U || value > 999'999U) {
+        return {};
+    }
+    std::string result(6U, '0');
+    for (std::size_t offset = 0U; offset < result.size(); ++offset) {
+        const std::size_t index = result.size() - offset - 1U;
+        result[index] =
+            static_cast<char>('0' + static_cast<char>(value % 10U));
+        value /= 10U;
+    }
+    return result;
 }
 
 class FakeSdkMessage final : public mdl::MDLMessage {
@@ -265,6 +290,146 @@ public:
 private:
     mdl::MDLMessageHead head_{};
     std::vector<std::byte> body_;
+};
+
+[[nodiscard]] std::uint64_t MonotonicNowNs() noexcept {
+    timespec value{};
+    if (::clock_gettime(CLOCK_MONOTONIC, &value) != 0 ||
+        value.tv_sec < 0 || value.tv_nsec < 0 ||
+        value.tv_nsec >= 1'000'000'000L) {
+        return 0U;
+    }
+    const std::uint64_t seconds =
+        static_cast<std::uint64_t>(value.tv_sec);
+    constexpr std::uint64_t kNanosecondsPerSecond =
+        1'000'000'000ULL;
+    if (seconds >
+        (std::numeric_limits<std::uint64_t>::max() -
+         static_cast<std::uint64_t>(value.tv_nsec)) /
+            kNanosecondsPerSecond) {
+        return 0U;
+    }
+    return seconds * kNanosecondsPerSecond +
+           static_cast<std::uint64_t>(value.tv_nsec);
+}
+
+class LatencySdkState final {
+public:
+    void Install(mdl::MessageHandlerBase* handler) noexcept {
+        handler_.store(handler, std::memory_order_release);
+    }
+
+    [[nodiscard]] mdl::MessageHandlerBase* handler() const noexcept {
+        return handler_.load(std::memory_order_acquire);
+    }
+
+    void Shutdown() noexcept {
+        handler_.store(nullptr, std::memory_order_release);
+    }
+
+private:
+    std::atomic<mdl::MessageHandlerBase*> handler_{nullptr};
+};
+
+class LatencySdkSubscriber final : public sdk::SdkSubscriber {
+public:
+    void SetServerAddress(std::string_view address) override {
+        server_valid_ = !address.empty();
+    }
+    void SetUserName(std::string_view user_name) override {
+        user_valid_ = !user_name.empty();
+    }
+    void SetHeartbeatInterval(std::uint32_t seconds) override {
+        heartbeat_valid_ = seconds != 0U;
+    }
+    void SetHeartbeatTimeout(std::uint32_t seconds) override {
+        timeout_valid_ = seconds != 0U;
+    }
+    void SetMessageEncoding(mdl::MDLMessageEncoding encoding) override {
+        encoding_valid_ = encoding == mdl::MDLEID_BINARY;
+    }
+    void EnableMergeMessage(bool enable) override {
+        merge_valid_ = !enable;
+    }
+    void SetSendMacAuth(bool) override {}
+    void EnableServerSelect(bool) override {}
+    void AddSubscription(const sdk::MessageKey&) override {
+        ++subscription_count_;
+    }
+
+    [[nodiscard]] std::string Connect() override {
+        return server_valid_ && user_valid_ && heartbeat_valid_ &&
+                       timeout_valid_ && encoding_valid_ && merge_valid_ &&
+                       subscription_count_ != 0U
+                   ? std::string{}
+                   : "invalid latency SDK fixture";
+    }
+
+    [[nodiscard]] bool Release(std::string* error) noexcept override {
+        if (error != nullptr) {
+            error->clear();
+        }
+        return true;
+    }
+
+private:
+    std::size_t subscription_count_ = 0U;
+    bool server_valid_ = false;
+    bool user_valid_ = false;
+    bool heartbeat_valid_ = false;
+    bool timeout_valid_ = false;
+    bool encoding_valid_ = false;
+    bool merge_valid_ = false;
+};
+
+class LatencySdkManager final : public sdk::SdkManager {
+public:
+    explicit LatencySdkManager(
+        std::shared_ptr<LatencySdkState> state)
+        : state_(std::move(state)) {}
+
+    void EnableLog(std::string_view, bool) override {}
+
+    [[nodiscard]] std::unique_ptr<sdk::SdkSubscriber> CreateSubscriber(
+        mdl::MessageHandlerBase* handler,
+        bool multithread_callback) override {
+        if (handler == nullptr || multithread_callback) {
+            return nullptr;
+        }
+        state_->Install(handler);
+        return std::make_unique<LatencySdkSubscriber>();
+    }
+
+    void Shutdown() override { state_->Shutdown(); }
+
+    [[nodiscard]] bool Release(std::string* error) noexcept override {
+        if (error != nullptr) {
+            error->clear();
+        }
+        return true;
+    }
+
+private:
+    std::shared_ptr<LatencySdkState> state_;
+};
+
+class LatencySdkFactory final : public sdk::SdkFactory {
+public:
+    explicit LatencySdkFactory(
+        std::shared_ptr<LatencySdkState> state)
+        : state_(std::move(state)) {}
+
+    [[nodiscard]] std::unique_ptr<sdk::SdkManager> Create(
+        int work_threads,
+        int io_threads) override {
+        if (work_threads <= 0 || io_threads <= 0) {
+            return nullptr;
+        }
+        return std::make_unique<LatencySdkManager>(state_);
+    }
+
+private:
+    std::shared_ptr<LatencySdkState> state_;
 };
 
 class UniqueFd final {
@@ -323,6 +488,214 @@ private:
     l2flow_shm_reader_v2* reader_ = nullptr;
 };
 
+struct TimedPublicationRecord final {
+    std::atomic<std::uint64_t> recv_monotonic_ns{0U};
+    std::atomic<std::uint64_t> begin_monotonic_ns{0U};
+    std::atomic<std::uint64_t> end_monotonic_ns{0U};
+    std::atomic<std::uint8_t> success{0U};
+};
+
+class TimedAppliedSink final
+    : public market::RealtimeAppliedRecordSinkV1 {
+public:
+    TimedAppliedSink(
+        std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service,
+        std::size_t maximum_sequence)
+        : service_(std::move(service)),
+          maximum_sequence_(maximum_sequence),
+          records_(
+              std::make_unique<TimedPublicationRecord[]>(
+                  maximum_sequence + 1U)) {}
+
+    [[nodiscard]] bool PublishApplied(
+        std::size_t ordinal,
+        const market::RealtimeHistoryRecordV1& record)
+        noexcept override {
+        const std::uint64_t sequence = record.ingress_sequence();
+        if (service_ == nullptr || sequence == 0U ||
+            sequence > maximum_sequence_) {
+            if (service_ != nullptr) {
+                service_->MarkCoverageLost();
+            }
+            return false;
+        }
+        TimedPublicationRecord& timing =
+            records_[static_cast<std::size_t>(sequence)];
+        timing.recv_monotonic_ns.store(
+            record.recv_monotonic_ns() < 0
+                ? 0U
+                : static_cast<std::uint64_t>(
+                      record.recv_monotonic_ns()),
+            std::memory_order_relaxed);
+        const std::uint64_t begin = MonotonicNowNs();
+        timing.begin_monotonic_ns.store(
+            begin, std::memory_order_relaxed);
+        const bool published =
+            begin != 0U &&
+            service_->PublishApplied(ordinal, record);
+        const std::uint64_t end = MonotonicNowNs();
+        timing.success.store(
+            published && end != 0U ? 1U : 0U,
+            std::memory_order_relaxed);
+        timing.end_monotonic_ns.store(
+            end, std::memory_order_release);
+        return published && end != 0U;
+    }
+
+    void MarkCoverageLost() noexcept override {
+        if (service_ != nullptr) {
+            service_->MarkCoverageLost();
+        }
+    }
+
+    [[nodiscard]] bool Read(
+        std::uint64_t sequence,
+        std::uint64_t* recv,
+        std::uint64_t* begin,
+        std::uint64_t* end) const noexcept {
+        if (sequence == 0U || sequence > maximum_sequence_ ||
+            recv == nullptr || begin == nullptr || end == nullptr) {
+            return false;
+        }
+        const TimedPublicationRecord& timing =
+            records_[static_cast<std::size_t>(sequence)];
+        const std::uint64_t observed_end =
+            timing.end_monotonic_ns.load(std::memory_order_acquire);
+        const std::uint64_t observed_recv =
+            timing.recv_monotonic_ns.load(std::memory_order_relaxed);
+        const std::uint64_t observed_begin =
+            timing.begin_monotonic_ns.load(std::memory_order_relaxed);
+        if (observed_end == 0U || observed_recv == 0U ||
+            observed_begin < observed_recv ||
+            observed_end < observed_begin ||
+            timing.success.load(std::memory_order_relaxed) == 0U) {
+            return false;
+        }
+        *recv = observed_recv;
+        *begin = observed_begin;
+        *end = observed_end;
+        return true;
+    }
+
+private:
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service_;
+    const std::size_t maximum_sequence_;
+    std::unique_ptr<TimedPublicationRecord[]> records_;
+};
+
+struct LatencySummary final {
+    std::uint64_t minimum_ns = 0U;
+    std::uint64_t maximum_ns = 0U;
+    std::uint64_t mean_ns = 0U;
+    std::uint64_t p50_ns = 0U;
+    std::uint64_t p90_ns = 0U;
+    std::uint64_t p95_ns = 0U;
+    std::uint64_t p99_ns = 0U;
+    std::uint64_t p999_ns = 0U;
+};
+
+[[nodiscard]] std::uint64_t ExactQuantile(
+    const std::vector<std::uint64_t>& sorted,
+    std::uint64_t numerator,
+    std::uint64_t denominator) noexcept {
+    if (sorted.empty() || denominator == 0U) {
+        return 0U;
+    }
+    const std::uint64_t count =
+        static_cast<std::uint64_t>(sorted.size());
+    const std::uint64_t rank =
+        (count / denominator) * numerator +
+        ((count % denominator) * numerator + denominator - 1U) /
+            denominator;
+    const std::uint64_t one_based = std::max<std::uint64_t>(1U, rank);
+    return sorted[static_cast<std::size_t>(
+        std::min(count, one_based) - 1U)];
+}
+
+[[nodiscard]] LatencySummary SummarizeLatency(
+    std::vector<std::uint64_t> values) {
+    LatencySummary result{};
+    if (values.empty()) {
+        return result;
+    }
+    std::sort(values.begin(), values.end());
+    long double sum = 0.0L;
+    for (const std::uint64_t value : values) {
+        sum += static_cast<long double>(value);
+    }
+    result.minimum_ns = values.front();
+    result.maximum_ns = values.back();
+    result.mean_ns = static_cast<std::uint64_t>(
+        sum / static_cast<long double>(values.size()));
+    result.p50_ns = ExactQuantile(values, 50U, 100U);
+    result.p90_ns = ExactQuantile(values, 90U, 100U);
+    result.p95_ns = ExactQuantile(values, 95U, 100U);
+    result.p99_ns = ExactQuantile(values, 99U, 100U);
+    result.p999_ns = ExactQuantile(values, 999U, 1000U);
+    return result;
+}
+
+void PrintLatency(
+    std::string_view name,
+    const std::vector<std::uint64_t>& values) {
+    const LatencySummary summary = SummarizeLatency(values);
+    std::cout
+        << "LATENCY name=" << name
+        << " samples=" << values.size()
+        << " min_ns=" << summary.minimum_ns
+        << " mean_ns=" << summary.mean_ns
+        << " p50_ns=" << summary.p50_ns
+        << " p90_ns=" << summary.p90_ns
+        << " p95_ns=" << summary.p95_ns
+        << " p99_ns=" << summary.p99_ns
+        << " p999_ns=" << summary.p999_ns
+        << " max_ns=" << summary.maximum_ns << '\n';
+}
+
+void PrintStageLatency(
+    std::string_view name,
+    const runtime::RealtimeLatencyDistributionV1& distribution) {
+    std::cout
+        << "STAGE name=" << name
+        << " samples=" << distribution.samples
+        << " invalid=" << distribution.invalid_samples
+        << " below_range=" << distribution.below_histogram_range
+        << " above_range=" << distribution.above_histogram_range
+        << " min_ns=" << distribution.minimum_ns
+        << " mean_ns=" << distribution.mean_ns
+        << " p50_ns=" << distribution.p50.estimate_ns
+        << " p90_ns=" << distribution.p90.estimate_ns
+        << " p95_ns=" << distribution.p95.estimate_ns
+        << " p99_ns=" << distribution.p99.estimate_ns
+        << " p999_ns=" << distribution.p999.estimate_ns
+        << " max_ns=" << distribution.maximum_ns
+        << " bucket_width_ns="
+        << distribution.histogram_bucket_width_ns << '\n';
+}
+
+[[nodiscard]] std::string CpuAffinityText() {
+    cpu_set_t set{};
+    if (::sched_getaffinity(0, sizeof(set), &set) != 0) {
+        return "unavailable";
+    }
+    std::ostringstream output;
+    std::size_t count = 0U;
+    bool first = true;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &set)) {
+            continue;
+        }
+        if (!first) {
+            output << ',';
+        }
+        output << cpu;
+        first = false;
+        ++count;
+    }
+    output << ";count=" << count;
+    return output.str();
+}
+
 class ScopedTempDirectory final {
 public:
     ScopedTempDirectory() {
@@ -357,6 +730,166 @@ public:
 
 private:
     std::filesystem::path path_;
+};
+
+class ProtocolChannel final {
+public:
+    explicit ProtocolChannel(int fd) noexcept : fd_(fd) {}
+
+    ProtocolChannel(const ProtocolChannel&) = delete;
+    ProtocolChannel& operator=(const ProtocolChannel&) = delete;
+
+    [[nodiscard]] bool SendLine(std::string_view line) noexcept {
+        std::string message;
+        try {
+            message.assign(line);
+            message.push_back('\n');
+        } catch (...) {
+            return false;
+        }
+        std::size_t offset = 0U;
+        while (offset < message.size()) {
+            const ssize_t written = ::send(
+                fd_.get(),
+                message.data() + offset,
+                message.size() - offset,
+                MSG_NOSIGNAL);
+            if (written > 0) {
+                offset += static_cast<std::size_t>(written);
+            } else if (written < 0 && errno == EINTR) {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ReadLine(
+        std::chrono::milliseconds timeout,
+        std::string* output) noexcept {
+        if (output == nullptr || timeout.count() <= 0) {
+            return false;
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            const std::size_t newline = buffer_.find('\n');
+            if (newline != std::string::npos) {
+                try {
+                    *output = buffer_.substr(0U, newline);
+                    buffer_.erase(0U, newline + 1U);
+                } catch (...) {
+                    return false;
+                }
+                return true;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return false;
+            }
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now);
+            pollfd descriptor{};
+            descriptor.fd = fd_.get();
+            descriptor.events = POLLIN;
+            const int wait_ms = static_cast<int>(std::max<std::int64_t>(
+                1,
+                std::min<std::int64_t>(
+                    remaining.count(),
+                    std::numeric_limits<int>::max())));
+            const int polled = ::poll(&descriptor, 1U, wait_ms);
+            if (polled < 0 && errno == EINTR) {
+                continue;
+            }
+            if (polled <= 0 ||
+                (descriptor.revents &
+                 (POLLERR | POLLNVAL)) != 0 ||
+                (descriptor.revents & POLLIN) == 0) {
+                return false;
+            }
+            std::array<char, 4096U> chunk{};
+            const ssize_t received =
+                ::recv(fd_.get(), chunk.data(), chunk.size(), 0);
+            if (received > 0) {
+                try {
+                    buffer_.append(
+                        chunk.data(),
+                        static_cast<std::size_t>(received));
+                } catch (...) {
+                    return false;
+                }
+                if (buffer_.size() > 64U * 1024U) {
+                    return false;
+                }
+            } else if (received < 0 && errno == EINTR) {
+                continue;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    [[nodiscard]] int fd() const noexcept { return fd_.get(); }
+
+private:
+    UniqueFd fd_;
+    std::string buffer_;
+};
+
+class PythonLatencyProcess final {
+public:
+    PythonLatencyProcess() = default;
+    PythonLatencyProcess(const PythonLatencyProcess&) = delete;
+    PythonLatencyProcess& operator=(const PythonLatencyProcess&) =
+        delete;
+
+    ~PythonLatencyProcess() {
+        if (pid_ > 0) {
+            static_cast<void>(::kill(pid_, SIGKILL));
+            int status = 0;
+            while (::waitpid(pid_, &status, 0) < 0 &&
+                   errno == EINTR) {
+            }
+        }
+    }
+
+    void Adopt(pid_t pid, std::unique_ptr<ProtocolChannel> channel) {
+        pid_ = pid;
+        channel_ = std::move(channel);
+    }
+
+    [[nodiscard]] ProtocolChannel* channel() const noexcept {
+        return channel_.get();
+    }
+
+    [[nodiscard]] bool Wait(std::chrono::seconds timeout) noexcept {
+        if (pid_ <= 0) {
+            return false;
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + timeout;
+        int status = 0;
+        for (;;) {
+            const pid_t result = ::waitpid(pid_, &status, WNOHANG);
+            if (result == pid_) {
+                pid_ = -1;
+                return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            }
+            if (result < 0 && errno != EINTR) {
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+private:
+    pid_t pid_ = -1;
+    std::unique_ptr<ProtocolChannel> channel_;
 };
 
 struct SessionTransfer final {
@@ -439,6 +972,115 @@ SessionTransfer RequestSession(
         }
     }
     return result;
+}
+
+[[nodiscard]] bool SpawnPythonLatencyProbe(
+    const std::filesystem::path& socket_path,
+    std::uint32_t instrument_id,
+    std::size_t active_count,
+    std::size_t warmup,
+    std::size_t measured,
+    PythonLatencyProcess* output) {
+#if defined(L2FLOW_V2_PYTHON_PROBE_EXECUTABLE) && \
+    defined(L2FLOW_V2_PYTHON_LATENCY_SCRIPT) && \
+    defined(L2FLOW_V2_PYTHON_SOURCE) && \
+    defined(L2FLOW_V2_PYTHON_READER_LIBRARY)
+    if (output == nullptr || instrument_id == 0U ||
+        active_count == 0U ||
+        warmup == 0U || measured == 0U) {
+        return false;
+    }
+    std::array<int, 2U> sockets{-1, -1};
+    if (::socketpair(
+            AF_UNIX,
+            SOCK_STREAM | SOCK_CLOEXEC,
+            0,
+            sockets.data()) != 0) {
+        return false;
+    }
+    UniqueFd parent_socket(sockets[0U]);
+    UniqueFd child_socket(sockets[1U]);
+    std::array<std::string, 10U> arguments{{
+        L2FLOW_V2_PYTHON_PROBE_EXECUTABLE,
+        "-B",
+        L2FLOW_V2_PYTHON_LATENCY_SCRIPT,
+        socket_path.string(),
+        L2FLOW_V2_PYTHON_READER_LIBRARY,
+        L2FLOW_V2_PYTHON_SOURCE,
+        std::to_string(instrument_id),
+        std::to_string(active_count),
+        std::to_string(warmup),
+        std::to_string(measured),
+    }};
+    std::array<char*, 11U> argv{};
+    for (std::size_t index = 0U; index < arguments.size(); ++index) {
+        argv[index] = arguments[index].data();
+    }
+
+    posix_spawn_file_actions_t actions{};
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        return false;
+    }
+    bool actions_valid = true;
+    actions_valid =
+        actions_valid &&
+        ::posix_spawn_file_actions_adddup2(
+            &actions, child_socket.get(), STDIN_FILENO) == 0;
+    actions_valid =
+        actions_valid &&
+        ::posix_spawn_file_actions_adddup2(
+            &actions, child_socket.get(), STDOUT_FILENO) == 0;
+    actions_valid =
+        actions_valid &&
+        ::posix_spawn_file_actions_addclose(
+            &actions, parent_socket.get()) == 0;
+    if (child_socket.get() != STDIN_FILENO &&
+        child_socket.get() != STDOUT_FILENO) {
+        actions_valid =
+            actions_valid &&
+            ::posix_spawn_file_actions_addclose(
+                &actions, child_socket.get()) == 0;
+    }
+    pid_t child = -1;
+    const int spawn_error =
+        actions_valid
+            ? ::posix_spawn(
+                  &child,
+                  argv[0U],
+                  &actions,
+                  nullptr,
+                  argv.data(),
+                  environ)
+            : EINVAL;
+    static_cast<void>(
+        ::posix_spawn_file_actions_destroy(&actions));
+    if (spawn_error != 0 || child <= 0) {
+        return false;
+    }
+    child_socket.Reset();
+    const int channel_fd = ::dup(parent_socket.get());
+    if (channel_fd < 0) {
+        static_cast<void>(::kill(child, SIGKILL));
+        int status = 0;
+        while (::waitpid(child, &status, 0) < 0 &&
+               errno == EINTR) {
+        }
+        return false;
+    }
+    output->Adopt(
+        child,
+        std::make_unique<ProtocolChannel>(
+            channel_fd));
+    return true;
+#else
+    static_cast<void>(socket_path);
+    static_cast<void>(instrument_id);
+    static_cast<void>(active_count);
+    static_cast<void>(warmup);
+    static_cast<void>(measured);
+    static_cast<void>(output);
+    return false;
+#endif
 }
 
 std::unique_ptr<market::ObservedInstrumentDirectoryV2>
@@ -1510,9 +2152,1040 @@ bool TestTickRingRejectsUnclosedGapOverwrite() {
     return ok && service->failed();
 }
 
+bool RunLatencyBenchmark(bool measure_stage_latency) {
+    constexpr std::size_t kCapacity = 65'536U;
+    constexpr std::size_t kActiveInstrumentCount = 60'000U;
+    constexpr std::size_t kFillBatchSize = 512U;
+    constexpr std::size_t kWarmupSamples = 1'000U;
+    constexpr std::size_t kMeasuredSamples = 10'000U;
+    constexpr std::size_t kBurstSamples = 3'000U;
+    constexpr std::size_t kMaximumSequence = 100'000U;
+    constexpr std::size_t kQueueCapacity = 4'096U;
+    constexpr std::size_t kClosedLoopDurabilityBarrierRecords = 512U;
+    constexpr std::uint32_t kStoreWorkerCount = 4U;
+    constexpr std::uint64_t kTickRingCapacity = 32'768U;
+    static_assert(
+        kActiveInstrumentCount +
+                2U * (kWarmupSamples + kMeasuredSamples) +
+                kBurstSamples <=
+            kMaximumSequence);
+
+    const char* const python_cpu =
+        std::getenv("L2FLOW_PYTHON_CPU");
+    std::cout
+        << "ENV capacity=" << kCapacity
+        << " worker_count=" << kStoreWorkerCount
+        << " processing_queue=" << kQueueCapacity
+        << " journal_queue=" << kQueueCapacity
+        << " decoder_queue_per_source=" << kQueueCapacity
+        << " store_queue_per_source_worker=" << kQueueCapacity
+        << " tick_ring_capacity=" << kTickRingCapacity
+        << " active_instrument_count=" << kActiveInstrumentCount
+        << " fill_batch_size=" << kFillBatchSize
+        << " closed_loop_durability_barrier_records="
+        << kClosedLoopDurabilityBarrierRecords
+        << " barrier_scope=between_samples_not_reader_gate"
+        << " burst_records=" << kBurstSamples
+        << " burst_scope=within_default_queue_capacity"
+        << " stage_latency="
+        << (measure_stage_latency ? 1 : 0)
+        << " stage_scope=whole_run_including_setup"
+        << " clock=CLOCK_MONOTONIC"
+        << " affinity=" << CpuAffinityText()
+        << " python_cpu="
+        << (python_cpu == nullptr ? "unset" : python_cpu)
+        << '\n';
+
+    ScopedTempDirectory temporary;
+    auto directory = MakeDirectory(kCapacity, 47U);
+    if (!Expect(
+            temporary.valid() && directory != nullptr,
+            "create latency benchmark directory")) {
+        return false;
+    }
+    const common::Identity128 run_id = RunId(0x47U);
+    const std::filesystem::path socket_path =
+        temporary.path() / "latency.sock";
+    const std::filesystem::path journal_path =
+        temporary.path() / "latency.journal";
+
+    ipc::RealtimeSharedServiceConfigV2 service_config{};
+    service_config.run_id = run_id;
+    service_config.session_epoch = 47U;
+    service_config.trade_date = kTradeDate;
+    service_config.directory = directory.get();
+    service_config.tick_ring_capacity = kTickRingCapacity;
+    service_config.control_socket_path = socket_path;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    const ipc::RealtimeSharedServiceCreateErrorV2 service_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            service_config, &service, &system_error);
+    if (!Expect(
+            service_error ==
+                    ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+                service != nullptr && system_error == 0,
+            "create latency Wire V2 service")) {
+        std::cerr
+            << "latency service create error="
+            << ipc::RealtimeSharedServiceCreateErrorNameV2(
+                   service_error)
+            << " errno=" << system_error << '\n';
+        return false;
+    }
+    if (!Expect(
+            service->Start(&system_error) && system_error == 0,
+            "start latency Wire V2 service")) {
+        service->StopControl();
+        return false;
+    }
+    std::cout
+        << "MAPPING total_bytes=" << service->mapping_bytes()
+        << " key_arena_used_bytes="
+        << service->key_arena_used_bytes() << '\n';
+
+    auto timed_sink = std::make_shared<TimedAppliedSink>(
+        service, kMaximumSequence);
+    auto sdk_state = std::make_shared<LatencySdkState>();
+    auto sdk_factory =
+        std::make_shared<LatencySdkFactory>(sdk_state);
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    PipelineJournalCleanup pipeline_cleanup(nullptr, &pipeline);
+    runtime::RealtimePipelineConfigV1 pipeline_config{};
+    pipeline_config.run_id = run_id;
+    pipeline_config.trade_date = kTradeDate;
+    pipeline_config.directory = directory.get();
+    pipeline_config.source_stream_ids = kSourceStreamIds;
+    pipeline_config.maximum_sdk_message_bytes = 4'096U;
+    pipeline_config.processing_queue_capacity = kQueueCapacity;
+    pipeline_config.decoder_queue_capacity_per_source =
+        kQueueCapacity;
+    pipeline_config.store_worker_count = kStoreWorkerCount;
+    pipeline_config.store_queue_capacity_per_source_worker =
+        kQueueCapacity;
+    pipeline_config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    pipeline_config.intraday_store.maximum_session_records =
+        kMaximumSequence;
+    pipeline_config.intraday_store.maximum_session_accounted_bytes =
+        1ULL * 1024ULL * 1024ULL * 1024ULL;
+    pipeline_config.intraday_store.maximum_records_per_batch =
+        kQueueCapacity;
+    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.journal.path = journal_path.string();
+    pipeline_config.journal.queue_capacity = kQueueCapacity;
+    pipeline_config.applied_record_sink = timed_sink;
+    pipeline_config.instrument_binding_sink = service;
+    pipeline_config.processing_progress_sink = service;
+    pipeline_config.measure_stage_latency =
+        measure_stage_latency;
+    pipeline_config.sdk.enabled = true;
+    pipeline_config.sdk.server_address = "latency.invalid";
+    pipeline_config.sdk.user_name = "latency-test";
+
+    std::string pipeline_detail;
+    const runtime::RealtimePipelineCreateErrorV1 pipeline_error =
+        runtime::RealtimePipelineV1::CreateForTest(
+            pipeline_config,
+            sdk_factory,
+            &pipeline,
+            &pipeline_detail);
+    if (!Expect(
+            pipeline_error ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "create full latency Pipeline: " + pipeline_detail)) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    mdl::MessageHandlerBase* const handler = sdk_state->handler();
+    if (!Expect(handler != nullptr, "latency SDK handler installed")) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    FakeSdkMessage snapshot(
+        sdk::kProductionMessageKeysV1[2U],
+        PipelineShenzhenSnapshotBody());
+
+    SessionTransfer transfer = RequestSession(socket_path);
+    ReaderHandle reader;
+    if (!Expect(
+            transfer.fd.get() >= 0 &&
+                l2flow_shm_reader_open_fd_v2(
+                    transfer.fd.get(), reader.output()) ==
+                    L2FLOW_SHM_READER_OK_V2 &&
+                reader.get() != nullptr,
+            "open benchmark C Reader before working-set fill")) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    transfer.fd.Reset();
+
+    auto wait_publication =
+        [&](std::uint64_t sequence,
+            std::uint64_t* recv,
+            std::uint64_t* begin,
+            std::uint64_t* end) {
+            return WaitUntil([&] {
+                return timed_sink->Read(
+                    sequence, recv, begin, end);
+            });
+        };
+
+    auto wait_pipeline_prefix =
+        [&](std::uint64_t sequence, bool require_durable) {
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(30);
+            for (;;) {
+                const runtime::RealtimePipelineSnapshotV1 state =
+                    pipeline->Snapshot();
+                if (state.fatal || pipeline->fatal()) {
+                    return false;
+                }
+                if (state.accepted_messages == sequence &&
+                    state.processing_progress.accepted_sequence ==
+                        sequence &&
+                    state.processing_progress.applied_sequence ==
+                        sequence &&
+                    (!require_durable ||
+                     state.processing_progress.durable_sequence ==
+                         sequence)) {
+                    return true;
+                }
+                if (state.accepted_messages > sequence ||
+                    state.processing_progress.accepted_sequence >
+                        sequence ||
+                    state.processing_progress.applied_sequence >
+                        sequence ||
+                    state.processing_progress.durable_sequence >
+                        sequence ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    return false;
+                }
+                std::this_thread::yield();
+            }
+        };
+
+    const std::uint64_t fill_start = MonotonicNowNs();
+    std::uint64_t fill_accepted = 0U;
+    std::uint64_t fill_visible = 0U;
+    std::uint64_t fill_durable = 0U;
+    for (std::size_t first = 1U;
+         first <= kActiveInstrumentCount;
+         first += kFillBatchSize) {
+        const std::size_t last = std::min(
+            kActiveInstrumentCount,
+            first + kFillBatchSize - 1U);
+        for (std::size_t instrument = first;
+             instrument <= last;
+             ++instrument) {
+            const std::string security_id = SixDigitSecurityId(
+                static_cast<std::uint32_t>(instrument));
+            if (!Expect(
+                    security_id.size() == 6U,
+                    "format working-set SecurityID")) {
+                return false;
+            }
+            FakeSdkMessage fill_snapshot(
+                sdk::kProductionMessageKeysV1[2U],
+                PipelineShenzhenSnapshotBody(security_id));
+            handler->OnMessage(nullptr, &fill_snapshot);
+        }
+        if (last == kActiveInstrumentCount) {
+            fill_accepted = MonotonicNowNs();
+        }
+        if (!Expect(
+                wait_pipeline_prefix(
+                    static_cast<std::uint64_t>(last), false),
+                "working-set batch reaches applied prefix")) {
+            return false;
+        }
+        if (last == kActiveInstrumentCount) {
+            fill_visible = MonotonicNowNs();
+        }
+        if (!Expect(
+                wait_pipeline_prefix(
+                    static_cast<std::uint64_t>(last), true),
+                "working-set batch reaches durable prefix")) {
+            return false;
+        }
+        if (last == kActiveInstrumentCount) {
+            fill_durable = MonotonicNowNs();
+        }
+    }
+    if (!Expect(
+            fill_start != 0U && fill_accepted >= fill_start &&
+                fill_visible >= fill_accepted &&
+                fill_durable >= fill_visible,
+            "measure working-set fill boundaries")) {
+        return false;
+    }
+
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        fill_catalog;
+    if (!Expect(
+            directory->AcquireSnapshot(&fill_catalog) ==
+                    market::ObservedInstrumentDirectoryErrorV2::kNone &&
+                fill_catalog != nullptr &&
+                fill_catalog->bound_count() ==
+                    kActiveInstrumentCount &&
+                fill_catalog->available_count() ==
+                    kActiveInstrumentCount &&
+                fill_catalog->snapshot_available_count() ==
+                    kActiveInstrumentCount &&
+                fill_catalog->tick_available_count() == 0U &&
+                fill_catalog->factor_eligible_count() ==
+                    kActiveInstrumentCount,
+            "working-set catalog has 60000 snapshot instruments")) {
+        return false;
+    }
+
+    l2flow_shm_session_info_v2 fill_session{};
+    bool session_matches_fill = false;
+    const auto session_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < session_deadline) {
+        const int session_error =
+            l2flow_shm_reader_session_v2(
+                reader.get(), &fill_session);
+        if (session_error ==
+                L2FLOW_SHM_READER_INCONSISTENT_READ_V2) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (session_error != L2FLOW_SHM_READER_OK_V2) {
+            break;
+        }
+        session_matches_fill =
+            fill_session.catalog_generation ==
+                kActiveInstrumentCount &&
+            fill_session.accepted_sequence ==
+                kActiveInstrumentCount &&
+            fill_session.applied_sequence ==
+                kActiveInstrumentCount &&
+            fill_session.durable_sequence ==
+                kActiveInstrumentCount &&
+            fill_session.processing_lag_records == 0U &&
+            fill_session.durability_lag_records == 0U &&
+            fill_session.bound_count ==
+                kActiveInstrumentCount &&
+            fill_session.available_count ==
+                kActiveInstrumentCount &&
+            fill_session.snapshot_available_count ==
+                kActiveInstrumentCount &&
+            fill_session.tick_available_count == 0U &&
+            fill_session.factor_eligible_count ==
+                kActiveInstrumentCount;
+        if (session_matches_fill) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!Expect(
+            session_matches_fill,
+            "Wire session exposes the complete 60000-instrument fill")) {
+        return false;
+    }
+
+    constexpr std::array<std::uint32_t, 2U> kBoundaryIds{
+        1U, static_cast<std::uint32_t>(kActiveInstrumentCount)};
+    std::array<ipc::RealtimeWireSnapshotPayloadV2, 2U>
+        boundary_latest{};
+    std::array<std::uint8_t, 2U> boundary_status{};
+    const int boundary_error =
+        l2flow_shm_reader_latest_snapshots_v2(
+            reader.get(),
+            kBoundaryIds.data(),
+            kBoundaryIds.size(),
+            boundary_latest.data(),
+            sizeof(boundary_latest[0U]),
+            boundary_status.data());
+    if (!Expect(
+            boundary_error == L2FLOW_SHM_READER_OK_V2 &&
+                boundary_status[0U] ==
+                    L2FLOW_LATEST_AVAILABLE_V2 &&
+                boundary_status[1U] ==
+                    L2FLOW_LATEST_AVAILABLE_V2 &&
+                boundary_latest[0U].common.instrument_id == 1U &&
+                boundary_latest[0U].common.ingress_sequence == 1U &&
+                boundary_latest[1U].common.instrument_id ==
+                    kActiveInstrumentCount &&
+                boundary_latest[1U].common.ingress_sequence ==
+                    kActiveInstrumentCount,
+            "C Reader verifies ID1 and ID60000 latest snapshots")) {
+        return false;
+    }
+
+    std::cout
+        << "FILL active_count=" << kActiveInstrumentCount
+        << " batch_size=" << kFillBatchSize
+        << " batches="
+        << (kActiveInstrumentCount + kFillBatchSize - 1U) /
+               kFillBatchSize
+        << " first_sequence=1"
+        << " last_sequence=" << kActiveInstrumentCount
+        << " start_to_accepted_ns="
+        << fill_accepted - fill_start
+        << " accepted_to_visible_ns="
+        << fill_visible - fill_accepted
+        << " accepted_to_durable_ns="
+        << fill_durable - fill_accepted
+        << " start_to_visible_ns="
+        << fill_visible - fill_start
+        << " start_to_durable_ns="
+        << fill_durable - fill_start
+        << " mapping_bytes=" << service->mapping_bytes()
+        << " key_arena_used_bytes="
+        << service->key_arena_used_bytes() << '\n';
+
+    std::uint64_t next_sequence =
+        static_cast<std::uint64_t>(kActiveInstrumentCount) + 1U;
+    std::vector<std::uint64_t> c_callback_duration;
+    std::vector<std::uint64_t> c_strict_callback_to_consumer;
+    std::vector<std::uint64_t> c_wire_recv_to_consumer;
+    std::vector<std::uint64_t> c_successful_read_call;
+    std::vector<std::uint64_t> c_strict_callback_to_ipc_begin;
+    std::vector<std::uint64_t> c_strict_callback_to_ipc_return;
+    std::vector<std::uint64_t> c_wire_recv_to_ipc_begin;
+    std::vector<std::uint64_t> c_wire_recv_to_ipc_return;
+    std::vector<std::uint64_t> c_ipc_call;
+    std::uint64_t c_poll_count = 0U;
+    std::uint64_t c_inconsistent_retries = 0U;
+    std::uint64_t c_max_polls = 0U;
+    for (std::size_t index = 0U;
+         index < kWarmupSamples + kMeasuredSamples;
+         ++index, ++next_sequence) {
+        const std::uint64_t expected = next_sequence;
+        const std::uint64_t strict_origin = MonotonicNowNs();
+        handler->OnMessage(nullptr, &snapshot);
+        const std::uint64_t callback_return = MonotonicNowNs();
+        if (!Expect(
+                strict_origin != 0U &&
+                    callback_return >= strict_origin,
+                "measure C callback invocation")) {
+            return false;
+        }
+
+        ipc::RealtimeWireSnapshotPayloadV2 latest{};
+        std::uint8_t status = 0xffU;
+        std::uint64_t successful_call_ns = 0U;
+        std::uint64_t seen_ns = 0U;
+        std::uint64_t polls = 0U;
+        std::uint64_t inconsistent_retries = 0U;
+        const std::uint64_t deadline =
+            MonotonicNowNs() + 3'000'000'000ULL;
+        for (;;) {
+            status = 0xffU;
+            const std::uint64_t poll_begin = MonotonicNowNs();
+            constexpr std::uint32_t instrument_id = 1U;
+            const int actual_error =
+                l2flow_shm_reader_latest_snapshots_v2(
+                    reader.get(),
+                    &instrument_id,
+                    1U,
+                    &latest,
+                    sizeof(latest),
+                    &status);
+            const std::uint64_t poll_end = MonotonicNowNs();
+            ++polls;
+            if (poll_begin == 0U || poll_end < poll_begin) {
+                return Expect(false, "C latest poll failed");
+            }
+            if (actual_error ==
+                L2FLOW_SHM_READER_INCONSISTENT_READ_V2) {
+                ++inconsistent_retries;
+                if (poll_end >= deadline) {
+                    return Expect(
+                        false,
+                        "C latest inconsistent-read retry timed out");
+                }
+                continue;
+            }
+            if (actual_error != L2FLOW_SHM_READER_OK_V2) {
+                std::cerr
+                    << "C latest error=" << actual_error << '\n';
+                return Expect(false, "C latest poll failed");
+            }
+            if (status == L2FLOW_LATEST_AVAILABLE_V2) {
+                if (latest.common.ingress_sequence > expected) {
+                    return Expect(
+                        false,
+                        "C latest skipped a closed-loop sequence");
+                }
+                if (latest.common.ingress_sequence == expected) {
+                    successful_call_ns = poll_end - poll_begin;
+                    seen_ns = poll_end;
+                    break;
+                }
+            }
+            if (poll_end >= deadline) {
+                return Expect(
+                    false,
+                    "C latest closed-loop observation timed out");
+            }
+        }
+        std::uint64_t recv = 0U;
+        std::uint64_t ipc_begin = 0U;
+        std::uint64_t ipc_end = 0U;
+        if (!Expect(
+                wait_publication(
+                    expected, &recv, &ipc_begin, &ipc_end) &&
+                    latest.common.recv_monotonic_ns > 0 &&
+                    recv == static_cast<std::uint64_t>(
+                                latest.common.recv_monotonic_ns) &&
+                    recv >= strict_origin &&
+                    seen_ns >= recv &&
+                    ipc_begin >= strict_origin &&
+                    ipc_end >= ipc_begin,
+                "correlate C observation with timed IPC publication")) {
+            return false;
+        }
+        if (index >= kWarmupSamples) {
+            c_callback_duration.push_back(
+                callback_return - strict_origin);
+            c_strict_callback_to_consumer.push_back(
+                seen_ns - strict_origin);
+            c_wire_recv_to_consumer.push_back(seen_ns - recv);
+            c_successful_read_call.push_back(successful_call_ns);
+            c_strict_callback_to_ipc_begin.push_back(
+                ipc_begin - strict_origin);
+            c_strict_callback_to_ipc_return.push_back(
+                ipc_end - strict_origin);
+            c_wire_recv_to_ipc_begin.push_back(ipc_begin - recv);
+            c_wire_recv_to_ipc_return.push_back(ipc_end - recv);
+            c_ipc_call.push_back(ipc_end - ipc_begin);
+            c_poll_count += polls;
+            c_inconsistent_retries += inconsistent_retries;
+            c_max_polls = std::max(c_max_polls, polls);
+        }
+        const std::size_t completed_samples = index + 1U;
+        if ((completed_samples %
+                 kClosedLoopDurabilityBarrierRecords ==
+             0U) ||
+            completed_samples ==
+                kWarmupSamples + kMeasuredSamples) {
+            if (!Expect(
+                    wait_pipeline_prefix(expected, true),
+                    "C closed-loop durability barrier")) {
+                return false;
+            }
+        }
+    }
+    PrintLatency("c_callback_call_duration", c_callback_duration);
+    PrintLatency(
+        "c_strict_callback_origin_to_latest_return",
+        c_strict_callback_to_consumer);
+    PrintLatency(
+        "c_wire_recv_monotonic_to_latest_return",
+        c_wire_recv_to_consumer);
+    PrintLatency(
+        "c_successful_latest_call",
+        c_successful_read_call);
+    PrintLatency(
+        "c_strict_callback_origin_to_ipc_begin",
+        c_strict_callback_to_ipc_begin);
+    PrintLatency(
+        "c_strict_callback_origin_to_ipc_return",
+        c_strict_callback_to_ipc_return);
+    PrintLatency(
+        "c_wire_recv_monotonic_to_ipc_begin",
+        c_wire_recv_to_ipc_begin);
+    PrintLatency(
+        "c_wire_recv_monotonic_to_ipc_return",
+        c_wire_recv_to_ipc_return);
+    PrintLatency("c_ipc_publish_call", c_ipc_call);
+    std::cout
+        << "POLL consumer=c samples=" << kMeasuredSamples
+        << " total_polls=" << c_poll_count
+        << " inconsistent_retries=" << c_inconsistent_retries
+        << " mean_polls="
+        << std::fixed << std::setprecision(3)
+        << static_cast<long double>(c_poll_count) /
+               static_cast<long double>(kMeasuredSamples)
+        << " max_polls=" << c_max_polls << std::defaultfloat
+        << '\n';
+
+    PythonLatencyProcess python;
+    if (!Expect(
+            SpawnPythonLatencyProbe(
+                socket_path,
+                1U,
+                kActiveInstrumentCount,
+                kWarmupSamples,
+                kMeasuredSamples,
+                &python) &&
+                python.channel() != nullptr,
+            "spawn Python latency benchmark probe")) {
+        return false;
+    }
+    ProtocolChannel* const protocol = python.channel();
+    std::string line;
+    for (;;) {
+        if (!Expect(
+                protocol->ReadLine(
+                    std::chrono::seconds(30), &line),
+                "read Python HOT/READY line")) {
+            return false;
+        }
+        if (line.starts_with("ENV ") ||
+            line.starts_with("CONNECT ") ||
+            line.starts_with("HEAD_PUBLIC ") ||
+            line.starts_with("TAIL_PUBLIC ") ||
+            line.starts_with("PYTHON_NATIVE_WRAPPER ") ||
+            line.starts_with("PUBLIC_STALENESS_DISABLED ") ||
+            line.starts_with("WORKING_SET ") ||
+            line.starts_with("DISTINCT_BATCH ")) {
+            std::cout << "PYTHON_" << line << '\n';
+            continue;
+        }
+        if (line.starts_with("READY")) {
+            std::cout << "PYTHON_" << line << '\n';
+            break;
+        }
+        std::cerr << "unexpected Python line: " << line << '\n';
+        return false;
+    }
+
+    std::vector<std::uint64_t> python_callback_duration;
+    std::vector<std::uint64_t>
+        python_strict_callback_to_consumer;
+    std::vector<std::uint64_t> python_wire_recv_to_consumer;
+    std::vector<std::uint64_t>
+        python_strict_callback_to_ipc_begin;
+    std::vector<std::uint64_t>
+        python_strict_callback_to_ipc_return;
+    std::vector<std::uint64_t>
+        python_wire_recv_to_ipc_begin;
+    std::vector<std::uint64_t>
+        python_wire_recv_to_ipc_return;
+    std::vector<std::uint64_t> python_ipc_call;
+    std::uint64_t python_poll_count = 0U;
+    std::uint64_t python_inconsistent_retries = 0U;
+    std::uint64_t python_max_polls = 0U;
+    for (std::size_t index = 0U;
+         index < kWarmupSamples + kMeasuredSamples;
+         ++index, ++next_sequence) {
+        const std::uint64_t expected = next_sequence;
+        if (!Expect(
+                protocol->SendLine(
+                    "EXPECT " + std::to_string(expected)),
+                "send Python EXPECT")) {
+            return false;
+        }
+        if (!Expect(
+                protocol->ReadLine(
+                    std::chrono::seconds(5), &line),
+                "read Python ARMED")) {
+            return false;
+        }
+        std::istringstream armed(line);
+        std::string armed_tag;
+        std::uint64_t armed_sequence = 0U;
+        armed >> armed_tag >> armed_sequence;
+        if (!Expect(
+                armed && armed_tag == "ARMED" &&
+                    armed_sequence == expected,
+                "validate Python ARMED")) {
+            std::cerr << "protocol line: " << line << '\n';
+            return false;
+        }
+
+        const std::uint64_t strict_origin = MonotonicNowNs();
+        handler->OnMessage(nullptr, &snapshot);
+        const std::uint64_t callback_return = MonotonicNowNs();
+        if (!Expect(
+                strict_origin != 0U &&
+                    callback_return >= strict_origin,
+                "measure Python-phase callback invocation")) {
+            return false;
+        }
+        if (!Expect(
+                protocol->ReadLine(
+                    std::chrono::seconds(5), &line),
+                "read Python SEEN")) {
+            return false;
+        }
+        std::istringstream seen(line);
+        std::string seen_tag;
+        std::uint64_t seen_sequence = 0U;
+        std::uint64_t seen_ns = 0U;
+        std::uint64_t wire_recv_ns = 0U;
+        std::uint64_t polls = 0U;
+        std::uint64_t inconsistent_retries = 0U;
+        seen >> seen_tag >> seen_sequence >> seen_ns >>
+            wire_recv_ns >> polls >> inconsistent_retries;
+        if (!Expect(
+                seen && seen_tag == "SEEN" &&
+                    seen_sequence == expected &&
+                    seen_ns >= wire_recv_ns &&
+                    wire_recv_ns >= strict_origin &&
+                    polls != 0U,
+                "validate Python SEEN")) {
+            std::cerr << "protocol line: " << line << '\n';
+            return false;
+        }
+        std::uint64_t recv = 0U;
+        std::uint64_t ipc_begin = 0U;
+        std::uint64_t ipc_end = 0U;
+        if (!Expect(
+                wait_publication(
+                    expected, &recv, &ipc_begin, &ipc_end) &&
+                    recv == wire_recv_ns &&
+                    ipc_begin >= strict_origin &&
+                    ipc_end >= ipc_begin,
+                "correlate Python observation with IPC publication")) {
+            return false;
+        }
+        if (index >= kWarmupSamples) {
+            python_callback_duration.push_back(
+                callback_return - strict_origin);
+            python_strict_callback_to_consumer.push_back(
+                seen_ns - strict_origin);
+            python_wire_recv_to_consumer.push_back(
+                seen_ns - wire_recv_ns);
+            python_strict_callback_to_ipc_begin.push_back(
+                ipc_begin - strict_origin);
+            python_strict_callback_to_ipc_return.push_back(
+                ipc_end - strict_origin);
+            python_wire_recv_to_ipc_begin.push_back(
+                ipc_begin - wire_recv_ns);
+            python_wire_recv_to_ipc_return.push_back(
+                ipc_end - wire_recv_ns);
+            python_ipc_call.push_back(ipc_end - ipc_begin);
+            python_poll_count += polls;
+            python_inconsistent_retries +=
+                inconsistent_retries;
+            python_max_polls =
+                std::max(python_max_polls, polls);
+        }
+        const std::size_t completed_samples = index + 1U;
+        if ((completed_samples %
+                 kClosedLoopDurabilityBarrierRecords ==
+             0U) ||
+            completed_samples ==
+                kWarmupSamples + kMeasuredSamples) {
+            if (!Expect(
+                    wait_pipeline_prefix(expected, true),
+                    "Python closed-loop durability barrier")) {
+                return false;
+            }
+        }
+    }
+    PrintLatency(
+        "python_callback_call_duration",
+        python_callback_duration);
+    PrintLatency(
+        "python_strict_callback_origin_to_latest_return",
+        python_strict_callback_to_consumer);
+    PrintLatency(
+        "python_wire_recv_monotonic_to_latest_return",
+        python_wire_recv_to_consumer);
+    PrintLatency(
+        "python_strict_callback_origin_to_ipc_begin",
+        python_strict_callback_to_ipc_begin);
+    PrintLatency(
+        "python_strict_callback_origin_to_ipc_return",
+        python_strict_callback_to_ipc_return);
+    PrintLatency(
+        "python_wire_recv_monotonic_to_ipc_begin",
+        python_wire_recv_to_ipc_begin);
+    PrintLatency(
+        "python_wire_recv_monotonic_to_ipc_return",
+        python_wire_recv_to_ipc_return);
+    PrintLatency("python_ipc_publish_call", python_ipc_call);
+    std::cout
+        << "POLL consumer=python samples=" << kMeasuredSamples
+        << " total_polls=" << python_poll_count
+        << " inconsistent_retries="
+        << python_inconsistent_retries
+        << " mean_polls="
+        << std::fixed << std::setprecision(3)
+        << static_cast<long double>(python_poll_count) /
+               static_cast<long double>(kMeasuredSamples)
+        << " max_polls=" << python_max_polls
+        << std::defaultfloat << '\n';
+
+    const std::uint64_t burst_first = next_sequence;
+    if (!Expect(
+            protocol->SendLine(
+                "BURST " + std::to_string(burst_first) + " " +
+                std::to_string(kBurstSamples)),
+            "send Python BURST")) {
+        return false;
+    }
+    if (!Expect(
+            protocol->ReadLine(
+                std::chrono::seconds(5), &line),
+            "read Python BURST_ARMED")) {
+        return false;
+    }
+    std::istringstream burst_armed(line);
+    std::string burst_armed_tag;
+    std::uint64_t armed_first = 0U;
+    std::size_t armed_count = 0U;
+    burst_armed >> burst_armed_tag >> armed_first >> armed_count;
+    if (!Expect(
+            burst_armed && burst_armed_tag == "BURST_ARMED" &&
+                armed_first == burst_first &&
+                armed_count == kBurstSamples,
+            "validate Python BURST_ARMED")) {
+        std::cerr << "protocol line: " << line << '\n';
+        return false;
+    }
+    std::vector<std::uint64_t> burst_strict_origins;
+    burst_strict_origins.reserve(kBurstSamples);
+    const std::uint64_t burst_start = MonotonicNowNs();
+    for (std::size_t index = 0U;
+         index < kBurstSamples;
+         ++index) {
+        const std::uint64_t strict_origin = MonotonicNowNs();
+        if (strict_origin == 0U) {
+            return Expect(
+                false,
+                "capture strict burst callback origin");
+        }
+        burst_strict_origins.push_back(strict_origin);
+        handler->OnMessage(nullptr, &snapshot);
+    }
+    const std::uint64_t burst_end = MonotonicNowNs();
+    const std::uint64_t burst_last =
+        burst_first + kBurstSamples - 1U;
+    next_sequence = burst_last + 1U;
+    if (!Expect(
+            burst_start != 0U && burst_end > burst_start,
+            "measure burst producer duration")) {
+        return false;
+    }
+    if (!Expect(
+            protocol->ReadLine(
+                std::chrono::seconds(30), &line) &&
+                line.starts_with("BURST_RESULT "),
+            "read Python BURST_RESULT")) {
+        std::cerr << "protocol line: " << line << '\n';
+        return false;
+    }
+    std::cout << "PYTHON_" << line << '\n';
+    if (!Expect(
+            protocol->ReadLine(
+                std::chrono::seconds(5), &line) &&
+                line == "DONE",
+            "read Python DONE")) {
+        return false;
+    }
+    if (!Expect(
+            python.Wait(std::chrono::seconds(10)),
+            "Python latency benchmark exits cleanly")) {
+        return false;
+    }
+
+    std::uint64_t last_recv = 0U;
+    std::uint64_t last_begin = 0U;
+    std::uint64_t last_end = 0U;
+    if (!Expect(
+            wait_publication(
+                burst_last,
+                &last_recv,
+                &last_begin,
+                &last_end),
+            "burst reaches the IPC sink")) {
+        return false;
+    }
+    std::vector<std::uint64_t>
+        burst_strict_callback_to_ipc_begin;
+    std::vector<std::uint64_t>
+        burst_strict_callback_to_ipc_return;
+    std::vector<std::uint64_t>
+        burst_wire_recv_to_ipc_begin;
+    std::vector<std::uint64_t>
+        burst_wire_recv_to_ipc_return;
+    std::vector<std::uint64_t> burst_ipc_call;
+    burst_strict_callback_to_ipc_begin.reserve(kBurstSamples);
+    burst_strict_callback_to_ipc_return.reserve(kBurstSamples);
+    burst_wire_recv_to_ipc_begin.reserve(kBurstSamples);
+    burst_wire_recv_to_ipc_return.reserve(kBurstSamples);
+    burst_ipc_call.reserve(kBurstSamples);
+    for (std::uint64_t sequence = burst_first;
+         sequence <= burst_last;
+         ++sequence) {
+        std::uint64_t recv = 0U;
+        std::uint64_t ipc_begin = 0U;
+        std::uint64_t ipc_end = 0U;
+        if (!timed_sink->Read(
+                sequence, &recv, &ipc_begin, &ipc_end)) {
+            return Expect(
+                false,
+                "burst publication timing is incomplete");
+        }
+        const std::size_t origin_index =
+            static_cast<std::size_t>(sequence - burst_first);
+        const std::uint64_t strict_origin =
+            burst_strict_origins[origin_index];
+        if (!Expect(
+                recv >= strict_origin &&
+                    ipc_begin >= recv && ipc_end >= ipc_begin,
+                "correlate strict burst callback origin")) {
+            return false;
+        }
+        burst_strict_callback_to_ipc_begin.push_back(
+            ipc_begin - strict_origin);
+        burst_strict_callback_to_ipc_return.push_back(
+            ipc_end - strict_origin);
+        burst_wire_recv_to_ipc_begin.push_back(ipc_begin - recv);
+        burst_wire_recv_to_ipc_return.push_back(ipc_end - recv);
+        burst_ipc_call.push_back(ipc_end - ipc_begin);
+    }
+    const std::uint64_t burst_duration = burst_end - burst_start;
+    const long double burst_rate =
+        static_cast<long double>(kBurstSamples) *
+        1'000'000'000.0L /
+        static_cast<long double>(burst_duration);
+    std::cout
+        << "BURST produced=" << kBurstSamples
+        << " first_sequence=" << burst_first
+        << " last_sequence=" << burst_last
+        << " producer_duration_ns=" << burst_duration
+        << " producer_records_per_second="
+        << std::fixed << std::setprecision(3) << burst_rate
+        << std::defaultfloat << '\n';
+    PrintLatency(
+        "burst_strict_callback_origin_to_ipc_begin",
+        burst_strict_callback_to_ipc_begin);
+    PrintLatency(
+        "burst_strict_callback_origin_to_ipc_return",
+        burst_strict_callback_to_ipc_return);
+    PrintLatency(
+        "burst_wire_recv_monotonic_to_ipc_begin",
+        burst_wire_recv_to_ipc_begin);
+    PrintLatency(
+        "burst_wire_recv_monotonic_to_ipc_return",
+        burst_wire_recv_to_ipc_return);
+    PrintLatency("burst_ipc_publish_call", burst_ipc_call);
+
+    pipeline->StopAndDrain();
+    const runtime::RealtimePipelineStageLatencySnapshotV1 stages =
+        pipeline->LatencySnapshot();
+    if (measure_stage_latency) {
+        PrintStageLatency(
+            "callback_entry_to_success",
+            stages.callback_entry_to_success);
+        PrintStageLatency(
+            "callback_entry_to_store_append",
+            stages.callback_entry_to_append_complete);
+        PrintStageLatency(
+            "callback_entry_to_inprocess_latest",
+            stages.callback_entry_to_inprocess_latest_read);
+        PrintStageLatency("store_append_call", stages.append_call);
+    }
+    std::cout
+        << "STAGE_COUNTS enabled=" << (stages.enabled ? 1 : 0)
+        << " stage_scope=whole_run_including_setup"
+        << " callback_samples="
+        << stages.callback_entry_to_success.samples
+        << " append_samples="
+        << stages.callback_entry_to_append_complete.samples
+        << '\n';
+
+    const runtime::RealtimePipelineSnapshotV1 final_state =
+        pipeline->Snapshot();
+    bool ok = Expect(
+        stages.enabled == measure_stage_latency &&
+            !pipeline->fatal() &&
+            !final_state.fatal &&
+            final_state.accepted_messages == burst_last &&
+            final_state.processing_progress.accepted_sequence ==
+                burst_last &&
+            final_state.processing_progress.applied_sequence ==
+                burst_last &&
+            final_state.processing_progress.durable_sequence ==
+                burst_last &&
+            !service->failed(),
+        "latency benchmark retains the complete accepted/applied prefix");
+
+    l2flow_shm_session_info_v2 final_session{};
+    bool wire_matches_final_prefix = false;
+    const auto final_session_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() <
+           final_session_deadline) {
+        const int session_error =
+            l2flow_shm_reader_session_v2(
+                reader.get(), &final_session);
+        if (session_error ==
+                L2FLOW_SHM_READER_INCONSISTENT_READ_V2) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (session_error != L2FLOW_SHM_READER_OK_V2) {
+            break;
+        }
+        wire_matches_final_prefix =
+            final_session.server_state ==
+                static_cast<std::uint32_t>(
+                    ipc::RealtimeServerStateV2::kActive) &&
+            final_session.catalog_scope ==
+                static_cast<std::uint32_t>(
+                    ipc::RealtimeCatalogScopeV2::kObservedOnly) &&
+            final_session.coverage_complete == 0U &&
+            final_session.capacity == kCapacity &&
+            final_session.catalog_generation ==
+                kActiveInstrumentCount &&
+            final_session.bound_count ==
+                kActiveInstrumentCount &&
+            final_session.available_count ==
+                kActiveInstrumentCount &&
+            final_session.snapshot_available_count ==
+                kActiveInstrumentCount &&
+            final_session.tick_available_count == 0U &&
+            final_session.factor_eligible_count ==
+                kActiveInstrumentCount &&
+            final_session.accepted_sequence == burst_last &&
+            final_session.applied_sequence == burst_last &&
+            final_session.durable_sequence == burst_last &&
+            final_session.processing_lag_records == 0U &&
+            final_session.durability_lag_records == 0U;
+        if (wire_matches_final_prefix) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    ok &= Expect(
+        wire_matches_final_prefix,
+        "Wire session publishes the complete 85000-record prefix");
+
+    service->MarkDraining();
+    ok &= Expect(
+        service->MarkStoppedClean(0U),
+        "latency benchmark stops with no tick gap");
+    service->StopControl();
+    return ok;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        const std::string_view mode(argv[1]);
+        if (mode == "--latency-benchmark") {
+            return RunLatencyBenchmark(false) ? 0 : 1;
+        }
+        if (mode == "--latency-benchmark-stages") {
+            return RunLatencyBenchmark(true) ? 0 : 1;
+        }
+    }
+    if (argc != 1) {
+        std::cerr
+            << "usage: " << argv[0]
+            << " [--latency-benchmark"
+               "|--latency-benchmark-stages]\n";
+        return 2;
+    }
     if (!TestServiceEndToEnd() ||
         !TestBlockedJournalDoesNotGateWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||

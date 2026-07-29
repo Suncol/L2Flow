@@ -319,6 +319,7 @@ if(L2FLOW_BUILD_TESTS)
                 PRIVATE
                     L2FLOW_V2_PYTHON_PROBE_EXECUTABLE="${Python3_EXECUTABLE}"
                     L2FLOW_V2_PYTHON_PROBE_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_hot_read_probe.py"
+                    L2FLOW_V2_PYTHON_LATENCY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_latency_benchmark_probe.py"
                     L2FLOW_V2_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python"
                     L2FLOW_V2_PYTHON_READER_LIBRARY="$<TARGET_FILE:l2flow_shm_reader>")
             add_test(
