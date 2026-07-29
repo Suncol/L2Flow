@@ -7,6 +7,7 @@ import ctypes.util
 import os
 import sys
 import threading
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple, Union
@@ -45,6 +46,19 @@ INCONSISTENT_READ = 8
 _UINT32_MAX = 0xFFFFFFFF
 _UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 _C_SIZE_MAX = ctypes.c_size_t(-1).value
+_INSTRUMENT_DELTA_PAGE_HEADER_BYTES = 4096
+_INSTRUMENT_DELTA_METADATA_BYTES = 736
+_PY_BYTES_FROM_STRING_AND_SIZE = (
+    ctypes.pythonapi.PyBytes_FromStringAndSize
+)
+_PY_BYTES_FROM_STRING_AND_SIZE.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_ssize_t,
+]
+_PY_BYTES_FROM_STRING_AND_SIZE.restype = ctypes.py_object
+_PY_BYTES_AS_STRING = ctypes.pythonapi.PyBytes_AsString
+_PY_BYTES_AS_STRING.argtypes = [ctypes.py_object]
+_PY_BYTES_AS_STRING.restype = ctypes.c_void_p
 
 
 class _SessionInfoC(ctypes.Structure):
@@ -70,6 +84,18 @@ class _SessionInfoC(ctypes.Structure):
 assert ctypes.sizeof(_SessionInfoC) == 128
 
 
+class _InstrumentTickDeltaPageResultC(ctypes.Structure):
+    _fields_ = [
+        ("source_counts", ctypes.c_uint64 * 4),
+        ("last_ingress_sequence", ctypes.c_uint64),
+        ("last_tick_stream_sequence", ctypes.c_uint64),
+        ("last_source_sequences", ctypes.c_uint64 * 4),
+    ]
+
+
+assert ctypes.sizeof(_InstrumentTickDeltaPageResultC) == 80
+
+
 @dataclass(frozen=True, slots=True)
 class NativeTickRead:
     payloads: Tuple[bytes, ...]
@@ -83,6 +109,15 @@ class NativeTickBlockRead:
     record_count: int
     next_sequence: int
     observed_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeInstrumentTickDeltaPageRead:
+    wire_records: bytes
+    source_counts: Tuple[int, int, int, int]
+    last_ingress_sequence: int
+    last_tick_stream_sequence: int
+    last_source_sequences: Tuple[int, int, int, int]
 
 
 def _candidate_library_paths() -> Iterable[str]:
@@ -110,6 +145,7 @@ def load_native_library(
         try:
             library = ctypes.CDLL(candidate, use_errno=True)
             _bind_library(library)
+            _bind_instrument_delta_library(library)
             return library
         except (OSError, AttributeError) as error:
             failures.append(f"{candidate}: {error}")
@@ -194,6 +230,27 @@ def _bind_library(library) -> None:
     library.l2flow_shm_reader_ticks_v1.restype = ctypes.c_int
 
 
+def _bind_instrument_delta_library(library) -> None:
+    function = (
+        library.l2flow_shm_reader_instrument_tick_delta_page_v2
+    )
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_uint32,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(_InstrumentTickDeltaPageResultC),
+    ]
+    function.restype = ctypes.c_int
+
+
 def _raise_native(operation: str, code: int) -> None:
     if code == OK:
         return
@@ -211,6 +268,22 @@ def _raise_native(operation: str, code: int) -> None:
         if error_number:
             detail = os.strerror(error_number)
     raise NativeReaderError(operation, code, detail)
+
+
+def _raise_delta_page_native(code: int) -> None:
+    if code in (ABI_MISMATCH, LAYOUT_INVALID):
+        raise WireFormatError(
+            "instrument delta page failed native wire validation"
+        )
+    _raise_native("instrument_tick_delta_page", code)
+
+
+def _close_native_handle(library, handle: ctypes.c_void_p) -> None:
+    address = handle.value
+    if not address:
+        return
+    handle.value = None
+    library.l2flow_shm_reader_close_v1(ctypes.c_void_p(address))
 
 
 def _validate_uint32(value, field: str, *, allow_zero: bool = True) -> int:
@@ -232,6 +305,128 @@ def _validate_uint32_sequence(values: Sequence[int], field: str):
     return result
 
 
+def _validate_uint64(value, field: str) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        or value > _UINT64_MAX
+    ):
+        raise ValueError(f"{field} must fit uint64")
+    return value
+
+
+class NativeInstrumentTickDeltaPageValidator:
+    """Validate one sealed V2 page and copy its wire rows into bytes."""
+
+    def __init__(
+        self,
+        *,
+        library_path: Optional[Union[str, os.PathLike]] = None,
+        library=None,
+    ) -> None:
+        self._library = (
+            library
+            if library is not None
+            else load_native_library(library_path)
+        )
+        _bind_instrument_delta_library(self._library)
+
+    def validate(
+        self,
+        page_fd: int,
+        *,
+        expected_mapping_bytes: int,
+        expected_record_count: int,
+        expected_page_index: int,
+        expected_metadata: bytes,
+        prior_ingress_sequence: int,
+        prior_tick_stream_sequence: int,
+        prior_source_sequences: Sequence[int],
+    ) -> NativeInstrumentTickDeltaPageRead:
+        if (
+            not isinstance(page_fd, int)
+            or isinstance(page_fd, bool)
+            or page_fd < 0
+        ):
+            raise ValueError("page_fd must be a nonnegative integer")
+        expected_mapping_bytes = _validate_uint64(
+            expected_mapping_bytes, "expected_mapping_bytes"
+        )
+        expected_record_count = _validate_uint32(
+            expected_record_count,
+            "expected_record_count",
+            allow_zero=False,
+        )
+        expected_page_index = _validate_uint64(
+            expected_page_index, "expected_page_index"
+        )
+        if (
+            not isinstance(expected_metadata, bytes)
+            or len(expected_metadata) != _INSTRUMENT_DELTA_METADATA_BYTES
+        ):
+            raise ValueError("expected_metadata must be exactly 736 bytes")
+        prior_ingress_sequence = _validate_uint64(
+            prior_ingress_sequence, "prior_ingress_sequence"
+        )
+        prior_tick_stream_sequence = _validate_uint64(
+            prior_tick_stream_sequence,
+            "prior_tick_stream_sequence",
+        )
+        prior_sources = tuple(
+            _validate_uint64(value, "prior_source_sequences")
+            for value in prior_source_sequences
+        )
+        if len(prior_sources) != 4:
+            raise ValueError(
+                "prior_source_sequences must contain four values"
+            )
+        if (
+            expected_record_count > _C_SIZE_MAX // TICK_BYTES
+            or expected_record_count > sys.maxsize // TICK_BYTES
+        ):
+            raise ValueError("expected_record_count is too large")
+        output_bytes = expected_record_count * TICK_BYTES
+        expected_size = (
+            _INSTRUMENT_DELTA_PAGE_HEADER_BYTES + output_bytes
+        )
+        if expected_mapping_bytes != expected_size:
+            raise ValueError(
+                "expected_mapping_bytes is not canonical"
+            )
+
+        wire_records = _PY_BYTES_FROM_STRING_AND_SIZE(None, output_bytes)
+        output_pointer = _PY_BYTES_AS_STRING(wire_records)
+        metadata_pointer = ctypes.c_char_p(expected_metadata)
+        prior_array = (ctypes.c_uint64 * 4)(*prior_sources)
+        result = _InstrumentTickDeltaPageResultC()
+        code = (
+            self._library
+            .l2flow_shm_reader_instrument_tick_delta_page_v2(
+                page_fd,
+                expected_mapping_bytes,
+                expected_record_count,
+                expected_page_index,
+                metadata_pointer,
+                len(expected_metadata),
+                prior_ingress_sequence,
+                prior_tick_stream_sequence,
+                prior_array,
+                output_pointer,
+                output_bytes,
+                ctypes.byref(result),
+            )
+        )
+        _raise_delta_page_native(code)
+        return NativeInstrumentTickDeltaPageRead(
+            wire_records=wire_records,
+            source_counts=tuple(result.source_counts),
+            last_ingress_sequence=result.last_ingress_sequence,
+            last_tick_stream_sequence=result.last_tick_stream_sequence,
+            last_source_sequences=tuple(result.last_source_sequences),
+        )
+
+
 class NativeReader:
     """Owns one native read-only mmap handle."""
 
@@ -241,6 +436,9 @@ class NativeReader:
         self._lock = threading.RLock()
         self._tick_output = None
         self._tick_output_bytes = 0
+        self._finalizer = weakref.finalize(
+            self, _close_native_handle, library, handle
+        )
 
     @classmethod
     def open_fd(
@@ -261,12 +459,16 @@ class NativeReader:
         code = loaded.l2flow_shm_reader_open_fd_v1(
             fd, ctypes.byref(handle)
         )
-        _raise_native("open_fd", code)
-        if not handle.value:
-            raise NativeReaderError(
-                "open_fd", LAYOUT_INVALID, "native handle is null"
-            )
-        return cls(loaded, handle)
+        try:
+            _raise_native("open_fd", code)
+            if not handle.value:
+                raise NativeReaderError(
+                    "open_fd", LAYOUT_INVALID, "native handle is null"
+                )
+            return cls(loaded, handle)
+        except BaseException:
+            _close_native_handle(loaded, handle)
+            raise
 
     @property
     def closed(self) -> bool:
@@ -278,9 +480,12 @@ class NativeReader:
 
     def close(self) -> None:
         with self._lock:
-            if self._handle.value:
-                self._library.l2flow_shm_reader_close_v1(self._handle)
-                self._handle = ctypes.c_void_p()
+            try:
+                _close_native_handle(self._library, self._handle)
+                self._finalizer.detach()
+            finally:
+                self._tick_output = None
+                self._tick_output_bytes = 0
 
     def __enter__(self) -> "NativeReader":
         self._require_open()

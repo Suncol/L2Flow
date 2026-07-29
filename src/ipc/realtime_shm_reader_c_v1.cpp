@@ -1,5 +1,6 @@
 #include "l2flow/ipc/realtime_shm_reader_c_v1.h"
 
+#include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_wire_v1.h"
 
 #include <algorithm>
@@ -23,18 +24,28 @@
 #endif
 
 static_assert(sizeof(l2flow_shm_session_info_v1) == 128U);
+static_assert(
+    sizeof(l2flow_instrument_tick_delta_page_result_v2) == 80U);
 
 namespace {
 
 using l2flow::ipc::RealtimeHeaderFlagV1;
+using l2flow::ipc::RealtimeInstrumentTickDeltaBaseKindV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaCheckpointV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaGenerationEndpointV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaMetadataV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaPageHeaderV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaPayloadProjectionV2;
 using l2flow::ipc::RealtimeRegionKindV1;
 using l2flow::ipc::RealtimeServerStateV1;
 using l2flow::ipc::RealtimeWireHeaderV1;
 using l2flow::ipc::RealtimeWireCommonRecordV1;
+using l2flow::ipc::RealtimeWireDecimalV1;
 using l2flow::ipc::RealtimeWireInstrumentV1;
 using l2flow::ipc::RealtimeWireKLinePayloadV1;
 using l2flow::ipc::RealtimeWireKLineSlotV1;
 using l2flow::ipc::RealtimeWireKLineWindowV1;
+using l2flow::ipc::RealtimeWireQuantityV1;
 using l2flow::ipc::RealtimeWireRegionDescriptorV1;
 using l2flow::ipc::RealtimeWireSnapshotPayloadV1;
 using l2flow::ipc::RealtimeWireSnapshotSlotV1;
@@ -163,6 +174,361 @@ bool TickPayloadProjectionValid(
                [](std::uint8_t byte) noexcept {
                    return byte == 0U;
                });
+}
+
+bool WireDecimalValid(
+    const RealtimeWireDecimalV1& value) noexcept {
+    return value.valid <= 1U && value.is_null <= 1U &&
+           !AnyNonzero(value.reserved);
+}
+
+bool WireQuantityValid(
+    const RealtimeWireQuantityV1& value) noexcept {
+    return value.valid <= 1U && value.is_null <= 1U &&
+           !AnyNonzero(value.reserved);
+}
+
+bool TickPayloadCanonical(
+    const RealtimeWireTickPayloadV1& payload) noexcept {
+    return payload.common.record_schema_version == 1U &&
+           payload.common.record_bytes ==
+               sizeof(RealtimeWireTickPayloadV1) &&
+           CommonRecordIdentityValid(payload.common) &&
+           (payload.common.event_kind == 2U ||
+            payload.common.event_kind == 4U ||
+            payload.common.event_kind == 5U) &&
+           TickPayloadProjectionValid(payload) &&
+           payload.action <= 4U && payload.side <= 4U &&
+           payload.order_type <= 3U && payload.aggressor <= 3U &&
+           payload.phase <= 7U &&
+           WireDecimalValid(payload.price) &&
+           WireQuantityValid(payload.quantity) &&
+           WireDecimalValid(payload.trade_amount) &&
+           WireQuantityValid(payload.matched_quantity);
+}
+
+bool AllZero(const void* data, std::size_t bytes) noexcept {
+    if (data == nullptr) {
+        return bytes == 0U;
+    }
+    const auto* const first =
+        static_cast<const std::uint8_t*>(data);
+    return std::all_of(
+        first,
+        first + bytes,
+        [](std::uint8_t byte) noexcept { return byte == 0U; });
+}
+
+bool CheckedAdd(
+    std::uint64_t left,
+    std::uint64_t right,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr ||
+        right > std::numeric_limits<std::uint64_t>::max() - left) {
+        return false;
+    }
+    *output = left + right;
+    return true;
+}
+
+bool GenerationEndpointCanonical(
+    const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+        endpoint) noexcept {
+    constexpr std::uint32_t known_flags =
+        l2flow::ipc::kRealtimeInstrumentTickDeltaCoverageFromOpenV2 |
+        l2flow::ipc::
+            kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2 |
+        l2flow::ipc::kRealtimeInstrumentTickDeltaFieldCompleteV2;
+    if (!AnyNonzero(endpoint.run_id) ||
+        endpoint.session_epoch == 0U || endpoint.generation == 0U ||
+        endpoint.trade_date == 0U ||
+        endpoint.instrument_count == 0U ||
+        endpoint.ingress_sequence_exclusive == 0U ||
+        endpoint.tick_stream_sequence_exclusive == 0U ||
+        endpoint.registry_version == 0U ||
+        !AnyNonzero(endpoint.registry_sha256) ||
+        !AnyNonzero(endpoint.input_identity_sha256) ||
+        (endpoint.flags & ~known_flags) != 0U ||
+        (endpoint.flags &
+         l2flow::ipc::
+             kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2) ==
+            0U ||
+        (endpoint.flags &
+         l2flow::ipc::kRealtimeInstrumentTickDeltaFieldCompleteV2) !=
+            0U ||
+        endpoint.payload_projection !=
+            static_cast<std::uint32_t>(
+                RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                    kCoreV1) ||
+        AnyNonzero(endpoint.reserved)) {
+        return false;
+    }
+
+    std::uint64_t ingress_prefix = 0U;
+    for (std::size_t source = 0U;
+         source < endpoint.source_stream_ids.size();
+         ++source) {
+        if (endpoint.source_stream_ids[source] == 0U ||
+            endpoint.source_sequence_exclusive[source] == 0U) {
+            return false;
+        }
+        for (std::size_t prior = 0U; prior < source; ++prior) {
+            if (endpoint.source_stream_ids[source] ==
+                endpoint.source_stream_ids[prior]) {
+                return false;
+            }
+        }
+        if (!CheckedAdd(
+                ingress_prefix,
+                endpoint.source_sequence_exclusive[source] - 1U,
+                &ingress_prefix)) {
+            return false;
+        }
+    }
+    if (endpoint.ingress_sequence_exclusive - 1U !=
+        ingress_prefix) {
+        return false;
+    }
+    std::uint64_t tick_prefix =
+        endpoint.source_sequence_exclusive[1U] - 1U;
+    return CheckedAdd(
+               tick_prefix,
+               endpoint.source_sequence_exclusive[3U] - 1U,
+               &tick_prefix) &&
+           endpoint.tick_stream_sequence_exclusive - 1U ==
+               tick_prefix;
+}
+
+bool CheckpointCanonical(
+    const RealtimeInstrumentTickDeltaCheckpointV2&
+        checkpoint) noexcept {
+    if (!GenerationEndpointCanonical(checkpoint.generation) ||
+        checkpoint.instrument_id == 0U ||
+        checkpoint.registry_ordinal >=
+            checkpoint.generation.instrument_count ||
+        checkpoint.instrument_tick_source_record_counts[0U] != 0U ||
+        checkpoint.instrument_tick_source_record_counts[2U] != 0U ||
+        AnyNonzero(checkpoint.reserved)) {
+        return false;
+    }
+    std::uint64_t total = 0U;
+    for (std::size_t source = 0U;
+         source <
+         checkpoint.instrument_tick_source_record_counts.size();
+         ++source) {
+        const std::uint64_t count =
+            checkpoint
+                .instrument_tick_source_record_counts[source];
+        if (!CheckedAdd(total, count, &total) ||
+            count >
+                checkpoint.generation
+                        .source_sequence_exclusive[source] -
+                    1U) {
+            return false;
+        }
+    }
+    return total == checkpoint.instrument_tick_record_count &&
+           total <=
+               checkpoint.generation
+                       .tick_stream_sequence_exclusive -
+                   1U;
+}
+
+bool SameStaticGeneration(
+    const RealtimeInstrumentTickDeltaGenerationEndpointV2& left,
+    const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+        right) noexcept {
+    return left.run_id == right.run_id &&
+           left.session_epoch == right.session_epoch &&
+           left.trade_date == right.trade_date &&
+           left.instrument_count == right.instrument_count &&
+           left.registry_version == right.registry_version &&
+           left.registry_sha256 == right.registry_sha256 &&
+           left.source_stream_ids == right.source_stream_ids &&
+           left.flags == right.flags &&
+           left.payload_projection == right.payload_projection;
+}
+
+bool MetadataCanonical(
+    const RealtimeInstrumentTickDeltaMetadataV2& metadata) noexcept {
+    const bool origin =
+        metadata.base_kind ==
+        static_cast<std::uint32_t>(
+            RealtimeInstrumentTickDeltaBaseKindV2::kOrigin);
+    const bool checkpoint_base =
+        metadata.base_kind ==
+        static_cast<std::uint32_t>(
+            RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint);
+    if ((!origin && !checkpoint_base) ||
+        metadata.selected_source_mask !=
+            l2flow::ipc::
+                kRealtimeInstrumentTickDeltaSourceMaskV2 ||
+        !CheckpointCanonical(metadata.target_checkpoint) ||
+        metadata.delta_tick_source_record_counts[0U] != 0U ||
+        metadata.delta_tick_source_record_counts[2U] != 0U ||
+        metadata.flags !=
+            metadata.target_checkpoint.generation.flags ||
+        metadata.payload_projection !=
+            metadata.target_checkpoint.generation
+                .payload_projection ||
+        metadata.ingress_sequence_end_exclusive !=
+            metadata.target_checkpoint.generation
+                .ingress_sequence_exclusive ||
+        metadata.tick_stream_sequence_end_exclusive !=
+            metadata.target_checkpoint.generation
+                .tick_stream_sequence_exclusive ||
+        AnyNonzero(metadata.reserved)) {
+        return false;
+    }
+
+    std::array<std::uint64_t, 4U> base_counts{};
+    std::array<std::uint64_t, 4U> base_source_endpoints{
+        1U, 1U, 1U, 1U};
+    if (origin) {
+        if (!AllZero(
+                &metadata.base_checkpoint,
+                sizeof(metadata.base_checkpoint)) ||
+            metadata.ingress_sequence_begin_inclusive != 1U ||
+            metadata.tick_stream_sequence_begin_inclusive != 1U) {
+            return false;
+        }
+    } else {
+        const auto& base = metadata.base_checkpoint;
+        const auto& target = metadata.target_checkpoint;
+        if (!CheckpointCanonical(base) ||
+            !SameStaticGeneration(
+                base.generation, target.generation) ||
+            base.instrument_id != target.instrument_id ||
+            base.registry_ordinal != target.registry_ordinal ||
+            target.generation.generation <
+                base.generation.generation ||
+            target.generation.ingress_sequence_exclusive <
+                base.generation.ingress_sequence_exclusive ||
+            target.generation.tick_stream_sequence_exclusive <
+                base.generation.tick_stream_sequence_exclusive ||
+            target.generation.recv_monotonic_cut_ns <
+                base.generation.recv_monotonic_cut_ns ||
+            metadata.ingress_sequence_begin_inclusive !=
+                base.generation.ingress_sequence_exclusive ||
+            metadata.tick_stream_sequence_begin_inclusive !=
+                base.generation.tick_stream_sequence_exclusive) {
+            return false;
+        }
+
+        std::uint64_t source_delta_total = 0U;
+        std::uint64_t tick_source_delta_total = 0U;
+        for (std::size_t source = 0U;
+             source < base_source_endpoints.size();
+             ++source) {
+            const std::uint64_t base_source =
+                base.generation
+                    .source_sequence_exclusive[source];
+            const std::uint64_t target_source =
+                target.generation
+                    .source_sequence_exclusive[source];
+            const std::uint64_t base_count =
+                base.instrument_tick_source_record_counts[source];
+            const std::uint64_t target_count =
+                target
+                    .instrument_tick_source_record_counts[source];
+            if (target_source < base_source ||
+                target_count < base_count ||
+                !CheckedAdd(
+                    source_delta_total,
+                    target_source - base_source,
+                    &source_delta_total)) {
+                return false;
+            }
+            if ((source == 1U || source == 3U) &&
+                !CheckedAdd(
+                    tick_source_delta_total,
+                    target_source - base_source,
+                    &tick_source_delta_total)) {
+                return false;
+            }
+            base_source_endpoints[source] = base_source;
+            base_counts[source] = base_count;
+        }
+        const std::uint64_t ingress_delta =
+            target.generation.ingress_sequence_exclusive -
+            base.generation.ingress_sequence_exclusive;
+        const std::uint64_t tick_delta =
+            target.generation.tick_stream_sequence_exclusive -
+            base.generation.tick_stream_sequence_exclusive;
+        if (ingress_delta != source_delta_total ||
+            tick_delta != tick_source_delta_total ||
+            (target.generation.generation ==
+                 base.generation.generation &&
+             std::memcmp(&target, &base, sizeof(target)) != 0)) {
+            return false;
+        }
+    }
+
+    std::uint64_t delta_total = 0U;
+    for (std::size_t source = 0U;
+         source <
+         metadata.delta_tick_source_record_counts.size();
+         ++source) {
+        const std::uint64_t target_count =
+            metadata.target_checkpoint
+                .instrument_tick_source_record_counts[source];
+        const std::uint64_t target_source =
+            metadata.target_checkpoint.generation
+                .source_sequence_exclusive[source];
+        if (target_count < base_counts[source] ||
+            target_source < base_source_endpoints[source]) {
+            return false;
+        }
+        const std::uint64_t local_delta =
+            target_count - base_counts[source];
+        if (metadata.delta_tick_source_record_counts[source] !=
+                local_delta ||
+            local_delta >
+                target_source - base_source_endpoints[source] ||
+            !CheckedAdd(delta_total, local_delta, &delta_total)) {
+            return false;
+        }
+    }
+    if (delta_total != metadata.delta_tick_record_count ||
+        metadata.ingress_sequence_begin_inclusive >
+            metadata.ingress_sequence_end_exclusive ||
+        metadata.tick_stream_sequence_begin_inclusive >
+            metadata.tick_stream_sequence_end_exclusive) {
+        return false;
+    }
+    const std::uint64_t ingress_delta =
+        metadata.ingress_sequence_end_exclusive -
+        metadata.ingress_sequence_begin_inclusive;
+    const std::uint64_t tick_delta =
+        metadata.tick_stream_sequence_end_exclusive -
+        metadata.tick_stream_sequence_begin_inclusive;
+    return delta_total <= tick_delta && tick_delta <= ingress_delta;
+}
+
+bool RangesOverlap(
+    const void* left,
+    std::size_t left_bytes,
+    const void* right,
+    std::size_t right_bytes) noexcept {
+    if (left == nullptr || right == nullptr ||
+        left_bytes == 0U || right_bytes == 0U) {
+        return false;
+    }
+    const std::uintptr_t left_begin =
+        reinterpret_cast<std::uintptr_t>(left);
+    const std::uintptr_t right_begin =
+        reinterpret_cast<std::uintptr_t>(right);
+    if (left_bytes >
+            std::numeric_limits<std::uintptr_t>::max() -
+                left_begin ||
+        right_bytes >
+            std::numeric_limits<std::uintptr_t>::max() -
+                right_begin) {
+        return true;
+    }
+    const std::uintptr_t left_end = left_begin + left_bytes;
+    const std::uintptr_t right_end = right_begin + right_bytes;
+    return left_begin < right_end && right_begin < left_end;
 }
 
 enum class SlotCopyResult : std::uint8_t {
@@ -1323,4 +1689,286 @@ extern "C" int l2flow_shm_reader_ticks_v1(
     return HealthyForRead(*reader->header)
                ? L2FLOW_SHM_READER_OK_V1
                : L2FLOW_SHM_READER_UNAVAILABLE_V1;
+}
+
+extern "C" int
+l2flow_shm_reader_instrument_tick_delta_page_v2(
+    int page_fd,
+    std::uint64_t expected_mapping_bytes,
+    std::uint32_t expected_record_count,
+    std::uint64_t expected_page_index,
+    const void* expected_metadata,
+    std::size_t expected_metadata_bytes,
+    std::uint64_t prior_ingress_sequence,
+    std::uint64_t prior_tick_stream_sequence,
+    const std::uint64_t* prior_source_sequences,
+    void* tick_payloads_output,
+    std::size_t tick_payloads_output_bytes,
+    l2flow_instrument_tick_delta_page_result_v2* result) noexcept {
+    constexpr std::uint64_t header_bytes =
+        sizeof(RealtimeInstrumentTickDeltaPageHeaderV2);
+    constexpr std::uint64_t tick_bytes =
+        sizeof(RealtimeWireTickPayloadV1);
+    const std::uint64_t payload_bytes =
+        static_cast<std::uint64_t>(expected_record_count) *
+        tick_bytes;
+    std::uint64_t canonical_mapping_bytes = 0U;
+    if (page_fd < 0 || expected_record_count == 0U ||
+        expected_metadata == nullptr ||
+        expected_metadata_bytes !=
+            sizeof(RealtimeInstrumentTickDeltaMetadataV2) ||
+        prior_source_sequences == nullptr ||
+        tick_payloads_output == nullptr || result == nullptr ||
+        !CheckedAdd(
+            header_bytes,
+            payload_bytes,
+            &canonical_mapping_bytes) ||
+        expected_mapping_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max()) ||
+        expected_mapping_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<off_t>::max()) ||
+        payload_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+        return L2FLOW_SHM_READER_INVALID_ARGUMENT_V1;
+    }
+    if (expected_mapping_bytes != canonical_mapping_bytes) {
+        return L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+    }
+    const std::size_t required_output_bytes =
+        static_cast<std::size_t>(payload_bytes);
+    if (tick_payloads_output_bytes < required_output_bytes) {
+        return L2FLOW_SHM_READER_BUFFER_TOO_SMALL_V1;
+    }
+    if (RangesOverlap(
+            tick_payloads_output,
+            required_output_bytes,
+            expected_metadata,
+            expected_metadata_bytes) ||
+        RangesOverlap(
+            tick_payloads_output,
+            required_output_bytes,
+            prior_source_sequences,
+            4U * sizeof(std::uint64_t)) ||
+        RangesOverlap(
+            tick_payloads_output,
+            required_output_bytes,
+            result,
+            sizeof(*result)) ||
+        RangesOverlap(
+            result,
+            sizeof(*result),
+            expected_metadata,
+            expected_metadata_bytes) ||
+        RangesOverlap(
+            result,
+            sizeof(*result),
+            prior_source_sequences,
+            4U * sizeof(std::uint64_t))) {
+        return L2FLOW_SHM_READER_INVALID_ARGUMENT_V1;
+    }
+    if constexpr (std::endian::native != std::endian::little) {
+        return L2FLOW_SHM_READER_ABI_MISMATCH_V1;
+    }
+
+    RealtimeInstrumentTickDeltaMetadataV2 expected_metadata_value{};
+    std::memcpy(
+        &expected_metadata_value,
+        expected_metadata,
+        sizeof(expected_metadata_value));
+    if (!MetadataCanonical(expected_metadata_value) ||
+        expected_record_count >
+            expected_metadata_value.delta_tick_record_count) {
+        return L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+    }
+    std::array<std::uint64_t, 4U> prior_sources{};
+    std::memcpy(
+        prior_sources.data(),
+        prior_source_sequences,
+        sizeof(prior_sources));
+
+    const int descriptor_flags = ::fcntl(page_fd, F_GETFL);
+    const int seals = ::fcntl(page_fd, F_GET_SEALS);
+    if (descriptor_flags < 0 || seals < 0) {
+        return L2FLOW_SHM_READER_SYSTEM_ERROR_V1;
+    }
+    constexpr int required_seals =
+        F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    if ((descriptor_flags & O_ACCMODE) != O_RDONLY ||
+        (seals & required_seals) != required_seals) {
+        return L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+    }
+    struct stat descriptor_stat {};
+    if (::fstat(page_fd, &descriptor_stat) != 0) {
+        return L2FLOW_SHM_READER_SYSTEM_ERROR_V1;
+    }
+    if (!S_ISREG(descriptor_stat.st_mode) ||
+        descriptor_stat.st_size < 0 ||
+        static_cast<std::uint64_t>(descriptor_stat.st_size) !=
+            expected_mapping_bytes) {
+        return L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+    }
+
+    void* const mapping = ::mmap(
+        nullptr,
+        static_cast<std::size_t>(expected_mapping_bytes),
+        PROT_READ,
+        MAP_SHARED,
+        page_fd,
+        0);
+    if (mapping == MAP_FAILED) {
+        return L2FLOW_SHM_READER_SYSTEM_ERROR_V1;
+    }
+    const auto* const page =
+        static_cast<const RealtimeInstrumentTickDeltaPageHeaderV2*>(
+            mapping);
+    int validation_error = L2FLOW_SHM_READER_OK_V1;
+    if (page->magic !=
+        l2flow::ipc::kRealtimeInstrumentTickDeltaPageMagicV2) {
+        validation_error = L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+    } else if (
+        page->abi_major != l2flow::ipc::kRealtimeWireMajorV1 ||
+        page->abi_minor != l2flow::ipc::kRealtimeWireMinorV1 ||
+        page->endian_marker !=
+            l2flow::ipc::kRealtimeLittleEndianMarkerV1) {
+        validation_error = L2FLOW_SHM_READER_ABI_MISMATCH_V1;
+    } else if (
+        page->header_bytes != header_bytes || page->flags != 0U ||
+        page->total_mapping_bytes != expected_mapping_bytes ||
+        page->page_index != expected_page_index ||
+        page->record_count != expected_record_count ||
+        page->tick_payload_bytes != tick_bytes ||
+        page->tick_payloads_offset != header_bytes ||
+        std::memcmp(
+            &page->metadata,
+            &expected_metadata_value,
+            sizeof(expected_metadata_value)) != 0 ||
+        AnyNonzero(page->reserved)) {
+        validation_error = L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+    }
+
+    l2flow_instrument_tick_delta_page_result_v2 local_result{};
+    local_result.last_ingress_sequence =
+        prior_ingress_sequence;
+    local_result.last_tick_stream_sequence =
+        prior_tick_stream_sequence;
+    std::copy(
+        prior_sources.begin(),
+        prior_sources.end(),
+        local_result.last_source_sequences);
+    const auto* const ticks =
+        reinterpret_cast<const RealtimeWireTickPayloadV1*>(
+            static_cast<const std::byte*>(mapping) +
+            static_cast<std::size_t>(header_bytes));
+    if (validation_error == L2FLOW_SHM_READER_OK_V1) {
+        const auto& metadata = expected_metadata_value;
+        const auto& target = metadata.target_checkpoint;
+        const bool origin =
+            metadata.base_kind ==
+            static_cast<std::uint32_t>(
+                RealtimeInstrumentTickDeltaBaseKindV2::kOrigin);
+        for (std::size_t index = 0U;
+             index < expected_record_count;
+             ++index) {
+            const RealtimeWireTickPayloadV1& tick = ticks[index];
+            const RealtimeWireCommonRecordV1& common = tick.common;
+            const std::size_t source = common.source_slot;
+            const bool source_kind_valid =
+                (source == 1U && common.event_kind == 2U) ||
+                (source == 3U &&
+                 (common.event_kind == 4U ||
+                  common.event_kind == 5U));
+            const std::uint64_t source_begin =
+                !source_kind_valid
+                    ? 0U
+                    : (origin
+                           ? 1U
+                           : metadata.base_checkpoint.generation
+                                 .source_sequence_exclusive[source]);
+            if (!TickPayloadCanonical(tick) ||
+                !source_kind_valid ||
+                common.instrument_id != target.instrument_id ||
+                common.registry_ordinal !=
+                    target.registry_ordinal ||
+                common.trade_date != target.generation.trade_date ||
+                common.source_stream_id !=
+                    target.generation.source_stream_ids[source] ||
+                common.source_sequence < source_begin ||
+                common.source_sequence >=
+                    target.generation
+                        .source_sequence_exclusive[source] ||
+                common.source_sequence <=
+                    local_result.last_source_sequences[source] ||
+                common.ingress_sequence <
+                    metadata
+                        .ingress_sequence_begin_inclusive ||
+                common.ingress_sequence >=
+                    metadata.ingress_sequence_end_exclusive ||
+                common.ingress_sequence <=
+                    local_result.last_ingress_sequence ||
+                common.tick_stream_sequence <
+                    metadata
+                        .tick_stream_sequence_begin_inclusive ||
+                common.tick_stream_sequence >=
+                    metadata
+                        .tick_stream_sequence_end_exclusive ||
+                common.tick_stream_sequence <=
+                    local_result.last_tick_stream_sequence ||
+                common.tick_stream_sequence >
+                    common.ingress_sequence) {
+                validation_error =
+                    L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+                break;
+            }
+            ++local_result.source_counts[source];
+            local_result.last_source_sequences[source] =
+                common.source_sequence;
+            local_result.last_ingress_sequence =
+                common.ingress_sequence;
+            local_result.last_tick_stream_sequence =
+                common.tick_stream_sequence;
+        }
+    }
+    if (validation_error == L2FLOW_SHM_READER_OK_V1) {
+        const auto& first = ticks[0U].common;
+        const auto& last =
+            ticks[expected_record_count - 1U].common;
+        if (page->first_ingress_sequence !=
+                first.ingress_sequence ||
+            page->last_ingress_sequence !=
+                last.ingress_sequence ||
+            page->first_tick_stream_sequence !=
+                first.tick_stream_sequence ||
+            page->last_tick_stream_sequence !=
+                last.tick_stream_sequence ||
+            local_result.source_counts[0U] != 0U ||
+            local_result.source_counts[2U] != 0U ||
+            local_result.source_counts[1U] >
+                expected_metadata_value
+                    .delta_tick_source_record_counts[1U] ||
+            local_result.source_counts[3U] >
+                expected_metadata_value
+                    .delta_tick_source_record_counts[3U]) {
+            validation_error =
+                L2FLOW_SHM_READER_LAYOUT_INVALID_V1;
+        }
+    }
+    if (validation_error != L2FLOW_SHM_READER_OK_V1) {
+        static_cast<void>(::munmap(
+            mapping,
+            static_cast<std::size_t>(expected_mapping_bytes)));
+        return validation_error;
+    }
+
+    std::memmove(
+        tick_payloads_output,
+        ticks,
+        required_output_bytes);
+    *result = local_result;
+    static_cast<void>(::munmap(
+        mapping,
+        static_cast<std::size_t>(expected_mapping_bytes)));
+    return L2FLOW_SHM_READER_OK_V1;
 }

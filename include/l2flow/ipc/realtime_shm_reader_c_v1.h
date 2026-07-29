@@ -18,6 +18,12 @@ extern "C" {
 
 typedef struct l2flow_shm_reader_v1 l2flow_shm_reader_v1;
 
+#if defined(__cplusplus)
+#define L2FLOW_SHM_READER_NOEXCEPT_V1 noexcept
+#else
+#define L2FLOW_SHM_READER_NOEXCEPT_V1
+#endif
+
 enum l2flow_shm_reader_error_v1 {
     L2FLOW_SHM_READER_OK_V1 = 0,
     L2FLOW_SHM_READER_INVALID_ARGUMENT_V1 = 1,
@@ -63,6 +69,17 @@ typedef struct l2flow_shm_session_info_v1 {
     uint32_t window_count;
     uint32_t reserved;
 } l2flow_shm_session_info_v1;
+
+// Result of validating and copying one nonterminal instrument tick-delta V2
+// page. source_counts contains counts for this page; last_source_sequences
+// starts from the caller-provided prior state and advances only lanes present
+// in the page.
+typedef struct l2flow_instrument_tick_delta_page_result_v2 {
+    uint64_t source_counts[4];
+    uint64_t last_ingress_sequence;
+    uint64_t last_tick_stream_sequence;
+    uint64_t last_source_sequences[4];
+} l2flow_instrument_tick_delta_page_result_v2;
 
 // Maps fd read-only and validates the complete V1 layout and required memfd
 // seals. The caller retains ownership of fd and may close it immediately
@@ -157,8 +174,32 @@ L2FLOW_SHM_READER_API_V1 int l2flow_shm_reader_ticks_v1(
     uint64_t* next_sequence,
     uint64_t* observed_sequence);
 
+// Validates one sealed, read-only V2 instrument tick-delta page and copies its
+// dense 336-byte tick payload array into caller-owned storage. The expected
+// metadata is the exact 736-byte metadata image accepted at instrument OPEN.
+// prior_source_sequences points to four uint64 lanes. The output buffer must
+// not overlap any input or result object. Validation is fail-closed: neither
+// tick_payloads_output nor result is modified unless the complete page,
+// including every row and cross-page sequence invariant, is valid.
+L2FLOW_SHM_READER_API_V1 int
+l2flow_shm_reader_instrument_tick_delta_page_v2(
+    int page_fd,
+    uint64_t expected_mapping_bytes,
+    uint32_t expected_record_count,
+    uint64_t expected_page_index,
+    const void* expected_metadata,
+    size_t expected_metadata_bytes,
+    uint64_t prior_ingress_sequence,
+    uint64_t prior_tick_stream_sequence,
+    const uint64_t* prior_source_sequences,
+    void* tick_payloads_output,
+    size_t tick_payloads_output_bytes,
+    l2flow_instrument_tick_delta_page_result_v2* result)
+    L2FLOW_SHM_READER_NOEXCEPT_V1;
+
 #ifdef __cplusplus
 }
 #endif
 
+#undef L2FLOW_SHM_READER_NOEXCEPT_V1
 #undef L2FLOW_SHM_READER_API_V1

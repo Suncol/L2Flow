@@ -139,6 +139,23 @@ struct IntradayInstrumentSummaryV1 final {
     const RealtimeHistoryRecordV1* latest_tick = nullptr;
 };
 
+// Immutable accounting for one tick-only delta cursor. Source slots 1 and 3
+// are selected; snapshot slots 0 and 2 are zero in every count vector.
+struct IntradayInstrumentTickDeltaSummaryV1 final {
+    std::uint32_t instrument_id = 0U;
+    std::array<std::uint8_t, kIntradayInstrumentStoreSourceCountV1>
+        selected_source_mask{};
+    std::uint64_t ingress_sequence_begin_inclusive = 0U;
+    std::uint64_t ingress_sequence_end_exclusive = 0U;
+    std::array<std::uint64_t, kIntradayInstrumentStoreSourceCountV1>
+        base_tick_source_record_counts{};
+    std::array<std::uint64_t, kIntradayInstrumentStoreSourceCountV1>
+        target_tick_source_record_counts{};
+    std::array<std::uint64_t, kIntradayInstrumentStoreSourceCountV1>
+        delta_tick_source_record_counts{};
+    std::uint64_t delta_tick_record_count = 0U;
+};
+
 struct IntradayInstrumentStoreSnapshotV1 final {
     std::uint64_t maximum_session_records = 0U;
     std::uint64_t maximum_session_accounted_bytes = 0U;
@@ -175,6 +192,37 @@ public:
 private:
     class Impl;
     explicit IntradayInstrumentCursorV1(
+        std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+
+    friend class IntradayInstrumentStoreGenerationV1;
+};
+
+class IntradayInstrumentTickDeltaCursorV1 final {
+public:
+    IntradayInstrumentTickDeltaCursorV1(
+        const IntradayInstrumentTickDeltaCursorV1&) = delete;
+    IntradayInstrumentTickDeltaCursorV1& operator=(
+        const IntradayInstrumentTickDeltaCursorV1&) = delete;
+    IntradayInstrumentTickDeltaCursorV1(
+        IntradayInstrumentTickDeltaCursorV1&&) noexcept;
+    IntradayInstrumentTickDeltaCursorV1& operator=(
+        IntradayInstrumentTickDeltaCursorV1&&) noexcept;
+    ~IntradayInstrumentTickDeltaCursorV1();
+
+    // Records are emitted oldest-first in process ingress order. Returned
+    // pointers are borrowed and remain valid for this cursor's lifetime. A
+    // successful zero-sized batch means end-of-stream.
+    [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 ReadBatch(
+        std::span<const RealtimeHistoryRecordV1*> output,
+        std::size_t* written) noexcept;
+    [[nodiscard]] bool done() const noexcept;
+    [[nodiscard]] const IntradayInstrumentTickDeltaSummaryV1& summary()
+        const noexcept;
+
+private:
+    class Impl;
+    explicit IntradayInstrumentTickDeltaCursorV1(
         std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
 
@@ -262,6 +310,17 @@ public:
         std::unique_ptr<IntradayInstrumentCursorV1>* output)
         const noexcept;
 
+    // Opens the tick-only half-open delta
+    // [ingress_sequence_begin_inclusive, watermark().ingress_sequence_exclusive).
+    // begin == end is valid and immediately done; begin == 0 or begin > end is
+    // invalid. Boundary location starts from each target tick-lane tail.
+    [[nodiscard]] IntradayInstrumentStoreQueryErrorV1
+    OpenInstrumentTickDeltaCursor(
+        std::uint32_t instrument_id,
+        std::uint64_t ingress_sequence_begin_inclusive,
+        std::unique_ptr<IntradayInstrumentTickDeltaCursorV1>* output)
+        const noexcept;
+
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1
     OpenUniverseCursor(
         IntradayInstrumentScanOptionsV1 options,
@@ -286,6 +345,7 @@ private:
 
     friend class IntradayInstrumentStoreV1;
     friend class IntradayInstrumentCursorV1::Impl;
+    friend class IntradayInstrumentTickDeltaCursorV1::Impl;
     friend class IntradayUniverseCursorV1::Impl;
 };
 

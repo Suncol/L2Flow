@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import array
 import os
 import secrets
 import socket
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
+from ._fd_owner import _ReceivedPacket, _recv_fds
 from .models import ProtocolError, UnavailableError
 from .wire import CONTROL_MAGIC, WIRE_MAJOR, WIRE_MINOR
 
@@ -31,10 +31,31 @@ assert RESPONSE_BYTES == 64
 
 @dataclass(frozen=True, slots=True)
 class ControlSession:
-    fd: int
+    _packet: _ReceivedPacket = field(repr=False)
     request_id: int
     session_epoch: int
     total_mapping_bytes: int
+
+    @property
+    def fd(self) -> int:
+        """Borrow the mapped-session fd while this object remains open."""
+
+        return self._packet.only_fd
+
+    @property
+    def closed(self) -> bool:
+        return self._packet.closed
+
+    def close(self) -> None:
+        self._packet.close()
+
+    def __enter__(self) -> "ControlSession":
+        if self.closed:
+            raise RuntimeError("control session is closed")
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        self.close()
 
 
 def build_get_session_request(request_id: int) -> bytes:
@@ -55,52 +76,19 @@ def build_get_session_request(request_id: int) -> bytes:
     )
 
 
-def _close_fds(fds) -> None:
-    for descriptor in fds:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-
-
 def receive_session_fd(
     control_socket: socket.socket, request_id: int
 ) -> ControlSession:
     """Receive and validate one control response from an existing socket."""
 
-    descriptor_array = array.array("i")
-    ancillary_bytes = socket.CMSG_SPACE(descriptor_array.itemsize)
-    recv_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
-    data, ancillary, message_flags, _address = control_socket.recvmsg(
-        RESPONSE_BYTES, ancillary_bytes, recv_flags
+    packet = _recv_fds(
+        control_socket,
+        RESPONSE_BYTES,
+        response_name="control response",
     )
-    received_fds = []
     try:
-        unexpected_ancillary = False
-        for level, kind, payload in ancillary:
-            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
-                unexpected_ancillary = True
-                continue
-            if len(payload) % descriptor_array.itemsize != 0:
-                # Recover and close every complete descriptor before failing.
-                complete = len(payload) - len(payload) % descriptor_array.itemsize
-                payload = payload[:complete]
-                unexpected_ancillary = True
-            values = array.array("i")
-            values.frombytes(payload)
-            received_fds.extend(values.tolist())
-        if unexpected_ancillary:
-            raise ProtocolError("unexpected or malformed ancillary message")
-
-        truncation_flags = getattr(socket, "MSG_TRUNC", 0) | getattr(
-            socket, "MSG_CTRUNC", 0
-        )
-        if message_flags & truncation_flags:
-            raise ProtocolError("truncated control response")
-        if len(data) != RESPONSE_BYTES:
-            raise ProtocolError(
-                f"control response has {len(data)} bytes; expected 64"
-            )
+        data = packet.data
+        received_fds = packet.fds
         fields = _RESPONSE.unpack(data)
         (
             magic,
@@ -152,20 +140,15 @@ def receive_session_fd(
             raise ProtocolError("control response session_epoch is zero")
         if total_mapping_bytes < 4096:
             raise ProtocolError("control response mapping is too small")
-        fd = received_fds.pop()
-        try:
-            os.set_inheritable(fd, False)
-        except OSError:
-            os.close(fd)
-            raise
         return ControlSession(
-            fd=fd,
+            _packet=packet,
             request_id=request_id,
             session_epoch=session_epoch,
             total_mapping_bytes=total_mapping_bytes,
         )
-    finally:
-        _close_fds(received_fds)
+    except BaseException:
+        packet.close()
+        raise
 
 
 def discover_session_fd(

@@ -10,6 +10,10 @@ from typing import Optional, Sequence, Union
 from .batch import LatestBatch, TickBatch, TickColumnBatch
 from .control import discover_session_fd
 from .history import open_history_cursor
+from .instrument_delta import (
+    DEFAULT_INSTRUMENT_TICK_DELTA_PAGE_RECORDS,
+    open_instrument_tick_delta_session,
+)
 from .models import (
     ClientClosedError,
     InstrumentKey,
@@ -113,42 +117,43 @@ class L2FlowClient:
         stale_after_ns: Optional[int] = DEFAULT_STALE_AFTER_NS,
         _native_factory=None,
     ) -> "L2FlowClient":
-        control = discover_session_fd(
+        with discover_session_fd(
             control_socket_path, timeout=timeout
-        )
-        native = None
-        try:
-            descriptor_size = os.fstat(control.fd).st_size
-            if descriptor_size != control.total_mapping_bytes:
-                raise StaleSessionError(
-                    "control response mapping size does not match its fd"
+        ) as control:
+            native = None
+            try:
+                descriptor_size = os.fstat(control.fd).st_size
+                if descriptor_size != control.total_mapping_bytes:
+                    raise StaleSessionError(
+                        "control response mapping size does not match its fd"
+                    )
+                if _native_factory is None:
+                    native = NativeReader.open_fd(
+                        control.fd, library_path=native_library
+                    )
+                else:
+                    native = _native_factory(control.fd)
+                if native is None:
+                    raise WireFormatError(
+                        "native reader factory returned None"
+                    )
+                session = native.session()
+                if session.session_epoch != control.session_epoch:
+                    raise StaleSessionError(
+                        "control response epoch does not match mapped "
+                        "session"
+                    )
+                return cls(
+                    native,
+                    stale_after_ns=stale_after_ns,
+                    expected_identity=session.identity,
+                    control_socket_path=control_socket_path,
+                    control_timeout=timeout,
                 )
-            if _native_factory is None:
-                native = NativeReader.open_fd(
-                    control.fd, library_path=native_library
-                )
-            else:
-                native = _native_factory(control.fd)
-            if native is None:
-                raise WireFormatError("native reader factory returned None")
-        finally:
-            os.close(control.fd)
-        try:
-            session = native.session()
-            if session.session_epoch != control.session_epoch:
-                raise StaleSessionError(
-                    "control response epoch does not match mapped session"
-                )
-            return cls(
-                native,
-                stale_after_ns=stale_after_ns,
-                expected_identity=session.identity,
-                control_socket_path=control_socket_path,
-                control_timeout=timeout,
-            )
-        except Exception:
-            native.close()
-            raise
+            except BaseException:
+                if native is not None:
+                    native.close()
+                raise
 
     @property
     def closed(self) -> bool:
@@ -204,9 +209,9 @@ class L2FlowClient:
     def close(self) -> None:
         with self._lock:
             if not self._closed:
-                self._closed = True
-                self._instrument_cache.clear()
                 self._native.close()
+                self._instrument_cache.clear()
+                self._closed = True
 
     def __enter__(self) -> "L2FlowClient":
         with self._lock:
@@ -365,6 +370,59 @@ class L2FlowClient:
             requested_page_records=requested_page_records,
             timeout=timeout,
         )
+
+    def open_instrument_tick_delta_session(
+        self,
+        *,
+        requested_page_records: int = (
+            DEFAULT_INSTRUMENT_TICK_DELTA_PAGE_RECORDS
+        ),
+        timeout: Optional[float] = None,
+    ):
+        """Pin one Store target for sequential instrument tick deltas."""
+
+        with self._lock:
+            session = self._checked_session()
+            control_socket_path = self._control_socket_path
+            if control_socket_path is None:
+                raise UnavailableError(
+                    "this client was not created from a control socket"
+                )
+            effective_timeout = (
+                self._control_timeout if timeout is None else timeout
+            )
+        delta_session = open_instrument_tick_delta_session(
+            control_socket_path,
+            requested_page_records=requested_page_records,
+            timeout=effective_timeout,
+            expected_run_id=session.run_id,
+            expected_session_epoch=session.session_epoch,
+            expected_trade_date=session.trade_date,
+            expected_instrument_count=session.instrument_count,
+            expected_registry_version=session.registry_version,
+            expected_registry_sha256=session.registry_sha256,
+        )
+        try:
+            with self._lock:
+                current = self._checked_session()
+                if (
+                    current.identity != session.identity
+                    or current.trade_date != session.trade_date
+                    or current.instrument_count
+                    != session.instrument_count
+                    or current.registry_version
+                    != session.registry_version
+                    or current.registry_sha256
+                    != session.registry_sha256
+                ):
+                    raise StaleSessionError(
+                        "realtime session changed while opening "
+                        "instrument delta session"
+                    )
+            return delta_session
+        except Exception:
+            delta_session.close()
+            raise
 
     def get_latest_snapshot(self, instrument_id: int):
         return self.get_latest_snapshots((instrument_id,))[0]

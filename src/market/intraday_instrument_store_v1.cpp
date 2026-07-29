@@ -893,6 +893,176 @@ private:
     bool done_ = false;
 };
 
+[[nodiscard]] constexpr bool TickDeltaSource(
+    std::size_t source) noexcept {
+    return source == 1U || source == 3U;
+}
+
+class MergedInstrumentTickDeltaReader final {
+public:
+    MergedInstrumentTickDeltaReader(
+        const CapturedInstrumentRow& row,
+        std::uint64_t ingress_sequence_begin_inclusive,
+        std::uint64_t ingress_sequence_end_exclusive) noexcept {
+        summary_.instrument_id = row.instrument_id;
+        summary_.ingress_sequence_begin_inclusive =
+            ingress_sequence_begin_inclusive;
+        summary_.ingress_sequence_end_exclusive =
+            ingress_sequence_end_exclusive;
+
+        for (std::size_t source = 0U;
+             source < positions_.size();
+             ++source) {
+            if (!TickDeltaSource(source)) {
+                continue;
+            }
+            summary_.selected_source_mask[source] = 1U;
+            const CapturedLane& lane = row.lanes[source];
+            summary_.target_tick_source_record_counts[source] =
+                lane.record_count;
+            LanePosition& position = positions_[source];
+            position.endpoint = lane;
+            position.segment = lane.tail;
+            position.index = lane.tail_used;
+
+            std::uint64_t delta_count = 0U;
+            if (ingress_sequence_begin_inclusive <
+                ingress_sequence_end_exclusive) {
+                while (position.segment != nullptr) {
+                    if (position.index == 0U) {
+                        const ArenaSegment* const previous =
+                            position.segment->previous;
+                        if (previous == nullptr) {
+                            break;
+                        }
+                        position.segment = previous;
+                        position.index = previous->header_count;
+                        continue;
+                    }
+                    const RealtimeHistoryRecordV1* const record =
+                        SegmentRecord(
+                            position.segment, position.index - 1U);
+                    if (record->source_slot() != source ||
+                        !IsTickEventKindV1(record->kind()) ||
+                        record->ingress_sequence() >=
+                            ingress_sequence_end_exclusive) {
+                        valid_ = false;
+                        return;
+                    }
+                    if (record->ingress_sequence() <
+                        ingress_sequence_begin_inclusive) {
+                        break;
+                    }
+                    --position.index;
+                    ++delta_count;
+                }
+            }
+            if (delta_count > lane.record_count) {
+                valid_ = false;
+                return;
+            }
+            if (delta_count != 0U && position.segment != nullptr &&
+                position.index >= UsedInPositionSegment(position)) {
+                position.segment =
+                    position.segment->owned_next.get();
+                position.index = 0U;
+            }
+            if (delta_count != 0U && position.segment == nullptr) {
+                valid_ = false;
+                return;
+            }
+            position.remaining = delta_count;
+            summary_.delta_tick_source_record_counts[source] =
+                delta_count;
+            summary_.base_tick_source_record_counts[source] =
+                lane.record_count - delta_count;
+            if (!CheckedAdd(
+                    summary_.delta_tick_record_count,
+                    delta_count,
+                    &summary_.delta_tick_record_count)) {
+                valid_ = false;
+                return;
+            }
+            current_[source] = Current(position);
+        }
+        RefreshState();
+    }
+
+    [[nodiscard]] bool Pop(
+        const RealtimeHistoryRecordV1** output) noexcept {
+        if (output == nullptr || done_ || !valid_) {
+            return false;
+        }
+        const std::size_t selected = SelectSource();
+        if (selected >= current_.size()) {
+            done_ = true;
+            return false;
+        }
+        *output = current_[selected];
+        Advance(positions_[selected]);
+        current_[selected] = Current(positions_[selected]);
+        RefreshState();
+        return true;
+    }
+
+    [[nodiscard]] bool done() const noexcept { return done_; }
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
+    [[nodiscard]] const IntradayInstrumentTickDeltaSummaryV1& summary()
+        const noexcept {
+        return summary_;
+    }
+
+private:
+    [[nodiscard]] const RealtimeHistoryRecordV1* Current(
+        const LanePosition& position) const noexcept {
+        if (position.remaining == 0U || position.segment == nullptr ||
+            position.index >= UsedInPositionSegment(position)) {
+            return nullptr;
+        }
+        return SegmentRecord(position.segment, position.index);
+    }
+
+    void Advance(LanePosition& position) noexcept {
+        if (position.remaining == 0U || position.segment == nullptr) {
+            return;
+        }
+        --position.remaining;
+        ++position.index;
+        if (position.remaining != 0U &&
+            position.index >= UsedInPositionSegment(position)) {
+            position.segment = position.segment->owned_next.get();
+            position.index = 0U;
+        }
+    }
+
+    [[nodiscard]] std::size_t SelectSource() const noexcept {
+        const RealtimeHistoryRecordV1* const first = current_[1U];
+        const RealtimeHistoryRecordV1* const second = current_[3U];
+        if (first == nullptr) {
+            return second == nullptr ? current_.size() : 3U;
+        }
+        if (second == nullptr) {
+            return 1U;
+        }
+        return second->ingress_sequence() < first->ingress_sequence()
+                   ? 3U
+                   : 1U;
+    }
+
+    void RefreshState() noexcept {
+        done_ = current_[1U] == nullptr && current_[3U] == nullptr;
+    }
+
+    IntradayInstrumentTickDeltaSummaryV1 summary_{};
+    std::array<LanePosition, kIntradayInstrumentStoreSourceCountV1>
+        positions_{};
+    std::array<const RealtimeHistoryRecordV1*,
+               kIntradayInstrumentStoreSourceCountV1>
+        current_{};
+    bool done_ = false;
+    bool valid_ = true;
+};
+
 }  // namespace
 
 class IntradayInstrumentCursorV1::Impl final {
@@ -906,6 +1076,23 @@ public:
 
     std::shared_ptr<const GenerationData> generation;
     MergedInstrumentReader reader;
+};
+
+class IntradayInstrumentTickDeltaCursorV1::Impl final {
+public:
+    Impl(
+        std::shared_ptr<const GenerationData> value_generation,
+        const CapturedInstrumentRow& row,
+        std::uint64_t ingress_sequence_begin_inclusive,
+        std::uint64_t ingress_sequence_end_exclusive) noexcept
+        : generation(std::move(value_generation)),
+          reader(
+              row,
+              ingress_sequence_begin_inclusive,
+              ingress_sequence_end_exclusive) {}
+
+    std::shared_ptr<const GenerationData> generation;
+    MergedInstrumentTickDeltaReader reader;
 };
 
 class IntradayUniverseCursorV1::Impl final {
@@ -1142,6 +1329,64 @@ bool IntradayInstrumentCursorV1::done() const noexcept {
     return impl_ == nullptr || impl_->reader.done();
 }
 
+IntradayInstrumentTickDeltaCursorV1::
+    IntradayInstrumentTickDeltaCursorV1(
+        std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+IntradayInstrumentTickDeltaCursorV1::
+    IntradayInstrumentTickDeltaCursorV1(
+        IntradayInstrumentTickDeltaCursorV1&&) noexcept = default;
+
+IntradayInstrumentTickDeltaCursorV1&
+IntradayInstrumentTickDeltaCursorV1::operator=(
+    IntradayInstrumentTickDeltaCursorV1&&) noexcept = default;
+
+IntradayInstrumentTickDeltaCursorV1::
+    ~IntradayInstrumentTickDeltaCursorV1() = default;
+
+IntradayInstrumentStoreQueryErrorV1
+IntradayInstrumentTickDeltaCursorV1::ReadBatch(
+    std::span<const RealtimeHistoryRecordV1*> output,
+    std::size_t* written) noexcept {
+    if (written == nullptr) {
+        return IntradayInstrumentStoreQueryErrorV1::kNullOutput;
+    }
+    *written = 0U;
+    if (impl_ == nullptr || !impl_->reader.valid()) {
+        return IntradayInstrumentStoreQueryErrorV1::kInvalidArgument;
+    }
+    if (output.size() >
+        impl_->generation->maximum_records_per_batch) {
+        return IntradayInstrumentStoreQueryErrorV1::kBatchLimitExceeded;
+    }
+    if (impl_->reader.done()) {
+        return IntradayInstrumentStoreQueryErrorV1::kNone;
+    }
+    if (output.empty()) {
+        return IntradayInstrumentStoreQueryErrorV1::kInvalidArgument;
+    }
+    while (*written < output.size()) {
+        const RealtimeHistoryRecordV1* record = nullptr;
+        if (!impl_->reader.Pop(&record)) {
+            break;
+        }
+        output[*written] = record;
+        ++*written;
+    }
+    return IntradayInstrumentStoreQueryErrorV1::kNone;
+}
+
+bool IntradayInstrumentTickDeltaCursorV1::done() const noexcept {
+    return impl_ == nullptr || impl_->reader.done();
+}
+
+const IntradayInstrumentTickDeltaSummaryV1&
+IntradayInstrumentTickDeltaCursorV1::summary() const noexcept {
+    static const IntradayInstrumentTickDeltaSummaryV1 empty{};
+    return impl_ == nullptr ? empty : impl_->reader.summary();
+}
+
 IntradayUniverseCursorV1::IntradayUniverseCursorV1(
     std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
@@ -1317,6 +1562,52 @@ IntradayInstrumentStoreGenerationV1::OpenTailCursor(
     options.direction =
         IntradayInstrumentScanDirectionV1::kNewestFirst;
     return OpenInstrumentCursor(instrument_id, options, output);
+}
+
+IntradayInstrumentStoreQueryErrorV1
+IntradayInstrumentStoreGenerationV1::
+    OpenInstrumentTickDeltaCursor(
+        std::uint32_t instrument_id,
+        std::uint64_t ingress_sequence_begin_inclusive,
+        std::unique_ptr<IntradayInstrumentTickDeltaCursorV1>* output)
+        const noexcept {
+    if (output == nullptr) {
+        return IntradayInstrumentStoreQueryErrorV1::kNullOutput;
+    }
+    output->reset();
+    const std::uint64_t ingress_sequence_end_exclusive =
+        impl_->data->watermark.ingress_sequence_exclusive;
+    if (instrument_id == 0U ||
+        ingress_sequence_begin_inclusive == 0U ||
+        ingress_sequence_begin_inclusive >
+            ingress_sequence_end_exclusive) {
+        return IntradayInstrumentStoreQueryErrorV1::kInvalidArgument;
+    }
+    const CapturedInstrumentRow* row =
+        FindCapturedRow(*impl_->data, instrument_id);
+    if (row == nullptr) {
+        return IntradayInstrumentStoreQueryErrorV1::kNotFound;
+    }
+    try {
+        auto cursor_impl =
+            std::make_unique<
+                IntradayInstrumentTickDeltaCursorV1::Impl>(
+                impl_->data,
+                *row,
+                ingress_sequence_begin_inclusive,
+                ingress_sequence_end_exclusive);
+        if (!cursor_impl->reader.valid()) {
+            return IntradayInstrumentStoreQueryErrorV1::
+                kInvalidArgument;
+        }
+        output->reset(
+            new IntradayInstrumentTickDeltaCursorV1(
+                std::move(cursor_impl)));
+        return IntradayInstrumentStoreQueryErrorV1::kNone;
+    } catch (...) {
+        return IntradayInstrumentStoreQueryErrorV1::
+            kResourceExhausted;
+    }
 }
 
 IntradayInstrumentStoreQueryErrorV1

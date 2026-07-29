@@ -156,6 +156,123 @@ _HISTORY_TYPES = {
 }
 
 
+def tick_wire_record_count(wire_records: bytes) -> int:
+    """Return the number of aligned V1 tick rows in a wire block."""
+
+    if not isinstance(wire_records, bytes):
+        raise TypeError("tick wire block must be bytes")
+    if len(wire_records) % TICK_BYTES != 0:
+        raise ValueError("tick wire block is not record-aligned")
+    return len(wire_records) // TICK_BYTES
+
+
+def tick_wire_numpy_records(wire_records: bytes):
+    """Return a zero-copy, read-only structured view of V1 tick rows."""
+
+    global _TICK_COLUMN_NUMPY_DTYPE
+    record_count = tick_wire_record_count(wire_records)
+    numpy = importlib.import_module("numpy")
+    if _TICK_COLUMN_NUMPY_DTYPE is None:
+        _TICK_COLUMN_NUMPY_DTYPE = numpy.dtype(
+            {
+                "names": [
+                    "record_schema_version",
+                    "record_bytes",
+                    "instrument_id",
+                    "registry_ordinal",
+                    "source_sequence",
+                    "ingress_sequence",
+                    "tick_stream_sequence",
+                    "vendor_sequence_id",
+                    "event_time_unix_ns",
+                    "recv_realtime_ns",
+                    "recv_monotonic_ns",
+                    "exchange_time_ns_since_midnight",
+                    "quality_flags",
+                    "market_notices",
+                    "source_stream_id",
+                    "trade_date",
+                    "vendor_local_time_raw",
+                    "common_reserved",
+                    "source_slot",
+                    "event_kind",
+                    "market",
+                    "quantity_unit",
+                    "security_type",
+                    "asset_scope",
+                    "validity_bitmap",
+                    "projection_flags",
+                    "channel",
+                    "native_event_sequence",
+                    "source_raw_code_1",
+                    "source_raw_code_2",
+                    "action",
+                    "side",
+                    "order_type",
+                    "aggressor",
+                    "phase",
+                    "raw_type_length",
+                    "raw_tick_flag_length",
+                    "tick_reserved_u8",
+                    "price_raw",
+                    "price_p6",
+                    "price_scale",
+                    "price_valid",
+                    "price_is_null",
+                    "quantity_raw",
+                    "quantity_scale",
+                    "quantity_valid",
+                    "quantity_is_null",
+                    "trade_amount_raw",
+                    "trade_amount_p6",
+                    "trade_amount_scale",
+                    "trade_amount_valid",
+                    "trade_amount_is_null",
+                    "matched_quantity_raw",
+                    "matched_quantity_scale",
+                    "matched_quantity_valid",
+                    "matched_quantity_is_null",
+                    "primary_order_id",
+                    "buy_order_id",
+                    "sell_order_id",
+                ],
+                "formats": [
+                    "<u4", "<u4", "<u4", "<u4",
+                    "<u8", "<u8", "<u8", "<u8",
+                    "<i8", "<i8", "<i8", "<u8",
+                    "<u8", "<u8", "<u4", "<u4",
+                    "<u4", "<u4",
+                    "u1", "u1", "u1", "u1", "u1", "u1",
+                    "<u4", "<u4", "<i8", "<i8", "<i4", "<i4",
+                    "u1", "u1", "u1", "u1", "u1", "u1", "u1",
+                    "u1", "<i8", "<i8", "u1", "u1", "u1",
+                    "<i8", "u1", "u1", "u1",
+                    "<i8", "<i8", "u1", "u1", "u1",
+                    "<i8", "u1", "u1", "u1",
+                    "<i8", "<i8", "<i8",
+                ],
+                "offsets": [
+                    0, 4, 8, 12, 16, 24, 32, 40,
+                    48, 56, 64, 72, 80, 88, 96, 100, 104, 108,
+                    112, 113, 114, 115, 116, 117,
+                    128, 132, 136, 144, 152, 156,
+                    160, 161, 162, 163, 164, 165, 166, 167,
+                    168, 176, 184, 185, 186,
+                    192, 200, 201, 202,
+                    208, 216, 224, 225, 226,
+                    232, 240, 241, 242,
+                    248, 256, 264,
+                ],
+                "itemsize": TICK_BYTES,
+            }
+        )
+    return numpy.frombuffer(
+        wire_records,
+        dtype=_TICK_COLUMN_NUMPY_DTYPE,
+        count=record_count,
+    )
+
+
 def _new_columns(types: Mapping[str, str]) -> ColumnDict:
     return {name: [] for name in types}
 
@@ -630,109 +747,8 @@ class TickColumnBatch:
             raise ValueError("tick column batch cursor is not contiguous")
 
     def __len__(self) -> int:
-        return len(self.wire_records) // TICK_BYTES
+        return tick_wire_record_count(self.wire_records)
 
     def numpy_records(self):
         """Return a zero-copy, read-only NumPy structured wire view."""
-
-        global _TICK_COLUMN_NUMPY_DTYPE
-        numpy = importlib.import_module("numpy")
-        if _TICK_COLUMN_NUMPY_DTYPE is None:
-            _TICK_COLUMN_NUMPY_DTYPE = numpy.dtype(
-                {
-                    "names": [
-                        "record_schema_version",
-                        "record_bytes",
-                        "instrument_id",
-                        "registry_ordinal",
-                        "source_sequence",
-                        "ingress_sequence",
-                        "tick_stream_sequence",
-                        "vendor_sequence_id",
-                        "event_time_unix_ns",
-                        "recv_realtime_ns",
-                        "recv_monotonic_ns",
-                        "exchange_time_ns_since_midnight",
-                        "quality_flags",
-                        "market_notices",
-                        "source_stream_id",
-                        "trade_date",
-                        "vendor_local_time_raw",
-                        "common_reserved",
-                        "source_slot",
-                        "event_kind",
-                        "market",
-                        "quantity_unit",
-                        "security_type",
-                        "asset_scope",
-                        "validity_bitmap",
-                        "projection_flags",
-                        "channel",
-                        "native_event_sequence",
-                        "source_raw_code_1",
-                        "source_raw_code_2",
-                        "action",
-                        "side",
-                        "order_type",
-                        "aggressor",
-                        "phase",
-                        "raw_type_length",
-                        "raw_tick_flag_length",
-                        "tick_reserved_u8",
-                        "price_raw",
-                        "price_p6",
-                        "price_scale",
-                        "price_valid",
-                        "price_is_null",
-                        "quantity_raw",
-                        "quantity_scale",
-                        "quantity_valid",
-                        "quantity_is_null",
-                        "trade_amount_raw",
-                        "trade_amount_p6",
-                        "trade_amount_scale",
-                        "trade_amount_valid",
-                        "trade_amount_is_null",
-                        "matched_quantity_raw",
-                        "matched_quantity_scale",
-                        "matched_quantity_valid",
-                        "matched_quantity_is_null",
-                        "primary_order_id",
-                        "buy_order_id",
-                        "sell_order_id",
-                    ],
-                    "formats": [
-                        "<u4", "<u4", "<u4", "<u4",
-                        "<u8", "<u8", "<u8", "<u8",
-                        "<i8", "<i8", "<i8", "<u8",
-                        "<u8", "<u8", "<u4", "<u4",
-                        "<u4", "<u4",
-                        "u1", "u1", "u1", "u1", "u1", "u1",
-                        "<u4", "<u4", "<i8", "<i8", "<i4", "<i4",
-                        "u1", "u1", "u1", "u1", "u1", "u1", "u1",
-                        "u1", "<i8", "<i8", "u1", "u1", "u1",
-                        "<i8", "u1", "u1", "u1",
-                        "<i8", "<i8", "u1", "u1", "u1",
-                        "<i8", "u1", "u1", "u1",
-                        "<i8", "<i8", "<i8",
-                    ],
-                    "offsets": [
-                        0, 4, 8, 12, 16, 24, 32, 40,
-                        48, 56, 64, 72, 80, 88, 96, 100, 104, 108,
-                        112, 113, 114, 115, 116, 117,
-                        128, 132, 136, 144, 152, 156,
-                        160, 161, 162, 163, 164, 165, 166, 167,
-                        168, 176, 184, 185, 186,
-                        192, 200, 201, 202,
-                        208, 216, 224, 225, 226,
-                        232, 240, 241, 242,
-                        248, 256, 264,
-                    ],
-                    "itemsize": TICK_BYTES,
-                }
-            )
-        return numpy.frombuffer(
-            self.wire_records,
-            dtype=_TICK_COLUMN_NUMPY_DTYPE,
-            count=len(self),
-        )
+        return tick_wire_numpy_records(self.wire_records)

@@ -1,6 +1,7 @@
 #include "l2flow/ipc/realtime_shared_service_v1.h"
 
 #include "l2flow/ipc/realtime_history_wire_v1.h"
+#include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_wire_projection_v1.h"
 #include "l2flow/ipc/realtime_wire_v1.h"
 
@@ -501,6 +502,26 @@ bool GenerateReadToken(
             return false;
         }
         if (token != 0U && token != forbidden) {
+            *output = token;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool GenerateReadTokenExcluding(
+    std::uint64_t first_forbidden,
+    std::uint64_t second_forbidden,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    for (std::size_t attempt = 0U; attempt < 4U; ++attempt) {
+        std::uint64_t token = 0U;
+        if (!GenerateReadToken(first_forbidden, &token)) {
+            return false;
+        }
+        if (token != second_forbidden) {
             *output = token;
             return true;
         }
@@ -1366,6 +1387,34 @@ private:
         kProjectionFailure,
     };
 
+    struct TickDeltaPageLayout final {
+        std::uint64_t tick_offset = 0U;
+        std::uint64_t total_bytes = 0U;
+    };
+
+    struct BuiltTickDeltaPage final {
+        int read_only_fd = -1;
+        std::uint64_t mapping_bytes = 0U;
+        std::uint32_t record_count = 0U;
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            source_counts{};
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            last_source_sequences{};
+        std::uint64_t first_ingress_sequence = 0U;
+        std::uint64_t last_ingress_sequence = 0U;
+        std::uint64_t first_tick_stream_sequence = 0U;
+        std::uint64_t last_tick_stream_sequence = 0U;
+    };
+
+    enum class TickDeltaPageBuildError : std::uint8_t {
+        kNone = 0U,
+        kResourceExhausted,
+        kQueryFailure,
+        kProjectionFailure,
+    };
+
     [[nodiscard]] bool HistoryHealthy() const noexcept {
         return header_ != nullptr &&
                StateAcceptsHistoryRead(
@@ -1373,6 +1422,383 @@ private:
                        .load(std::memory_order_acquire)) &&
                (Atomic(header_->flags).load(std::memory_order_acquire) &
                 kRealtimeHeaderCoverageLostV1) == 0U;
+    }
+
+    [[nodiscard]] static bool TickDeltaExclusive(
+        const market::RealtimeHistoryWatermarkV1& watermark,
+        std::uint64_t* output) noexcept {
+        if (output == nullptr ||
+            watermark.sources[1U].sequence_exclusive == 0U ||
+            watermark.sources[3U].sequence_exclusive == 0U) {
+            return false;
+        }
+        std::uint64_t tick_count = 0U;
+        return CheckedAdd(
+                   watermark.sources[1U].sequence_exclusive - 1U,
+                   watermark.sources[3U].sequence_exclusive - 1U,
+                   &tick_count) &&
+               CheckedAdd(tick_count, 1U, output);
+    }
+
+    [[nodiscard]] static bool TickDeltaExclusive(
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            endpoint,
+        std::uint64_t* output) noexcept {
+        if (output == nullptr ||
+            endpoint.source_sequence_exclusive[1U] == 0U ||
+            endpoint.source_sequence_exclusive[3U] == 0U) {
+            return false;
+        }
+        std::uint64_t tick_count = 0U;
+        return CheckedAdd(
+                   endpoint.source_sequence_exclusive[1U] - 1U,
+                   endpoint.source_sequence_exclusive[3U] - 1U,
+                   &tick_count) &&
+               CheckedAdd(tick_count, 1U, output);
+    }
+
+    [[nodiscard]] bool FillTickDeltaGenerationEndpoint(
+        const market::IntradayInstrumentStoreGenerationV1& generation,
+        RealtimeInstrumentTickDeltaGenerationEndpointV2* output)
+        const noexcept {
+        if (output == nullptr ||
+            generation.instrument_count() !=
+                config_.registry->size() ||
+            generation.instrument_count() >
+                static_cast<std::size_t>(
+                    std::numeric_limits<std::uint32_t>::max())) {
+            return false;
+        }
+        const market::RealtimeHistoryWatermarkV1& watermark =
+            generation.watermark();
+        RealtimeInstrumentTickDeltaGenerationEndpointV2 result{};
+        for (std::size_t index = 0U;
+             index < watermark.run_id.size();
+             ++index) {
+            result.run_id[index] =
+                std::to_integer<std::uint8_t>(
+                    watermark.run_id[index]);
+        }
+        result.session_epoch = config_.session_epoch;
+        result.generation = watermark.generation;
+        result.trade_date = watermark.trade_date;
+        result.instrument_count =
+            static_cast<std::uint32_t>(
+                generation.instrument_count());
+        result.ingress_sequence_exclusive =
+            watermark.ingress_sequence_exclusive;
+        if (!TickDeltaExclusive(
+                watermark,
+                &result.tick_stream_sequence_exclusive)) {
+            return false;
+        }
+        result.recv_monotonic_cut_ns =
+            watermark.recv_monotonic_cut_ns;
+        result.registry_version = watermark.registry_version;
+        for (std::size_t index = 0U;
+             index < result.registry_sha256.size();
+             ++index) {
+            result.registry_sha256[index] =
+                std::to_integer<std::uint8_t>(
+                    watermark.registry_sha256[index]);
+            result.input_identity_sha256[index] =
+                std::to_integer<std::uint8_t>(
+                    watermark.input_identity_sha256[index]);
+        }
+        for (std::size_t source = 0U;
+             source < watermark.sources.size();
+             ++source) {
+            result.source_stream_ids[source] =
+                watermark.sources[source].source_stream_id;
+            result.source_sequence_exclusive[source] =
+                watermark.sources[source].sequence_exclusive;
+        }
+        result.flags =
+            kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2 |
+            (generation.coverage_from_open()
+                 ? kRealtimeInstrumentTickDeltaCoverageFromOpenV2
+                 : 0U);
+        result.payload_projection =
+            static_cast<std::uint32_t>(
+                RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                    kCoreV1);
+        *output = result;
+        return true;
+    }
+
+    [[nodiscard]] static bool SameTickDeltaGenerationEndpoint(
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            left,
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            right) noexcept {
+        return left.run_id == right.run_id &&
+               left.session_epoch == right.session_epoch &&
+               left.generation == right.generation &&
+               left.trade_date == right.trade_date &&
+               left.instrument_count == right.instrument_count &&
+               left.ingress_sequence_exclusive ==
+                   right.ingress_sequence_exclusive &&
+               left.tick_stream_sequence_exclusive ==
+                   right.tick_stream_sequence_exclusive &&
+               left.recv_monotonic_cut_ns ==
+                   right.recv_monotonic_cut_ns &&
+               left.registry_version == right.registry_version &&
+               left.registry_sha256 == right.registry_sha256 &&
+               left.input_identity_sha256 ==
+                   right.input_identity_sha256 &&
+               left.source_stream_ids == right.source_stream_ids &&
+               left.source_sequence_exclusive ==
+                   right.source_sequence_exclusive &&
+               left.flags == right.flags &&
+               left.payload_projection ==
+                   right.payload_projection &&
+               std::all_of(
+                   left.reserved.begin(),
+                   left.reserved.end(),
+                   [](std::uint8_t value) noexcept {
+                       return value == 0U;
+                   }) &&
+               std::all_of(
+                   right.reserved.begin(),
+                   right.reserved.end(),
+                   [](std::uint8_t value) noexcept {
+                       return value == 0U;
+                   });
+    }
+
+    [[nodiscard]] bool ValidateTickDeltaTargetEndpoint(
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            endpoint) const noexcept {
+        constexpr std::uint32_t expected_projection =
+            static_cast<std::uint32_t>(
+                RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                    kCoreV1);
+        constexpr std::uint32_t known_flags =
+            kRealtimeInstrumentTickDeltaCoverageFromOpenV2 |
+            kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2 |
+            kRealtimeInstrumentTickDeltaFieldCompleteV2;
+        std::array<std::uint8_t, 16U> expected_run_id{};
+        for (std::size_t index = 0U;
+             index < config_.run_id.size();
+             ++index) {
+            expected_run_id[index] =
+                std::to_integer<std::uint8_t>(
+                    config_.run_id[index]);
+        }
+        std::array<std::uint8_t, 32U> expected_registry_sha{};
+        for (std::size_t index = 0U;
+             index < expected_registry_sha.size();
+             ++index) {
+            expected_registry_sha[index] =
+                std::to_integer<std::uint8_t>(
+                    config_.registry->registry_sha256()[index]);
+        }
+        if (endpoint.run_id != expected_run_id ||
+            endpoint.session_epoch != config_.session_epoch ||
+            endpoint.generation == 0U ||
+            endpoint.trade_date != config_.trade_date ||
+            endpoint.instrument_count != config_.registry->size() ||
+            endpoint.ingress_sequence_exclusive == 0U ||
+            endpoint.registry_version !=
+                config_.registry->registry_version() ||
+            endpoint.registry_sha256 != expected_registry_sha ||
+            !std::any_of(
+                endpoint.input_identity_sha256.begin(),
+                endpoint.input_identity_sha256.end(),
+                [](std::uint8_t value) noexcept {
+                    return value != 0U;
+                }) ||
+            endpoint.payload_projection != expected_projection ||
+            (endpoint.flags & ~known_flags) != 0U ||
+            (endpoint.flags &
+             kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2) ==
+                0U ||
+            (endpoint.flags &
+             kRealtimeInstrumentTickDeltaFieldCompleteV2) != 0U ||
+            std::any_of(
+                endpoint.reserved.begin(),
+                endpoint.reserved.end(),
+                [](std::uint8_t value) noexcept {
+                    return value != 0U;
+                })) {
+            return false;
+        }
+        std::uint64_t source_total = 0U;
+        for (std::size_t source = 0U;
+             source < endpoint.source_stream_ids.size();
+             ++source) {
+            if (endpoint.source_stream_ids[source] == 0U ||
+                endpoint.source_sequence_exclusive[source] == 0U ||
+                !CheckedAdd(
+                    source_total,
+                    endpoint
+                            .source_sequence_exclusive[source] -
+                        1U,
+                    &source_total)) {
+                return false;
+            }
+            for (std::size_t prior = 0U;
+                 prior < source;
+                 ++prior) {
+                if (endpoint.source_stream_ids[prior] ==
+                    endpoint.source_stream_ids[source]) {
+                    return false;
+                }
+            }
+        }
+        std::uint64_t tick_exclusive = 0U;
+        return source_total ==
+                   endpoint.ingress_sequence_exclusive - 1U &&
+               TickDeltaExclusive(
+                   endpoint, &tick_exclusive) &&
+               tick_exclusive ==
+                   endpoint.tick_stream_sequence_exclusive;
+    }
+
+    [[nodiscard]] static bool ObjectBytesZero(
+        const void* value,
+        std::size_t bytes) noexcept {
+        if (value == nullptr) {
+            return false;
+        }
+        const auto* const begin =
+            static_cast<const std::uint8_t*>(value);
+        return std::all_of(
+            begin,
+            begin + bytes,
+            [](std::uint8_t byte) noexcept {
+                return byte == 0U;
+            });
+    }
+
+    [[nodiscard]] bool ValidateTickDeltaBaseEndpoint(
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            base,
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            target) const noexcept {
+        constexpr std::uint32_t known_flags =
+            kRealtimeInstrumentTickDeltaCoverageFromOpenV2 |
+            kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2 |
+            kRealtimeInstrumentTickDeltaFieldCompleteV2;
+        if (base.run_id != target.run_id ||
+            base.session_epoch != target.session_epoch ||
+            base.session_epoch != config_.session_epoch ||
+            base.generation == 0U ||
+            base.generation > target.generation ||
+            base.trade_date != target.trade_date ||
+            base.instrument_count != target.instrument_count ||
+            base.ingress_sequence_exclusive == 0U ||
+            base.ingress_sequence_exclusive >
+                target.ingress_sequence_exclusive ||
+            base.recv_monotonic_cut_ns >
+                target.recv_monotonic_cut_ns ||
+            base.registry_version != target.registry_version ||
+            base.registry_sha256 != target.registry_sha256 ||
+            base.source_stream_ids != target.source_stream_ids ||
+            base.flags != target.flags ||
+            (base.flags & ~known_flags) != 0U ||
+            (base.flags &
+             kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2) ==
+                0U ||
+            (base.flags &
+             kRealtimeInstrumentTickDeltaFieldCompleteV2) != 0U ||
+            base.payload_projection != target.payload_projection ||
+            base.payload_projection !=
+                static_cast<std::uint32_t>(
+                    RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                        kCoreV1) ||
+            std::any_of(
+                base.reserved.begin(),
+                base.reserved.end(),
+                [](std::uint8_t value) noexcept {
+                    return value != 0U;
+                })) {
+            return false;
+        }
+
+        std::uint64_t source_delta_total = 0U;
+        for (std::size_t source = 0U;
+             source < base.source_sequence_exclusive.size();
+             ++source) {
+            if (base.source_sequence_exclusive[source] == 0U ||
+                base.source_sequence_exclusive[source] >
+                    target.source_sequence_exclusive[source] ||
+                !CheckedAdd(
+                    source_delta_total,
+                    target.source_sequence_exclusive[source] -
+                        base.source_sequence_exclusive[source],
+                    &source_delta_total)) {
+                return false;
+            }
+        }
+        if (source_delta_total !=
+            target.ingress_sequence_exclusive -
+                base.ingress_sequence_exclusive) {
+            return false;
+        }
+
+        std::uint64_t computed_tick_exclusive = 0U;
+        if (!TickDeltaExclusive(
+                base, &computed_tick_exclusive) ||
+            computed_tick_exclusive !=
+                base.tick_stream_sequence_exclusive ||
+            base.tick_stream_sequence_exclusive >
+                target.tick_stream_sequence_exclusive) {
+            return false;
+        }
+        std::uint64_t source_tick_delta = 0U;
+        if (!CheckedAdd(
+                target.source_sequence_exclusive[1U] -
+                    base.source_sequence_exclusive[1U],
+                target.source_sequence_exclusive[3U] -
+                    base.source_sequence_exclusive[3U],
+                &source_tick_delta) ||
+            source_tick_delta !=
+                target.tick_stream_sequence_exclusive -
+                    base.tick_stream_sequence_exclusive) {
+            return false;
+        }
+
+        common::Identity128 run_id{};
+        for (std::size_t index = 0U; index < run_id.size(); ++index) {
+            run_id[index] = static_cast<std::byte>(
+                base.run_id[index]);
+        }
+        std::array<market::RealtimeSourceWatermarkV1,
+                   market::kRealtimeHistorySourceCountV1>
+            sources{};
+        for (std::size_t source = 0U;
+             source < sources.size();
+             ++source) {
+            sources[source].source_stream_id =
+                base.source_stream_ids[source];
+            sources[source].sequence_exclusive =
+                base.source_sequence_exclusive[source];
+        }
+        market::RealtimeHistoryWatermarkV1 rebuilt{};
+        if (market::BuildRealtimeHistoryWatermarkV1(
+                run_id,
+                base.generation,
+                base.trade_date,
+                base.ingress_sequence_exclusive,
+                base.recv_monotonic_cut_ns,
+                *config_.registry,
+                sources,
+                &rebuilt) !=
+                market::RealtimeHistoryWatermarkErrorV1::kNone) {
+            return false;
+        }
+        for (std::size_t index = 0U;
+             index < rebuilt.input_identity_sha256.size();
+             ++index) {
+            if (std::to_integer<std::uint8_t>(
+                    rebuilt.input_identity_sha256[index]) !=
+                base.input_identity_sha256[index]) {
+                return false;
+            }
+        }
+        return base.generation != target.generation ||
+               SameTickDeltaGenerationEndpoint(base, target);
     }
 
     [[nodiscard]] bool ComputeHistoryPageLayout(
@@ -1441,6 +1867,305 @@ private:
         }
         *output = result;
         return true;
+    }
+
+    [[nodiscard]] bool ComputeTickDeltaPageLayout(
+        std::uint64_t record_count,
+        TickDeltaPageLayout* output) const noexcept {
+        if (output == nullptr || record_count == 0U) {
+            return false;
+        }
+        TickDeltaPageLayout result{};
+        result.tick_offset =
+            sizeof(RealtimeInstrumentTickDeltaPageHeaderV2);
+        std::uint64_t tick_bytes = 0U;
+        if (!CheckedMultiply(
+                record_count,
+                sizeof(RealtimeWireTickPayloadV1),
+                &tick_bytes) ||
+            !CheckedAdd(
+                result.tick_offset,
+                tick_bytes,
+                &result.total_bytes) ||
+            result.total_bytes >
+                config_.maximum_history_page_bytes ||
+            result.total_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            result.total_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max())) {
+            return false;
+        }
+        *output = result;
+        return true;
+    }
+
+    [[nodiscard]] std::size_t TickDeltaPageRecordCapacity(
+        std::uint32_t requested) const noexcept {
+        const std::uint64_t upper = std::min<std::uint64_t>(
+            requested, config_.maximum_history_page_records);
+        std::uint64_t low = 0U;
+        std::uint64_t high = upper + 1U;
+        while (low + 1U < high) {
+            const std::uint64_t middle =
+                low + (high - low) / 2U;
+            TickDeltaPageLayout ignored{};
+            if (ComputeTickDeltaPageLayout(middle, &ignored)) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        return static_cast<std::size_t>(low);
+    }
+
+    [[nodiscard]] static bool TickDeltaCheckpointCountsValid(
+        const RealtimeInstrumentTickDeltaCheckpointV2&
+            checkpoint) noexcept {
+        if (checkpoint.instrument_id == 0U ||
+            checkpoint.generation
+                    .source_sequence_exclusive[1U] == 0U ||
+            checkpoint.generation
+                    .source_sequence_exclusive[3U] == 0U ||
+            checkpoint.instrument_tick_source_record_counts[0U] !=
+                0U ||
+            checkpoint.instrument_tick_source_record_counts[2U] !=
+                0U ||
+            std::any_of(
+                checkpoint.reserved.begin(),
+                checkpoint.reserved.end(),
+                [](std::uint8_t value) noexcept {
+                    return value != 0U;
+                })) {
+            return false;
+        }
+        std::uint64_t total = 0U;
+        return CheckedAdd(
+                   checkpoint
+                       .instrument_tick_source_record_counts[1U],
+                   checkpoint
+                       .instrument_tick_source_record_counts[3U],
+                   &total) &&
+               total == checkpoint.instrument_tick_record_count &&
+               checkpoint
+                       .instrument_tick_source_record_counts[1U] <=
+                   checkpoint.generation
+                           .source_sequence_exclusive[1U] -
+                       1U &&
+               checkpoint
+                       .instrument_tick_source_record_counts[3U] <=
+                   checkpoint.generation
+                           .source_sequence_exclusive[3U] -
+                       1U;
+    }
+
+    [[nodiscard]]
+    RealtimeInstrumentTickDeltaControlStatusV2
+    FillTickDeltaMetadata(
+        RealtimeInstrumentTickDeltaBaseKindV2 base_kind,
+        const RealtimeInstrumentTickDeltaCheckpointV2&
+            requested_base,
+        std::uint32_t instrument_id,
+        std::size_t registry_ordinal,
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            target_endpoint,
+        const market::IntradayInstrumentTickDeltaSummaryV1&
+            summary,
+        RealtimeInstrumentTickDeltaMetadataV2* output)
+        const noexcept {
+        if (output == nullptr ||
+            instrument_id == 0U ||
+            registry_ordinal >= config_.registry->size() ||
+            registry_ordinal >
+                static_cast<std::size_t>(
+                    std::numeric_limits<std::uint32_t>::max()) ||
+            summary.instrument_id != instrument_id ||
+            summary.ingress_sequence_end_exclusive !=
+                target_endpoint.ingress_sequence_exclusive ||
+            summary.selected_source_mask !=
+                std::array<std::uint8_t, 4U>{0U, 1U, 0U, 1U} ||
+            summary.base_tick_source_record_counts[0U] != 0U ||
+            summary.base_tick_source_record_counts[2U] != 0U ||
+            summary.target_tick_source_record_counts[0U] != 0U ||
+            summary.target_tick_source_record_counts[2U] != 0U ||
+            summary.delta_tick_source_record_counts[0U] != 0U ||
+            summary.delta_tick_source_record_counts[2U] != 0U) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+
+        const std::uint64_t expected_begin =
+            base_kind ==
+                    RealtimeInstrumentTickDeltaBaseKindV2::kOrigin
+                ? 1U
+                : requested_base.generation
+                      .ingress_sequence_exclusive;
+        if (summary.ingress_sequence_begin_inclusive !=
+            expected_begin) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+
+        RealtimeInstrumentTickDeltaMetadataV2 result{};
+        result.base_kind =
+            static_cast<std::uint32_t>(base_kind);
+        result.selected_source_mask =
+            kRealtimeInstrumentTickDeltaSourceMaskV2;
+        if (base_kind ==
+            RealtimeInstrumentTickDeltaBaseKindV2::kOrigin) {
+            if (!ObjectBytesZero(
+                    &requested_base,
+                    sizeof(requested_base)) ||
+                summary.base_tick_source_record_counts !=
+                    std::array<std::uint64_t, 4U>{}) {
+                return RealtimeInstrumentTickDeltaControlStatusV2::
+                    kCheckpointMismatch;
+            }
+            result.ingress_sequence_begin_inclusive = 1U;
+            result.tick_stream_sequence_begin_inclusive = 1U;
+        } else {
+            if (!ValidateTickDeltaBaseEndpoint(
+                    requested_base.generation,
+                    target_endpoint) ||
+                requested_base.instrument_id != instrument_id ||
+                requested_base.registry_ordinal !=
+                    registry_ordinal ||
+                !TickDeltaCheckpointCountsValid(
+                    requested_base) ||
+                requested_base
+                        .instrument_tick_source_record_counts !=
+                    summary.base_tick_source_record_counts) {
+                return RealtimeInstrumentTickDeltaControlStatusV2::
+                    kCheckpointMismatch;
+            }
+            result.base_checkpoint = requested_base;
+            result.ingress_sequence_begin_inclusive =
+                requested_base.generation
+                    .ingress_sequence_exclusive;
+            result.tick_stream_sequence_begin_inclusive =
+                requested_base.generation
+                    .tick_stream_sequence_exclusive;
+        }
+
+        result.target_checkpoint.generation = target_endpoint;
+        result.target_checkpoint.instrument_id = instrument_id;
+        result.target_checkpoint.registry_ordinal =
+            static_cast<std::uint32_t>(registry_ordinal);
+        result.target_checkpoint
+            .instrument_tick_source_record_counts =
+            summary.target_tick_source_record_counts;
+        if (!CheckedAdd(
+                summary.target_tick_source_record_counts[1U],
+                summary.target_tick_source_record_counts[3U],
+                &result.target_checkpoint
+                     .instrument_tick_record_count) ||
+            result.target_checkpoint
+                    .instrument_tick_source_record_counts[1U] >
+                target_endpoint.source_sequence_exclusive[1U] -
+                    1U ||
+            result.target_checkpoint
+                    .instrument_tick_source_record_counts[3U] >
+                target_endpoint.source_sequence_exclusive[3U] -
+                    1U) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+
+        result.delta_tick_source_record_counts =
+            summary.delta_tick_source_record_counts;
+        result.delta_tick_record_count =
+            summary.delta_tick_record_count;
+        std::uint64_t checked_delta_total = 0U;
+        if (!CheckedAdd(
+                result.delta_tick_source_record_counts[1U],
+                result.delta_tick_source_record_counts[3U],
+                &checked_delta_total) ||
+            checked_delta_total !=
+                result.delta_tick_record_count) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+        const auto boundary_failure =
+            base_kind ==
+                    RealtimeInstrumentTickDeltaBaseKindV2::
+                        kCheckpoint
+                ? RealtimeInstrumentTickDeltaControlStatusV2::
+                      kCheckpointMismatch
+                : RealtimeInstrumentTickDeltaControlStatusV2::
+                      kInternalFailure;
+        const std::uint64_t base_ingress_exclusive =
+            base_kind ==
+                    RealtimeInstrumentTickDeltaBaseKindV2::kOrigin
+                ? 1U
+                : requested_base.generation
+                      .ingress_sequence_exclusive;
+        const std::uint64_t base_tick_exclusive =
+            base_kind ==
+                    RealtimeInstrumentTickDeltaBaseKindV2::kOrigin
+                ? 1U
+                : requested_base.generation
+                      .tick_stream_sequence_exclusive;
+        for (const std::size_t source :
+             std::array<std::size_t, 2U>{1U, 3U}) {
+            const std::uint64_t base_source_exclusive =
+                base_kind ==
+                        RealtimeInstrumentTickDeltaBaseKindV2::
+                            kOrigin
+                    ? 1U
+                    : requested_base.generation
+                          .source_sequence_exclusive[source];
+            if (base_source_exclusive >
+                    target_endpoint
+                        .source_sequence_exclusive[source] ||
+                result.delta_tick_source_record_counts[source] >
+                    target_endpoint
+                            .source_sequence_exclusive[source] -
+                        base_source_exclusive) {
+                return boundary_failure;
+            }
+        }
+        if (base_ingress_exclusive >
+                target_endpoint.ingress_sequence_exclusive ||
+            base_tick_exclusive >
+                target_endpoint
+                    .tick_stream_sequence_exclusive ||
+            result.delta_tick_record_count >
+                target_endpoint
+                        .tick_stream_sequence_exclusive -
+                    base_tick_exclusive ||
+            target_endpoint
+                        .tick_stream_sequence_exclusive -
+                    base_tick_exclusive >
+                target_endpoint.ingress_sequence_exclusive -
+                    base_ingress_exclusive) {
+            return boundary_failure;
+        }
+        for (const std::size_t source :
+             std::array<std::size_t, 2U>{1U, 3U}) {
+            if (summary.base_tick_source_record_counts[source] >
+                    summary
+                        .target_tick_source_record_counts[source] ||
+                summary
+                        .target_tick_source_record_counts[source] -
+                        summary
+                            .base_tick_source_record_counts[source] !=
+                    summary
+                        .delta_tick_source_record_counts[source]) {
+                return RealtimeInstrumentTickDeltaControlStatusV2::
+                    kInternalFailure;
+            }
+        }
+
+        result.ingress_sequence_end_exclusive =
+            target_endpoint.ingress_sequence_exclusive;
+        result.tick_stream_sequence_end_exclusive =
+            target_endpoint.tick_stream_sequence_exclusive;
+        result.flags = target_endpoint.flags;
+        result.payload_projection =
+            target_endpoint.payload_projection;
+        *output = result;
+        return RealtimeInstrumentTickDeltaControlStatusV2::kOk;
     }
 
     [[nodiscard]] bool FillHistoryGenerationInfo(
@@ -2188,6 +2913,299 @@ private:
         return HistoryPageBuildError::kNone;
     }
 
+    [[nodiscard]] TickDeltaPageBuildError BuildTickDeltaPage(
+        market::IntradayInstrumentTickDeltaCursorV1& cursor,
+        std::size_t registry_ordinal,
+        const RealtimeInstrumentTickDeltaMetadataV2& metadata,
+        std::uint64_t page_index,
+        std::size_t* page_capacity,
+        std::uint64_t previous_ingress_sequence,
+        std::uint64_t previous_tick_stream_sequence,
+        const std::array<
+            std::uint64_t,
+            market::kIntradayInstrumentStoreSourceCountV1>&
+            previous_source_sequences,
+        BuiltTickDeltaPage* output) noexcept {
+        if (page_capacity == nullptr || *page_capacity == 0U ||
+            output == nullptr || output->read_only_fd >= 0) {
+            return TickDeltaPageBuildError::kQueryFailure;
+        }
+        *output = BuiltTickDeltaPage{};
+        std::vector<const market::RealtimeHistoryRecordV1*> records;
+        try {
+            records.resize(*page_capacity);
+        } catch (...) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+
+        std::size_t written = 0U;
+        market::IntradayInstrumentStoreQueryErrorV1 query_error =
+            market::IntradayInstrumentStoreQueryErrorV1::
+                kBatchLimitExceeded;
+        while (query_error ==
+               market::IntradayInstrumentStoreQueryErrorV1::
+                   kBatchLimitExceeded) {
+            query_error = cursor.ReadBatch(
+                std::span<
+                    const market::RealtimeHistoryRecordV1*>(
+                    records.data(), *page_capacity),
+                &written);
+            if (query_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded) {
+                break;
+            }
+            if (*page_capacity == 1U) {
+                return TickDeltaPageBuildError::kQueryFailure;
+            }
+            *page_capacity = std::max<std::size_t>(
+                1U, *page_capacity / 2U);
+            records.resize(*page_capacity);
+        }
+        if (query_error ==
+            market::IntradayInstrumentStoreQueryErrorV1::
+                kResourceExhausted) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        if (query_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            written > *page_capacity) {
+            return TickDeltaPageBuildError::kQueryFailure;
+        }
+        if (written == 0U) {
+            return cursor.done()
+                       ? TickDeltaPageBuildError::kNone
+                       : TickDeltaPageBuildError::kQueryFailure;
+        }
+
+        TickDeltaPageLayout layout{};
+        if (!ComputeTickDeltaPageLayout(written, &layout)) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+
+        struct PageResources final {
+            int writable_fd = -1;
+            void* mapping = MAP_FAILED;
+            std::size_t mapping_bytes = 0U;
+            ~PageResources() {
+                if (mapping != MAP_FAILED) {
+                    static_cast<void>(
+                        ::munmap(mapping, mapping_bytes));
+                }
+                CloseDescriptor(&writable_fd);
+            }
+        } resources;
+        resources.mapping_bytes =
+            static_cast<std::size_t>(layout.total_bytes);
+        resources.writable_fd = ::memfd_create(
+            "l2flow-instrument-tick-delta-page-v2",
+            MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (resources.writable_fd < 0 ||
+            ::ftruncate(
+                resources.writable_fd,
+                static_cast<off_t>(layout.total_bytes)) != 0) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        resources.mapping = ::mmap(
+            nullptr,
+            resources.mapping_bytes,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            resources.writable_fd,
+            0);
+        if (resources.mapping == MAP_FAILED) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        std::memset(
+            resources.mapping, 0, resources.mapping_bytes);
+
+        auto* const page =
+            static_cast<RealtimeInstrumentTickDeltaPageHeaderV2*>(
+                resources.mapping);
+        page->magic = kRealtimeInstrumentTickDeltaPageMagicV2;
+        page->abi_major = kRealtimeWireMajorV1;
+        page->abi_minor = kRealtimeWireMinorV1;
+        page->header_bytes =
+            static_cast<std::uint32_t>(
+                sizeof(RealtimeInstrumentTickDeltaPageHeaderV2));
+        page->endian_marker = kRealtimeLittleEndianMarkerV1;
+        page->total_mapping_bytes = layout.total_bytes;
+        page->page_index = page_index;
+        page->record_count =
+            static_cast<std::uint32_t>(written);
+        page->tick_payload_bytes =
+            static_cast<std::uint32_t>(
+                sizeof(RealtimeWireTickPayloadV1));
+        page->tick_payloads_offset = layout.tick_offset;
+        page->metadata = metadata;
+        auto* const ticks =
+            reinterpret_cast<RealtimeWireTickPayloadV1*>(
+                static_cast<std::byte*>(resources.mapping) +
+                layout.tick_offset);
+
+        std::uint64_t prior_ingress =
+            previous_ingress_sequence;
+        std::uint64_t prior_tick =
+            previous_tick_stream_sequence;
+        auto prior_source_sequences =
+            previous_source_sequences;
+        const std::uint32_t instrument_id =
+            metadata.target_checkpoint.instrument_id;
+        const auto& target =
+            metadata.target_checkpoint.generation;
+        const auto& base =
+            metadata.base_checkpoint.generation;
+        const bool origin =
+            metadata.base_kind ==
+            static_cast<std::uint32_t>(
+                RealtimeInstrumentTickDeltaBaseKindV2::kOrigin);
+        for (std::size_t index = 0U; index < written; ++index) {
+            if (records[index] == nullptr) {
+                return TickDeltaPageBuildError::kProjectionFailure;
+            }
+            const market::RealtimeHistoryRecordV1& record =
+                *records[index];
+            const std::size_t source = record.source_slot();
+            const bool source_kind_valid =
+                (source == 1U &&
+                 record.kind() ==
+                     market::MarketEventKindV1::kShanghaiTick) ||
+                (source == 3U &&
+                 (record.kind() ==
+                      market::MarketEventKindV1::kShenzhenOrder ||
+                  record.kind() ==
+                      market::MarketEventKindV1::
+                          kShenzhenTransaction));
+            const std::uint64_t source_begin =
+                !source_kind_valid
+                    ? 0U
+                    : (origin
+                           ? 1U
+                           : base.source_sequence_exclusive[source]);
+            if (!source_kind_valid ||
+                record.instrument_id() != instrument_id ||
+                source >= target.source_stream_ids.size() ||
+                record.source_stream_id() !=
+                    target.source_stream_ids[source] ||
+                record.source_sequence() < source_begin ||
+                record.source_sequence() >=
+                    target.source_sequence_exclusive[source] ||
+                record.source_sequence() <=
+                    prior_source_sequences[source] ||
+                record.ingress_sequence() <
+                    metadata
+                        .ingress_sequence_begin_inclusive ||
+                record.ingress_sequence() >=
+                    metadata
+                        .ingress_sequence_end_exclusive ||
+                record.ingress_sequence() <= prior_ingress ||
+                record.tick_stream_sequence() == 0U ||
+                record.tick_stream_sequence() ==
+                    std::numeric_limits<std::uint64_t>::max() ||
+                record.tick_stream_sequence() <
+                    metadata
+                        .tick_stream_sequence_begin_inclusive ||
+                record.tick_stream_sequence() >=
+                    metadata
+                        .tick_stream_sequence_end_exclusive ||
+                record.tick_stream_sequence() <= prior_tick ||
+                record.tick_stream_sequence() >
+                    record.ingress_sequence() ||
+                output->source_counts[source] ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                return TickDeltaPageBuildError::kProjectionFailure;
+            }
+
+            std::uint32_t projection_flags = 0U;
+            if (!ProjectHistoryTickWireV1(
+                    record,
+                    registry_ordinal,
+                    &ticks[index],
+                    &projection_flags) ||
+                ticks[index].projection_flags !=
+                    projection_flags) {
+                return TickDeltaPageBuildError::kProjectionFailure;
+            }
+            const RealtimeWireCommonRecordV1& common =
+                ticks[index].common;
+            if (common.instrument_id != record.instrument_id() ||
+                common.registry_ordinal != registry_ordinal ||
+                common.source_stream_id !=
+                    record.source_stream_id() ||
+                common.source_sequence !=
+                    record.source_sequence() ||
+                common.ingress_sequence !=
+                    record.ingress_sequence() ||
+                common.tick_stream_sequence !=
+                    record.tick_stream_sequence() ||
+                common.source_slot != record.source_slot() ||
+                common.event_kind !=
+                    static_cast<std::uint8_t>(record.kind()) ||
+                common.trade_date != target.trade_date) {
+                return TickDeltaPageBuildError::kProjectionFailure;
+            }
+            ++output->source_counts[source];
+            prior_source_sequences[source] =
+                record.source_sequence();
+            prior_ingress = record.ingress_sequence();
+            prior_tick = record.tick_stream_sequence();
+        }
+
+        page->first_ingress_sequence =
+            records.front()->ingress_sequence();
+        page->last_ingress_sequence =
+            records[written - 1U]->ingress_sequence();
+        page->first_tick_stream_sequence =
+            records.front()->tick_stream_sequence();
+        page->last_tick_stream_sequence =
+            records[written - 1U]->tick_stream_sequence();
+        output->first_ingress_sequence =
+            page->first_ingress_sequence;
+        output->last_ingress_sequence =
+            page->last_ingress_sequence;
+        output->first_tick_stream_sequence =
+            page->first_tick_stream_sequence;
+        output->last_tick_stream_sequence =
+            page->last_tick_stream_sequence;
+        output->last_source_sequences =
+            prior_source_sequences;
+
+        if (::munmap(
+                resources.mapping, resources.mapping_bytes) != 0) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        resources.mapping = MAP_FAILED;
+        const int seals =
+            F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK |
+            F_SEAL_SEAL;
+        if (::fcntl(
+                resources.writable_fd, F_ADD_SEALS, seals) != 0 ||
+            ::fcntl(resources.writable_fd, F_GET_SEALS) != seals) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        std::array<char, 64U> proc_path{};
+        const int path_bytes = std::snprintf(
+            proc_path.data(),
+            proc_path.size(),
+            "/proc/self/fd/%d",
+            resources.writable_fd);
+        if (path_bytes <= 0 ||
+            static_cast<std::size_t>(path_bytes) >=
+                proc_path.size()) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        const int read_only_fd =
+            ::open(proc_path.data(), O_RDONLY | O_CLOEXEC);
+        if (read_only_fd < 0) {
+            return TickDeltaPageBuildError::kResourceExhausted;
+        }
+        output->read_only_fd = read_only_fd;
+        output->mapping_bytes = layout.total_bytes;
+        output->record_count =
+            static_cast<std::uint32_t>(written);
+        return TickDeltaPageBuildError::kNone;
+    }
+
     [[nodiscard]] bool SendHistoryOpenResponse(
         int client,
         std::uint64_t request_id,
@@ -2276,6 +3294,183 @@ private:
             page_fd,
             static_cast<int>(
                 config_.history_reader_idle_timeout.count()));
+    }
+
+    [[nodiscard]] bool SendTickDeltaOpenSessionResponse(
+        int client,
+        std::uint64_t request_id,
+        RealtimeInstrumentTickDeltaControlStatusV2 status,
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2*
+            target,
+        std::uint64_t delta_session_token = 0U) const noexcept {
+        RealtimeInstrumentTickDeltaOpenSessionResponseV2 response{};
+        response.magic = kRealtimeControlMagicV1;
+        response.protocol_major = kRealtimeWireMajorV1;
+        response.protocol_minor = kRealtimeWireMinorV1;
+        response.status = static_cast<std::uint16_t>(status);
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.request_id = request_id;
+        if (status ==
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+            if (target == nullptr || delta_session_token == 0U) {
+                return false;
+            }
+            response.target_generation = *target;
+            response.delta_session_token = delta_session_token;
+        } else if (
+            target != nullptr || delta_session_token != 0U) {
+            return false;
+        }
+        return SendPacket(
+            client,
+            &response,
+            sizeof(response),
+            -1,
+            static_cast<int>(
+                config_.history_reader_idle_timeout.count()));
+    }
+
+    [[nodiscard]] bool SendTickDeltaOpenInstrumentResponse(
+        int client,
+        std::uint64_t request_id,
+        RealtimeInstrumentTickDeltaControlStatusV2 status,
+        const RealtimeInstrumentTickDeltaMetadataV2* metadata,
+        std::uint64_t initial_read_token = 0U) const noexcept {
+        RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+            response{};
+        response.magic = kRealtimeControlMagicV1;
+        response.protocol_major = kRealtimeWireMajorV1;
+        response.protocol_minor = kRealtimeWireMinorV1;
+        response.status = static_cast<std::uint16_t>(status);
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.request_id = request_id;
+        if (status ==
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+            if (metadata == nullptr ||
+                initial_read_token == 0U) {
+                return false;
+            }
+            response.initial_read_token = initial_read_token;
+            response.metadata = *metadata;
+        } else if (
+            metadata != nullptr || initial_read_token != 0U) {
+            return false;
+        }
+        return SendPacket(
+            client,
+            &response,
+            sizeof(response),
+            -1,
+            static_cast<int>(
+                config_.history_reader_idle_timeout.count()));
+    }
+
+    [[nodiscard]] bool SendTickDeltaReadResponse(
+        int client,
+        std::uint64_t request_id,
+        RealtimeInstrumentTickDeltaControlStatusV2 status,
+        std::uint16_t response_flags,
+        std::uint32_t record_count,
+        std::uint64_t page_mapping_bytes,
+        std::uint64_t page_index,
+        std::uint64_t target_generation,
+        int page_fd,
+        std::uint64_t next_read_token = 0U) const noexcept {
+        const bool success =
+            status ==
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk;
+        const bool terminal =
+            (response_flags &
+             kRealtimeInstrumentTickDeltaResponseTerminalV2) != 0U;
+        if ((!success &&
+             (response_flags != 0U || record_count != 0U ||
+              page_mapping_bytes != 0U || page_index != 0U ||
+              target_generation != 0U || page_fd >= 0 ||
+              next_read_token != 0U)) ||
+            (success && terminal &&
+             (response_flags !=
+                  kRealtimeInstrumentTickDeltaResponseTerminalV2 ||
+              record_count != 0U || page_mapping_bytes != 0U ||
+              page_fd >= 0 || next_read_token != 0U)) ||
+            (success && !terminal &&
+             (response_flags != 0U || record_count == 0U ||
+              page_mapping_bytes <
+                  sizeof(
+                      RealtimeInstrumentTickDeltaPageHeaderV2) ||
+              page_fd < 0 || next_read_token == 0U))) {
+            return false;
+        }
+        RealtimeInstrumentTickDeltaReadResponseV2 response{};
+        response.magic = kRealtimeControlMagicV1;
+        response.protocol_major = kRealtimeWireMajorV1;
+        response.protocol_minor = kRealtimeWireMinorV1;
+        response.status = static_cast<std::uint16_t>(status);
+        response.flags = response_flags;
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.record_count = record_count;
+        response.request_id = request_id;
+        response.page_mapping_bytes = page_mapping_bytes;
+        response.page_index = page_index;
+        response.target_generation = target_generation;
+        response.next_read_token = next_read_token;
+        return SendPacket(
+            client,
+            &response,
+            sizeof(response),
+            page_fd,
+            static_cast<int>(
+                config_.history_reader_idle_timeout.count()));
+    }
+
+    template <typename Request>
+    [[nodiscard]] bool ReceiveTickDeltaRequest(
+        int client,
+        Request* output) const noexcept {
+        static_assert(std::is_standard_layout_v<Request>);
+        if (output == nullptr) {
+            return false;
+        }
+        *output = Request{};
+        pollfd descriptor{};
+        descriptor.fd = client;
+        descriptor.events = static_cast<short>(POLLIN);
+        std::uint64_t deadline_ns = 0U;
+        if (!MonotonicDeadline(
+                static_cast<int>(
+                    config_.history_reader_idle_timeout.count()),
+                &deadline_ns)) {
+            return false;
+        }
+        int ready = -1;
+        do {
+            const int remaining_ms =
+                RemainingPollMilliseconds(deadline_ns);
+            if (remaining_ms == 0) {
+                return false;
+            }
+            ready = ::poll(
+                &descriptor,
+                1U,
+                remaining_ms);
+        } while (ready < 0 && errno == EINTR);
+        if (ready <= 0 ||
+            (descriptor.revents &
+             (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+            (descriptor.revents & POLLIN) == 0) {
+            return false;
+        }
+        ssize_t received = -1;
+        do {
+            received = ::recv(
+                client, output, sizeof(*output), MSG_TRUNC);
+        } while (
+            received < 0 && errno == EINTR &&
+            RemainingPollMilliseconds(deadline_ns) != 0);
+        return received ==
+               static_cast<ssize_t>(sizeof(*output));
     }
 
     [[nodiscard]] bool ReceiveHistoryReadRequest(
@@ -2760,6 +3955,542 @@ private:
         }
     }
 
+    [[nodiscard]] bool ServeTickDeltaInstrument(
+        int client,
+        const std::shared_ptr<const market::
+                                  IntradayInstrumentStoreGenerationV1>&
+            target_generation,
+        const RealtimeInstrumentTickDeltaGenerationEndpointV2&
+            target_endpoint,
+        std::uint64_t delta_session_token,
+        const RealtimeInstrumentTickDeltaOpenInstrumentRequestV2&
+            request) noexcept {
+        const auto send_open_error =
+            [&](RealtimeInstrumentTickDeltaControlStatusV2 status)
+                noexcept {
+                    static_cast<void>(
+                        SendTickDeltaOpenInstrumentResponse(
+                            client,
+                            request.request_id,
+                            status,
+                            nullptr));
+                };
+        if (request.magic != kRealtimeControlMagicV1 ||
+            request.message_bytes != sizeof(request) ||
+            request.opcode !=
+                static_cast<std::uint16_t>(
+                    RealtimeInstrumentTickDeltaControlOpcodeV2::
+                        kOpenInstrumentDelta) ||
+            request.flags != 0U || request.reserved0 != 0U ||
+            request.reserved1 != 0U ||
+            std::any_of(
+                request.reserved2.begin(),
+                request.reserved2.end(),
+                [](std::uint8_t value) noexcept {
+                    return value != 0U;
+                }) ||
+            request.request_id == 0U ||
+            request.instrument_id == 0U ||
+            request.requested_page_records == 0U ||
+            request.delta_session_token !=
+                delta_session_token) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kInvalidRequest);
+            return false;
+        }
+        if (request.protocol_major != kRealtimeWireMajorV1 ||
+            request.protocol_minor != kRealtimeWireMinorV1) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnsupportedVersion);
+            return false;
+        }
+        const auto base_kind =
+            static_cast<RealtimeInstrumentTickDeltaBaseKindV2>(
+                request.base_kind);
+        if (base_kind !=
+                RealtimeInstrumentTickDeltaBaseKindV2::kOrigin &&
+            base_kind !=
+                RealtimeInstrumentTickDeltaBaseKindV2::
+                    kCheckpoint) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kInvalidRequest);
+            return false;
+        }
+        if (!HistoryHealthy()) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnavailable);
+            return false;
+        }
+
+        const market::InstrumentRegistryLookupResultV1 lookup =
+            config_.registry->LookupById(request.instrument_id);
+        if (!lookup.known()) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kNotFound);
+            return true;
+        }
+        std::uint64_t ingress_begin = 1U;
+        if (base_kind ==
+            RealtimeInstrumentTickDeltaBaseKindV2::kOrigin) {
+            if (!ObjectBytesZero(
+                    &request.base_checkpoint,
+                    sizeof(request.base_checkpoint))) {
+                send_open_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kCheckpointMismatch);
+                return true;
+            }
+        } else {
+            if (!ValidateTickDeltaBaseEndpoint(
+                    request.base_checkpoint.generation,
+                    target_endpoint) ||
+                request.base_checkpoint.instrument_id !=
+                    request.instrument_id ||
+                request.base_checkpoint.registry_ordinal !=
+                    lookup.registry_ordinal ||
+                !TickDeltaCheckpointCountsValid(
+                    request.base_checkpoint)) {
+                send_open_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kCheckpointMismatch);
+                return true;
+            }
+            ingress_begin =
+                request.base_checkpoint.generation
+                    .ingress_sequence_exclusive;
+        }
+
+        std::size_t page_capacity =
+            TickDeltaPageRecordCapacity(
+                request.requested_page_records);
+        if (page_capacity == 0U) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kResourceExhausted);
+            return true;
+        }
+        std::unique_ptr<
+            market::IntradayInstrumentTickDeltaCursorV1>
+            cursor;
+        const market::IntradayInstrumentStoreQueryErrorV1
+            open_error =
+                target_generation
+                    ->OpenInstrumentTickDeltaCursor(
+                        request.instrument_id,
+                        ingress_begin,
+                        &cursor);
+        if (open_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            cursor == nullptr) {
+            send_open_error(
+                open_error ==
+                        market::IntradayInstrumentStoreQueryErrorV1::
+                            kResourceExhausted
+                    ? RealtimeInstrumentTickDeltaControlStatusV2::
+                          kResourceExhausted
+                    : RealtimeInstrumentTickDeltaControlStatusV2::
+                          kInternalFailure);
+            return open_error ==
+                   market::IntradayInstrumentStoreQueryErrorV1::
+                       kResourceExhausted;
+        }
+
+        RealtimeInstrumentTickDeltaMetadataV2 metadata{};
+        const RealtimeInstrumentTickDeltaControlStatusV2
+            metadata_status = FillTickDeltaMetadata(
+                base_kind,
+                request.base_checkpoint,
+                request.instrument_id,
+                lookup.registry_ordinal,
+                target_endpoint,
+                cursor->summary(),
+                &metadata);
+        if (metadata_status !=
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+            send_open_error(metadata_status);
+            return metadata_status ==
+                   RealtimeInstrumentTickDeltaControlStatusV2::
+                       kCheckpointMismatch;
+        }
+        if (!HistoryHealthy()) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnavailable);
+            return false;
+        }
+        std::uint64_t read_token = 0U;
+        if (!GenerateReadTokenExcluding(
+                delta_session_token, 0U, &read_token)) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kResourceExhausted);
+            return true;
+        }
+        if (!SendTickDeltaOpenInstrumentResponse(
+                client,
+                request.request_id,
+                RealtimeInstrumentTickDeltaControlStatusV2::kOk,
+                &metadata,
+                read_token)) {
+            return false;
+        }
+
+        std::uint64_t page_index = 0U;
+        std::uint64_t emitted_records = 0U;
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            emitted_source_counts{};
+        std::array<std::uint64_t,
+                   market::kIntradayInstrumentStoreSourceCountV1>
+            last_source_sequences{};
+        if (base_kind ==
+            RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint) {
+            for (std::size_t source = 0U;
+                 source < last_source_sequences.size();
+                 ++source) {
+                last_source_sequences[source] =
+                    metadata.base_checkpoint.generation
+                            .source_sequence_exclusive[source] -
+                        1U;
+            }
+        }
+        std::uint64_t last_ingress_sequence =
+            metadata.ingress_sequence_begin_inclusive - 1U;
+        std::uint64_t last_tick_stream_sequence =
+            metadata
+                .tick_stream_sequence_begin_inclusive -
+            1U;
+
+        for (;;) {
+            if (control_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            RealtimeInstrumentTickDeltaReadRequestV2
+                read_request{};
+            if (!ReceiveTickDeltaRequest(
+                    client, &read_request)) {
+                return false;
+            }
+            const auto send_read_error =
+                [&](RealtimeInstrumentTickDeltaControlStatusV2
+                        status) noexcept {
+                    static_cast<void>(
+                        SendTickDeltaReadResponse(
+                            client,
+                            read_request.request_id,
+                            status,
+                            0U,
+                            0U,
+                            0U,
+                            0U,
+                            0U,
+                            -1));
+                };
+            if (read_request.magic !=
+                    kRealtimeControlMagicV1 ||
+                read_request.message_bytes !=
+                    sizeof(read_request) ||
+                read_request.opcode !=
+                    static_cast<std::uint16_t>(
+                        RealtimeInstrumentTickDeltaControlOpcodeV2::
+                            kReadInstrumentDelta) ||
+                read_request.flags != 0U ||
+                read_request.reserved0 != 0U ||
+                read_request.request_id == 0U ||
+                read_request.expected_page_index != page_index ||
+                read_request.read_token != read_token) {
+                send_read_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kInvalidRequest);
+                return false;
+            }
+            if (read_request.protocol_major !=
+                    kRealtimeWireMajorV1 ||
+                read_request.protocol_minor !=
+                    kRealtimeWireMinorV1) {
+                send_read_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnsupportedVersion);
+                return false;
+            }
+            if (!HistoryHealthy()) {
+                send_read_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnavailable);
+                return false;
+            }
+
+            if (cursor->done()) {
+                if (emitted_records !=
+                        metadata.delta_tick_record_count ||
+                    emitted_source_counts !=
+                        metadata
+                            .delta_tick_source_record_counts) {
+                    send_read_error(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInternalFailure);
+                    return false;
+                }
+                if (!HistoryHealthy()) {
+                    send_read_error(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kUnavailable);
+                    return false;
+                }
+                return SendTickDeltaReadResponse(
+                    client,
+                    read_request.request_id,
+                    RealtimeInstrumentTickDeltaControlStatusV2::kOk,
+                    kRealtimeInstrumentTickDeltaResponseTerminalV2,
+                    0U,
+                    0U,
+                    page_index,
+                    target_endpoint.generation,
+                    -1);
+            }
+
+            BuiltTickDeltaPage page{};
+            const TickDeltaPageBuildError build_error =
+                BuildTickDeltaPage(
+                    *cursor,
+                    lookup.registry_ordinal,
+                    metadata,
+                    page_index,
+                    &page_capacity,
+                    last_ingress_sequence,
+                    last_tick_stream_sequence,
+                    last_source_sequences,
+                    &page);
+            if (build_error !=
+                TickDeltaPageBuildError::kNone) {
+                send_read_error(
+                    build_error ==
+                            TickDeltaPageBuildError::
+                                kResourceExhausted
+                        ? RealtimeInstrumentTickDeltaControlStatusV2::
+                              kResourceExhausted
+                        : RealtimeInstrumentTickDeltaControlStatusV2::
+                              kInternalFailure);
+                CloseDescriptor(&page.read_only_fd);
+                return false;
+            }
+            if (page.record_count == 0U) {
+                if (!cursor->done() ||
+                    emitted_records !=
+                        metadata.delta_tick_record_count ||
+                    emitted_source_counts !=
+                        metadata
+                            .delta_tick_source_record_counts) {
+                    send_read_error(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInternalFailure);
+                    return false;
+                }
+                if (!HistoryHealthy()) {
+                    send_read_error(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kUnavailable);
+                    return false;
+                }
+                return SendTickDeltaReadResponse(
+                    client,
+                    read_request.request_id,
+                    RealtimeInstrumentTickDeltaControlStatusV2::kOk,
+                    kRealtimeInstrumentTickDeltaResponseTerminalV2,
+                    0U,
+                    0U,
+                    page_index,
+                    target_endpoint.generation,
+                    -1);
+            }
+
+            std::uint64_t next_emitted = 0U;
+            if (!CheckedAdd(
+                    emitted_records,
+                    page.record_count,
+                    &next_emitted) ||
+                next_emitted >
+                    metadata.delta_tick_record_count) {
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kInternalFailure);
+                return false;
+            }
+            auto next_source_counts = emitted_source_counts;
+            for (std::size_t source = 0U;
+                 source < next_source_counts.size();
+                 ++source) {
+                if (!CheckedAdd(
+                        next_source_counts[source],
+                        page.source_counts[source],
+                        &next_source_counts[source]) ||
+                    next_source_counts[source] >
+                        metadata
+                            .delta_tick_source_record_counts[source]) {
+                    CloseDescriptor(&page.read_only_fd);
+                    send_read_error(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInternalFailure);
+                    return false;
+                }
+            }
+            std::uint64_t next_read_token = 0U;
+            if (!GenerateReadTokenExcluding(
+                    delta_session_token,
+                    read_token,
+                    &next_read_token)) {
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kResourceExhausted);
+                return false;
+            }
+            if (!HistoryHealthy()) {
+                CloseDescriptor(&page.read_only_fd);
+                send_read_error(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnavailable);
+                return false;
+            }
+            const bool sent = SendTickDeltaReadResponse(
+                client,
+                read_request.request_id,
+                RealtimeInstrumentTickDeltaControlStatusV2::kOk,
+                0U,
+                page.record_count,
+                page.mapping_bytes,
+                page_index,
+                target_endpoint.generation,
+                page.read_only_fd,
+                next_read_token);
+            CloseDescriptor(&page.read_only_fd);
+            if (!sent) {
+                return false;
+            }
+            emitted_records = next_emitted;
+            emitted_source_counts = next_source_counts;
+            last_ingress_sequence =
+                page.last_ingress_sequence;
+            last_tick_stream_sequence =
+                page.last_tick_stream_sequence;
+            last_source_sequences =
+                page.last_source_sequences;
+            read_token = next_read_token;
+            if (page_index ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                return false;
+            }
+            ++page_index;
+        }
+    }
+
+    void TickDeltaClientLoop(
+        int client,
+        RealtimeInstrumentTickDeltaOpenSessionRequestV2 request)
+        noexcept {
+        const auto send_open_error =
+            [&](RealtimeInstrumentTickDeltaControlStatusV2 status)
+                noexcept {
+                    static_cast<void>(
+                        SendTickDeltaOpenSessionResponse(
+                            client,
+                            request.request_id,
+                            status,
+                            nullptr));
+                };
+        if (request.magic != kRealtimeControlMagicV1 ||
+            request.message_bytes != sizeof(request) ||
+            request.opcode !=
+                static_cast<std::uint16_t>(
+                    RealtimeInstrumentTickDeltaControlOpcodeV2::
+                        kOpenDeltaSession) ||
+            request.flags != 0U || request.reserved0 != 0U ||
+            request.reserved1 != 0U ||
+            request.request_id == 0U) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kInvalidRequest);
+            return;
+        }
+        if (request.protocol_major != kRealtimeWireMajorV1 ||
+            request.protocol_minor != kRealtimeWireMinorV1) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnsupportedVersion);
+            return;
+        }
+        if (!HistoryHealthy()) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnavailable);
+            return;
+        }
+        const std::shared_ptr<const market::
+                                  IntradayInstrumentStoreGenerationV1>
+            target_generation = std::atomic_load_explicit(
+                &store_generation_, std::memory_order_acquire);
+        if (target_generation == nullptr) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnavailable);
+            return;
+        }
+        RealtimeInstrumentTickDeltaGenerationEndpointV2
+            target_endpoint{};
+        if (!FillTickDeltaGenerationEndpoint(
+                *target_generation, &target_endpoint) ||
+            !ValidateTickDeltaTargetEndpoint(target_endpoint)) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kInternalFailure);
+            return;
+        }
+        std::uint64_t delta_session_token = 0U;
+        if (!GenerateReadToken(
+                0U, &delta_session_token)) {
+            send_open_error(
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kResourceExhausted);
+            return;
+        }
+        if (!SendTickDeltaOpenSessionResponse(
+                client,
+                request.request_id,
+                RealtimeInstrumentTickDeltaControlStatusV2::kOk,
+                &target_endpoint,
+                delta_session_token)) {
+            return;
+        }
+
+        for (;;) {
+            if (control_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                return;
+            }
+            RealtimeInstrumentTickDeltaOpenInstrumentRequestV2
+                instrument_request{};
+            if (!ReceiveTickDeltaRequest(
+                    client, &instrument_request)) {
+                return;
+            }
+            if (!ServeTickDeltaInstrument(
+                    client,
+                    target_generation,
+                    target_endpoint,
+                    delta_session_token,
+                    instrument_request)) {
+                return;
+            }
+        }
+    }
+
     [[nodiscard]] bool DispatchHistoryClient(
         int client,
         const RealtimeHistoryOpenRequestV1& request) noexcept {
@@ -2819,6 +4550,72 @@ private:
             client,
             request.request_id,
             RealtimeHistoryControlStatusV1::kResourceExhausted,
+            nullptr));
+        return false;
+    }
+
+    [[nodiscard]] bool DispatchTickDeltaClient(
+        int client,
+        const RealtimeInstrumentTickDeltaOpenSessionRequestV2&
+            request) noexcept {
+        if (client < 0 || history_workers_ == nullptr) {
+            return false;
+        }
+        for (std::uint32_t index = 0U;
+             index < config_.maximum_history_readers;
+             ++index) {
+            HistoryWorkerSlot& slot = history_workers_[index];
+            if (slot.running.load(std::memory_order_acquire)) {
+                continue;
+            }
+            if (slot.thread.joinable()) {
+                slot.thread.join();
+            }
+            {
+                std::lock_guard<std::mutex> lock(slot.socket_mutex);
+                if (slot.client_fd >= 0) {
+                    continue;
+                }
+                slot.client_fd = client;
+            }
+            slot.running.store(true, std::memory_order_release);
+            try {
+                slot.thread = std::thread(
+                    [this, &slot, client, request]() noexcept {
+                        TickDeltaClientLoop(client, request);
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                slot.socket_mutex);
+                            if (slot.client_fd == client) {
+                                CloseDescriptor(&slot.client_fd);
+                            }
+                        }
+                        slot.running.store(
+                            false, std::memory_order_release);
+                    });
+                return true;
+            } catch (...) {
+                slot.running.store(
+                    false, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(slot.socket_mutex);
+                if (slot.client_fd == client) {
+                    slot.client_fd = -1;
+                }
+                static_cast<void>(
+                    SendTickDeltaOpenSessionResponse(
+                        client,
+                        request.request_id,
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kResourceExhausted,
+                        nullptr));
+                return false;
+            }
+        }
+        static_cast<void>(SendTickDeltaOpenSessionResponse(
+            client,
+            request.request_id,
+            RealtimeInstrumentTickDeltaControlStatusV2::
+                kResourceExhausted,
             nullptr));
         return false;
     }
@@ -3083,7 +4880,8 @@ private:
             return false;
         }
         std::array<std::byte,
-                   sizeof(RealtimeHistoryOpenRequestV1)>
+                   sizeof(
+                       RealtimeInstrumentTickDeltaOpenInstrumentRequestV2)>
             request_bytes{};
         const ssize_t received = ::recv(
             client,
@@ -3095,6 +4893,32 @@ private:
             static_cast<ssize_t>(sizeof(request))) {
             std::memcpy(
                 &request, request_bytes.data(), sizeof(request));
+        }
+        if (request.opcode ==
+            static_cast<std::uint16_t>(
+                RealtimeInstrumentTickDeltaControlOpcodeV2::
+                    kOpenDeltaSession)) {
+            if (received !=
+                static_cast<ssize_t>(
+                    sizeof(
+                        RealtimeInstrumentTickDeltaOpenSessionRequestV2))) {
+                static_cast<void>(
+                    SendTickDeltaOpenSessionResponse(
+                        client,
+                        request.request_id,
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInvalidRequest,
+                        nullptr));
+                return false;
+            }
+            RealtimeInstrumentTickDeltaOpenSessionRequestV2
+                delta_request{};
+            std::memcpy(
+                &delta_request,
+                request_bytes.data(),
+                sizeof(delta_request));
+            return DispatchTickDeltaClient(
+                client, delta_request);
         }
         if (request.opcode ==
             static_cast<std::uint16_t>(

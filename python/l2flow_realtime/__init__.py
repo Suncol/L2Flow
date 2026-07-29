@@ -1,6 +1,7 @@
 """Low-latency, read-only Python client for L2Flow realtime market data."""
 
 from .batch import LatestBatch, TickBatch, TickColumnBatch
+from .checkpoint import InstrumentTickDeltaCheckpoint
 from .client import (
     DEFAULT_STALE_AFTER_NS,
     L2FlowClient,
@@ -17,6 +18,21 @@ from .history import (
     HistoryResourceExhaustedError,
     connect_history,
     open_history_cursor,
+)
+from .instrument_delta import (
+    DEFAULT_INSTRUMENT_TICK_DELTA_PAGE_RECORDS,
+    InstrumentTickDeltaBaseKind,
+    InstrumentTickDeltaCheckpointMismatchError,
+    InstrumentTickDeltaCheckpointUnavailableError,
+    InstrumentTickDeltaCursor,
+    InstrumentTickDeltaGeneration,
+    InstrumentTickDeltaInternalFailureError,
+    InstrumentTickDeltaMetadata,
+    InstrumentTickDeltaNotFoundError,
+    InstrumentTickDeltaPage,
+    InstrumentTickDeltaResourceExhaustedError,
+    InstrumentTickDeltaSession,
+    open_instrument_tick_delta_session,
 )
 from .models import (
     Aggressor,
@@ -55,6 +71,17 @@ from .models import (
     UnavailableError,
     WireFormatError,
 )
+from .rolling import (
+    InstrumentTickColumns,
+    InstrumentTickRollingCommit,
+    InstrumentTickRollingFactor,
+    InstrumentTickRollingGeneration,
+    InstrumentTickRollingState,
+    InstrumentTickRollingStore,
+    InstrumentTickRollingTransaction,
+    InstrumentTickRollingUpdate,
+    InstrumentTickRollingWindow,
+)
 
 
 def connect(control_socket_path, **kwargs) -> L2FlowClient:
@@ -68,6 +95,7 @@ __all__ = [
     "ClientClosedError",
     "CommonRecord",
     "DEFAULT_STALE_AFTER_NS",
+    "DEFAULT_INSTRUMENT_TICK_DELTA_PAGE_RECORDS",
     "DecimalValue",
     "FactorResult",
     "HistoryCursor",
@@ -82,6 +110,27 @@ __all__ = [
     "InstrumentKey",
     "InstrumentLookupResult",
     "InstrumentLookupStatus",
+    "InstrumentTickDeltaBaseKind",
+    "InstrumentTickDeltaCheckpoint",
+    "InstrumentTickDeltaCheckpointMismatchError",
+    "InstrumentTickDeltaCheckpointUnavailableError",
+    "InstrumentTickDeltaCursor",
+    "InstrumentTickDeltaGeneration",
+    "InstrumentTickDeltaInternalFailureError",
+    "InstrumentTickDeltaMetadata",
+    "InstrumentTickDeltaNotFoundError",
+    "InstrumentTickDeltaPage",
+    "InstrumentTickDeltaResourceExhaustedError",
+    "InstrumentTickDeltaSession",
+    "InstrumentTickColumns",
+    "InstrumentTickRollingCommit",
+    "InstrumentTickRollingFactor",
+    "InstrumentTickRollingGeneration",
+    "InstrumentTickRollingState",
+    "InstrumentTickRollingStore",
+    "InstrumentTickRollingTransaction",
+    "InstrumentTickRollingUpdate",
+    "InstrumentTickRollingWindow",
     "KLine",
     "L2FlowClient",
     "L2FlowRealtimeError",
@@ -115,4 +164,5 @@ __all__ = [
     "connect",
     "connect_history",
     "open_history_cursor",
+    "open_instrument_tick_delta_session",
 ]

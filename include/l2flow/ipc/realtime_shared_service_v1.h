@@ -61,13 +61,14 @@ struct RealtimeSharedServiceConfigV1 final {
     std::uint64_t tick_ring_capacity = 262'144U;
     std::uint64_t maximum_mapping_bytes = 2ULL * 1024ULL * 1024ULL *
                                           1024ULL;
-    // History readers pin one immutable Store generation for the lifetime of
-    // a cursor. These limits bound pinned generations, worker threads, and
-    // each completed sealed page; they do not limit total history length or
-    // pages intentionally retained by a same-UID client after SCM_RIGHTS
-    // transfer. The V1 trust boundary treats same-UID clients as trusted.
+    // History readers and V2 tick-delta sessions pin one immutable Store
+    // generation for the lifetime of a cursor/session. These limits bound
+    // pinned generations, worker threads, and each completed sealed page;
+    // they do not limit total history length or pages intentionally retained
+    // by a same-UID client after SCM_RIGHTS transfer. The trust boundary
+    // treats same-UID clients as trusted.
     std::uint32_t maximum_history_readers = 8U;
-    std::uint32_t maximum_history_page_records = 4096U;
+    std::uint32_t maximum_history_page_records = 16'384U;
     std::uint64_t maximum_history_page_bytes =
         64ULL * 1024ULL * 1024ULL;
     std::chrono::milliseconds history_reader_idle_timeout{

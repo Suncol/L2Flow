@@ -1,6 +1,7 @@
 #include "l2flow/ipc/realtime_shared_service_v1.h"
 #include "l2flow/ipc/realtime_shm_reader_c_v1.h"
 #include "l2flow/ipc/realtime_history_wire_v1.h"
+#include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_wire_projection_v1.h"
 #include "l2flow/ipc/realtime_wire_v1.h"
 #include "l2flow/market/instrument_registry.h"
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -23,10 +25,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -1117,6 +1121,440 @@ int ReceiveSessionFd(
     return received_fd;
 }
 
+int ConnectControlClient(
+    const std::filesystem::path& socket_path) {
+    const int client =
+        ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (client < 0) {
+        return -1;
+    }
+    timeval timeout{};
+    timeout.tv_sec = 2;
+    if (::setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            static_cast<socklen_t>(sizeof(timeout))) != 0 ||
+        ::setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            &timeout,
+            static_cast<socklen_t>(sizeof(timeout))) != 0) {
+        static_cast<void>(::close(client));
+        return -1;
+    }
+    const std::string native_path = socket_path.string();
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    if (native_path.size() >= sizeof(address.sun_path)) {
+        static_cast<void>(::close(client));
+        return -1;
+    }
+    std::memcpy(
+        address.sun_path,
+        native_path.c_str(),
+        native_path.size() + 1U);
+    const socklen_t address_bytes = static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) +
+        native_path.size() + 1U);
+    if (::connect(
+            client,
+            reinterpret_cast<const sockaddr*>(&address),
+            address_bytes) != 0) {
+        static_cast<void>(::close(client));
+        return -1;
+    }
+    return client;
+}
+
+template <typename Packet>
+bool SendControlPacket(int client, const Packet& packet) {
+    static_assert(std::is_standard_layout_v<Packet>);
+    return client >= 0 &&
+           ::send(
+               client,
+               &packet,
+               sizeof(packet),
+               MSG_NOSIGNAL) ==
+               static_cast<ssize_t>(sizeof(packet));
+}
+
+template <typename Packet>
+bool ReceiveControlPacket(
+    int client,
+    Packet* output,
+    int* attached_fd) {
+    static_assert(std::is_standard_layout_v<Packet>);
+    if (client < 0 || output == nullptr ||
+        attached_fd == nullptr) {
+        return false;
+    }
+    *output = Packet{};
+    *attached_fd = -1;
+    iovec vector{};
+    vector.iov_base = output;
+    vector.iov_len = sizeof(*output);
+    std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1U;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    const ssize_t received =
+        ::recvmsg(client, &message, MSG_CMSG_CLOEXEC);
+    if (received != static_cast<ssize_t>(sizeof(*output)) ||
+        (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0) {
+        return false;
+    }
+    for (cmsghdr* header = CMSG_FIRSTHDR(&message);
+         header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level == SOL_SOCKET &&
+            header->cmsg_type == SCM_RIGHTS &&
+            header->cmsg_len == CMSG_LEN(sizeof(int))) {
+            if (*attached_fd >= 0) {
+                return false;
+            }
+            std::memcpy(
+                attached_fd,
+                CMSG_DATA(header),
+                sizeof(*attached_fd));
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+struct TickDeltaPageCopy final {
+    ipc::RealtimeInstrumentTickDeltaPageHeaderV2 header{};
+    std::vector<ipc::RealtimeWireTickPayloadV1> ticks;
+    bool descriptor_is_read_only = false;
+    bool descriptor_is_sealed = false;
+};
+
+bool OpenSealedReadOnlyPage(
+    std::span<const std::byte> image,
+    int* output) {
+    if (image.empty() || output == nullptr) {
+        return false;
+    }
+    *output = -1;
+    UniqueFd writable(::memfd_create(
+        "l2flow-test-tick-delta-page",
+        MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    if (writable.get() < 0 ||
+        ::ftruncate(
+            writable.get(),
+            static_cast<off_t>(image.size())) != 0) {
+        return false;
+    }
+    std::size_t written = 0U;
+    while (written < image.size()) {
+        const ssize_t result = ::write(
+            writable.get(),
+            image.data() + written,
+            image.size() - written);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return false;
+        }
+        written += static_cast<std::size_t>(result);
+    }
+    constexpr int seals =
+        F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    if (::fcntl(writable.get(), F_ADD_SEALS, seals) != 0 ||
+        ::fcntl(writable.get(), F_GET_SEALS) != seals) {
+        return false;
+    }
+    std::array<char, 64U> path{};
+    const int path_bytes = std::snprintf(
+        path.data(),
+        path.size(),
+        "/proc/self/fd/%d",
+        writable.get());
+    if (path_bytes <= 0 ||
+        static_cast<std::size_t>(path_bytes) >= path.size()) {
+        return false;
+    }
+    *output = ::open(path.data(), O_RDONLY | O_CLOEXEC);
+    return *output >= 0;
+}
+
+class TickDeltaWireClient final {
+public:
+    TickDeltaWireClient() = default;
+    TickDeltaWireClient(const TickDeltaWireClient&) = delete;
+    TickDeltaWireClient& operator=(const TickDeltaWireClient&) =
+        delete;
+
+    [[nodiscard]] bool OpenSession(
+        const std::filesystem::path& socket_path,
+        ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2*
+            output) {
+        if (output == nullptr) {
+            return false;
+        }
+        client_.Reset(ConnectControlClient(socket_path));
+        if (client_.get() < 0) {
+            return false;
+        }
+        ipc::RealtimeInstrumentTickDeltaOpenSessionRequestV2
+            request{};
+        request.magic = ipc::kRealtimeControlMagicV1;
+        request.protocol_major = ipc::kRealtimeWireMajorV1;
+        request.protocol_minor = ipc::kRealtimeWireMinorV1;
+        request.opcode = static_cast<std::uint16_t>(
+            ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+                kOpenDeltaSession);
+        request.message_bytes =
+            static_cast<std::uint32_t>(sizeof(request));
+        request.request_id = NextRequestId();
+        int received_fd = -1;
+        if (!SendControlPacket(client_.get(), request) ||
+            !ReceiveControlPacket(
+                client_.get(), output, &received_fd)) {
+            if (received_fd >= 0) {
+                static_cast<void>(::close(received_fd));
+            }
+            return false;
+        }
+        const bool valid =
+            received_fd < 0 &&
+            output->magic == ipc::kRealtimeControlMagicV1 &&
+            output->protocol_major ==
+                ipc::kRealtimeWireMajorV1 &&
+            output->protocol_minor ==
+                ipc::kRealtimeWireMinorV1 &&
+            output->message_bytes == sizeof(*output) &&
+            output->request_id == request.request_id;
+        if (valid &&
+            output->status ==
+                static_cast<std::uint16_t>(
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk)) {
+            session_token_ = output->delta_session_token;
+        }
+        return valid;
+    }
+
+    [[nodiscard]] bool OpenInstrument(
+        std::uint32_t instrument_id,
+        std::uint32_t requested_page_records,
+        ipc::RealtimeInstrumentTickDeltaBaseKindV2 base_kind,
+        const ipc::RealtimeInstrumentTickDeltaCheckpointV2&
+            base_checkpoint,
+        ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2*
+            output) {
+        if (output == nullptr || client_.get() < 0 ||
+            session_token_ == 0U) {
+            return false;
+        }
+        ipc::RealtimeInstrumentTickDeltaOpenInstrumentRequestV2
+            request{};
+        request.magic = ipc::kRealtimeControlMagicV1;
+        request.protocol_major = ipc::kRealtimeWireMajorV1;
+        request.protocol_minor = ipc::kRealtimeWireMinorV1;
+        request.opcode = static_cast<std::uint16_t>(
+            ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+                kOpenInstrumentDelta);
+        request.message_bytes =
+            static_cast<std::uint32_t>(sizeof(request));
+        request.request_id = NextRequestId();
+        request.instrument_id = instrument_id;
+        request.requested_page_records =
+            requested_page_records;
+        request.base_kind =
+            static_cast<std::uint32_t>(base_kind);
+        request.delta_session_token = session_token_;
+        request.base_checkpoint = base_checkpoint;
+        int received_fd = -1;
+        if (!SendControlPacket(client_.get(), request) ||
+            !ReceiveControlPacket(
+                client_.get(), output, &received_fd)) {
+            if (received_fd >= 0) {
+                static_cast<void>(::close(received_fd));
+            }
+            return false;
+        }
+        return received_fd < 0 &&
+               output->magic == ipc::kRealtimeControlMagicV1 &&
+               output->protocol_major ==
+                   ipc::kRealtimeWireMajorV1 &&
+               output->protocol_minor ==
+                   ipc::kRealtimeWireMinorV1 &&
+               output->message_bytes == sizeof(*output) &&
+               output->request_id == request.request_id;
+    }
+
+    [[nodiscard]] bool Read(
+        std::uint64_t expected_page_index,
+        std::uint64_t read_token,
+        ipc::RealtimeInstrumentTickDeltaReadResponseV2* output,
+        TickDeltaPageCopy* page_output,
+        std::vector<std::byte>* page_image = nullptr) {
+        if (output == nullptr || page_output == nullptr ||
+            client_.get() < 0) {
+            return false;
+        }
+        *page_output = TickDeltaPageCopy{};
+        if (page_image != nullptr) {
+            page_image->clear();
+        }
+        ipc::RealtimeInstrumentTickDeltaReadRequestV2 request{};
+        request.magic = ipc::kRealtimeControlMagicV1;
+        request.protocol_major = ipc::kRealtimeWireMajorV1;
+        request.protocol_minor = ipc::kRealtimeWireMinorV1;
+        request.opcode = static_cast<std::uint16_t>(
+            ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+                kReadInstrumentDelta);
+        request.message_bytes =
+            static_cast<std::uint32_t>(sizeof(request));
+        request.request_id = NextRequestId();
+        request.expected_page_index = expected_page_index;
+        request.read_token = read_token;
+        int received_fd = -1;
+        if (!SendControlPacket(client_.get(), request) ||
+            !ReceiveControlPacket(
+                client_.get(), output, &received_fd)) {
+            if (received_fd >= 0) {
+                static_cast<void>(::close(received_fd));
+            }
+            return false;
+        }
+        UniqueFd page_fd(received_fd);
+        if (output->magic != ipc::kRealtimeControlMagicV1 ||
+            output->protocol_major !=
+                ipc::kRealtimeWireMajorV1 ||
+            output->protocol_minor !=
+                ipc::kRealtimeWireMinorV1 ||
+            output->message_bytes != sizeof(*output) ||
+            output->request_id != request.request_id) {
+            return false;
+        }
+        const bool success =
+            output->status ==
+            static_cast<std::uint16_t>(
+                ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                    kOk);
+        const bool terminal =
+            (output->flags &
+             ipc::
+                 kRealtimeInstrumentTickDeltaResponseTerminalV2) !=
+            0U;
+        if (!success || terminal) {
+            return page_fd.get() < 0;
+        }
+        if (page_fd.get() < 0 ||
+            output->record_count == 0U ||
+            output->page_mapping_bytes <
+                sizeof(
+                    ipc::
+                        RealtimeInstrumentTickDeltaPageHeaderV2)) {
+            return false;
+        }
+        struct stat page_stat {};
+        const int descriptor_flags =
+            ::fcntl(page_fd.get(), F_GETFL);
+        const int descriptor_fd_flags =
+            ::fcntl(page_fd.get(), F_GETFD);
+        const int seals =
+            ::fcntl(page_fd.get(), F_GET_SEALS);
+        const int expected_seals =
+            F_SEAL_WRITE | F_SEAL_GROW |
+            F_SEAL_SHRINK | F_SEAL_SEAL;
+        page_output->descriptor_is_read_only =
+            descriptor_flags >= 0 &&
+            (descriptor_flags & O_ACCMODE) == O_RDONLY &&
+            descriptor_fd_flags >= 0 &&
+            (descriptor_fd_flags & FD_CLOEXEC) != 0;
+        page_output->descriptor_is_sealed =
+            seals == expected_seals;
+        if (::fstat(page_fd.get(), &page_stat) != 0 ||
+            !S_ISREG(page_stat.st_mode) ||
+            page_stat.st_size !=
+                static_cast<off_t>(
+                    output->page_mapping_bytes)) {
+            return false;
+        }
+        void* const mapping = ::mmap(
+            nullptr,
+            static_cast<std::size_t>(
+                output->page_mapping_bytes),
+            PROT_READ,
+            MAP_SHARED,
+            page_fd.get(),
+            0);
+        if (mapping == MAP_FAILED) {
+            return false;
+        }
+        std::memcpy(
+            &page_output->header,
+            mapping,
+            sizeof(page_output->header));
+        const std::uint64_t tick_bytes =
+            static_cast<std::uint64_t>(output->record_count) *
+            sizeof(ipc::RealtimeWireTickPayloadV1);
+        if (page_output->header.record_count !=
+                output->record_count ||
+            page_output->header.tick_payloads_offset >
+                output->page_mapping_bytes ||
+            tick_bytes >
+                output->page_mapping_bytes -
+                    page_output->header.tick_payloads_offset) {
+            static_cast<void>(::munmap(
+                mapping,
+                static_cast<std::size_t>(
+                    output->page_mapping_bytes)));
+            return false;
+        }
+        const auto* const ticks =
+            reinterpret_cast<
+                const ipc::RealtimeWireTickPayloadV1*>(
+                static_cast<const std::byte*>(mapping) +
+                page_output->header.tick_payloads_offset);
+        try {
+            page_output->ticks.assign(
+                ticks,
+                ticks + output->record_count);
+            if (page_image != nullptr) {
+                const auto* const image_begin =
+                    static_cast<const std::byte*>(mapping);
+                page_image->assign(
+                    image_begin,
+                    image_begin +
+                        static_cast<std::size_t>(
+                            output->page_mapping_bytes));
+            }
+        } catch (...) {
+            static_cast<void>(::munmap(
+                mapping,
+                static_cast<std::size_t>(
+                    output->page_mapping_bytes)));
+            return false;
+        }
+        return ::munmap(
+                   mapping,
+                   static_cast<std::size_t>(
+                       output->page_mapping_bytes)) == 0;
+    }
+
+private:
+    [[nodiscard]] std::uint64_t NextRequestId() noexcept {
+        return next_request_id_++;
+    }
+
+    UniqueFd client_;
+    std::uint64_t session_token_ = 0U;
+    std::uint64_t next_request_id_ =
+        0x8100000000000001ULL;
+};
+
 bool StatusEquals(std::uint8_t actual, int expected) {
     return static_cast<int>(actual) == expected;
 }
@@ -1552,6 +1990,753 @@ bool TestLatestBatches(
             resolved_ids[0U] ==
                 std::numeric_limits<std::uint32_t>::max(),
         "instrument resolver validates every security-ID span before output");
+    return ok;
+}
+
+bool TestInstrumentTickDeltaV2() {
+    bool ok = true;
+    MarketFixture fixture;
+    if (!fixture.Initialize()) {
+        return false;
+    }
+    ScopedTempDirectory directory;
+    if (!Expect(
+            directory.valid(),
+            "create tick-delta IPC temp directory")) {
+        return false;
+    }
+    const std::filesystem::path socket_path =
+        directory.path() / "tick-delta.sock";
+
+    common::Identity128 run_id{};
+    run_id[0U] = std::byte{0x7dU};
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        first_generation;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        second_generation;
+    if (!fixture.BuildStoreGeneration(
+            run_id, 1U, 80'000U, &first_generation) ||
+        !fixture.BuildStoreGeneration(
+            run_id, 2U, 80'001U, &second_generation)) {
+        return false;
+    }
+
+    ipc::RealtimeSharedServiceConfigV1 config{};
+    config.run_id = run_id;
+    config.session_epoch = 29U;
+    config.trade_date = kTradeDate;
+    config.registry = fixture.registry.get();
+    config.tick_ring_capacity = 2U;
+    config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.maximum_history_page_records = 2U;
+    config.control_socket_path = socket_path;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV1> service;
+    int system_error = 0;
+    const auto create_error =
+        ipc::RealtimeSharedMarketServiceV1::Create(
+            std::move(config), &service, &system_error);
+    if (!Expect(
+            create_error ==
+                    ipc::RealtimeSharedServiceCreateErrorV1::kNone &&
+                service != nullptr && system_error == 0,
+            "create tick-delta IPC service")) {
+        return false;
+    }
+    if (!Expect(
+            service->Start(&system_error) && system_error == 0 &&
+                service->PublishStoreGeneration(first_generation),
+            "start tick-delta service and publish generation 1")) {
+        service->StopControl();
+        return false;
+    }
+
+    const auto status_is =
+        [](std::uint16_t actual,
+           ipc::RealtimeInstrumentTickDeltaControlStatusV2
+               expected) noexcept {
+            return actual ==
+                   static_cast<std::uint16_t>(expected);
+        };
+    const auto terminal =
+        [](const ipc::RealtimeInstrumentTickDeltaReadResponseV2&
+               response) noexcept {
+            return (response.flags &
+                    ipc::
+                        kRealtimeInstrumentTickDeltaResponseTerminalV2) !=
+                   0U;
+        };
+
+    TickDeltaWireClient client;
+    ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2
+        session{};
+    if (!Expect(
+            client.OpenSession(socket_path, &session) &&
+                status_is(
+                    session.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk),
+            "open one pinned tick-delta session")) {
+        service->StopControl();
+        return false;
+    }
+    const auto& target = session.target_generation;
+    std::uint64_t source_record_total = 0U;
+    for (const std::uint64_t exclusive :
+         target.source_sequence_exclusive) {
+        if (exclusive == 0U ||
+            source_record_total >
+                std::numeric_limits<std::uint64_t>::max() -
+                    (exclusive - 1U)) {
+            source_record_total =
+                std::numeric_limits<std::uint64_t>::max();
+            break;
+        }
+        source_record_total += exclusive - 1U;
+    }
+    const std::uint64_t checked_tick_exclusive =
+        1U +
+        (target.source_sequence_exclusive[1U] - 1U) +
+        (target.source_sequence_exclusive[3U] - 1U);
+    ok &= Expect(
+        target.generation == 1U &&
+            target.session_epoch == 29U &&
+            target.trade_date == kTradeDate &&
+            target.instrument_count == 3U &&
+            target.ingress_sequence_exclusive == 8U &&
+            target.source_stream_ids == kSourceStreamIds &&
+            target.source_sequence_exclusive ==
+                std::array<std::uint64_t, 4U>{2U, 4U, 2U, 3U} &&
+            source_record_total + 1U ==
+                target.ingress_sequence_exclusive &&
+            checked_tick_exclusive == 6U &&
+            target.tick_stream_sequence_exclusive ==
+                checked_tick_exclusive &&
+            target.flags ==
+                (ipc::
+                     kRealtimeInstrumentTickDeltaCoverageFromOpenV2 |
+                 ipc::
+                     kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2) &&
+            target.payload_projection ==
+                static_cast<std::uint32_t>(
+                    ipc::
+                        RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                            kCoreV1) &&
+            session.delta_session_token != 0U,
+        "target endpoint carries checked I/S/Q identity and coverage");
+    ok &= Expect(
+        service->PublishStoreGeneration(second_generation),
+        "publish generation 2 after V2 pins generation 1");
+
+    const ipc::RealtimeInstrumentTickDeltaCheckpointV2
+        origin_checkpoint{};
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        shenzhen_open{};
+    if (!Expect(
+            client.OpenInstrument(
+                kShenzhenInstrumentId,
+                1U,
+                ipc::RealtimeInstrumentTickDeltaBaseKindV2::kOrigin,
+                origin_checkpoint,
+                &shenzhen_open) &&
+                status_is(
+                    shenzhen_open.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk),
+            "open paginated Shenzhen origin delta")) {
+        service->StopControl();
+        return false;
+    }
+    const auto& metadata = shenzhen_open.metadata;
+    ok &= Expect(
+        metadata.base_kind ==
+                static_cast<std::uint32_t>(
+                    ipc::RealtimeInstrumentTickDeltaBaseKindV2::
+                        kOrigin) &&
+            metadata.selected_source_mask ==
+                ipc::kRealtimeInstrumentTickDeltaSourceMaskV2 &&
+            std::memcmp(
+                &metadata.base_checkpoint,
+                &origin_checkpoint,
+                sizeof(origin_checkpoint)) == 0 &&
+            metadata.target_checkpoint.generation.generation == 1U &&
+            metadata.target_checkpoint.instrument_id ==
+                kShenzhenInstrumentId &&
+            metadata.target_checkpoint.registry_ordinal ==
+                fixture.Ordinal(kShenzhenInstrumentId) &&
+            metadata.target_checkpoint
+                    .instrument_tick_source_record_counts ==
+                std::array<std::uint64_t, 4U>{0U, 0U, 0U, 2U} &&
+            metadata.target_checkpoint
+                    .instrument_tick_record_count == 2U &&
+            metadata.delta_tick_source_record_counts ==
+                std::array<std::uint64_t, 4U>{0U, 0U, 0U, 2U} &&
+            metadata.delta_tick_record_count == 2U &&
+            metadata.ingress_sequence_begin_inclusive == 1U &&
+            metadata.ingress_sequence_end_exclusive == 8U &&
+            metadata.tick_stream_sequence_begin_inclusive == 1U &&
+            metadata.tick_stream_sequence_end_exclusive == 6U &&
+            metadata.flags == target.flags &&
+            metadata.payload_projection ==
+                target.payload_projection &&
+            shenzhen_open.initial_read_token != 0U &&
+            shenzhen_open.initial_read_token !=
+                session.delta_session_token,
+        "origin metadata has exact counts, bounds, and distinct token");
+
+    std::uint64_t read_token = shenzhen_open.initial_read_token;
+    constexpr std::array<std::uint64_t, 2U>
+        expected_ingress{4U, 5U};
+    constexpr std::array<std::uint64_t, 2U>
+        expected_tick{2U, 3U};
+    constexpr std::array<std::uint64_t, 2U>
+        expected_source{1U, 2U};
+    std::uint64_t native_prior_ingress = 0U;
+    std::uint64_t native_prior_tick = 0U;
+    std::array<std::uint64_t, 4U> native_prior_sources{};
+    for (std::uint64_t page_index = 0U;
+         page_index < 2U;
+         ++page_index) {
+        ipc::RealtimeInstrumentTickDeltaReadResponseV2 response{};
+        TickDeltaPageCopy page{};
+        std::vector<std::byte> page_image;
+        if (!Expect(
+                client.Read(
+                    page_index,
+                    read_token,
+                    &response,
+                    &page,
+                    &page_image) &&
+                    status_is(
+                        response.status,
+                        ipc::
+                            RealtimeInstrumentTickDeltaControlStatusV2::
+                                kOk) &&
+                    !terminal(response) &&
+                    response.record_count == 1U &&
+                    response.page_index == page_index &&
+                    response.target_generation == 1U &&
+                    response.next_read_token != 0U &&
+                    response.next_read_token != read_token &&
+                    response.next_read_token !=
+                        session.delta_session_token &&
+                    page.ticks.size() == 1U,
+                "read one dense paginated tick-delta page")) {
+            service->StopControl();
+            return false;
+        }
+        const auto& header = page.header;
+        const auto& tick = page.ticks[0U].common;
+        ok &= Expect(
+            page.descriptor_is_read_only &&
+                page.descriptor_is_sealed &&
+                header.magic ==
+                    ipc::kRealtimeInstrumentTickDeltaPageMagicV2 &&
+                header.abi_major == ipc::kRealtimeWireMajorV1 &&
+                header.abi_minor == ipc::kRealtimeWireMinorV1 &&
+                header.header_bytes ==
+                    sizeof(
+                        ipc::
+                            RealtimeInstrumentTickDeltaPageHeaderV2) &&
+                header.endian_marker ==
+                    ipc::kRealtimeLittleEndianMarkerV1 &&
+                header.flags == 0U &&
+                header.total_mapping_bytes ==
+                    sizeof(
+                        ipc::
+                            RealtimeInstrumentTickDeltaPageHeaderV2) +
+                        sizeof(ipc::RealtimeWireTickPayloadV1) &&
+                header.page_index == page_index &&
+                header.record_count == 1U &&
+                header.tick_payload_bytes ==
+                    sizeof(ipc::RealtimeWireTickPayloadV1) &&
+                header.tick_payloads_offset ==
+                    sizeof(
+                        ipc::
+                            RealtimeInstrumentTickDeltaPageHeaderV2) &&
+                header.first_ingress_sequence ==
+                    expected_ingress[page_index] &&
+                header.last_ingress_sequence ==
+                    expected_ingress[page_index] &&
+                header.first_tick_stream_sequence ==
+                    expected_tick[page_index] &&
+                header.last_tick_stream_sequence ==
+                    expected_tick[page_index] &&
+                header.metadata.target_checkpoint.generation.generation ==
+                    1U &&
+                tick.instrument_id == kShenzhenInstrumentId &&
+                tick.registry_ordinal ==
+                    fixture.Ordinal(kShenzhenInstrumentId) &&
+                tick.source_slot == 3U &&
+                tick.source_stream_id == kSourceStreamIds[3U] &&
+                tick.source_sequence ==
+                    expected_source[page_index] &&
+                tick.ingress_sequence ==
+                    expected_ingress[page_index] &&
+                tick.tick_stream_sequence ==
+                    expected_tick[page_index] &&
+                tick.event_kind ==
+                    static_cast<std::uint8_t>(
+                        page_index == 0U
+                            ? market::MarketEventKindV1::
+                                  kShenzhenOrder
+                            : market::MarketEventKindV1::
+                                  kShenzhenTransaction),
+            "page is sealed, dense, oldest-first, and bounded");
+
+        int validation_fd_value = -1;
+        if (!Expect(
+                OpenSealedReadOnlyPage(
+                    page_image, &validation_fd_value),
+                "recreate sealed read-only tick-delta page")) {
+            service->StopControl();
+            return false;
+        }
+        UniqueFd validation_fd(validation_fd_value);
+        std::vector<std::byte> validated_ticks(
+            response.record_count *
+            sizeof(ipc::RealtimeWireTickPayloadV1));
+        l2flow_instrument_tick_delta_page_result_v2
+            validation_result{};
+        const int validation_error =
+            l2flow_shm_reader_instrument_tick_delta_page_v2(
+                validation_fd.get(),
+                response.page_mapping_bytes,
+                response.record_count,
+                response.page_index,
+                &metadata,
+                sizeof(metadata),
+                native_prior_ingress,
+                native_prior_tick,
+                native_prior_sources.data(),
+                validated_ticks.data(),
+                validated_ticks.size(),
+                &validation_result);
+        ok &= Expect(
+            validation_error == L2FLOW_SHM_READER_OK_V1 &&
+                validated_ticks.size() ==
+                    page.ticks.size() *
+                        sizeof(
+                            ipc::RealtimeWireTickPayloadV1) &&
+                std::memcmp(
+                    validated_ticks.data(),
+                    page.ticks.data(),
+                    validated_ticks.size()) == 0 &&
+                validation_result.source_counts[0U] == 0U &&
+                validation_result.source_counts[1U] == 0U &&
+                validation_result.source_counts[2U] == 0U &&
+                validation_result.source_counts[3U] == 1U &&
+                validation_result.last_ingress_sequence ==
+                    expected_ingress[page_index] &&
+                validation_result.last_tick_stream_sequence ==
+                    expected_tick[page_index] &&
+                validation_result.last_source_sequences[3U] ==
+                    expected_source[page_index],
+            "native column page validator copies and advances "
+            "cross-page state");
+
+        if (page_index == 0U) {
+            std::vector<std::byte> corrupt_image = page_image;
+            constexpr std::size_t instrument_id_offset =
+                sizeof(
+                    ipc::
+                        RealtimeInstrumentTickDeltaPageHeaderV2) +
+                offsetof(
+                    ipc::RealtimeWireTickPayloadV1,
+                    common) +
+                offsetof(
+                    ipc::RealtimeWireCommonRecordV1,
+                    instrument_id);
+            corrupt_image[instrument_id_offset] ^= std::byte{1U};
+            int corrupt_fd_value = -1;
+            if (!Expect(
+                    OpenSealedReadOnlyPage(
+                        corrupt_image, &corrupt_fd_value),
+                    "seal mutated tick-delta page")) {
+                service->StopControl();
+                return false;
+            }
+            UniqueFd corrupt_fd(corrupt_fd_value);
+            std::vector<std::byte> failure_output(
+                validated_ticks.size(), std::byte{0xa5U});
+            const std::vector<std::byte>
+                expected_failure_output = failure_output;
+            l2flow_instrument_tick_delta_page_result_v2
+                failure_result{};
+            std::memset(
+                &failure_result, 0x5a, sizeof(failure_result));
+            const auto expected_failure_result = failure_result;
+            const int failure_error =
+                l2flow_shm_reader_instrument_tick_delta_page_v2(
+                    corrupt_fd.get(),
+                    response.page_mapping_bytes,
+                    response.record_count,
+                    response.page_index,
+                    &metadata,
+                    sizeof(metadata),
+                    native_prior_ingress,
+                    native_prior_tick,
+                    native_prior_sources.data(),
+                    failure_output.data(),
+                    failure_output.size(),
+                    &failure_result);
+            ok &= Expect(
+                failure_error ==
+                        L2FLOW_SHM_READER_LAYOUT_INVALID_V1 &&
+                    failure_output == expected_failure_output &&
+                    std::memcmp(
+                        &failure_result,
+                        &expected_failure_result,
+                        sizeof(failure_result)) == 0,
+                "mutated payload fails without changing outputs");
+        }
+        native_prior_ingress =
+            validation_result.last_ingress_sequence;
+        native_prior_tick =
+            validation_result.last_tick_stream_sequence;
+        std::copy(
+            std::begin(
+                validation_result.last_source_sequences),
+            std::end(
+                validation_result.last_source_sequences),
+            native_prior_sources.begin());
+        read_token = response.next_read_token;
+    }
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2 shenzhen_eof{};
+    TickDeltaPageCopy empty_page{};
+    ok &= Expect(
+        client.Read(2U, read_token, &shenzhen_eof, &empty_page) &&
+            status_is(
+                shenzhen_eof.status,
+                ipc::
+                    RealtimeInstrumentTickDeltaControlStatusV2::kOk) &&
+            terminal(shenzhen_eof) &&
+            shenzhen_eof.record_count == 0U &&
+            shenzhen_eof.page_mapping_bytes == 0U &&
+            shenzhen_eof.page_index == 2U &&
+            shenzhen_eof.target_generation == 1U &&
+            shenzhen_eof.next_read_token == 0U &&
+            empty_page.ticks.empty(),
+        "Shenzhen delta ends with explicit zero-row EOF");
+
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        unobserved_open{};
+    if (!Expect(
+            client.OpenInstrument(
+                kUnobservedInstrumentId,
+                1U,
+                ipc::RealtimeInstrumentTickDeltaBaseKindV2::kOrigin,
+                origin_checkpoint,
+                &unobserved_open) &&
+                status_is(
+                    unobserved_open.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk),
+            "open a second, empty instrument on the same target")) {
+        service->StopControl();
+        return false;
+    }
+    ok &= Expect(
+        unobserved_open.metadata
+                    .target_checkpoint.generation.generation == 1U &&
+            unobserved_open.metadata
+                    .target_checkpoint.instrument_id ==
+                kUnobservedInstrumentId &&
+            unobserved_open.metadata
+                    .target_checkpoint.instrument_tick_record_count ==
+                0U &&
+            unobserved_open.metadata.delta_tick_record_count == 0U &&
+            unobserved_open.initial_read_token !=
+                session.delta_session_token,
+        "empty delta retains the session's pinned generation 1 target");
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2
+        unobserved_eof{};
+    ok &= Expect(
+        client.Read(
+            0U,
+            unobserved_open.initial_read_token,
+            &unobserved_eof,
+            &empty_page) &&
+            status_is(
+                unobserved_eof.status,
+                ipc::
+                    RealtimeInstrumentTickDeltaControlStatusV2::kOk) &&
+            terminal(unobserved_eof) &&
+            unobserved_eof.record_count == 0U &&
+            unobserved_eof.page_index == 0U &&
+            unobserved_eof.target_generation == 1U,
+        "empty delta emits explicit EOF and permits another instrument");
+
+    std::unique_ptr<market::IntradayInstrumentTickDeltaCursorV1>
+        shanghai_summary_cursor;
+    if (!Expect(
+            first_generation->OpenInstrumentTickDeltaCursor(
+                kShanghaiInstrumentId,
+                1U,
+                &shanghai_summary_cursor) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone &&
+                shanghai_summary_cursor != nullptr,
+            "obtain Store-derived Shanghai checkpoint oracle")) {
+        service->StopControl();
+        return false;
+    }
+    ipc::RealtimeInstrumentTickDeltaCheckpointV2
+        shanghai_checkpoint{};
+    shanghai_checkpoint.generation = target;
+    shanghai_checkpoint.instrument_id = kShanghaiInstrumentId;
+    shanghai_checkpoint.registry_ordinal =
+        static_cast<std::uint32_t>(
+            fixture.Ordinal(kShanghaiInstrumentId));
+    shanghai_checkpoint
+        .instrument_tick_source_record_counts =
+        shanghai_summary_cursor->summary()
+            .target_tick_source_record_counts;
+    shanghai_checkpoint.instrument_tick_record_count =
+        shanghai_summary_cursor->summary().delta_tick_record_count;
+    ok &= Expect(
+        shanghai_checkpoint
+                .instrument_tick_source_record_counts ==
+                std::array<std::uint64_t, 4U>{0U, 3U, 0U, 0U} &&
+            shanghai_checkpoint.instrument_tick_record_count == 3U,
+        "Store oracle counts all three Shanghai tick-lane rows");
+
+    auto mismatched_checkpoint = shanghai_checkpoint;
+    --mismatched_checkpoint
+          .instrument_tick_source_record_counts[1U];
+    --mismatched_checkpoint.instrument_tick_record_count;
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        mismatch_response{};
+    ok &= Expect(
+        client.OpenInstrument(
+            kShanghaiInstrumentId,
+            1U,
+            ipc::RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint,
+            mismatched_checkpoint,
+            &mismatch_response) &&
+            status_is(
+                mismatch_response.status,
+                ipc::
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kCheckpointMismatch) &&
+            mismatch_response.initial_read_token == 0U,
+        "checkpoint counts must match Store-derived base counts");
+
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        exact_checkpoint_open{};
+    if (!Expect(
+            client.OpenInstrument(
+                kShanghaiInstrumentId,
+                1U,
+                ipc::
+                    RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint,
+                shanghai_checkpoint,
+                &exact_checkpoint_open) &&
+                status_is(
+                    exact_checkpoint_open.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk),
+            "checkpoint mismatch is recoverable within the same session")) {
+        service->StopControl();
+        return false;
+    }
+    ok &= Expect(
+        std::memcmp(
+            &exact_checkpoint_open.metadata.base_checkpoint,
+            &shanghai_checkpoint,
+            sizeof(shanghai_checkpoint)) == 0 &&
+            exact_checkpoint_open.metadata
+                    .target_checkpoint.generation.generation == 1U &&
+            exact_checkpoint_open.metadata.delta_tick_record_count ==
+                0U &&
+            exact_checkpoint_open.metadata
+                    .ingress_sequence_begin_inclusive == 8U &&
+            exact_checkpoint_open.metadata
+                    .ingress_sequence_end_exclusive == 8U &&
+            exact_checkpoint_open.metadata
+                    .tick_stream_sequence_begin_inclusive == 6U &&
+            exact_checkpoint_open.metadata
+                    .tick_stream_sequence_end_exclusive == 6U &&
+            exact_checkpoint_open.initial_read_token !=
+                session.delta_session_token,
+        "same-target checkpoint produces exact empty half-open delta");
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2
+        exact_checkpoint_eof{};
+    ok &= Expect(
+        client.Read(
+            0U,
+            exact_checkpoint_open.initial_read_token,
+            &exact_checkpoint_eof,
+            &empty_page) &&
+            status_is(
+                exact_checkpoint_eof.status,
+                ipc::
+                    RealtimeInstrumentTickDeltaControlStatusV2::kOk) &&
+            terminal(exact_checkpoint_eof) &&
+            exact_checkpoint_eof.record_count == 0U &&
+            exact_checkpoint_eof.target_generation == 1U,
+        "same-target checkpoint has explicit zero-row EOF");
+
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        shanghai_origin_open{};
+    if (!Expect(
+            client.OpenInstrument(
+                kShanghaiInstrumentId,
+                1U,
+                ipc::RealtimeInstrumentTickDeltaBaseKindV2::kOrigin,
+                origin_checkpoint,
+                &shanghai_origin_open) &&
+                status_is(
+                    shanghai_origin_open.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk) &&
+                shanghai_origin_open.metadata
+                        .delta_tick_record_count == 3U &&
+                shanghai_origin_open.initial_read_token !=
+                    session.delta_session_token,
+            "open Shanghai origin delta containing a zero tick seam")) {
+        service->StopControl();
+        return false;
+    }
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2
+        shanghai_first{};
+    TickDeltaPageCopy shanghai_page{};
+    if (!Expect(
+            client.Read(
+                0U,
+                shanghai_origin_open.initial_read_token,
+                &shanghai_first,
+                &shanghai_page) &&
+                status_is(
+                    shanghai_first.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk) &&
+                !terminal(shanghai_first) &&
+                shanghai_page.ticks.size() == 1U &&
+                shanghai_page.ticks[0U]
+                        .common.tick_stream_sequence == 1U,
+            "read valid Shanghai row before zero tick seam")) {
+        service->StopControl();
+        return false;
+    }
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2
+        zero_tick_failure{};
+    ok &= Expect(
+        client.Read(
+            1U,
+            shanghai_first.next_read_token,
+            &zero_tick_failure,
+            &empty_page) &&
+            status_is(
+                zero_tick_failure.status,
+                ipc::
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kInternalFailure) &&
+            !terminal(zero_tick_failure) &&
+            zero_tick_failure.record_count == 0U &&
+            zero_tick_failure.page_mapping_bytes == 0U &&
+            !service->failed(),
+        "zero tick fails only the V2 cursor without coverage loss");
+
+    shanghai_summary_cursor.reset();
+    first_generation.reset();
+    TickDeltaWireClient advanced_client;
+    ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2
+        advanced_session{};
+    if (!Expect(
+            advanced_client.OpenSession(
+                socket_path, &advanced_session) &&
+                status_is(
+                    advanced_session.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk) &&
+                advanced_session.target_generation.generation == 2U &&
+                advanced_session.target_generation
+                        .recv_monotonic_cut_ns == 80'001U,
+            "new V2 session pins the subsequently published generation 2")) {
+        service->StopControl();
+        return false;
+    }
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        advanced_open{};
+    if (!Expect(
+            advanced_client.OpenInstrument(
+                kShanghaiInstrumentId,
+                1U,
+                ipc::
+                    RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint,
+                shanghai_checkpoint,
+                &advanced_open) &&
+                status_is(
+                    advanced_open.status,
+                    ipc::
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk),
+            "open generation 1 checkpoint against generation 2 target")) {
+        service->StopControl();
+        return false;
+    }
+    ok &= Expect(
+        advanced_open.metadata.base_checkpoint.generation.generation ==
+                1U &&
+            advanced_open.metadata
+                    .target_checkpoint.generation.generation == 2U &&
+            advanced_open.metadata
+                    .target_checkpoint.instrument_tick_source_record_counts ==
+                shanghai_checkpoint
+                    .instrument_tick_source_record_counts &&
+            advanced_open.metadata.delta_tick_record_count == 0U &&
+            advanced_open.metadata
+                    .ingress_sequence_begin_inclusive == 8U &&
+            advanced_open.metadata
+                    .ingress_sequence_end_exclusive == 8U &&
+            advanced_open.metadata
+                    .tick_stream_sequence_begin_inclusive == 6U &&
+            advanced_open.metadata
+                    .tick_stream_sequence_end_exclusive == 6U &&
+            advanced_open.initial_read_token !=
+                advanced_session.delta_session_token,
+        "durable prior-generation checkpoint advances to exact gen2 cut");
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2 advanced_eof{};
+    ok &= Expect(
+        advanced_client.Read(
+            0U,
+            advanced_open.initial_read_token,
+            &advanced_eof,
+            &empty_page) &&
+            status_is(
+                advanced_eof.status,
+                ipc::
+                    RealtimeInstrumentTickDeltaControlStatusV2::kOk) &&
+            terminal(advanced_eof) &&
+            advanced_eof.record_count == 0U &&
+            advanced_eof.page_mapping_bytes == 0U &&
+            advanced_eof.page_index == 0U &&
+            advanced_eof.target_generation == 2U,
+        "cross-generation empty delta ends with explicit gen2 EOF");
+
+    ipc::RealtimeControlResponseV1 v1_response{};
+    UniqueFd v1_data_fd(
+        ReceiveSessionFd(socket_path, &v1_response));
+    ok &= Expect(
+        v1_data_fd.get() >= 0 &&
+            v1_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeControlStatusV1::kOk) &&
+            v1_response.message_bytes == sizeof(v1_response) &&
+            v1_response.session_epoch == 29U &&
+            !service->failed(),
+        "V1 GET_SESSION remains compatible after V2 cursor failure");
+
+    service->StopControl();
     return ok;
 }
 
@@ -2263,6 +3448,7 @@ int main() {
     bool ok = true;
     ok &= TestWireProjection(fixture);
     ok &= TestForeignStoreGenerationFailsClosed();
+    ok &= TestInstrumentTickDeltaV2();
     ok &= TestServiceAndReader(fixture);
     ok &= TestServiceLifecycle(fixture);
     if (!ok) {

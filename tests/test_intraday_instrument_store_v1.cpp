@@ -1,6 +1,7 @@
 #include "l2flow/market/intraday_instrument_store_v1.h"
 #include "l2flow/market/realtime_history_v1.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -895,6 +896,147 @@ bool CheckGenerationQueriesAndLifetime(
             "four source lanes merge by global ingress sequence");
     }
 
+    std::unique_ptr<market::IntradayInstrumentTickDeltaCursorV1>
+        tick_delta;
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(
+            5U, 2U, &tick_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            tick_delta != nullptr,
+        "open tick-only instrument delta");
+    if (tick_delta != nullptr) {
+        const auto& delta_summary = tick_delta->summary();
+        ok &= Expect(
+            delta_summary.instrument_id == 5U &&
+                delta_summary.selected_source_mask ==
+                    std::array<std::uint8_t, 4U>{0U, 1U, 0U, 1U} &&
+                delta_summary.ingress_sequence_begin_inclusive == 2U &&
+                delta_summary.ingress_sequence_end_exclusive == 9U &&
+                delta_summary.base_tick_source_record_counts ==
+                    std::array<std::uint64_t, 4U>{0U, 1U, 0U, 0U} &&
+                delta_summary.target_tick_source_record_counts ==
+                    std::array<std::uint64_t, 4U>{0U, 3U, 0U, 1U} &&
+                delta_summary.delta_tick_source_record_counts ==
+                    std::array<std::uint64_t, 4U>{0U, 2U, 0U, 1U} &&
+                delta_summary.delta_tick_record_count == 3U,
+            "tick delta summary exposes exact selected/base/target/delta counts");
+        const auto records = DrainCursor(tick_delta.get(), 2U, &ok);
+        ok &= Expect(
+            IngressSequences(records) ==
+                    std::vector<std::uint64_t>{4U, 5U, 6U} &&
+                std::all_of(
+                    records.begin(),
+                    records.end(),
+                    [](const market::RealtimeHistoryRecordV1* record) {
+                        return record != nullptr &&
+                               (record->source_slot() == 1U ||
+                                record->source_slot() == 3U) &&
+                               market::IsTickEventKindV1(record->kind());
+                    }),
+            "tick delta excludes both snapshot lanes and merges tick lanes by ingress");
+
+        market::IntradayInstrumentScanOptionsV1 oracle_options{};
+        oracle_options.ingress_sequence_begin_inclusive = 2U;
+        oracle_options.ingress_sequence_end_exclusive =
+            first->watermark().ingress_sequence_exclusive;
+        std::unique_ptr<market::IntradayInstrumentCursorV1>
+            oracle_cursor;
+        ok &= Expect(
+            first->OpenInstrumentCursor(
+                5U, oracle_options, &oracle_cursor) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                oracle_cursor != nullptr,
+            "open legacy range cursor as tick-delta oracle");
+        if (oracle_cursor != nullptr) {
+            const auto mixed =
+                DrainCursor(oracle_cursor.get(), 2U, &ok);
+            std::vector<const market::RealtimeHistoryRecordV1*>
+                oracle;
+            for (const market::RealtimeHistoryRecordV1* record : mixed) {
+                if (record != nullptr &&
+                    (record->source_slot() == 1U ||
+                     record->source_slot() == 3U)) {
+                    oracle.push_back(record);
+                }
+            }
+            ok &= Expect(
+                records == oracle,
+                "tail-located tick delta exactly matches legacy full-range oracle");
+        }
+    }
+
+    std::unique_ptr<market::IntradayInstrumentTickDeltaCursorV1>
+        bootstrap_delta;
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(
+            5U, 1U, &bootstrap_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            bootstrap_delta != nullptr,
+        "open begin-one tick bootstrap");
+    if (bootstrap_delta != nullptr) {
+        const auto records =
+            DrainCursor(bootstrap_delta.get(), 2U, &ok);
+        ok &= Expect(
+            IngressSequences(records) ==
+                    std::vector<std::uint64_t>{1U, 4U, 5U, 6U} &&
+                bootstrap_delta->summary()
+                        .base_tick_source_record_counts ==
+                    std::array<std::uint64_t, 4U>{},
+            "begin-one bootstrap emits every retained tick and has zero base counts");
+    }
+
+    std::unique_ptr<market::IntradayInstrumentTickDeltaCursorV1>
+        empty_tick_delta;
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(
+            5U,
+            first->watermark().ingress_sequence_exclusive,
+            &empty_tick_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            empty_tick_delta != nullptr && empty_tick_delta->done() &&
+            empty_tick_delta->summary().delta_tick_record_count == 0U &&
+            empty_tick_delta->summary()
+                    .base_tick_source_record_counts ==
+                empty_tick_delta->summary()
+                    .target_tick_source_record_counts,
+        "begin equal to generation end is a valid empty tick delta");
+    if (empty_tick_delta != nullptr) {
+        std::array<const market::RealtimeHistoryRecordV1*, 1U> batch{};
+        std::size_t written = std::numeric_limits<std::size_t>::max();
+        ok &= Expect(
+            empty_tick_delta->ReadBatch(batch, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                written == 0U,
+            "empty tick delta returns an explicit zero-sized terminal batch");
+    }
+
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(
+            5U, 0U, &empty_tick_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::
+                    kInvalidArgument &&
+            empty_tick_delta == nullptr,
+        "tick delta rejects begin zero");
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(
+            5U,
+            first->watermark().ingress_sequence_exclusive + 1U,
+            &empty_tick_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::
+                    kInvalidArgument &&
+            empty_tick_delta == nullptr,
+        "tick delta rejects begin beyond immutable generation end");
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(
+            99U, 1U, &empty_tick_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNotFound &&
+            empty_tick_delta == nullptr,
+        "tick delta rejects an instrument outside the registry");
+    ok &= Expect(
+        first->OpenInstrumentTickDeltaCursor(5U, 1U, nullptr) ==
+            market::IntradayInstrumentStoreQueryErrorV1::kNullOutput,
+        "tick delta rejects a null cursor output");
+
     market::IntradayInstrumentScanOptionsV1 range{};
     range.ingress_sequence_begin_inclusive = 2U;
     range.ingress_sequence_end_exclusive = 6U;
@@ -1183,6 +1325,22 @@ bool CheckGenerationQueriesAndLifetime(
             second_summary.latest_snapshot->ingress_sequence() == 9U,
         "next generation includes post-cut append");
 
+    std::unique_ptr<market::IntradayInstrumentTickDeltaCursorV1>
+        snapshot_only_delta;
+    ok &= Expect(
+        second->OpenInstrumentTickDeltaCursor(
+            5U, 9U, &snapshot_only_delta) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            snapshot_only_delta != nullptr &&
+            snapshot_only_delta->done() &&
+            snapshot_only_delta->summary().delta_tick_record_count ==
+                0U &&
+            snapshot_only_delta->summary()
+                    .base_tick_source_record_counts ==
+                snapshot_only_delta->summary()
+                    .target_tick_source_record_counts,
+        "snapshot-only suffix produces an empty tick delta");
+
     std::unique_ptr<market::IntradayInstrumentCursorV1>
         cursor_surviving_store;
     ok &= Expect(
@@ -1264,6 +1422,45 @@ bool CheckRolloverCapsAndWorkerOwnership(
             first_segment_record_count < kMaximumFixtureRecords &&
             rollover->Snapshot().allocated_segments >= 2U,
         "4 KiB lane arena rolls into a second segment at a measured boundary");
+    const std::uint64_t rollover_record_count =
+        rollover->Snapshot().appended_records;
+    const auto rollover_generation = BuildStoreGeneration(
+        rollover.get(),
+        registry,
+        1U,
+        1U,
+        {1U, rollover_record_count + 1U, 1U, 1U},
+        &ok);
+    if (rollover_generation != nullptr) {
+        std::unique_ptr<market::IntradayInstrumentTickDeltaCursorV1>
+            cross_segment_delta;
+        ok &= Expect(
+            rollover_generation->OpenInstrumentTickDeltaCursor(
+                5U,
+                first_segment_record_count,
+                &cross_segment_delta) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                cross_segment_delta != nullptr &&
+                cross_segment_delta->summary()
+                        .delta_tick_record_count == 2U &&
+                cross_segment_delta->summary()
+                        .base_tick_source_record_counts[1U] ==
+                    first_segment_record_count - 1U &&
+                cross_segment_delta->summary()
+                        .target_tick_source_record_counts[1U] ==
+                    rollover_record_count,
+            "tick delta locates a boundary in the prior segment from the target tail");
+        if (cross_segment_delta != nullptr) {
+            const auto records =
+                DrainCursor(cross_segment_delta.get(), 1U, &ok);
+            ok &= Expect(
+                IngressSequences(records) ==
+                    std::vector<std::uint64_t>{
+                        first_segment_record_count,
+                        rollover_record_count},
+                "tick delta traverses forward across the arena segment boundary");
+        }
+    }
 
     auto wrong_worker = CreateStore(
         registry,

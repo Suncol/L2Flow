@@ -363,9 +363,13 @@ if(L2FLOW_BUILD_TESTS)
             set_tests_properties(
                 test_l2flow_realtime_python
                 PROPERTIES
-                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-                    ENVIRONMENT
-                    "PYTHONDONTWRITEBYTECODE=1;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python")
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+            set_property(
+                TEST test_l2flow_realtime_python
+                PROPERTY ENVIRONMENT
+                    "PYTHONDONTWRITEBYTECODE=1"
+                    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+                    "L2FLOW_SHM_READER_LIBRARY=$<TARGET_FILE:l2flow_shm_reader>")
         endif()
     endif()
 endif()

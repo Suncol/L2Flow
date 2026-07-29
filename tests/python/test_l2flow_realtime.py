@@ -4,6 +4,7 @@ import array
 import csv
 import ctypes
 import fcntl
+import gc
 import importlib.util
 import json
 import os
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +23,13 @@ from l2flow_realtime import (
     ClientClosedError,
     InstrumentKey,
     InstrumentLookupStatus,
+    InstrumentTickDeltaCheckpoint,
+    InstrumentTickDeltaCheckpointUnavailableError,
+    InstrumentTickDeltaCursor,
+    InstrumentTickDeltaPage,
+    InstrumentTickDeltaSession,
+    InstrumentTickColumns,
+    InstrumentTickRollingStore,
     L2FlowClient,
     LatestBatch,
     LatestResult,
@@ -39,6 +48,9 @@ from l2flow_realtime import (
     TickProjectionFlag,
     WireFormatError,
 )
+import l2flow_realtime.instrument_delta as instrument_delta
+import l2flow_realtime.native as native_module
+from l2flow_realtime._fd_owner import _ReceivedPacket
 from l2flow_realtime.control import (
     CONTROL_MAGIC,
     ControlSession,
@@ -176,6 +188,147 @@ def tick_payload(
     return bytes(result)
 
 
+def instrument_delta_tick_payload(
+    tick_sequence,
+    ingress_sequence,
+    source_sequence,
+    source_slot,
+):
+    kind = 2 if source_slot == 1 else 4
+    payload = bytearray(
+        tick_payload(
+            tick_sequence,
+            instrument_id=7,
+            kind=kind,
+            action=3 if source_slot == 1 else 1,
+        )
+    )
+    common = list(_COMMON.unpack_from(payload))
+    common[4] = source_sequence
+    common[5] = ingress_sequence
+    common[6] = tick_sequence
+    common[14] = (30, 31, 32, 33)[source_slot]
+    _COMMON.pack_into(payload, 0, *common)
+    return bytes(payload)
+
+
+def instrument_delta_checkpoint(
+    *,
+    generation=1,
+    source_endpoints=(1, 6, 1, 5),
+    counts=(0, 2, 0, 1),
+    run_id=b"0123456789abcdef",
+):
+    ingress_exclusive = 1 + sum(
+        endpoint - 1 for endpoint in source_endpoints
+    )
+    tick_exclusive = (
+        1 + source_endpoints[1] - 1 + source_endpoints[3] - 1
+    )
+    return InstrumentTickDeltaCheckpoint(
+        run_id=run_id,
+        session_epoch=5,
+        trade_date=20260727,
+        instrument_count=1,
+        registry_version=9,
+        registry_sha256=b"x" * 32,
+        instrument_id=7,
+        registry_ordinal=0,
+        generation=generation,
+        input_identity_sha256=bytes([generation]) * 32,
+        ingress_sequence_exclusive=ingress_exclusive,
+        tick_stream_sequence_exclusive=tick_exclusive,
+        recv_monotonic_cut_ns=generation * 100,
+        source_stream_ids=(30, 31, 32, 33),
+        source_sequence_exclusive=source_endpoints,
+        instrument_tick_counts=counts,
+        coverage_from_open=True,
+        record_coverage_complete=True,
+        field_complete=False,
+        payload_projection=1,
+    )
+
+
+def instrument_delta_metadata_bytes(target, base=None):
+    result = bytearray(
+        instrument_delta.INSTRUMENT_TICK_DELTA_METADATA_BYTES_V2
+    )
+    base_kind = 1 if base is None else 2
+    instrument_delta._METADATA_HEAD.pack_into(
+        result,
+        0,
+        base_kind,
+        instrument_delta.INSTRUMENT_TICK_DELTA_SOURCE_MASK_V2,
+    )
+    if base is not None:
+        result[8:328] = instrument_delta._pack_checkpoint(base)
+        base_counts = base.instrument_tick_counts
+        ingress_begin = base.ingress_sequence_exclusive
+        tick_begin = base.tick_stream_sequence_exclusive
+    else:
+        base_counts = (0, 0, 0, 0)
+        ingress_begin = 1
+        tick_begin = 1
+    result[328:648] = instrument_delta._pack_checkpoint(target)
+    delta_counts = tuple(
+        target_count - base_count
+        for target_count, base_count in zip(
+            target.instrument_tick_counts, base_counts
+        )
+    )
+    instrument_delta._METADATA_TAIL.pack_into(
+        result,
+        648,
+        *delta_counts,
+        sum(delta_counts),
+        ingress_begin,
+        target.ingress_sequence_exclusive,
+        tick_begin,
+        target.tick_stream_sequence_exclusive,
+        target.flags,
+        target.payload_projection,
+        bytes(8),
+    )
+    return bytes(result)
+
+
+def instrument_delta_page_bytes(metadata_bytes, payloads, page_index=0):
+    ticks = tuple(parse_tick(payload) for payload in payloads)
+    total_bytes = (
+        instrument_delta.INSTRUMENT_TICK_DELTA_PAGE_HEADER_BYTES_V2
+        + len(payloads) * TICK_BYTES
+    )
+    result = bytearray(total_bytes)
+    instrument_delta._PAGE_PREFIX.pack_into(
+        result,
+        0,
+        instrument_delta.INSTRUMENT_TICK_DELTA_PAGE_MAGIC_V2,
+        WIRE_MAJOR,
+        WIRE_MINOR,
+        instrument_delta.INSTRUMENT_TICK_DELTA_PAGE_HEADER_BYTES_V2,
+        instrument_delta.INSTRUMENT_TICK_DELTA_ENDIAN_MARKER_V2,
+        0,
+        total_bytes,
+        page_index,
+        len(payloads),
+        TICK_BYTES,
+        instrument_delta.INSTRUMENT_TICK_DELTA_PAGE_HEADER_BYTES_V2,
+        ticks[0].common.ingress_sequence,
+        ticks[-1].common.ingress_sequence,
+        ticks[0].common.tick_stream_sequence,
+        ticks[-1].common.tick_stream_sequence,
+    )
+    result[88:824] = metadata_bytes
+    for index, payload in enumerate(payloads):
+        offset = (
+            instrument_delta
+            .INSTRUMENT_TICK_DELTA_PAGE_HEADER_BYTES_V2
+            + index * TICK_BYTES
+        )
+        result[offset : offset + TICK_BYTES] = payload
+    return bytes(result)
+
+
 def kline_payload(instrument_id=7, window_id=60_000):
     values = [
         3,
@@ -235,6 +388,42 @@ def session_info(
         instrument_count=1,
         window_count=1,
     )
+
+
+def assert_scm_fd_closed_on_base_exception(
+    test_case, payload, receiver
+):
+    left, right = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_SEQPACKET
+    )
+    test_case.addCleanup(left.close)
+    test_case.addCleanup(right.close)
+    descriptor = os.open("/dev/null", os.O_RDONLY)
+    test_case.addCleanup(lambda: os.close(descriptor))
+    rights = array.array("i", [descriptor])
+    right.sendmsg(
+        [payload],
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+    )
+    installed = []
+
+    def interrupt(descriptor_value, _inheritable):
+        installed.append(descriptor_value)
+        raise KeyboardInterrupt("injected fd handoff interruption")
+
+    with (
+        mock.patch(
+            "l2flow_realtime._fd_owner.os.set_inheritable",
+            side_effect=interrupt,
+        ),
+        test_case.assertRaisesRegex(
+            KeyboardInterrupt, "fd handoff interruption"
+        ),
+    ):
+        receiver(left)
+    test_case.assertEqual(len(installed), 1)
+    with test_case.assertRaises(OSError):
+        os.fstat(installed[0])
 
 
 class FakeNative:
@@ -661,6 +850,36 @@ class ClientTests(unittest.TestCase):
         )
         stopped.close()
 
+    def test_client_opens_session_anchored_instrument_delta(self):
+        native = FakeNative()
+        client = L2FlowClient(
+            native,
+            control_socket_path="/tmp/l2flow-control.sock",
+            control_timeout=0.25,
+        )
+        self.addCleanup(client.close)
+        delta_session = mock.Mock()
+        with mock.patch(
+            "l2flow_realtime.client."
+            "open_instrument_tick_delta_session",
+            return_value=delta_session,
+        ) as opened:
+            result = client.open_instrument_tick_delta_session(
+                requested_page_records=17
+            )
+        self.assertIs(result, delta_session)
+        opened.assert_called_once_with(
+            "/tmp/l2flow-control.sock",
+            requested_page_records=17,
+            timeout=0.25,
+            expected_run_id=b"0123456789abcdef",
+            expected_session_epoch=5,
+            expected_trade_date=20260727,
+            expected_instrument_count=1,
+            expected_registry_version=9,
+            expected_registry_sha256=b"x" * 32,
+        )
+
     def test_optional_dependencies_are_lazy_and_explicit(self):
         batch = LatestBatch(
             "tick", SessionIdentity(b"0123456789abcdef", 5), ()
@@ -892,8 +1111,143 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             closed.read_ticks(0, 1)
 
+    def test_close_commits_client_state_after_native_close(self):
+        native = FakeNative()
+        native.close = mock.Mock(
+            side_effect=(RuntimeError("close failed"), None)
+        )
+        client = L2FlowClient(native)
+        client._instrument_cache[7] = object()
+
+        with self.assertRaisesRegex(RuntimeError, "close failed"):
+            client.close()
+        self.assertFalse(client.closed)
+        self.assertIn(7, client._instrument_cache)
+
+        client.close()
+        client.close()
+        self.assertTrue(client.closed)
+        self.assertEqual(client._instrument_cache, {})
+        self.assertEqual(native.close.call_count, 2)
+
+
+class NativeReaderOwnershipTests(unittest.TestCase):
+    @staticmethod
+    def _library():
+        library = mock.Mock()
+
+        def open_reader(_fd, output):
+            ctypes.cast(
+                output, ctypes.POINTER(ctypes.c_void_p)
+            ).contents.value = 0x1234
+            return 0
+
+        library.l2flow_shm_reader_open_fd_v1.side_effect = open_reader
+        return library
+
+    def _open(self, reader_type=NativeReader):
+        library = self._library()
+        with mock.patch.object(native_module, "_bind_library"):
+            reader = reader_type.open_fd(0, library=library)
+        return reader, library
+
+    def test_explicit_close_is_idempotent_and_releases_tick_buffer(self):
+        reader, library = self._open()
+        reader._tick_output = (ctypes.c_uint8 * 4096)()
+        reader._tick_output_bytes = 4096
+
+        reader.close()
+        reader.close()
+
+        self.assertTrue(reader.closed)
+        self.assertIsNone(reader._tick_output)
+        self.assertEqual(reader._tick_output_bytes, 0)
+        library.l2flow_shm_reader_close_v1.assert_called_once()
+
+    def test_abandoned_client_releases_its_native_reader(self):
+        reader, library = self._open()
+        reader.session = mock.Mock(return_value=session_info())
+        client = L2FlowClient(reader)
+        reader_reference = weakref.ref(reader)
+        client_reference = weakref.ref(client)
+
+        del reader
+        del client
+        gc.collect()
+
+        self.assertIsNone(client_reference())
+        self.assertIsNone(reader_reference())
+        library.l2flow_shm_reader_close_v1.assert_called_once()
+
+    def test_open_rolls_back_handle_when_reader_construction_fails(self):
+        class FailingReader(NativeReader):
+            def __init__(self, library, handle):
+                super().__init__(library, handle)
+                raise RuntimeError("reader construction failed")
+
+        library = self._library()
+        with (
+            mock.patch.object(native_module, "_bind_library"),
+            self.assertRaisesRegex(
+                RuntimeError, "reader construction failed"
+            ),
+        ):
+            FailingReader.open_fd(0, library=library)
+        gc.collect()
+
+        library.l2flow_shm_reader_close_v1.assert_called_once()
+
 
 class HistoryProtocolTests(unittest.TestCase):
+    def test_recv_packet_closes_scm_fd_on_baseexception(self):
+        from l2flow_realtime import history as history_module
+
+        payload = bytes(8)
+        assert_scm_fd_closed_on_base_exception(
+            self,
+            payload,
+            lambda channel: history_module._recv_packet(
+                channel, len(payload)
+            ),
+        )
+
+    def test_read_baseexception_closes_packet_and_cursor(self):
+        from l2flow_realtime import history as history_module
+
+        client_socket, server_socket = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_SEQPACKET
+        )
+        self.addCleanup(server_socket.close)
+        cursor = HistoryCursor(
+            _channel=client_socket,
+            generation=self.generation(),
+            requested_page_records=1,
+        )
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        packet = _ReceivedPacket(
+            bytes(history_module.READ_HISTORY_RESPONSE_BYTES),
+            (descriptor,),
+        )
+        with (
+            mock.patch.object(history_module, "_send_packet"),
+            mock.patch.object(
+                history_module, "_recv_packet", return_value=packet
+            ),
+            mock.patch.object(
+                history_module,
+                "_validate_response_prefix",
+                side_effect=KeyboardInterrupt("injected page validation"),
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt, "page validation"
+            ),
+        ):
+            cursor.read()
+        self.assertTrue(cursor.closed)
+        self.assertTrue(packet.closed)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
     @staticmethod
     def generation():
         return HistoryGeneration(
@@ -1689,8 +2043,944 @@ class HistoryBenchmarkSummarizerTests(unittest.TestCase):
                     summarizer.summarize(root, 2)
 
 
+class FakeInstrumentDeltaCursor:
+    def __init__(self, base_checkpoint, target_checkpoint, pages):
+        self.instrument_id = target_checkpoint.instrument_id
+        self.base_checkpoint = base_checkpoint
+        self._target_checkpoint = target_checkpoint
+        self._pages = tuple(pages)
+        self.done = False
+        self.closed = False
+
+    @property
+    def verified_checkpoint(self):
+        if not self.done:
+            raise InstrumentTickDeltaCheckpointUnavailableError(
+                "checkpoint unavailable before EOF"
+            )
+        return self._target_checkpoint
+
+    def pages(self):
+        for page in self._pages:
+            if page.eof:
+                self.done = True
+            yield page
+
+    def close(self):
+        self.closed = True
+
+
+class RecordingRollingFactor:
+    factor_schema = "factor-v1"
+
+    def __init__(self, fail_call=None):
+        self.fail_call = fail_call
+        self.changes = []
+
+    def update(self, state, change):
+        self.changes.append(change)
+        if len(self.changes) == self.fail_call:
+            raise RuntimeError("factor failure")
+        return state + len(change.appended), (
+            len(change.appended),
+            len(change.evicted),
+        )
+
+
+class InstrumentDeltaV2Tests(unittest.TestCase):
+    def test_recv_packet_closes_scm_fd_on_baseexception(self):
+        payload = bytes(8)
+        assert_scm_fd_closed_on_base_exception(
+            self,
+            payload,
+            lambda channel: instrument_delta._recv_packet(
+                channel, len(payload)
+            ),
+        )
+
+    def test_read_baseexception_closes_packet_and_session(self):
+        target = instrument_delta_checkpoint()
+        metadata_wire = instrument_delta_metadata_bytes(target)
+        metadata = instrument_delta._parse_metadata(metadata_wire)
+        session = InstrumentTickDeltaSession(
+            mock.Mock(),
+            instrument_delta._checkpoint_endpoint(target),
+            55,
+            16,
+        )
+        cursor = InstrumentTickDeltaCursor(
+            _session=session,
+            _metadata=metadata,
+            requested_page_records=16,
+            _read_token=91,
+        )
+        session._active_cursor = cursor
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        packet = _ReceivedPacket(
+            bytes(
+                instrument_delta
+                .READ_INSTRUMENT_TICK_DELTA_RESPONSE_BYTES_V2
+            ),
+            (descriptor,),
+        )
+        with (
+            mock.patch.object(instrument_delta, "_send_packet"),
+            mock.patch.object(
+                instrument_delta, "_recv_packet", return_value=packet
+            ),
+            mock.patch.object(
+                instrument_delta,
+                "_validate_response_prefix",
+                side_effect=KeyboardInterrupt("injected page validation"),
+            ),
+            self.assertRaisesRegex(
+                KeyboardInterrupt, "page validation"
+            ),
+        ):
+            cursor.read()
+        self.assertTrue(cursor.closed)
+        self.assertTrue(session.closed)
+        self.assertTrue(packet.closed)
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def metadata(self, target=None, base=None):
+        target = target or instrument_delta_checkpoint()
+        wire = instrument_delta_metadata_bytes(target, base)
+        return wire, instrument_delta._parse_metadata(wire)
+
+    def sparse_payloads(self):
+        return (
+            instrument_delta_tick_payload(2, 2, 2, 1),
+            instrument_delta_tick_payload(6, 6, 3, 3),
+            instrument_delta_tick_payload(9, 9, 5, 1),
+        )
+
+    def sealed_page_fd(self, page):
+        if not hasattr(os, "memfd_create"):
+            self.skipTest("memfd_create is unavailable")
+        writable_fd = os.memfd_create(
+            "l2flow-instrument-delta-test",
+            getattr(os, "MFD_CLOEXEC", 1)
+            | getattr(os, "MFD_ALLOW_SEALING", 2),
+        )
+        try:
+            view = memoryview(page)
+            while view:
+                written = os.write(writable_fd, view)
+                if written <= 0:
+                    raise RuntimeError("short instrument delta page write")
+                view = view[written:]
+            fcntl.fcntl(
+                writable_fd,
+                getattr(fcntl, "F_ADD_SEALS", 1033),
+                getattr(fcntl, "F_SEAL_WRITE", 0x0008)
+                | getattr(fcntl, "F_SEAL_GROW", 0x0004)
+                | getattr(fcntl, "F_SEAL_SHRINK", 0x0002)
+                | getattr(fcntl, "F_SEAL_SEAL", 0x0001),
+            )
+            return os.open(
+                f"/proc/self/fd/{writable_fd}",
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+        finally:
+            os.close(writable_fd)
+
+    def validate_page(self, page, metadata_wire, record_count):
+        fd = self.sealed_page_fd(page)
+        try:
+            return instrument_delta._parse_page(
+                instrument_delta
+                .NativeInstrumentTickDeltaPageValidator(),
+                fd,
+                expected_bytes=len(page),
+                expected_records=record_count,
+                expected_page_index=0,
+                metadata_wire=metadata_wire,
+                prior_ingress_sequence=0,
+                prior_tick_stream_sequence=0,
+                prior_source_sequences=(0, 0, 0, 0),
+            )
+        finally:
+            os.close(fd)
+
+    def test_v2_abi_sizes_and_checkpoint_parser(self):
+        self.assertEqual(
+            instrument_delta
+            .DEFAULT_INSTRUMENT_TICK_DELTA_PAGE_RECORDS,
+            16_384,
+        )
+        self.assertEqual(
+            instrument_delta
+            .open_instrument_tick_delta_session.__kwdefaults__[
+                "requested_page_records"
+            ],
+            16_384,
+        )
+        self.assertEqual(
+            L2FlowClient
+            .open_instrument_tick_delta_session.__kwdefaults__[
+                "requested_page_records"
+            ],
+            16_384,
+        )
+        target = instrument_delta_checkpoint()
+        packed = instrument_delta._pack_checkpoint(target)
+        self.assertEqual(len(packed), 320)
+        self.assertEqual(
+            instrument_delta._parse_checkpoint(packed), target
+        )
+        self.assertEqual(instrument_delta._ENDPOINT.size, 256)
+        self.assertEqual(instrument_delta._CHECKPOINT_TAIL.size, 64)
+        self.assertEqual(instrument_delta._METADATA_TAIL.size, 88)
+        self.assertEqual(instrument_delta._PAGE_PREFIX.size, 88)
+        self.assertEqual(
+            instrument_delta._OPEN_SESSION_REQUEST.size, 40
+        )
+        self.assertEqual(
+            instrument_delta._OPEN_INSTRUMENT_PREFIX.size, 56
+        )
+        self.assertEqual(instrument_delta._READ_REQUEST.size, 48)
+        self.assertEqual(instrument_delta._READ_RESPONSE.size, 64)
+        metadata_wire, metadata = self.metadata(target)
+        self.assertEqual(len(metadata_wire), 736)
+        self.assertIsNone(metadata.base_checkpoint)
+        self.assertEqual(metadata.target_checkpoint, target)
+        restored = InstrumentTickDeltaCheckpoint.from_dict(
+            json.loads(json.dumps(target.to_dict()))
+        )
+        self.assertEqual(restored, target)
+
+    def test_checkpoint_rejects_impossible_local_successor(self):
+        base = instrument_delta_checkpoint(
+            source_endpoints=(1, 5, 1, 1),
+            counts=(0, 0, 0, 0),
+        )
+        impossible = instrument_delta_checkpoint(
+            generation=2,
+            source_endpoints=(1, 6, 1, 1),
+            counts=(0, 2, 0, 0),
+        )
+        with self.assertRaisesRegex(
+            StaleSessionError, "local count"
+        ):
+            impossible.ensure_successor_of(base)
+
+    def test_sparse_tick_and_source_sequences_are_accepted(self):
+        metadata_wire, metadata = self.metadata()
+        self.assertEqual(
+            instrument_delta._pack_metadata(metadata), metadata_wire
+        )
+        payloads = self.sparse_payloads()
+        page = instrument_delta_page_bytes(
+            metadata_wire, payloads
+        )
+        result = self.validate_page(page, metadata_wire, 3)
+        self.assertEqual(result.wire_records, b"".join(payloads))
+        self.assertEqual(result.source_counts, (0, 2, 0, 1))
+        self.assertEqual(
+            (
+                result.last_ingress_sequence,
+                result.last_tick_stream_sequence,
+            ),
+            (9, 9),
+        )
+        self.assertEqual(
+            result.last_source_sequences, (0, 5, 0, 3)
+        )
+        column_page = InstrumentTickDeltaPage(
+            instrument_id=7,
+            page_index=0,
+            wire_records=result.wire_records,
+            eof=False,
+            cumulative_record_count=3,
+            cumulative_source_record_counts=(0, 2, 0, 1),
+        )
+        records = column_page.numpy_records()
+        self.assertEqual(len(column_page), 3)
+        self.assertFalse(records.flags.writeable)
+        self.assertEqual(
+            records["tick_stream_sequence"].tolist(),
+            [2, 6, 9],
+        )
+        self.assertEqual(
+            records["source_sequence"].tolist(),
+            [2, 3, 5],
+        )
+
+    def test_page_rejects_half_open_target_boundary(self):
+        metadata_wire, _metadata = self.metadata()
+        payload = instrument_delta_tick_payload(10, 9, 5, 1)
+        page = instrument_delta_page_bytes(
+            metadata_wire, (payload,)
+        )
+        with self.assertRaisesRegex(
+            WireFormatError, "native wire validation"
+        ):
+            self.validate_page(page, metadata_wire, 1)
+
+    def test_checkpoint_unavailable_until_explicit_empty_eof(self):
+        target = instrument_delta_checkpoint(
+            source_endpoints=(2, 1, 2, 1),
+            counts=(0, 0, 0, 0),
+        )
+        metadata_wire = instrument_delta_metadata_bytes(target)
+        metadata = instrument_delta._parse_metadata(metadata_wire)
+        channel = mock.Mock()
+        session = InstrumentTickDeltaSession(
+            channel,
+            instrument_delta._checkpoint_endpoint(target),
+            55,
+            16,
+        )
+        cursor = InstrumentTickDeltaCursor(
+            _session=session,
+            _metadata=metadata,
+            requested_page_records=16,
+            _read_token=91,
+        )
+        session._active_cursor = cursor
+        with self.assertRaises(
+            InstrumentTickDeltaCheckpointUnavailableError
+        ):
+            _ = cursor.verified_checkpoint
+        response = instrument_delta._READ_RESPONSE.pack(
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            instrument_delta
+            .INSTRUMENT_TICK_DELTA_RESPONSE_TERMINAL_V2,
+            instrument_delta
+            .READ_INSTRUMENT_TICK_DELTA_RESPONSE_BYTES_V2,
+            0,
+            77,
+            0,
+            0,
+            target.generation,
+            0,
+        )
+        with (
+            mock.patch.object(
+                instrument_delta,
+                "_request_id",
+                return_value=77,
+            ),
+            mock.patch.object(instrument_delta, "_send_packet"),
+            mock.patch.object(
+                instrument_delta,
+                "_recv_packet",
+                return_value=instrument_delta._ReceivedPacket(response),
+            ),
+        ):
+            page = cursor.read()
+        self.assertTrue(page.eof)
+        self.assertEqual(page.wire_records, b"")
+        self.assertTrue(cursor.done)
+        self.assertEqual(cursor.verified_checkpoint, target)
+        self.assertIsNone(session._active_cursor)
+
+    def test_cursor_commits_column_page_after_native_validation(self):
+        target = instrument_delta_checkpoint()
+        _metadata_wire, metadata = self.metadata(target)
+        payloads = self.sparse_payloads()
+        channel = mock.Mock()
+        session = InstrumentTickDeltaSession(
+            channel,
+            instrument_delta._checkpoint_endpoint(target),
+            55,
+            16,
+        )
+        session._validate_page = mock.Mock(
+            return_value=mock.Mock(
+                wire_records=b"".join(payloads),
+                source_counts=(0, 2, 0, 1),
+                last_ingress_sequence=9,
+                last_tick_stream_sequence=9,
+                last_source_sequences=(0, 5, 0, 3),
+            )
+        )
+        cursor = InstrumentTickDeltaCursor(
+            _session=session,
+            _metadata=metadata,
+            requested_page_records=16,
+            _read_token=91,
+        )
+        session._active_cursor = cursor
+        response = instrument_delta._READ_RESPONSE.pack(
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            0,
+            instrument_delta
+            .READ_INSTRUMENT_TICK_DELTA_RESPONSE_BYTES_V2,
+            3,
+            77,
+            (
+                instrument_delta
+                .INSTRUMENT_TICK_DELTA_PAGE_HEADER_BYTES_V2
+                + 3 * TICK_BYTES
+            ),
+            0,
+            target.generation,
+            92,
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+            with (
+                mock.patch.object(
+                    instrument_delta,
+                    "_request_id",
+                    return_value=77,
+                ),
+                mock.patch.object(instrument_delta, "_send_packet"),
+                mock.patch.object(
+                    instrument_delta,
+                    "_recv_packet",
+                    return_value=instrument_delta._ReceivedPacket(
+                        response, (read_fd,)
+                    ),
+                ),
+            ):
+                page = cursor.read()
+        finally:
+            os.close(write_fd)
+        self.assertEqual(page.wire_records, b"".join(payloads))
+        self.assertEqual(len(page), 3)
+        self.assertFalse(hasattr(page, "records"))
+        self.assertEqual(cursor.next_page_index, 1)
+        self.assertEqual(cursor.cumulative_record_count, 3)
+        self.assertEqual(cursor._read_token, 92)
+        self.assertEqual(
+            cursor._cumulative_source_counts, (0, 2, 0, 1)
+        )
+        self.assertEqual(session._validate_page.call_count, 1)
+        cursor.close()
+
+    def test_cursor_validation_failure_does_not_advance_state(self):
+        target = instrument_delta_checkpoint()
+        _metadata_wire, metadata = self.metadata(target)
+        channel = mock.Mock()
+        session = InstrumentTickDeltaSession(
+            channel,
+            instrument_delta._checkpoint_endpoint(target),
+            55,
+            16,
+        )
+        session._validate_page = mock.Mock(
+            side_effect=WireFormatError("invalid page")
+        )
+        cursor = InstrumentTickDeltaCursor(
+            _session=session,
+            _metadata=metadata,
+            requested_page_records=16,
+            _read_token=91,
+        )
+        session._active_cursor = cursor
+        response = instrument_delta._READ_RESPONSE.pack(
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            0,
+            instrument_delta
+            .READ_INSTRUMENT_TICK_DELTA_RESPONSE_BYTES_V2,
+            3,
+            77,
+            (
+                instrument_delta
+                .INSTRUMENT_TICK_DELTA_PAGE_HEADER_BYTES_V2
+                + 3 * TICK_BYTES
+            ),
+            0,
+            target.generation,
+            92,
+        )
+        read_fd, write_fd = os.pipe()
+        try:
+            with (
+                mock.patch.object(
+                    instrument_delta,
+                    "_request_id",
+                    return_value=77,
+                ),
+                mock.patch.object(instrument_delta, "_send_packet"),
+                mock.patch.object(
+                    instrument_delta,
+                    "_recv_packet",
+                    return_value=instrument_delta._ReceivedPacket(
+                        response, (read_fd,)
+                    ),
+                ),
+                self.assertRaises(WireFormatError),
+            ):
+                cursor.read()
+        finally:
+            os.close(write_fd)
+        self.assertTrue(session.closed)
+        self.assertTrue(cursor.closed)
+        self.assertEqual(cursor.next_page_index, 0)
+        self.assertEqual(cursor.cumulative_record_count, 0)
+        self.assertEqual(cursor._read_token, 91)
+        self.assertEqual(session._validate_page.call_count, 1)
+
+    def test_open_instrument_rejects_checkpoint_session_mismatch(self):
+        target = instrument_delta_checkpoint()
+        foreign = instrument_delta_checkpoint(
+            run_id=b"fedcba9876543210"
+        )
+        session = InstrumentTickDeltaSession(
+            mock.Mock(),
+            instrument_delta._checkpoint_endpoint(target),
+            55,
+            16,
+        )
+        with self.assertRaises(StaleSessionError):
+            session.open_instrument(7, after=foreign)
+
+
+class InstrumentRollingTests(unittest.TestCase):
+    def payloads(self):
+        return (
+            instrument_delta_tick_payload(2, 2, 2, 1),
+            instrument_delta_tick_payload(6, 6, 3, 3),
+            instrument_delta_tick_payload(9, 9, 5, 1),
+        )
+
+    def pages(self):
+        payloads = self.payloads()
+        return (
+            InstrumentTickDeltaPage(
+                instrument_id=7,
+                page_index=0,
+                wire_records=b"".join(payloads[:2]),
+                eof=False,
+                cumulative_record_count=2,
+                cumulative_source_record_counts=(0, 1, 0, 1),
+            ),
+            InstrumentTickDeltaPage(
+                instrument_id=7,
+                page_index=1,
+                wire_records=payloads[2],
+                eof=False,
+                cumulative_record_count=3,
+                cumulative_source_record_counts=(0, 2, 0, 1),
+            ),
+            InstrumentTickDeltaPage(
+                instrument_id=7,
+                page_index=2,
+                wire_records=b"",
+                eof=True,
+                cumulative_record_count=3,
+                cumulative_source_record_counts=(0, 2, 0, 1),
+            ),
+        )
+
+    def store(self):
+        return InstrumentTickRollingStore(
+            7,
+            2,
+            state_schema="ticks-v1",
+            factor_schema="factor-v1",
+            factor_state=0,
+        )
+
+    def test_columns_require_immutable_aligned_wire_bytes(self):
+        with self.assertRaises(TypeError):
+            InstrumentTickColumns(bytearray(TICK_BYTES))
+        with self.assertRaisesRegex(ValueError, "record-aligned"):
+            InstrumentTickColumns(b"\x00")
+
+    def test_page_staging_commit_and_window_eviction(self):
+        target = instrument_delta_checkpoint()
+        cursor = FakeInstrumentDeltaCursor(
+            None, target, self.pages()
+        )
+        factor = RecordingRollingFactor()
+        store = self.store()
+        committed = store.update(cursor, factor)
+        self.assertEqual(
+            committed.state.numpy_records()[
+                "tick_stream_sequence"
+            ].tolist(),
+            [6, 9],
+        )
+        self.assertFalse(
+            committed.state.numpy_records().flags.writeable
+        )
+        self.assertFalse(hasattr(committed.state, "ticks"))
+        self.assertEqual(committed.state.seen_count, 3)
+        self.assertEqual(committed.state.factor_state, 3)
+        self.assertEqual(committed.checkpoint, target)
+        self.assertEqual(
+            [len(change.appended) for change in factor.changes],
+            [2, 1],
+        )
+        self.assertEqual(
+            [len(change.evicted) for change in factor.changes],
+            [0, 1],
+        )
+        self.assertEqual(
+            factor.changes[0].appended.numpy_records()[
+                "tick_stream_sequence"
+            ].tolist(),
+            [2, 6],
+        )
+        self.assertEqual(
+            factor.changes[1].evicted.numpy_records()[
+                "tick_stream_sequence"
+            ].tolist(),
+            [2],
+        )
+
+    def test_page_larger_than_window_evicts_early_page_columns(self):
+        cursor = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        factor = RecordingRollingFactor()
+        store = InstrumentTickRollingStore(
+            7,
+            1,
+            state_schema="ticks-v1",
+            factor_schema="factor-v1",
+            factor_state=0,
+        )
+        committed = store.update(cursor, factor)
+        self.assertEqual(
+            factor.changes[0].evicted.numpy_records()[
+                "tick_stream_sequence"
+            ].tolist(),
+            [2],
+        )
+        self.assertEqual(
+            factor.changes[0].after.numpy_records()[
+                "tick_stream_sequence"
+            ].tolist(),
+            [6],
+        )
+        self.assertEqual(
+            committed.state.numpy_records()[
+                "tick_stream_sequence"
+            ].tolist(),
+            [9],
+        )
+
+    def test_factor_failure_aborts_all_committed_fields(self):
+        target = instrument_delta_checkpoint()
+        cursor = FakeInstrumentDeltaCursor(
+            None, target, self.pages()
+        )
+        store = self.store()
+        before = store.snapshot()
+        with self.assertRaisesRegex(RuntimeError, "factor failure"):
+            store.update(
+                cursor, RecordingRollingFactor(fail_call=2)
+            )
+        self.assertEqual(store.snapshot(), before)
+        self.assertTrue(cursor.closed)
+
+    def test_transaction_context_aborts_on_block_exception(self):
+        cursor = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store = self.store()
+        before = store.snapshot()
+        with self.assertRaisesRegex(ValueError, "block failure"):
+            with store.begin(
+                cursor, RecordingRollingFactor()
+            ) as transaction:
+                transaction.apply_page(self.pages()[0])
+                raise ValueError("block failure")
+        self.assertFalse(transaction.active)
+        self.assertTrue(cursor.closed)
+        self.assertEqual(store.snapshot(), before)
+
+    def test_context_commit_result_survives_reference_cleanup(self):
+        target = instrument_delta_checkpoint()
+        cursor = FakeInstrumentDeltaCursor(
+            None, target, self.pages()
+        )
+        store = self.store()
+        with store.begin(
+            cursor, RecordingRollingFactor()
+        ) as transaction:
+            for page in cursor.pages():
+                transaction.apply_page(page)
+            committed = transaction.commit()
+            self.assertFalse(transaction.active)
+            self.assertIsNone(transaction._cursor)
+            self.assertIsNone(transaction._base)
+            self.assertEqual(transaction._shadow_wire_records, b"")
+            self.assertIsNone(transaction._shadow_factor_state)
+        self.assertEqual(committed.checkpoint, target)
+        self.assertEqual(committed.state.seen_count, 3)
+        self.assertEqual(committed.state.factor_state, 3)
+
+    def test_store_update_aborts_on_keyboard_interrupt(self):
+        class InterruptingCursor(FakeInstrumentDeltaCursor):
+            def pages(self):
+                raise KeyboardInterrupt("cursor interrupted")
+                yield
+
+        cursor = InterruptingCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store = self.store()
+        before = store.snapshot()
+        with self.assertRaisesRegex(
+            KeyboardInterrupt, "cursor interrupted"
+        ):
+            store.update(cursor, RecordingRollingFactor())
+        self.assertTrue(cursor.closed)
+        self.assertEqual(store.snapshot(), before)
+
+        replacement = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store.begin(
+            replacement, RecordingRollingFactor()
+        ).abort()
+
+    def test_apply_page_aborts_on_keyboard_interrupt(self):
+        class InterruptingFactor:
+            factor_schema = "factor-v1"
+
+            def update(self, state, change):
+                raise KeyboardInterrupt("factor interrupted")
+
+        cursor = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store = self.store()
+        before = store.snapshot()
+        transaction = store.begin(cursor, InterruptingFactor())
+        with self.assertRaisesRegex(
+            KeyboardInterrupt, "factor interrupted"
+        ):
+            transaction.apply_page(self.pages()[0])
+        self.assertFalse(transaction.active)
+        self.assertTrue(cursor.closed)
+        self.assertIsNone(transaction._cursor)
+        self.assertIsNone(transaction._factor)
+        self.assertIsNone(transaction._base)
+        self.assertEqual(transaction._shadow_wire_records, b"")
+        self.assertIsNone(transaction._shadow_factor_state)
+        self.assertEqual(store.snapshot(), before)
+
+    def test_commit_aborts_on_keyboard_interrupt(self):
+        cursor = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store = self.store()
+        before = store.snapshot()
+        transaction = store.begin(
+            cursor, RecordingRollingFactor()
+        )
+        for page in cursor.pages():
+            transaction.apply_page(page)
+
+        with mock.patch(
+            "l2flow_realtime.rolling.copy.deepcopy",
+            side_effect=KeyboardInterrupt("commit interrupted"),
+        ), self.assertRaisesRegex(
+            KeyboardInterrupt, "commit interrupted"
+        ):
+            transaction.commit()
+
+        self.assertFalse(transaction.active)
+        self.assertIsNone(transaction._cursor)
+        self.assertIsNone(transaction._base)
+        self.assertEqual(transaction._shadow_wire_records, b"")
+        self.assertIsNone(transaction._shadow_factor_state)
+        self.assertEqual(store.snapshot(), before)
+
+        replacement = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store.begin(
+            replacement, RecordingRollingFactor()
+        ).abort()
+
+    def test_abandoned_transaction_finalizer_is_safe(self):
+        class InterruptingCloseCursor(FakeInstrumentDeltaCursor):
+            def close(self):
+                self.closed = True
+                raise KeyboardInterrupt("close interrupted")
+
+        cursor = InterruptingCloseCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store = self.store()
+        before = store.snapshot()
+        transaction = store.begin(
+            cursor, RecordingRollingFactor()
+        )
+        transaction.apply_page(self.pages()[0])
+        del transaction
+        gc.collect()
+
+        self.assertTrue(cursor.closed)
+        self.assertEqual(store.snapshot(), before)
+        replacement = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store.begin(
+            replacement, RecordingRollingFactor()
+        ).abort()
+
+    def test_mutating_factor_failure_cannot_change_committed_state(self):
+        class MutatingFailure:
+            factor_schema = "factor-v1"
+
+            def update(self, state, change):
+                state["count"] += len(change.appended)
+                raise RuntimeError("mutating factor failure")
+
+        cursor = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), self.pages()
+        )
+        store = InstrumentTickRollingStore(
+            7,
+            2,
+            state_schema="ticks-v1",
+            factor_schema="factor-v1",
+            factor_state={"count": 0},
+        )
+        before = store.snapshot()
+        with self.assertRaisesRegex(
+            RuntimeError, "mutating factor failure"
+        ):
+            store.update(cursor, MutatingFailure())
+        self.assertEqual(store.snapshot(), before)
+
+    def test_source_counts_must_reconcile_at_eof(self):
+        pages = tuple(
+            InstrumentTickDeltaPage(
+                instrument_id=page.instrument_id,
+                page_index=page.page_index,
+                wire_records=page.wire_records,
+                eof=page.eof,
+                cumulative_record_count=page.cumulative_record_count,
+                cumulative_source_record_counts=(
+                    (0, 2, 0, 0)
+                    if page.page_index == 0
+                    else (0, 3, 0, 0)
+                ),
+            )
+            for page in self.pages()
+        )
+        cursor = FakeInstrumentDeltaCursor(
+            None, instrument_delta_checkpoint(), pages
+        )
+        store = self.store()
+        before = store.snapshot()
+        with self.assertRaisesRegex(
+            WireFormatError, "counts do not reconcile"
+        ):
+            store.update(cursor, RecordingRollingFactor())
+        self.assertEqual(store.snapshot(), before)
+
+    def test_empty_delta_advances_checkpoint_and_generation_hook(self):
+        base = instrument_delta_checkpoint()
+        target = instrument_delta_checkpoint(
+            generation=2,
+            source_endpoints=(2, 6, 2, 5),
+            counts=base.instrument_tick_counts,
+        )
+        wire_records = b"".join(self.payloads())
+        store = InstrumentTickRollingStore(
+            7,
+            3,
+            state_schema="ticks-v1",
+            factor_schema="factor-v1",
+            factor_state=3,
+            checkpoint=base,
+            wire_records=wire_records,
+        )
+        eof = InstrumentTickDeltaPage(
+            instrument_id=7,
+            page_index=0,
+            wire_records=b"",
+            eof=True,
+            cumulative_record_count=0,
+            cumulative_source_record_counts=(0, 0, 0, 0),
+        )
+        cursor = FakeInstrumentDeltaCursor(
+            base, target, (eof,)
+        )
+
+        class GenerationFactor(RecordingRollingFactor):
+            def on_generation(self, state, generation):
+                return state + 10, generation.checkpoint.generation
+
+        factor = GenerationFactor()
+        committed = store.update(cursor, factor)
+        self.assertEqual(factor.changes, [])
+        self.assertEqual(committed.state.factor_state, 13)
+        self.assertEqual(committed.factor_value, 2)
+        self.assertEqual(committed.checkpoint, target)
+        self.assertEqual(
+            committed.state.wire_records, wire_records
+        )
+
+    def test_cursor_base_session_mismatch_is_rejected(self):
+        target = instrument_delta_checkpoint()
+        cursor = FakeInstrumentDeltaCursor(
+            target, target, self.pages()
+        )
+        store = self.store()
+        with self.assertRaises(StaleSessionError):
+            store.begin(cursor, RecordingRollingFactor())
+
+    def test_restore_rejects_incomplete_retained_tail(self):
+        checkpoint = instrument_delta_checkpoint()
+        with self.assertRaisesRegex(ValueError, "exact count tail"):
+            InstrumentTickRollingStore(
+                7,
+                2,
+                state_schema="ticks-v1",
+                factor_schema="factor-v1",
+                factor_state=0,
+                checkpoint=checkpoint,
+                wire_records=self.payloads()[-1],
+            )
+
+
 class ControlTests(unittest.TestCase):
     _RESPONSE = struct.Struct("<8sHHHHIIQQQQQ")
+
+    def test_unclaimed_control_session_finalizer_closes_fd(self):
+        descriptor = os.open("/dev/null", os.O_RDONLY)
+        session = ControlSession(
+            _ReceivedPacket(fds=(descriptor,)), 11, 5, 4096
+        )
+        del session
+        gc.collect()
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def test_receive_closes_scm_fd_on_baseexception(self):
+        request_id = 91
+        response = self._RESPONSE.pack(
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            0,
+            RESPONSE_BYTES,
+            0,
+            request_id,
+            5,
+            4096,
+            0,
+            0,
+        )
+        assert_scm_fd_closed_on_base_exception(
+            self,
+            response,
+            lambda channel: receive_session_fd(channel, request_id),
+        )
 
     def test_receive_exact_response_and_one_fd(self):
         left, right = socket.socketpair(
@@ -1720,13 +3010,16 @@ class ControlTests(unittest.TestCase):
             [response],
             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
         )
-        discovered = receive_session_fd(left, request_id)
-        try:
+        with receive_session_fd(left, request_id) as discovered:
+            received_fd = discovered.fd
             self.assertEqual(discovered.session_epoch, 5)
             self.assertFalse(os.get_inheritable(discovered.fd))
-            self.assertEqual(os.fstat(discovered.fd).st_rdev, os.fstat(descriptor).st_rdev)
-        finally:
-            os.close(discovered.fd)
+            self.assertEqual(
+                os.fstat(discovered.fd).st_rdev,
+                os.fstat(descriptor).st_rdev,
+            )
+        with self.assertRaises(OSError):
+            os.fstat(received_fd)
 
     def test_discovery_rejects_relative_socket_path(self):
         with self.assertRaisesRegex(ValueError, "absolute"):
@@ -1743,7 +3036,9 @@ class ControlTests(unittest.TestCase):
                 factory_fd.append(fd)
                 return FakeNative()
 
-            control = ControlSession(control_fd, 11, 5, 4096)
+            control = ControlSession(
+                _ReceivedPacket(fds=(control_fd,)), 11, 5, 4096
+            )
             with mock.patch(
                 "l2flow_realtime.client.discover_session_fd",
                 return_value=control,
@@ -1754,6 +3049,38 @@ class ControlTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(factory_fd[0])
             client.close()
+
+    def test_connect_baseexception_closes_control_and_native(self):
+        with tempfile.TemporaryFile() as mapping:
+            mapping.truncate(4096)
+            control_fd = os.dup(mapping.fileno())
+            control = ControlSession(
+                _ReceivedPacket(fds=(control_fd,)), 11, 5, 4096
+            )
+            native = FakeNative()
+            native.session = mock.Mock(
+                side_effect=KeyboardInterrupt("session interrupted")
+            )
+            native.close = mock.Mock()
+
+            with (
+                mock.patch(
+                    "l2flow_realtime.client.discover_session_fd",
+                    return_value=control,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "session interrupted"
+                ),
+            ):
+                L2FlowClient.connect(
+                    "/unused/control.sock",
+                    _native_factory=lambda _fd: native,
+                )
+
+            self.assertTrue(control.closed)
+            with self.assertRaises(OSError):
+                os.fstat(control_fd)
+            native.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

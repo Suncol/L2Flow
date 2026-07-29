@@ -13,7 +13,6 @@ field-complete copy of the C++ Store payload.
 
 from __future__ import annotations
 
-import array
 import fcntl
 import mmap
 import os
@@ -26,6 +25,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple, Union
 
+from ._fd_owner import _ReceivedPacket, _recv_fds
 from .models import (
     ClientClosedError,
     L2FlowRealtimeError,
@@ -320,63 +320,15 @@ def _validate_timeout(timeout: Optional[float]) -> Optional[float]:
     return None
 
 
-def _close_fds(descriptors) -> None:
-    for descriptor in descriptors:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-
-
 def _recv_packet(
     channel: socket.socket,
     expected_bytes: int,
-) -> Tuple[bytes, Tuple[int, ...]]:
-    descriptor_array = array.array("i")
-    ancillary_capacity = socket.CMSG_SPACE(descriptor_array.itemsize)
-    recv_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
-    data, ancillary, message_flags, _address = channel.recvmsg(
-        expected_bytes, ancillary_capacity, recv_flags
+) -> _ReceivedPacket:
+    return _recv_fds(
+        channel,
+        expected_bytes,
+        response_name="history response",
     )
-    received_fds = []
-    try:
-        unexpected_ancillary = False
-        for level, kind, payload in ancillary:
-            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
-                unexpected_ancillary = True
-                continue
-            complete_bytes = (
-                len(payload)
-                - len(payload) % descriptor_array.itemsize
-            )
-            if complete_bytes != len(payload):
-                unexpected_ancillary = True
-            if complete_bytes:
-                values = array.array("i")
-                values.frombytes(payload[:complete_bytes])
-                received_fds.extend(values.tolist())
-        truncation_flags = getattr(socket, "MSG_TRUNC", 0) | getattr(
-            socket, "MSG_CTRUNC", 0
-        )
-        if message_flags & truncation_flags:
-            raise ProtocolError("truncated history control response")
-        if unexpected_ancillary:
-            raise ProtocolError(
-                "unexpected or malformed history ancillary message"
-            )
-        if len(data) != expected_bytes:
-            raise ProtocolError(
-                "history response has "
-                f"{len(data)} bytes; expected {expected_bytes}"
-            )
-        for descriptor in received_fds:
-            os.set_inheritable(descriptor, False)
-        result = tuple(received_fds)
-        received_fds.clear()
-        return data, result
-    except Exception:
-        _close_fds(received_fds)
-        raise
 
 
 def _send_packet(channel: socket.socket, payload: bytes) -> None:
@@ -1087,15 +1039,17 @@ class HistoryCursor:
             )
             try:
                 _send_packet(self._channel, request)
-                response, fds = _recv_packet(
+                packet = _recv_packet(
                     self._channel, READ_HISTORY_RESPONSE_BYTES
                 )
-            except Exception:
+            except BaseException:
                 self._closed = True
                 self._channel.close()
                 raise
 
             try:
+                response = packet.data
+                fds = packet.fds
                 status, response_flags = _validate_response_prefix(
                     response,
                     expected_bytes=READ_HISTORY_RESPONSE_BYTES,
@@ -1245,12 +1199,12 @@ class HistoryCursor:
                     cumulative_record_count=new_total,
                     cumulative_source_record_counts=new_source_counts,
                 )
-            except Exception:
+            except BaseException:
                 self._closed = True
                 self._channel.close()
                 raise
             finally:
-                _close_fds(fds)
+                packet.close()
 
     def pages(self):
         """Yield data pages followed by the explicit zero-row EOF page."""
@@ -1342,10 +1296,12 @@ def open_history_cursor(
         channel.settimeout(timeout)
         channel.connect(path)
         _send_packet(channel, request)
-        response, fds = _recv_packet(
+        packet = _recv_packet(
             channel, OPEN_HISTORY_RESPONSE_BYTES
         )
         try:
+            response = packet.data
+            fds = packet.fds
             status, flags = _validate_response_prefix(
                 response,
                 expected_bytes=OPEN_HISTORY_RESPONSE_BYTES,
@@ -1383,14 +1339,14 @@ def open_history_cursor(
                 expected_registry_sha256=expected_registry_sha256,
             )
         finally:
-            _close_fds(fds)
+            packet.close()
         return HistoryCursor(
             _channel=channel,
             generation=generation,
             requested_page_records=requested_page_records,
             _read_token=initial_read_token,
         )
-    except Exception:
+    except BaseException:
         channel.close()
         raise
 

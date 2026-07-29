@@ -2588,9 +2588,9 @@ public:
         if (stopping_.load(std::memory_order_acquire)) {
             return false;
         }
-        subscriber->AddRef();
         std::lock_guard<std::mutex> subscribers_lock(subscribers_mutex_);
         subscribers_.push_back(subscriber);
+        subscriber->AddRef();
         return true;
     }
 
@@ -3020,6 +3020,21 @@ void MockSubscriber::Disconnect() {
     }
 }
 
+MockSubscriber* CreateRegisteredSubscriber(
+    const std::shared_ptr<Runtime>& runtime,
+    MessageHandlerBase* handler,
+    bool multithread_callback) {
+    MockSubscriber* const subscriber =
+        new MockSubscriber(runtime, handler, multithread_callback);
+    try {
+        runtime->AddSubscriber(subscriber);
+    } catch (...) {
+        subscriber->ReleaseRef();
+        throw;
+    }
+    return subscriber;
+}
+
 class MockPublisher final
     : public AtomicRefCounted<MockPublisher, Publisher> {
 public:
@@ -3093,9 +3108,8 @@ public:
         {
             std::lock_guard<std::mutex> state_lock(state_mutex_);
             if (subscriber_.IsNull()) {
-                MockSubscriber* raw = new MockSubscriber(
+                MockSubscriber* raw = CreateRegisteredSubscriber(
                     runtime_, handler_, multithread_callback_);
-                runtime_->AddSubscriber(raw);
                 subscriber_ = PtrFromReturn<Subscriber>(raw);
                 SubscribeAll(subscriber_.Get());
             }
@@ -3202,10 +3216,8 @@ protected:
     Subscriber* _CreateSubscriber(
         MessageHandlerBase* handler,
         bool multithread_callback) override {
-        MockSubscriber* subscriber =
-            new MockSubscriber(runtime_, handler, multithread_callback);
-        runtime_->AddSubscriber(subscriber);
-        return subscriber;
+        return CreateRegisteredSubscriber(
+            runtime_, handler, multithread_callback);
     }
 
 private:
