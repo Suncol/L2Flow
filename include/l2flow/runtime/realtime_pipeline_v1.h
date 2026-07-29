@@ -2,6 +2,7 @@
 
 #include "l2flow/common/identity128.h"
 #include "l2flow/factor/realtime_factor_engine_v1.h"
+#include "l2flow/ipc/realtime_store_generation_sink_v2.h"
 #include "l2flow/market/market_decoder.h"
 #include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
@@ -95,6 +96,13 @@ struct RealtimePipelineConfigV1 final {
         instrument_binding_sink;
     std::shared_ptr<l2flow::realtime::ProcessingProgressSinkV2>
         processing_progress_sink;
+    // Optional required Wire V2 immutable-generation publication. When
+    // configured, CutAndPublishGeneration invokes this exact sink after the
+    // Store generation is current and healthy, and before Factor calculation.
+    // Sink failure is fatal. The sink must publish from the applied cut carried
+    // by the generation and must not introduce a Journal-durability gate.
+    std::shared_ptr<l2flow::ipc::RealtimeStoreGenerationSinkV2>
+        store_generation_sink;
     // Explicit test/diagnostic mode.  Disabled by default because the extra
     // clock reads and atomic histogram updates perturb the measured system.
     // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
@@ -260,6 +268,7 @@ enum class RealtimePipelineCutErrorV1 : std::uint8_t {
     kGenerationBeginFailed,
     kMarkerAdmissionFailed,
     kGenerationWaitFailed,
+    kStoreGenerationPublishFailed,
     kFactorPublishFailed,
     kUnexpectedFailure,
 };

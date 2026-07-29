@@ -799,6 +799,7 @@ int Run(const Options& options) {
     pipeline_config.applied_record_sink = ipc_service;
     pipeline_config.instrument_binding_sink = ipc_service;
     pipeline_config.processing_progress_sink = ipc_service;
+    pipeline_config.store_generation_sink = ipc_service;
 
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
     std::string detail;

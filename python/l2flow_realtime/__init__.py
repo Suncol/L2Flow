@@ -1,6 +1,32 @@
 """Observed-universe, read-only Python client for L2Flow Wire V2."""
 
 from .client import DEFAULT_STALE_AFTER_NS, L2FlowClient
+from .checkpoint import InstrumentTickDeltaCheckpoint
+from ._history_columns import LazyWireColumns
+from ._stream_control import (
+    StreamCheckpointMismatchError,
+    StreamInternalFailureError,
+    StreamNotFoundError,
+    StreamResourceExhaustedError,
+)
+from .history import (
+    HistoryCursor,
+    HistoryCursorClosedError,
+    HistoryGeneration,
+    HistoryGenerationChangedError,
+    HistoryPage,
+)
+from .instrument_delta import (
+    DeltaCheckpointUnverifiedError,
+    InstrumentTickDeltaBaseKind,
+    InstrumentTickDeltaCursor,
+    InstrumentTickDeltaCursorClosedError,
+    InstrumentTickDeltaGeneration,
+    InstrumentTickDeltaMetadata,
+    InstrumentTickDeltaPage,
+    InstrumentTickDeltaSession,
+    InstrumentTickDeltaSessionClosedError,
+)
 from .models import (
     Aggressor,
     AvailabilityFlag,
@@ -57,16 +83,32 @@ __all__ = [
     "DecimalValue",
     "InconsistentReadError",
     "Instrument",
+    "InstrumentTickDeltaBaseKind",
+    "InstrumentTickDeltaCheckpoint",
+    "InstrumentTickDeltaCursor",
+    "InstrumentTickDeltaCursorClosedError",
+    "InstrumentTickDeltaGeneration",
+    "InstrumentTickDeltaMetadata",
+    "InstrumentTickDeltaPage",
+    "InstrumentTickDeltaSession",
+    "InstrumentTickDeltaSessionClosedError",
     "InstrumentKey",
     "InstrumentLookupResult",
     "InstrumentLookupStatus",
     "InstrumentStatus",
     "L2FlowClient",
     "L2FlowRealtimeError",
+    "DeltaCheckpointUnverifiedError",
+    "HistoryCursor",
+    "HistoryCursorClosedError",
+    "HistoryGeneration",
+    "HistoryGenerationChangedError",
+    "HistoryPage",
     "LatestKLine",
     "LatestSnapshot",
     "LatestStatus",
     "LatestTick",
+    "LazyWireColumns",
     "Market",
     "MarketEventKind",
     "NativeReaderError",
@@ -80,6 +122,10 @@ __all__ = [
     "SessionInfo",
     "Side",
     "StaleSessionError",
+    "StreamCheckpointMismatchError",
+    "StreamInternalFailureError",
+    "StreamNotFoundError",
+    "StreamResourceExhaustedError",
     "TickAction",
     "TickOverrunError",
     "TickProjectionFlag",

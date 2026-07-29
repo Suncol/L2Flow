@@ -806,6 +806,9 @@ std::string_view RealtimePipelineCutErrorNameV1(
             return "marker_admission_failed";
         case RealtimePipelineCutErrorV1::kGenerationWaitFailed:
             return "generation_wait_failed";
+        case RealtimePipelineCutErrorV1::
+            kStoreGenerationPublishFailed:
+            return "store_generation_publish_failed";
         case RealtimePipelineCutErrorV1::kFactorPublishFailed:
             return "factor_publish_failed";
         case RealtimePipelineCutErrorV1::kUnexpectedFailure:
@@ -877,8 +880,16 @@ public:
                 if (publication_gate_.closed_and_quiesced()) {
                     return false;
                 }
-                consumer_sleeping_.store(
-                    true, std::memory_order_release);
+                // This must be an RMW paired with WakeConsumer's exchange.
+                // With a plain store, the producer may publish the sole
+                // record and observe sleeping=false immediately before this
+                // store, while this thread subsequently observes the old
+                // tail and sleeps with no later producer to wake it. If the
+                // producer's exchange wins first, this acquire imports its
+                // preceding tail publication; if this exchange wins first,
+                // the producer observes true and notifies.
+                consumer_sleeping_.exchange(
+                    true, std::memory_order_acq_rel);
                 if (!Empty() ||
                     publication_gate_.closed_and_quiesced()) {
                     consumer_sleeping_.store(
@@ -2002,6 +2013,15 @@ public:
                 result.error =
                     RealtimePipelineCutErrorV1::
                         kGenerationWaitFailed;
+                TripFatal();
+                return result;
+            }
+
+            if (config_.store_generation_sink != nullptr &&
+                !config_.store_generation_sink->PublishStoreGeneration(
+                    result.store_generation)) {
+                result.error = RealtimePipelineCutErrorV1::
+                    kStoreGenerationPublishFailed;
                 TripFatal();
                 return result;
             }

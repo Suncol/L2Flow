@@ -684,7 +684,7 @@ void FillSummary(
 [[nodiscard]] bool ValidScanOptions(
     const IntradayInstrumentScanOptionsV1& options) noexcept {
     return options.ingress_sequence_begin_inclusive != 0U &&
-           options.ingress_sequence_begin_inclusive <
+           options.ingress_sequence_begin_inclusive <=
                options.ingress_sequence_end_exclusive &&
            options.maximum_records != 0U &&
            ValidDirection(options.direction);

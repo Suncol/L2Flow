@@ -301,6 +301,8 @@ if(L2FLOW_BUILD_TESTS)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         l2flow_add_test(test_realtime_wire_v2
             tests/test_realtime_wire_v2.cpp L2Flow::common)
+        l2flow_add_test(test_realtime_history_wire_v2
+            tests/test_realtime_history_wire_v2.cpp L2Flow::common)
         l2flow_add_test(test_realtime_shm_reader_v2
             tests/test_realtime_shm_reader_v2.cpp
             l2flow_shm_reader)
@@ -320,6 +322,7 @@ if(L2FLOW_BUILD_TESTS)
                     L2FLOW_V2_PYTHON_PROBE_EXECUTABLE="${Python3_EXECUTABLE}"
                     L2FLOW_V2_PYTHON_PROBE_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_hot_read_probe.py"
                     L2FLOW_V2_PYTHON_LATENCY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_latency_benchmark_probe.py"
+                    L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_history_latency_benchmark_probe.py"
                     L2FLOW_V2_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python"
                     L2FLOW_V2_PYTHON_READER_LIBRARY="$<TARGET_FILE:l2flow_shm_reader>")
             add_test(
@@ -327,7 +330,7 @@ if(L2FLOW_BUILD_TESTS)
                 COMMAND
                     ${Python3_EXECUTABLE} -m unittest discover
                     -s tests/python
-                    -p test_l2flow_realtime.py
+                    -p "test_l2flow_*.py"
                     -v)
             set_tests_properties(
                 test_l2flow_realtime_python

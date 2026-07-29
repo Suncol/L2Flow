@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Optional, Sequence, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
+from ._stream_control import validate_socket_path, validate_timeout
 from .control import discover_session_fd
 from .models import (
     ClientClosedError,
@@ -25,6 +26,11 @@ from .models import (
     WireFormatError,
 )
 from .native import MAX_BATCH_RECORDS, NativeReader
+
+
+if TYPE_CHECKING:
+    from .history import HistoryCursor
+    from .instrument_delta import InstrumentTickDeltaSession
 
 
 DEFAULT_STALE_AFTER_NS = 3_000_000_000
@@ -62,6 +68,8 @@ class L2FlowClient:
         *,
         stale_after_ns: Optional[int] = DEFAULT_STALE_AFTER_NS,
         expected_identity: Optional[SessionIdentity] = None,
+        control_socket_path: Optional[Union[str, os.PathLike]] = None,
+        control_timeout: Optional[float] = 1.0,
     ) -> None:
         if (
             stale_after_ns is not None
@@ -74,6 +82,12 @@ class L2FlowClient:
             raise ValueError("stale_after_ns must be positive or None")
         self._native = native_reader
         self._stale_after_ns = stale_after_ns
+        self._control_socket_path = (
+            None
+            if control_socket_path is None
+            else validate_socket_path(control_socket_path)
+        )
+        self._control_timeout = validate_timeout(control_timeout)
         self._lock = threading.RLock()
         self._closed = False
         self._health_check_interval_ns = (
@@ -146,6 +160,8 @@ class L2FlowClient:
                     native,
                     stale_after_ns=stale_after_ns,
                     expected_identity=session.identity,
+                    control_socket_path=control_socket_path,
+                    control_timeout=timeout,
                 )
             except BaseException:
                 if native is not None:
@@ -366,6 +382,109 @@ class L2FlowClient:
                     "native KLine result has wrong window ID"
                 )
             return results
+
+    def open_instrument_history(
+        self,
+        instrument_id: int,
+        *,
+        requested_page_records: int = 4096,
+        expected_generation: Optional[int] = None,
+    ) -> "HistoryCursor":
+        """Pin one immutable V2 generation on an independent cursor socket."""
+
+        from .history import _open_instrument_history
+
+        with self._lock:
+            session = self._checked_session()
+            path = self._control_socket_path
+            if path is None:
+                raise UnavailableError(
+                    "history requires a client opened through the "
+                    "Wire V2 control socket"
+                )
+            run_id = session.run_id
+            session_epoch = session.session_epoch
+            trade_date = session.trade_date
+            capacity = session.capacity
+        # Socket connect and OPEN are deliberately outside the client lock:
+        # a slow history service cannot stall latest_snapshot/latest_tick.
+        cursor = _open_instrument_history(
+            path,
+            instrument_id=instrument_id,
+            requested_page_records=requested_page_records,
+            expected_generation=(
+                0
+                if expected_generation is None
+                else expected_generation
+            ),
+            expected_run_id=run_id,
+            expected_session_epoch=session_epoch,
+            expected_trade_date=trade_date,
+            expected_capacity=capacity,
+            timeout=self._control_timeout,
+        )
+        try:
+            with self._lock:
+                self._checked_session()
+                if self._identity != cursor.generation.session_identity:
+                    raise StaleSessionError(
+                        "history cursor belongs to another session"
+                    )
+            return cursor
+        except BaseException:
+            cursor.close()
+            raise
+
+    def open_instrument_tick_delta_session(
+        self,
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> "InstrumentTickDeltaSession":
+        """Pin one immutable V2 delta target on an independent socket."""
+
+        from .instrument_delta import (
+            _open_instrument_tick_delta_session,
+        )
+
+        with self._lock:
+            session = self._checked_session()
+            path = self._control_socket_path
+            if path is None:
+                raise UnavailableError(
+                    "tick deltas require a client opened through the "
+                    "Wire V2 control socket"
+                )
+            run_id = session.run_id
+            session_epoch = session.session_epoch
+            trade_date = session.trade_date
+            capacity = session.capacity
+        delta_session = _open_instrument_tick_delta_session(
+            path,
+            expected_generation=(
+                0
+                if expected_generation is None
+                else expected_generation
+            ),
+            expected_run_id=run_id,
+            expected_session_epoch=session_epoch,
+            expected_trade_date=trade_date,
+            expected_capacity=capacity,
+            timeout=self._control_timeout,
+        )
+        try:
+            with self._lock:
+                self._checked_session()
+                if (
+                    self._identity
+                    != delta_session.generation.session_identity
+                ):
+                    raise StaleSessionError(
+                        "delta session belongs to another realtime session"
+                    )
+            return delta_session
+        except BaseException:
+            delta_session.close()
+            raise
 
     def _validate_latest(self, results, ids, expected_type) -> None:
         if len(results) != len(ids):

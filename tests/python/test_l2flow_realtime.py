@@ -613,13 +613,20 @@ class AbiContractTests(unittest.TestCase):
         self.assertEqual((major, minor), (WIRE_MAJOR, WIRE_MINOR))
         self.assertEqual((major, minor), (2, 0))
 
-    def test_v1_modules_and_exports_are_removed(self):
-        self.assertFalse(hasattr(l2flow_realtime, "HistoryCursor"))
+    def test_v2_history_modules_replace_removed_v1_surface(self):
+        self.assertTrue(hasattr(l2flow_realtime, "HistoryCursor"))
+        self.assertTrue(
+            hasattr(l2flow_realtime, "InstrumentTickDeltaCursor")
+        )
         self.assertFalse(hasattr(l2flow_realtime, "LatestResult"))
-        with self.assertRaises(ModuleNotFoundError):
-            importlib.import_module("l2flow_realtime.history")
-        with self.assertRaises(ModuleNotFoundError):
-            importlib.import_module("l2flow_realtime.instrument_delta")
+        history = importlib.import_module("l2flow_realtime.history")
+        delta = importlib.import_module(
+            "l2flow_realtime.instrument_delta"
+        )
+        self.assertFalse(hasattr(history, "connect"))
+        self.assertFalse(hasattr(history, "open_history"))
+        self.assertFalse(hasattr(delta, "connect"))
+        self.assertFalse(hasattr(delta, "open_instrument_delta"))
 
 
 class NativeReaderTests(unittest.TestCase):

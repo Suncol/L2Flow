@@ -1,6 +1,8 @@
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 
 #include "l2flow/common/sha256.h"
+#include "l2flow/ipc/realtime_history_wire_v2.h"
+#include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
 #include "l2flow/market/market_types_v1.h"
 
@@ -8,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -18,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -347,6 +351,205 @@ bool SendPacket(
         }
     }
 }
+
+template <typename Value>
+bool ObjectBytesAreZero(const Value& value) noexcept {
+    static_assert(std::is_trivially_copyable_v<Value>);
+    const auto bytes = std::as_bytes(std::span(&value, 1U));
+    return std::all_of(
+        bytes.begin(), bytes.end(), [](std::byte byte) noexcept {
+            return byte == std::byte{0U};
+        });
+}
+
+bool GenerateNonzeroToken(std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    common::Identity128 entropy{};
+    if (!common::GenerateIdentity128(&entropy)) {
+        return false;
+    }
+    std::array<std::uint64_t, 2U> words{};
+    std::memcpy(words.data(), entropy.data(), entropy.size());
+    *output = words[0U] != 0U ? words[0U] : words[1U];
+    return *output != 0U;
+}
+
+enum class PacketReceiveResult {
+    kOk,
+    kIdleTimeout,
+    kStopped,
+    kClosed,
+    kFailure,
+};
+
+struct RealtimeRequestPrefixV2 final {
+    std::array<std::uint8_t, 8U> magic{};
+    std::uint16_t protocol_major = 0U;
+    std::uint16_t protocol_minor = 0U;
+    std::uint16_t opcode = 0U;
+    std::uint16_t reserved0 = 0U;
+    std::uint32_t message_bytes = 0U;
+    std::uint32_t flags = 0U;
+    std::uint64_t request_id = 0U;
+};
+static_assert(sizeof(RealtimeRequestPrefixV2) == 32U);
+
+PacketReceiveResult ReceivePacket(
+    int socket_fd,
+    int stop_event_fd,
+    std::chrono::milliseconds timeout,
+    std::span<std::byte> buffer,
+    std::size_t* received_bytes) noexcept {
+    if (socket_fd < 0 || stop_event_fd < 0 || timeout.count() <= 0 ||
+        buffer.empty() || received_bytes == nullptr) {
+        return PacketReceiveResult::kFailure;
+    }
+    *received_bytes = 0U;
+    const auto bounded_timeout = std::min<std::int64_t>(
+        timeout.count(),
+        static_cast<std::int64_t>(
+            std::numeric_limits<int>::max()));
+    std::array<pollfd, 2U> descriptors{};
+    descriptors[0U].fd = socket_fd;
+    descriptors[0U].events = static_cast<short>(POLLIN);
+    descriptors[1U].fd = stop_event_fd;
+    descriptors[1U].events = static_cast<short>(POLLIN);
+    int ready = -1;
+    do {
+        ready = ::poll(
+            descriptors.data(),
+            descriptors.size(),
+            static_cast<int>(bounded_timeout));
+    } while (ready < 0 && errno == EINTR);
+    if (ready == 0) {
+        return PacketReceiveResult::kIdleTimeout;
+    }
+    if (ready < 0) {
+        return PacketReceiveResult::kFailure;
+    }
+    if ((descriptors[1U].revents & POLLIN) != 0) {
+        return PacketReceiveResult::kStopped;
+    }
+    if ((descriptors[0U].revents &
+         (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        return PacketReceiveResult::kClosed;
+    }
+    if ((descriptors[0U].revents & POLLIN) == 0) {
+        return PacketReceiveResult::kFailure;
+    }
+    ssize_t received = -1;
+    do {
+        received = ::recv(
+            socket_fd,
+            buffer.data(),
+            buffer.size(),
+            MSG_TRUNC);
+    } while (received < 0 && errno == EINTR);
+    if (received == 0) {
+        return PacketReceiveResult::kClosed;
+    }
+    if (received < 0) {
+        return PacketReceiveResult::kFailure;
+    }
+    *received_bytes = static_cast<std::size_t>(received);
+    return PacketReceiveResult::kOk;
+}
+
+class SealedReadOnlyPage final {
+public:
+    SealedReadOnlyPage() = default;
+    SealedReadOnlyPage(const SealedReadOnlyPage&) = delete;
+    SealedReadOnlyPage& operator=(const SealedReadOnlyPage&) = delete;
+
+    ~SealedReadOnlyPage() {
+        if (mapping_ != MAP_FAILED) {
+            static_cast<void>(
+                ::munmap(mapping_, static_cast<std::size_t>(bytes_)));
+        }
+        CloseDescriptor(&read_only_fd_);
+        CloseDescriptor(&writable_fd_);
+    }
+
+    [[nodiscard]] bool Create(
+        const char* name,
+        std::uint64_t bytes) noexcept {
+        if (name == nullptr || bytes == 0U ||
+            bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max()) ||
+            writable_fd_ >= 0 || read_only_fd_ >= 0 ||
+            mapping_ != MAP_FAILED) {
+            return false;
+        }
+        writable_fd_ = ::memfd_create(
+            name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (writable_fd_ < 0 ||
+            ::ftruncate(writable_fd_, static_cast<off_t>(bytes)) !=
+                0) {
+            return false;
+        }
+        mapping_ = ::mmap(
+            nullptr,
+            static_cast<std::size_t>(bytes),
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            writable_fd_,
+            0);
+        if (mapping_ == MAP_FAILED) {
+            return false;
+        }
+        bytes_ = bytes;
+        std::memset(
+            mapping_, 0, static_cast<std::size_t>(bytes_));
+        return true;
+    }
+
+    [[nodiscard]] void* mapping() const noexcept {
+        return mapping_;
+    }
+
+    [[nodiscard]] bool Finalize() noexcept {
+        if (mapping_ == MAP_FAILED || writable_fd_ < 0 ||
+            read_only_fd_ >= 0 || bytes_ == 0U) {
+            return false;
+        }
+        if (::munmap(
+                mapping_, static_cast<std::size_t>(bytes_)) != 0) {
+            return false;
+        }
+        mapping_ = MAP_FAILED;
+        const std::string proc_path =
+            "/proc/self/fd/" + std::to_string(writable_fd_);
+        read_only_fd_ =
+            ::open(proc_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (read_only_fd_ < 0) {
+            return false;
+        }
+        constexpr int seals =
+            F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK |
+            F_SEAL_SEAL;
+        if (::fcntl(writable_fd_, F_ADD_SEALS, seals) != 0) {
+            return false;
+        }
+        CloseDescriptor(&writable_fd_);
+        return true;
+    }
+
+    [[nodiscard]] int descriptor() const noexcept {
+        return read_only_fd_;
+    }
+
+private:
+    int writable_fd_ = -1;
+    int read_only_fd_ = -1;
+    void* mapping_ = MAP_FAILED;
+    std::uint64_t bytes_ = 0U;
+};
 
 RealtimeWireDecimalV2 Decimal(
     const market::DecimalValueV1& value) noexcept {
@@ -880,6 +1083,528 @@ bool HashU64(
            hasher->Update(std::as_bytes(std::span(&value, 1U)));
 }
 
+template <std::size_t Size>
+bool ByteDigestNonzero(
+    const std::array<std::uint8_t, Size>& digest) noexcept {
+    return std::any_of(
+        digest.begin(),
+        digest.end(),
+        [](std::uint8_t value) noexcept { return value != 0U; });
+}
+
+bool ComputeEndpointInputIdentity(
+    const RealtimeGenerationEndpointV2& endpoint,
+    std::array<std::uint8_t, 32U>* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    common::Sha256Hasher hasher;
+    constexpr std::string_view domain =
+        "L2FLOW_OBSERVED_HISTORY_WATERMARK_V2";
+    constexpr std::array<std::byte, 1U> separator{
+        std::byte{0U}};
+    if (!hasher.Update(std::as_bytes(std::span(
+            domain.data(), domain.size()))) ||
+        !hasher.Update(separator) ||
+        !hasher.Update(std::as_bytes(std::span(endpoint.run_id))) ||
+        !HashU64(&hasher, endpoint.generation) ||
+        !HashU32(&hasher, endpoint.trade_date) ||
+        !HashU64(
+            &hasher, endpoint.ingress_sequence_exclusive) ||
+        !HashU64(&hasher, endpoint.session_epoch) ||
+        !HashU64(&hasher, endpoint.capacity) ||
+        !HashU32(&hasher, endpoint.catalog_scope) ||
+        !HashU32(&hasher, endpoint.coverage_complete) ||
+        !HashU64(&hasher, endpoint.catalog_generation) ||
+        !HashU64(&hasher, endpoint.data_state_generation) ||
+        !hasher.Update(
+            std::as_bytes(std::span(endpoint.catalog_digest))) ||
+        !HashU64(&hasher, endpoint.bound_count) ||
+        !HashU64(&hasher, endpoint.available_count) ||
+        !HashU64(
+            &hasher, endpoint.snapshot_available_count) ||
+        !HashU64(&hasher, endpoint.tick_available_count) ||
+        !HashU64(&hasher, endpoint.factor_eligible_count) ||
+        !HashU64(&hasher, endpoint.accepted_sequence) ||
+        !HashU64(&hasher, endpoint.durable_sequence) ||
+        !HashU64(&hasher, endpoint.applied_sequence)) {
+        return false;
+    }
+    for (std::size_t source = 0U;
+         source < endpoint.source_stream_ids.size();
+         ++source) {
+        if (!HashU32(
+                &hasher, endpoint.source_stream_ids[source]) ||
+            !HashU64(
+                &hasher,
+                endpoint.source_sequence_exclusive[source])) {
+            return false;
+        }
+    }
+    common::Sha256Digest digest{};
+    if (!hasher.Finalize(&digest)) {
+        return false;
+    }
+    std::memcpy(output->data(), digest.data(), digest.size());
+    return ByteDigestNonzero(*output);
+}
+
+bool EndpointSelfConsistent(
+    const RealtimeGenerationEndpointV2& endpoint) noexcept {
+    constexpr std::uint32_t known_flags =
+        kRealtimeGenerationCoverageFromOpenV2 |
+        kRealtimeGenerationRecordCoverageCompleteV2;
+    if (!ByteDigestNonzero(endpoint.run_id) ||
+        endpoint.session_epoch == 0U ||
+        endpoint.generation == 0U ||
+        endpoint.catalog_generation != endpoint.bound_count ||
+        endpoint.ingress_sequence_exclusive == 0U ||
+        endpoint.tick_stream_sequence_exclusive == 0U ||
+        endpoint.recv_monotonic_cut_ns == 0U ||
+        endpoint.history_published_monotonic_ns <
+            endpoint.recv_monotonic_cut_ns ||
+        endpoint.accepted_sequence !=
+            endpoint.ingress_sequence_exclusive - 1U ||
+        endpoint.applied_sequence != endpoint.accepted_sequence ||
+        endpoint.durable_sequence > endpoint.accepted_sequence ||
+        endpoint.capacity == 0U ||
+        !RealtimeWireCountsValidV2(
+            endpoint.capacity,
+            endpoint.bound_count,
+            endpoint.available_count,
+            endpoint.snapshot_available_count,
+            endpoint.tick_available_count,
+            endpoint.factor_eligible_count) ||
+        endpoint.catalog_scope !=
+            static_cast<std::uint32_t>(
+                RealtimeCatalogScopeV2::kObservedOnly) ||
+        endpoint.coverage_complete != 0U ||
+        (endpoint.flags & ~known_flags) != 0U ||
+        (endpoint.flags &
+         kRealtimeGenerationRecordCoverageCompleteV2) == 0U ||
+        !ByteDigestNonzero(endpoint.catalog_digest) ||
+        !ByteDigestNonzero(endpoint.input_identity_sha256)) {
+        return false;
+    }
+
+    std::uint64_t source_total = 0U;
+    for (std::size_t source = 0U;
+         source < endpoint.source_stream_ids.size();
+         ++source) {
+        if (endpoint.source_stream_ids[source] == 0U ||
+            endpoint.source_sequence_exclusive[source] == 0U ||
+            !CheckedAdd(
+                source_total,
+                endpoint.source_sequence_exclusive[source] - 1U,
+                &source_total)) {
+            return false;
+        }
+        for (std::size_t prior = 0U; prior < source; ++prior) {
+            if (endpoint.source_stream_ids[prior] ==
+                endpoint.source_stream_ids[source]) {
+                return false;
+            }
+        }
+    }
+    std::uint64_t tick_count = 0U;
+    if (!CheckedAdd(
+            endpoint.source_sequence_exclusive[1U] - 1U,
+            endpoint.source_sequence_exclusive[3U] - 1U,
+            &tick_count) ||
+        tick_count ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        source_total != endpoint.ingress_sequence_exclusive - 1U ||
+        endpoint.tick_stream_sequence_exclusive != tick_count + 1U) {
+        return false;
+    }
+    std::array<std::uint8_t, 32U> identity{};
+    return ComputeEndpointInputIdentity(endpoint, &identity) &&
+           identity == endpoint.input_identity_sha256;
+}
+
+bool BuildGenerationEndpoint(
+    const RealtimeSharedServiceConfigV2& config,
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    std::uint64_t published_monotonic_ns,
+    RealtimeGenerationEndpointV2* output) noexcept {
+    if (output == nullptr || published_monotonic_ns == 0U) {
+        return false;
+    }
+    const market::RealtimeHistoryWatermarkV1& watermark =
+        generation.watermark();
+    const auto& catalog = watermark.catalog_snapshot;
+    if (watermark.run_id != config.run_id ||
+        watermark.generation == 0U ||
+        watermark.trade_date != config.trade_date ||
+        watermark.ingress_sequence_exclusive == 0U ||
+        watermark.recv_monotonic_cut_ns == 0U ||
+        published_monotonic_ns < watermark.recv_monotonic_cut_ns ||
+        catalog == nullptr ||
+        catalog.get() != generation.catalog_snapshot().get() ||
+        catalog->session_epoch() != config.session_epoch ||
+        catalog->capacity() != config.directory->capacity() ||
+        catalog->capacity() >
+            std::numeric_limits<std::uint32_t>::max() ||
+        catalog->catalog_scope() !=
+            market::ObservedInstrumentCatalogScopeV2::kObservedOnly ||
+        catalog->coverage_complete() ||
+        catalog->catalog_generation() != catalog->bound_count() ||
+        catalog->bound_count() >
+            std::numeric_limits<std::uint32_t>::max() ||
+        generation.instrument_count() != catalog->bound_count() ||
+        !watermark.processing_progress.valid() ||
+        watermark.processing_progress.accepted_sequence !=
+            watermark.ingress_sequence_exclusive - 1U ||
+        watermark.processing_progress.applied_sequence !=
+            watermark.processing_progress.accepted_sequence ||
+        !DigestNonzero(catalog->catalog_digest()) ||
+        !DigestNonzero(watermark.input_identity_sha256)) {
+        return false;
+    }
+
+    RealtimeGenerationEndpointV2 endpoint{};
+    std::memcpy(
+        endpoint.run_id.data(),
+        config.run_id.data(),
+        config.run_id.size());
+    endpoint.session_epoch = config.session_epoch;
+    endpoint.generation = watermark.generation;
+    endpoint.catalog_generation =
+        catalog->catalog_generation();
+    endpoint.data_state_generation =
+        catalog->data_state_generation();
+    endpoint.ingress_sequence_exclusive =
+        watermark.ingress_sequence_exclusive;
+    endpoint.recv_monotonic_cut_ns =
+        watermark.recv_monotonic_cut_ns;
+    endpoint.history_published_monotonic_ns =
+        published_monotonic_ns;
+    endpoint.accepted_sequence =
+        watermark.processing_progress.accepted_sequence;
+    endpoint.durable_sequence =
+        watermark.processing_progress.durable_sequence;
+    endpoint.applied_sequence =
+        watermark.processing_progress.applied_sequence;
+    std::memcpy(
+        endpoint.catalog_digest.data(),
+        catalog->catalog_digest().data(),
+        catalog->catalog_digest().size());
+    std::memcpy(
+        endpoint.input_identity_sha256.data(),
+        watermark.input_identity_sha256.data(),
+        watermark.input_identity_sha256.size());
+    for (std::size_t source = 0U;
+         source < watermark.sources.size();
+         ++source) {
+        endpoint.source_stream_ids[source] =
+            watermark.sources[source].source_stream_id;
+        endpoint.source_sequence_exclusive[source] =
+            watermark.sources[source].sequence_exclusive;
+    }
+    std::uint64_t tick_count = 0U;
+    if (endpoint.source_sequence_exclusive[1U] == 0U ||
+        endpoint.source_sequence_exclusive[3U] == 0U ||
+        !CheckedAdd(
+            endpoint.source_sequence_exclusive[1U] - 1U,
+            endpoint.source_sequence_exclusive[3U] - 1U,
+            &tick_count) ||
+        tick_count ==
+            std::numeric_limits<std::uint64_t>::max()) {
+        return false;
+    }
+    endpoint.tick_stream_sequence_exclusive = tick_count + 1U;
+    endpoint.trade_date = config.trade_date;
+    endpoint.capacity =
+        static_cast<std::uint32_t>(catalog->capacity());
+    endpoint.bound_count =
+        static_cast<std::uint32_t>(catalog->bound_count());
+    endpoint.available_count =
+        static_cast<std::uint32_t>(catalog->available_count());
+    endpoint.snapshot_available_count =
+        static_cast<std::uint32_t>(
+            catalog->snapshot_available_count());
+    endpoint.tick_available_count =
+        static_cast<std::uint32_t>(
+            catalog->tick_available_count());
+    endpoint.factor_eligible_count =
+        static_cast<std::uint32_t>(
+            catalog->factor_eligible_count());
+    endpoint.catalog_scope =
+        static_cast<std::uint32_t>(
+            RealtimeCatalogScopeV2::kObservedOnly);
+    endpoint.coverage_complete = 0U;
+    endpoint.flags =
+        kRealtimeGenerationRecordCoverageCompleteV2;
+    if (generation.coverage_from_open()) {
+        endpoint.flags |= kRealtimeGenerationCoverageFromOpenV2;
+    }
+    if (!EndpointSelfConsistent(endpoint)) {
+        return false;
+    }
+    *output = endpoint;
+    return true;
+}
+
+struct HistoryPageLayout final {
+    std::uint64_t descriptors_offset = 0U;
+    std::uint64_t snapshots_offset = 0U;
+    std::uint64_t ticks_offset = 0U;
+    std::uint64_t total_bytes = 0U;
+};
+
+bool ComputeHistoryPageLayout(
+    std::uint64_t record_count,
+    std::uint64_t snapshot_count,
+    std::uint64_t tick_count,
+    HistoryPageLayout* output) noexcept {
+    if (output == nullptr || record_count == 0U ||
+        snapshot_count > record_count ||
+        tick_count != record_count - snapshot_count) {
+        return false;
+    }
+    HistoryPageLayout result{};
+    std::uint64_t cursor = kRealtimeHistoryPageHeaderBytesV2;
+    std::uint64_t bytes = 0U;
+    if (!AlignUp(
+            cursor,
+            alignof(RealtimeHistoryRecordDescriptorV2),
+            &result.descriptors_offset) ||
+        !CheckedMultiply(
+            record_count,
+            sizeof(RealtimeHistoryRecordDescriptorV2),
+            &bytes) ||
+        !CheckedAdd(result.descriptors_offset, bytes, &cursor) ||
+        !AlignUp(
+            cursor,
+            alignof(RealtimeWireSnapshotPayloadV2),
+            &result.snapshots_offset) ||
+        !CheckedMultiply(
+            snapshot_count,
+            sizeof(RealtimeWireSnapshotPayloadV2),
+            &bytes) ||
+        !CheckedAdd(result.snapshots_offset, bytes, &cursor) ||
+        !AlignUp(
+            cursor,
+            alignof(RealtimeWireTickPayloadV2),
+            &result.ticks_offset) ||
+        !CheckedMultiply(
+            tick_count,
+            sizeof(RealtimeWireTickPayloadV2),
+            &bytes) ||
+        !CheckedAdd(result.ticks_offset, bytes, &cursor)) {
+        return false;
+    }
+    result.total_bytes = cursor;
+    *output = result;
+    return true;
+}
+
+struct DeltaPageLayout final {
+    std::uint64_t ticks_offset = 0U;
+    std::uint64_t total_bytes = 0U;
+};
+
+bool ComputeDeltaPageLayout(
+    std::uint64_t record_count,
+    DeltaPageLayout* output) noexcept {
+    if (output == nullptr || record_count == 0U) {
+        return false;
+    }
+    DeltaPageLayout result{};
+    std::uint64_t cursor =
+        kRealtimeInstrumentTickDeltaPageHeaderBytesV2;
+    std::uint64_t bytes = 0U;
+    if (!AlignUp(
+            cursor,
+            alignof(RealtimeWireTickPayloadV2),
+            &result.ticks_offset) ||
+        !CheckedMultiply(
+            record_count,
+            sizeof(RealtimeWireTickPayloadV2),
+            &bytes) ||
+        !CheckedAdd(result.ticks_offset, bytes, &cursor)) {
+        return false;
+    }
+    result.total_bytes = cursor;
+    *output = result;
+    return true;
+}
+
+bool EndpointIsValidPredecessor(
+    const RealtimeGenerationEndpointV2& base,
+    const RealtimeGenerationEndpointV2& target) noexcept {
+    if (!EndpointSelfConsistent(base) ||
+        !EndpointSelfConsistent(target) ||
+        base.run_id != target.run_id ||
+        base.session_epoch != target.session_epoch ||
+        base.trade_date != target.trade_date ||
+        base.capacity != target.capacity ||
+        base.catalog_scope != target.catalog_scope ||
+        base.coverage_complete != target.coverage_complete ||
+        (base.flags & kRealtimeGenerationCoverageFromOpenV2) !=
+            (target.flags &
+             kRealtimeGenerationCoverageFromOpenV2) ||
+        base.generation > target.generation ||
+        base.ingress_sequence_exclusive >
+            target.ingress_sequence_exclusive ||
+        base.tick_stream_sequence_exclusive >
+            target.tick_stream_sequence_exclusive ||
+        base.recv_monotonic_cut_ns >
+            target.recv_monotonic_cut_ns ||
+        base.history_published_monotonic_ns >
+            target.history_published_monotonic_ns ||
+        base.accepted_sequence > target.accepted_sequence ||
+        base.durable_sequence > target.durable_sequence ||
+        base.applied_sequence > target.applied_sequence ||
+        base.catalog_generation > target.catalog_generation ||
+        base.data_state_generation >
+            target.data_state_generation ||
+        base.bound_count > target.bound_count ||
+        base.available_count > target.available_count ||
+        base.snapshot_available_count >
+            target.snapshot_available_count ||
+        base.tick_available_count > target.tick_available_count) {
+        return false;
+    }
+    for (std::size_t source = 0U;
+         source < base.source_stream_ids.size();
+         ++source) {
+        if (base.source_stream_ids[source] !=
+                target.source_stream_ids[source] ||
+            base.source_sequence_exclusive[source] >
+                target.source_sequence_exclusive[source]) {
+            return false;
+        }
+    }
+    if (base.catalog_generation ==
+            target.catalog_generation &&
+        (base.bound_count != target.bound_count ||
+         base.catalog_digest != target.catalog_digest)) {
+        return false;
+    }
+    if (base.generation == target.generation) {
+        return std::memcmp(&base, &target, sizeof(base)) == 0;
+    }
+    return true;
+}
+
+bool BuildHistoryGenerationInfo(
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    const RealtimeGenerationEndpointV2& endpoint,
+    std::uint32_t instrument_id,
+    RealtimeHistoryGenerationInfoV2* output) noexcept {
+    if (output == nullptr || instrument_id == 0U ||
+        !EndpointSelfConsistent(endpoint)) {
+        return false;
+    }
+    market::IntradayInstrumentSummaryV1 summary{};
+    market::ObservedInstrumentEntryViewV2 entry{};
+    if (generation.Find(instrument_id, &summary) !=
+            market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+        generation.catalog_snapshot() == nullptr ||
+        generation.catalog_snapshot()->LookupById(
+            instrument_id, &entry) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+        !entry.bound() || entry.instrument_id != instrument_id ||
+        entry.ordinal >= endpoint.bound_count ||
+        entry.ordinal >
+            std::numeric_limits<std::uint32_t>::max() ||
+        summary.instrument_id != instrument_id) {
+        return false;
+    }
+    std::uint64_t record_count = 0U;
+    std::uint64_t snapshot_count = 0U;
+    std::uint64_t tick_count = 0U;
+    for (std::size_t source = 0U;
+         source < summary.source_record_counts.size();
+         ++source) {
+        if (!CheckedAdd(
+                record_count,
+                summary.source_record_counts[source],
+                &record_count)) {
+            return false;
+        }
+        std::uint64_t* const selected =
+            source == 0U || source == 2U
+                ? &snapshot_count
+                : &tick_count;
+        if (!CheckedAdd(
+                *selected,
+                summary.source_record_counts[source],
+                selected)) {
+            return false;
+        }
+    }
+    if (record_count != summary.record_count ||
+        snapshot_count > record_count ||
+        tick_count != record_count - snapshot_count) {
+        return false;
+    }
+    RealtimeHistoryGenerationInfoV2 info{};
+    info.endpoint = endpoint;
+    info.instrument_id = instrument_id;
+    info.ordinal = static_cast<std::uint32_t>(entry.ordinal);
+    info.instrument_source_record_counts =
+        summary.source_record_counts;
+    info.instrument_record_count = record_count;
+    info.snapshot_record_count = snapshot_count;
+    info.tick_record_count = tick_count;
+    info.payload_projection =
+        static_cast<std::uint32_t>(
+            RealtimeHistoryPayloadProjectionV2::kCoreV2);
+    *output = info;
+    return true;
+}
+
+bool BuildTargetDeltaCheckpoint(
+    const market::IntradayInstrumentStoreGenerationV1& generation,
+    const RealtimeGenerationEndpointV2& endpoint,
+    std::uint32_t instrument_id,
+    RealtimeInstrumentTickDeltaCheckpointV2* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    market::IntradayInstrumentSummaryV1 summary{};
+    market::ObservedInstrumentEntryViewV2 entry{};
+    if (generation.Find(instrument_id, &summary) !=
+            market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+        generation.catalog_snapshot() == nullptr ||
+        generation.catalog_snapshot()->LookupById(
+            instrument_id, &entry) !=
+            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+        !entry.bound() || entry.instrument_id != instrument_id ||
+        entry.ordinal >= endpoint.bound_count ||
+        entry.ordinal >
+            std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    RealtimeInstrumentTickDeltaCheckpointV2 checkpoint{};
+    checkpoint.generation = endpoint;
+    checkpoint.instrument_id = instrument_id;
+    checkpoint.ordinal =
+        static_cast<std::uint32_t>(entry.ordinal);
+    checkpoint.instrument_tick_source_record_counts[1U] =
+        summary.source_record_counts[1U];
+    checkpoint.instrument_tick_source_record_counts[3U] =
+        summary.source_record_counts[3U];
+    if (!CheckedAdd(
+            checkpoint
+                .instrument_tick_source_record_counts[1U],
+            checkpoint
+                .instrument_tick_source_record_counts[3U],
+            &checkpoint.instrument_tick_record_count)) {
+        return false;
+    }
+    checkpoint.payload_projection =
+        static_cast<std::uint32_t>(
+            RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                kCoreV2);
+    checkpoint.flags =
+        kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2;
+    *output = checkpoint;
+    return true;
+}
+
 bool ComputeLayoutDigest(
     const RealtimeSharedServiceConfigV2& config,
     std::span<const LayoutRegion, kRealtimeWireRegionCountV2> regions,
@@ -970,6 +1695,51 @@ std::string_view RealtimeSharedServiceCreateErrorNameV2(
 }
 
 class RealtimeSharedMarketServiceV2::Impl final {
+private:
+    struct PublishedStoreGeneration final {
+        std::shared_ptr<
+            const market::IntradayInstrumentStoreGenerationV1>
+            generation;
+        RealtimeGenerationEndpointV2 endpoint{};
+    };
+
+    struct ClientWorkerSlot final {
+        std::atomic<bool> active{false};
+        std::atomic<int> client_fd{-1};
+        std::thread thread;
+    };
+
+    struct HistoryCursorState final {
+        std::shared_ptr<const PublishedStoreGeneration> published;
+        std::unique_ptr<market::IntradayInstrumentCursorV1> cursor;
+        RealtimeHistoryGenerationInfoV2 generation_info{};
+        std::uint64_t open_request_id = 0U;
+        std::uint64_t page_index = 0U;
+        std::uint64_t read_token = 0U;
+        std::uint32_t page_records = 0U;
+        std::vector<const market::RealtimeHistoryRecordV1*>
+            records;
+    };
+
+    struct DeltaCursorState final {
+        std::unique_ptr<
+            market::IntradayInstrumentTickDeltaCursorV1>
+            cursor;
+        RealtimeInstrumentTickDeltaMetadataV2 metadata{};
+        std::uint64_t open_request_id = 0U;
+        std::uint64_t page_index = 0U;
+        std::uint64_t read_token = 0U;
+        std::uint32_t page_records = 0U;
+        std::vector<const market::RealtimeHistoryRecordV1*>
+            records;
+    };
+
+    struct DeltaSessionState final {
+        std::shared_ptr<const PublishedStoreGeneration> target;
+        std::uint64_t session_token = 0U;
+        std::optional<DeltaCursorState> cursor;
+    };
+
 public:
     explicit Impl(RealtimeSharedServiceConfigV2 config)
         : config_(std::move(config)) {}
@@ -1009,11 +1779,48 @@ public:
             config_.key_arena_bytes == 0U ||
             config_.maximum_mapping_bytes <
                 sizeof(RealtimeWireHeaderV2) ||
+            config_.maximum_history_readers == 0U ||
+            config_.maximum_history_readers > 1024U ||
+            config_.maximum_history_page_records == 0U ||
+            config_.maximum_history_page_records >
+                market::
+                    kIntradayInstrumentStoreMaximumBatchRecordsV1 ||
+            config_.maximum_history_page_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            config_.maximum_history_page_bytes >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<off_t>::max()) ||
+            config_.history_reader_idle_timeout <=
+                std::chrono::milliseconds::zero() ||
             !ValidSocketPath(config_.control_socket_path) ||
             config_.kline_windows.size() >
                 market::kKLineMaximumWindowsV1) {
             return RealtimeSharedServiceCreateErrorV2::
                 kInvalidConfiguration;
+        }
+        {
+            std::uint32_t low = 0U;
+            std::uint32_t high =
+                config_.maximum_history_page_records;
+            while (low < high) {
+                const std::uint32_t candidate =
+                    low + (high - low + 1U) / 2U;
+                HistoryPageLayout layout{};
+                if (ComputeHistoryPageLayout(
+                        candidate, candidate, 0U, &layout) &&
+                    layout.total_bytes <=
+                        config_.maximum_history_page_bytes) {
+                    low = candidate;
+                } else {
+                    high = candidate - 1U;
+                }
+            }
+            if (low == 0U) {
+                return RealtimeSharedServiceCreateErrorV2::
+                    kInvalidConfiguration;
+            }
+            effective_history_page_records_ = low;
         }
         for (std::size_t index = 0U;
              index < config_.kline_windows.size();
@@ -1219,6 +2026,14 @@ public:
                  ++index) {
                 ring_locks_[static_cast<std::size_t>(index)].clear(
                     std::memory_order_relaxed);
+            }
+            client_workers_.reserve(
+                config_.maximum_history_readers);
+            for (std::uint32_t index = 0U;
+                 index < config_.maximum_history_readers;
+                 ++index) {
+                client_workers_.push_back(
+                    std::make_unique<ClientWorkerSlot>());
             }
         } catch (...) {
             return RealtimeSharedServiceCreateErrorV2::
@@ -1589,6 +2404,94 @@ public:
                 std::memory_order_release);
     }
 
+    [[nodiscard]] bool PublishStoreGeneration(
+        const std::shared_ptr<
+            const market::IntradayInstrumentStoreGenerationV1>&
+            generation) noexcept {
+        if (store_generation_publication_in_progress_.test_and_set(
+                std::memory_order_acquire)) {
+            MarkCoverageLost();
+            return false;
+        }
+        struct FlagGuard final {
+            std::atomic_flag& flag;
+            ~FlagGuard() { flag.clear(std::memory_order_release); }
+        } guard{store_generation_publication_in_progress_};
+
+        if (generation == nullptr || header_ == nullptr ||
+            !StateAcceptsPublication(
+                Atomic(header_->server_state)
+                    .load(std::memory_order_acquire))) {
+            MarkCoverageLost();
+            return false;
+        }
+        const std::uint64_t store_session_epoch =
+            generation->store_session_epoch();
+        if (store_session_epoch == 0U ||
+            (published_store_session_epoch_ != 0U &&
+             published_store_session_epoch_ !=
+                 store_session_epoch)) {
+            MarkCoverageLost();
+            return false;
+        }
+
+        RealtimeGenerationEndpointV2 endpoint{};
+        if (!BuildGenerationEndpoint(
+                config_,
+                *generation,
+                std::numeric_limits<std::uint64_t>::max(),
+                &endpoint)) {
+            MarkCoverageLost();
+            return false;
+        }
+        const std::shared_ptr<const PublishedStoreGeneration> prior =
+            std::atomic_load_explicit(
+                &published_store_generation_,
+                std::memory_order_acquire);
+        if ((prior == nullptr && endpoint.generation != 1U) ||
+            (prior != nullptr &&
+             (prior->generation->store_session_epoch() !=
+                  store_session_epoch ||
+              prior->endpoint.generation ==
+                  std::numeric_limits<std::uint64_t>::max() ||
+              endpoint.generation !=
+                  prior->endpoint.generation + 1U ||
+              endpoint.ingress_sequence_exclusive <
+                  prior->endpoint.ingress_sequence_exclusive ||
+              endpoint.tick_stream_sequence_exclusive <
+                  prior->endpoint.tick_stream_sequence_exclusive))) {
+            MarkCoverageLost();
+            return false;
+        }
+
+        std::shared_ptr<PublishedStoreGeneration> published;
+        try {
+            published =
+                std::make_shared<PublishedStoreGeneration>();
+        } catch (...) {
+            MarkCoverageLost();
+            return false;
+        }
+        published->generation = generation;
+        published->endpoint = endpoint;
+        std::uint64_t published_monotonic_ns = 0U;
+        if (!MonotonicNowNanoseconds(&published_monotonic_ns) ||
+            published_monotonic_ns <
+                endpoint.recv_monotonic_cut_ns) {
+            MarkCoverageLost();
+            return false;
+        }
+        published->endpoint.history_published_monotonic_ns =
+            published_monotonic_ns;
+        published_store_session_epoch_ = store_session_epoch;
+        std::atomic_store_explicit(
+            &published_store_generation_,
+            std::shared_ptr<const PublishedStoreGeneration>(
+                std::move(published)),
+            std::memory_order_release);
+        return true;
+    }
+
     [[nodiscard]] bool PublishKLineGeneration(
         const market::RealtimeKLineGenerationV1& generation)
         noexcept {
@@ -1950,6 +2853,7 @@ public:
             if (control_thread_.joinable()) {
                 control_thread_.join();
             }
+            StopClientWorkers();
             return;
         }
         if (stop_event_fd_ >= 0) {
@@ -1967,6 +2871,7 @@ public:
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
+        StopClientWorkers();
     }
 
     [[nodiscard]] std::uint64_t mapping_bytes() const noexcept {
@@ -2704,6 +3609,1475 @@ private:
             .store(now, std::memory_order_release);
     }
 
+    void ReadStageClock(
+        std::uint64_t* output,
+        RealtimeHistoryPageStageTimingV2* timing) const noexcept {
+        if (output == nullptr) {
+            return;
+        }
+        *output = 0U;
+        if (config_.history_stage_observer == nullptr) {
+            return;
+        }
+        if (!MonotonicNowNanoseconds(output) && timing != nullptr) {
+            ++timing->clock_read_failures;
+        }
+    }
+
+    static std::uint64_t StageDuration(
+        std::uint64_t begin,
+        std::uint64_t end) noexcept {
+        return begin != 0U && end >= begin ? end - begin : 0U;
+    }
+
+    [[nodiscard]] bool BuildHistoryPage(
+        const HistoryCursorState& state,
+        std::span<const market::RealtimeHistoryRecordV1* const>
+            records,
+        SealedReadOnlyPage* page,
+        RealtimeHistoryPageStageTimingV2* timing) noexcept {
+        if (records.empty() || page == nullptr || timing == nullptr ||
+            state.published == nullptr) {
+            return false;
+        }
+        std::uint64_t build_begin = 0U;
+        std::uint64_t stage_begin = 0U;
+        std::uint64_t stage_end = 0U;
+        ReadStageClock(&build_begin, timing);
+        stage_begin = build_begin;
+
+        std::uint32_t snapshot_count = 0U;
+        std::uint32_t tick_count = 0U;
+        std::uint64_t prior_ingress = 0U;
+        for (const market::RealtimeHistoryRecordV1* record :
+             records) {
+            if (record == nullptr ||
+                record->instrument_id() !=
+                    state.generation_info.instrument_id ||
+                record->ingress_sequence() == 0U ||
+                record->ingress_sequence() <= prior_ingress ||
+                record->source_slot() >=
+                    market::kRealtimeHistorySourceCountV1) {
+                return false;
+            }
+            prior_ingress = record->ingress_sequence();
+            if (market::IsSnapshotEventKindV1(record->kind()) &&
+                (record->source_slot() == 0U ||
+                 record->source_slot() == 2U) &&
+                record->tick_stream_sequence() == 0U) {
+                ++snapshot_count;
+            } else if (
+                market::IsTickEventKindV1(record->kind()) &&
+                (record->source_slot() == 1U ||
+                 record->source_slot() == 3U) &&
+                record->tick_stream_sequence() != 0U) {
+                ++tick_count;
+            } else {
+                return false;
+            }
+        }
+        if (static_cast<std::uint64_t>(snapshot_count) +
+                tick_count !=
+            records.size()) {
+            return false;
+        }
+        HistoryPageLayout layout{};
+        if (!ComputeHistoryPageLayout(
+                records.size(),
+                snapshot_count,
+                tick_count,
+                &layout) ||
+            layout.total_bytes >
+                config_.maximum_history_page_bytes) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->classify_layout_ns =
+            StageDuration(stage_begin, stage_end);
+
+        stage_begin = stage_end;
+        if (!page->Create(
+                "l2flow-history-page-v2",
+                layout.total_bytes)) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->memfd_prepare_ns =
+            StageDuration(stage_begin, stage_end);
+
+        stage_begin = stage_end;
+        auto* const base =
+            static_cast<std::byte*>(page->mapping());
+        auto* const header =
+            reinterpret_cast<RealtimeHistoryPageHeaderV2*>(base);
+        auto* const descriptors =
+            reinterpret_cast<RealtimeHistoryRecordDescriptorV2*>(
+                base + layout.descriptors_offset);
+        auto* const snapshots =
+            reinterpret_cast<RealtimeWireSnapshotPayloadV2*>(
+                base + layout.snapshots_offset);
+        auto* const ticks =
+            reinterpret_cast<RealtimeWireTickPayloadV2*>(
+                base + layout.ticks_offset);
+        header->magic = kRealtimeHistoryPageMagicV2;
+        header->abi_major = kRealtimeWireMajorV2;
+        header->abi_minor = kRealtimeWireMinorV2;
+        header->header_bytes =
+            static_cast<std::uint32_t>(
+                kRealtimeHistoryPageHeaderBytesV2);
+        header->endian_marker = kRealtimeLittleEndianMarkerV2;
+        header->total_mapping_bytes = layout.total_bytes;
+        header->page_index = state.page_index;
+        header->record_count =
+            static_cast<std::uint32_t>(records.size());
+        header->record_descriptor_bytes =
+            static_cast<std::uint32_t>(
+                sizeof(RealtimeHistoryRecordDescriptorV2));
+        header->record_descriptors_offset =
+            layout.descriptors_offset;
+        header->snapshot_payloads_offset =
+            layout.snapshots_offset;
+        header->snapshot_count = snapshot_count;
+        header->snapshot_payload_bytes =
+            static_cast<std::uint32_t>(
+                sizeof(RealtimeWireSnapshotPayloadV2));
+        header->tick_payloads_offset = layout.ticks_offset;
+        header->tick_count = tick_count;
+        header->tick_payload_bytes =
+            static_cast<std::uint32_t>(
+                sizeof(RealtimeWireTickPayloadV2));
+        header->first_ingress_sequence =
+            records.front()->ingress_sequence();
+        header->last_ingress_sequence =
+            records.back()->ingress_sequence();
+        header->generation = state.generation_info;
+
+        std::uint32_t snapshot_index = 0U;
+        std::uint32_t tick_index = 0U;
+        for (std::size_t index = 0U;
+             index < records.size();
+             ++index) {
+            const market::RealtimeHistoryRecordV1& record =
+                *records[index];
+            RealtimeHistoryRecordDescriptorV2 descriptor{};
+            descriptor.ingress_sequence =
+                record.ingress_sequence();
+            descriptor.source_sequence =
+                record.source_sequence();
+            descriptor.tick_stream_sequence =
+                record.tick_stream_sequence();
+            descriptor.event_kind =
+                static_cast<std::uint8_t>(record.kind());
+            descriptor.source_slot = record.source_slot();
+            if (market::IsSnapshotEventKindV1(record.kind())) {
+                descriptor.payload_kind =
+                    static_cast<std::uint8_t>(
+                        RealtimeHistoryPayloadKindV2::kSnapshot);
+                descriptor.payload_index = snapshot_index;
+                if (snapshot_index >= snapshot_count ||
+                    !ProjectSnapshot(
+                        record,
+                        state.generation_info.ordinal,
+                        &snapshots[snapshot_index])) {
+                    return false;
+                }
+                ++snapshot_index;
+            } else {
+                descriptor.payload_kind =
+                    static_cast<std::uint8_t>(
+                        RealtimeHistoryPayloadKindV2::kTick);
+                descriptor.payload_index = tick_index;
+                if (tick_index >= tick_count ||
+                    !ProjectTick(
+                        record,
+                        state.generation_info.ordinal,
+                        &ticks[tick_index])) {
+                    return false;
+                }
+                if ((ticks[tick_index].projection_flags &
+                     kRealtimeWireTickRawTypeOmittedV2) != 0U) {
+                    descriptor.projection_flags |=
+                        kRealtimeHistoryRawTypeOmittedV2;
+                }
+                if ((ticks[tick_index].projection_flags &
+                     kRealtimeWireTickRawTickFlagOmittedV2) !=
+                    0U) {
+                    descriptor.projection_flags |=
+                        kRealtimeHistoryRawTickFlagOmittedV2;
+                }
+                ++tick_index;
+            }
+            descriptors[index] = descriptor;
+        }
+        if (snapshot_index != snapshot_count ||
+            tick_index != tick_count) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->projection_ns =
+            StageDuration(stage_begin, stage_end);
+
+        stage_begin = stage_end;
+        if (!page->Finalize()) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->memfd_finalize_ns =
+            StageDuration(stage_begin, stage_end);
+        timing->build_total_ns =
+            StageDuration(build_begin, stage_end);
+        timing->record_count =
+            static_cast<std::uint32_t>(records.size());
+        timing->snapshot_count = snapshot_count;
+        timing->tick_count = tick_count;
+        timing->page_mapping_bytes = layout.total_bytes;
+        return true;
+    }
+
+    [[nodiscard]] bool BuildDeltaPage(
+        const DeltaSessionState& session,
+        const DeltaCursorState& state,
+        std::span<const market::RealtimeHistoryRecordV1* const>
+            records,
+        SealedReadOnlyPage* page,
+        RealtimeHistoryPageStageTimingV2* timing) noexcept {
+        if (records.empty() || page == nullptr || timing == nullptr ||
+            session.target == nullptr) {
+            return false;
+        }
+        std::uint64_t build_begin = 0U;
+        std::uint64_t stage_begin = 0U;
+        std::uint64_t stage_end = 0U;
+        ReadStageClock(&build_begin, timing);
+        stage_begin = build_begin;
+        std::uint64_t prior_ingress = 0U;
+        std::uint64_t prior_tick = 0U;
+        for (const market::RealtimeHistoryRecordV1* record :
+             records) {
+            if (record == nullptr ||
+                record->instrument_id() !=
+                    state.metadata.target_checkpoint.instrument_id ||
+                !market::IsTickEventKindV1(record->kind()) ||
+                (record->source_slot() != 1U &&
+                 record->source_slot() != 3U) ||
+                record->ingress_sequence() <= prior_ingress ||
+                record->tick_stream_sequence() <= prior_tick) {
+                return false;
+            }
+            prior_ingress = record->ingress_sequence();
+            prior_tick = record->tick_stream_sequence();
+        }
+        DeltaPageLayout layout{};
+        if (!ComputeDeltaPageLayout(records.size(), &layout) ||
+            layout.total_bytes >
+                config_.maximum_history_page_bytes) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->classify_layout_ns =
+            StageDuration(stage_begin, stage_end);
+
+        stage_begin = stage_end;
+        if (!page->Create(
+                "l2flow-tick-delta-page-v2",
+                layout.total_bytes)) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->memfd_prepare_ns =
+            StageDuration(stage_begin, stage_end);
+
+        stage_begin = stage_end;
+        auto* const base =
+            static_cast<std::byte*>(page->mapping());
+        auto* const header = reinterpret_cast<
+            RealtimeInstrumentTickDeltaPageHeaderV2*>(base);
+        auto* const ticks =
+            reinterpret_cast<RealtimeWireTickPayloadV2*>(
+                base + layout.ticks_offset);
+        header->magic =
+            kRealtimeInstrumentTickDeltaPageMagicV2;
+        header->abi_major = kRealtimeWireMajorV2;
+        header->abi_minor = kRealtimeWireMinorV2;
+        header->header_bytes =
+            static_cast<std::uint32_t>(
+                kRealtimeInstrumentTickDeltaPageHeaderBytesV2);
+        header->endian_marker = kRealtimeLittleEndianMarkerV2;
+        header->total_mapping_bytes = layout.total_bytes;
+        header->page_index = state.page_index;
+        header->record_count =
+            static_cast<std::uint32_t>(records.size());
+        header->tick_payload_bytes =
+            static_cast<std::uint32_t>(
+                sizeof(RealtimeWireTickPayloadV2));
+        header->tick_payloads_offset = layout.ticks_offset;
+        header->first_ingress_sequence =
+            records.front()->ingress_sequence();
+        header->last_ingress_sequence =
+            records.back()->ingress_sequence();
+        header->first_tick_stream_sequence =
+            records.front()->tick_stream_sequence();
+        header->last_tick_stream_sequence =
+            records.back()->tick_stream_sequence();
+        header->metadata = state.metadata;
+        for (std::size_t index = 0U;
+             index < records.size();
+             ++index) {
+            if (!ProjectTick(
+                    *records[index],
+                    state.metadata.target_checkpoint.ordinal,
+                    &ticks[index])) {
+                return false;
+            }
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->projection_ns =
+            StageDuration(stage_begin, stage_end);
+
+        stage_begin = stage_end;
+        if (!page->Finalize()) {
+            return false;
+        }
+        ReadStageClock(&stage_end, timing);
+        timing->memfd_finalize_ns =
+            StageDuration(stage_begin, stage_end);
+        timing->build_total_ns =
+            StageDuration(build_begin, stage_end);
+        timing->record_count =
+            static_cast<std::uint32_t>(records.size());
+        timing->snapshot_count = 0U;
+        timing->tick_count =
+            static_cast<std::uint32_t>(records.size());
+        timing->page_mapping_bytes = layout.total_bytes;
+        return true;
+    }
+
+    void HandleGetSession(
+        int client,
+        const RealtimeControlRequestV2& request,
+        std::size_t received_bytes) noexcept {
+        RealtimeControlResponseV2 response{};
+        response.magic = kRealtimeControlMagicV2;
+        response.protocol_major = kRealtimeWireMajorV2;
+        response.protocol_minor = kRealtimeWireMinorV2;
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.request_id = request.request_id;
+        response.session_epoch = config_.session_epoch;
+        response.total_mapping_bytes = mapping_bytes_;
+        bool send_fd = false;
+        if (received_bytes != sizeof(request) ||
+            request.magic != kRealtimeControlMagicV2 ||
+            request.message_bytes != sizeof(request) ||
+            request.opcode !=
+                static_cast<std::uint16_t>(
+                    RealtimeControlOpcodeV2::kGetSession) ||
+            request.flags != 0U || request.reserved0 != 0U ||
+            request.reserved1 != 0U) {
+            response.status =
+                static_cast<std::uint16_t>(
+                    RealtimeControlStatusV2::kInvalidRequest);
+        } else if (
+            request.protocol_major != kRealtimeWireMajorV2 ||
+            request.protocol_minor != kRealtimeWireMinorV2) {
+            response.status =
+                static_cast<std::uint16_t>(
+                    RealtimeControlStatusV2::
+                        kUnsupportedVersion);
+        } else if (failed()) {
+            response.status =
+                static_cast<std::uint16_t>(
+                    RealtimeControlStatusV2::kUnavailable);
+        } else {
+            response.status =
+                static_cast<std::uint16_t>(
+                    RealtimeControlStatusV2::kOk);
+            send_fd = true;
+        }
+        static_cast<void>(SendPacket(
+            client,
+            &response,
+            sizeof(response),
+            send_fd ? read_only_fd_ : -1));
+    }
+
+    [[nodiscard]] bool ReceiveNextRequest(
+        int client,
+        std::span<std::byte> packet,
+        std::size_t* received_bytes) const noexcept {
+        return ReceivePacket(
+                   client,
+                   stop_event_fd_,
+                   config_.history_reader_idle_timeout,
+                   packet,
+                   received_bytes) ==
+               PacketReceiveResult::kOk;
+    }
+
+    void ServeHistory(
+        int client,
+        const RealtimeHistoryOpenRequestV2& request,
+        std::size_t received_bytes) noexcept {
+        RealtimeHistoryOpenResponseV2 response{};
+        response.magic = kRealtimeControlMagicV2;
+        response.protocol_major = kRealtimeWireMajorV2;
+        response.protocol_minor = kRealtimeWireMinorV2;
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.request_id = request.request_id;
+
+        RealtimeHistoryControlStatusV2 status =
+            RealtimeHistoryControlStatusV2::kOk;
+        if (received_bytes != sizeof(request) ||
+            request.magic != kRealtimeControlMagicV2 ||
+            request.message_bytes != sizeof(request) ||
+            request.opcode !=
+                static_cast<std::uint16_t>(
+                    RealtimeHistoryControlOpcodeV2::
+                        kOpenHistory) ||
+            request.flags != 0U || request.reserved0 != 0U ||
+            !ObjectBytesAreZero(request.reserved)) {
+            status =
+                RealtimeHistoryControlStatusV2::kInvalidRequest;
+        } else if (
+            request.protocol_major != kRealtimeWireMajorV2 ||
+            request.protocol_minor != kRealtimeWireMinorV2) {
+            status = RealtimeHistoryControlStatusV2::
+                kUnsupportedVersion;
+        } else if (request.instrument_id == 0U ||
+                   request.requested_page_records == 0U) {
+            status =
+                RealtimeHistoryControlStatusV2::kInvalidRequest;
+        } else if (
+            request.requested_page_records >
+                config_.maximum_history_page_records) {
+            status = RealtimeHistoryControlStatusV2::
+                kResourceExhausted;
+        } else if (failed()) {
+            status =
+                RealtimeHistoryControlStatusV2::kUnavailable;
+        }
+
+        HistoryCursorState state{};
+        if (status == RealtimeHistoryControlStatusV2::kOk) {
+            state.published =
+                std::atomic_load_explicit(
+                    &published_store_generation_,
+                    std::memory_order_acquire);
+            if (state.published == nullptr) {
+                status =
+                    RealtimeHistoryControlStatusV2::kUnavailable;
+            } else if (
+                request.expected_generation != 0U &&
+                request.expected_generation !=
+                    state.published->endpoint.generation) {
+                status = RealtimeHistoryControlStatusV2::
+                    kGenerationChanged;
+            }
+        }
+        if (status == RealtimeHistoryControlStatusV2::kOk) {
+            market::ObservedInstrumentEntryViewV2 entry{};
+            const auto& catalog =
+                state.published->generation->catalog_snapshot();
+            if (catalog == nullptr ||
+                catalog->LookupById(
+                    request.instrument_id, &entry) ==
+                    market::ObservedInstrumentDirectoryErrorV2::
+                        kNotFound) {
+                status =
+                    RealtimeHistoryControlStatusV2::kNotFound;
+            } else if (
+                !BuildHistoryGenerationInfo(
+                    *state.published->generation,
+                    state.published->endpoint,
+                    request.instrument_id,
+                    &state.generation_info)) {
+                status = RealtimeHistoryControlStatusV2::
+                    kInternalFailure;
+            }
+        }
+        if (status == RealtimeHistoryControlStatusV2::kOk) {
+            market::IntradayInstrumentScanOptionsV1 options{};
+            options.ingress_sequence_begin_inclusive = 1U;
+            options.ingress_sequence_end_exclusive =
+                state.published->endpoint
+                    .ingress_sequence_exclusive;
+            options.maximum_records =
+                std::numeric_limits<std::uint64_t>::max();
+            options.direction =
+                market::IntradayInstrumentScanDirectionV1::
+                    kOldestFirst;
+            const market::IntradayInstrumentStoreQueryErrorV1
+                open_error =
+                    state.published->generation
+                        ->OpenInstrumentCursor(
+                            request.instrument_id,
+                            options,
+                            &state.cursor);
+            if (open_error ==
+                market::IntradayInstrumentStoreQueryErrorV1::
+                    kNotFound) {
+                status =
+                    RealtimeHistoryControlStatusV2::kNotFound;
+            } else if (
+                open_error ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kResourceExhausted) {
+                status = RealtimeHistoryControlStatusV2::
+                    kResourceExhausted;
+            } else if (
+                open_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone ||
+                state.cursor == nullptr) {
+                status = RealtimeHistoryControlStatusV2::
+                    kInternalFailure;
+            }
+        }
+        if (status == RealtimeHistoryControlStatusV2::kOk) {
+            state.open_request_id = request.request_id;
+            state.page_records = std::min(
+                request.requested_page_records,
+                effective_history_page_records_);
+            try {
+                state.records.resize(state.page_records);
+            } catch (...) {
+                status = RealtimeHistoryControlStatusV2::
+                    kResourceExhausted;
+            }
+            if (status == RealtimeHistoryControlStatusV2::kOk &&
+                !GenerateNonzeroToken(&state.read_token)) {
+                status = RealtimeHistoryControlStatusV2::
+                    kInternalFailure;
+            }
+        }
+        response.status =
+            static_cast<std::uint16_t>(status);
+        if (status == RealtimeHistoryControlStatusV2::kOk) {
+            response.initial_read_token = state.read_token;
+            response.generation = state.generation_info;
+        }
+        if (!SendPacket(client, &response, sizeof(response), -1) ||
+            status != RealtimeHistoryControlStatusV2::kOk) {
+            return;
+        }
+
+        std::array<std::byte, 1024U> packet{};
+        for (;;) {
+            std::size_t packet_bytes = 0U;
+            if (!ReceiveNextRequest(
+                    client, packet, &packet_bytes)) {
+                return;
+            }
+            RealtimeHistoryReadRequestV2 read{};
+            if (packet_bytes <= packet.size()) {
+                std::memcpy(
+                    &read,
+                    packet.data(),
+                    std::min(packet_bytes, sizeof(read)));
+            }
+            RealtimeHistoryReadResponseV2 read_response{};
+            read_response.magic = kRealtimeControlMagicV2;
+            read_response.protocol_major = kRealtimeWireMajorV2;
+            read_response.protocol_minor = kRealtimeWireMinorV2;
+            read_response.message_bytes =
+                static_cast<std::uint32_t>(
+                    sizeof(read_response));
+            read_response.request_id = read.request_id;
+            RealtimeHistoryControlStatusV2 read_status =
+                RealtimeHistoryControlStatusV2::kOk;
+            if (packet_bytes != sizeof(read) ||
+                read.magic != kRealtimeControlMagicV2 ||
+                read.message_bytes != sizeof(read) ||
+                read.opcode !=
+                    static_cast<std::uint16_t>(
+                        RealtimeHistoryControlOpcodeV2::
+                            kReadHistory) ||
+                read.flags != 0U || read.reserved0 != 0U ||
+                read.protocol_major !=
+                    kRealtimeWireMajorV2 ||
+                read.protocol_minor !=
+                    kRealtimeWireMinorV2 ||
+                read.expected_page_index != state.page_index ||
+                read.read_token == 0U ||
+                read.read_token != state.read_token) {
+                read_status =
+                    RealtimeHistoryControlStatusV2::
+                        kInvalidRequest;
+            }
+            if (read_status !=
+                RealtimeHistoryControlStatusV2::kOk) {
+                read_response.status =
+                    static_cast<std::uint16_t>(read_status);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+
+            RealtimeHistoryPageStageTimingV2 timing{};
+            timing.open_request_id = state.open_request_id;
+            timing.read_request_id = read.request_id;
+            timing.generation =
+                state.published->endpoint.generation;
+            timing.instrument_id =
+                state.generation_info.instrument_id;
+            timing.page_index = state.page_index;
+            std::uint64_t stage_begin = 0U;
+            std::uint64_t stage_end = 0U;
+            ReadStageClock(&stage_begin, &timing);
+            std::size_t written = 0U;
+            market::IntradayInstrumentStoreQueryErrorV1
+                read_error =
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded;
+            while (state.page_records != 0U) {
+                read_error = state.cursor->ReadBatch(
+                    std::span(
+                        state.records.data(),
+                        state.page_records),
+                    &written);
+                if (read_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded) {
+                    break;
+                }
+                state.page_records /= 2U;
+            }
+            ReadStageClock(&stage_end, &timing);
+            timing.cursor_read_ns =
+                StageDuration(stage_begin, stage_end);
+            if (read_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone ||
+                state.page_records == 0U) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        read_error ==
+                                market::
+                                    IntradayInstrumentStoreQueryErrorV1::
+                                        kResourceExhausted
+                            ? RealtimeHistoryControlStatusV2::
+                                  kResourceExhausted
+                            : RealtimeHistoryControlStatusV2::
+                                  kInternalFailure);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+            if (written == 0U) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        RealtimeHistoryControlStatusV2::kOk);
+                read_response.flags =
+                    kRealtimeHistoryResponseTerminalV2;
+                read_response.page_index = state.page_index;
+                read_response.generation =
+                    state.published->endpoint.generation;
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+
+            SealedReadOnlyPage page;
+            const auto page_records = std::span(
+                state.records.data(), written);
+            if (!BuildHistoryPage(
+                    state, page_records, &page, &timing)) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        RealtimeHistoryControlStatusV2::
+                            kInternalFailure);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+            std::uint64_t next_token = 0U;
+            ReadStageClock(&stage_begin, &timing);
+            const bool token_ok =
+                GenerateNonzeroToken(&next_token);
+            ReadStageClock(&stage_end, &timing);
+            timing.token_ns =
+                StageDuration(stage_begin, stage_end);
+            if (!token_ok) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        RealtimeHistoryControlStatusV2::
+                            kInternalFailure);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+            read_response.status =
+                static_cast<std::uint16_t>(
+                    RealtimeHistoryControlStatusV2::kOk);
+            read_response.record_count =
+                static_cast<std::uint32_t>(written);
+            read_response.page_mapping_bytes =
+                timing.page_mapping_bytes;
+            read_response.page_index = state.page_index;
+            read_response.generation =
+                state.published->endpoint.generation;
+            read_response.next_read_token = next_token;
+            ReadStageClock(&stage_begin, &timing);
+            const bool sent = SendPacket(
+                client,
+                &read_response,
+                sizeof(read_response),
+                page.descriptor());
+            ReadStageClock(&stage_end, &timing);
+            timing.send_ns =
+                StageDuration(stage_begin, stage_end);
+            if (!sent) {
+                return;
+            }
+            if (config_.history_stage_observer != nullptr) {
+                config_.history_stage_observer
+                    ->ObserveHistoryPageStageTiming(timing);
+            }
+            state.read_token = next_token;
+            ++state.page_index;
+        }
+    }
+
+    [[nodiscard]] bool ValidateDeltaBaseCheckpoint(
+        const RealtimeInstrumentTickDeltaCheckpointV2& base,
+        const RealtimeInstrumentTickDeltaCheckpointV2& target,
+        const market::IntradayInstrumentTickDeltaSummaryV1&
+            summary) const noexcept {
+        if (!ObjectBytesAreZero(base.reserved) ||
+            !EndpointIsValidPredecessor(
+                base.generation, target.generation) ||
+            base.instrument_id != target.instrument_id ||
+            base.ordinal != target.ordinal ||
+            base.instrument_id == 0U ||
+            base.ordinal + 1U != base.instrument_id ||
+            base.instrument_id > base.generation.bound_count ||
+            base.payload_projection !=
+                static_cast<std::uint32_t>(
+                    RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                        kCoreV2) ||
+            base.flags !=
+                kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2 ||
+            base.instrument_tick_source_record_counts[0U] != 0U ||
+            base.instrument_tick_source_record_counts[2U] != 0U ||
+            base.instrument_tick_source_record_counts[1U] >
+                target.instrument_tick_source_record_counts[1U] ||
+            base.instrument_tick_source_record_counts[3U] >
+                target.instrument_tick_source_record_counts[3U] ||
+            base.instrument_tick_source_record_counts !=
+                summary.base_tick_source_record_counts ||
+            target.instrument_tick_source_record_counts !=
+                summary.target_tick_source_record_counts) {
+            return false;
+        }
+        std::uint64_t total = 0U;
+        return CheckedAdd(
+                   base.instrument_tick_source_record_counts[1U],
+                   base.instrument_tick_source_record_counts[3U],
+                   &total) &&
+               total == base.instrument_tick_record_count;
+    }
+
+    [[nodiscard]] RealtimeInstrumentTickDeltaControlStatusV2
+    OpenDeltaInstrument(
+        const RealtimeInstrumentTickDeltaOpenInstrumentRequestV2&
+            request,
+        DeltaSessionState* session,
+        DeltaCursorState* output) noexcept {
+        if (session == nullptr || output == nullptr ||
+            session->target == nullptr ||
+            request.instrument_id == 0U ||
+            request.requested_page_records == 0U ||
+            request.requested_page_records >
+                config_.maximum_history_page_records ||
+            request.delta_session_token == 0U ||
+            request.delta_session_token !=
+                session->session_token ||
+            request.reserved1 != 0U ||
+            !ObjectBytesAreZero(request.reserved2)) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInvalidRequest;
+        }
+
+        RealtimeInstrumentTickDeltaCheckpointV2 target{};
+        market::ObservedInstrumentEntryViewV2 entry{};
+        const auto& catalog =
+            session->target->generation->catalog_snapshot();
+        if (catalog == nullptr ||
+            catalog->LookupById(request.instrument_id, &entry) ==
+                market::ObservedInstrumentDirectoryErrorV2::
+                    kNotFound) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kNotFound;
+        }
+        if (!BuildTargetDeltaCheckpoint(
+                *session->target->generation,
+                session->target->endpoint,
+                request.instrument_id,
+                &target)) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+
+        const auto base_kind =
+            static_cast<RealtimeInstrumentTickDeltaBaseKindV2>(
+                request.base_kind);
+        std::uint64_t begin_ingress = 0U;
+        if (base_kind ==
+            RealtimeInstrumentTickDeltaBaseKindV2::kOrigin) {
+            if (!ObjectBytesAreZero(request.base_checkpoint)) {
+                return RealtimeInstrumentTickDeltaControlStatusV2::
+                    kCheckpointMismatch;
+            }
+            begin_ingress = 1U;
+        } else if (
+            base_kind ==
+            RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint) {
+            begin_ingress = request.base_checkpoint.generation
+                                .ingress_sequence_exclusive;
+            if (begin_ingress == 0U) {
+                return RealtimeInstrumentTickDeltaControlStatusV2::
+                    kCheckpointMismatch;
+            }
+        } else {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInvalidRequest;
+        }
+
+        DeltaCursorState candidate{};
+        const market::IntradayInstrumentStoreQueryErrorV1
+            open_error =
+                session->target->generation
+                    ->OpenInstrumentTickDeltaCursor(
+                        request.instrument_id,
+                        begin_ingress,
+                        &candidate.cursor);
+        if (open_error ==
+            market::IntradayInstrumentStoreQueryErrorV1::
+                kNotFound) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kNotFound;
+        }
+        if (open_error ==
+            market::IntradayInstrumentStoreQueryErrorV1::
+                kResourceExhausted) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kResourceExhausted;
+        }
+        if (open_error !=
+                market::IntradayInstrumentStoreQueryErrorV1::kNone ||
+            candidate.cursor == nullptr) {
+            return base_kind ==
+                           RealtimeInstrumentTickDeltaBaseKindV2::
+                               kCheckpoint
+                       ? RealtimeInstrumentTickDeltaControlStatusV2::
+                             kCheckpointMismatch
+                       : RealtimeInstrumentTickDeltaControlStatusV2::
+                             kInternalFailure;
+        }
+        const market::IntradayInstrumentTickDeltaSummaryV1&
+            summary = candidate.cursor->summary();
+        if (summary.instrument_id != request.instrument_id ||
+            summary.selected_source_mask[0U] != 0U ||
+            summary.selected_source_mask[1U] != 1U ||
+            summary.selected_source_mask[2U] != 0U ||
+            summary.selected_source_mask[3U] != 1U ||
+            summary.ingress_sequence_begin_inclusive !=
+                begin_ingress ||
+            summary.ingress_sequence_end_exclusive !=
+                session->target->endpoint
+                    .ingress_sequence_exclusive ||
+            summary.target_tick_source_record_counts !=
+                target.instrument_tick_source_record_counts) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+        if (base_kind ==
+                RealtimeInstrumentTickDeltaBaseKindV2::
+                    kOrigin &&
+            (summary.base_tick_source_record_counts !=
+                 std::array<std::uint64_t, 4U>{} ||
+             request.base_checkpoint.instrument_tick_record_count !=
+                 0U)) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+        if (base_kind ==
+                RealtimeInstrumentTickDeltaBaseKindV2::
+                    kCheckpoint &&
+            !ValidateDeltaBaseCheckpoint(
+                request.base_checkpoint, target, summary)) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kCheckpointMismatch;
+        }
+        std::uint64_t target_total = 0U;
+        if (!CheckedAdd(
+                target.instrument_tick_source_record_counts[1U],
+                target.instrument_tick_source_record_counts[3U],
+                &target_total) ||
+            target_total !=
+                target.instrument_tick_record_count) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+
+        candidate.metadata.base_kind = request.base_kind;
+        candidate.metadata.selected_source_mask =
+            kRealtimeInstrumentTickDeltaSourceMaskV2;
+        if (base_kind ==
+            RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint) {
+            candidate.metadata.base_checkpoint =
+                request.base_checkpoint;
+        }
+        candidate.metadata.target_checkpoint = target;
+        candidate.metadata.delta_tick_source_record_counts =
+            summary.delta_tick_source_record_counts;
+        candidate.metadata.delta_tick_record_count =
+            summary.delta_tick_record_count;
+        candidate.metadata.ingress_sequence_begin_inclusive =
+            begin_ingress;
+        candidate.metadata.ingress_sequence_end_exclusive =
+            session->target->endpoint
+                .ingress_sequence_exclusive;
+        candidate.metadata.tick_stream_sequence_begin_inclusive =
+            base_kind ==
+                    RealtimeInstrumentTickDeltaBaseKindV2::
+                        kOrigin
+                ? 1U
+                : request.base_checkpoint.generation
+                      .tick_stream_sequence_exclusive;
+        candidate.metadata.tick_stream_sequence_end_exclusive =
+            session->target->endpoint
+                .tick_stream_sequence_exclusive;
+        candidate.metadata.flags =
+            kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2;
+        candidate.metadata.payload_projection =
+            static_cast<std::uint32_t>(
+                RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                    kCoreV2);
+        candidate.open_request_id = request.request_id;
+        candidate.page_records = std::min(
+            request.requested_page_records,
+            effective_history_page_records_);
+        try {
+            candidate.records.resize(candidate.page_records);
+        } catch (...) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kResourceExhausted;
+        }
+        if (!GenerateNonzeroToken(&candidate.read_token)) {
+            return RealtimeInstrumentTickDeltaControlStatusV2::
+                kInternalFailure;
+        }
+        *output = std::move(candidate);
+        return RealtimeInstrumentTickDeltaControlStatusV2::kOk;
+    }
+
+    void ServeDelta(
+        int client,
+        const RealtimeInstrumentTickDeltaOpenSessionRequestV2&
+            request,
+        std::size_t received_bytes) noexcept {
+        RealtimeInstrumentTickDeltaOpenSessionResponseV2 response{};
+        response.magic = kRealtimeControlMagicV2;
+        response.protocol_major = kRealtimeWireMajorV2;
+        response.protocol_minor = kRealtimeWireMinorV2;
+        response.message_bytes =
+            static_cast<std::uint32_t>(sizeof(response));
+        response.request_id = request.request_id;
+        auto status =
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk;
+        if (received_bytes != sizeof(request) ||
+            request.magic != kRealtimeControlMagicV2 ||
+            request.message_bytes != sizeof(request) ||
+            request.opcode !=
+                static_cast<std::uint16_t>(
+                    RealtimeInstrumentTickDeltaControlOpcodeV2::
+                        kOpenDeltaSession) ||
+            request.flags != 0U || request.reserved0 != 0U) {
+            status =
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kInvalidRequest;
+        } else if (
+            request.protocol_major != kRealtimeWireMajorV2 ||
+            request.protocol_minor != kRealtimeWireMinorV2) {
+            status =
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnsupportedVersion;
+        } else if (failed()) {
+            status =
+                RealtimeInstrumentTickDeltaControlStatusV2::
+                    kUnavailable;
+        }
+
+        DeltaSessionState session{};
+        if (status ==
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+            session.target =
+                std::atomic_load_explicit(
+                    &published_store_generation_,
+                    std::memory_order_acquire);
+            if (session.target == nullptr) {
+                status =
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnavailable;
+            } else if (
+                request.expected_generation != 0U &&
+                request.expected_generation !=
+                    session.target->endpoint.generation) {
+                status =
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kCheckpointMismatch;
+            } else if (
+                !GenerateNonzeroToken(&session.session_token)) {
+                status =
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kInternalFailure;
+            }
+        }
+        response.status = static_cast<std::uint16_t>(status);
+        if (status ==
+            RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+            response.target_generation =
+                session.target->endpoint;
+            response.delta_session_token =
+                session.session_token;
+        }
+        if (!SendPacket(client, &response, sizeof(response), -1) ||
+            status !=
+                RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+            return;
+        }
+
+        std::array<std::byte, 1024U> packet{};
+        for (;;) {
+            std::size_t packet_bytes = 0U;
+            if (!ReceiveNextRequest(
+                    client, packet, &packet_bytes)) {
+                return;
+            }
+            RealtimeRequestPrefixV2 prefix{};
+            if (packet_bytes >= sizeof(prefix) &&
+                packet_bytes <= packet.size()) {
+                std::memcpy(&prefix, packet.data(), sizeof(prefix));
+            } else {
+                return;
+            }
+            if (!session.cursor.has_value()) {
+                RealtimeInstrumentTickDeltaOpenInstrumentRequestV2
+                    open{};
+                std::memcpy(
+                    &open,
+                    packet.data(),
+                    std::min(packet_bytes, sizeof(open)));
+                RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+                    open_response{};
+                open_response.magic = kRealtimeControlMagicV2;
+                open_response.protocol_major =
+                    kRealtimeWireMajorV2;
+                open_response.protocol_minor =
+                    kRealtimeWireMinorV2;
+                open_response.message_bytes =
+                    static_cast<std::uint32_t>(
+                        sizeof(open_response));
+                open_response.request_id = open.request_id;
+                auto open_status =
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kOk;
+                if (packet_bytes != sizeof(open) ||
+                    open.magic != kRealtimeControlMagicV2 ||
+                    open.message_bytes != sizeof(open) ||
+                    open.opcode !=
+                        static_cast<std::uint16_t>(
+                            RealtimeInstrumentTickDeltaControlOpcodeV2::
+                                kOpenInstrumentDelta) ||
+                    open.flags != 0U || open.reserved0 != 0U) {
+                    open_status =
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInvalidRequest;
+                } else if (
+                    open.protocol_major != kRealtimeWireMajorV2 ||
+                    open.protocol_minor != kRealtimeWireMinorV2) {
+                    open_status =
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kUnsupportedVersion;
+                } else {
+                    DeltaCursorState cursor{};
+                    open_status = OpenDeltaInstrument(
+                        open, &session, &cursor);
+                    if (open_status ==
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk) {
+                        session.cursor.emplace(
+                            std::move(cursor));
+                    }
+                }
+                open_response.status =
+                    static_cast<std::uint16_t>(open_status);
+                if (open_status ==
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kOk) {
+                    open_response.initial_read_token =
+                        session.cursor->read_token;
+                    open_response.metadata =
+                        session.cursor->metadata;
+                }
+                if (!SendPacket(
+                        client,
+                        &open_response,
+                        sizeof(open_response),
+                        -1) ||
+                    open_status !=
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk) {
+                    return;
+                }
+                continue;
+            }
+
+            RealtimeInstrumentTickDeltaReadRequestV2 read{};
+            std::memcpy(
+                &read,
+                packet.data(),
+                std::min(packet_bytes, sizeof(read)));
+            DeltaCursorState& cursor = *session.cursor;
+            RealtimeInstrumentTickDeltaReadResponseV2
+                read_response{};
+            read_response.magic = kRealtimeControlMagicV2;
+            read_response.protocol_major = kRealtimeWireMajorV2;
+            read_response.protocol_minor = kRealtimeWireMinorV2;
+            read_response.message_bytes =
+                static_cast<std::uint32_t>(
+                    sizeof(read_response));
+            read_response.request_id = read.request_id;
+            auto read_status =
+                RealtimeInstrumentTickDeltaControlStatusV2::kOk;
+            if (packet_bytes != sizeof(read) ||
+                read.magic != kRealtimeControlMagicV2 ||
+                read.message_bytes != sizeof(read) ||
+                read.opcode !=
+                    static_cast<std::uint16_t>(
+                        RealtimeInstrumentTickDeltaControlOpcodeV2::
+                            kReadInstrumentDelta) ||
+                read.flags != 0U || read.reserved0 != 0U ||
+                read.protocol_major != kRealtimeWireMajorV2 ||
+                read.protocol_minor != kRealtimeWireMinorV2 ||
+                read.expected_page_index != cursor.page_index ||
+                read.read_token == 0U ||
+                read.read_token != cursor.read_token) {
+                read_status =
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kInvalidRequest;
+            }
+            if (read_status !=
+                RealtimeInstrumentTickDeltaControlStatusV2::kOk) {
+                read_response.status =
+                    static_cast<std::uint16_t>(read_status);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+
+            RealtimeHistoryPageStageTimingV2 timing{};
+            timing.open_request_id = cursor.open_request_id;
+            timing.read_request_id = read.request_id;
+            timing.generation =
+                session.target->endpoint.generation;
+            timing.instrument_id =
+                cursor.metadata.target_checkpoint.instrument_id;
+            timing.page_index = cursor.page_index;
+            std::uint64_t stage_begin = 0U;
+            std::uint64_t stage_end = 0U;
+            ReadStageClock(&stage_begin, &timing);
+            std::size_t written = 0U;
+            market::IntradayInstrumentStoreQueryErrorV1
+                read_error =
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded;
+            while (cursor.page_records != 0U) {
+                read_error = cursor.cursor->ReadBatch(
+                    std::span(
+                        cursor.records.data(),
+                        cursor.page_records),
+                    &written);
+                if (read_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kBatchLimitExceeded) {
+                    break;
+                }
+                cursor.page_records /= 2U;
+            }
+            ReadStageClock(&stage_end, &timing);
+            timing.cursor_read_ns =
+                StageDuration(stage_begin, stage_end);
+            if (read_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone ||
+                cursor.page_records == 0U) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        read_error ==
+                                market::
+                                    IntradayInstrumentStoreQueryErrorV1::
+                                        kResourceExhausted
+                            ? RealtimeInstrumentTickDeltaControlStatusV2::
+                                  kResourceExhausted
+                            : RealtimeInstrumentTickDeltaControlStatusV2::
+                                  kInternalFailure);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+            if (written == 0U) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kOk);
+                read_response.flags =
+                    kRealtimeInstrumentTickDeltaResponseTerminalV2;
+                read_response.page_index = cursor.page_index;
+                read_response.target_generation =
+                    session.target->endpoint.generation;
+                if (!SendPacket(
+                        client,
+                        &read_response,
+                        sizeof(read_response),
+                        -1)) {
+                    return;
+                }
+                session.cursor.reset();
+                continue;
+            }
+
+            SealedReadOnlyPage page;
+            if (!BuildDeltaPage(
+                    session,
+                    cursor,
+                    std::span(cursor.records.data(), written),
+                    &page,
+                    &timing)) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInternalFailure);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+            std::uint64_t next_token = 0U;
+            ReadStageClock(&stage_begin, &timing);
+            const bool token_ok =
+                GenerateNonzeroToken(&next_token);
+            ReadStageClock(&stage_end, &timing);
+            timing.token_ns =
+                StageDuration(stage_begin, stage_end);
+            if (!token_ok) {
+                read_response.status =
+                    static_cast<std::uint16_t>(
+                        RealtimeInstrumentTickDeltaControlStatusV2::
+                            kInternalFailure);
+                static_cast<void>(SendPacket(
+                    client,
+                    &read_response,
+                    sizeof(read_response),
+                    -1));
+                return;
+            }
+            read_response.status =
+                static_cast<std::uint16_t>(
+                    RealtimeInstrumentTickDeltaControlStatusV2::
+                        kOk);
+            read_response.record_count =
+                static_cast<std::uint32_t>(written);
+            read_response.page_mapping_bytes =
+                timing.page_mapping_bytes;
+            read_response.page_index = cursor.page_index;
+            read_response.target_generation =
+                session.target->endpoint.generation;
+            read_response.next_read_token = next_token;
+            ReadStageClock(&stage_begin, &timing);
+            const bool sent = SendPacket(
+                client,
+                &read_response,
+                sizeof(read_response),
+                page.descriptor());
+            ReadStageClock(&stage_end, &timing);
+            timing.send_ns =
+                StageDuration(stage_begin, stage_end);
+            if (!sent) {
+                return;
+            }
+            if (config_.history_stage_observer != nullptr) {
+                config_.history_stage_observer
+                    ->ObserveHistoryPageStageTiming(timing);
+            }
+            cursor.read_token = next_token;
+            ++cursor.page_index;
+        }
+    }
+
+    [[nodiscard]] bool PeerUidAllowed(int client) const noexcept {
+        ucred credentials{};
+        socklen_t credentials_size =
+            static_cast<socklen_t>(sizeof(credentials));
+        return client >= 0 &&
+               ::getsockopt(
+                   client,
+                   SOL_SOCKET,
+                   SO_PEERCRED,
+                   &credentials,
+                   &credentials_size) == 0 &&
+               credentials_size == sizeof(credentials) &&
+               credentials.uid == ::geteuid();
+    }
+
+    void ReapClientWorkers() noexcept {
+        for (const std::unique_ptr<ClientWorkerSlot>& slot :
+             client_workers_) {
+            if (slot != nullptr &&
+                !slot->active.load(std::memory_order_acquire) &&
+                slot->thread.joinable()) {
+                slot->thread.join();
+            }
+        }
+    }
+
+    [[nodiscard]] bool DispatchClient(int client) noexcept {
+        ReapClientWorkers();
+        for (const std::unique_ptr<ClientWorkerSlot>& slot :
+             client_workers_) {
+            if (slot == nullptr || slot->thread.joinable() ||
+                slot->active.load(std::memory_order_acquire)) {
+                continue;
+            }
+            slot->client_fd.store(
+                client, std::memory_order_release);
+            slot->active.store(true, std::memory_order_release);
+            try {
+                ClientWorkerSlot* const raw = slot.get();
+                slot->thread = std::thread([this, raw] {
+                    ClientWorker(raw);
+                });
+                return true;
+            } catch (...) {
+                slot->active.store(
+                    false, std::memory_order_release);
+                slot->client_fd.store(
+                    -1, std::memory_order_release);
+                return false;
+            }
+        }
+        return false;
+    }
+
+    void StopClientWorkers() noexcept {
+        for (const std::unique_ptr<ClientWorkerSlot>& slot :
+             client_workers_) {
+            if (slot == nullptr ||
+                !slot->active.load(std::memory_order_acquire)) {
+                continue;
+            }
+            const int client =
+                slot->client_fd.load(std::memory_order_acquire);
+            if (client >= 0) {
+                static_cast<void>(::shutdown(client, SHUT_RDWR));
+            }
+        }
+        for (const std::unique_ptr<ClientWorkerSlot>& slot :
+             client_workers_) {
+            if (slot != nullptr && slot->thread.joinable()) {
+                slot->thread.join();
+            }
+        }
+    }
+
+    void ClientWorker(ClientWorkerSlot* slot) noexcept {
+        if (slot == nullptr) {
+            return;
+        }
+        const int client =
+            slot->client_fd.load(std::memory_order_acquire);
+        if (client >= 0) {
+            HandleClientSession(client);
+            static_cast<void>(::close(client));
+        }
+        slot->client_fd.store(-1, std::memory_order_release);
+        slot->active.store(false, std::memory_order_release);
+    }
+
+    void HandleClientSession(int client) noexcept {
+        std::array<std::byte, 1024U> packet{};
+        std::size_t received_bytes = 0U;
+        if (!ReceiveNextRequest(
+                client, packet, &received_bytes) ||
+            received_bytes < sizeof(RealtimeRequestPrefixV2)) {
+            return;
+        }
+        RealtimeRequestPrefixV2 prefix{};
+        std::memcpy(&prefix, packet.data(), sizeof(prefix));
+        if (prefix.magic != kRealtimeControlMagicV2) {
+            return;
+        }
+        if (prefix.opcode ==
+            static_cast<std::uint16_t>(
+                RealtimeControlOpcodeV2::kGetSession)) {
+            RealtimeControlRequestV2 request{};
+            std::memcpy(
+                &request,
+                packet.data(),
+                std::min(received_bytes, sizeof(request)));
+            HandleGetSession(client, request, received_bytes);
+            return;
+        }
+        if (prefix.opcode ==
+            static_cast<std::uint16_t>(
+                RealtimeHistoryControlOpcodeV2::kOpenHistory)) {
+            RealtimeHistoryOpenRequestV2 request{};
+            std::memcpy(
+                &request,
+                packet.data(),
+                std::min(received_bytes, sizeof(request)));
+            ServeHistory(client, request, received_bytes);
+            return;
+        }
+        if (prefix.opcode ==
+            static_cast<std::uint16_t>(
+                RealtimeInstrumentTickDeltaControlOpcodeV2::
+                    kOpenDeltaSession)) {
+            RealtimeInstrumentTickDeltaOpenSessionRequestV2
+                request{};
+            std::memcpy(
+                &request,
+                packet.data(),
+                std::min(received_bytes, sizeof(request)));
+            ServeDelta(client, request, received_bytes);
+        }
+    }
+
     void ControlLoop() noexcept {
         std::array<pollfd, 3U> descriptors{};
         descriptors[0U].fd = listener_fd_;
@@ -2724,6 +5098,7 @@ private:
                 return;
             }
             if (ready == 0) {
+                ReapClientWorkers();
                 UpdateHeartbeatNow();
                 continue;
             }
@@ -2781,85 +5156,15 @@ private:
                         MarkFailed();
                         return;
                     }
-                    HandleClient(client);
-                    static_cast<void>(::close(client));
+                    if (!PeerUidAllowed(client) ||
+                        !DispatchClient(client)) {
+                        static_cast<void>(::close(client));
+                    }
                 }
             }
+            ReapClientWorkers();
             UpdateHeartbeatNow();
         }
-    }
-
-    void HandleClient(int client) noexcept {
-        ucred credentials{};
-        socklen_t credentials_size =
-            static_cast<socklen_t>(sizeof(credentials));
-        if (::getsockopt(
-                client,
-                SOL_SOCKET,
-                SO_PEERCRED,
-                &credentials,
-                &credentials_size) != 0 ||
-            credentials_size != sizeof(credentials) ||
-            credentials.uid != ::geteuid()) {
-            return;
-        }
-        pollfd descriptor{};
-        descriptor.fd = client;
-        descriptor.events = static_cast<short>(POLLIN);
-        int ready = -1;
-        do {
-            ready = ::poll(&descriptor, 1U, 250);
-        } while (ready < 0 && errno == EINTR);
-        if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
-            return;
-        }
-        RealtimeControlRequestV2 request{};
-        const ssize_t received = ::recv(
-            client, &request, sizeof(request), MSG_TRUNC);
-        RealtimeControlResponseV2 response{};
-        response.magic = kRealtimeControlMagicV2;
-        response.protocol_major = kRealtimeWireMajorV2;
-        response.protocol_minor = kRealtimeWireMinorV2;
-        response.message_bytes =
-            static_cast<std::uint32_t>(sizeof(response));
-        response.request_id = request.request_id;
-        response.session_epoch = config_.session_epoch;
-        response.total_mapping_bytes = mapping_bytes_;
-        bool send_fd = false;
-        if (received !=
-                static_cast<ssize_t>(sizeof(request)) ||
-            request.magic != kRealtimeControlMagicV2 ||
-            request.message_bytes != sizeof(request) ||
-            request.opcode !=
-                static_cast<std::uint16_t>(
-                    RealtimeControlOpcodeV2::kGetSession) ||
-            request.flags != 0U || request.reserved0 != 0U ||
-            request.reserved1 != 0U) {
-            response.status =
-                static_cast<std::uint16_t>(
-                    RealtimeControlStatusV2::kInvalidRequest);
-        } else if (
-            request.protocol_major != kRealtimeWireMajorV2 ||
-            request.protocol_minor != kRealtimeWireMinorV2) {
-            response.status =
-                static_cast<std::uint16_t>(
-                    RealtimeControlStatusV2::
-                        kUnsupportedVersion);
-        } else if (failed()) {
-            response.status =
-                static_cast<std::uint16_t>(
-                    RealtimeControlStatusV2::kUnavailable);
-        } else {
-            response.status =
-                static_cast<std::uint16_t>(
-                    RealtimeControlStatusV2::kOk);
-            send_fd = true;
-        }
-        static_cast<void>(SendPacket(
-            client,
-            &response,
-            sizeof(response),
-            send_fd ? read_only_fd_ : -1));
     }
 
     [[nodiscard]] RealtimeWireInstrumentV2* instrument_rows()
@@ -2945,6 +5250,12 @@ private:
     std::atomic_flag failure_reported_ = ATOMIC_FLAG_INIT;
     std::atomic_flag kline_publication_in_progress_ =
         ATOMIC_FLAG_INIT;
+    std::atomic_flag store_generation_publication_in_progress_ =
+        ATOMIC_FLAG_INIT;
+    std::uint64_t published_store_session_epoch_ = 0U;
+    std::shared_ptr<const PublishedStoreGeneration>
+        published_store_generation_;
+    std::uint32_t effective_history_page_records_ = 0U;
 
     int listener_fd_ = -1;
     int stop_event_fd_ = -1;
@@ -2956,6 +5267,8 @@ private:
     std::atomic<bool> control_stop_requested_{false};
     std::mutex control_stop_mutex_;
     std::thread control_thread_;
+    std::vector<std::unique_ptr<ClientWorkerSlot>>
+        client_workers_;
 };
 
 RealtimeSharedMarketServiceV2::RealtimeSharedMarketServiceV2(
@@ -3030,6 +5343,14 @@ bool RealtimeSharedMarketServiceV2::PublishKLineGeneration(
     const market::RealtimeKLineGenerationV1& generation) noexcept {
     return impl_ != nullptr &&
            impl_->PublishKLineGeneration(generation);
+}
+
+bool RealtimeSharedMarketServiceV2::PublishStoreGeneration(
+    const std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>&
+        generation) noexcept {
+    return impl_ != nullptr &&
+           impl_->PublishStoreGeneration(generation);
 }
 
 void RealtimeSharedMarketServiceV2::MarkDraining() noexcept {

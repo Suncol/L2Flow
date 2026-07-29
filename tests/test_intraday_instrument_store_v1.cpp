@@ -1318,6 +1318,33 @@ bool CheckGenerationQueriesAndLifetime(
             market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
         "Find rejects instrument outside the bound catalog");
 
+    market::IntradayInstrumentScanOptionsV1
+        empty_instrument_options{};
+    empty_instrument_options.ingress_sequence_begin_inclusive =
+        first->watermark().ingress_sequence_exclusive;
+    empty_instrument_options.ingress_sequence_end_exclusive =
+        first->watermark().ingress_sequence_exclusive;
+    std::unique_ptr<market::IntradayInstrumentCursorV1>
+        empty_range_cursor;
+    ok &= Expect(
+        first->OpenInstrumentCursor(
+            7U,
+            empty_instrument_options,
+            &empty_range_cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            empty_range_cursor != nullptr &&
+            empty_range_cursor->done(),
+        "equal half-open bounds open an empty instrument cursor");
+    if (empty_range_cursor != nullptr) {
+        std::array<const market::RealtimeHistoryRecordV1*, 1U> batch{};
+        std::size_t written = std::numeric_limits<std::size_t>::max();
+        ok &= Expect(
+            empty_range_cursor->ReadBatch(batch, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                written == 0U,
+            "empty instrument cursor returns an explicit terminal batch");
+    }
+
     std::unique_ptr<market::IntradayInstrumentCursorV1> all_cursor;
     ok &= Expect(
         first->OpenInstrumentCursor(5U, {}, &all_cursor) ==

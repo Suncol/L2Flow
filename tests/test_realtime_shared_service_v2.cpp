@@ -1,3 +1,5 @@
+#include "l2flow/ipc/realtime_history_wire_v2.h"
+#include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/ipc/realtime_shm_reader_c_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
@@ -235,6 +237,41 @@ std::vector<std::byte> PipelineShenzhenSnapshotBody(
     writer.StoreString(14U, security_id);
     writer.StoreString(20U, "102 ");
     writer.StoreString(26U, "T");
+    return std::move(writer).Take();
+}
+
+std::vector<std::byte> PipelineShanghaiTickBody(
+    std::string_view security_id = "600001",
+    std::uint64_t business_index = 1U) {
+    PipelineWireWriter writer(70U);
+    writer.StoreU64(0U, business_index);
+    writer.StoreU32(8U, 7U);
+    writer.StoreU32(18U, 93'000'125U);
+    writer.StoreU64(28U, 11'001U);
+    writer.StoreU64(36U, 22'002U);
+    writer.StoreU32(44U, 12'345U);
+    writer.StoreU64(48U, 41U);
+    writer.StoreU64(56U, 506'145U);
+    writer.StoreString(12U, security_id);
+    writer.StoreString(22U, "T");
+    writer.StoreString(64U, "B");
+    return std::move(writer).Take();
+}
+
+std::vector<std::byte> PipelineShenzhenOrderBody(
+    std::string_view security_id = "000001",
+    std::uint64_t application_sequence = 1U) {
+    PipelineWireWriter writer(58U);
+    writer.StoreU32(0U, 12U);
+    writer.StoreU64(4U, application_sequence);
+    writer.StoreU64(30U, 123'456U);
+    writer.StoreU64(38U, 201U);
+    writer.StoreU32(46U, 49U);
+    writer.StoreU32(50U, 93'000'124U);
+    writer.StoreU32(54U, 50U);
+    writer.StoreString(12U, "010");
+    writer.StoreString(18U, security_id);
+    writer.StoreString(24U, "102 ");
     return std::move(writer).Take();
 }
 
@@ -583,6 +620,44 @@ private:
     std::unique_ptr<TimedPublicationRecord[]> records_;
 };
 
+class HistoryStageCollector final
+    : public ipc::RealtimeHistoryPageStageObserverV2 {
+public:
+    void ObserveHistoryPageStageTiming(
+        const ipc::RealtimeHistoryPageStageTimingV2& timing)
+        noexcept override {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            timings_.push_back(timing);
+        } catch (...) {
+            failed_.store(true, std::memory_order_release);
+        }
+    }
+
+    [[nodiscard]] std::vector<
+        ipc::RealtimeHistoryPageStageTimingV2>
+    Take() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<ipc::RealtimeHistoryPageStageTimingV2> result;
+        result.swap(timings_);
+        return result;
+    }
+
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        timings_.clear();
+    }
+
+    [[nodiscard]] bool failed() const noexcept {
+        return failed_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<ipc::RealtimeHistoryPageStageTimingV2> timings_;
+    std::atomic<bool> failed_{false};
+};
+
 struct LatencySummary final {
     std::uint64_t minimum_ns = 0U;
     std::uint64_t maximum_ns = 0U;
@@ -838,6 +913,285 @@ private:
     std::string buffer_;
 };
 
+[[nodiscard]] bool ParseLineUnsignedField(
+    std::string_view line,
+    std::string_view name,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr || name.empty() ||
+        name.find_first_of(" =\t\r\n") != std::string_view::npos) {
+        return false;
+    }
+    std::size_t position = 0U;
+    while (position < line.size()) {
+        const std::size_t end = line.find(' ', position);
+        const std::string_view item = line.substr(
+            position,
+            end == std::string_view::npos
+                ? line.size() - position
+                : end - position);
+        if (item.size() > name.size() &&
+            item.starts_with(name) &&
+            item[name.size()] == '=') {
+            const std::string_view value =
+                item.substr(name.size() + 1U);
+            if (value.empty()) {
+                return false;
+            }
+            std::uint64_t parsed = 0U;
+            for (const char character : value) {
+                if (character < '0' || character > '9') {
+                    return false;
+                }
+                const std::uint64_t digit =
+                    static_cast<std::uint64_t>(character - '0');
+                if (parsed >
+                    (std::numeric_limits<std::uint64_t>::max() -
+                     digit) /
+                        10U) {
+                    return false;
+                }
+                parsed = parsed * 10U + digit;
+            }
+            *output = parsed;
+            return true;
+        }
+        if (end == std::string_view::npos) {
+            break;
+        }
+        position = end + 1U;
+    }
+    return false;
+}
+
+void PrintHistoryPageStages(
+    std::string_view workload,
+    const std::vector<
+        ipc::RealtimeHistoryPageStageTimingV2>& timings) {
+    std::vector<std::uint64_t> cursor;
+    std::vector<std::uint64_t> layout;
+    std::vector<std::uint64_t> memfd_prepare;
+    std::vector<std::uint64_t> projection;
+    std::vector<std::uint64_t> memfd_finalize;
+    std::vector<std::uint64_t> build;
+    std::vector<std::uint64_t> token;
+    std::vector<std::uint64_t> send;
+    cursor.reserve(timings.size());
+    layout.reserve(timings.size());
+    memfd_prepare.reserve(timings.size());
+    projection.reserve(timings.size());
+    memfd_finalize.reserve(timings.size());
+    build.reserve(timings.size());
+    token.reserve(timings.size());
+    send.reserve(timings.size());
+    std::uint64_t records = 0U;
+    std::uint64_t bytes = 0U;
+    std::uint64_t clock_failures = 0U;
+    for (const auto& timing : timings) {
+        cursor.push_back(timing.cursor_read_ns);
+        layout.push_back(timing.classify_layout_ns);
+        memfd_prepare.push_back(timing.memfd_prepare_ns);
+        projection.push_back(timing.projection_ns);
+        memfd_finalize.push_back(timing.memfd_finalize_ns);
+        build.push_back(timing.build_total_ns);
+        token.push_back(timing.token_ns);
+        send.push_back(timing.send_ns);
+        records += timing.record_count;
+        bytes += timing.page_mapping_bytes;
+        clock_failures += timing.clock_read_failures;
+    }
+    const std::string prefix =
+        "history_page_" + std::string(workload) + "_";
+    PrintLatency(prefix + "cursor_read", cursor);
+    PrintLatency(prefix + "classify_layout", layout);
+    PrintLatency(prefix + "memfd_prepare", memfd_prepare);
+    PrintLatency(prefix + "projection", projection);
+    PrintLatency(prefix + "memfd_finalize", memfd_finalize);
+    PrintLatency(prefix + "build_total", build);
+    PrintLatency(prefix + "token", token);
+    PrintLatency(prefix + "send", send);
+    std::cout
+        << "HISTORY_PAGE_STAGE_TOTAL workload=" << workload
+        << " pages=" << timings.size()
+        << " records=" << records
+        << " mapping_bytes=" << bytes
+        << " clock_failures=" << clock_failures << '\n';
+}
+
+struct PythonHistoryCommandResult final {
+    std::uint64_t published_ns = 0U;
+    std::uint64_t first_open_start_ns = 0U;
+    std::uint64_t first_open_return_ns = 0U;
+    std::uint64_t first_cursor_open_start_ns = 0U;
+    std::uint64_t first_cursor_open_return_ns = 0U;
+    std::uint64_t first_scan_start_ns = 0U;
+    std::uint64_t first_complete_ns = 0U;
+    std::vector<std::uint64_t> session_open_ns;
+    std::vector<std::uint64_t> cursor_open_ns;
+    std::vector<std::uint64_t> scan_ns;
+    std::vector<std::uint64_t> open_return_to_complete_ns;
+    std::vector<std::uint64_t> checkpoint_access_ns;
+};
+
+[[nodiscard]] bool RunPythonHistoryCommand(
+    ProtocolChannel* channel,
+    std::string_view command,
+    std::string_view sample_tag,
+    std::size_t repeats,
+    std::uint64_t expected_records,
+    PythonHistoryCommandResult* output) {
+    if (channel == nullptr || command.empty() ||
+        sample_tag.empty() || repeats == 0U || output == nullptr ||
+        !channel->SendLine(command)) {
+        return false;
+    }
+    PythonHistoryCommandResult result{};
+    std::string line;
+    for (std::size_t sample = 0U; sample < repeats; ++sample) {
+        if (!channel->ReadLine(
+                std::chrono::seconds(120), &line) ||
+            !line.starts_with(sample_tag)) {
+            std::cerr << "unexpected history probe line: "
+                      << line << '\n';
+            return false;
+        }
+        std::uint64_t record_count = 0U;
+        std::uint64_t published = 0U;
+        std::uint64_t open_start = 0U;
+        std::uint64_t open_return = 0U;
+        std::uint64_t scan_start = 0U;
+        std::uint64_t complete = 0U;
+        if (!ParseLineUnsignedField(
+                line, "record_count", &record_count) ||
+            record_count != expected_records ||
+            !ParseLineUnsignedField(
+                line,
+                "history_published_monotonic_ns",
+                &published)) {
+            std::cerr << "invalid history probe sample: "
+                      << line << '\n';
+            return false;
+        }
+        if (sample_tag == "HISTORY_SAMPLE") {
+            std::uint64_t open_latency = 0U;
+            std::uint64_t scan_latency = 0U;
+            std::uint64_t open_to_complete = 0U;
+            if (!ParseLineUnsignedField(
+                    line, "open_call_start_ns", &open_start) ||
+                !ParseLineUnsignedField(
+                    line, "open_return_ns", &open_return) ||
+                !ParseLineUnsignedField(
+                    line, "scan_start_ns", &scan_start) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "eof_columns_complete_ns",
+                    &complete) ||
+                !ParseLineUnsignedField(
+                    line, "python_open_ns", &open_latency) ||
+                !ParseLineUnsignedField(
+                    line, "complete_scan_ns", &scan_latency) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "open_return_to_eof_columns_complete_ns",
+                    &open_to_complete)) {
+                return false;
+            }
+            result.cursor_open_ns.push_back(open_latency);
+            result.scan_ns.push_back(scan_latency);
+            result.open_return_to_complete_ns.push_back(
+                open_to_complete);
+        } else if (sample_tag == "DELTA_SAMPLE") {
+            std::uint64_t session_open = 0U;
+            std::uint64_t cursor_open = 0U;
+            std::uint64_t scan_latency = 0U;
+            std::uint64_t checkpoint_access = 0U;
+            std::uint64_t cursor_open_start = 0U;
+            std::uint64_t cursor_open_return = 0U;
+            std::uint64_t open_to_complete = 0U;
+            if (!ParseLineUnsignedField(
+                    line,
+                    "session_open_call_start_ns",
+                    &open_start) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "session_open_return_ns",
+                    &open_return) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_call_start_ns",
+                    &cursor_open_start) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_return_ns",
+                    &cursor_open_return) ||
+                !ParseLineUnsignedField(
+                    line, "scan_start_ns", &scan_start) ||
+                !ParseLineUnsignedField(
+                    line, "checkpoint_return_ns", &complete) ||
+                !ParseLineUnsignedField(
+                    line, "session_open_ns", &session_open) ||
+                !ParseLineUnsignedField(
+                    line, "cursor_open_ns", &cursor_open) ||
+                !ParseLineUnsignedField(
+                    line, "scan_to_eof_ns", &scan_latency) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "checkpoint_access_ns",
+                    &checkpoint_access) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_return_to_checkpoint_ns",
+                    &open_to_complete)) {
+                return false;
+            }
+            result.session_open_ns.push_back(session_open);
+            result.cursor_open_ns.push_back(cursor_open);
+            result.scan_ns.push_back(scan_latency);
+            result.open_return_to_complete_ns.push_back(
+                open_to_complete);
+            result.checkpoint_access_ns.push_back(
+                checkpoint_access);
+            if (cursor_open_start < open_return ||
+                cursor_open_return < cursor_open_start ||
+                scan_start < cursor_open_return) {
+                return false;
+            }
+            if (sample == 0U) {
+                result.first_cursor_open_start_ns =
+                    cursor_open_start;
+                result.first_cursor_open_return_ns =
+                    cursor_open_return;
+            }
+        } else {
+            return false;
+        }
+        if (published == 0U || open_start < published ||
+            open_return < open_start || scan_start < open_return ||
+            complete < scan_start ||
+            (result.published_ns != 0U &&
+             result.published_ns != published)) {
+            std::cerr << "non-monotonic history probe sample: "
+                      << line << '\n';
+            return false;
+        }
+        result.published_ns = published;
+        if (sample == 0U) {
+            result.first_open_start_ns = open_start;
+            result.first_open_return_ns = open_return;
+            result.first_scan_start_ns = scan_start;
+            result.first_complete_ns = complete;
+        }
+        std::cout << "PYTHON_" << line << '\n';
+    }
+    if (!channel->ReadLine(std::chrono::seconds(30), &line) ||
+        !line.starts_with("DONE ")) {
+        std::cerr << "missing history probe DONE: " << line << '\n';
+        return false;
+    }
+    std::cout << "PYTHON_" << line << '\n';
+    *output = std::move(result);
+    return true;
+}
+
 class PythonLatencyProcess final {
 public:
     PythonLatencyProcess() = default;
@@ -974,6 +1328,189 @@ SessionTransfer RequestSession(
     return result;
 }
 
+[[nodiscard]] UniqueFd ConnectControlSocket(
+    const std::filesystem::path& socket_path) {
+    UniqueFd socket_fd(::socket(
+        AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+    if (socket_fd.get() < 0) {
+        return {};
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::string path = socket_path.string();
+    if (path.size() >= sizeof(address.sun_path)) {
+        return {};
+    }
+    std::memcpy(
+        address.sun_path, path.c_str(), path.size() + 1U);
+    if (::connect(
+            socket_fd.get(),
+            reinterpret_cast<const sockaddr*>(&address),
+            static_cast<socklen_t>(
+                offsetof(sockaddr_un, sun_path) +
+                path.size() + 1U)) != 0) {
+        return {};
+    }
+    return socket_fd;
+}
+
+template <typename Message>
+[[nodiscard]] bool SendObject(int socket_fd, const Message& message) {
+    return socket_fd >= 0 &&
+           ::send(
+               socket_fd,
+               &message,
+               sizeof(message),
+               MSG_NOSIGNAL) ==
+               static_cast<ssize_t>(sizeof(message));
+}
+
+template <typename Message>
+[[nodiscard]] bool ReceiveObjectWithoutDescriptor(
+    int socket_fd,
+    Message* output) {
+    if (socket_fd < 0 || output == nullptr) {
+        return false;
+    }
+    *output = Message{};
+    iovec vector{};
+    vector.iov_base = output;
+    vector.iov_len = sizeof(*output);
+    std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1U;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    const ssize_t received =
+        ::recvmsg(socket_fd, &message, MSG_CMSG_CLOEXEC);
+    return received == static_cast<ssize_t>(sizeof(*output)) &&
+           (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) == 0 &&
+           CMSG_FIRSTHDR(&message) == nullptr;
+}
+
+[[nodiscard]] bool CheckCanonicalHistoryReadErrorFrame(
+    const std::filesystem::path& socket_path,
+    std::uint64_t generation) {
+    UniqueFd channel = ConnectControlSocket(socket_path);
+    ipc::RealtimeHistoryOpenRequestV2 open{};
+    open.magic = ipc::kRealtimeControlMagicV2;
+    open.protocol_major = ipc::kRealtimeWireMajorV2;
+    open.protocol_minor = ipc::kRealtimeWireMinorV2;
+    open.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeHistoryControlOpcodeV2::kOpenHistory);
+    open.message_bytes = sizeof(open);
+    open.request_id = 0x484953544f50454eULL;
+    open.instrument_id = 1U;
+    open.requested_page_records = 1U;
+    open.expected_generation = generation;
+    ipc::RealtimeHistoryOpenResponseV2 opened{};
+    if (!SendObject(channel.get(), open) ||
+        !ReceiveObjectWithoutDescriptor(channel.get(), &opened) ||
+        opened.status != static_cast<std::uint16_t>(
+            ipc::RealtimeHistoryControlStatusV2::kOk) ||
+        opened.initial_read_token == 0U) {
+        return false;
+    }
+
+    ipc::RealtimeHistoryReadRequestV2 malformed{};
+    malformed.magic = ipc::kRealtimeControlMagicV2;
+    malformed.protocol_major = ipc::kRealtimeWireMajorV2;
+    malformed.protocol_minor = ipc::kRealtimeWireMinorV2;
+    malformed.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeHistoryControlOpcodeV2::kReadHistory);
+    malformed.message_bytes = sizeof(malformed);
+    malformed.request_id = 0x4849535452454144ULL;
+    malformed.expected_page_index = 0U;
+    malformed.read_token = 0U;
+    ipc::RealtimeHistoryReadResponseV2 rejected{};
+    return SendObject(channel.get(), malformed) &&
+           ReceiveObjectWithoutDescriptor(channel.get(), &rejected) &&
+           rejected.status == static_cast<std::uint16_t>(
+               ipc::RealtimeHistoryControlStatusV2::kInvalidRequest) &&
+           rejected.flags == 0U && rejected.record_count == 0U &&
+           rejected.request_id == malformed.request_id &&
+           rejected.page_mapping_bytes == 0U &&
+           rejected.page_index == 0U &&
+           rejected.generation == 0U &&
+           rejected.next_read_token == 0U;
+}
+
+[[nodiscard]] bool CheckCanonicalDeltaReadErrorFrame(
+    const std::filesystem::path& socket_path,
+    std::uint64_t generation) {
+    UniqueFd channel = ConnectControlSocket(socket_path);
+    ipc::RealtimeInstrumentTickDeltaOpenSessionRequestV2 open_session{};
+    open_session.magic = ipc::kRealtimeControlMagicV2;
+    open_session.protocol_major = ipc::kRealtimeWireMajorV2;
+    open_session.protocol_minor = ipc::kRealtimeWireMinorV2;
+    open_session.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kOpenDeltaSession);
+    open_session.message_bytes = sizeof(open_session);
+    open_session.request_id = 0x44454c5441534553ULL;
+    open_session.expected_generation = generation;
+    ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2
+        session{};
+    if (!SendObject(channel.get(), open_session) ||
+        !ReceiveObjectWithoutDescriptor(channel.get(), &session) ||
+        session.status != static_cast<std::uint16_t>(
+            ipc::RealtimeInstrumentTickDeltaControlStatusV2::kOk) ||
+        session.delta_session_token == 0U) {
+        return false;
+    }
+
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentRequestV2
+        open_instrument{};
+    open_instrument.magic = ipc::kRealtimeControlMagicV2;
+    open_instrument.protocol_major = ipc::kRealtimeWireMajorV2;
+    open_instrument.protocol_minor = ipc::kRealtimeWireMinorV2;
+    open_instrument.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kOpenInstrumentDelta);
+    open_instrument.message_bytes = sizeof(open_instrument);
+    open_instrument.request_id = 0x44454c5441494e53ULL;
+    open_instrument.instrument_id = 1U;
+    open_instrument.requested_page_records = 1U;
+    open_instrument.base_kind = static_cast<std::uint32_t>(
+        ipc::RealtimeInstrumentTickDeltaBaseKindV2::kOrigin);
+    open_instrument.delta_session_token =
+        session.delta_session_token;
+    ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2
+        opened{};
+    if (!SendObject(channel.get(), open_instrument) ||
+        !ReceiveObjectWithoutDescriptor(channel.get(), &opened) ||
+        opened.status != static_cast<std::uint16_t>(
+            ipc::RealtimeInstrumentTickDeltaControlStatusV2::kOk) ||
+        opened.initial_read_token == 0U) {
+        return false;
+    }
+
+    ipc::RealtimeInstrumentTickDeltaReadRequestV2 malformed{};
+    malformed.magic = ipc::kRealtimeControlMagicV2;
+    malformed.protocol_major = ipc::kRealtimeWireMajorV2;
+    malformed.protocol_minor = ipc::kRealtimeWireMinorV2;
+    malformed.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kReadInstrumentDelta);
+    malformed.message_bytes = sizeof(malformed);
+    malformed.request_id = 0x44454c5441524541ULL;
+    malformed.expected_page_index = 0U;
+    malformed.read_token = 0U;
+    ipc::RealtimeInstrumentTickDeltaReadResponseV2 rejected{};
+    return SendObject(channel.get(), malformed) &&
+           ReceiveObjectWithoutDescriptor(channel.get(), &rejected) &&
+           rejected.status == static_cast<std::uint16_t>(
+               ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                   kInvalidRequest) &&
+           rejected.flags == 0U && rejected.record_count == 0U &&
+           rejected.request_id == malformed.request_id &&
+           rejected.page_mapping_bytes == 0U &&
+           rejected.page_index == 0U &&
+           rejected.target_generation == 0U &&
+           rejected.next_read_token == 0U;
+}
+
 [[nodiscard]] bool SpawnPythonLatencyProbe(
     const std::filesystem::path& socket_path,
     std::uint32_t instrument_id,
@@ -1078,6 +1615,100 @@ SessionTransfer RequestSession(
     static_cast<void>(active_count);
     static_cast<void>(warmup);
     static_cast<void>(measured);
+    static_cast<void>(output);
+    return false;
+#endif
+}
+
+[[nodiscard]] bool SpawnPythonHistoryLatencyProbe(
+    const std::filesystem::path& socket_path,
+    PythonLatencyProcess* output) {
+#if defined(L2FLOW_V2_PYTHON_PROBE_EXECUTABLE) && \
+    defined(L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT) && \
+    defined(L2FLOW_V2_PYTHON_SOURCE) && \
+    defined(L2FLOW_V2_PYTHON_READER_LIBRARY)
+    if (output == nullptr) {
+        return false;
+    }
+    std::array<int, 2U> sockets{-1, -1};
+    if (::socketpair(
+            AF_UNIX,
+            SOCK_STREAM | SOCK_CLOEXEC,
+            0,
+            sockets.data()) != 0) {
+        return false;
+    }
+    UniqueFd parent_socket(sockets[0U]);
+    UniqueFd child_socket(sockets[1U]);
+    std::array<std::string, 6U> arguments{{
+        L2FLOW_V2_PYTHON_PROBE_EXECUTABLE,
+        "-B",
+        L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT,
+        socket_path.string(),
+        L2FLOW_V2_PYTHON_READER_LIBRARY,
+        L2FLOW_V2_PYTHON_SOURCE,
+    }};
+    std::array<char*, 7U> argv{};
+    for (std::size_t index = 0U; index < arguments.size(); ++index) {
+        argv[index] = arguments[index].data();
+    }
+
+    posix_spawn_file_actions_t actions{};
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        return false;
+    }
+    bool actions_valid = true;
+    actions_valid =
+        actions_valid &&
+        ::posix_spawn_file_actions_adddup2(
+            &actions, child_socket.get(), STDIN_FILENO) == 0;
+    actions_valid =
+        actions_valid &&
+        ::posix_spawn_file_actions_adddup2(
+            &actions, child_socket.get(), STDOUT_FILENO) == 0;
+    actions_valid =
+        actions_valid &&
+        ::posix_spawn_file_actions_addclose(
+            &actions, parent_socket.get()) == 0;
+    if (child_socket.get() != STDIN_FILENO &&
+        child_socket.get() != STDOUT_FILENO) {
+        actions_valid =
+            actions_valid &&
+            ::posix_spawn_file_actions_addclose(
+                &actions, child_socket.get()) == 0;
+    }
+    pid_t child = -1;
+    const int spawn_error =
+        actions_valid
+            ? ::posix_spawn(
+                  &child,
+                  argv[0U],
+                  &actions,
+                  nullptr,
+                  argv.data(),
+                  environ)
+            : EINVAL;
+    static_cast<void>(
+        ::posix_spawn_file_actions_destroy(&actions));
+    if (spawn_error != 0 || child <= 0) {
+        return false;
+    }
+    child_socket.Reset();
+    const int channel_fd = ::dup(parent_socket.get());
+    if (channel_fd < 0) {
+        static_cast<void>(::kill(child, SIGKILL));
+        int status = 0;
+        while (::waitpid(child, &status, 0) < 0 &&
+               errno == EINTR) {
+        }
+        return false;
+    }
+    output->Adopt(
+        child,
+        std::make_unique<ProtocolChannel>(channel_fd));
+    return true;
+#else
+    static_cast<void>(socket_path);
     static_cast<void>(output);
     return false;
 #endif
@@ -1303,6 +1934,88 @@ bool RunPythonKnownIdProbe(
 #endif
 }
 
+bool RunPythonHistoryDeltaSmoke(
+    const std::filesystem::path& socket_path,
+    std::uint64_t generation,
+    std::uint64_t history_records,
+    bool include_delta) {
+#if defined(L2FLOW_V2_PYTHON_PROBE_EXECUTABLE) && \
+    defined(L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT) && \
+    defined(L2FLOW_V2_PYTHON_SOURCE) && \
+    defined(L2FLOW_V2_PYTHON_READER_LIBRARY)
+    PythonLatencyProcess stream_python;
+    const bool spawned =
+        SpawnPythonHistoryLatencyProbe(
+            socket_path, &stream_python) &&
+        stream_python.channel() != nullptr;
+    if (!Expect(
+            spawned,
+            "spawn native Wire V2 history/delta Python smoke probe")) {
+        return false;
+    }
+    ProtocolChannel* const stream_protocol =
+        stream_python.channel();
+    std::string stream_line;
+    if (!Expect(
+            stream_protocol->ReadLine(
+                std::chrono::seconds(30), &stream_line) &&
+                stream_line.starts_with("READY "),
+            "Python history/delta smoke probe opens Wire V2")) {
+        return false;
+    }
+    PythonHistoryCommandResult history_result{};
+    PythonHistoryCommandResult delta_result{};
+    const std::string history_command =
+        "HISTORY 1 " + std::to_string(generation) +
+        " price 1 " + std::to_string(history_records);
+    if (!Expect(
+            RunPythonHistoryCommand(
+                stream_protocol,
+                history_command,
+                "HISTORY_SAMPLE",
+                1U,
+                history_records,
+                &history_result),
+            history_records == 0U
+                ? "Python reaches explicit EOF for bound no-data history"
+                : "Python reaches explicit EOF for three-record history")) {
+        return false;
+    }
+    const std::string delta_command =
+        "DELTA_ORIGIN 1 " + std::to_string(generation) +
+        " price 1 1";
+    if (include_delta &&
+        !Expect(
+            RunPythonHistoryCommand(
+                stream_protocol,
+                delta_command,
+                "DELTA_SAMPLE",
+                1U,
+                1U,
+                &delta_result) &&
+                delta_result.checkpoint_access_ns.size() == 1U,
+            "Python returns the tick checkpoint only after delta EOF")) {
+        return false;
+    }
+    if (!Expect(
+            stream_protocol->SendLine("QUIT") &&
+                stream_protocol->ReadLine(
+                    std::chrono::seconds(30), &stream_line) &&
+                stream_line.starts_with("BYE ") &&
+                stream_python.Wait(std::chrono::seconds(30)),
+            "Python history/delta smoke probe exits cleanly")) {
+        return false;
+    }
+    return true;
+#else
+    static_cast<void>(socket_path);
+    static_cast<void>(generation);
+    static_cast<void>(history_records);
+    static_cast<void>(include_delta);
+    return true;
+#endif
+}
+
 bool TestServiceEndToEnd() {
     ScopedTempDirectory temporary;
     auto directory = MakeDirectory(4U, kSessionEpoch);
@@ -1356,7 +2069,7 @@ bool TestServiceEndToEnd() {
                 static_cast<std::uint16_t>(
                     ipc::RealtimeControlStatusV2::kInvalidRequest) &&
             invalid.fd.get() < 0,
-        "control plane exposes only GET_SESSION");
+        "malformed history OPEN using the GET_SESSION shape is rejected");
 
     SessionTransfer transfer = RequestSession(socket_path);
     ok &= Expect(
@@ -1472,6 +2185,70 @@ bool TestServiceEndToEnd() {
         return false;
     }
 
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        catalog;
+    ok &= Expect(
+        directory->AcquireSnapshot(&catalog) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            catalog != nullptr,
+        "capture bound no-data catalog snapshot");
+    const std::array<market::RealtimeSourceWatermarkV1, 4U>
+        empty_sources{{
+            {11U, 1U},
+            {12U, 1U},
+            {13U, 1U},
+            {14U, 1U},
+        }};
+    market::RealtimeHistoryWatermarkV1 empty_watermark{};
+    ok &= Expect(
+        market::BuildRealtimeHistoryWatermarkV1(
+            run_id,
+            1U,
+            kTradeDate,
+            1U,
+            40'000U,
+            catalog,
+            realtime::ProcessingProgressV2{},
+            empty_sources,
+            &empty_watermark) ==
+            market::RealtimeHistoryWatermarkErrorV1::kNone,
+        "build bound no-data generation watermark");
+    ok &= Expect(
+        runtime->BeginGeneration(empty_watermark) ==
+            market::RealtimeHistoryGenerationErrorV1::kNone,
+        "begin bound no-data generation");
+    for (std::uint8_t source = 0U; source < 4U; ++source) {
+        ok &= Expect(
+            runtime->SealSource(source, 1U) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "seal bound no-data generation source");
+    }
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        empty_store_generation;
+    std::shared_ptr<const market::RealtimeKLineGenerationV1>
+        empty_kline_generation;
+    ok &= Expect(
+        runtime->WaitForGeneration(
+            1U,
+            std::chrono::seconds(3),
+            &empty_store_generation,
+            &empty_kline_generation) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone &&
+            empty_store_generation != nullptr &&
+            empty_kline_generation != nullptr,
+        "build bound no-data immutable generation");
+    ok &= Expect(
+        empty_kline_generation != nullptr &&
+            service->PublishKLineGeneration(
+                *empty_kline_generation) &&
+            service->PublishStoreGeneration(
+                empty_store_generation),
+        "publish bound no-data generation");
+    ok &= RunPythonHistoryDeltaSmoke(
+        socket_path, 1U, 0U, false);
+
     ok &= Expect(
         Submit(runtime.get(), SnapshotInput(1U, 1U)) &&
             Submit(runtime.get(), SnapshotInput(2U, 2U)) &&
@@ -1493,9 +2270,6 @@ bool TestServiceEndToEnd() {
         }),
         "history applies availability to the directory");
 
-    std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
-        catalog;
     ok &= Expect(
         directory->AcquireSnapshot(&catalog) ==
                 market::ObservedInstrumentDirectoryErrorV2::kNone &&
@@ -1512,7 +2286,7 @@ bool TestServiceEndToEnd() {
     ok &= Expect(
         market::BuildRealtimeHistoryWatermarkV1(
             run_id,
-            1U,
+            2U,
             kTradeDate,
             4U,
             50'000U,
@@ -1528,7 +2302,7 @@ bool TestServiceEndToEnd() {
         "begin KLine generation");
     for (std::uint8_t source = 0U; source < 4U; ++source) {
         ok &= Expect(
-            runtime->SealSource(source, 1U) ==
+            runtime->SealSource(source, 2U) ==
                 market::RealtimeHistoryGenerationErrorV1::kNone,
             "seal generation source");
     }
@@ -1539,7 +2313,7 @@ bool TestServiceEndToEnd() {
         kline_generation;
     ok &= Expect(
         runtime->WaitForGeneration(
-            1U,
+            2U,
             std::chrono::seconds(3),
             &store_generation,
             &kline_generation) ==
@@ -1551,6 +2325,17 @@ bool TestServiceEndToEnd() {
         kline_generation != nullptr &&
             service->PublishKLineGeneration(*kline_generation),
         "publish KLine table before generation pointer");
+    ok &= Expect(
+        service->PublishStoreGeneration(store_generation),
+        "publish exact immutable Store generation for V2 history");
+    ok &= Expect(
+        CheckCanonicalHistoryReadErrorFrame(socket_path, 2U),
+        "history READ error frame zeros every success-only field");
+    ok &= Expect(
+        CheckCanonicalDeltaReadErrorFrame(socket_path, 2U),
+        "delta READ error frame zeros every success-only field");
+    ok &= RunPythonHistoryDeltaSmoke(
+        socket_path, 2U, 3U, true);
 
     ok &= Expect(
         service->PublishProcessingProgress({10U, 7U, 9U}) &&
@@ -1570,7 +2355,7 @@ bool TestServiceEndToEnd() {
             session.applied_sequence == 9U &&
             session.processing_lag_records == 1U &&
             session.durability_lag_records == 2U &&
-            session.kline_generation == 1U &&
+            session.kline_generation == 2U &&
             service->key_arena_used_bytes() ==
                 used_after_binding,
         "counts/progress satisfy one coherent header envelope");
@@ -1653,7 +2438,7 @@ bool TestServiceEndToEnd() {
             sizeof(latest_kline),
             &item_status) == L2FLOW_SHM_READER_OK_V2 &&
             item_status == L2FLOW_LATEST_AVAILABLE_V2 &&
-            latest_kline.generation == 1U &&
+            latest_kline.generation == 2U &&
             latest_kline.instrument_id == 1U &&
             latest_kline.present == 1U,
         "Reader observes published KLine from active table");
@@ -1832,6 +2617,7 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
     pipeline_config.applied_record_sink = service;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
+    pipeline_config.store_generation_sink = service;
     pipeline_config.sdk.enabled = false;
 
     ok &= Expect(
@@ -2277,6 +3063,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     pipeline_config.applied_record_sink = timed_sink;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
+    pipeline_config.store_generation_sink = service;
     pipeline_config.measure_stage_latency =
         measure_stage_latency;
     pipeline_config.sdk.enabled = true;
@@ -3167,6 +3954,1132 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     return ok;
 }
 
+bool RunHistoryLatencyBenchmark() {
+    constexpr std::size_t kCapacity = 65'536U;
+    constexpr std::size_t kBoundInstrumentCount = 60'000U;
+    constexpr std::size_t kSnapshotFillCount =
+        kBoundInstrumentCount - 1U;
+    constexpr std::size_t kQueueCapacity = 8'192U;
+    constexpr std::size_t kFillBatch = 512U;
+    constexpr std::size_t kMaximumSequence = 250'000U;
+    constexpr std::uint64_t kTickRingCapacity = 262'144U;
+    constexpr std::uint32_t kStoreWorkerCount = 4U;
+    constexpr std::uint32_t kPureTickInstrument =
+        static_cast<std::uint32_t>(kBoundInstrumentCount);
+    constexpr std::uint32_t kMixedInstrument = 1U;
+    constexpr std::size_t kPriceRepeats = 20U;
+    constexpr std::size_t kAllColumnRepeats = 10U;
+
+    std::cout
+        << "HISTORY_ENV capacity=" << kCapacity
+        << " bound_instruments=" << kBoundInstrumentCount
+        << " snapshot_fill=" << kSnapshotFillCount
+        << " worker_count=" << kStoreWorkerCount
+        << " processing_queue=" << kQueueCapacity
+        << " journal_queue=" << kQueueCapacity
+        << " tick_ring_capacity=" << kTickRingCapacity
+        << " requested_page_records=4096"
+        << " price_repeats=" << kPriceRepeats
+        << " all_column_repeats=" << kAllColumnRepeats
+        << " clock=CLOCK_MONOTONIC"
+        << " affinity=" << CpuAffinityText() << '\n';
+
+    ScopedTempDirectory temporary;
+    auto directory = MakeDirectory(kCapacity, 67U);
+    if (!Expect(
+            temporary.valid() && directory != nullptr,
+            "create history latency fixture")) {
+        return false;
+    }
+    const common::Identity128 run_id = RunId(0x67U);
+    const std::filesystem::path socket_path =
+        temporary.path() / "history-latency.sock";
+    const std::filesystem::path journal_path =
+        temporary.path() / "history-latency.journal";
+    HistoryStageCollector history_stages;
+
+    ipc::RealtimeSharedServiceConfigV2 service_config{};
+    service_config.run_id = run_id;
+    service_config.session_epoch = 67U;
+    service_config.trade_date = kTradeDate;
+    service_config.directory = directory.get();
+    service_config.tick_ring_capacity = kTickRingCapacity;
+    service_config.maximum_history_readers = 8U;
+    service_config.maximum_history_page_records = 4'096U;
+    service_config.history_stage_observer = &history_stages;
+    service_config.control_socket_path = socket_path;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    const auto service_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            service_config, &service, &system_error);
+    if (!Expect(
+            service_error ==
+                    ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+                service != nullptr && system_error == 0,
+            "create history Wire V2 service") ||
+        !Expect(
+            service->Start(&system_error) && system_error == 0,
+            "start history Wire V2 service")) {
+        if (service != nullptr) {
+            service->StopControl();
+        }
+        return false;
+    }
+
+    auto timed_applied = std::make_shared<TimedAppliedSink>(
+        service, kMaximumSequence);
+    auto sdk_state = std::make_shared<LatencySdkState>();
+    auto sdk_factory =
+        std::make_shared<LatencySdkFactory>(sdk_state);
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    PipelineJournalCleanup pipeline_cleanup(nullptr, &pipeline);
+    runtime::RealtimePipelineConfigV1 pipeline_config{};
+    pipeline_config.run_id = run_id;
+    pipeline_config.trade_date = kTradeDate;
+    pipeline_config.directory = directory.get();
+    pipeline_config.source_stream_ids = kSourceStreamIds;
+    pipeline_config.maximum_sdk_message_bytes = 4'096U;
+    pipeline_config.processing_queue_capacity = kQueueCapacity;
+    pipeline_config.decoder_queue_capacity_per_source =
+        kQueueCapacity;
+    pipeline_config.store_worker_count = kStoreWorkerCount;
+    pipeline_config.store_queue_capacity_per_source_worker =
+        kQueueCapacity;
+    pipeline_config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    pipeline_config.intraday_store.maximum_session_records =
+        kMaximumSequence;
+    pipeline_config.intraday_store.maximum_session_accounted_bytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
+    pipeline_config.intraday_store.maximum_records_per_batch =
+        kQueueCapacity;
+    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.journal.path = journal_path.string();
+    pipeline_config.journal.queue_capacity = kQueueCapacity;
+    pipeline_config.applied_record_sink = timed_applied;
+    pipeline_config.instrument_binding_sink = service;
+    pipeline_config.processing_progress_sink = service;
+    pipeline_config.store_generation_sink = service;
+    pipeline_config.sdk.enabled = true;
+    pipeline_config.sdk.server_address = "history-latency.invalid";
+    pipeline_config.sdk.user_name = "history-latency";
+
+    std::string pipeline_detail;
+    const auto pipeline_error =
+        runtime::RealtimePipelineV1::CreateForTest(
+            pipeline_config,
+            sdk_factory,
+            &pipeline,
+            &pipeline_detail);
+    if (!Expect(
+            pipeline_error ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "create history latency Pipeline: " +
+                pipeline_detail)) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    mdl::MessageHandlerBase* const handler = sdk_state->handler();
+    if (!Expect(
+            handler != nullptr,
+            "history latency SDK callback installed")) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    auto wait_prefix =
+        [&](std::uint64_t sequence, bool require_durable) {
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(60);
+            while (std::chrono::steady_clock::now() < deadline) {
+                const runtime::RealtimePipelineSnapshotV1 state =
+                    pipeline->Snapshot();
+                if (state.fatal || pipeline->fatal()) {
+                    return false;
+                }
+                if (state.accepted_messages == sequence &&
+                    state.processing_progress.accepted_sequence ==
+                        sequence &&
+                    state.processing_progress.applied_sequence ==
+                        sequence &&
+                    (!require_durable ||
+                     state.processing_progress.durable_sequence ==
+                         sequence)) {
+                    return true;
+                }
+                std::this_thread::yield();
+            }
+            return false;
+        };
+
+    std::uint64_t next_sequence = 1U;
+    for (std::uint32_t first = 1U;
+         first <= kSnapshotFillCount;
+         first += static_cast<std::uint32_t>(kFillBatch)) {
+        const std::uint32_t last =
+            std::min<std::uint32_t>(
+                static_cast<std::uint32_t>(kSnapshotFillCount),
+                first + static_cast<std::uint32_t>(kFillBatch) - 1U);
+        for (std::uint32_t id = first; id <= last; ++id) {
+            FakeSdkMessage snapshot(
+                sdk::kProductionMessageKeysV1[2U],
+                PipelineShenzhenSnapshotBody(
+                    SixDigitSecurityId(id)));
+            handler->OnMessage(nullptr, &snapshot);
+            ++next_sequence;
+        }
+        if (!Expect(
+                wait_prefix(next_sequence - 1U, true),
+                "fill 59,999 observed snapshots")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
+    std::cout
+        << "HISTORY_FILL records=" << (next_sequence - 1U)
+        << " bound_count=" << kSnapshotFillCount << '\n';
+
+    FakeSdkMessage shanghai_tick(
+        sdk::kProductionMessageKeysV1[1U],
+        PipelineShanghaiTickBody());
+    FakeSdkMessage shenzhen_order(
+        sdk::kProductionMessageKeysV1[3U],
+        PipelineShenzhenOrderBody());
+
+    struct CallbackBoundary final {
+        std::uint64_t sequence = 0U;
+        std::uint64_t callback_start_ns = 0U;
+        std::uint64_t callback_return_ns = 0U;
+        std::uint64_t wire_recv_ns = 0U;
+        std::uint64_t ipc_begin_ns = 0U;
+        std::uint64_t ipc_return_ns = 0U;
+        std::uint64_t applied_observed_ns = 0U;
+    };
+    auto append_until =
+        [&](FakeSdkMessage* message,
+            std::uint64_t* current_count,
+            std::uint64_t target_count,
+            CallbackBoundary* boundary) {
+            if (message == nullptr || current_count == nullptr ||
+                boundary == nullptr ||
+                target_count <= *current_count) {
+                return false;
+            }
+            while (*current_count + 1U < target_count) {
+                handler->OnMessage(nullptr, message);
+                ++*current_count;
+                ++next_sequence;
+                if ((*current_count % kFillBatch) == 0U &&
+                    !wait_prefix(next_sequence - 1U, true)) {
+                    const auto state = pipeline->Snapshot();
+                    std::cerr
+                        << "append wait failed target_count="
+                        << target_count
+                        << " current_count=" << *current_count
+                        << " expected_sequence="
+                        << (next_sequence - 1U)
+                        << " accepted=" << state.accepted_messages
+                        << " decoded=" << state.decoded_messages
+                        << " rejected=" << state.rejected_messages
+                        << " applied="
+                        << state.processing_progress.applied_sequence
+                        << " durable="
+                        << state.processing_progress.durable_sequence
+                        << " journal_failure="
+                        << static_cast<unsigned int>(
+                               state.journal.failure_kind)
+                        << " decode_error="
+                        << static_cast<unsigned int>(
+                               state.last_decode_error)
+                        << " store_records="
+                        << state.store.appended_records
+                        << " store_bytes="
+                        << state.store.accounted_record_bytes
+                        << " store_failed="
+                        << state.store.failed_appends
+                        << " store_coverage_lost="
+                        << state.store.coverage_lost
+                        << " fatal=" << state.fatal << '\n';
+                    return false;
+                }
+            }
+            if (next_sequence > 1U &&
+                !wait_prefix(next_sequence - 1U, true)) {
+                const auto state = pipeline->Snapshot();
+                std::cerr
+                    << "append pre-final wait failed target_count="
+                    << target_count
+                    << " current_count=" << *current_count
+                    << " expected_sequence="
+                    << (next_sequence - 1U)
+                    << " accepted=" << state.accepted_messages
+                    << " applied="
+                    << state.processing_progress.applied_sequence
+                    << " durable="
+                    << state.processing_progress.durable_sequence
+                    << " fatal=" << state.fatal << '\n';
+                return false;
+            }
+            boundary->sequence = next_sequence;
+            boundary->callback_start_ns = MonotonicNowNs();
+            handler->OnMessage(nullptr, message);
+            boundary->callback_return_ns = MonotonicNowNs();
+            ++*current_count;
+            ++next_sequence;
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(30);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (timed_applied->Read(
+                        boundary->sequence,
+                        &boundary->wire_recv_ns,
+                        &boundary->ipc_begin_ns,
+                        &boundary->ipc_return_ns)) {
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            const auto applied_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(30);
+            while (std::chrono::steady_clock::now() <
+                   applied_deadline) {
+                const runtime::RealtimePipelineSnapshotV1 state =
+                    pipeline->Snapshot();
+                if (state.fatal || pipeline->fatal()) {
+                    break;
+                }
+                if (state.processing_progress.applied_sequence >=
+                    boundary->sequence) {
+                    boundary->applied_observed_ns =
+                        MonotonicNowNs();
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            return boundary->callback_start_ns != 0U &&
+                   boundary->callback_return_ns >=
+                       boundary->callback_start_ns &&
+                   boundary->wire_recv_ns >=
+                       boundary->callback_start_ns &&
+                   boundary->ipc_begin_ns >=
+                       boundary->wire_recv_ns &&
+                   boundary->ipc_return_ns >=
+                       boundary->ipc_begin_ns &&
+                   boundary->applied_observed_ns >=
+                       boundary->ipc_return_ns;
+        };
+
+    PythonLatencyProcess python;
+    ProtocolChannel* protocol = nullptr;
+    auto ensure_python = [&] {
+        if (protocol != nullptr) {
+            return true;
+        }
+        if (!SpawnPythonHistoryLatencyProbe(
+                socket_path, &python) ||
+            python.channel() == nullptr) {
+            return false;
+        }
+        protocol = python.channel();
+        std::string line;
+        if (!protocol->ReadLine(
+                std::chrono::seconds(30), &line) ||
+            !line.starts_with("READY ")) {
+            std::cerr << "history probe startup: " << line << '\n';
+            return false;
+        }
+        std::cout << "PYTHON_" << line << '\n';
+        return true;
+    };
+    if (!Expect(
+            ensure_python(),
+            "prestart Python history probe before measured t0")) {
+        return false;
+    }
+
+    auto print_python_distribution =
+        [](std::string_view workload,
+           const PythonHistoryCommandResult& result,
+           std::uint64_t records) {
+            const std::string prefix =
+                std::string(workload) + "_";
+            if (!result.session_open_ns.empty()) {
+                PrintLatency(
+                    prefix + "python_session_open",
+                    result.session_open_ns);
+            }
+            PrintLatency(
+                prefix + "python_cursor_open",
+                result.cursor_open_ns);
+            PrintLatency(
+                prefix + "python_scan_to_explicit_eof",
+                result.scan_ns);
+            PrintLatency(
+                prefix +
+                    "python_open_return_to_complete_consumption",
+                result.open_return_to_complete_ns);
+            if (!result.checkpoint_access_ns.empty()) {
+                PrintLatency(
+                    prefix +
+                        "verified_checkpoint_property_access",
+                    result.checkpoint_access_ns);
+            }
+            const LatencySummary scan =
+                SummarizeLatency(result.scan_ns);
+            const long double records_per_second =
+                scan.mean_ns == 0U
+                    ? 0.0L
+                    : static_cast<long double>(records) *
+                          1'000'000'000.0L /
+                          static_cast<long double>(scan.mean_ns);
+            std::cout
+                << "PYTHON_THROUGHPUT workload=" << workload
+                << " records_per_scan=" << records
+                << " mean_records_per_second=" << std::fixed
+                << std::setprecision(3) << records_per_second
+                << std::defaultfloat << '\n';
+        };
+
+    auto cut_and_run_history =
+        [&](std::string_view workload,
+            std::uint32_t instrument_id,
+            std::uint64_t expected_records,
+            const CallbackBoundary& boundary) {
+            const auto cut_start = MonotonicNowNs();
+            const runtime::RealtimePipelineCutResultV1 cut =
+                pipeline->CutAndPublishGeneration(
+                    std::chrono::seconds(60));
+            const auto cut_return = MonotonicNowNs();
+            if (!Expect(
+                    cut.published() &&
+                        cut.store_generation != nullptr,
+                    "publish history generation for " +
+                        std::string(workload))) {
+                return false;
+            }
+            const std::uint64_t generation =
+                cut.store_generation->watermark().generation;
+            PythonHistoryCommandResult price{};
+            history_stages.Clear();
+            const std::string price_command =
+                "HISTORY " + std::to_string(instrument_id) + " " +
+                std::to_string(generation) + " price " +
+                std::to_string(kPriceRepeats) + " " +
+                std::to_string(expected_records);
+            if (!RunPythonHistoryCommand(
+                    protocol,
+                    price_command,
+                    "HISTORY_SAMPLE",
+                    kPriceRepeats,
+                    expected_records,
+                    &price)) {
+                return false;
+            }
+            PrintHistoryPageStages(
+                std::string(workload) + "_price",
+                history_stages.Take());
+            print_python_distribution(
+                std::string(workload) + "_price",
+                price,
+                expected_records);
+            if (!Expect(
+                    price.published_ns >=
+                            boundary.applied_observed_ns &&
+                        price.first_open_start_ns >=
+                            price.published_ns &&
+                        price.first_complete_ns >=
+                            price.first_open_return_ns &&
+                        boundary.applied_observed_ns >=
+                            boundary.ipc_return_ns &&
+                        boundary.ipc_return_ns >=
+                            boundary.callback_start_ns,
+                    "history t0..t4 timestamps are monotonic")) {
+                return false;
+            }
+            std::cout
+                << "HISTORY_BOUNDARY workload=" << workload
+                << " generation=" << generation
+                << " records=" << expected_records
+                << " t0_callback_start_ns="
+                << boundary.callback_start_ns
+                << " t0_kind=caller_side_before_OnMessage"
+                << " callback_return_ns="
+                << boundary.callback_return_ns
+                << " t1_applied_observed_ns="
+                << boundary.applied_observed_ns
+                << " t1_kind=applied_observation_upper_bound"
+                << " store_ipc_visible_ns="
+                << boundary.ipc_return_ns
+                << " cut_call_start_ns=" << cut_start
+                << " t2_generation_published_ns="
+                << price.published_ns
+                << " t2_kind=pre_release_publication_mark"
+                << " cut_call_return_ns=" << cut_return
+                << " t3_python_open_return_ns="
+                << price.first_open_return_ns
+                << " t4_eof_columns_complete_ns="
+                << price.first_complete_ns
+                << " realtime_processing_ns="
+                << (boundary.applied_observed_ns -
+                    boundary.callback_start_ns)
+                << " realtime_ipc_visibility_ns="
+                << (boundary.ipc_return_ns -
+                    boundary.callback_start_ns)
+                << " generation_publish_wait_ns="
+                << (price.published_ns -
+                    boundary.applied_observed_ns)
+                << " publication_to_open_call_ns="
+                << (price.first_open_start_ns -
+                    price.published_ns)
+                << " publication_to_open_return_ns="
+                << (price.first_open_return_ns -
+                    price.published_ns)
+                << " first_complete_scan_ns="
+                << (price.first_complete_ns -
+                    price.first_scan_start_ns)
+                << " open_return_to_complete_consumption_ns="
+                << (price.first_complete_ns -
+                    price.first_open_return_ns)
+                << " end_to_end_complete_ns="
+                << (price.first_complete_ns -
+                    boundary.callback_start_ns)
+                << '\n';
+
+            PythonHistoryCommandResult all{};
+            history_stages.Clear();
+            const std::string all_command =
+                "HISTORY " + std::to_string(instrument_id) + " " +
+                std::to_string(generation) + " all " +
+                std::to_string(kAllColumnRepeats) + " " +
+                std::to_string(expected_records);
+            if (!RunPythonHistoryCommand(
+                    protocol,
+                    all_command,
+                    "HISTORY_SAMPLE",
+                    kAllColumnRepeats,
+                    expected_records,
+                    &all)) {
+                return false;
+            }
+            PrintHistoryPageStages(
+                std::string(workload) + "_all",
+                history_stages.Take());
+            print_python_distribution(
+                std::string(workload) + "_all",
+                all,
+                expected_records);
+            return !history_stages.failed();
+        };
+
+    std::uint64_t pure_tick_count = 0U;
+    CallbackBoundary pure_1k{};
+    if (!Expect(
+            append_until(
+                &shanghai_tick,
+                &pure_tick_count,
+                1'000U,
+                &pure_1k),
+            "append pure tick history to 1k") ||
+        !cut_and_run_history(
+            "pure_tick_1k",
+            kPureTickInstrument,
+            1'000U,
+            pure_1k)) {
+        return false;
+    }
+    CallbackBoundary pure_10k{};
+    if (!Expect(
+            append_until(
+                &shanghai_tick,
+                &pure_tick_count,
+                10'000U,
+                &pure_10k),
+            "append pure tick history to 10k") ||
+        !cut_and_run_history(
+            "pure_tick_10k",
+            kPureTickInstrument,
+            10'000U,
+            pure_10k)) {
+        return false;
+    }
+    CallbackBoundary pure_65536{};
+    if (!Expect(
+            append_until(
+                &shanghai_tick,
+                &pure_tick_count,
+                65'536U,
+                &pure_65536),
+            "append pure tick history to 65,536") ||
+        !cut_and_run_history(
+            "pure_tick_65536",
+            kPureTickInstrument,
+            65'536U,
+            pure_65536)) {
+        return false;
+    }
+
+    const std::uint64_t generation_65536 =
+        pipeline->Snapshot().last_published_generation;
+    PythonHistoryCommandResult delta_origin{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "DELTA_ORIGIN " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(generation_65536) + " price " +
+                std::to_string(kPriceRepeats) + " 65536",
+            "DELTA_SAMPLE",
+            kPriceRepeats,
+            65'536U,
+            &delta_origin)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "delta_origin_65536_price",
+        history_stages.Take());
+    print_python_distribution(
+        "delta_origin_65536_price",
+        delta_origin,
+        65'536U);
+
+    auto cut_without_history =
+        [&](std::uint64_t target_tick_count,
+            CallbackBoundary* boundary,
+            std::uint64_t* generation) {
+            if (!append_until(
+                    &shanghai_tick,
+                    &pure_tick_count,
+                    target_tick_count,
+                    boundary)) {
+                return false;
+            }
+            const auto cut = pipeline->CutAndPublishGeneration(
+                std::chrono::seconds(60));
+            if (!cut.published() ||
+                cut.store_generation == nullptr) {
+                const auto state = pipeline->Snapshot();
+                std::cerr
+                    << "delta cut failed target_tick_count="
+                    << target_tick_count
+                    << " cut_error="
+                    << runtime::RealtimePipelineCutErrorNameV1(
+                           cut.error)
+                    << " generation_error="
+                    << static_cast<unsigned int>(
+                           cut.generation_error)
+                    << " accepted=" << state.accepted_messages
+                    << " applied="
+                    << state.processing_progress.applied_sequence
+                    << " durable="
+                    << state.processing_progress.durable_sequence
+                    << " last_started="
+                    << state.last_started_generation
+                    << " last_published="
+                    << state.last_published_generation
+                    << " service_failed=" << service->failed()
+                    << " fatal=" << state.fatal << '\n';
+                return false;
+            }
+            *generation =
+                cut.store_generation->watermark().generation;
+            return true;
+        };
+    CallbackBoundary delta_price_boundary{};
+    std::uint64_t delta_price_generation = 0U;
+    if (!Expect(
+            cut_without_history(
+                69'632U,
+                &delta_price_boundary,
+                &delta_price_generation),
+            "publish 4,096-record verified delta target")) {
+        return false;
+    }
+    PythonHistoryCommandResult delta_price{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "DELTA_FROM_VERIFIED " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(delta_price_generation) +
+                " price " + std::to_string(kPriceRepeats) +
+                " 4096",
+            "DELTA_SAMPLE",
+            kPriceRepeats,
+            4'096U,
+            &delta_price)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "delta_verified_4096_price",
+        history_stages.Take());
+    print_python_distribution(
+        "delta_verified_4096_price",
+        delta_price,
+        4'096U);
+    std::cout
+        << "DELTA_BOUNDARY workload=verified_4096_price"
+        << " generation=" << delta_price_generation
+        << " realtime_processing_ns="
+        << (delta_price_boundary.applied_observed_ns -
+            delta_price_boundary.callback_start_ns)
+        << " realtime_ipc_visibility_ns="
+        << (delta_price_boundary.ipc_return_ns -
+            delta_price_boundary.callback_start_ns)
+        << " generation_publish_wait_ns="
+        << (delta_price.published_ns -
+            delta_price_boundary.applied_observed_ns)
+        << " t3_delta_session_open_return_ns="
+        << delta_price.first_open_return_ns
+        << " t3_delta_cursor_open_return_ns="
+        << delta_price.first_cursor_open_return_ns
+        << " publication_to_verified_checkpoint_ns="
+        << (delta_price.first_complete_ns -
+            delta_price.published_ns)
+        << " cursor_open_return_to_verified_checkpoint_ns="
+        << (delta_price.first_complete_ns -
+            delta_price.first_cursor_open_return_ns)
+        << " end_to_end_verified_checkpoint_ns="
+        << (delta_price.first_complete_ns -
+            delta_price_boundary.callback_start_ns)
+        << '\n';
+
+    CallbackBoundary delta_all_boundary{};
+    std::uint64_t delta_all_generation = 0U;
+    if (!Expect(
+            cut_without_history(
+                73'728U,
+                &delta_all_boundary,
+                &delta_all_generation),
+            "publish second 4,096-record delta target")) {
+        return false;
+    }
+    PythonHistoryCommandResult delta_all{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "DELTA_FROM_VERIFIED " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(delta_all_generation) +
+                " all " + std::to_string(kAllColumnRepeats) +
+                " 4096",
+            "DELTA_SAMPLE",
+            kAllColumnRepeats,
+            4'096U,
+            &delta_all)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "delta_verified_4096_all",
+        history_stages.Take());
+    print_python_distribution(
+        "delta_verified_4096_all",
+        delta_all,
+        4'096U);
+
+    std::uint64_t mixed_tick_count = 0U;
+    CallbackBoundary mixed_boundary{};
+    if (!Expect(
+            append_until(
+                &shenzhen_order,
+                &mixed_tick_count,
+                65'535U,
+                &mixed_boundary),
+            "append mixed snapshot/tick history")) {
+        return false;
+    }
+    const auto mixed_cut = pipeline->CutAndPublishGeneration(
+        std::chrono::seconds(60));
+    if (!Expect(
+            mixed_cut.published() &&
+                mixed_cut.store_generation != nullptr,
+            "publish mixed history generation")) {
+        return false;
+    }
+    const std::uint64_t mixed_generation =
+        mixed_cut.store_generation->watermark().generation;
+    PythonHistoryCommandResult mixed_price{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "HISTORY " + std::to_string(kMixedInstrument) + " " +
+                std::to_string(mixed_generation) + " price " +
+                std::to_string(kPriceRepeats) + " 65536",
+            "HISTORY_SAMPLE",
+            kPriceRepeats,
+            65'536U,
+            &mixed_price)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "mixed_65536_price",
+        history_stages.Take());
+    print_python_distribution(
+        "mixed_65536_price",
+        mixed_price,
+        65'536U);
+    std::cout
+        << "HISTORY_BOUNDARY workload=mixed_65536"
+        << " generation=" << mixed_generation
+        << " records=65536 snapshots=1 ticks=65535"
+        << " realtime_processing_ns="
+        << (mixed_boundary.applied_observed_ns -
+            mixed_boundary.callback_start_ns)
+        << " realtime_ipc_visibility_ns="
+        << (mixed_boundary.ipc_return_ns -
+            mixed_boundary.callback_start_ns)
+        << " generation_publish_wait_ns="
+        << (mixed_price.published_ns -
+            mixed_boundary.applied_observed_ns)
+        << " publication_to_open_return_ns="
+        << (mixed_price.first_open_return_ns -
+            mixed_price.published_ns)
+        << " complete_scan_ns="
+        << (mixed_price.first_complete_ns -
+            mixed_price.first_scan_start_ns)
+        << " open_return_to_complete_consumption_ns="
+        << (mixed_price.first_complete_ns -
+            mixed_price.first_open_return_ns)
+        << " end_to_end_complete_ns="
+        << (mixed_price.first_complete_ns -
+            mixed_boundary.callback_start_ns)
+        << '\n';
+    PythonHistoryCommandResult mixed_all{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "HISTORY " + std::to_string(kMixedInstrument) + " " +
+                std::to_string(mixed_generation) + " all " +
+                std::to_string(kAllColumnRepeats) + " 65536",
+            "HISTORY_SAMPLE",
+            kAllColumnRepeats,
+            65'536U,
+            &mixed_all)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "mixed_65536_all",
+        history_stages.Take());
+    print_python_distribution(
+        "mixed_65536_all",
+        mixed_all,
+        65'536U);
+
+    struct LatestSeriesResult final {
+        std::vector<std::uint64_t> strict_callback_to_python_ns;
+        std::vector<std::uint64_t> wire_recv_to_python_ns;
+        std::vector<std::uint64_t> callback_call_ns;
+        std::uint64_t polls = 0U;
+        std::uint64_t inconsistent_retries = 0U;
+    };
+    FakeSdkMessage live_snapshot(
+        sdk::kProductionMessageKeysV1[2U],
+        PipelineShenzhenSnapshotBody("000001"));
+    auto run_latest_series =
+        [&](std::string_view workload,
+            std::size_t count,
+            LatestSeriesResult* output) {
+            if (count == 0U || output == nullptr) {
+                return false;
+            }
+            const std::uint64_t first = next_sequence;
+            if (!protocol->SendLine(
+                    "LATEST_SERIES " +
+                    std::to_string(kMixedInstrument) + " " +
+                    std::to_string(first) + " " +
+                    std::to_string(count))) {
+                return false;
+            }
+            std::string response;
+            if (!protocol->ReadLine(
+                    std::chrono::seconds(30), &response) ||
+                !response.starts_with("LATEST_ARMED ")) {
+                std::cerr << "latest series arm: " << response
+                          << '\n';
+                return false;
+            }
+            std::cout << "PYTHON_" << response << '\n';
+            LatestSeriesResult result{};
+            result.strict_callback_to_python_ns.reserve(count);
+            result.wire_recv_to_python_ns.reserve(count);
+            result.callback_call_ns.reserve(count);
+            for (std::size_t index = 0U; index < count; ++index) {
+                const std::uint64_t expected = next_sequence;
+                const std::uint64_t start = MonotonicNowNs();
+                handler->OnMessage(nullptr, &live_snapshot);
+                const std::uint64_t returned = MonotonicNowNs();
+                ++next_sequence;
+                if (!protocol->ReadLine(
+                        std::chrono::seconds(30), &response) ||
+                    !response.starts_with("LATEST_SAMPLE ")) {
+                    std::cerr << "latest sample: " << response
+                              << '\n';
+                    return false;
+                }
+                std::uint64_t reported_expected = 0U;
+                std::uint64_t seen = 0U;
+                std::uint64_t recv = 0U;
+                std::uint64_t polls = 0U;
+                std::uint64_t inconsistent = 0U;
+                if (!ParseLineUnsignedField(
+                        response,
+                        "expected",
+                        &reported_expected) ||
+                    reported_expected != expected ||
+                    !ParseLineUnsignedField(
+                        response, "seen_ns", &seen) ||
+                    !ParseLineUnsignedField(
+                        response,
+                        "wire_recv_monotonic_ns",
+                        &recv) ||
+                    !ParseLineUnsignedField(
+                        response, "polls", &polls) ||
+                    !ParseLineUnsignedField(
+                        response,
+                        "inconsistent_retries",
+                        &inconsistent) ||
+                    start == 0U || returned < start ||
+                    recv < start || seen < recv) {
+                    std::cerr << "invalid latest sample: "
+                              << response << '\n';
+                    return false;
+                }
+                result.strict_callback_to_python_ns.push_back(
+                    seen - start);
+                result.wire_recv_to_python_ns.push_back(
+                    seen - recv);
+                result.callback_call_ns.push_back(returned - start);
+                result.polls += polls;
+                result.inconsistent_retries += inconsistent;
+            }
+            if (!protocol->ReadLine(
+                    std::chrono::seconds(30), &response) ||
+                !response.starts_with("DONE ")) {
+                std::cerr << "latest series DONE: " << response
+                          << '\n';
+                return false;
+            }
+            std::cout << "PYTHON_" << response << '\n';
+            PrintLatency(
+                std::string(workload) +
+                    "_strict_callback_to_python_latest",
+                result.strict_callback_to_python_ns);
+            PrintLatency(
+                std::string(workload) +
+                    "_wire_recv_to_python_latest",
+                result.wire_recv_to_python_ns);
+            PrintLatency(
+                std::string(workload) + "_callback_call",
+                result.callback_call_ns);
+            std::cout
+                << "LATEST_SERIES_TOTAL workload=" << workload
+                << " samples=" << count
+                << " total_polls=" << result.polls
+                << " inconsistent_retries="
+                << result.inconsistent_retries << '\n';
+            *output = std::move(result);
+            return true;
+        };
+
+    constexpr std::size_t kInterferenceSamples = 1'000U;
+    LatestSeriesResult latest_baseline{};
+    if (!run_latest_series(
+            "latest_baseline",
+            kInterferenceSamples,
+            &latest_baseline)) {
+        return false;
+    }
+
+    std::string line;
+    history_stages.Clear();
+    if (!protocol->SendLine(
+            "START_HISTORY_LOOP " +
+            std::to_string(kPureTickInstrument) + " " +
+            std::to_string(mixed_generation) +
+            " all 73728")) {
+        return false;
+    }
+    if (!protocol->ReadLine(
+            std::chrono::seconds(120), &line) ||
+        !line.starts_with("HISTORY_LOOP_STARTED ")) {
+        std::cerr << "history loop start: " << line << '\n';
+        return false;
+    }
+    std::cout << "PYTHON_" << line << '\n';
+    LatestSeriesResult latest_with_same_process_scan{};
+    if (!run_latest_series(
+            "latest_with_same_process_history_scan",
+            kInterferenceSamples,
+            &latest_with_same_process_scan)) {
+        return false;
+    }
+    if (!protocol->SendLine("STOP_HISTORY_LOOP") ||
+        !protocol->ReadLine(
+            std::chrono::seconds(120), &line) ||
+        !line.starts_with("HISTORY_LOOP_STOPPED ")) {
+        std::cerr << "history loop stop: " << line << '\n';
+        return false;
+    }
+    std::cout << "PYTHON_" << line << '\n';
+    PrintHistoryPageStages(
+        "same_process_concurrent_scan_loop",
+        history_stages.Take());
+
+    PythonLatencyProcess isolated_scan_python;
+    if (!SpawnPythonHistoryLatencyProbe(
+            socket_path, &isolated_scan_python) ||
+        isolated_scan_python.channel() == nullptr) {
+        return false;
+    }
+    ProtocolChannel* const isolated_scan_protocol =
+        isolated_scan_python.channel();
+    if (!isolated_scan_protocol->ReadLine(
+            std::chrono::seconds(30), &line) ||
+        !line.starts_with("READY ")) {
+        std::cerr << "isolated history probe startup: "
+                  << line << '\n';
+        return false;
+    }
+    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
+    history_stages.Clear();
+    if (!isolated_scan_protocol->SendLine(
+            "START_HISTORY_LOOP " +
+            std::to_string(kPureTickInstrument) + " " +
+            std::to_string(mixed_generation) +
+            " all 73728") ||
+        !isolated_scan_protocol->ReadLine(
+            std::chrono::seconds(120), &line) ||
+        !line.starts_with("HISTORY_LOOP_STARTED ")) {
+        std::cerr << "isolated history loop start: "
+                  << line << '\n';
+        return false;
+    }
+    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
+    LatestSeriesResult latest_with_isolated_scan{};
+    if (!run_latest_series(
+            "latest_with_isolated_process_history_scan",
+            kInterferenceSamples,
+            &latest_with_isolated_scan)) {
+        return false;
+    }
+    if (!isolated_scan_protocol->SendLine("STOP_HISTORY_LOOP") ||
+        !isolated_scan_protocol->ReadLine(
+            std::chrono::seconds(120), &line) ||
+        !line.starts_with("HISTORY_LOOP_STOPPED ")) {
+        std::cerr << "isolated history loop stop: "
+                  << line << '\n';
+        return false;
+    }
+    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
+    if (!isolated_scan_protocol->SendLine("QUIT") ||
+        !isolated_scan_protocol->ReadLine(
+            std::chrono::seconds(30), &line) ||
+        !line.starts_with("BYE ") ||
+        !isolated_scan_python.Wait(std::chrono::seconds(30))) {
+        std::cerr << "isolated history probe shutdown: "
+                  << line << '\n';
+        return false;
+    }
+    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
+    PrintHistoryPageStages(
+        "isolated_process_concurrent_scan_loop",
+        history_stages.Take());
+
+    const LatencySummary baseline = SummarizeLatency(
+        latest_baseline.strict_callback_to_python_ns);
+    const LatencySummary with_same_process_scan = SummarizeLatency(
+        latest_with_same_process_scan
+            .strict_callback_to_python_ns);
+    const LatencySummary with_isolated_scan = SummarizeLatency(
+        latest_with_isolated_scan
+            .strict_callback_to_python_ns);
+    auto ratio = [](std::uint64_t numerator,
+                    std::uint64_t denominator) {
+        return denominator == 0U
+                   ? 0.0L
+                   : static_cast<long double>(numerator) /
+                         static_cast<long double>(denominator);
+    };
+    std::cout
+        << "HISTORY_SCAN_INTERFERENCE mode=same_python_process"
+        << " samples="
+        << kInterferenceSamples
+        << " baseline_p50_ns=" << baseline.p50_ns
+        << " scan_p50_ns=" << with_same_process_scan.p50_ns
+        << " p50_ratio=" << std::fixed << std::setprecision(3)
+        << ratio(
+               with_same_process_scan.p50_ns,
+               baseline.p50_ns)
+        << " baseline_p95_ns=" << baseline.p95_ns
+        << " scan_p95_ns=" << with_same_process_scan.p95_ns
+        << " p95_ratio="
+        << ratio(
+               with_same_process_scan.p95_ns,
+               baseline.p95_ns)
+        << " baseline_p99_ns=" << baseline.p99_ns
+        << " scan_p99_ns=" << with_same_process_scan.p99_ns
+        << " p99_ratio="
+        << ratio(
+               with_same_process_scan.p99_ns,
+               baseline.p99_ns)
+        << std::defaultfloat << '\n';
+    std::cout
+        << "HISTORY_SCAN_INTERFERENCE mode=isolated_python_process"
+        << " samples=" << kInterferenceSamples
+        << " baseline_p50_ns=" << baseline.p50_ns
+        << " scan_p50_ns=" << with_isolated_scan.p50_ns
+        << " p50_ratio=" << std::fixed << std::setprecision(3)
+        << ratio(with_isolated_scan.p50_ns, baseline.p50_ns)
+        << " baseline_p95_ns=" << baseline.p95_ns
+        << " scan_p95_ns=" << with_isolated_scan.p95_ns
+        << " p95_ratio="
+        << ratio(with_isolated_scan.p95_ns, baseline.p95_ns)
+        << " baseline_p99_ns=" << baseline.p99_ns
+        << " scan_p99_ns=" << with_isolated_scan.p99_ns
+        << " p99_ratio="
+        << ratio(with_isolated_scan.p99_ns, baseline.p99_ns)
+        << std::defaultfloat << '\n';
+    if (!Expect(
+            wait_prefix(next_sequence - 1U, true),
+            "concurrent latest samples reach durable/applied prefix")) {
+        return false;
+    }
+
+    if (!protocol->SendLine("QUIT")) {
+        return false;
+    }
+    if (!protocol->ReadLine(
+            std::chrono::seconds(30), &line) ||
+        !line.starts_with("BYE ") ||
+        !python.Wait(std::chrono::seconds(30))) {
+        std::cerr << "history probe shutdown: " << line << '\n';
+        return false;
+    }
+    std::cout << "PYTHON_" << line << '\n';
+
+    pipeline->StopAndDrain();
+    const auto final = pipeline->Snapshot();
+    const bool ok = Expect(
+        !pipeline->fatal() && !final.fatal &&
+            final.accepted_messages == next_sequence - 1U &&
+            final.processing_progress.applied_sequence ==
+                next_sequence - 1U &&
+            !service->failed() && !history_stages.failed(),
+        "history benchmark retains its complete accepted/applied prefix");
+    service->MarkDraining();
+    const bool stopped =
+        service->MarkStoppedClean(pure_tick_count + mixed_tick_count);
+    service->StopControl();
+    return ok &&
+           Expect(stopped, "history benchmark stops cleanly");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3178,12 +5091,16 @@ int main(int argc, char** argv) {
         if (mode == "--latency-benchmark-stages") {
             return RunLatencyBenchmark(true) ? 0 : 1;
         }
+        if (mode == "--history-latency-benchmark") {
+            return RunHistoryLatencyBenchmark() ? 0 : 1;
+        }
     }
     if (argc != 1) {
         std::cerr
             << "usage: " << argv[0]
             << " [--latency-benchmark"
-               "|--latency-benchmark-stages]\n";
+               "|--latency-benchmark-stages"
+               "|--history-latency-benchmark]\n";
         return 2;
     }
     if (!TestServiceEndToEnd() ||

@@ -24,6 +24,7 @@
 #include <stdlib.h>
 
 namespace factor = l2flow::factor;
+namespace ipc = l2flow::ipc;
 namespace market = l2flow::market;
 namespace mdl = datayes::mdl;
 namespace realtime = l2flow::realtime;
@@ -402,6 +403,123 @@ private:
     bool release_first_applied_ = false;
 };
 
+class GenerationPublicationOrder final {
+public:
+    [[nodiscard]] bool ObserveSink(
+        const market::IntradayInstrumentStoreGenerationV1& generation)
+        noexcept {
+        const std::uint64_t expected =
+            sink_calls_.load(std::memory_order_acquire) + 1U;
+        if (generation.watermark().generation != expected ||
+            generation.watermark().catalog_snapshot == nullptr ||
+            generation.watermark().catalog_snapshot->catalog_scope() !=
+                market::ObservedInstrumentCatalogScopeV2::kObservedOnly ||
+            generation.watermark().catalog_snapshot->coverage_complete() ||
+            !generation.watermark().processing_progress.valid() ||
+            generation.watermark().processing_progress.accepted_sequence !=
+                generation.watermark().processing_progress.applied_sequence ||
+            factor_calls_.load(std::memory_order_acquire) + 1U != expected) {
+            invalid_order_.store(true, std::memory_order_release);
+            return false;
+        }
+        sink_calls_.store(expected, std::memory_order_release);
+        return !fail_sink_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool ObserveFactor(
+        const market::IntradayInstrumentStoreGenerationV1& generation)
+        noexcept {
+        const std::uint64_t expected =
+            factor_calls_.load(std::memory_order_acquire) + 1U;
+        if (generation.watermark().generation != expected ||
+            sink_calls_.load(std::memory_order_acquire) != expected) {
+            invalid_order_.store(true, std::memory_order_release);
+            return false;
+        }
+        factor_calls_.store(expected, std::memory_order_release);
+        return true;
+    }
+
+    void FailSink() noexcept {
+        fail_sink_.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] std::uint64_t sink_calls() const noexcept {
+        return sink_calls_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] std::uint64_t factor_calls() const noexcept {
+        return factor_calls_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool invalid_order() const noexcept {
+        return invalid_order_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<std::uint64_t> sink_calls_{0U};
+    std::atomic<std::uint64_t> factor_calls_{0U};
+    std::atomic<bool> fail_sink_{false};
+    std::atomic<bool> invalid_order_{false};
+};
+
+class StoreGenerationSinkProbe final
+    : public ipc::RealtimeStoreGenerationSinkV2 {
+public:
+    explicit StoreGenerationSinkProbe(
+        std::shared_ptr<GenerationPublicationOrder> order)
+        : order_(std::move(order)) {}
+
+    [[nodiscard]] bool PublishStoreGeneration(
+        const std::shared_ptr<
+            const market::IntradayInstrumentStoreGenerationV1>&
+            generation) noexcept override {
+        if (generation == nullptr || order_ == nullptr) {
+            return false;
+        }
+        last_generation_ = generation;
+        return order_->ObserveSink(*generation);
+    }
+
+    [[nodiscard]] const std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>&
+    last_generation() const noexcept {
+        return last_generation_;
+    }
+
+private:
+    std::shared_ptr<GenerationPublicationOrder> order_;
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        last_generation_;
+};
+
+class OrderedFactorCalculator final
+    : public factor::RealtimeFactorCalculatorV1 {
+public:
+    explicit OrderedFactorCalculator(
+        std::shared_ptr<GenerationPublicationOrder> order)
+        : order_(std::move(order)) {}
+
+    [[nodiscard]] std::span<const factor::RealtimeFactorDefinitionV1>
+    definitions() const noexcept override {
+        return delegate_.definitions();
+    }
+
+    [[nodiscard]] factor::RealtimeFactorCalculatorErrorV1 Calculate(
+        const market::IntradayInstrumentStoreGenerationV1& store,
+        std::vector<factor::RealtimeFactorPointV1>* output)
+        const noexcept override {
+        if (order_ == nullptr || !order_->ObserveFactor(store)) {
+            return factor::RealtimeFactorCalculatorErrorV1::
+                kCalculationFailed;
+        }
+        return delegate_.Calculate(store, output);
+    }
+
+private:
+    std::shared_ptr<GenerationPublicationOrder> order_;
+    factor::SnapshotLastPriceProjectionV1 delegate_;
+};
+
 [[nodiscard]] runtime::RealtimePipelineConfigV1 MakeConfig(
     market::ObservedInstrumentDirectoryV2* directory,
     const std::filesystem::path& journal_path,
@@ -432,6 +550,77 @@ private:
     config.processing_progress_sink = projection;
     config.sdk.enabled = false;
     return config;
+}
+
+void CheckStoreGenerationSinkOrderingAndFailure(
+    TestContext* test,
+    const std::filesystem::path& journal_path) {
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    test->Expect(
+        market::ObservedInstrumentDirectoryV2::Create(
+            market::ObservedInstrumentDirectoryConfigV2{4U, 20U},
+            &directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            directory != nullptr,
+        "create store-generation-sink directory");
+    if (directory == nullptr) {
+        return;
+    }
+
+    const auto projection = std::make_shared<ProjectionProbe>();
+    const auto order = std::make_shared<GenerationPublicationOrder>();
+    const auto sink =
+        std::make_shared<StoreGenerationSinkProbe>(order);
+    const auto calculator =
+        std::make_shared<OrderedFactorCalculator>(order);
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(directory.get(), journal_path, projection);
+    config.store_generation_sink = sink;
+    config.factor_calculator = calculator;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create store-generation-sink pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    const runtime::RealtimePipelineCutResultV1 first =
+        pipeline->CutAndPublishGeneration(3s);
+    test->Expect(
+        first.published() && first.store_generation != nullptr &&
+            sink->last_generation().get() ==
+                first.store_generation.get() &&
+            !sink->last_generation().owner_before(
+                first.store_generation) &&
+            !first.store_generation.owner_before(
+                sink->last_generation()) &&
+            order->sink_calls() == 1U &&
+            order->factor_calls() == 1U &&
+            !order->invalid_order(),
+        "exact Store generation is sink-published before Factor");
+
+    order->FailSink();
+    const runtime::RealtimePipelineCutResultV1 second =
+        pipeline->CutAndPublishGeneration(3s);
+    test->Expect(
+        second.error ==
+                runtime::RealtimePipelineCutErrorV1::
+                    kStoreGenerationPublishFailed &&
+            second.store_generation != nullptr &&
+            second.factor_generation == nullptr &&
+            order->sink_calls() == 2U &&
+            order->factor_calls() == 1U &&
+            pipeline->fatal() &&
+            runtime::RealtimePipelineCutErrorNameV1(second.error) ==
+                "store_generation_publish_failed",
+        "Store-generation sink failure prevents Factor and fails closed");
+    pipeline->StopAndDrain();
 }
 
 template <typename Predicate>
@@ -705,6 +894,118 @@ void CheckExplicitAppliedDispatchWindow(
     pipeline->StopAndDrain();
 }
 
+void CheckProcessingQueueIdleBoundaryLastMessage(
+    TestContext* test,
+    const std::filesystem::path& journal_path) {
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    test->Expect(
+        market::ObservedInstrumentDirectoryV2::Create(
+            market::ObservedInstrumentDirectoryConfigV2{4U, 21U},
+            &directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            directory != nullptr,
+        "create processing-queue idle-boundary directory");
+    if (directory == nullptr) {
+        return;
+    }
+
+    constexpr std::uint64_t rounds = 4096U;
+    constexpr std::uint64_t records_per_round = 2U;
+    constexpr std::uint64_t total_records =
+        rounds * records_per_round;
+    const std::shared_ptr<ProjectionProbe> no_projection;
+    runtime::RealtimePipelineConfigV1 config = MakeConfig(
+        directory.get(), journal_path, no_projection);
+    config.processing_queue_capacity = 2U;
+    config.decoder_queue_capacity_per_source = 2U;
+    config.store_queue_capacity_per_source_worker = 8U;
+    config.intraday_store.maximum_session_records =
+        total_records + 64U;
+    config.intraday_store.maximum_session_accounted_bytes =
+        128U * 1024U * 1024U;
+    // Keep persistence admitted but out of the scheduling experiment. The
+    // queue can retain the entire finite run, so disk speed cannot turn this
+    // processing-wakeup regression into a Journal-capacity failure.
+    config.journal.queue_capacity =
+        static_cast<std::size_t>(total_records + 64U);
+    config.journal.max_batch_records = 64U;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create processing-queue idle-boundary pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    std::uint64_t expected = 0U;
+    bool completed = true;
+    for (std::uint64_t round = 0U;
+         round < rounds && completed;
+         ++round) {
+        for (std::uint64_t index = 0U;
+             index < records_per_round;
+             ++index) {
+            ++expected;
+            FakeMessage message(
+                sdk::kProductionMessageKeysV1[1U],
+                ShanghaiTradeBody(10'000U + expected));
+            const runtime::RealtimePipelineIngressResultV1 admitted =
+                pipeline->InjectSdkMessageForTest(&message);
+            message.DestroyCallbackBytes();
+            if (!admitted.accepted()) {
+                completed = false;
+                break;
+            }
+
+            if (index + 1U < records_per_round) {
+                // Let the dispatcher race the producer toward its next empty
+                // Pop. The following record is the terminal record for this
+                // burst, so a lost wakeup cannot be hidden by a later push.
+                std::this_thread::yield();
+            }
+        }
+
+        if (completed) {
+            completed = WaitUntil([&] {
+                const runtime::RealtimePipelineSnapshotV1 snapshot =
+                    pipeline->Snapshot();
+                return snapshot.fatal ||
+                       (snapshot.accepted_messages == expected &&
+                        snapshot.decoded_messages == expected &&
+                        snapshot.processing_progress.accepted_sequence ==
+                            expected &&
+                        snapshot.processing_progress.applied_sequence ==
+                            expected &&
+                        snapshot.store.appended_records == expected);
+            });
+            if (completed && pipeline->Snapshot().fatal) {
+                completed = false;
+            }
+        }
+    }
+
+    const runtime::RealtimePipelineSnapshotV1 final =
+        pipeline->Snapshot();
+    test->Expect(
+        completed && expected == total_records &&
+            final.accepted_messages == total_records &&
+            final.decoded_messages == total_records &&
+            final.processing_progress.accepted_sequence ==
+                total_records &&
+            final.processing_progress.applied_sequence ==
+                total_records &&
+            final.store.appended_records == total_records &&
+            !final.fatal,
+        "short bursts preserve the exact applied prefix for the terminal "
+        "message across repeated processing-queue idle boundaries");
+    pipeline->StopAndDrain();
+}
+
 void CheckBlockedJournalDoesNotBlockLatest(
     TestContext* test,
     const std::filesystem::path& journal_path) {
@@ -722,8 +1023,18 @@ void CheckBlockedJournalDoesNotBlockLatest(
 
     JournalSyncBlocker sync_blocker;
     const auto projection = std::make_shared<ProjectionProbe>();
+    const auto publication_order =
+        std::make_shared<GenerationPublicationOrder>();
+    const auto generation_sink =
+        std::make_shared<StoreGenerationSinkProbe>(
+            publication_order);
+    const auto factor_calculator =
+        std::make_shared<OrderedFactorCalculator>(
+            publication_order);
     runtime::RealtimePipelineConfigV1 config = MakeConfig(
         directory.get(), journal_path, projection);
+    config.store_generation_sink = generation_sink;
+    config.factor_calculator = factor_calculator;
     config.journal.max_batch_records = 1U;
     config.journal.before_sync_for_test =
         &JournalSyncBlocker::BeforeSync;
@@ -788,8 +1099,14 @@ void CheckBlockedJournalDoesNotBlockLatest(
             cut.store_generation->watermark()
                     .processing_progress.applied_sequence == 1U &&
             cut.store_generation->watermark()
-                    .processing_progress.durable_sequence == 0U,
-        "generation publication waits for applied data but never durability");
+                    .processing_progress.durable_sequence == 0U &&
+            generation_sink->last_generation().get() ==
+                cut.store_generation.get() &&
+            publication_order->sink_calls() == 1U &&
+            publication_order->factor_calls() == 1U &&
+            !publication_order->invalid_order(),
+        "Store generation reaches its sink before Factor without waiting "
+        "for durability");
 
     sync_blocker.Release();
     test->Expect(
@@ -876,6 +1193,10 @@ int main() {
 
     CheckExplicitAppliedDispatchWindow(
         &test, temporary.path() / "window.journal");
+    CheckStoreGenerationSinkOrderingAndFailure(
+        &test, temporary.path() / "generation-sink.journal");
+    CheckProcessingQueueIdleBoundaryLastMessage(
+        &test, temporary.path() / "processing-idle-boundary.journal");
     CheckBlockedJournalDoesNotBlockLatest(
         &test, temporary.path() / "blocked-sync.journal");
 

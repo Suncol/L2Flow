@@ -301,6 +301,8 @@ public:
         std::size_t ordinal,
         IntradayInstrumentSummaryV1* output) const noexcept;
 
+    // begin == end is a valid empty half-open range and returns a cursor
+    // whose first ReadBatch is the explicit zero-sized terminal batch.
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1
     OpenInstrumentCursor(
         std::uint32_t instrument_id,
