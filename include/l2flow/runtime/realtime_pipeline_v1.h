@@ -3,8 +3,9 @@
 #include "l2flow/common/identity128.h"
 #include "l2flow/factor/realtime_factor_engine_v1.h"
 #include "l2flow/ipc/realtime_store_generation_sink_v2.h"
+#include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/market_decoder.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/realtime/contiguous_sequence_tracker_v2.h"
 #include "l2flow/realtime/owned_ingress_message_v1.h"
@@ -55,19 +56,25 @@ struct RealtimePipelineSdkConfigV1 final {
 struct RealtimePipelineConfigV1 final {
     l2flow::common::Identity128 run_id{};
     std::uint32_t trade_date = 0U;
-    // Borrowed runtime directory shared with Store/IPC. It starts empty,
-    // remains OBSERVED_ONLY, and owns one fixed-capacity session.
-    l2flow::market::ObservedInstrumentDirectoryV2* directory = nullptr;
+    // Frozen before Create and retained for the pipeline lifetime. Callback
+    // admission performs its sole exact-key lookup here.
+    std::shared_ptr<const l2flow::market::DailyInstrumentCatalogV2>
+        daily_catalog;
+    // Borrowed dense runtime availability state created from daily_catalog.
+    // It is shared with History/Store and must outlive the pipeline.
+    l2flow::market::InstrumentRuntimeStateV2* runtime_state = nullptr;
     std::array<std::uint32_t,
                l2flow::market::kRealtimeHistorySourceCountV1>
         source_stream_ids{};
 
     std::uint32_t maximum_sdk_message_bytes =
         16U * 1024U * 1024U;
-    // One serialized, bounded, allocation-free callback handoff after the
-    // pooled body copy. It preserves global capture order for first binding.
-    std::size_t processing_queue_capacity = 4096U;
     std::size_t decoder_queue_capacity_per_source = 4096U;
+    // The decoder gate window D is min(sum(queue capacities)+source_count,
+    // completion_tracker_capacity-1, tick_ring_capacity-1). Both backing
+    // capacities must therefore be at least two and strictly exceed D.
+    std::size_t completion_tracker_capacity = 262'144U;
+    std::size_t tick_ring_capacity = 262'144U;
     l2flow::market::MarketDecoderLimitsV1 decoder_limits{};
 
     std::uint32_t store_worker_count = 1U;
@@ -93,8 +100,6 @@ struct RealtimePipelineConfigV1 final {
     // boundary to History.
     std::shared_ptr<l2flow::market::RealtimeAppliedRecordSinkV1>
         applied_record_sink;
-    std::shared_ptr<l2flow::market::ObservedInstrumentBindingSinkV2>
-        instrument_binding_sink;
     std::shared_ptr<l2flow::realtime::ProcessingProgressSinkV2>
         processing_progress_sink;
     // Optional required Wire V2 immutable-generation publication. When
@@ -109,24 +114,20 @@ struct RealtimePipelineConfigV1 final {
     // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
     // append-stage distributions defined below.
     bool measure_stage_latency = false;
-    // Enabled by default. Supported SDK messages are admitted only when their
-    // source market and exact SecurityID match the centralized current
-    // Mainland A-share code rules. A filtered callback consumes no capture,
-    // source, or mixed-tick sequence and enters no owned pool or queue. This
-    // switch does not add a data source: the current production catalog still
-    // contains only the Shanghai and Shenzhen message tuples.
-    bool enable_mainland_a_share_filter = true;
+    // Supported SDK messages are unconditionally admitted only when their
+    // source market and exact SecurityID match the centralized Mainland
+    // A-share rules. A filtered callback consumes no sequence and enters no
+    // owned pool or queue. This invariant is intentionally not configurable.
 };
 
-// Returns the finite completion window enforced by the ordered in-memory
-// processing dispatcher. A captured message with global sequence s is not
-// routed to its source decoder until:
+// Returns the finite completion window enforced after each source-local
+// decoder pop and before full decode/History submission:
 //
 //   0 < s - applied_sequence <= returned_capacity
 //
-// This is an explicit admission bound, not an inference from how quickly
-// decoder or Store queues are expected to drain. A mixed-tick ring receiving
-// this pipeline's applied records must have at least this many slots.
+// Accepted-applied may be larger because messages waiting in source queues
+// have not crossed this gate. The returned D is strictly smaller than both
+// configured completion-tracker and tick-ring capacities.
 [[nodiscard]] bool RealtimePipelineAppliedWindowCapacityV1(
     const RealtimePipelineConfigV1& config,
     std::size_t* output) noexcept;
@@ -178,11 +179,11 @@ struct RealtimePipelineStageLatencySnapshotV1 final {
     RealtimeLatencyDistributionV1 sdk_local_to_callback_success{};
     RealtimeLatencyDistributionV1 sdk_local_to_append_complete{};
 
-    // Same-host CLOCK_MONOTONIC measurements.  callback_entry is the first
+    // Same-host CLOCK_MONOTONIC measurements. callback_entry is the first
     // clock observation made by OnMessage (or the injection seam); callback
-    // success is the first observation after successful ordered-processing
-    // queue admission. append_complete is the first observation after Store
-    // Append returned kNone. inprocess_latest_read is observed only after an
+    // success is the first observation after successful direct source-lane
+    // admission. append_complete is the first observation after Store Append
+    // returned kNone. inprocess_latest_read is observed only after an
     // allocation-free acquire-read through the live latest model has returned
     // and been verified to expose the exact Store-owned record just appended;
     // it does not wait for or acquire an immutable generation.
@@ -195,6 +196,26 @@ struct RealtimePipelineStageLatencySnapshotV1 final {
     // upper bound for the store call rather than an isolated function-body
     // measurement.
     RealtimeLatencyDistributionV1 append_call{};
+    std::array<RealtimeLatencyDistributionV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        callback_to_decoder_publish{};
+    std::array<RealtimeLatencyDistributionV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        decoder_queue_dwell{};
+    std::array<RealtimeLatencyDistributionV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        decode_duration{};
+    std::array<RealtimeLatencyDistributionV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        decode_to_history_submit{};
+    std::array<RealtimeLatencyDistributionV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        decode_to_applied{};
+    // Store-applied is sampled immediately after Store Append succeeds.
+    // IPC-visible is sampled immediately after the configured required
+    // applied sink returns success; without such a sink its sample is invalid.
+    RealtimeLatencyDistributionV1 callback_to_store_applied{};
+    RealtimeLatencyDistributionV1 callback_to_ipc_visible{};
 };
 
 enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
@@ -205,7 +226,6 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
     kKLineRuntimeCreateFailed,
     kFactorCreateFailed,
     kProgressThreadStartFailed,
-    kProcessingThreadStartFailed,
     kDecoderThreadStartFailed,
     kSdkLoadFailed,
     kSdkManagerCreateFailed,
@@ -232,7 +252,7 @@ enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     kSequenceExhausted,
     kOwnedMessageRejected,
     kForbiddenCombinedTick,
-    kProcessingAdmissionFailed,
+    kDecoderAdmissionFailed,
     kStopped,
     kFatal,
     // A well-formed supported message whose source-market SecurityID is
@@ -242,6 +262,9 @@ enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     // key. This is malformed required data and fails closed; it is never
     // counted as a normal filter decision.
     kInstrumentKeyRejected,
+    // Structurally valid A-share identity missing from the declared complete
+    // daily catalog. No sequence or pool slot has been committed.
+    kCatalogMiss,
 };
 
 [[nodiscard]] std::string_view RealtimePipelineIngressErrorNameV1(
@@ -274,9 +297,10 @@ enum class RealtimePipelineCutErrorV1 : std::uint8_t {
     kSequenceExhausted,
     kClockFailure,
     kWatermarkFailed,
-    kProcessingBarrierFailed,
+    kFenceArrivalFailed,
     kGenerationBeginFailed,
-    kMarkerAdmissionFailed,
+    kFenceAdmissionFailed,
+    kFenceSealFailed,
     kGenerationWaitFailed,
     kStoreGenerationPublishFailed,
     kFactorPublishFailed,
@@ -311,8 +335,16 @@ struct RealtimePipelineCutResultV1 final {
     }
 };
 
+struct RealtimeDecoderQueueSnapshotV1 final {
+    std::size_t message_capacity = 0U;
+    std::size_t message_depth = 0U;
+    std::size_t total_depth = 0U;
+    std::size_t message_high_water = 0U;
+    std::uint64_t full_count = 0U;
+};
+
 struct RealtimePipelineSnapshotV1 final {
-    // Exact count committed to the ordered processing queue. It always
+    // Exact count committed to one source decoder queue. It always
     // matches global_ingress_sequence.
     std::uint64_t accepted_messages = 0U;
     std::uint64_t ignored_messages = 0U;
@@ -346,10 +378,12 @@ struct RealtimePipelineSnapshotV1 final {
     std::array<std::uint64_t,
                l2flow::market::kRealtimeHistorySourceCountV1>
         filtered_messages_by_source{};
-    bool mainland_a_share_filter_enabled = true;
+    std::array<RealtimeDecoderQueueSnapshotV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        decoder_queues{};
 };
 
-// Owns the single production data chain. The observed directory and
+// Owns the single production data chain. The frozen catalog, runtime state and
 // calculator backing objects referenced by config must outlive this runtime.
 // One physical SDK manager and one physical Subscriber are created when
 // sdk.enabled is true.
@@ -379,10 +413,10 @@ public:
     [[nodiscard]] RealtimePipelineIngressResultV1 InjectSdkMessageForTest(
         const datayes::mdl::MDLMessage* message) noexcept;
 
-    // Establishes an exclusive process-owned ingress prefix, admits one
-    // marker into each serial decoder queue, waits for every store worker
-    // slice, then performs one atomic full-generation factor publication.
-    // timeout is a shared wait budget for decoder-marker backpressure and the
+    // Establishes an exclusive ingress prefix, inserts one reserved-slot
+    // parked fence into each decoder FIFO, snapshots availability only after
+    // every lane is parked and the cut is applied, then seals History and
+    // releases all lanes together. timeout is shared by fence arrival and the
     // generation condition wait; it is not an API completion deadline. It cannot
     // preempt setup/allocation or arbitrary user calculator code, and waiting
     // to serialize behind an already-running cut/stop is outside the budget.
@@ -392,7 +426,7 @@ public:
     // Terminal publication path. It first closes callback admission and
     // performs SDK Shutdown so no accepted message can appear after the cut.
     // It then releases the quiesced SDK objects, publishes the exact final
-    // accepted ingress prefix, drains processing/decoder/Store workers, and
+    // accepted ingress prefix, drains decoder/Store workers, and
     // leaves the runtime stopped. This is the production shutdown path when
     // a final complete generation is required. Every normal return is
     // destructive and leaves the runtime stopped, including invalid timeout
@@ -452,8 +486,8 @@ public:
     [[nodiscard]] bool fatal() const noexcept;
 
     // Idempotent terminal shutdown without creating another generation. SDK
-    // callbacks are stopped first, then processing and decoder queues are
-    // drained and joined before the Store runtime stops.
+    // callbacks are stopped first, then decoder queues are drained and joined
+    // before the Store runtime stops.
     void StopAndDrain() noexcept;
 
 private:

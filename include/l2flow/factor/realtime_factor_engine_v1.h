@@ -58,11 +58,11 @@ enum class RealtimeFactorCalculatorErrorV1 : std::uint8_t {
 [[nodiscard]] std::string_view RealtimeFactorCalculatorErrorNameV1(
     RealtimeFactorCalculatorErrorV1 error) noexcept;
 
-// A calculator is a pure, non-reentrant observed-universe transformation. It
+// A calculator is a pure, non-reentrant daily-catalog transformation. It
 // receives one immutable Store generation and must return exactly one row,
 // in ascending ID order, for each instrument marked factor_eligible in that
-// generation's exact CatalogSnapshot. It must not infer an authoritative
-// exchange-wide denominator from this subset.
+// generation's exact runtime-state snapshot. It must not infer an
+// exchange-wide denominator from the eligible subset.
 class RealtimeFactorCalculatorV1 {
 public:
     virtual ~RealtimeFactorCalculatorV1() = default;
@@ -100,8 +100,8 @@ private:
     std::array<RealtimeFactorDefinitionV1, 1U> definitions_;
 };
 
-// One immutable observed-universe publication. Its watermark and exact
-// CatalogSnapshot are retained through input_store. Readers acquire this
+// One immutable daily-catalog publication. Its watermark and exact runtime
+// state snapshot are retained through input_store. Readers acquire this
 // object once and cannot observe mismatched catalog/count/factor generations.
 class RealtimeFactorGenerationV1 final {
 public:
@@ -125,11 +125,11 @@ public:
         return input_store_;
     }
     [[nodiscard]] const std::shared_ptr<const
-        l2flow::market::ObservedInstrumentCatalogSnapshotV2>&
+        l2flow::market::DailyInstrumentCatalogSnapshotV2>&
     catalog_snapshot() const noexcept {
         return input_store_->catalog_snapshot();
     }
-    [[nodiscard]] l2flow::market::ObservedInstrumentCatalogScopeV2
+    [[nodiscard]] l2flow::market::InstrumentCatalogScopeV2
     catalog_scope() const noexcept {
         return catalog_snapshot()->catalog_scope();
     }

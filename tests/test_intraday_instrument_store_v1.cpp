@@ -1,5 +1,6 @@
+#include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/intraday_instrument_store_v1.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <algorithm>
@@ -51,23 +52,22 @@ std::vector<std::byte> Bytes(std::string_view text) {
     return {bytes.begin(), bytes.end()};
 }
 
-std::unique_ptr<market::ObservedInstrumentDirectoryV2>
-MakeDirectory(
-    std::size_t capacity = 9U,
-    std::size_t bound_count = 9U,
-    std::uint64_t session_epoch = 17U) {
-    if (capacity == 0U || bound_count > capacity ||
-        bound_count > 9U) {
-        return nullptr;
+struct DailyRuntimeFixture final {
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return catalog != nullptr && runtime_state != nullptr;
     }
-    market::ObservedInstrumentDirectoryConfigV2 config{};
-    config.capacity = capacity;
-    config.session_epoch = session_epoch;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
-    if (market::ObservedInstrumentDirectoryV2::Create(
-            config, &directory) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone) {
-        return nullptr;
+};
+
+DailyRuntimeFixture MakeDailyRuntimeFixture(
+    std::size_t instrument_count = 9U,
+    std::uint64_t session_epoch = 17U) {
+    DailyRuntimeFixture fixture{};
+    if (instrument_count == 0U || instrument_count > 9U ||
+        session_epoch == 0U) {
+        return fixture;
     }
     constexpr std::array<std::string_view, 9U> security_ids{
         "600001",
@@ -79,33 +79,46 @@ MakeDirectory(
         "600007",
         "600008",
         "600009"};
-    const market::ObservedInstrumentMetadataV2 metadata{
-        market::QuantityUnitV1::kShare,
-        market::SecurityTypeV1::kEquity,
-        market::AssetScopeV1::kDocumentedCore};
+    std::vector<market::DailyInstrumentSourceEntryV2> entries;
+    entries.reserve(instrument_count);
     for (std::size_t ordinal = 0U;
-         ordinal < bound_count;
+         ordinal < instrument_count;
          ++ordinal) {
-        market::InstrumentKeyV1 key{};
-        key.market = market::MarketV1::kShanghai;
-        key.security_id_source = Bytes("101");
-        key.security_id = Bytes(security_ids[ordinal]);
-        market::ObservedInstrumentBindResultV2 result{};
-        if (directory->BindOrGet(
-                key, metadata, ordinal + 1U, &result) !=
-                market::ObservedInstrumentDirectoryErrorV2::kNone ||
-            !result.newly_bound ||
-            result.entry.ordinal != ordinal ||
-            result.entry.instrument_id !=
-                static_cast<std::uint32_t>(ordinal + 1U)) {
-            return nullptr;
-        }
+        market::DailyInstrumentSourceEntryV2 entry{};
+        entry.key.market = market::MarketV1::kShanghai;
+        entry.key.security_id_source = {};
+        entry.key.security_id = Bytes(security_ids[ordinal]);
+        entry.metadata.quantity_unit =
+            market::QuantityUnitV1::kShare;
+        entry.metadata.security_type =
+            market::SecurityTypeV1::kEquity;
+        entry.metadata.asset_scope =
+            market::AssetScopeV1::kDocumentedCore;
+        entries.push_back(std::move(entry));
     }
-    return directory;
+    market::DailyInstrumentCatalogConfigV2 catalog_config{};
+    catalog_config.trade_date = kTradeDate;
+    catalog_config.catalog_version = session_epoch;
+    catalog_config.session_epoch = session_epoch;
+    catalog_config.market_scope =
+        market::kDailyCatalogMainlandScopeV2;
+    catalog_config.coverage_complete = true;
+    if (market::DailyInstrumentCatalogV2::Create(
+            catalog_config,
+            entries,
+            &fixture.catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        market::InstrumentRuntimeStateV2::Create(
+            *fixture.catalog,
+            &fixture.runtime_state) !=
+            market::InstrumentRuntimeStateErrorV2::kNone) {
+        return {};
+    }
+    return fixture;
 }
 
 void FillCommon(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& directory,
     market::DecodedMarketCommonV1* common,
     market::MarketEventKindV1 kind,
     market::MarketV1 venue,
@@ -123,9 +136,9 @@ void FillCommon(
     common->origin.recv_monotonic_ns =
         static_cast<std::int64_t>(ingress_sequence * 10U);
     common->instrument_id = instrument_id;
-    market::ObservedInstrumentEntryViewV2 lookup{};
+    market::InstrumentRuntimeEntryViewV2 lookup{};
     if (directory.LookupById(instrument_id, &lookup) ==
-        market::ObservedInstrumentDirectoryErrorV2::kNone) {
+        market::InstrumentRuntimeStateErrorV2::kNone) {
         common->ordinal = lookup.ordinal;
     }
 }
@@ -151,7 +164,7 @@ std::unique_ptr<market::RealtimeHistoryEventInputV1> OwnInput(
 }
 
 std::unique_ptr<market::RealtimeHistoryEventInputV1> MakeInput(
-    const market::ObservedInstrumentDirectoryV2& registry,
+    const market::InstrumentRuntimeStateV2& registry,
     std::uint8_t source_slot,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
@@ -258,7 +271,7 @@ market::IntradayInstrumentStoreAppendErrorV1 AppendInput(
 
 market::RealtimeHistoryWatermarkV1 MakeWatermarkForSnapshot(
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot,
     std::uint64_t generation,
     std::array<std::uint64_t, 4U> source_sequence_exclusive) {
@@ -303,14 +316,14 @@ market::RealtimeHistoryWatermarkV1 MakeWatermarkForSnapshot(
 }
 
 market::RealtimeHistoryWatermarkV1 MakeWatermark(
-    const market::ObservedInstrumentDirectoryV2& registry,
+    const market::InstrumentRuntimeStateV2& registry,
     std::uint64_t generation,
     std::array<std::uint64_t, 4U> source_sequence_exclusive) {
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
     if (registry.AcquireSnapshot(&catalog_snapshot) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            market::InstrumentRuntimeStateErrorV2::kNone ||
         catalog_snapshot == nullptr) {
         return {};
     }
@@ -334,7 +347,7 @@ market::IntradayInstrumentStoreConfigV1 StoreConfig(
 }
 
 std::unique_ptr<market::IntradayInstrumentStoreV1> CreateStore(
-    const market::ObservedInstrumentDirectoryV2& registry,
+    const market::InstrumentRuntimeStateV2& registry,
     std::uint32_t worker_count,
     market::IntradayInstrumentStoreConfigV1 config,
     std::string_view message,
@@ -352,7 +365,7 @@ std::unique_ptr<market::IntradayInstrumentStoreV1> CreateStore(
 std::shared_ptr<const market::IntradayInstrumentStoreGenerationV1>
 BuildStoreGeneration(
     market::IntradayInstrumentStoreV1* store,
-    const market::ObservedInstrumentDirectoryV2& registry,
+    const market::InstrumentRuntimeStateV2& registry,
     std::uint32_t worker_count,
     std::uint64_t generation,
     std::array<std::uint64_t, 4U> source_sequence_exclusive,
@@ -449,20 +462,24 @@ std::vector<const market::RealtimeHistoryRecordV1*> DrainCursor(
     return records;
 }
 
-bool CheckObservedCatalogPrefixAndRouting() {
+bool CheckFrozenDailyCatalogAndRouting() {
     bool ok = true;
-    auto directory = MakeDirectory(6U, 2U, 71U);
+    auto fixture = MakeDailyRuntimeFixture(3U, 71U);
     ok &= Expect(
-        directory != nullptr,
-        "create partially bound fixed-capacity directory");
-    if (directory == nullptr) {
+        static_cast<bool>(fixture) &&
+            fixture.catalog->instrument_count() == 3U &&
+            fixture.runtime_state->capacity() == 3U,
+        "create frozen three-instrument daily catalog and runtime state");
+    if (!fixture) {
         return false;
     }
+    market::InstrumentRuntimeStateV2& runtime_state =
+        *fixture.runtime_state;
     auto store = CreateStore(
-        *directory,
+        runtime_state,
         3U,
         StoreConfig(),
-        "create capacity-backed Store",
+        "create daily-catalog-backed Store",
         &ok);
     if (store == nullptr) {
         return false;
@@ -476,47 +493,44 @@ bool CheckObservedCatalogPrefixAndRouting() {
             route.worker == 0U &&
             store->ResolveRouteToken(1U, 2U, &route) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
-            route.ordinal == 1U && route.worker == 1U,
-        "bound IDs resolve by exact ordinal with ordinal-modulo owners");
+            route.ordinal == 1U && route.worker == 1U &&
+            store->ResolveRouteToken(2U, 3U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            route.ordinal == 2U && route.worker == 2U,
+        "daily catalog IDs resolve by exact dense ordinal and owner");
     ok &= Expect(
-        store->ResolveRouteToken(2U, 3U, &route) ==
+        store->ResolveRouteToken(3U, 4U, &route) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNotFound &&
             store->ResolveRouteToken(0U, 2U, &route) ==
                 market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
-        "route resolution rejects unbound and mismatched identities");
+        "route resolution rejects out-of-catalog and mismatched identities");
 
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         first_catalog;
     ok &= Expect(
-        directory->AcquireSnapshot(&first_catalog) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        runtime_state.AcquireSnapshot(&first_catalog) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             first_catalog != nullptr &&
-            first_catalog->bound_count() == 2U,
-        "freeze two-instrument catalog cut");
+            first_catalog->capacity() == 3U &&
+            first_catalog->bound_count() == 3U &&
+            first_catalog->catalog_generation() == 1U &&
+            first_catalog->catalog_scope() ==
+                market::InstrumentCatalogScopeV2::
+                    kDeclaredDailyAShare &&
+            first_catalog->coverage_complete() &&
+            first_catalog->trade_date() == kTradeDate &&
+            first_catalog->catalog_digest() ==
+                fixture.catalog->catalog_digest(),
+        "snapshot carries the complete frozen daily catalog identity");
     if (first_catalog == nullptr) {
         return false;
     }
 
-    market::InstrumentKeyV1 third_key{};
-    third_key.market = market::MarketV1::kShanghai;
-    third_key.security_id_source = Bytes("101");
-    third_key.security_id = Bytes("600003");
-    const market::ObservedInstrumentMetadataV2 metadata{
-        market::QuantityUnitV1::kShare,
-        market::SecurityTypeV1::kEquity,
-        market::AssetScopeV1::kDocumentedCore};
-    market::ObservedInstrumentBindResultV2 third{};
     ok &= Expect(
-        directory->BindOrGet(
-            third_key, metadata, 3U, &third) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            third.newly_bound && third.entry.ordinal == 2U &&
-            third.entry.instrument_id == 3U &&
-            store->ResolveRouteToken(2U, 3U, &route) ==
-                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
-            route.worker == 2U,
-        "prebuilt physical row becomes routable after one-way binding");
+        store->ResolveRouteToken(3U, 4U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
+        "frozen runtime exposes no post-connect identity mutation");
 
     const market::RealtimeHistoryWatermarkV1 first_watermark =
         MakeWatermarkForSnapshot(
@@ -547,12 +561,12 @@ bool CheckObservedCatalogPrefixAndRouting() {
             first_generation->catalog_snapshot() == first_catalog &&
             first_generation->watermark().catalog_snapshot ==
                 first_catalog &&
-            first_generation->instrument_count() == 2U,
-        "generation retains the exact earlier catalog snapshot");
+            first_generation->instrument_count() == 3U,
+        "generation retains the exact frozen catalog snapshot");
     if (first_generation == nullptr) {
         return false;
     }
-    for (std::size_t ordinal = 0U; ordinal < 2U; ++ordinal) {
+    for (std::size_t ordinal = 0U; ordinal < 3U; ++ordinal) {
         market::IntradayInstrumentSummaryV1 summary{};
         ok &= Expect(
             first_generation->SummaryAt(ordinal, &summary) ==
@@ -565,23 +579,27 @@ bool CheckObservedCatalogPrefixAndRouting() {
     }
     market::IntradayInstrumentSummaryV1 outside_cut{};
     ok &= Expect(
-        first_generation->SummaryAt(2U, &outside_cut) ==
+        first_generation->SummaryAt(3U, &outside_cut) ==
             market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
-        "post-cut binding is absent from an older generation");
+        "identity outside the declared daily catalog is absent");
 
     ok &= Expect(
         store->PublishGeneration(first_generation) ==
             market::IntradayInstrumentStoreGenerationErrorV1::kNone,
-        "publish first catalog-bound generation");
+        "publish first frozen-catalog generation");
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         second_catalog;
     ok &= Expect(
-        directory->AcquireSnapshot(&second_catalog) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        runtime_state.AcquireSnapshot(&second_catalog) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             second_catalog != nullptr &&
-            second_catalog->bound_count() == 3U,
-        "freeze expanded catalog cut");
+            second_catalog->capacity() == 3U &&
+            second_catalog->bound_count() == 3U &&
+            second_catalog->catalog_generation() == 1U &&
+            second_catalog->catalog_digest() ==
+                first_catalog->catalog_digest(),
+        "successive cuts retain one immutable catalog identity");
     std::vector<
         std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
         second_slices(3U);
@@ -593,7 +611,7 @@ bool CheckObservedCatalogPrefixAndRouting() {
                 second_catalog,
                 &second_slices[worker]) ==
                 market::IntradayInstrumentStoreGenerationErrorV1::kNone,
-            "capture expanded catalog worker slice");
+            "capture second frozen-catalog worker slice");
     }
     std::shared_ptr<
         const market::IntradayInstrumentStoreGenerationV1>
@@ -609,46 +627,50 @@ bool CheckObservedCatalogPrefixAndRouting() {
                 market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
             second_generation != nullptr &&
             second_generation->catalog_snapshot() == second_catalog &&
-            second_generation->instrument_count() == 3U,
-        "next generation exposes the expanded bound prefix");
+            second_generation->instrument_count() == 3U &&
+            second_generation->watermark().catalog_snapshot ==
+                second_catalog,
+        "next generation reuses the complete frozen daily catalog");
     return ok;
 }
 
-bool CheckGenerationCaptureUsesOnlyBoundPrefix() {
+bool CheckGenerationCaptureUsesFrozenCatalog() {
     bool ok = true;
-    constexpr std::size_t kCapacity =
-        market::kObservedInstrumentDirectoryDefaultCapacityV2;
-    constexpr std::size_t kBoundCount = 3U;
+    constexpr std::size_t kInstrumentCount = 3U;
     constexpr std::uint32_t kWorkerCount = 8U;
-    auto directory =
-        MakeDirectory(kCapacity, kBoundCount, 72U);
+    auto fixture =
+        MakeDailyRuntimeFixture(kInstrumentCount, 72U);
     ok &= Expect(
-        directory != nullptr &&
-            directory->capacity() == kCapacity,
-        "create production-capacity sparse observed directory");
-    if (directory == nullptr) {
+        static_cast<bool>(fixture) &&
+            fixture.runtime_state->capacity() == kInstrumentCount,
+        "create three-instrument frozen daily runtime state");
+    if (!fixture) {
         return false;
     }
+    market::InstrumentRuntimeStateV2& runtime_state =
+        *fixture.runtime_state;
     auto store = CreateStore(
-        *directory,
+        runtime_state,
         kWorkerCount,
         StoreConfig(),
-        "create production-capacity sparse Store",
+        "create frozen-catalog Store",
         &ok);
     if (store == nullptr) {
         return false;
     }
 
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
     ok &= Expect(
-        directory->AcquireSnapshot(&catalog_snapshot) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        runtime_state.AcquireSnapshot(&catalog_snapshot) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             catalog_snapshot != nullptr &&
-            catalog_snapshot->capacity() == kCapacity &&
-            catalog_snapshot->bound_count() == kBoundCount,
-        "freeze sparse three-instrument catalog");
+            catalog_snapshot->capacity() == kInstrumentCount &&
+            catalog_snapshot->bound_count() == kInstrumentCount &&
+            catalog_snapshot->catalog_generation() == 1U &&
+            catalog_snapshot->coverage_complete(),
+        "capture complete three-instrument daily catalog");
     if (catalog_snapshot == nullptr) {
         return false;
     }
@@ -657,7 +679,7 @@ bool CheckGenerationCaptureUsesOnlyBoundPrefix() {
             catalog_snapshot, 1U, {1U, 1U, 1U, 1U});
     ok &= Expect(
         watermark.generation == 1U,
-        "build sparse generation watermark");
+        "build frozen-catalog generation watermark");
 
     std::vector<
         std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
@@ -676,22 +698,21 @@ bool CheckGenerationCaptureUsesOnlyBoundPrefix() {
                     market::IntradayInstrumentStoreGenerationErrorV1::
                         kNone &&
                 slices[worker] != nullptr,
-            "capture sparse worker slice");
+            "capture frozen-catalog worker slice");
         if (slices[worker] == nullptr) {
             return false;
         }
         const std::size_t expected =
-            worker < kBoundCount ? 1U : 0U;
+            worker < kInstrumentCount ? 1U : 0U;
         ok &= Expect(
             slices[worker]->captured_instrument_count() == expected,
-            "worker slice token represents only its bound-prefix rows");
+            "worker slice token represents its owned catalog rows");
         captured_instrument_count +=
             slices[worker]->captured_instrument_count();
     }
     ok &= Expect(
-        captured_instrument_count == kBoundCount &&
-            captured_instrument_count != kCapacity,
-        "total token rows equal bound_count, not capacity");
+        captured_instrument_count == kInstrumentCount,
+        "worker tokens cover each daily catalog row exactly once");
 
     std::shared_ptr<
         const market::IntradayInstrumentStoreGenerationV1>
@@ -701,12 +722,12 @@ bool CheckGenerationCaptureUsesOnlyBoundPrefix() {
             watermark, std::move(slices), &generation) ==
                 market::IntradayInstrumentStoreGenerationErrorV1::kNone &&
             generation != nullptr &&
-            generation->instrument_count() == kBoundCount &&
+            generation->instrument_count() == kInstrumentCount &&
             generation->catalog_snapshot() == catalog_snapshot,
-        "sparse generation outputs exactly the bound prefix");
+        "generation outputs exactly the frozen daily catalog");
     if (generation != nullptr) {
         for (std::size_t ordinal = 0U;
-             ordinal < kBoundCount;
+             ordinal < kInstrumentCount;
              ++ordinal) {
             market::IntradayInstrumentSummaryV1 summary{};
             ok &= Expect(
@@ -714,42 +735,43 @@ bool CheckGenerationCaptureUsesOnlyBoundPrefix() {
                         market::IntradayInstrumentStoreQueryErrorV1::
                             kNone &&
                     summary.instrument_id == ordinal + 1U,
-                "sparse generation SummaryAt preserves dense bound order");
+                "generation SummaryAt preserves dense catalog order");
         }
-        market::IntradayInstrumentSummaryV1 unbound{};
+        market::IntradayInstrumentSummaryV1 outside_catalog{};
         ok &= Expect(
-            generation->SummaryAt(kBoundCount, &unbound) ==
+            generation->SummaryAt(
+                kInstrumentCount, &outside_catalog) ==
                     market::IntradayInstrumentStoreQueryErrorV1::
                         kNotFound &&
-                unbound.instrument_id == 0U,
-            "sparse generation never outputs an unbound capacity slot");
+                outside_catalog.instrument_id == 0U,
+            "generation excludes rows outside the daily catalog");
     }
     return ok;
 }
 
 bool CheckLazyPostCutRowFreeze() {
     bool ok = true;
-    constexpr std::size_t kCapacity =
-        market::kObservedInstrumentDirectoryDefaultCapacityV2;
     constexpr std::uint32_t kWorkerCount = 4U;
-    auto directory = MakeDirectory(kCapacity, 1U, 73U);
+    auto fixture = MakeDailyRuntimeFixture(1U, 73U);
     ok &= Expect(
-        directory != nullptr,
-        "create production-capacity lazy-freeze directory");
-    if (directory == nullptr) {
+        static_cast<bool>(fixture),
+        "create one-instrument frozen daily runtime state");
+    if (!fixture) {
         return false;
     }
+    market::InstrumentRuntimeStateV2& runtime_state =
+        *fixture.runtime_state;
     auto store = CreateStore(
-        *directory,
+        runtime_state,
         kWorkerCount,
         StoreConfig(),
-        "create production-capacity lazy-freeze Store",
+        "create daily-catalog lazy-freeze Store",
         &ok);
     if (store == nullptr) {
         return false;
     }
 
-    auto first = MakeInput(*directory, 0U, 1U, 1U, 1U);
+    auto first = MakeInput(runtime_state, 0U, 1U, 1U, 1U);
     ok &= Expect(
         first != nullptr &&
             AppendInput(store.get(), 0U, first.get()) ==
@@ -757,7 +779,8 @@ bool CheckLazyPostCutRowFreeze() {
         "append record before lazy generation fence");
 
     const market::RealtimeHistoryWatermarkV1 first_watermark =
-        MakeWatermark(*directory, 1U, {2U, 1U, 1U, 1U});
+        MakeWatermark(
+            runtime_state, 1U, {2U, 1U, 1U, 1U});
     std::vector<
         std::unique_ptr<market::IntradayInstrumentStoreWorkerSliceV1>>
         first_slices(kWorkerCount);
@@ -778,7 +801,7 @@ bool CheckLazyPostCutRowFreeze() {
 
     // This append deliberately occurs before BuildGeneration. Its row owner
     // must preserve generation 1 lazily while the live latest path advances.
-    auto second = MakeInput(*directory, 0U, 2U, 2U, 1U);
+    auto second = MakeInput(runtime_state, 0U, 2U, 2U, 1U);
     ok &= Expect(
         second != nullptr &&
             AppendInput(store.get(), 0U, second.get()) ==
@@ -809,7 +832,7 @@ bool CheckLazyPostCutRowFreeze() {
 
     const auto generation_two = BuildStoreGeneration(
         store.get(),
-        *directory,
+        runtime_state,
         kWorkerCount,
         2U,
         {3U, 1U, 1U, 1U},
@@ -1023,7 +1046,7 @@ std::vector<std::uint32_t> InstrumentIds(
 }
 
 bool CheckCreationAndInvalidConfiguration(
-    const market::ObservedInstrumentDirectoryV2& registry) {
+    const market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     const auto valid = StoreConfig();
     ok &= Expect(
@@ -1137,7 +1160,7 @@ bool CheckCreationAndInvalidConfiguration(
 }
 
 bool CheckStoreSessionProvenance(
-    const market::ObservedInstrumentDirectoryV2& registry) {
+    const market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     auto first_store = CreateStore(
         registry,
@@ -1174,7 +1197,7 @@ bool CheckStoreSessionProvenance(
 }
 
 bool CheckGenerationQueriesAndLifetime(
-    const market::ObservedInstrumentDirectoryV2& registry) {
+    const market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     auto store = CreateStore(
         registry,
@@ -1258,7 +1281,7 @@ bool CheckGenerationQueriesAndLifetime(
                     market::IntradayInstrumentStoreQueryErrorV1::kNone &&
                 ordinal_summary.instrument_id ==
                     expected_instrument_ids[ordinal],
-            "SummaryAt exposes the exact bound prefix in ID order");
+            "SummaryAt exposes the complete dense catalog in ID order");
     }
     market::IntradayInstrumentSummaryV1 invalid_ordinal_summary{};
     invalid_ordinal_summary.instrument_id = 123U;
@@ -1311,7 +1334,7 @@ bool CheckGenerationQueriesAndLifetime(
             empty_summary.record_count == 0U &&
             empty_summary.latest_snapshot == nullptr &&
             empty_summary.latest_tick == nullptr,
-        "Find retains an unobserved fixed-universe instrument");
+        "Find retains a no-data daily-catalog instrument");
     ok &= Expect(
         first->Find(99U, &empty_summary) ==
             market::IntradayInstrumentStoreQueryErrorV1::kNotFound,
@@ -1845,7 +1868,7 @@ bool CheckGenerationQueriesAndLifetime(
 }
 
 bool CheckRolloverCapsAndWorkerOwnership(
-    const market::ObservedInstrumentDirectoryV2& registry) {
+    const market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     constexpr std::uint64_t kMaximumFixtureRecords = 64U;
 
@@ -2279,7 +2302,7 @@ bool CheckRolloverCapsAndWorkerOwnership(
 }
 
 bool CheckLiveTailGenerationIsolation(
-    const market::ObservedInstrumentDirectoryV2& registry) {
+    const market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     constexpr std::uint64_t final_sequence = 5'000U;
     std::uint64_t full_tail_records = 0U;
@@ -2447,14 +2470,14 @@ bool CheckLiveTailGenerationIsolation(
 }
 
 bool CheckRuntimeStoreGenerationPublication(
-    market::ObservedInstrumentDirectoryV2& registry) {
+    market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = kSourceStreamIds;
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 32U;
     config.intraday_store = StoreConfig(32U, 1U << 20U);
-    config.directory = &registry;
+    config.runtime_state = &registry;
 
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
     ok &= Expect(
@@ -2567,14 +2590,14 @@ bool CheckRuntimeStoreGenerationPublication(
 }
 
 bool CheckRuntimeStoreFailureFailClosed(
-    market::ObservedInstrumentDirectoryV2& registry) {
+    market::InstrumentRuntimeStateV2& registry) {
     bool ok = true;
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = kSourceStreamIds;
     config.worker_count = 1U;
     config.queue_capacity_per_source_worker = 16U;
     config.intraday_store = StoreConfig(1U, 1U << 20U);
-    config.directory = &registry;
+    config.runtime_state = &registry;
     const market::RealtimeHistoryWatermarkV1 watermark =
         MakeWatermark(registry, 1U, {3U, 1U, 1U, 1U});
 
@@ -2638,22 +2661,25 @@ bool CheckRuntimeStoreFailureFailClosed(
 }  // namespace
 
 int main() {
-    const std::unique_ptr<market::ObservedInstrumentDirectoryV2>
-        registry = MakeDirectory();
-    if (!Expect(registry != nullptr, "instrument directory creation")) {
+    DailyRuntimeFixture fixture = MakeDailyRuntimeFixture();
+    if (!Expect(
+            static_cast<bool>(fixture),
+            "daily catalog and runtime-state creation")) {
         return 1;
     }
+    market::InstrumentRuntimeStateV2& registry =
+        *fixture.runtime_state;
 
     bool ok = true;
-    ok &= CheckObservedCatalogPrefixAndRouting();
-    ok &= CheckGenerationCaptureUsesOnlyBoundPrefix();
+    ok &= CheckFrozenDailyCatalogAndRouting();
+    ok &= CheckGenerationCaptureUsesFrozenCatalog();
     ok &= CheckLazyPostCutRowFreeze();
-    ok &= CheckCreationAndInvalidConfiguration(*registry);
-    ok &= CheckStoreSessionProvenance(*registry);
-    ok &= CheckGenerationQueriesAndLifetime(*registry);
-    ok &= CheckRolloverCapsAndWorkerOwnership(*registry);
-    ok &= CheckLiveTailGenerationIsolation(*registry);
-    ok &= CheckRuntimeStoreGenerationPublication(*registry);
-    ok &= CheckRuntimeStoreFailureFailClosed(*registry);
+    ok &= CheckCreationAndInvalidConfiguration(registry);
+    ok &= CheckStoreSessionProvenance(registry);
+    ok &= CheckGenerationQueriesAndLifetime(registry);
+    ok &= CheckRolloverCapsAndWorkerOwnership(registry);
+    ok &= CheckLiveTailGenerationIsolation(registry);
+    ok &= CheckRuntimeStoreGenerationPublication(registry);
+    ok &= CheckRuntimeStoreFailureFailClosed(registry);
     return ok ? 0 : 1;
 }

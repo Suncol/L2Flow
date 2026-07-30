@@ -122,7 +122,7 @@ class InstrumentTickDeltaCheckpoint:
             or self.instrument_id > self.bound_count
         ):
             raise ValueError(
-                "instrument identity is outside the observed bound prefix"
+                "instrument identity is outside the daily catalog"
             )
         counts = _quad(
             self.instrument_tick_source_record_counts,
@@ -263,22 +263,22 @@ class InstrumentTickDeltaCheckpoint:
             raise StaleSessionError(
                 "tick checkpoint static identity changed"
             )
-        # A larger catalog is an expected observed-universe successor. The
-        # digest must match only when its generation number is unchanged.
+        # The daily catalog is frozen for the whole session. Any identity
+        # movement invalidates a rolling cursor instead of treating growth as
+        # a normal successor.
         if (
-            self.catalog_generation < base.catalog_generation
-            or self.bound_count < base.bound_count
+            self.catalog_generation != base.catalog_generation
+            or self.bound_count != base.bound_count
+            or self.capacity != base.capacity
+            or self.catalog_digest != base.catalog_digest
             or self.available_count < base.available_count
             or self.snapshot_available_count
             < base.snapshot_available_count
             or self.tick_available_count < base.tick_available_count
-            or (
-                self.catalog_generation == base.catalog_generation
-                and self.catalog_digest != base.catalog_digest
-            )
         ):
             raise StaleSessionError(
-                "observed catalog checkpoint moved backwards or conflicted"
+                "daily catalog checkpoint changed or data state moved "
+                "backwards"
             )
         monotone = (
             self.generation >= base.generation
@@ -525,7 +525,7 @@ class InstrumentTickDeltaCheckpoint:
             )
         except (TypeError, ValueError) as error:
             raise ValueError(
-                "catalog_scope is not OBSERVED_ONLY"
+                "catalog_scope is not DECLARED_DAILY_A_SHARE"
             ) from error
         return cls(**restored)
 

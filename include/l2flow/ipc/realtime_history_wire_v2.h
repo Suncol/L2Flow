@@ -101,11 +101,11 @@ template <typename T, std::size_t Size>
 
 }  // namespace realtime_history_wire_v2_detail
 
-// One immutable observed-universe Store generation endpoint. The accepted
-// processing-queue prefix and applied Store prefix identify the generation
+// One immutable declared-daily-catalog Store generation endpoint. The accepted
+// ingress/source-lane prefixes and applied Store prefix identify the generation
 // cut. history_published_monotonic_ns is the t2 release-publication boundary
 // for callback-to-history latency measurement. input_identity_sha256
-// identifies the accepted-process cut and catalog; it is not a digest of
+// identifies the accepted-ingress cut and catalog; it is not a digest of
 // serialized page payload bytes.
 struct RealtimeGenerationEndpointV2 final {
     std::array<std::uint8_t, 16U> run_id{};
@@ -212,8 +212,8 @@ static_assert(offsetof(RealtimeGenerationEndpointV2, flags) == 244U);
         endpoint.trade_date == 0U || endpoint.capacity == 0U ||
         endpoint.catalog_scope !=
             static_cast<std::uint32_t>(
-                RealtimeCatalogScopeV2::kObservedOnly) ||
-        endpoint.coverage_complete != 0U ||
+                RealtimeCatalogScopeV2::kDeclaredDailyAShare) ||
+        endpoint.coverage_complete != 1U ||
         (endpoint.flags & ~known_flags) != 0U ||
         (endpoint.flags &
          kRealtimeGenerationRecordCoverageCompleteV2) == 0U ||
@@ -230,7 +230,8 @@ static_assert(offsetof(RealtimeGenerationEndpointV2, flags) == 244U);
         endpoint.accepted_sequence !=
             endpoint.ingress_sequence_exclusive - 1U ||
         endpoint.applied_sequence != endpoint.accepted_sequence ||
-        endpoint.catalog_generation != endpoint.bound_count ||
+        endpoint.catalog_generation != 1U ||
+        endpoint.bound_count != endpoint.capacity ||
         endpoint.bound_count > endpoint.capacity ||
         endpoint.available_count > endpoint.bound_count ||
         endpoint.snapshot_available_count >

@@ -1,4 +1,4 @@
-"""Public, immutable models for the observed-universe Wire V2 client."""
+"""Public, immutable models for the declared daily-catalog Wire V2 client."""
 
 from __future__ import annotations
 
@@ -65,15 +65,17 @@ class TickOverrunError(L2FlowRealtimeError):
 
 
 class CatalogScope(IntEnum):
-    OBSERVED_ONLY = 1
+    DECLARED_DAILY_A_SHARE = 2
 
 
 class SelectionScope(IntEnum):
-    BOUND = 1
-    OBSERVED_ANY = 2
+    CATALOG_ALL = 1
+    AVAILABLE_ANY = 2
     SNAPSHOT_AVAILABLE = 3
     TICK_AVAILABLE = 4
     FACTOR_ELIGIBLE = 5
+    BOUND = CATALOG_ALL
+    OBSERVED_ANY = AVAILABLE_ANY
 
 
 class InstrumentStatus(IntEnum):
@@ -235,7 +237,7 @@ def _validate_counts(
         <= bound_count
         <= capacity
     ):
-        raise ValueError("observed-universe counts are inconsistent")
+        raise ValueError("daily-catalog counts are inconsistent")
     if tick_available_count > available_count:
         raise ValueError("tick_available_count exceeds available_count")
 
@@ -283,6 +285,8 @@ class SessionInfo:
     snapshot_available_count: int
     tick_available_count: int
     factor_eligible_count: int
+    catalog_trade_date: int
+    catalog_version: int
 
     def __post_init__(self) -> None:
         _digest(self.run_id, 16, "run_id")
@@ -290,6 +294,8 @@ class SessionInfo:
         _digest(self.catalog_digest, 32, "catalog_digest")
         if not any(self.run_id):
             raise ValueError("run_id must be nonzero")
+        if not any(self.catalog_digest):
+            raise ValueError("catalog_digest must be nonzero")
         _uint64(self.session_epoch, "session_epoch", nonzero=True)
         for value, name in (
             (self.catalog_generation, "catalog_generation"),
@@ -309,12 +315,14 @@ class SessionInfo:
             (self.kline_generation, "kline_generation"),
             (self.heartbeat_monotonic_ns, "heartbeat_monotonic_ns"),
             (self.published_records, "published_records"),
+            (self.catalog_version, "catalog_version"),
         ):
             _uint64(value, name)
         if self.accepted_sequence == _UINT64_MAX:
             raise ValueError("accepted_sequence uses the reserved sentinel")
         for value, name in (
             (self.trade_date, "trade_date"),
+            (self.catalog_trade_date, "catalog_trade_date"),
             (self.flags, "flags"),
             (self.window_count, "window_count"),
         ):
@@ -325,10 +333,23 @@ class SessionInfo:
             raise ValueError("tick_ring_capacity must be nonzero")
         if self.flags & ~0x3:
             raise ValueError("flags contain an unknown Wire V2 bit")
-        if CatalogScope(self.catalog_scope) is not CatalogScope.OBSERVED_ONLY:
-            raise ValueError("Wire V2 catalog scope must be OBSERVED_ONLY")
-        if self.coverage_complete is not False:
-            raise ValueError("observed-universe coverage cannot be complete")
+        if (
+            CatalogScope(self.catalog_scope)
+            is not CatalogScope.DECLARED_DAILY_A_SHARE
+        ):
+            raise ValueError(
+                "Wire V2 catalog scope must be DECLARED_DAILY_A_SHARE"
+            )
+        if self.coverage_complete is not True:
+            raise ValueError("daily A-share catalog coverage must be complete")
+        if self.catalog_trade_date != self.trade_date:
+            raise ValueError("catalog_trade_date does not match trade_date")
+        if self.catalog_version == 0:
+            raise ValueError("catalog_version must be nonzero")
+        if self.catalog_generation != 1:
+            raise ValueError("frozen catalog_generation must equal one")
+        if self.bound_count != self.capacity:
+            raise ValueError("daily catalog must bind every physical row")
         if self.applied_sequence > self.accepted_sequence:
             raise ValueError("applied_sequence exceeds accepted_sequence")
         if (
@@ -709,7 +730,7 @@ def _validate_latest(
 
 @dataclass(frozen=True, slots=True)
 class SelectionEnvelope:
-    """A coherent observed-universe selection and its session-scoped IDs."""
+    """A coherent daily-catalog selection and its session-scoped IDs."""
 
     run_id: bytes
     catalog_digest: bytes
@@ -749,10 +770,18 @@ class SelectionEnvelope:
             raise ValueError("accepted_sequence uses the reserved sentinel")
         scope = CatalogScope(self.catalog_scope)
         selection = SelectionScope(self.selection_scope)
-        if scope is not CatalogScope.OBSERVED_ONLY:
-            raise ValueError("selection must use OBSERVED_ONLY catalog scope")
-        if self.coverage_complete is not False:
-            raise ValueError("observed-universe selection cannot be complete")
+        if scope is not CatalogScope.DECLARED_DAILY_A_SHARE:
+            raise ValueError(
+                "selection must use DECLARED_DAILY_A_SHARE catalog scope"
+            )
+        if self.coverage_complete is not True:
+            raise ValueError(
+                "daily A-share selection must declare complete coverage"
+            )
+        if self.catalog_generation != 1:
+            raise ValueError("frozen catalog_generation must equal one")
+        if self.bound_count != self.capacity:
+            raise ValueError("daily catalog must bind every physical row")
         if self.applied_sequence > self.accepted_sequence:
             raise ValueError("applied_sequence exceeds accepted_sequence")
         if (
@@ -773,8 +802,8 @@ class SelectionEnvelope:
         if self.capacity == 0:
             raise ValueError("capacity must be nonzero")
         expected = {
-            SelectionScope.BOUND: self.bound_count,
-            SelectionScope.OBSERVED_ANY: self.available_count,
+            SelectionScope.CATALOG_ALL: self.bound_count,
+            SelectionScope.AVAILABLE_ANY: self.available_count,
             SelectionScope.SNAPSHOT_AVAILABLE:
                 self.snapshot_available_count,
             SelectionScope.TICK_AVAILABLE: self.tick_available_count,

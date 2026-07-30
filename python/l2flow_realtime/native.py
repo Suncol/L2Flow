@@ -86,7 +86,9 @@ class _SessionInfoC(ctypes.Structure):
         ("snapshot_available_count", ctypes.c_uint32),
         ("tick_available_count", ctypes.c_uint32),
         ("factor_eligible_count", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32 * 4),
+        ("catalog_trade_date", ctypes.c_uint32),
+        ("reserved_catalog", ctypes.c_uint32),
+        ("catalog_version", ctypes.c_uint64),
     ]
 
 
@@ -318,10 +320,12 @@ def _bytes(array) -> bytes:
 
 
 def _session_from_c(value: _SessionInfoC) -> SessionInfo:
-    if any(value.reserved):
-        raise WireFormatError("session C result reserved fields are nonzero")
-    if value.coverage_complete != 0:
-        raise WireFormatError("Wire V2 coverage_complete must be zero")
+    if value.reserved_catalog != 0:
+        raise WireFormatError(
+            "session C result reserved_catalog is nonzero"
+        )
+    if value.coverage_complete != 1:
+        raise WireFormatError("Wire V2 coverage_complete must be one")
     if value.flags & ~0x3:
         raise WireFormatError("session C result has unknown flags")
     try:
@@ -351,12 +355,14 @@ def _session_from_c(value: _SessionInfoC) -> SessionInfo:
             capacity=value.capacity,
             window_count=value.window_count,
             catalog_scope=CatalogScope(value.catalog_scope),
-            coverage_complete=False,
+            coverage_complete=True,
             bound_count=value.bound_count,
             available_count=value.available_count,
             snapshot_available_count=value.snapshot_available_count,
             tick_available_count=value.tick_available_count,
             factor_eligible_count=value.factor_eligible_count,
+            catalog_trade_date=value.catalog_trade_date,
+            catalog_version=value.catalog_version,
         )
     except ValueError as error:
         raise WireFormatError(f"invalid session C result: {error}") from error
@@ -370,8 +376,8 @@ def _selection_from_c(
         raise WireFormatError(
             "selection C result reserved fields are nonzero"
         )
-    if value.coverage_complete != 0:
-        raise WireFormatError("Wire V2 coverage_complete must be zero")
+    if value.coverage_complete != 1:
+        raise WireFormatError("Wire V2 coverage_complete must be one")
     try:
         return SelectionEnvelope(
             run_id=_bytes(value.run_id),
@@ -384,7 +390,7 @@ def _selection_from_c(
             processing_lag_records=value.processing_lag_records,
             capacity=value.capacity,
             catalog_scope=CatalogScope(value.catalog_scope),
-            coverage_complete=False,
+            coverage_complete=True,
             bound_count=value.bound_count,
             available_count=value.available_count,
             snapshot_available_count=value.snapshot_available_count,

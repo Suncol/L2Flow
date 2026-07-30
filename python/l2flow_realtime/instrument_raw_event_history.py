@@ -51,7 +51,7 @@ InstrumentRawEventColumns = InstrumentTickDeltaResultColumns
 
 
 class InstrumentRawEventLookupError(L2FlowRealtimeError):
-    """An exact instrument key is not bound in this observed session."""
+    """An exact instrument key is absent from this session's daily catalog."""
 
     def __init__(
         self,

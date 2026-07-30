@@ -11,8 +11,8 @@
 
 namespace l2flow::market {
 
-class ObservedInstrumentCatalogSnapshotV2;
-class ObservedInstrumentDirectoryV2;
+class DailyInstrumentCatalogSnapshotV2;
+class InstrumentRuntimeStateV2;
 class RealtimeHistoryEventInputV1;
 class RealtimeHistoryRecordV1;
 struct RealtimeHistoryWatermarkV1;
@@ -48,7 +48,7 @@ struct IntradayInstrumentStoreConfigV1 final {
     bool coverage_from_open = false;
 };
 
-// The decoder resolves the directory ordinal once. The history runtime
+// The decoder resolves the daily-catalog ordinal once. The history runtime
 // carries this value through its source×worker queue so append does not
 // repeat an ID lookup. A token is valid only for the Store session epoch that
 // created it.
@@ -289,7 +289,7 @@ public:
     // This is the exact CatalogSnapshot carried by the matching watermark,
     // not a later snapshot acquired while the generation was built.
     [[nodiscard]] const std::shared_ptr<
-        const ObservedInstrumentCatalogSnapshotV2>&
+        const DailyInstrumentCatalogSnapshotV2>&
     catalog_snapshot() const noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 Find(
@@ -414,7 +414,7 @@ public:
         std::array<std::uint32_t,
                    kIntradayInstrumentStoreSourceCountV1>
             source_stream_ids,
-        const ObservedInstrumentDirectoryV2* directory,
+        const InstrumentRuntimeStateV2* runtime_state,
         std::unique_ptr<IntradayInstrumentStoreV1>* output) noexcept;
 
     [[nodiscard]] IntradayInstrumentStoreQueryErrorV1 ResolveRouteToken(
@@ -441,7 +441,7 @@ public:
         std::uint32_t worker,
         std::uint64_t generation,
         const std::shared_ptr<
-            const ObservedInstrumentCatalogSnapshotV2>& catalog_snapshot,
+            const DailyInstrumentCatalogSnapshotV2>& catalog_snapshot,
         std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>* output)
         noexcept;
 

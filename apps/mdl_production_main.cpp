@@ -1,10 +1,13 @@
 #include "l2flow/common/identity128.h"
+#include "l2flow/common/sha256.h"
 #if !defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V2)
 #error "mdl-production-router requires Linux realtime IPC Wire V2"
 #endif
 #include "l2flow/ipc/order_event_delta_control_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/ipc/realtime_wire_v2.h"
+#include "l2flow/market/daily_instrument_catalog_loader_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
 #include <algorithm>
@@ -33,9 +36,6 @@ namespace ipc = l2flow::ipc;
 namespace market = l2flow::market;
 namespace runtime = l2flow::runtime;
 
-static_assert(
-    market::kObservedInstrumentDirectoryDefaultCapacityV2 <=
-    std::numeric_limits<std::uint32_t>::max());
 static_assert(market::kRealtimeHistorySourceCountV1 == 4U);
 
 volatile std::sig_atomic_t g_stop_requested = 0;
@@ -134,14 +134,12 @@ IntervalWaitResult WaitForInterval(
 struct Options final {
     std::filesystem::path sdk_library;
     std::uint64_t session_epoch = 0U;
-    std::uint32_t instrument_capacity = static_cast<std::uint32_t>(
-        market::kObservedInstrumentDirectoryDefaultCapacityV2);
     std::uint32_t trade_date = 0U;
+    std::filesystem::path daily_catalog;
+    std::uint64_t catalog_version = 0U;
     std::string server_address;
     std::string user_name;
     std::string sdk_log_prefix = "l2flow-realtime";
-    bool enable_mainland_a_share_filter = true;
-
     std::uint32_t instrument_store_workers = 4U;
     std::uint64_t intraday_store_maximum_records = 0U;
     std::uint64_t intraday_store_memory_bytes = 0U;
@@ -174,6 +172,8 @@ void PrintUsage(std::ostream& output) {
         << "  --sdk-library PATH            vendor .so selected by operator\n"
         << "  --session-epoch N             positive u64 session identity\n"
         << "  --trade-date YYYYMMDD         fixed UTC+08:00 trading date\n"
+        << "  --daily-catalog PATH          absolute strict V2 catalog file\n"
+        << "  --catalog-version N           positive u64 source version\n"
         << "  --server-address HOST:PORT    vendor endpoint\n"
         << "  --user-name VALUE             nonempty vendor user/token field\n"
         << "  --ipc-socket PATH             absolute GET_SESSION UDS path\n"
@@ -183,10 +183,7 @@ void PrintUsage(std::ostream& output) {
         << "  --intraday-store-from-open    required assertion that capture "
            "starts at market open\n"
         << "Optional:\n"
-        << "  --instrument-capacity N       1..4294967294, default 65536\n"
         << "  --sdk-log-prefix PATH         default l2flow-realtime\n"
-        << "  --enable-mainland-a-share-filter BOOL\n"
-        << "                                true|false, default true\n"
         << "  --instrument-store-workers N  1..256, default 4\n"
         << "  --intraday-store-segment-kib N\n"
         << "                                4..16384, default 64\n"
@@ -209,11 +206,10 @@ void PrintUsage(std::ostream& output) {
         << "                                1..600000, default 30000; "
            "requires event socket\n"
         << "  --help\n\n"
-        << "The session exposes only the observed universe. Capacity and key "
-           "arena exhaustion are fatal; this process does not roll over or "
-           "resume a session. The current production source catalog contains "
-           "Shanghai and Shenzhen tuples only; enabling the filter does not "
-           "add Beijing ingress.\n";
+        << "The catalog must declare complete Shanghai+Shenzhen A-share "
+           "subscription coverage for the exact trade date. Identity is "
+           "frozen before IPC becomes ACTIVE and SDK Connect; catalog misses "
+           "and capacity failures are fatal.\n";
 }
 
 bool ParseU32(std::string_view text, std::uint32_t* output) noexcept {
@@ -244,21 +240,6 @@ bool ParseU64(std::string_view text, std::uint64_t* output) noexcept {
     }
     *output = value;
     return true;
-}
-
-bool ParseBool(std::string_view text, bool* output) noexcept {
-    if (output == nullptr) {
-        return false;
-    }
-    if (text == "true") {
-        *output = true;
-        return true;
-    }
-    if (text == "false") {
-        *output = false;
-        return true;
-    }
-    return false;
 }
 
 bool ParsePositiveScaledBytes(
@@ -379,12 +360,12 @@ bool ParseOptions(
 
         if (option != "--sdk-library" &&
             option != "--session-epoch" &&
-            option != "--instrument-capacity" &&
             option != "--trade-date" &&
+            option != "--daily-catalog" &&
+            option != "--catalog-version" &&
             option != "--server-address" &&
             option != "--user-name" &&
             option != "--sdk-log-prefix" &&
-            option != "--enable-mainland-a-share-filter" &&
             option != "--instrument-store-workers" &&
             option != "--intraday-store-max-records" &&
             option != "--intraday-store-memory-gib" &&
@@ -420,22 +401,19 @@ bool ParseOptions(
                 *error = "--session-epoch must be positive u64";
                 return false;
             }
-        } else if (option == "--instrument-capacity") {
-            std::uint64_t capacity = 0U;
-            if (!ParseU64(value, &capacity) || capacity == 0U ||
-                capacity >=
-                    std::numeric_limits<std::uint32_t>::max()) {
-                *error =
-                    "--instrument-capacity must be 1..4294967294";
-                return false;
-            }
-            parsed.instrument_capacity =
-                static_cast<std::uint32_t>(capacity);
         } else if (option == "--trade-date") {
             if (value.size() != 8U ||
                 !ParseU32(value, &parsed.trade_date) ||
                 !IsValidTradeDate(parsed.trade_date)) {
                 *error = "--trade-date must be a valid YYYYMMDD date";
+                return false;
+            }
+        } else if (option == "--daily-catalog") {
+            parsed.daily_catalog = std::string(value);
+        } else if (option == "--catalog-version") {
+            if (!ParseU64(value, &parsed.catalog_version) ||
+                parsed.catalog_version == 0U) {
+                *error = "--catalog-version must be positive u64";
                 return false;
             }
         } else if (option == "--server-address") {
@@ -444,16 +422,6 @@ bool ParseOptions(
             parsed.user_name = value;
         } else if (option == "--sdk-log-prefix") {
             parsed.sdk_log_prefix = value;
-        } else if (option ==
-                   "--enable-mainland-a-share-filter") {
-            if (!ParseBool(
-                    value,
-                    &parsed.enable_mainland_a_share_filter)) {
-                *error =
-                    "--enable-mainland-a-share-filter must be "
-                    "true or false";
-                return false;
-            }
         } else if (option == "--instrument-store-workers") {
             if (!ParseU32(
                     value, &parsed.instrument_store_workers) ||
@@ -591,6 +559,8 @@ bool ParseOptions(
     if (parsed.sdk_library.empty() ||
         parsed.session_epoch == 0U ||
         parsed.trade_date == 0U ||
+        parsed.daily_catalog.empty() ||
+        parsed.catalog_version == 0U ||
         parsed.server_address.empty() ||
         parsed.user_name.empty() ||
         parsed.ipc_socket.empty()) {
@@ -599,6 +569,10 @@ bool ParseOptions(
     }
     if (!parsed.ipc_socket.is_absolute()) {
         *error = "--ipc-socket must be an absolute path";
+        return false;
+    }
+    if (!parsed.daily_catalog.is_absolute()) {
+        *error = "--daily-catalog must be an absolute path";
         return false;
     }
     if (!parsed.event_aggregator_socket.empty() &&
@@ -715,6 +689,7 @@ bool EventAggregatorProbeErrorIsRetryable(
 bool WaitForEventAggregatorReady(
     const Options& options,
     const common::Identity128& source_run_id,
+    const market::DailyInstrumentCatalogV2& daily_catalog,
     ipc::OrderEventDeltaControlSnapshotV1* output_snapshot,
     std::string* output_detail) {
     if (output_snapshot == nullptr || output_detail == nullptr ||
@@ -727,9 +702,27 @@ bool WaitForEventAggregatorReady(
     ipc::OrderEventDeltaControlClientConfigV1 config{};
     config.control_socket_path = options.event_aggregator_socket;
     config.expected_source_session.run_id = source_run_id;
+    config.expected_source_session.catalog_digest =
+        daily_catalog.catalog_digest();
     config.expected_source_session.session_epoch =
         options.session_epoch;
+    config.expected_source_session.catalog_generation = 1U;
+    config.expected_source_session.catalog_version =
+        daily_catalog.catalog_version();
     config.expected_source_session.trade_date = options.trade_date;
+    config.expected_source_session.catalog_trade_date =
+        daily_catalog.trade_date();
+    config.expected_source_session.capacity =
+        static_cast<std::uint32_t>(
+            daily_catalog.instrument_count());
+    config.expected_source_session.bound_count =
+        config.expected_source_session.capacity;
+    config.expected_source_session.catalog_scope =
+        static_cast<std::uint32_t>(
+            ipc::RealtimeCatalogScopeV2::
+                kDeclaredDailyAShare);
+    config.expected_source_session.coverage_complete =
+        daily_catalog.coverage_complete() ? 1U : 0U;
 
     const auto deadline =
         std::chrono::steady_clock::now() +
@@ -847,21 +840,49 @@ int Run(const Options& options) {
         return 1;
     }
 
-    market::ObservedInstrumentDirectoryConfigV2 directory_config{};
-    directory_config.capacity =
-        static_cast<std::size_t>(options.instrument_capacity);
-    directory_config.session_epoch = options.session_epoch;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
-    const market::ObservedInstrumentDirectoryErrorV2 directory_error =
-        market::ObservedInstrumentDirectoryV2::Create(
-            directory_config, &directory);
-    if (directory_error !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
-        directory == nullptr) {
+    market::DailyInstrumentCatalogFileOptionsV2 catalog_options{};
+    catalog_options.path = options.daily_catalog;
+    catalog_options.expected_trade_date = options.trade_date;
+    catalog_options.expected_catalog_version =
+        options.catalog_version;
+    catalog_options.session_epoch = options.session_epoch;
+    market::DailyInstrumentCatalogFileResultV2 catalog_result =
+        market::LoadDailyInstrumentCatalogFileV2(catalog_options);
+    if (!catalog_result.ok()) {
         std::cerr
-            << "mdl-production-router: observed directory create failed: "
-            << market::ObservedInstrumentDirectoryErrorNameV2(
-                   directory_error)
+            << "mdl-production-router: daily catalog load failed: "
+            << market::DailyInstrumentCatalogFileErrorNameV2(
+                   catalog_result.error)
+            << " catalog_error="
+            << market::DailyInstrumentCatalogCreateErrorNameV2(
+                   catalog_result.catalog_error)
+            << " line=" << catalog_result.line
+            << '\n';
+        return 1;
+    }
+    std::shared_ptr<const market::DailyInstrumentCatalogV2>
+        daily_catalog(std::move(catalog_result.catalog));
+    if (daily_catalog == nullptr ||
+        daily_catalog->market_scope() !=
+            market::kDailyCatalogMainlandScopeV2 ||
+        !daily_catalog->coverage_complete()) {
+        std::cerr
+            << "mdl-production-router: daily catalog lacks declared "
+               "complete Shanghai+Shenzhen A-share coverage\n";
+        return 1;
+    }
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+    const market::InstrumentRuntimeStateErrorV2 runtime_error =
+        market::InstrumentRuntimeStateV2::Create(
+            *daily_catalog, &runtime_state);
+    if (runtime_error !=
+            market::InstrumentRuntimeStateErrorV2::kNone ||
+        runtime_state == nullptr) {
+        std::cerr
+            << "mdl-production-router: instrument runtime state create "
+               "failed: "
+            << market::InstrumentRuntimeStateErrorNameV2(
+                   runtime_error)
             << '\n';
         return 1;
     }
@@ -872,7 +893,8 @@ int Run(const Options& options) {
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = options.trade_date;
-    pipeline_config.directory = directory.get();
+    pipeline_config.daily_catalog = daily_catalog;
+    pipeline_config.runtime_state = runtime_state.get();
     pipeline_config.source_stream_ids =
         {1001U, 1002U, 2001U, 2002U};
     pipeline_config.store_worker_count =
@@ -892,8 +914,9 @@ int Run(const Options& options) {
         options.intraday_store_from_open;
     pipeline_config.kline.windows = kline_windows;
     pipeline_config.enforce_receive_trade_date = true;
-    pipeline_config.enable_mainland_a_share_filter =
-        options.enable_mainland_a_share_filter;
+    pipeline_config.tick_ring_capacity =
+        static_cast<std::size_t>(
+            options.ipc_tick_ring_records);
     pipeline_config.sdk.enabled = true;
     pipeline_config.sdk.library_path = options.sdk_library;
     pipeline_config.sdk.server_address = options.server_address;
@@ -925,7 +948,7 @@ int Run(const Options& options) {
     ipc_config.run_id = run_id;
     ipc_config.session_epoch = options.session_epoch;
     ipc_config.trade_date = options.trade_date;
-    ipc_config.directory = directory.get();
+    ipc_config.daily_catalog = daily_catalog;
     ipc_config.kline_windows = kline_windows;
     ipc_config.tick_ring_capacity =
         options.ipc_tick_ring_records;
@@ -965,15 +988,16 @@ int Run(const Options& options) {
     std::cerr
         << "mdl-production-router: IPC V2 ACTIVE: socket="
         << ipc_service->control_socket_path()
-        << " capacity=" << options.instrument_capacity
-        << " bound_count=0 catalog_scope=OBSERVED_ONLY"
-        << " coverage_complete=false"
+        << " capacity=" << daily_catalog->instrument_count()
+        << " bound_count=" << daily_catalog->instrument_count()
+        << " catalog_scope=DECLARED_DAILY_A_SHARE"
+        << " coverage_complete=true"
+        << " catalog_version=" << daily_catalog->catalog_version()
+        << " catalog_digest="
+        << common::Sha256Hex(daily_catalog->catalog_digest())
         << " mapping_bytes=" << ipc_service->mapping_bytes()
         << " key_arena_bytes=" << options.ipc_key_arena_bytes
-        << " mainland_a_share_filter="
-        << (options.enable_mainland_a_share_filter
-                ? "true"
-                : "false")
+        << " mainland_a_share_filter=true"
         << '\n';
 
     if (!options.event_aggregator_socket.empty()) {
@@ -982,6 +1006,7 @@ int Run(const Options& options) {
         if (!WaitForEventAggregatorReady(
                 options,
                 run_id,
+                *daily_catalog,
                 &event_snapshot,
                 &ready_detail)) {
             std::cerr
@@ -1002,7 +1027,6 @@ int Run(const Options& options) {
     }
 
     pipeline_config.applied_record_sink = ipc_service;
-    pipeline_config.instrument_binding_sink = ipc_service;
     pipeline_config.processing_progress_sink = ipc_service;
     pipeline_config.store_generation_sink = ipc_service;
 
@@ -1164,11 +1188,11 @@ int Run(const Options& options) {
     const std::shared_ptr<const market::RealtimeKLineGenerationV1>
         final_kline = pipeline->AcquireLatestKLineGeneration();
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         final_catalog;
-    const market::ObservedInstrumentDirectoryErrorV2
+    const market::InstrumentRuntimeStateErrorV2
         catalog_snapshot_error =
-            directory->AcquireSnapshot(&final_catalog);
+            runtime_state->AcquireSnapshot(&final_catalog);
     const market::IntradayInstrumentStoreSnapshotV1& final_store =
         final_snapshot.store;
     std::cerr
@@ -1190,10 +1214,7 @@ int Run(const Options& options) {
         << final_snapshot.processing_progress.applied_sequence
         << " processing_lag_records="
         << final_snapshot.processing_progress.processing_lag_records()
-        << " mainland_a_share_filter="
-        << (final_snapshot.mainland_a_share_filter_enabled
-                ? "true"
-                : "false")
+        << " mainland_a_share_filter=mandatory"
         << " filtered_messages="
         << final_snapshot.filtered_messages
         << " filtered_by_source_sh_snapshot_sh_tick_sz_snapshot_sz_tick="
@@ -1202,10 +1223,10 @@ int Run(const Options& options) {
         << final_snapshot.filtered_messages_by_source[2] << ','
         << final_snapshot.filtered_messages_by_source[3];
     if (catalog_snapshot_error ==
-            market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            market::InstrumentRuntimeStateErrorV2::kNone &&
         final_catalog != nullptr) {
         std::cerr
-            << " catalog_scope=OBSERVED_ONLY"
+            << " catalog_scope=DECLARED_DAILY_A_SHARE"
             << " coverage_complete="
             << (final_catalog->coverage_complete()
                     ? "true"
@@ -1224,7 +1245,7 @@ int Run(const Options& options) {
     } else {
         std::cerr
             << " catalog_snapshot_error="
-            << market::ObservedInstrumentDirectoryErrorNameV2(
+            << market::InstrumentRuntimeStateErrorNameV2(
                    catalog_snapshot_error);
     }
     std::cerr << '\n';

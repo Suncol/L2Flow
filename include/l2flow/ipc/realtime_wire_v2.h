@@ -15,7 +15,7 @@ inline constexpr std::array<std::uint8_t, 8U> kRealtimeShmMagicV2{
 inline constexpr std::array<std::uint8_t, 8U> kRealtimeControlMagicV2{
     'L', '2', 'F', 'C', 'T', 'L', '2', '\0'};
 inline constexpr std::uint16_t kRealtimeWireMajorV2 = 2U;
-inline constexpr std::uint16_t kRealtimeWireMinorV2 = 1U;
+inline constexpr std::uint16_t kRealtimeWireMinorV2 = 2U;
 inline constexpr std::uint32_t kRealtimeLittleEndianMarkerV2 =
     0x01020304U;
 inline constexpr std::uint32_t kRealtimeDefaultInstrumentCapacityV2 =
@@ -39,16 +39,17 @@ enum RealtimeHeaderFlagV2 : std::uint32_t {
     kRealtimeHeaderKLineEnabledV2 = 1U << 1U,
 };
 
-// V2 intentionally has no authoritative/full-universe state. A zero
-// coverage_complete field is part of the wire contract, not an unavailable
-// or coverage-lost condition.
+// V2.2 exposes the immutable, declared daily Shanghai+Shenzhen A-share
+// catalog. It does not claim that every exchange security is subscribed or
+// that every catalog instrument has produced data.
 enum class RealtimeCatalogScopeV2 : std::uint32_t {
-    kObservedOnly = 1U,
+    kDeclaredDailyAShare = 2U,
 };
 
 enum class RealtimeInstrumentBindingStateV2 : std::uint32_t {
-    // Zero is required so a value-initialized physical slot is the canonical
-    // UNBOUND representation.
+    // Zero remains the value-initialized prepublication representation.
+    // A V2.2 ACTIVE mapping has no UNBOUND tail: every capacity row is
+    // prepublished as kBoundNoData or kAvailable.
     kUnbound = 0U,
     kBinding = 1U,
     kBoundNoData = 2U,
@@ -63,11 +64,15 @@ enum RealtimeInstrumentAvailabilityFlagV2 : std::uint32_t {
 };
 
 enum class RealtimeSelectionScopeV2 : std::uint32_t {
-    kBound = 1U,
-    kObservedAny = 2U,
+    kCatalogAll = 1U,
+    kAvailableAny = 2U,
     kSnapshotAvailable = 3U,
     kTickAvailable = 4U,
     kFactorEligible = 5U,
+    // Source-compatibility aliases. Wire V2.2 documentation and new code use
+    // the catalog/availability names.
+    kBound = kCatalogAll,
+    kObservedAny = kAvailableAny,
 };
 
 enum RealtimeWireTickProjectionFlagV2 : std::uint32_t {
@@ -129,7 +134,8 @@ struct RealtimeWireRegionDescriptorV2 final {
 static_assert(sizeof(RealtimeWireRegionDescriptorV2) == 64U);
 static_assert(std::is_standard_layout_v<RealtimeWireRegionDescriptorV2>);
 
-// catalog_generation changes only when the bound identity prefix changes.
+// In V2.2 catalog_generation is the immutable value 1 because the complete
+// capacity-sized identity table is published before ACTIVE.
 // data_state_generation changes when availability or factor eligibility
 // changes. Writers serialize updates covered by status_publish_tag:
 //
@@ -161,8 +167,11 @@ struct alignas(4096) RealtimeWireHeaderV2 final {
     std::uint32_t window_count = 0U;
     std::uint32_t catalog_scope =
         static_cast<std::uint32_t>(
-            RealtimeCatalogScopeV2::kObservedOnly);
-    std::uint32_t coverage_complete = 0U;
+            RealtimeCatalogScopeV2::kDeclaredDailyAShare);
+    std::uint32_t coverage_complete = 1U;
+    std::uint32_t catalog_trade_date = 0U;
+    std::uint32_t reserved_catalog = 0U;
+    std::uint64_t catalog_version = 0U;
     RealtimeWireDigest256V2 layout_digest{};
 
     // Coherent live catalog/data-state status. All fields from this tag
@@ -194,7 +203,7 @@ struct alignas(4096) RealtimeWireHeaderV2 final {
     std::array<RealtimeWireRegionDescriptorV2,
                kRealtimeWireRegionCountV2>
         regions{};
-    std::array<std::uint8_t, 3256U> reserved{};
+    std::array<std::uint8_t, 3240U> reserved{};
 };
 static_assert(sizeof(RealtimeWireHeaderV2) == 4096U);
 static_assert(alignof(RealtimeWireHeaderV2) == 4096U);
@@ -203,27 +212,30 @@ static_assert(offsetof(RealtimeWireHeaderV2, total_mapping_bytes) == 24U);
 static_assert(offsetof(RealtimeWireHeaderV2, session_epoch) == 48U);
 static_assert(offsetof(RealtimeWireHeaderV2, flags) == 60U);
 static_assert(offsetof(RealtimeWireHeaderV2, capacity) == 64U);
-static_assert(offsetof(RealtimeWireHeaderV2, layout_digest) == 80U);
 static_assert(
-    offsetof(RealtimeWireHeaderV2, status_publish_tag) == 112U);
+    offsetof(RealtimeWireHeaderV2, catalog_trade_date) == 80U);
+static_assert(offsetof(RealtimeWireHeaderV2, catalog_version) == 88U);
+static_assert(offsetof(RealtimeWireHeaderV2, layout_digest) == 96U);
 static_assert(
-    offsetof(RealtimeWireHeaderV2, catalog_generation) == 120U);
+    offsetof(RealtimeWireHeaderV2, status_publish_tag) == 128U);
 static_assert(
-    offsetof(RealtimeWireHeaderV2, data_state_generation) == 128U);
-static_assert(offsetof(RealtimeWireHeaderV2, catalog_digest) == 136U);
-static_assert(offsetof(RealtimeWireHeaderV2, bound_count) == 168U);
-static_assert(offsetof(RealtimeWireHeaderV2, accepted_sequence) == 192U);
+    offsetof(RealtimeWireHeaderV2, catalog_generation) == 136U);
 static_assert(
-    offsetof(RealtimeWireHeaderV2, applied_sequence) == 200U);
+    offsetof(RealtimeWireHeaderV2, data_state_generation) == 144U);
+static_assert(offsetof(RealtimeWireHeaderV2, catalog_digest) == 152U);
+static_assert(offsetof(RealtimeWireHeaderV2, bound_count) == 184U);
+static_assert(offsetof(RealtimeWireHeaderV2, accepted_sequence) == 208U);
 static_assert(
-    offsetof(RealtimeWireHeaderV2, heartbeat_monotonic_ns) == 208U);
-static_assert(offsetof(RealtimeWireHeaderV2, regions) == 264U);
-static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 840U);
+    offsetof(RealtimeWireHeaderV2, applied_sequence) == 216U);
+static_assert(
+    offsetof(RealtimeWireHeaderV2, heartbeat_monotonic_ns) == 224U);
+static_assert(offsetof(RealtimeWireHeaderV2, regions) == 280U);
+static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 856U);
 
 // One physical ordinal slot. Instrument identity and key bytes are published
 // once and never changed or rebound within a session. Availability flags and
-// ingress bounds may advance under the row publish_tag. A canonical UNBOUND
-// row is all-zero bytes, including publish_tag and every reserved field.
+// ingress bounds may advance under the row publish_tag. Before prepublication
+// a physical row is all-zero bytes; no such row is valid after ACTIVE.
 struct alignas(64) RealtimeWireInstrumentV2 final {
     std::uint64_t publish_tag = 0U;
     std::uint32_t instrument_id = 0U;
@@ -290,9 +302,8 @@ struct RealtimeWireQuantityV2 final {
 };
 static_assert(sizeof(RealtimeWireQuantityV2) == 16U);
 
-// The payload layout is intentionally unchanged, but the semantic field at
-// offset 12 is now the dynamic directory ordinal rather than a registry
-// ordinal. record_schema_version is therefore 2.
+// The payload layout is intentionally unchanged. The semantic field at
+// offset 12 is the frozen daily-catalog ordinal (instrument_id - 1).
 struct RealtimeWireCommonRecordV2 final {
     std::uint32_t record_schema_version = 2U;
     std::uint32_t record_bytes = 0U;
@@ -539,8 +550,14 @@ static_assert(sizeof(RealtimeControlResponseV2) == 64U);
     const RealtimeWireHeaderV2& header) noexcept {
     return header.catalog_scope ==
                static_cast<std::uint32_t>(
-                   RealtimeCatalogScopeV2::kObservedOnly) &&
-           header.coverage_complete == 0U &&
+                   RealtimeCatalogScopeV2::kDeclaredDailyAShare) &&
+           header.coverage_complete == 1U &&
+           header.catalog_trade_date == header.trade_date &&
+           header.catalog_trade_date != 0U &&
+           header.reserved_catalog == 0U &&
+           header.catalog_version != 0U &&
+           header.catalog_generation == 1U &&
+           header.bound_count == header.capacity &&
            header.reserved_count == 0U &&
            RealtimeWireCountsValidV2(
                header.capacity,

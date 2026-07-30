@@ -38,8 +38,8 @@ enum class SecurityTypeV1 : std::uint8_t {
     kOption,
 };
 
-// Scope is explicit observed-directory metadata. The decoder never guesses it
-// from a security-code prefix.
+// Scope is explicit daily-catalog metadata. The decoder never guesses it from
+// a security-code prefix.
 enum class AssetScopeV1 : std::uint8_t {
     kUnknown = 0U,
     kDocumentedCore = 1U,
@@ -137,7 +137,7 @@ struct DecimalValueV1 final {
 struct QuantityValueV1 final {
     // Quantities retain their native vendor scale.  A scale of zero is an
     // integer native quantity.  The decoder does not assume that the unit is
-    // shares; quantity_unit comes from observed-directory metadata.
+    // shares; quantity_unit comes from daily-catalog metadata.
     std::int64_t raw = 0;
     std::uint8_t scale = 0U;
     bool valid = false;
@@ -223,9 +223,8 @@ struct DecodedMarketCommonV1 final {
     bool security_id_source_valid = false;
     bool md_stream_id_valid = false;
     std::uint32_t instrument_id = 0U;
-    // Stable ordinal in the session's observed directory. The capture-ordered
-    // in-memory dispatcher obtains it with instrument_id; downstream routing
-    // does not perform another key lookup.
+    // Stable ordinal in the frozen daily catalog. Callback admission obtains
+    // it with instrument_id; downstream routing performs no second key lookup.
     std::size_t ordinal =
         std::numeric_limits<std::size_t>::max();
     QuantityUnitV1 quantity_unit = QuantityUnitV1::kUnknown;

@@ -1,6 +1,7 @@
 #include "l2flow/market/intraday_instrument_store_v1.h"
+#include "l2flow/market/daily_instrument_catalog_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/market_types_v1.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/market/realtime_latest_read_model_v1.h"
 
@@ -23,12 +24,12 @@ namespace market = l2flow::market;
 constexpr std::uint32_t kTradeDate = 20260727U;
 constexpr std::array<std::uint32_t, 4U> kSourceStreamIds{
     7101U, 7102U, 7103U, 7104U};
-constexpr std::size_t kDirectoryCapacity = 5U;
-constexpr std::uint64_t kDirectorySessionEpoch = 27U;
+constexpr std::size_t kCatalogCapacity = 5U;
+constexpr std::uint64_t kCatalogSessionEpoch = 27U;
 constexpr std::uint32_t kShanghaiInstrumentId = 1U;
-constexpr std::uint32_t kShenzhenInstrumentId = 2U;
-constexpr std::uint32_t kLateBoundInstrumentId = 3U;
-constexpr std::uint32_t kUnboundInstrumentId = 5U;
+constexpr std::uint32_t kCatalogOnlyInstrumentId = 2U;
+constexpr std::uint32_t kNoDataInstrumentId = 3U;
+constexpr std::uint32_t kShenzhenInstrumentId = 4U;
 constexpr std::uint32_t kOutOfCapacityInstrumentId = 6U;
 
 bool Expect(bool condition, std::string_view detail) {
@@ -55,74 +56,62 @@ market::InstrumentKeyV1 MakeKey(
     return key;
 }
 
-market::ObservedInstrumentMetadataV2 EquityMetadata() {
-    market::ObservedInstrumentMetadataV2 metadata{};
+market::InstrumentRuntimeMetadataV2 EquityMetadata() {
+    market::InstrumentRuntimeMetadataV2 metadata{};
     metadata.quantity_unit = market::QuantityUnitV1::kShare;
     metadata.security_type = market::SecurityTypeV1::kEquity;
     metadata.asset_scope = market::AssetScopeV1::kDocumentedCore;
     return metadata;
 }
 
-bool Bind(
-    market::ObservedInstrumentDirectoryV2* directory,
+market::DailyInstrumentSourceEntryV2 CatalogEntry(
     const market::InstrumentKeyV1& key,
-    std::uint64_t capture_sequence,
-    std::uint32_t expected_instrument_id,
-    market::ObservedInstrumentEntryViewV2* output) {
-    if (directory == nullptr || output == nullptr) {
-        return false;
-    }
-    *output = market::ObservedInstrumentEntryViewV2{};
-    market::ObservedInstrumentBindResultV2 result{};
-    if (directory->BindOrGet(
-            key,
-            EquityMetadata(),
-            capture_sequence,
-            &result) != market::ObservedInstrumentDirectoryErrorV2::kNone ||
-        !result.newly_bound || !result.entry.bound() ||
-        result.entry.instrument_id != expected_instrument_id ||
-        result.entry.ordinal !=
-            static_cast<std::size_t>(expected_instrument_id - 1U)) {
-        return false;
-    }
-    *output = result.entry;
-    return true;
+    market::InstrumentRuntimeMetadataV2 metadata = EquityMetadata()) {
+    market::DailyInstrumentSourceEntryV2 result{};
+    result.key = key;
+    result.metadata = metadata;
+    return result;
 }
 
-std::unique_ptr<market::ObservedInstrumentDirectoryV2> MakeDirectory() {
-    market::ObservedInstrumentDirectoryConfigV2 config{};
-    config.capacity = kDirectoryCapacity;
-    config.session_epoch = kDirectorySessionEpoch;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
-    if (market::ObservedInstrumentDirectoryV2::Create(
-            config, &directory) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
-        directory == nullptr) {
+std::unique_ptr<market::InstrumentRuntimeStateV2> MakeRuntimeState() {
+    const std::array<market::DailyInstrumentSourceEntryV2,
+                     kCatalogCapacity>
+        entries{
+            CatalogEntry(MakeKey(
+                market::MarketV1::kShanghai, "", "600007")),
+            CatalogEntry(MakeKey(
+                market::MarketV1::kShanghai, "", "600033")),
+            CatalogEntry(MakeKey(
+                market::MarketV1::kShanghai, "", "600099")),
+            CatalogEntry(MakeKey(
+                market::MarketV1::kShenzhen, "102", "000018")),
+            CatalogEntry(MakeKey(
+                market::MarketV1::kShenzhen, "102", "000099")),
+        };
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = kTradeDate;
+    config.catalog_version = 1U;
+    config.session_epoch = kCatalogSessionEpoch;
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    if (market::DailyInstrumentCatalogV2::Create(
+            config, entries, &catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        catalog == nullptr) {
         return nullptr;
     }
-    market::ObservedInstrumentEntryViewV2 shanghai{};
-    market::ObservedInstrumentEntryViewV2 shenzhen{};
-    if (!Bind(
-            directory.get(),
-            MakeKey(
-                market::MarketV1::kShanghai, "101", "600007"),
-            1U,
-            kShanghaiInstrumentId,
-            &shanghai) ||
-        !Bind(
-            directory.get(),
-            MakeKey(
-                market::MarketV1::kShenzhen, "102", "000018"),
-            2U,
-            kShenzhenInstrumentId,
-            &shenzhen)) {
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+    if (market::InstrumentRuntimeStateV2::Create(
+            *catalog, &runtime_state) !=
+            market::InstrumentRuntimeStateErrorV2::kNone) {
         return nullptr;
     }
-    return directory;
+    return runtime_state;
 }
 
 void FillCommon(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     market::DecodedMarketCommonV1* common,
     market::MarketEventKindV1 kind,
     market::MarketV1 venue,
@@ -142,22 +131,22 @@ void FillCommon(
     common->origin.recv_monotonic_ns =
         static_cast<std::int64_t>(ingress_sequence * 10U);
     common->instrument_id = instrument_id;
-    market::ObservedInstrumentEntryViewV2 identity{};
-    if (directory.LookupById(instrument_id, &identity) ==
-            market::ObservedInstrumentDirectoryErrorV2::kNone &&
+    market::InstrumentRuntimeEntryViewV2 identity{};
+    if (runtime_state.LookupById(instrument_id, &identity) ==
+            market::InstrumentRuntimeStateErrorV2::kNone &&
         identity.bound()) {
         common->ordinal = identity.ordinal;
     }
 }
 
 market::DecodedMarketEventV1 MakeShanghaiSnapshot(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::int64_t price_p6) {
     market::ShanghaiSnapshotV1 event{};
     FillCommon(
-        directory,
+        runtime_state,
         &event.common,
         market::MarketEventKindV1::kShanghaiSnapshot,
         market::MarketV1::kShanghai,
@@ -173,13 +162,13 @@ market::DecodedMarketEventV1 MakeShanghaiSnapshot(
 }
 
 market::DecodedMarketEventV1 MakeShenzhenSnapshot(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::int64_t price_p6) {
     market::ShenzhenSnapshotV1 event{};
     FillCommon(
-        directory,
+        runtime_state,
         &event.common,
         market::MarketEventKindV1::kShenzhenSnapshot,
         market::MarketV1::kShenzhen,
@@ -195,12 +184,12 @@ market::DecodedMarketEventV1 MakeShenzhenSnapshot(
 }
 
 market::DecodedMarketEventV1 MakeShanghaiTick(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence) {
     market::ShanghaiTickV1 event{};
     FillCommon(
-        directory,
+        runtime_state,
         &event.common,
         market::MarketEventKindV1::kShanghaiTick,
         market::MarketV1::kShanghai,
@@ -213,12 +202,12 @@ market::DecodedMarketEventV1 MakeShanghaiTick(
 }
 
 market::DecodedMarketEventV1 MakeShenzhenOrder(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence) {
     market::ShenzhenOrderV1 event{};
     FillCommon(
-        directory,
+        runtime_state,
         &event.common,
         market::MarketEventKindV1::kShenzhenOrder,
         market::MarketV1::kShenzhen,
@@ -230,21 +219,21 @@ market::DecodedMarketEventV1 MakeShenzhenOrder(
     return event;
 }
 
-market::DecodedMarketEventV1 MakeLateBoundSnapshot(
-    const market::ObservedInstrumentDirectoryV2& directory,
+market::DecodedMarketEventV1 MakeCatalogOnlySnapshot(
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::int64_t price_p6) {
     market::ShanghaiSnapshotV1 event{};
     FillCommon(
-        directory,
+        runtime_state,
         &event.common,
         market::MarketEventKindV1::kShanghaiSnapshot,
         market::MarketV1::kShanghai,
         0U,
         source_sequence,
         ingress_sequence,
-        kLateBoundInstrumentId);
+        kCatalogOnlyInstrumentId);
     event.last_price.raw = price_p6;
     event.last_price.normalized_p6 = price_p6;
     event.last_price.scale = 6U;
@@ -311,33 +300,14 @@ bool Run() {
                 market::RealtimeLatestReadModelCreateErrorV1::
                     kInvalidConfiguration &&
             invalid == nullptr,
-        "Create rejects a null directory");
+        "Create rejects a null runtime state");
 
-    market::ObservedInstrumentDirectoryConfigV2 empty_config{};
-    empty_config.capacity = 2U;
-    empty_config.session_epoch = kDirectorySessionEpoch - 1U;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> empty_directory;
-    std::unique_ptr<market::RealtimeLatestReadModelV1> empty_model;
-    market::RealtimeLatestRecordViewV1 empty_view{};
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state =
+        MakeRuntimeState();
     ok &= Expect(
-        market::ObservedInstrumentDirectoryV2::Create(
-            empty_config, &empty_directory) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            empty_directory != nullptr &&
-            market::RealtimeLatestReadModelV1::Create(
-                empty_directory.get(), &empty_model) ==
-                market::RealtimeLatestReadModelCreateErrorV1::kNone &&
-            empty_model != nullptr &&
-            empty_model->GetLatestSnapshot(1U, &empty_view) ==
-                market::RealtimeLatestQueryErrorV1::kNone &&
-            empty_view.status ==
-                market::RealtimeLatestRecordStatusV1::kUnbound,
-        "latest model starts before the first directory binding");
-
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory =
-        MakeDirectory();
-    ok &= Expect(directory != nullptr, "create observed instrument directory");
-    if (directory == nullptr) {
+        runtime_state != nullptr,
+        "create frozen daily instrument runtime state");
+    if (runtime_state == nullptr) {
         return false;
     }
 
@@ -354,7 +324,7 @@ bool Run() {
             store_config,
             2U,
             kSourceStreamIds,
-            directory.get(),
+            runtime_state.get(),
             &store) ==
                 market::IntradayInstrumentStoreCreateErrorV1::kNone &&
             store != nullptr,
@@ -366,7 +336,7 @@ bool Run() {
     std::unique_ptr<market::RealtimeLatestReadModelV1> model;
     ok &= Expect(
         market::RealtimeLatestReadModelV1::Create(
-            directory.get(), &model) ==
+            runtime_state.get(), &model) ==
                 market::RealtimeLatestReadModelCreateErrorV1::kNone &&
             model != nullptr,
         "create latest read model");
@@ -384,13 +354,14 @@ bool Run() {
             view.record == nullptr,
         "bound instrument starts without requested-type data");
     ok &= Expect(
-        model->GetLatestTick(kUnboundInstrumentId, &view) ==
+        model->GetLatestTick(kNoDataInstrumentId, &view) ==
                 market::RealtimeLatestQueryErrorV1::kNone &&
-            view.instrument_id == kUnboundInstrumentId &&
+            view.instrument_id == kNoDataInstrumentId &&
             view.status ==
-                market::RealtimeLatestRecordStatusV1::kUnbound &&
+                market::RealtimeLatestRecordStatusV1::
+                    kBoundNoTypeData &&
             view.record == nullptr,
-        "capacity slot without a binding reports unbound");
+        "catalog identity without data reports bound-no-type-data");
     ok &= Expect(
         model->GetLatestTick(kOutOfCapacityInstrumentId, &view) ==
                 market::RealtimeLatestQueryErrorV1::kNone &&
@@ -412,89 +383,88 @@ bool Run() {
             market::RealtimeLatestQueryErrorV1::kNullOutput,
         "single query rejects null output");
 
-    market::ObservedInstrumentEntryViewV2 late_bound{};
+    market::InstrumentRuntimeEntryViewV2 catalog_only{};
     ok &= Expect(
-        Bind(
-            directory.get(),
-            MakeKey(
-                market::MarketV1::kShanghai, "101", "600033"),
-            3U,
-            kLateBoundInstrumentId,
-            &late_bound),
-        "bind a new instrument after latest model creation");
-    ok &= Expect(
-        model->GetLatestSnapshot(kLateBoundInstrumentId, &view) ==
+        runtime_state->LookupById(
+            kCatalogOnlyInstrumentId, &catalog_only) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
+            model->GetLatestSnapshot(
+                kCatalogOnlyInstrumentId, &view) ==
                 market::RealtimeLatestQueryErrorV1::kNone &&
-            view.instrument_id == kLateBoundInstrumentId &&
+            view.instrument_id == kCatalogOnlyInstrumentId &&
             view.status ==
                 market::RealtimeLatestRecordStatusV1::kBoundNoTypeData &&
             view.record == nullptr,
-        "post-create binding is queryable without rebuilding an index");
+        "every frozen catalog identity is queryable at model creation");
 
     const market::RealtimeHistoryRecordV1* const sh_snapshot_1 =
         Append(
             store.get(),
             0U,
             1U,
-            MakeShanghaiSnapshot(*directory, 1U, 1U, 7'100'000),
+            MakeShanghaiSnapshot(*runtime_state, 1U, 1U, 7'100'000),
             &ok);
     const market::RealtimeHistoryRecordV1* const sz_snapshot =
         Append(
             store.get(),
             2U,
             2U,
-            MakeShenzhenSnapshot(*directory, 1U, 2U, 18'200'000),
+            MakeShenzhenSnapshot(
+                *runtime_state, 1U, 2U, 18'200'000),
             &ok);
     const market::RealtimeHistoryRecordV1* const sh_tick =
         Append(
             store.get(),
             1U,
             3U,
-            MakeShanghaiTick(*directory, 1U, 3U),
+            MakeShanghaiTick(*runtime_state, 1U, 3U),
             &ok);
     const market::RealtimeHistoryRecordV1* const sz_order =
         Append(
             store.get(),
             3U,
             4U,
-            MakeShenzhenOrder(*directory, 1U, 4U),
+            MakeShenzhenOrder(*runtime_state, 1U, 4U),
             &ok);
     const market::RealtimeHistoryRecordV1* const sh_snapshot_5 =
         Append(
             store.get(),
             0U,
             5U,
-            MakeShanghaiSnapshot(*directory, 2U, 5U, 7'500'000),
+            MakeShanghaiSnapshot(*runtime_state, 2U, 5U, 7'500'000),
             &ok);
     const market::RealtimeHistoryRecordV1* const sh_snapshot_10 =
         Append(
             store.get(),
             0U,
             10U,
-            MakeShanghaiSnapshot(*directory, 3U, 10U, 7'900'000),
+            MakeShanghaiSnapshot(
+                *runtime_state, 3U, 10U, 7'900'000),
             &ok);
-    const market::RealtimeHistoryRecordV1* const late_snapshot =
+    const market::RealtimeHistoryRecordV1* const catalog_only_snapshot =
         Append(
             store.get(),
             0U,
             6U,
-            MakeLateBoundSnapshot(*directory, 1U, 6U, 33'600'000),
+            MakeCatalogOnlySnapshot(
+                *runtime_state, 1U, 6U, 33'600'000),
             &ok);
     if (sh_snapshot_1 == nullptr || sz_snapshot == nullptr ||
         sh_tick == nullptr || sz_order == nullptr ||
         sh_snapshot_5 == nullptr || sh_snapshot_10 == nullptr ||
-        late_snapshot == nullptr) {
+        catalog_only_snapshot == nullptr) {
         return false;
     }
 
-    market::ObservedInstrumentEntryViewV2 sh_lookup{};
-    market::ObservedInstrumentEntryViewV2 sz_lookup{};
+    market::InstrumentRuntimeEntryViewV2 sh_lookup{};
+    market::InstrumentRuntimeEntryViewV2 sz_lookup{};
     ok &= Expect(
-        directory->LookupById(kShanghaiInstrumentId, &sh_lookup) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            directory->LookupById(kShenzhenInstrumentId, &sz_lookup) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone,
-        "resolve bound directory identities");
+        runtime_state->LookupById(kShanghaiInstrumentId, &sh_lookup) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
+            runtime_state->LookupById(
+                kShenzhenInstrumentId, &sz_lookup) ==
+                market::InstrumentRuntimeStateErrorV2::kNone,
+        "resolve frozen catalog identities");
     bool updated = true;
     ok &= Expect(
         model->PublishApplied(
@@ -504,19 +474,10 @@ bool Run() {
         "publish clears updated and rejects null record");
     ok &= Expect(
         model->PublishApplied(
-            directory->capacity(), sh_snapshot_1, &updated) ==
+            runtime_state->capacity(), sh_snapshot_1, &updated) ==
                 market::RealtimeLatestPublishErrorV1::kInvalidOrdinal &&
             !updated,
         "publish rejects an invalid ordinal");
-    ok &= Expect(
-        model->PublishApplied(
-            static_cast<std::size_t>(kUnboundInstrumentId - 1U),
-            sh_snapshot_1,
-            &updated) ==
-                market::RealtimeLatestPublishErrorV1::
-                    kUnboundInstrument &&
-            !updated,
-        "publish rejects an in-capacity unbound slot");
     ok &= Expect(
         model->PublishApplied(
             sz_lookup.ordinal, sh_snapshot_1, &updated) ==
@@ -551,17 +512,17 @@ bool Run() {
         "publish Shenzhen order as mixed tick");
     ok &= Expect(
         model->PublishApplied(
-            late_bound.ordinal, late_snapshot, &updated) ==
+            catalog_only.ordinal, catalog_only_snapshot, &updated) ==
                 market::RealtimeLatestPublishErrorV1::kNone &&
             updated,
-        "post-create binding publishes through its preallocated slot");
+        "catalog-only identity publishes through its preallocated slot");
     ok &= Expect(
-        model->GetLatestSnapshot(kLateBoundInstrumentId, &view) ==
+        model->GetLatestSnapshot(kCatalogOnlyInstrumentId, &view) ==
                 market::RealtimeLatestQueryErrorV1::kNone &&
-            view.available() && view.record == late_snapshot,
-        "post-create binding is readable after publication");
+            view.available() && view.record == catalog_only_snapshot,
+        "catalog identity is readable after publication");
     ok &= Expect(
-        model->GetLatestTick(kLateBoundInstrumentId, &view) ==
+        model->GetLatestTick(kCatalogOnlyInstrumentId, &view) ==
                 market::RealtimeLatestQueryErrorV1::kNone &&
             view.status ==
                 market::RealtimeLatestRecordStatusV1::kBoundNoTypeData &&
@@ -607,8 +568,8 @@ bool Run() {
     const std::array<std::uint32_t, 7U> ids{
         kShenzhenInstrumentId,
         kShanghaiInstrumentId,
-        kLateBoundInstrumentId,
-        kUnboundInstrumentId,
+        kCatalogOnlyInstrumentId,
+        kNoDataInstrumentId,
         0U,
         kShanghaiInstrumentId,
         kOutOfCapacityInstrumentId};
@@ -619,9 +580,10 @@ bool Run() {
                 market::RealtimeLatestQueryErrorV1::kNone &&
             snapshots[0U].record == sz_snapshot &&
             snapshots[1U].record == sh_snapshot_1 &&
-            snapshots[2U].record == late_snapshot &&
+            snapshots[2U].record == catalog_only_snapshot &&
             snapshots[3U].status ==
-                market::RealtimeLatestRecordStatusV1::kUnbound &&
+                market::RealtimeLatestRecordStatusV1::
+                    kBoundNoTypeData &&
             snapshots[4U].status ==
                 market::RealtimeLatestRecordStatusV1::
                     kInvalidInstrumentId &&
@@ -685,7 +647,7 @@ bool Run() {
                 0U,
                 ingress_sequence,
                 MakeShanghaiSnapshot(
-                    *directory,
+                    *runtime_state,
                     source_sequence,
                     ingress_sequence,
                     7'900'000 +
@@ -702,7 +664,7 @@ bool Run() {
         concurrent_model;
     ok &= Expect(
         market::RealtimeLatestReadModelV1::Create(
-            directory.get(), &concurrent_model) ==
+            runtime_state.get(), &concurrent_model) ==
                 market::RealtimeLatestReadModelCreateErrorV1::kNone &&
             concurrent_model != nullptr,
         "create concurrent-read model");
@@ -809,7 +771,8 @@ bool Run() {
     auto rejected_input = market::RealtimeHistoryEventInputV1::Create(
         0U,
         99U,
-        MakeShanghaiSnapshot(*directory, 99U, 99U, 7'099'000));
+        MakeShanghaiSnapshot(
+            *runtime_state, 99U, 99U, 7'099'000));
     market::InstrumentRouteTokenV1 rejected_route{};
     ok &= Expect(
         rejected_input.has_value() &&

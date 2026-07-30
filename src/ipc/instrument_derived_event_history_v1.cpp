@@ -44,6 +44,32 @@ namespace {
            value.find('\0') == std::string::npos;
 }
 
+template <std::size_t Size>
+[[nodiscard]] bool CByteArrayAnyNonzero(
+    const std::uint8_t (&value)[Size]) noexcept {
+    return std::any_of(
+        value,
+        value + Size,
+        [](std::uint8_t byte) noexcept { return byte != 0U; });
+}
+
+[[nodiscard]] bool ExpectedSessionCanonical(
+    const l2flow_shm_session_info_v2& session) noexcept {
+    return CByteArrayAnyNonzero(session.run_id) &&
+           CByteArrayAnyNonzero(session.catalog_digest) &&
+           session.session_epoch != 0U && session.trade_date != 0U &&
+           session.capacity != 0U &&
+           session.catalog_scope ==
+               static_cast<std::uint32_t>(
+                   L2FLOW_CATALOG_DECLARED_DAILY_A_SHARE_V2) &&
+           session.coverage_complete == 1U &&
+           session.catalog_generation == 1U &&
+           session.bound_count == session.capacity &&
+           session.catalog_trade_date == session.trade_date &&
+           session.reserved_catalog == 0U &&
+           session.catalog_version != 0U;
+}
+
 template <typename SourceVariant>
 [[nodiscard]] bool AppendMarketEvents(
     SourceVariant* source,
@@ -576,7 +602,7 @@ InstrumentDerivedEventHistorySessionV1::Create(
     }
     output->reset();
     if (!IsAbsoluteUnixPath(config.control_socket_path) ||
-        config.expected_session.trade_date == 0U ||
+        !ExpectedSessionCanonical(config.expected_session) ||
         config.instrument_id == 0U ||
         config.instrument_id > config.expected_session.bound_count ||
         (config.market != market::MarketV1::kShanghai &&

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "l2flow/common/identity128.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/market/realtime_kline_v1.h"
 #include "l2flow/ipc/realtime_store_generation_sink_v2.h"
@@ -55,10 +55,11 @@ struct RealtimeSharedServiceConfigV2 final {
     l2flow::common::Identity128 run_id{};
     std::uint64_t session_epoch = 1U;
     std::uint32_t trade_date = 0U;
-    // Non-owning. The directory must outlive the service and must still have
-    // an empty bound prefix when Create is called.
-    const l2flow::market::ObservedInstrumentDirectoryV2* directory =
-        nullptr;
+    // Immutable identity source. Create copies every exact key and identity
+    // row into shared memory before Start can make the mapping ACTIVE.
+    std::shared_ptr<
+        const l2flow::market::DailyInstrumentCatalogV2>
+        daily_catalog;
     std::vector<l2flow::market::KLineWindowSpecV1> kline_windows;
     std::uint64_t tick_ring_capacity = 262'144U;
     // Fixed for the session. Exhaustion is fatal; V2 deliberately has no
@@ -87,7 +88,7 @@ enum class RealtimeSharedServiceCreateErrorV2 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
     kInvalidConfiguration,
-    kDirectoryNotEmpty,
+    kCatalogMismatch,
     kLayoutOverflow,
     kMappingCreateFailed,
     kReadOnlyHandleFailed,
@@ -103,12 +104,10 @@ enum class RealtimeSharedServiceCreateErrorV2 : std::uint8_t {
 RealtimeSharedServiceCreateErrorNameV2(
     RealtimeSharedServiceCreateErrorV2 error) noexcept;
 
-// Hard Wire V2 replacement. There is no V1 adapter or authoritative-catalog
-// mode. History and delta readers bind to one immutable observed-universe
-// generation and never enter the live callback/processing path.
+// Wire V2.2 service. History and delta readers bind to one immutable daily
+// catalog generation and never enter the live callback/decoder path.
 class RealtimeSharedMarketServiceV2 final
     : public l2flow::market::RealtimeAppliedRecordSinkV1,
-      public l2flow::market::ObservedInstrumentBindingSinkV2,
       public l2flow::realtime::ProcessingProgressSinkV2,
       public RealtimeStoreGenerationSinkV2 {
 public:
@@ -127,13 +126,10 @@ public:
         std::shared_ptr<RealtimeSharedMarketServiceV2>* output,
         int* system_error_number = nullptr) noexcept;
 
-    // Starts only the minimal GET_SESSION/SCM_RIGHTS control plane and makes
-    // the mapping ACTIVE immediately, including when bound_count is zero.
+    // Starts only the control plane. All catalog rows are already published,
+    // so ACTIVE always begins with bound_count == capacity.
     [[nodiscard]] bool Start(int* system_error_number = nullptr) noexcept;
 
-    [[nodiscard]] bool PublishObservedInstrumentBinding(
-        const l2flow::market::ObservedInstrumentBindResultV2& binding)
-        noexcept override;
     [[nodiscard]] bool PublishApplied(
         std::size_t ordinal,
         const l2flow::market::RealtimeHistoryRecordV1& record)

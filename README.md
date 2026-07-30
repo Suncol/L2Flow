@@ -3,120 +3,115 @@
 L2Flow is a C++20 realtime market-data runtime. The production chain is:
 
 ```text
-vendor SDK callback
-  -> bounded owned-message copy
-  -> nonblocking ordered-processing-queue admission
-  -> callback return
+strict premarket daily A-share catalog
+  -> exact-key sort/deduplicate
+  -> dense session-local IDs
+  -> Store/runtime/IPC preallocation
+  -> Wire V2.2 ACTIVE
 
-ordered in-memory processing dispatcher
-  -> capture-ordered observed-instrument binding
-  -> decoder and fixed ordinal worker
+single-threaded vendor SDK callback
+  -> inspect and exact-key extraction
+  -> A-share classification
+  -> immutable catalog lookup
+  -> one bounded owned-message copy
+  -> direct nonblocking source-decoder admission
+
+four serial source decoder lanes
+  -> bounded cross-lane applied gate
+  -> full decode and exact-key revalidation
   -> intraday Store, latest IPC, and KLine
   -> contiguous applied watermark
-  -> immutable Store/Factor generation
+  -> parked all-lane generation fence
 ```
 
-This branch implements a hard Wire V2 replacement. There is no immutable
-startup registry, optional WAL side path, Wire V1 adapter, or compatibility
-reader.
+The four lanes are fixed: Shanghai snapshot, Shanghai NGTSTick, Shenzhen
+snapshot, and one shared Shenzhen 6.33/6.36 tick lane. This preserves the
+Shanghai phase state machine and Shenzhen order/trade/cancel source order.
+The SDK remains configured for one callback thread.
 
-## Observed-universe contract
+## Daily-catalog contract
 
-The runtime exposes only identities actually observed from the SDK during the
-current session:
+Before SDK Connect, production must load an absolute, regular, non-symlink
+catalog file that declares the configured trade date, a positive source
+version, complete Shanghai+Shenzhen subscription coverage, and exact opaque
+`SecurityID`/`SecurityIDSource` bytes. Wire V2.2 exposes:
 
 ```text
-catalog_scope     = OBSERVED_ONLY
-coverage_complete = false
+catalog_scope             = DECLARED_DAILY_A_SHARE
+catalog_coverage_complete = true
+catalog_generation        = 1
+bound_count               = capacity
 ```
 
-An unknown key means "not observed in this session"; it does not prove that a
-security does not exist. APIs that require an authoritative exchange-wide
-denominator must not treat this catalog as a complete market universe.
-
-The directory preallocates a fixed number of ordinal slots. Production
-defaults to 65,536:
+Entries are filtered with the same A-share classifier used by the callback,
+sorted by exact `(market, SecurityIDSource bytes, SecurityID bytes)`, and
+deduplicated before assigning:
 
 ```text
 instrument_id = ordinal + 1
 ordinal       = instrument_id - 1
 ```
 
-IDs are scoped by `session_epoch`. A numeric ID cannot be reused in another
-session without resolving its exact key again. Capacity and key-arena
-exhaustion fail the session closed; this implementation deliberately has no
-intraday resize or rollover path.
+Identity is immutable for the session. Mutable availability and generation
+state live in a preallocated dense array. `CATALOG_ALL` includes catalog
+members with no data; `AVAILABLE_ANY` includes only identities with an applied
+snapshot or tick. A catalog member with no data returns an empty successful
+history result. A key absent from the catalog is an explicit unknown
+instrument. IDs and rolling cursors are scoped by run/session/trade date and
+catalog digest and cannot cross sessions.
 
-The live status contains:
-
-- `capacity`, `bound_count`, and `available_count`;
-- `snapshot_available_count`, `tick_available_count`, and
-  `factor_eligible_count`;
-- `catalog_generation`, `data_state_generation`, and `catalog_digest`;
-- `accepted_sequence` and `applied_sequence`;
-- `processing_lag_records = accepted_sequence - applied_sequence`;
-
-The enforced relations are:
-
-```text
-factor_eligible_count <= snapshot_available_count
-snapshot_available_count <= available_count <= bound_count <= capacity
-tick_available_count <= available_count
-applied_sequence <= accepted_sequence
-```
-
-Readers become usable while `bound_count == 0`; neither catalog completion nor
-processing lag is a startup gate.
+`coverage_complete=true` means only that the premarket source declares the
+configured Shanghai+Shenzhen A-share subscription scope complete. It does not
+claim complete exchange-wide products, complete-from-open history, or that
+every catalog member has received data.
 
 ## Latency-sensitive path
 
-The SDK callback performs no file I/O and no catalog scan. It copies into a
-bounded pool once and nonblockingly transfers the immutable message to the
-ordered-processing queue. Queue exhaustion fails the session closed instead
-of silently dropping the record.
+Filtering and catalog lookup occur before pool acquisition and all sequence
+allocation. A non-A-share message consumes no global, source, or tick
+sequence. A structurally valid A-share catalog miss is fatal before sequence
+commit. There is no global ProcessingQueue, ProcessingLoop, dynamic
+`BindOrGet`, or runtime IPC binding publication.
 
-Before the SDK connects, the pool prewarms the complete bounded in-flight
-window for wire messages up to 4,096 bytes and physically touches those
-pages. The window includes ordered processing, decoder, batch, and
-applied-completion ownership, whose retained sequence ranges need not overlap.
-Prewarming is capped at 256 MiB, so unusually large configured windows do not
-turn startup into an unbounded reservation. Larger legal messages retain the
-bounded size-class fallback instead of being rejected or narrowing the
-supported message limit.
+Each source ring has `Q` logical message slots plus one reserved control slot.
+Message admission fully constructs its command, release-publishes all accepted
+frontiers, and only then release-publishes the queue tail. Full/closed queues
+and pool exhaustion do not commit candidate sequences and fail the session
+closed; SDK messages are never silently dropped.
 
-The single in-memory dispatcher preserves capture order across all sources
-before `BindOrGet`, then routes records to their source decoders. It enforces
-an explicit applied-sequence window `W`: a record with capture sequence `s`
-is routed only while
-`0 < s - applied_sequence <= W`, and the IPC tick ring is required to have at
-least `W` slots. This bounds out-of-order completion without making the SDK
-callback wait on decoder, Store, or IPC work.
+After pop and before full decode, each lane enforces:
+
+```text
+D = min(4*Q + 4, completion_tracker_capacity - 1,
+        tick_ring_capacity - 1)
+0 < global_sequence - applied_sequence <= D
+```
+
+Cross-source completion may be out of order, but only the contiguous
+completion prefix is published as `applied_sequence`. Backlog remains
+source-local until that lane exhausts its own capacity.
 
 The accepted/applied status tuple is coalesced by a background
 publisher on a 1 ms cadence. Per-record progress notifications therefore do
-not compete continuously with early-session binding and first-availability
-updates; latest slot publication and reads do not wait for this status
-publisher.
+not compete continuously with first-availability updates; latest slot
+publication and reads do not wait for this status publisher.
 
 Known-ID C/Python latest reads acquire `bound_count`, use direct ordinal
 arithmetic, and copy one fixed data slot. A valid published slot is
 self-identifying, so the available-data hot path does not copy the mutable
 instrument row; only an unpublished type slot takes that cold path to
 distinguish `BOUND_NO_DATA` from `TYPE_UNAVAILABLE`. Latest reads do not
-resolve keys, rebuild the catalog index, scan the bound universe, or contend
-on the global catalog status seqcount. Exact key lookup is a separate
-operation whose local sorted index is rebuilt lazily only when
-`catalog_generation` changes.
+resolve keys, rebuild the catalog index, scan the catalog, or contend on the
+status seqcount. Exact key lookup uses a separate immutable local index.
 
-An explicit Store/Factor generation cut installs a processing-dispatch barrier
-at the accepted sequence under a short admission lock. Callbacks resume queue
-admission immediately; the cut waits only for that prefix to become
-applied, then freezes its Catalog Snapshot and enqueues Store/Factor markers.
-Each Store/KLine owner publishes a constant-size cut token after its source
-fences; it does not scan or copy its instrument partition. The first post-cut
-update to a row lazily freezes that row's pre-cut endpoint, while a background
-builder materializes only the Catalog Snapshot's bound prefix. Unbound capacity
-rows are not emitted. The cut is not a gate for live latest reads.
+A generation cut takes the short admission lock, captures global/source/tick
+cuts, and inserts one reserved FIFO fence into every lane. A lane drains its
+pre-cut messages, reaches the fence, and parks. Once all four are parked, the
+coordinator waits for the contiguous applied cut, snapshots catalog/runtime
+availability, begins History generation, asks each source owner to seal, and
+releases all lanes together. Post-cut records cannot enter History or mutate
+generation availability before the snapshot. Timeout, begin, or seal failure
+wakes every lane and fails closed.
 
 The runtime itself does not persist captured messages. It has no startup
 replay gate, Raw WAL, intraday replay, or crash-recovery path. Deployments that
@@ -151,6 +146,8 @@ build/mdl-production-router \
   --sdk-library /absolute/path/to/vendor.so \
   --session-epoch 1 \
   --trade-date 20260730 \
+  --daily-catalog /absolute/path/to/daily.catalog \
+  --catalog-version 20260730 \
   --server-address HOST:PORT \
   --user-name USER \
   --ipc-socket /absolute/path/to/l2flow.sock \
@@ -162,6 +159,17 @@ build/mdl-production-router \
 The control socket must not already exist. Operational code must assert
 `--intraday-store-from-open`; this replacement runtime does not offer a
 partial-session or recovery startup mode.
+
+The catalog is canonical ASCII with LF endings and lowercase exact-byte hex:
+
+```text
+L2FLOW_DAILY_INSTRUMENT_CATALOG_V2	20260730	20260730	sh+sz	complete
+sh	-	363030303031	share	equity	documented_core	-
+sz	31303220	303030303031	share	equity	documented_core	-
+```
+
+The Shenzhen source above decodes to the four bytes `102 `; the loader never
+trims or normalizes it.
 
 For the strict live order-event path, add
 `--event-aggregator-socket /absolute/private/events.sock` to the router and
@@ -184,16 +192,17 @@ build/mdl-order-event-aggregator \
 
 Both socket parents must be same-UID, owner-only directories and neither
 socket may already exist. With the event socket configured, the router starts
-its source IPC service, then waits for an exact source run/epoch/day event
-service at the zero-prefix origin before creating the SDK pipeline. Size the
-source and event rings for measured rates and maximum reader pauses; an
-overrun fails closed and this version does not catch up or recover.
+its source IPC service, then waits for an event service with the exact source
+run and frozen daily-catalog identity at the zero-prefix origin before
+creating the SDK pipeline. Size the source and event rings for measured rates
+and maximum reader pauses; an overrun fails closed and this version does not
+catch up or recover.
 
 ### Default Mainland A-share admission filter
 
-`RealtimePipelineConfigV1::enable_mainland_a_share_filter` and the production
-option `--enable-mainland-a-share-filter true|false` both default to `true`.
-The filter applies the following complete rule:
+The production callback and premarket catalog builder both apply the same
+mandatory, non-configurable classifier. The classifier applies the following
+rule:
 
 1. The classification predicate accepts a `SecurityID` only when it is
    exactly six ASCII decimal digits. Signs, spaces, shorter IDs, and longer
@@ -229,10 +238,8 @@ callback on the next civil date still closes the prior-day session.
 
 The classifier includes the Beijing rule, but the current production message
 catalog contains only Shanghai and Shenzhen tuples
-(`4.101.{4,24}` and `6.101.{28,33,36}`). Enabling this filter does not add a
-Beijing subscription or decoder. Set
-`--enable-mainland-a-share-filter false` only when the operator intentionally
-wants the previous all-supported-products behavior.
+(`4.101.{4,24}` and `6.101.{28,33,36}`). The Beijing classification rule does
+not add a Beijing subscription or decoder.
 
 The rule baseline is 2026-07-30:
 [SSE code allocation guide (2026 second revision)](https://www.sse.com.cn/lawandrules/guide/stock/jyglywznylc/zn/c/c_20260713_10825354.shtml),
@@ -262,12 +269,12 @@ from l2flow_realtime import L2FlowClient, SelectionScope
 
 with L2FlowClient.connect("/absolute/path/to/l2flow.sock") as client:
     session = client.session_info()
-    observed = client.select(SelectionScope.OBSERVED_ANY)
-    snapshots = client.latest_snapshots(observed.instrument_ids)
+    available = client.select(SelectionScope.AVAILABLE_ANY)
+    snapshots = client.latest_snapshots(available.instrument_ids)
 ```
 
-`select()` returns its IDs and counts in one coherent observed-universe
-envelope. Once a caller has a session-scoped ID, `latest_snapshot()`,
+`select()` returns its IDs and counts in one coherent daily-catalog envelope.
+Once a caller has a session-scoped ID, `latest_snapshot()`,
 `latest_tick()`, and `latest_kline()` use the direct known-ID path.
 
 The market library also provides deterministic order-analysis cores for the
@@ -362,5 +369,5 @@ source-free Shenzhen end-of-day finalization. See
 [`docs/order-event-reconstruction-v1.md`](docs/order-event-reconstruction-v1.md)
 for the control protocol, capacity invariant, and failure semantics.
 
-The precise runtime, count, generation, and bias semantics are documented in
-[`docs/observed-universe-runtime-v2.md`](docs/observed-universe-runtime-v2.md).
+The precise runtime, count, and generation semantics are documented in
+[`docs/daily-instrument-catalog-runtime-v2.md`](docs/daily-instrument-catalog-runtime-v2.md).

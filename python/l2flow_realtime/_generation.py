@@ -5,7 +5,12 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from .models import CatalogScope, SessionIdentity, WireFormatError
+from .models import (
+    CatalogScope,
+    SessionIdentity,
+    SessionInfo,
+    WireFormatError,
+)
 
 
 ENDPOINT_BYTES = 248
@@ -80,7 +85,7 @@ def _uint_quad(
 
 @dataclass(frozen=True, slots=True)
 class GenerationEndpoint:
-    """One immutable, observed-universe Store generation endpoint."""
+    """One immutable declared-daily-catalog Store generation endpoint."""
 
     run_id: bytes
     session_epoch: int
@@ -126,6 +131,133 @@ class GenerationEndpoint:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class DailyCatalogSessionIdentity:
+    """The exact live-session identity required to attach history."""
+
+    run_id: bytes
+    session_epoch: int
+    trade_date: int
+    capacity: int
+    catalog_digest: bytes
+    catalog_generation: int
+    bound_count: int
+    catalog_scope: CatalogScope
+    coverage_complete: bool
+    catalog_trade_date: int
+    catalog_version: int
+
+    def __post_init__(self) -> None:
+        validate_daily_catalog_session_identity(self)
+
+    @classmethod
+    def from_session_info(
+        cls, session: SessionInfo
+    ) -> "DailyCatalogSessionIdentity":
+        if not isinstance(session, SessionInfo):
+            raise TypeError("session must be SessionInfo")
+        return cls(
+            run_id=session.run_id,
+            session_epoch=session.session_epoch,
+            trade_date=session.trade_date,
+            capacity=session.capacity,
+            catalog_digest=session.catalog_digest,
+            catalog_generation=session.catalog_generation,
+            bound_count=session.bound_count,
+            catalog_scope=session.catalog_scope,
+            coverage_complete=session.coverage_complete,
+            catalog_trade_date=session.catalog_trade_date,
+            catalog_version=session.catalog_version,
+        )
+
+    @property
+    def session_identity(self) -> SessionIdentity:
+        return SessionIdentity(self.run_id, self.session_epoch)
+
+
+def validate_daily_catalog_session_identity(
+    value: DailyCatalogSessionIdentity,
+) -> None:
+    _exact_bytes(value.run_id, 16, "expected_session.run_id")
+    _exact_bytes(
+        value.catalog_digest,
+        32,
+        "expected_session.catalog_digest",
+    )
+    _fail(
+        not any(value.run_id),
+        "expected_session.run_id is zero",
+    )
+    _fail(
+        not any(value.catalog_digest),
+        "expected_session.catalog_digest is zero",
+    )
+    _uint(
+        value.session_epoch,
+        64,
+        "expected_session.session_epoch",
+        nonzero=True,
+    )
+    _uint(
+        value.trade_date,
+        32,
+        "expected_session.trade_date",
+        nonzero=True,
+    )
+    _uint(
+        value.capacity,
+        32,
+        "expected_session.capacity",
+        nonzero=True,
+    )
+    _uint(
+        value.catalog_generation,
+        64,
+        "expected_session.catalog_generation",
+        nonzero=True,
+    )
+    _uint(
+        value.bound_count,
+        32,
+        "expected_session.bound_count",
+        nonzero=True,
+    )
+    _uint(
+        value.catalog_trade_date,
+        32,
+        "expected_session.catalog_trade_date",
+        nonzero=True,
+    )
+    _uint(
+        value.catalog_version,
+        64,
+        "expected_session.catalog_version",
+        nonzero=True,
+    )
+    _fail(
+        not isinstance(value.catalog_scope, CatalogScope)
+        or value.catalog_scope
+        is not CatalogScope.DECLARED_DAILY_A_SHARE,
+        "expected_session.catalog_scope is not DECLARED_DAILY_A_SHARE",
+    )
+    _fail(
+        value.coverage_complete is not True,
+        "expected_session.coverage_complete is not true",
+    )
+    _fail(
+        value.catalog_generation != 1,
+        "expected_session.catalog_generation is not frozen at one",
+    )
+    _fail(
+        value.bound_count != value.capacity,
+        "expected_session does not bind its full daily catalog",
+    )
+    _fail(
+        value.catalog_trade_date != value.trade_date,
+        "expected_session catalog trade date differs from session day",
+    )
+
+
 def parse_generation_endpoint(
     data: bytes | memoryview, offset: int = 0
 ) -> GenerationEndpoint:
@@ -158,7 +290,7 @@ def parse_generation_endpoint(
         tick_available_count=values[26],
         factor_eligible_count=values[27],
         catalog_scope=CatalogScope(values[28])
-        if values[28] == int(CatalogScope.OBSERVED_ONLY)
+        if values[28] == int(CatalogScope.DECLARED_DAILY_A_SHARE)
         else _unsupported_scope(values[28]),
         coverage_complete=_wire_bool(
             values[29], "generation.coverage_complete"
@@ -170,7 +302,8 @@ def parse_generation_endpoint(
 
 def _unsupported_scope(value: int) -> CatalogScope:
     raise WireFormatError(
-        f"generation catalog_scope {value} is not OBSERVED_ONLY"
+        "generation catalog_scope "
+        f"{value} is not DECLARED_DAILY_A_SHARE"
     )
 
 
@@ -241,8 +374,8 @@ def validate_generation_endpoint(value: GenerationEndpoint) -> None:
     _fail(value.session_epoch == 0, "generation session_epoch is zero")
     _fail(value.generation == 0, "generation number is zero")
     _fail(
-        value.catalog_generation != value.bound_count,
-        "generation catalog_generation does not equal bound_count",
+        value.catalog_generation != 1,
+        "generation catalog_generation does not equal one",
     )
     # Zero is the canonical early-session value when instruments are bound
     # but no snapshot/tick has advanced the observed data state yet.
@@ -271,12 +404,16 @@ def validate_generation_endpoint(value: GenerationEndpoint) -> None:
         "generation tick_available_count exceeds available_count",
     )
     _fail(
-        value.catalog_scope is not CatalogScope.OBSERVED_ONLY,
-        "generation catalog_scope is not OBSERVED_ONLY",
+        value.catalog_scope is not CatalogScope.DECLARED_DAILY_A_SHARE,
+        "generation catalog_scope is not DECLARED_DAILY_A_SHARE",
     )
     _fail(
-        value.coverage_complete,
-        "observed-universe generation claims complete coverage",
+        not value.coverage_complete,
+        "daily A-share generation lacks complete catalog coverage",
+    )
+    _fail(
+        value.bound_count != value.capacity,
+        "daily catalog generation does not bind its full capacity",
     )
     _fail(
         value.flags & ~ENDPOINT_FLAGS_MASK != 0,
@@ -376,19 +513,29 @@ def pack_generation_endpoint(value: GenerationEndpoint) -> bytes:
 def validate_same_session(
     endpoint: GenerationEndpoint,
     *,
-    run_id: bytes,
-    session_epoch: int,
-    trade_date: int,
-    capacity: int,
+    expected: DailyCatalogSessionIdentity,
 ) -> None:
+    if not isinstance(expected, DailyCatalogSessionIdentity):
+        raise TypeError(
+            "expected must be DailyCatalogSessionIdentity"
+        )
+    validate_daily_catalog_session_identity(expected)
     if (
-        endpoint.run_id != run_id
-        or endpoint.session_epoch != session_epoch
-        or endpoint.trade_date != trade_date
-        or endpoint.capacity != capacity
+        endpoint.run_id != expected.run_id
+        or endpoint.session_epoch != expected.session_epoch
+        or endpoint.trade_date != expected.trade_date
+        or endpoint.capacity != expected.capacity
+        or endpoint.catalog_digest != expected.catalog_digest
+        or endpoint.catalog_generation
+        != expected.catalog_generation
+        or endpoint.bound_count != expected.bound_count
+        or endpoint.catalog_scope is not expected.catalog_scope
+        or endpoint.coverage_complete
+        is not expected.coverage_complete
     ):
         raise WireFormatError(
-            "immutable generation belongs to another session/day/layout"
+            "immutable generation belongs to another "
+            "session/day/daily catalog"
         )
 
 
@@ -396,9 +543,11 @@ __all__ = [
     "ENDPOINT_BYTES",
     "ENDPOINT_FLAG_COVERAGE_FROM_OPEN",
     "ENDPOINT_FLAG_RECORD_COVERAGE_COMPLETE",
+    "DailyCatalogSessionIdentity",
     "GenerationEndpoint",
     "pack_generation_endpoint",
     "parse_generation_endpoint",
+    "validate_daily_catalog_session_identity",
     "validate_generation_endpoint",
     "validate_same_session",
 ]

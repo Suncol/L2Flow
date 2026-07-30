@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read known observed-universe instrument IDs through the Wire V2 hot path."""
+"""Read known daily-catalog instrument IDs through the Wire V2 hot path."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Read latest snapshots by session-scoped instrument ID. "
-            "This path never resolves keys or scans the observed catalog."
+            "This path never resolves keys or scans the daily catalog."
         )
     )
     parser.add_argument("--control-socket", required=True)

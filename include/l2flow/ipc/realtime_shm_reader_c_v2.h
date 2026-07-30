@@ -59,11 +59,18 @@ enum l2flow_instrument_lookup_status_v2 {
 };
 
 enum l2flow_selection_scope_v2 {
-    L2FLOW_SELECTION_BOUND_V2 = 1,
-    L2FLOW_SELECTION_OBSERVED_ANY_V2 = 2,
+    L2FLOW_SELECTION_CATALOG_ALL_V2 = 1,
+    L2FLOW_SELECTION_AVAILABLE_ANY_V2 = 2,
     L2FLOW_SELECTION_SNAPSHOT_AVAILABLE_V2 = 3,
     L2FLOW_SELECTION_TICK_AVAILABLE_V2 = 4,
     L2FLOW_SELECTION_FACTOR_ELIGIBLE_V2 = 5,
+    L2FLOW_SELECTION_BOUND_V2 = L2FLOW_SELECTION_CATALOG_ALL_V2,
+    L2FLOW_SELECTION_OBSERVED_ANY_V2 =
+        L2FLOW_SELECTION_AVAILABLE_ANY_V2,
+};
+
+enum l2flow_catalog_scope_v2 {
+    L2FLOW_CATALOG_DECLARED_DAILY_A_SHARE_V2 = 2,
 };
 
 // Stable error set for the stateful instrument raw-event history API. This
@@ -231,7 +238,9 @@ typedef struct l2flow_shm_session_info_v2 {
     uint32_t snapshot_available_count;
     uint32_t tick_available_count;
     uint32_t factor_eligible_count;
-    uint32_t reserved[4];
+    uint32_t catalog_trade_date;
+    uint32_t reserved_catalog;
+    uint64_t catalog_version;
 } l2flow_shm_session_info_v2;
 
 // Minimal throttled Python health sample. Unlike session_v2, this never
@@ -273,7 +282,7 @@ typedef struct l2flow_selection_envelope_v2 {
     uint32_t reserved[2];
 } l2flow_selection_envelope_v2;
 
-// Maps fd read-only and accepts only the sealed Wire V2.1 layout. The caller
+// Maps fd read-only and accepts only the sealed Wire V2.2 layout. The caller
 // retains ownership of fd and may close it immediately after this function
 // returns.
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_open_fd_v2(
@@ -382,10 +391,13 @@ l2flow_shm_reader_select_instruments_v2(
 //
 // Opens one stateful control connection and pins its latest immutable target
 // generation. expected_session must be a successful session_v2 result from
-// the matching shared-memory mapping; its run/session/date/capacity identity
-// is checked against the pinned generation. expected_generation==0 selects
-// the latest published generation, while a nonzero value requires that exact
-// latest generation. timeout_ms==0 leaves socket operations blocking.
+// the matching shared-memory mapping. Its run/session/day/capacity and frozen
+// daily-catalog scope, coverage, generation, bound count, and digest are
+// checked against the pinned generation. catalog_trade_date/catalog_version
+// must also be canonical; catalog_digest binds their catalog definition.
+// expected_generation==0 selects the latest published generation, while a
+// nonzero value requires that exact latest generation. timeout_ms==0 leaves
+// socket operations blocking.
 L2FLOW_SHM_READER_API_V2 int
 l2flow_instrument_raw_event_history_session_open_v2(
     const char* absolute_control_socket_path,

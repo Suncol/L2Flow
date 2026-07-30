@@ -275,22 +275,25 @@ public:
         header_->window_count = 1U;
         header_->catalog_scope =
             static_cast<std::uint32_t>(
-                ipc::RealtimeCatalogScopeV2::kObservedOnly);
-        header_->coverage_complete = 0U;
+                ipc::RealtimeCatalogScopeV2::
+                    kDeclaredDailyAShare);
+        header_->coverage_complete = 1U;
+        header_->catalog_trade_date = kTradeDate;
+        header_->catalog_version = 19U;
         header_->layout_digest.words = {
             0x0102030405060708ULL,
             0x1112131415161718ULL,
             0x2122232425262728ULL,
             0x3132333435363738ULL};
         header_->status_publish_tag = 2U;
-        header_->catalog_generation = 3U;
+        header_->catalog_generation = 1U;
         header_->data_state_generation = 4U;
         header_->catalog_digest.words = {
             0x4142434445464748ULL,
             0x5152535455565758ULL,
             0x6162636465666768ULL,
             0x7172737475767778ULL};
-        header_->bound_count = 3U;
+        header_->bound_count = kCapacity;
         header_->available_count = 2U;
         header_->snapshot_available_count = 1U;
         header_->tick_available_count = 1U;
@@ -500,6 +503,15 @@ private:
             ipc::kRealtimeInstrumentHasTickV2,
             13U,
             13U);
+        BindRow(
+            3U,
+            1U,
+            "N",
+            "CC",
+            ipc::RealtimeInstrumentBindingStateV2::kBoundNoData,
+            0U,
+            0U,
+            0U);
     }
 
     ipc::RealtimeWireCommonRecordV2 Common(
@@ -612,11 +624,14 @@ bool TestSessionAndPointStates() {
             session.capacity == kCapacity &&
             session.catalog_scope ==
                 static_cast<std::uint32_t>(
-                    ipc::RealtimeCatalogScopeV2::kObservedOnly) &&
-            session.coverage_complete == 0U &&
-            session.catalog_generation == 3U &&
+                    ipc::RealtimeCatalogScopeV2::
+                        kDeclaredDailyAShare) &&
+            session.coverage_complete == 1U &&
+            session.catalog_trade_date == kTradeDate &&
+            session.catalog_version == 19U &&
+            session.catalog_generation == 1U &&
             session.data_state_generation == 4U &&
-            session.bound_count == 3U &&
+            session.bound_count == kCapacity &&
             session.available_count == 2U &&
             session.snapshot_available_count == 1U &&
             session.tick_available_count == 1U &&
@@ -639,7 +654,7 @@ bool TestSessionAndPointStates() {
                 std::begin(session.catalog_digest),
                 std::end(session.catalog_digest),
             [](std::uint8_t byte) { return byte != 0U; }),
-        "session returns immutable layout and dynamic catalog digests");
+        "session returns immutable layout and daily catalog digests");
 
     l2flow_shm_health_v2 health{};
     ok &= Expect(
@@ -714,10 +729,10 @@ bool TestSessionAndPointStates() {
             security_id.size(),
             &id_written,
             &status) == L2FLOW_SHM_READER_OK_V2 &&
-            status == L2FLOW_INSTRUMENT_UNBOUND_V2 &&
-            source_written == 0U && id_written == 0U &&
-            row.instrument_id == 99U,
-        "point lookup distinguishes in-capacity UNBOUND without touching row");
+            status == L2FLOW_INSTRUMENT_BOUND_NO_DATA_V2 &&
+            source_written == 1U && id_written == 2U &&
+            row.instrument_id == 4U && row.ordinal == 3U,
+        "point lookup returns prepublished daily identity with no data");
 
     ok &= Expect(
         l2flow_shm_reader_instrument_v2(
@@ -762,12 +777,12 @@ bool TestLatestStatesAndStreams() {
                     L2FLOW_LATEST_AVAILABLE_V2,
                     L2FLOW_LATEST_BOUND_NO_DATA_V2,
                     L2FLOW_LATEST_TYPE_UNAVAILABLE_V2,
-                    L2FLOW_LATEST_UNBOUND_V2,
+                    L2FLOW_LATEST_BOUND_NO_DATA_V2,
                     L2FLOW_LATEST_INVALID_INSTRUMENT_ID_V2,
                     L2FLOW_LATEST_INVALID_INSTRUMENT_ID_V2} &&
             snapshots[0U].common.instrument_id == 1U &&
             snapshots[0U].common.ordinal == 0U,
-        "snapshot latest separates bound, type, unbound, and invalid states");
+        "snapshot latest separates no-data, type, and invalid states");
 
     std::array<ipc::RealtimeWireTickPayloadV2, ids.size()> ticks{};
     ok &= Expect(
@@ -783,7 +798,7 @@ bool TestLatestStatesAndStreams() {
                     L2FLOW_LATEST_TYPE_UNAVAILABLE_V2,
                     L2FLOW_LATEST_BOUND_NO_DATA_V2,
                     L2FLOW_LATEST_AVAILABLE_V2,
-                    L2FLOW_LATEST_UNBOUND_V2,
+                    L2FLOW_LATEST_BOUND_NO_DATA_V2,
                     L2FLOW_LATEST_INVALID_INSTRUMENT_ID_V2,
                     L2FLOW_LATEST_INVALID_INSTRUMENT_ID_V2} &&
             ticks[2U].common.instrument_id == 3U &&
@@ -812,10 +827,10 @@ bool TestLatestStatesAndStreams() {
                     L2FLOW_LATEST_AVAILABLE_V2,
                     L2FLOW_LATEST_BOUND_NO_DATA_V2,
                     L2FLOW_LATEST_TYPE_UNAVAILABLE_V2,
-                    L2FLOW_LATEST_UNBOUND_V2,
+                    L2FLOW_LATEST_BOUND_NO_DATA_V2,
                     L2FLOW_LATEST_INVALID_INSTRUMENT_ID_V2} &&
             klines[0U].instrument_id == 1U,
-        "KLine latest preserves dynamic instrument states");
+        "KLine latest preserves daily-catalog data states");
 
     std::array<ipc::RealtimeWireTickPayloadV2, 2U> ring_ticks{};
     std::size_t written = 0U;
@@ -886,7 +901,7 @@ bool TestResolveRefreshAndSelections() {
     std::array<std::uint32_t, 4U> resolved{};
     std::array<std::uint8_t, 4U> lookup_statuses{};
     bool ok = true;
-    ok &= Expect(
+    const int initial_resolve_error =
         l2flow_shm_reader_resolve_instruments_v2(
             reader.get(),
             markets.data(),
@@ -896,8 +911,9 @@ bool TestResolveRefreshAndSelections() {
             id_lengths.data(),
             markets.size(),
             resolved.data(),
-            lookup_statuses.data()) ==
-                L2FLOW_SHM_READER_OK_V2 &&
+            lookup_statuses.data());
+    ok &= Expect(
+        initial_resolve_error == L2FLOW_SHM_READER_OK_V2 &&
             resolved ==
                 std::array<std::uint32_t, 4U>{1U, 3U, 0U, 0U} &&
             lookup_statuses ==
@@ -907,6 +923,22 @@ bool TestResolveRefreshAndSelections() {
                     L2FLOW_INSTRUMENT_LOOKUP_UNKNOWN_V2,
                     L2FLOW_INSTRUMENT_LOOKUP_INVALID_MARKET_V2},
         "lazy key index sorts exact opaque keys independently of ordinal");
+    if (initial_resolve_error != L2FLOW_SHM_READER_OK_V2 ||
+        resolved !=
+            std::array<std::uint32_t, 4U>{1U, 3U, 0U, 0U}) {
+        std::cerr << "resolve error=" << initial_resolve_error
+                  << " ids=" << resolved[0U] << ','
+                  << resolved[1U] << ',' << resolved[2U] << ','
+                  << resolved[3U] << " status="
+                  << static_cast<unsigned int>(lookup_statuses[0U])
+                  << ','
+                  << static_cast<unsigned int>(lookup_statuses[1U])
+                  << ','
+                  << static_cast<unsigned int>(lookup_statuses[2U])
+                  << ','
+                  << static_cast<unsigned int>(lookup_statuses[3U])
+                  << '\n';
+    }
 
     std::array<std::uint32_t, kCapacity> selected{};
     std::size_t required = 0U;
@@ -919,20 +951,17 @@ bool TestResolveRefreshAndSelections() {
             selected.size(),
             &required,
             &envelope) == L2FLOW_SHM_READER_OK_V2 &&
-            required == 3U &&
-            std::equal(
-                selected.begin(),
-                selected.begin() + 3U,
-                std::array<std::uint32_t, 3U>{1U, 2U, 3U}
-                    .begin()) &&
-            envelope.returned_row_count == 3U &&
-            envelope.bound_count == 3U &&
-            envelope.catalog_generation == 3U &&
+            required == 4U &&
+            selected ==
+                std::array<std::uint32_t, 4U>{1U, 2U, 3U, 4U} &&
+            envelope.returned_row_count == 4U &&
+            envelope.bound_count == 4U &&
+            envelope.catalog_generation == 1U &&
             envelope.data_state_generation == 4U &&
             envelope.accepted_sequence == 100U &&
             envelope.applied_sequence == 99U &&
             envelope.processing_lag_records == 1U,
-        "BOUND selection returns ordinal IDs and one coherent envelope");
+        "CATALOG_ALL selection returns every dense ID in one envelope");
 
     selected.fill(99U);
     ok &= Expect(
@@ -947,7 +976,7 @@ bool TestResolveRefreshAndSelections() {
             selected[1U] == 3U &&
             envelope.returned_row_count ==
                 envelope.available_count,
-        "OBSERVED_ANY selection count equals available_count");
+        "AVAILABLE_ANY selection count equals available_count");
 
     selected.fill(77U);
     ok &= Expect(
@@ -991,7 +1020,6 @@ bool TestResolveRefreshAndSelections() {
             selected[0U] == 77U,
         "selection reports required count and envelope without partial IDs");
 
-    fixture.BindFourth(false, false);
     std::uint32_t fourth = 0U;
     std::uint8_t fourth_status = 0xffU;
     constexpr std::uint8_t market = 1U;
@@ -1005,7 +1033,7 @@ bool TestResolveRefreshAndSelections() {
             fourth_id.data());
     const std::size_t source_length = fourth_source.size();
     const std::size_t id_length = fourth_id.size();
-    ok &= Expect(
+    const int fourth_resolve_error =
         l2flow_shm_reader_resolve_instruments_v2(
             reader.get(),
             &market,
@@ -1015,11 +1043,13 @@ bool TestResolveRefreshAndSelections() {
             &id_length,
             1U,
             &fourth,
-            &fourth_status) == L2FLOW_SHM_READER_OK_V2 &&
+            &fourth_status);
+    ok &= Expect(
+        fourth_resolve_error == L2FLOW_SHM_READER_OK_V2 &&
             fourth == 4U &&
             fourth_status ==
                 L2FLOW_INSTRUMENT_LOOKUP_FOUND_V2,
-        "resolve refreshes its index after catalog_generation changes");
+        "resolve includes a catalog instrument with no data");
 
     ok &= Expect(
         l2flow_shm_reader_select_instruments_v2(
@@ -1031,8 +1061,8 @@ bool TestResolveRefreshAndSelections() {
             &envelope) == L2FLOW_SHM_READER_OK_V2 &&
             required == 4U &&
             envelope.returned_row_count == 4U &&
-            envelope.catalog_generation == 4U,
-        "selection binds rows and counts to the new catalog cut");
+            envelope.catalog_generation == 1U,
+        "selection retains one frozen catalog cut");
 
     fixture.SetStatusTag(5U);
     ok &= Expect(

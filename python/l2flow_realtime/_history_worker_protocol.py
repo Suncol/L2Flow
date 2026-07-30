@@ -20,16 +20,17 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Mapping, Sequence
 
+from ._generation import DailyCatalogSessionIdentity
 from ._stream_control import UINT64_MAX
 from .checkpoint import CHECKPOINT_BYTES
-from .models import ProtocolError, WireFormatError
+from .models import CatalogScope, ProtocolError, WireFormatError
 
 
 CONTROL_MAGIC = b"L2FHWK2\x00"
 RING_MAGIC = b"L2FHRR2\x00"
 SLOT_MAGIC = b"L2FHRS2\x00"
 PROTOCOL_MAJOR = 2
-PROTOCOL_MINOR = 0
+PROTOCOL_MINOR = 1
 CONTROL_PACKET_BYTES = 512
 CONTROL_PAYLOAD_OFFSET = 80
 CONTROL_PAYLOAD_BYTES = CONTROL_PACKET_BYTES - CONTROL_PAYLOAD_OFFSET
@@ -189,13 +190,13 @@ DEFAULT_RESULT_COLUMNS = (
 _CONTROL_PREFIX = struct.Struct("<8sHHHHIQQII4Q")
 _RING_PREFIX = struct.Struct("<8sHHIQIIIQQ32s")
 _SLOT_PREFIX = struct.Struct("<8sHHIIII18Q")
-_INIT_PREFIX = struct.Struct("<16sQIIQQHH")
+_INIT_PREFIX = struct.Struct("<16s32sQQQIIIIIIQQHH")
 _OPEN_PREFIX = struct.Struct("<IIQII8x")
 
 assert _CONTROL_PREFIX.size == 76
 assert _RING_PREFIX.size == 84
 assert _SLOT_PREFIX.size == 172
-assert _INIT_PREFIX.size == 52
+assert _INIT_PREFIX.size == 116
 assert _OPEN_PREFIX.size == 32
 assert SLOT_CHECKPOINT_OFFSET + CHECKPOINT_BYTES <= SLOT_HEADER_BYTES
 
@@ -475,21 +476,18 @@ def recv_control(channel: socket.socket) -> ControlPacket:
 
 def pack_init_payload(
     *,
-    run_id: bytes,
-    session_epoch: int,
-    trade_date: int,
-    capacity: int,
+    expected_session: DailyCatalogSessionIdentity,
     timeout_ns: int,
     result_column_mask: int,
     control_socket_path: str | bytes,
 ) -> bytes:
     path = os.fsencode(control_socket_path)
-    if (
-        not isinstance(run_id, bytes)
-        or len(run_id) != 16
-        or not any(run_id)
+    if not isinstance(
+        expected_session, DailyCatalogSessionIdentity
     ):
-        raise ValueError("worker run_id must contain 16 nonzero bytes")
+        raise TypeError(
+            "expected_session must be DailyCatalogSessionIdentity"
+        )
     if (
         not path
         or b"\x00" in path
@@ -503,10 +501,17 @@ def pack_init_payload(
     _INIT_PREFIX.pack_into(
         payload,
         0,
-        run_id,
-        session_epoch,
-        trade_date,
-        capacity,
+        expected_session.run_id,
+        expected_session.catalog_digest,
+        expected_session.session_epoch,
+        expected_session.catalog_generation,
+        expected_session.catalog_version,
+        expected_session.trade_date,
+        expected_session.catalog_trade_date,
+        expected_session.capacity,
+        expected_session.bound_count,
+        int(expected_session.catalog_scope),
+        int(expected_session.coverage_complete),
         timeout_ns,
         result_column_mask,
         len(path),
@@ -518,14 +523,21 @@ def pack_init_payload(
 
 def parse_init_payload(
     payload: bytes,
-) -> tuple[bytes, int, int, int, int, int, bytes]:
+) -> tuple[DailyCatalogSessionIdentity, int, int, bytes]:
     if len(payload) != CONTROL_PAYLOAD_BYTES:
         raise ProtocolError("worker INIT payload has the wrong size")
     (
         run_id,
+        catalog_digest,
         session_epoch,
+        catalog_generation,
+        catalog_version,
         trade_date,
+        catalog_trade_date,
         capacity,
+        bound_count,
+        catalog_scope,
+        coverage_complete,
         timeout_ns,
         result_column_mask,
         path_length,
@@ -533,11 +545,7 @@ def parse_init_payload(
     ) = _INIT_PREFIX.unpack_from(payload)
     end = _INIT_PREFIX.size + path_length
     if (
-        not any(run_id)
-        or session_epoch == 0
-        or trade_date == 0
-        or capacity == 0
-        or timeout_ns == 0
+        timeout_ns == 0
         or reserved
         or path_length == 0
         or path_length > MAX_CONTROL_PATH_BYTES
@@ -552,11 +560,28 @@ def parse_init_payload(
     path = payload[_INIT_PREFIX.size:end]
     if b"\x00" in path or not os.path.isabs(path):
         raise ProtocolError("worker INIT path is invalid")
+    try:
+        expected_session = DailyCatalogSessionIdentity(
+            run_id=run_id,
+            session_epoch=session_epoch,
+            trade_date=trade_date,
+            capacity=capacity,
+            catalog_digest=catalog_digest,
+            catalog_generation=catalog_generation,
+            bound_count=bound_count,
+            catalog_scope=CatalogScope(catalog_scope),
+            coverage_complete=bool(coverage_complete)
+            if coverage_complete in (0, 1)
+            else coverage_complete,
+            catalog_trade_date=catalog_trade_date,
+            catalog_version=catalog_version,
+        )
+    except (TypeError, ValueError, WireFormatError) as error:
+        raise ProtocolError(
+            "worker INIT daily catalog identity is invalid"
+        ) from error
     return (
-        run_id,
-        session_epoch,
-        trade_date,
-        capacity,
+        expected_session,
         timeout_ns,
         result_column_mask,
         path,

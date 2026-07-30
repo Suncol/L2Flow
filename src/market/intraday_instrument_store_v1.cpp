@@ -1,6 +1,6 @@
 #include "l2flow/market/intraday_instrument_store_v1.h"
 
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/market_types_v1.h"
 #include "l2flow/market/realtime_history_v1.h"
 
@@ -498,14 +498,14 @@ struct RowCaptureState final {
 struct SessionState final {
     IntradayInstrumentStoreConfigV1 config{};
     std::uint32_t worker_count = 0U;
-    const ObservedInstrumentDirectoryV2* directory = nullptr;
-    std::uint64_t directory_session_epoch = 0U;
+    const InstrumentRuntimeStateV2* runtime_state = nullptr;
+    std::uint64_t runtime_state_session_epoch = 0U;
     std::size_t capacity = 0U;
     std::uint64_t session_epoch = 0U;
     std::array<std::uint32_t, kIntradayInstrumentStoreSourceCountV1>
         source_stream_ids{};
     std::vector<std::unique_ptr<WorkerState>> workers;
-    // Exact directory-ordinal order: instrument_id == ordinal + 1.
+    // Exact daily-catalog ordinal order: instrument_id == ordinal + 1.
     std::vector<OrdinalEntry> ordinals;
     // Fixed capacity storage allocated before ingress starts. The generation
     // builder and one permanent row owner synchronize only for a constant-size
@@ -631,7 +631,7 @@ void ReturnQuota(
 
 struct WorkerSliceData final {
     std::shared_ptr<SessionState> session;
-    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+    std::shared_ptr<const DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
     std::uint32_t worker = 0U;
     std::uint64_t generation = 0U;
@@ -641,7 +641,7 @@ struct WorkerSliceData final {
 struct GenerationData final {
     RealtimeHistoryWatermarkV1 watermark{};
     std::shared_ptr<const SessionState> session;
-    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+    std::shared_ptr<const DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
     std::vector<CapturedInstrumentRow> rows;
     std::uint64_t record_count = 0U;
@@ -1537,7 +1537,7 @@ IntradayInstrumentStoreGenerationV1::store_session_epoch()
     return impl_->data->session->session_epoch;
 }
 
-const std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>&
+const std::shared_ptr<const DailyInstrumentCatalogSnapshotV2>&
 IntradayInstrumentStoreGenerationV1::catalog_snapshot()
     const noexcept {
     return impl_->data->catalog_snapshot;
@@ -1738,7 +1738,7 @@ IntradayInstrumentStoreV1::Create(
     std::array<std::uint32_t,
                kIntradayInstrumentStoreSourceCountV1>
         source_stream_ids,
-    const ObservedInstrumentDirectoryV2* directory,
+    const InstrumentRuntimeStateV2* runtime_state,
     std::unique_ptr<IntradayInstrumentStoreV1>* output) noexcept {
     if (output == nullptr) {
         return IntradayInstrumentStoreCreateErrorV1::kNullOutput;
@@ -1757,8 +1757,8 @@ IntradayInstrumentStoreV1::Create(
         }
     }
     if (worker_count == 0U || worker_count > 256U ||
-        directory == nullptr || directory->capacity() == 0U ||
-        directory->capacity() >
+        runtime_state == nullptr || runtime_state->capacity() == 0U ||
+        runtime_state->capacity() >
             static_cast<std::size_t>(
                 std::numeric_limits<std::uint32_t>::max()) ||
         !valid_source_ids ||
@@ -1785,10 +1785,10 @@ IntradayInstrumentStoreV1::Create(
         auto session = std::make_shared<SessionState>();
         session->config = config;
         session->worker_count = worker_count;
-        session->directory = directory;
-        session->directory_session_epoch =
-            directory->session_epoch();
-        session->capacity = directory->capacity();
+        session->runtime_state = runtime_state;
+        session->runtime_state_session_epoch =
+            runtime_state->session_epoch();
+        session->capacity = runtime_state->capacity();
         session->session_epoch = session_epoch;
         session->source_stream_ids = source_stream_ids;
         session->workers.reserve(worker_count);
@@ -1884,9 +1884,9 @@ IntradayInstrumentStoreV1::ResolveRouteToken(
         return IntradayInstrumentStoreQueryErrorV1::kNotFound;
     }
     std::size_t resolved_ordinal = 0U;
-    if (session.directory->ResolveBoundId(
+    if (session.runtime_state->ResolveBoundId(
             instrument_id, &resolved_ordinal) !=
-            ObservedInstrumentDirectoryErrorV2::kNone ||
+            InstrumentRuntimeStateErrorV2::kNone ||
         resolved_ordinal != ordinal) {
         return IntradayInstrumentStoreQueryErrorV1::kNotFound;
     }
@@ -2165,7 +2165,7 @@ IntradayInstrumentStoreV1::CaptureWorker(
     std::uint32_t worker,
     std::uint64_t generation,
     const std::shared_ptr<
-        const ObservedInstrumentCatalogSnapshotV2>& catalog_snapshot,
+        const DailyInstrumentCatalogSnapshotV2>& catalog_snapshot,
     std::unique_ptr<IntradayInstrumentStoreWorkerSliceV1>* output)
     noexcept {
     if (output == nullptr) {
@@ -2181,7 +2181,7 @@ IntradayInstrumentStoreV1::CaptureWorker(
     }
     if (catalog_snapshot == nullptr ||
         catalog_snapshot->session_epoch() !=
-            session.directory_session_epoch ||
+            session.runtime_state_session_epoch ||
         catalog_snapshot->capacity() != session.capacity ||
         catalog_snapshot->bound_count() > session.capacity) {
         return IntradayInstrumentStoreGenerationErrorV1::
@@ -2254,7 +2254,7 @@ IntradayInstrumentStoreV1::BuildGeneration(
 
     if (watermark.catalog_snapshot == nullptr ||
         watermark.catalog_snapshot->session_epoch() !=
-            session.directory_session_epoch ||
+            session.runtime_state_session_epoch ||
         watermark.catalog_snapshot->capacity() != session.capacity) {
         return IntradayInstrumentStoreGenerationErrorV1::
             kInvalidWatermark;
@@ -2386,10 +2386,10 @@ IntradayInstrumentStoreV1::BuildGeneration(
                     return IntradayInstrumentStoreGenerationErrorV1::
                         kIncompleteWorkerSet;
                 }
-                ObservedInstrumentEntryViewV2 catalog_entry{};
+                InstrumentRuntimeEntryViewV2 catalog_entry{};
                 if (watermark.catalog_snapshot->EntryAt(
                         row.ordinal, &catalog_entry) !=
-                        ObservedInstrumentDirectoryErrorV2::kNone ||
+                        InstrumentRuntimeStateErrorV2::kNone ||
                     !catalog_entry.bound() ||
                     catalog_entry.instrument_id != row.instrument_id ||
                     catalog_entry.ordinal != row.ordinal ||

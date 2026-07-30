@@ -1,8 +1,9 @@
 #include "l2flow/factor/realtime_factor_engine_v1.h"
 
 #include "l2flow/common/identity128.h"
+#include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/market_types_v1.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <algorithm>
@@ -64,73 +65,114 @@ struct TestContext final {
     return result;
 }
 
-[[nodiscard]] market::ObservedInstrumentMetadataV2 EquityMetadata() {
+[[nodiscard]] market::InstrumentMetadataV2 EquityMetadata() {
     return {
         market::QuantityUnitV1::kShare,
         market::SecurityTypeV1::kEquity,
         market::AssetScopeV1::kDocumentedCore};
 }
 
-[[nodiscard]] std::unique_ptr<
-    market::ObservedInstrumentDirectoryV2>
-MakeDirectory(
+struct DailyRuntimeFixture final {
+    std::shared_ptr<const market::DailyInstrumentCatalogV2> catalog;
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return catalog != nullptr && runtime_state != nullptr;
+    }
+};
+
+[[nodiscard]] std::unique_ptr<DailyRuntimeFixture>
+MakeDailyRuntimeFixture(
     TestContext* test,
-    std::size_t capacity,
+    std::span<const market::InstrumentKeyV1> keys,
     std::uint64_t session_epoch) {
-    market::ObservedInstrumentDirectoryConfigV2 config{};
-    config.capacity = capacity;
+    std::vector<market::DailyInstrumentSourceEntryV2> source;
+    try {
+        source.reserve(keys.size());
+        for (const market::InstrumentKeyV1& key : keys) {
+            market::DailyInstrumentSourceEntryV2 entry{};
+            entry.key = key;
+            entry.metadata = EquityMetadata();
+            source.push_back(std::move(entry));
+        }
+    } catch (...) {
+        test->Expect(false, "daily catalog fixture allocation succeeds");
+        return nullptr;
+    }
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = kTradeDate;
+    config.catalog_version = session_epoch;
     config.session_epoch = session_epoch;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> result;
-    const auto error =
-        market::ObservedInstrumentDirectoryV2::Create(
-            config, &result);
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    const auto catalog_error =
+        market::DailyInstrumentCatalogV2::Create(
+            config, source, &catalog);
     test->Expect(
-        error ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            result != nullptr,
-        "observed instrument directory creates");
+        catalog_error ==
+                market::DailyInstrumentCatalogCreateErrorV2::kNone &&
+            catalog != nullptr,
+        "frozen complete daily instrument catalog creates");
+    if (catalog == nullptr) {
+        return nullptr;
+    }
+    auto result = std::make_unique<DailyRuntimeFixture>();
+    result->catalog =
+        std::shared_ptr<const market::DailyInstrumentCatalogV2>(
+            std::move(catalog));
+    const auto runtime_error =
+        market::InstrumentRuntimeStateV2::Create(
+            *result->catalog, &result->runtime_state);
+    test->Expect(
+        runtime_error ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
+            result->runtime_state != nullptr,
+        "dense runtime state creates from frozen daily catalog");
+    if (result->runtime_state == nullptr) {
+        return nullptr;
+    }
     return result;
 }
 
-[[nodiscard]] std::uint32_t BindInstrument(
+[[nodiscard]] std::unique_ptr<DailyRuntimeFixture>
+MakeSingleInstrumentDailyRuntimeFixture(
     TestContext* test,
-    market::ObservedInstrumentDirectoryV2* directory,
-    const market::InstrumentKeyV1& key,
-    std::uint64_t capture_sequence) {
-    market::ObservedInstrumentBindResultV2 result{};
-    const auto error = directory == nullptr
-                           ? market::ObservedInstrumentDirectoryErrorV2::
-                                 kNullOutput
-                           : directory->BindOrGet(
-                                 key,
-                                 EquityMetadata(),
-                                 capture_sequence,
-                                 &result);
+    std::uint64_t session_epoch,
+    std::string_view security_id = "600001") {
+    const std::array<market::InstrumentKeyV1, 1U> keys{{
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", security_id),
+    }};
+    return MakeDailyRuntimeFixture(test, keys, session_epoch);
+}
+
+[[nodiscard]] std::uint32_t CatalogInstrumentId(
+    TestContext* test,
+    const market::DailyInstrumentCatalogV2* catalog,
+    const market::InstrumentKeyV1& key) {
+    const market::DailyInstrumentCatalogLookupResultV2 lookup =
+        catalog == nullptr
+            ? market::DailyInstrumentCatalogLookupResultV2{}
+            : catalog->Lookup(key);
     test->Expect(
-        error ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            result.newly_bound && result.entry.bound() &&
-            result.entry.instrument_id ==
-                static_cast<std::uint32_t>(
-                    result.entry.ordinal + 1U),
-        "observed instrument binds to its capture-ordered ID");
-    return error ==
-                       market::ObservedInstrumentDirectoryErrorV2::
-                           kNone
-               ? result.entry.instrument_id
-               : 0U;
+        lookup.known() && lookup.entry->instrument_id ==
+                              static_cast<std::uint32_t>(
+                                  lookup.entry->ordinal + 1U),
+        "exact daily catalog key resolves to its dense ID");
+    return lookup.known() ? lookup.entry->instrument_id : 0U;
 }
 
 [[nodiscard]] std::unique_ptr<market::RealtimeHistoryRuntimeV1>
 MakeRuntime(
     TestContext* test,
-    market::ObservedInstrumentDirectoryV2* directory,
+    market::InstrumentRuntimeStateV2* runtime_state,
     std::uint64_t maximum_session_records = 1024U) {
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = kSourceStreamIds;
     config.worker_count = 2U;
     config.queue_capacity_per_source_worker = 64U;
-    config.directory = directory;
+    config.runtime_state = runtime_state;
     config.intraday_store.segment_target_bytes =
         market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     config.intraday_store.maximum_session_records =
@@ -144,7 +186,7 @@ MakeRuntime(
     test->Expect(
         error == market::RealtimeHistoryCreateErrorV1::kNone &&
             result != nullptr,
-        "observed-universe history runtime creates");
+        "daily-catalog history runtime creates");
     return result;
 }
 
@@ -157,7 +199,7 @@ MakeRuntime(
 }
 
 void FillCommon(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     market::DecodedMarketCommonV1* common,
     market::MarketEventKindV1 kind,
     market::MarketV1 venue,
@@ -177,9 +219,9 @@ void FillCommon(
     common->origin.recv_monotonic_ns =
         static_cast<std::int64_t>(ingress_sequence * 10U);
     common->instrument_id = instrument_id;
-    market::ObservedInstrumentEntryViewV2 identity{};
-    if (directory.LookupById(instrument_id, &identity) ==
-            market::ObservedInstrumentDirectoryErrorV2::kNone &&
+    market::InstrumentRuntimeEntryViewV2 identity{};
+    if (runtime_state.LookupById(instrument_id, &identity) ==
+            market::InstrumentRuntimeStateErrorV2::kNone &&
         identity.bound()) {
         common->ordinal = identity.ordinal;
     }
@@ -193,7 +235,7 @@ struct SnapshotPrice final {
 
 [[nodiscard]] bool SubmitSnapshot(
     market::RealtimeHistoryRuntimeV1* runtime,
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     market::MarketV1 venue,
     std::uint32_t instrument_id,
     std::uint64_t source_sequence,
@@ -203,7 +245,7 @@ struct SnapshotPrice final {
         venue == market::MarketV1::kShanghai ? 0U : 2U;
     const auto fill = [&](auto* event) {
         FillCommon(
-            directory,
+            runtime_state,
             &event->common,
             venue == market::MarketV1::kShanghai
                 ? market::MarketEventKindV1::kShanghaiSnapshot
@@ -239,14 +281,14 @@ struct SnapshotPrice final {
 
 [[nodiscard]] bool SubmitShanghaiTick(
     market::RealtimeHistoryRuntimeV1* runtime,
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint32_t instrument_id,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::uint64_t tick_stream_sequence) {
     market::ShanghaiTickV1 tick{};
     FillCommon(
-        directory,
+        runtime_state,
         &tick.common,
         market::MarketEventKindV1::kShanghaiTick,
         market::MarketV1::kShanghai,
@@ -267,7 +309,7 @@ struct SnapshotPrice final {
 }
 
 [[nodiscard]] bool WaitUntilApplied(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint32_t instrument_id,
     std::uint64_t ingress_sequence,
     bool factor_eligible,
@@ -275,9 +317,9 @@ struct SnapshotPrice final {
     std::chrono::seconds timeout = 5s) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     do {
-        market::ObservedInstrumentEntryViewV2 entry{};
-        if (directory.LookupById(instrument_id, &entry) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        market::InstrumentRuntimeEntryViewV2 entry{};
+        if (runtime_state.LookupById(instrument_id, &entry) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             entry.last_ingress_sequence >= ingress_sequence &&
             entry.has_snapshot &&
             entry.has_tick == has_tick &&
@@ -294,20 +336,27 @@ struct SnapshotPrice final {
 PublishStoreGeneration(
     TestContext* test,
     market::RealtimeHistoryRuntimeV1* runtime,
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t generation,
     std::array<std::uint64_t,
                market::kRealtimeHistorySourceCountV1>
         source_sequence_exclusive,
     std::uint64_t accepted_sequence) {
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
     test->Expect(
-        directory.AcquireSnapshot(&catalog_snapshot) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            catalog_snapshot != nullptr,
-        "exact observed CatalogSnapshot freezes");
+        runtime_state.AcquireSnapshot(&catalog_snapshot) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
+            catalog_snapshot != nullptr &&
+            catalog_snapshot->catalog_scope() ==
+                market::InstrumentCatalogScopeV2::
+                    kDeclaredDailyAShare &&
+            catalog_snapshot->coverage_complete() &&
+            catalog_snapshot->catalog_generation() == 1U &&
+            catalog_snapshot->bound_count() ==
+                catalog_snapshot->capacity(),
+        "exact complete daily CatalogSnapshot freezes");
     if (catalog_snapshot == nullptr || runtime == nullptr) {
         return nullptr;
     }
@@ -346,21 +395,21 @@ PublishStoreGeneration(
             source_watermarks,
             &watermark) ==
             market::RealtimeHistoryWatermarkErrorV1::kNone,
-        "observed store watermark builds");
+        "daily-catalog store watermark builds");
     if (watermark.generation == 0U) {
         return nullptr;
     }
     test->Expect(
         runtime->BeginGeneration(watermark) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
-        "observed store generation begins");
+        "daily-catalog store generation begins");
     for (std::uint8_t source = 0U;
          source < market::kRealtimeHistorySourceCountV1;
          ++source) {
         test->Expect(
             runtime->SealSource(source, generation) ==
                 market::RealtimeHistoryGenerationErrorV1::kNone,
-            "observed store source fence seals");
+            "daily-catalog store source fence seals");
     }
 
     std::shared_ptr<
@@ -370,7 +419,7 @@ PublishStoreGeneration(
         runtime->WaitForGeneration(generation, 5s, &result) ==
                 market::RealtimeHistoryGenerationErrorV1::kNone &&
             result != nullptr,
-        "complete observed store generation publishes");
+        "complete daily-catalog store generation publishes");
     return result;
 }
 
@@ -423,9 +472,9 @@ template <typename Value>
     for (std::size_t ordinal = 0U;
          ordinal < catalog->bound_count();
          ++ordinal) {
-        market::ObservedInstrumentEntryViewV2 entry{};
+        market::InstrumentRuntimeEntryViewV2 entry{};
         if (catalog->EntryAt(ordinal, &entry) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone) {
+            market::InstrumentRuntimeStateErrorV2::kNone) {
             return {};
         }
         if (entry.factor_eligible) {
@@ -606,31 +655,34 @@ MakeFactorEngine(
             std::move(config), &result) ==
                 factor::RealtimeFactorEngineCreateErrorV1::kNone &&
             result != nullptr,
-        "observed-universe factor engine creates");
+        "daily-catalog factor engine creates");
     return result;
 }
 
 void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
-    auto directory = MakeDirectory(test, 8U, 71U);
-    if (directory == nullptr) {
+    const std::array<market::InstrumentKeyV1, 5U> keys{{
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "600001"),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "600002"),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "600003"),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "600004"),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "600005"),
+    }};
+    auto fixture = MakeDailyRuntimeFixture(test, keys, 71U);
+    if (fixture == nullptr) {
         return;
     }
     std::array<std::uint32_t, 5U> ids{};
     for (std::size_t index = 0U; index < ids.size(); ++index) {
-        const std::string_view security_id =
-            std::array<std::string_view, 5U>{{
-                "600001", "600002", "600003", "600004", "600005"}}[
-                index];
-        ids[index] = BindInstrument(
-            test,
-            directory.get(),
-            InstrumentKey(
-                market::MarketV1::kShanghai,
-                "101",
-                security_id),
-            static_cast<std::uint64_t>(index + 1U));
+        ids[index] = CatalogInstrumentId(
+            test, fixture->catalog.get(), keys[index]);
     }
-    auto runtime = MakeRuntime(test, directory.get());
+    auto runtime =
+        MakeRuntime(test, fixture->runtime_state.get());
     if (runtime == nullptr) {
         return;
     }
@@ -646,7 +698,7 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
         test->Expect(
             SubmitSnapshot(
                 runtime.get(),
-                *directory,
+                *fixture->runtime_state,
                 market::MarketV1::kShanghai,
                 ids[index],
                 static_cast<std::uint64_t>(index + 1U),
@@ -656,7 +708,12 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
     }
     test->Expect(
         SubmitShanghaiTick(
-            runtime.get(), *directory, ids[0U], 1U, 6U, 1U),
+            runtime.get(),
+            *fixture->runtime_state,
+            ids[0U],
+            1U,
+            6U,
+            1U),
         "tick availability input reaches Store");
     for (std::size_t index = 0U; index < ids.size(); ++index) {
         const std::uint64_t expected_ingress =
@@ -664,7 +721,7 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
                         : static_cast<std::uint64_t>(index + 1U);
         test->Expect(
             WaitUntilApplied(
-                *directory,
+                *fixture->runtime_state,
                 ids[index],
                 expected_ingress,
                 index == 4U,
@@ -675,7 +732,7 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
     auto store1 = PublishStoreGeneration(
         test,
         runtime.get(),
-        *directory,
+        *fixture->runtime_state,
         1U,
         {6U, 2U, 1U, 1U},
         10U);
@@ -708,9 +765,9 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
         "factor generation retains the exact Store and CatalogSnapshot");
     test->Expect(
         first.generation->catalog_scope() ==
-                market::ObservedInstrumentCatalogScopeV2::
-                    kObservedOnly &&
-            first.generation->catalog_generation() == 5U &&
+                market::InstrumentCatalogScopeV2::
+                    kDeclaredDailyAShare &&
+            first.generation->catalog_generation() == 1U &&
             first.generation->catalog_digest() ==
                 catalog1->catalog_digest() &&
             first.generation->bound_count() == 5U &&
@@ -721,7 +778,7 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
             first.generation->capture_accepted_sequence() == 10U &&
             first.generation->input_applied_sequence() == 6U &&
             first.generation->processing_lag_records() == 4U,
-        "factor envelope exposes exact observed counts, identity, and "
+        "factor envelope exposes exact daily counts, identity, and "
         "processing lag");
     test->Expect(
         first.generation->points().size() ==
@@ -746,18 +803,19 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
     test->Expect(
         SubmitSnapshot(
             runtime.get(),
-            *directory,
+            *fixture->runtime_state,
             market::MarketV1::kShanghai,
             ids[3U],
             6U,
             7U,
             SnapshotPrice{2'500'000, true, false}) &&
-            WaitUntilApplied(*directory, ids[3U], 7U, true),
+            WaitUntilApplied(
+                *fixture->runtime_state, ids[3U], 7U, true),
         "new positive latest snapshot reverses eligibility");
     auto store2 = PublishStoreGeneration(
         test,
         runtime.get(),
-        *directory,
+        *fixture->runtime_state,
         2U,
         {7U, 2U, 1U, 1U},
         7U);
@@ -783,9 +841,19 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
 }
 
 void CheckEmptyBoundAndEmptyEligibleGenerations(TestContext* test) {
-    auto directory = MakeDirectory(test, 4U, 72U);
-    auto runtime = MakeRuntime(test, directory.get());
-    if (directory == nullptr || runtime == nullptr) {
+    const std::array<market::InstrumentKeyV1, 2U> keys{{
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "601001"),
+        InstrumentKey(
+            market::MarketV1::kShenzhen, "102 ", "001202"),
+    }};
+    auto fixture = MakeDailyRuntimeFixture(test, keys, 72U);
+    if (fixture == nullptr) {
+        return;
+    }
+    auto runtime =
+        MakeRuntime(test, fixture->runtime_state.get());
+    if (runtime == nullptr) {
         return;
     }
     auto calculator =
@@ -796,42 +864,15 @@ void CheckEmptyBoundAndEmptyEligibleGenerations(TestContext* test) {
         return;
     }
 
-    auto empty_store = PublishStoreGeneration(
-        test,
-        runtime.get(),
-        *directory,
-        1U,
-        {1U, 1U, 1U, 1U},
-        0U);
-    if (empty_store == nullptr) {
-        return;
-    }
-    const auto empty = engine->CalculateAndPublish(empty_store);
-    test->Expect(
-        empty.published() && empty.generation->bound_count() == 0U &&
-            empty.generation->available_count() == 0U &&
-            empty.generation->factor_eligible_count() == 0U &&
-            empty.generation->points().empty() &&
-            empty.generation->input_applied_sequence() == 0U,
-        "an empty observed catalog is a legal factor generation");
-
-    const std::uint32_t first = BindInstrument(
-        test,
-        directory.get(),
-        InstrumentKey(
-            market::MarketV1::kShanghai, "101", "601001"),
-        1U);
-    const std::uint32_t second = BindInstrument(
-        test,
-        directory.get(),
-        InstrumentKey(
-            market::MarketV1::kShenzhen, "102 ", "001002"),
-        2U);
+    const std::uint32_t first = CatalogInstrumentId(
+        test, fixture->catalog.get(), keys[0U]);
+    const std::uint32_t second = CatalogInstrumentId(
+        test, fixture->catalog.get(), keys[1U]);
     auto bound_no_data_store = PublishStoreGeneration(
         test,
         runtime.get(),
-        *directory,
-        2U,
+        *fixture->runtime_state,
+        1U,
         {1U, 1U, 1U, 1U},
         0U);
     if (bound_no_data_store == nullptr) {
@@ -842,7 +883,10 @@ void CheckEmptyBoundAndEmptyEligibleGenerations(TestContext* test) {
     test->Expect(
         first == 1U && second == 2U &&
             bound_no_data.published() &&
-            bound_no_data.generation->catalog_generation() == 2U &&
+            bound_no_data.generation->catalog_scope() ==
+                market::InstrumentCatalogScopeV2::
+                    kDeclaredDailyAShare &&
+            bound_no_data.generation->catalog_generation() == 1U &&
             bound_no_data.generation->bound_count() == 2U &&
             bound_no_data.generation->available_count() == 0U &&
             bound_no_data.generation->snapshot_available_count() ==
@@ -851,42 +895,40 @@ void CheckEmptyBoundAndEmptyEligibleGenerations(TestContext* test) {
             bound_no_data.generation->factor_eligible_count() == 0U &&
             bound_no_data.generation->points().empty() &&
             bound_no_data.generation->Find(first) == nullptr &&
-            bound_no_data.generation->Find(second) == nullptr,
+            bound_no_data.generation->Find(second) == nullptr &&
+            bound_no_data.generation->input_applied_sequence() == 0U,
         "bound instruments with no eligible snapshot legally publish "
         "an empty factor batch");
 }
 
 void CheckInvalidCalculatorOutputDenied(TestContext* test) {
-    auto directory = MakeDirectory(test, 4U, 73U);
-    if (directory == nullptr) {
+    const std::array<market::InstrumentKeyV1, 3U> keys{{
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "603101"),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "603102"),
+        InstrumentKey(
+            market::MarketV1::kShanghai, "", "603103"),
+    }};
+    auto fixture = MakeDailyRuntimeFixture(test, keys, 73U);
+    if (fixture == nullptr) {
         return;
     }
-    const std::uint32_t first = BindInstrument(
-        test,
-        directory.get(),
-        InstrumentKey(
-            market::MarketV1::kShanghai, "101", "602001"),
-        1U);
-    const std::uint32_t ineligible = BindInstrument(
-        test,
-        directory.get(),
-        InstrumentKey(
-            market::MarketV1::kShanghai, "101", "602002"),
-        2U);
-    const std::uint32_t third = BindInstrument(
-        test,
-        directory.get(),
-        InstrumentKey(
-            market::MarketV1::kShanghai, "101", "602003"),
-        3U);
-    auto runtime = MakeRuntime(test, directory.get());
+    const std::uint32_t first = CatalogInstrumentId(
+        test, fixture->catalog.get(), keys[0U]);
+    const std::uint32_t ineligible = CatalogInstrumentId(
+        test, fixture->catalog.get(), keys[1U]);
+    const std::uint32_t third = CatalogInstrumentId(
+        test, fixture->catalog.get(), keys[2U]);
+    auto runtime =
+        MakeRuntime(test, fixture->runtime_state.get());
     if (runtime == nullptr) {
         return;
     }
     test->Expect(
         SubmitSnapshot(
             runtime.get(),
-            *directory,
+            *fixture->runtime_state,
             market::MarketV1::kShanghai,
             first,
             1U,
@@ -894,19 +936,21 @@ void CheckInvalidCalculatorOutputDenied(TestContext* test) {
             SnapshotPrice{1'000'000, true, false}) &&
             SubmitSnapshot(
                 runtime.get(),
-                *directory,
+                *fixture->runtime_state,
                 market::MarketV1::kShanghai,
                 third,
                 2U,
                 2U,
                 SnapshotPrice{3'000'000, true, false}) &&
-            WaitUntilApplied(*directory, first, 1U, true) &&
-            WaitUntilApplied(*directory, third, 2U, true),
+            WaitUntilApplied(
+                *fixture->runtime_state, first, 1U, true) &&
+            WaitUntilApplied(
+                *fixture->runtime_state, third, 2U, true),
         "two eligible calculator-validation inputs apply");
     auto store = PublishStoreGeneration(
         test,
         runtime.get(),
-        *directory,
+        *fixture->runtime_state,
         1U,
         {3U, 1U, 1U, 1U},
         2U);
@@ -962,15 +1006,20 @@ void CheckInvalidCalculatorOutputDenied(TestContext* test) {
 }
 
 void CheckForgedStoreOwnerDenied(TestContext* test) {
-    auto directory = MakeDirectory(test, 2U, 74U);
-    auto runtime = MakeRuntime(test, directory.get());
-    if (directory == nullptr || runtime == nullptr) {
+    auto fixture =
+        MakeSingleInstrumentDailyRuntimeFixture(test, 74U);
+    if (fixture == nullptr) {
+        return;
+    }
+    auto runtime =
+        MakeRuntime(test, fixture->runtime_state.get());
+    if (runtime == nullptr) {
         return;
     }
     auto store = PublishStoreGeneration(
         test,
         runtime.get(),
-        *directory,
+        *fixture->runtime_state,
         1U,
         {1U, 1U, 1U, 1U},
         0U);
@@ -1010,15 +1059,20 @@ void CheckForgedStoreOwnerDenied(TestContext* test) {
 
 void CheckGenerationChangeDuringCalculationDenied(
     TestContext* test) {
-    auto directory = MakeDirectory(test, 2U, 75U);
-    auto runtime = MakeRuntime(test, directory.get());
-    if (directory == nullptr || runtime == nullptr) {
+    auto fixture =
+        MakeSingleInstrumentDailyRuntimeFixture(test, 75U);
+    if (fixture == nullptr) {
+        return;
+    }
+    auto runtime =
+        MakeRuntime(test, fixture->runtime_state.get());
+    if (runtime == nullptr) {
         return;
     }
     auto store1 = PublishStoreGeneration(
         test,
         runtime.get(),
-        *directory,
+        *fixture->runtime_state,
         1U,
         {1U, 1U, 1U, 1U},
         0U);
@@ -1037,12 +1091,12 @@ void CheckGenerationChangeDuringCalculationDenied(
         result = engine->CalculateAndPublish(store1);
     });
     const bool entered = calculator->WaitUntilEntered(5s);
-    test->Expect(entered, "blocking observed calculator enters");
+    test->Expect(entered, "blocking daily-catalog calculator enters");
     if (entered) {
         const auto store2 = PublishStoreGeneration(
             test,
             runtime.get(),
-            *directory,
+            *fixture->runtime_state,
             2U,
             {1U, 1U, 1U, 1U},
             0U);
@@ -1064,15 +1118,20 @@ void CheckGenerationChangeDuringCalculationDenied(
 void CheckFatalAndStoreFailureDuringCalculationDenied(
     TestContext* test) {
     {
-        auto directory = MakeDirectory(test, 2U, 76U);
-        auto runtime = MakeRuntime(test, directory.get());
-        if (directory == nullptr || runtime == nullptr) {
+        auto fixture =
+            MakeSingleInstrumentDailyRuntimeFixture(test, 76U);
+        if (fixture == nullptr) {
+            return;
+        }
+        auto runtime =
+            MakeRuntime(test, fixture->runtime_state.get());
+        if (runtime == nullptr) {
             return;
         }
         auto store = PublishStoreGeneration(
             test,
             runtime.get(),
-            *directory,
+            *fixture->runtime_state,
             1U,
             {1U, 1U, 1U, 1U},
             0U);
@@ -1105,38 +1164,41 @@ void CheckFatalAndStoreFailureDuringCalculationDenied(
     }
 
     {
-        auto directory = MakeDirectory(test, 2U, 77U);
-        if (directory == nullptr) {
+        auto fixture = MakeSingleInstrumentDailyRuntimeFixture(
+            test, 77U, "603001");
+        if (fixture == nullptr) {
             return;
         }
-        const std::uint32_t instrument_id = BindInstrument(
+        const market::InstrumentKeyV1 key = InstrumentKey(
+            market::MarketV1::kShanghai, "", "603001");
+        const std::uint32_t instrument_id = CatalogInstrumentId(
             test,
-            directory.get(),
-            InstrumentKey(
-                market::MarketV1::kShanghai,
-                "101",
-                "603001"),
-            1U);
-        auto runtime = MakeRuntime(test, directory.get(), 1U);
+            fixture->catalog.get(),
+            key);
+        auto runtime = MakeRuntime(
+            test, fixture->runtime_state.get(), 1U);
         if (runtime == nullptr) {
             return;
         }
         test->Expect(
             SubmitSnapshot(
                 runtime.get(),
-                *directory,
+                *fixture->runtime_state,
                 market::MarketV1::kShanghai,
                 instrument_id,
                 1U,
                 1U,
                 SnapshotPrice{1'000'000, true, false}) &&
                 WaitUntilApplied(
-                    *directory, instrument_id, 1U, true),
+                    *fixture->runtime_state,
+                    instrument_id,
+                    1U,
+                    true),
             "capacity fixture first eligible snapshot applies");
         auto store = PublishStoreGeneration(
             test,
             runtime.get(),
-            *directory,
+            *fixture->runtime_state,
             1U,
             {2U, 1U, 1U, 1U},
             1U);
@@ -1160,7 +1222,7 @@ void CheckFatalAndStoreFailureDuringCalculationDenied(
             test->Expect(
                 SubmitSnapshot(
                     runtime.get(),
-                    *directory,
+                    *fixture->runtime_state,
                     market::MarketV1::kShanghai,
                     instrument_id,
                     2U,

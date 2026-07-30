@@ -17,7 +17,7 @@ MakeEndpoint(bool target) noexcept {
     endpoint.run_id[0U] = 0xA5U;
     endpoint.session_epoch = 9U;
     endpoint.generation = target ? 3U : 2U;
-    endpoint.catalog_generation = target ? 2U : 1U;
+    endpoint.catalog_generation = 1U;
     endpoint.data_state_generation = target ? 4U : 2U;
     endpoint.ingress_sequence_exclusive = target ? 11U : 5U;
     endpoint.tick_stream_sequence_exclusive = target ? 8U : 4U;
@@ -26,7 +26,7 @@ MakeEndpoint(bool target) noexcept {
         target ? 150U : 90U;
     endpoint.accepted_sequence = target ? 10U : 4U;
     endpoint.applied_sequence = target ? 10U : 4U;
-    endpoint.catalog_digest[0U] = target ? 0x22U : 0x11U;
+    endpoint.catalog_digest[0U] = 0x22U;
     endpoint.input_identity_sha256[0U] =
         target ? 0x44U : 0x33U;
     endpoint.source_stream_ids = {101U, 102U, 103U, 104U};
@@ -35,14 +35,14 @@ MakeEndpoint(bool target) noexcept {
                : std::array<std::uint64_t, 4U>{2U, 3U, 1U, 2U};
     endpoint.trade_date = 20260729U;
     endpoint.capacity = ipc::kRealtimeDefaultInstrumentCapacityV2;
-    endpoint.bound_count = target ? 2U : 1U;
+    endpoint.bound_count = endpoint.capacity;
     endpoint.available_count = target ? 2U : 1U;
     endpoint.snapshot_available_count = 1U;
     endpoint.tick_available_count = target ? 2U : 1U;
     endpoint.factor_eligible_count = 1U;
     endpoint.catalog_scope = static_cast<std::uint32_t>(
-        ipc::RealtimeCatalogScopeV2::kObservedOnly);
-    endpoint.coverage_complete = 0U;
+        ipc::RealtimeCatalogScopeV2::kDeclaredDailyAShare);
+    endpoint.coverage_complete = 1U;
     endpoint.flags =
         ipc::kRealtimeGenerationCoverageFromOpenV2 |
         ipc::kRealtimeGenerationRecordCoverageCompleteV2;
@@ -203,7 +203,7 @@ static_assert([]() constexpr {
 }());
 static_assert([]() constexpr {
     auto endpoint = MakeEndpoint(true);
-    endpoint.coverage_complete = 1U;
+    endpoint.coverage_complete = 0U;
     return !ipc::RealtimeGenerationEndpointCanonicalV2(endpoint);
 }());
 static_assert([]() constexpr {
@@ -279,21 +279,13 @@ static_assert([]() constexpr {
 }());
 static_assert([]() constexpr {
     auto metadata = MakeCheckpointDelta();
-    // Dynamic observed-catalog identity is allowed to change.
-    metadata.base_checkpoint.generation.catalog_digest[0U] =
-        metadata.target_checkpoint.generation.catalog_digest[0U];
-    return ipc::RealtimeInstrumentTickDeltaMetadataCanonicalV2(
+    metadata.base_checkpoint.generation.catalog_digest[0U] ^= 0xffU;
+    return !ipc::RealtimeInstrumentTickDeltaMetadataCanonicalV2(
         metadata);
 }());
 static_assert([]() constexpr {
     auto metadata = MakeCheckpointDelta();
-    metadata.base_checkpoint.generation.catalog_generation =
-        metadata.target_checkpoint.generation.catalog_generation;
-    metadata.base_checkpoint.generation.bound_count =
-        metadata.target_checkpoint.generation.bound_count;
-    // The same catalog generation cannot name two catalog identities.
-    metadata.base_checkpoint.generation.catalog_digest[0U] ^=
-        0xffU;
+    metadata.base_checkpoint.generation.bound_count -= 1U;
     return !ipc::
         RealtimeInstrumentTickDeltaMetadataCanonicalV2(metadata);
 }());

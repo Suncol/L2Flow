@@ -46,6 +46,7 @@ from l2flow_realtime import (  # noqa: E402
     UnavailableError,
 )
 from l2flow_realtime._generation import (  # noqa: E402
+    DailyCatalogSessionIdentity,
     ENDPOINT_FLAG_COVERAGE_FROM_OPEN,
     ENDPOINT_FLAG_RECORD_COVERAGE_COMPLETE,
     GenerationEndpoint,
@@ -163,17 +164,33 @@ def _endpoint() -> GenerationEndpoint:
         source_sequence_exclusive=(1, 3, 1, 1),
         trade_date=TRADE_DATE,
         capacity=CAPACITY,
-        bound_count=1,
+        bound_count=CAPACITY,
         available_count=1,
         snapshot_available_count=0,
         tick_available_count=1,
         factor_eligible_count=0,
-        catalog_scope=CatalogScope.OBSERVED_ONLY,
-        coverage_complete=False,
+        catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
+        coverage_complete=True,
         flags=(
             ENDPOINT_FLAG_COVERAGE_FROM_OPEN
             | ENDPOINT_FLAG_RECORD_COVERAGE_COMPLETE
         ),
+    )
+
+
+def _expected_session() -> DailyCatalogSessionIdentity:
+    return DailyCatalogSessionIdentity(
+        run_id=RUN_ID,
+        session_epoch=SESSION_EPOCH,
+        trade_date=TRADE_DATE,
+        capacity=CAPACITY,
+        catalog_digest=CATALOG_DIGEST,
+        catalog_generation=1,
+        bound_count=CAPACITY,
+        catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
+        coverage_complete=True,
+        catalog_trade_date=TRADE_DATE,
+        catalog_version=7,
     )
 
 
@@ -709,6 +726,24 @@ def _send_delta_data_page(
 
 
 class HistoryCursorTests(unittest.TestCase):
+    def test_open_rejects_another_daily_catalog(self):
+        with _SocketPairServer(_history_server) as server, mock.patch(
+            "l2flow_realtime.history.socket.socket",
+            return_value=server.client,
+        ):
+            with self.assertRaises(WireFormatError):
+                _open_instrument_history(
+                    server.path,
+                    instrument_id=1,
+                    requested_page_records=4096,
+                    expected_generation=9,
+                    expected_session=replace(
+                        _expected_session(),
+                        catalog_digest=b"D" * 32,
+                    ),
+                    timeout=1.0,
+                )
+
     def test_lazy_tick_column_and_rich_explicit_eof(self):
         with _SocketPairServer(_history_server) as server, mock.patch(
             "l2flow_realtime.history.socket.socket",
@@ -719,10 +754,7 @@ class HistoryCursorTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=4096,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             ) as cursor:
                 self.assertIsInstance(cursor.generation, HistoryGeneration)
@@ -805,10 +837,7 @@ class HistoryCursorTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=2,
                 expected_generation=0,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             ) as cursor:
                 self.assertEqual(len(tuple(cursor.pages())), 1)
@@ -816,6 +845,22 @@ class HistoryCursorTests(unittest.TestCase):
 
 
 class DeltaCursorTests(unittest.TestCase):
+    def test_open_rejects_another_daily_catalog(self):
+        with _SocketPairServer(_delta_server) as server, mock.patch(
+            "l2flow_realtime.instrument_delta.socket.socket",
+            return_value=server.client,
+        ):
+            with self.assertRaises(WireFormatError):
+                _open_instrument_tick_delta_session(
+                    server.path,
+                    expected_generation=9,
+                    expected_session=replace(
+                        _expected_session(),
+                        catalog_digest=b"D" * 32,
+                    ),
+                    timeout=1.0,
+                )
+
     def test_checkpoint_is_published_only_after_terminal_eof(self):
         with _SocketPairServer(_delta_server) as server, mock.patch(
             "l2flow_realtime.instrument_delta.socket.socket",
@@ -824,10 +869,7 @@ class DeltaCursorTests(unittest.TestCase):
             with _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             ) as session:
                 self.assertIsInstance(
@@ -1230,10 +1272,7 @@ class RollingTransactionTests(unittest.TestCase):
             with _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             ) as session:
                 cursor = session.open_instrument(
@@ -1571,10 +1610,7 @@ class CursorCancellationTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=4096,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=None,
             )
 
@@ -1618,10 +1654,7 @@ class CursorCancellationTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=None,
             )
             cursor = session.open_instrument(
@@ -1673,10 +1706,7 @@ class StrictPageValidationTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             cursor = session.open_instrument(1)
@@ -1711,10 +1741,7 @@ class StrictPageValidationTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=4096,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             with self.assertRaises(WireFormatError):
@@ -1741,10 +1768,7 @@ class StrictPageValidationTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             cursor = session.open_instrument(1)
@@ -1766,10 +1790,7 @@ class PageAndCumulativeLimitTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=1,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             with self.assertRaises(ProtocolError):
@@ -1784,10 +1805,7 @@ class PageAndCumulativeLimitTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             cursor = session.open_instrument(
@@ -1807,10 +1825,7 @@ class PageAndCumulativeLimitTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             cursor = session.open_instrument(1)
@@ -1834,10 +1849,7 @@ class PageAndCumulativeLimitTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             cursor = session.open_instrument(1)
@@ -1885,10 +1897,7 @@ class ProtocolFailureTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=4096,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             with self.assertRaises(ProtocolError):
@@ -1928,10 +1937,7 @@ class ProtocolFailureTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             cursor = session.open_instrument(1)
@@ -1985,10 +1991,7 @@ class ProtocolFailureTests(unittest.TestCase):
             session = _open_instrument_tick_delta_session(
                 server.path,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             with self.assertRaises(StreamNotFoundError):
@@ -2007,10 +2010,7 @@ class ProtocolFailureTests(unittest.TestCase):
                 instrument_id=1,
                 requested_page_records=4096,
                 expected_generation=9,
-                expected_run_id=RUN_ID,
-                expected_session_epoch=SESSION_EPOCH,
-                expected_trade_date=TRADE_DATE,
-                expected_capacity=CAPACITY,
+                expected_session=_expected_session(),
                 timeout=1.0,
             )
             barrier = threading.Barrier(3)
@@ -2182,7 +2182,7 @@ class GenerationValidationTests(unittest.TestCase):
         validate_generation_endpoint(endpoint)
         self.assertEqual(len(pack_generation_endpoint(endpoint)), 248)
 
-    def test_catalog_generation_must_equal_bound_count(self):
+    def test_catalog_generation_must_remain_frozen_at_one(self):
         with self.assertRaises(WireFormatError):
             validate_generation_endpoint(
                 replace(_endpoint(), catalog_generation=2)
@@ -2222,8 +2222,15 @@ class ClientLockIsolationTests(unittest.TestCase):
             ),
             close=lambda: None,
         )
+        expected_session = (
+            DailyCatalogSessionIdentity.from_session_info(
+                client.session_info()
+            )
+        )
+        captured_sessions = []
 
-        def slow_open(*_args, **_kwargs):
+        def slow_open(*_args, **kwargs):
+            captured_sessions.append(kwargs["expected_session"])
             entered.set()
             if not release.wait(2):
                 raise RuntimeError("test did not release history OPEN")
@@ -2255,9 +2262,57 @@ class ClientLockIsolationTests(unittest.TestCase):
                 thread.join(2)
                 self.assertFalse(thread.is_alive())
                 self.assertEqual(result, [fake_cursor])
+                self.assertEqual(
+                    captured_sessions, [expected_session]
+                )
                 self.assertEqual(checked_session.call_count, 2)
         finally:
             release.set()
+            client.close()
+            reader.close()
+
+    def test_delta_open_forwards_complete_daily_catalog_identity(self):
+        from tests.python.test_l2flow_realtime import (
+            FakeV2Library,
+        )
+        from l2flow_realtime import native
+
+        reader = native.NativeReader.open_fd(
+            9, library=FakeV2Library()
+        )
+        client = L2FlowClient(
+            reader,
+            stale_after_ns=None,
+            control_socket_path="/tmp/not-used.sock",
+        )
+        fake_session = SimpleNamespace(
+            generation=SimpleNamespace(
+                session_identity=client.session_identity
+            ),
+            close=lambda: None,
+        )
+        expected_session = (
+            DailyCatalogSessionIdentity.from_session_info(
+                client.session_info()
+            )
+        )
+        try:
+            with mock.patch(
+                "l2flow_realtime.instrument_delta."
+                "_open_instrument_tick_delta_session",
+                return_value=fake_session,
+            ) as open_session:
+                self.assertIs(
+                    client.open_instrument_tick_delta_session(),
+                    fake_session,
+                )
+                self.assertEqual(
+                    open_session.call_args.kwargs[
+                        "expected_session"
+                    ],
+                    expected_session,
+                )
+        finally:
             client.close()
             reader.close()
 

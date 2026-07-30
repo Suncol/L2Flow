@@ -190,10 +190,10 @@ struct OwnerRowCaptureState final {
     projected.quantity_raw =
         static_cast<std::uint64_t>(fields.quantity.raw);
     projected.quantity_scale = fields.quantity.scale;
-    // The decoded raw quantity and its scale remain exact even when the
-    // observed directory has no reference metadata from which to infer an
-    // economic unit. Preserve kUnknown instead of inventing shares/lots or
-    // dropping a valid trade.
+    // The decoded raw quantity and its scale remain exact even when the daily
+    // catalog has no reference metadata from which to infer an economic unit.
+    // Preserve kUnknown instead of inventing shares/lots or dropping a valid
+    // trade.
     projected.quantity_unit = common.quantity_unit;
     projected.event_sequence =
         native_event_sequence == 0U

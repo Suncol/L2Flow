@@ -109,7 +109,7 @@ template <typename Value>
            last_price->normalized_p6 > 0;
 }
 
-[[nodiscard]] bool StoreMatchesObservedCatalog(
+[[nodiscard]] bool StoreMatchesDailyCatalog(
     const l2flow::market::IntradayInstrumentStoreGenerationV1& store,
     std::vector<std::uint32_t>* eligible_instrument_ids) {
     if (eligible_instrument_ids == nullptr) {
@@ -123,14 +123,15 @@ template <typename Value>
         !SameSharedOwnerAndPointer(
             watermark.catalog_snapshot, catalog) ||
         catalog->catalog_scope() !=
-            l2flow::market::ObservedInstrumentCatalogScopeV2::
-                kObservedOnly ||
-        catalog->coverage_complete() ||
+            l2flow::market::InstrumentCatalogScopeV2::
+                kDeclaredDailyAShare ||
+        !catalog->coverage_complete() ||
+        catalog->trade_date() != watermark.trade_date ||
+        catalog->catalog_version() == 0U ||
         catalog->session_epoch() == 0U ||
         catalog->capacity() == 0U ||
-        catalog->bound_count() > catalog->capacity() ||
-        catalog->catalog_generation() !=
-            static_cast<std::uint64_t>(catalog->bound_count()) ||
+        catalog->bound_count() != catalog->capacity() ||
+        catalog->catalog_generation() != 1U ||
         !watermark.processing_progress.valid() ||
         watermark.processing_progress.applied_sequence !=
             watermark.ingress_sequence_exclusive - 1U ||
@@ -148,11 +149,11 @@ template <typename Value>
          index < store.instrument_count();
          ++index) {
         l2flow::market::IntradayInstrumentSummaryV1 summary{};
-        l2flow::market::ObservedInstrumentEntryViewV2 entry{};
+        l2flow::market::InstrumentRuntimeEntryViewV2 entry{};
         if (store.SummaryAt(index, &summary) !=
                 l2flow::market::IntradayInstrumentStoreQueryErrorV1::kNone ||
             catalog->EntryAt(index, &entry) !=
-                l2flow::market::ObservedInstrumentDirectoryErrorV2::kNone ||
+                l2flow::market::InstrumentRuntimeStateErrorV2::kNone ||
             !entry.bound() || entry.ordinal != index ||
             entry.instrument_id != summary.instrument_id ||
             entry.instrument_id !=
@@ -270,13 +271,13 @@ SnapshotLastPriceProjectionV1::Calculate(
              ordinal < store.instrument_count();
              ++ordinal) {
             l2flow::market::IntradayInstrumentSummaryV1 instrument{};
-            l2flow::market::ObservedInstrumentEntryViewV2 entry{};
+            l2flow::market::InstrumentRuntimeEntryViewV2 entry{};
             if (store.SummaryAt(ordinal, &instrument) !=
                     l2flow::market::IntradayInstrumentStoreQueryErrorV1::
                         kNone ||
                 catalog->EntryAt(ordinal, &entry) !=
                     l2flow::market::
-                        ObservedInstrumentDirectoryErrorV2::kNone ||
+                        InstrumentRuntimeStateErrorV2::kNone ||
                 entry.instrument_id != instrument.instrument_id) {
                 return RealtimeFactorCalculatorErrorV1::kInvalidStore;
             }
@@ -450,7 +451,7 @@ RealtimeFactorEngineV1::CalculateAndPublish(
             return result;
         }
         std::vector<std::uint32_t> eligible_instrument_ids;
-        if (!StoreMatchesObservedCatalog(
+        if (!StoreMatchesDailyCatalog(
                 *store, &eligible_instrument_ids)) {
             result.error = RealtimeFactorPublishErrorV1::kInvalidStore;
             return result;

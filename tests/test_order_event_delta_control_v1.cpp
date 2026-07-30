@@ -1,4 +1,5 @@
 #include "l2flow/ipc/order_event_delta_control_v1.h"
+#include "l2flow/ipc/realtime_wire_v2.h"
 
 #include <array>
 #include <cerrno>
@@ -28,6 +29,8 @@ namespace ipc = l2flow::ipc;
 
 constexpr std::uint32_t kTradeDate = 20260730U;
 constexpr std::uint64_t kSourceSessionEpoch = 71U;
+constexpr std::uint64_t kCatalogVersion = 2026073001U;
+constexpr std::uint32_t kCatalogCapacity = 4096U;
 
 bool Expect(bool condition, std::string_view message) {
     if (!condition) {
@@ -46,11 +49,30 @@ l2flow::common::Identity128 Identity(std::uint8_t seed) {
     return result;
 }
 
+l2flow::common::Sha256Digest Digest(std::uint8_t seed) {
+    l2flow::common::Sha256Digest result{};
+    for (std::size_t index = 0U; index < result.size(); ++index) {
+        result[index] = static_cast<std::byte>(
+            static_cast<std::uint8_t>(
+                seed + static_cast<std::uint8_t>(index)));
+    }
+    return result;
+}
+
 ipc::OrderEventDeltaSourceSessionV1 SourceSession() {
     ipc::OrderEventDeltaSourceSessionV1 result{};
     result.run_id = Identity(90U);
+    result.catalog_digest = Digest(120U);
     result.session_epoch = kSourceSessionEpoch;
+    result.catalog_generation = 1U;
+    result.catalog_version = kCatalogVersion;
     result.trade_date = kTradeDate;
+    result.catalog_trade_date = kTradeDate;
+    result.capacity = kCatalogCapacity;
+    result.bound_count = kCatalogCapacity;
+    result.catalog_scope = static_cast<std::uint32_t>(
+        ipc::RealtimeCatalogScopeV2::kDeclaredDailyAShare);
+    result.coverage_complete = 1U;
     return result;
 }
 
@@ -215,10 +237,11 @@ void TestWireAbi(bool* ok) {
     *ok &= Expect(
         sizeof(
             ipc::OrderEventDeltaControlGetSessionRequestV1) ==
-                80U &&
+                144U &&
             sizeof(
                 ipc::OrderEventDeltaControlGetSessionResponseV1) ==
-                192U,
+                264U &&
+            ipc::kOrderEventDeltaControlProtocolMinorV1 == 1U,
         "fixed-width control wire sizes");
 }
 
@@ -241,6 +264,22 @@ void TestPathAndStartValidation(
                             kInvalidConfiguration &&
                 server == nullptr,
             "relative socket path rejected");
+    }
+    {
+        auto config =
+            ServerConfig(
+                directory / "invalid-source.sock",
+                producer.get());
+        config.source_session.catalog_generation = 0U;
+        std::unique_ptr<ipc::OrderEventDeltaControlServerV1> server;
+        *ok &= Expect(
+            ipc::OrderEventDeltaControlServerV1::Create(
+                config, &server) ==
+                    ipc::
+                        OrderEventDeltaControlServerCreateErrorV1::
+                            kInvalidConfiguration &&
+                server == nullptr,
+            "server rejects noncanonical daily catalog identity");
     }
     {
         const std::filesystem::path existing =
@@ -432,6 +471,29 @@ void TestLiveServer(
             snapshot ==
                 ipc::OrderEventDeltaControlSnapshotV1{},
         "client and server reject stale source session");
+
+    for (std::uint32_t variant = 0U; variant < 3U; ++variant) {
+        wrong = ClientConfig(socket_path);
+        if (variant == 0U) {
+            wrong.expected_source_session.catalog_digest[0U] ^=
+                std::byte{0xffU};
+        } else if (variant == 1U) {
+            ++wrong.expected_source_session.catalog_version;
+        } else {
+            ++wrong.expected_source_session.capacity;
+            wrong.expected_source_session.bound_count =
+                wrong.expected_source_session.capacity;
+        }
+        snapshot = {};
+        *ok &= Expect(
+            ipc::OrderEventDeltaControlProbeV1(
+                wrong, &snapshot, &system_error) ==
+                    ipc::OrderEventDeltaControlClientErrorV1::
+                        kSourceSessionMismatch &&
+                snapshot ==
+                    ipc::OrderEventDeltaControlSnapshotV1{},
+            "client and server reject stale catalog identity");
+    }
 
     *ok &= Expect(
         SpawnExecClient(socket_path),

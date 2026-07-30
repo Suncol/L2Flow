@@ -6,9 +6,9 @@
 namespace l2flow::realtime {
 
 struct ProcessingProgressV2 final {
-    // Greatest contiguous capture sequence committed to the ordered
-    // processing queue. Queue publication is release-ordered after this
-    // frontier, so no consumer can apply a sequence before it is accepted.
+    // Greatest contiguous capture sequence committed across the four source
+    // decoder FIFOs. Each queue-tail publication is release-ordered after this
+    // frontier, so no decoder can apply a sequence before it is accepted.
     std::uint64_t accepted_sequence = 0U;
     // Greatest contiguous capture prefix for which Store, every enabled
     // derived state, latest publication, and the required external applied
@@ -27,7 +27,7 @@ struct ProcessingProgressV2 final {
     }
 };
 
-// Optional application-composition projection. Admission and processing may
+// Optional application-composition projection. Admission and completion may
 // each publish a newer component. Implementations merge both monotonically.
 // A false result makes the required external read projection unusable and the
 // Pipeline fails closed.

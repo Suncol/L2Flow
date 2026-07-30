@@ -275,15 +275,18 @@ fail-close；V1 没有跳过缺口、overrun catch-up、reset 或恢复入口。
 
 生产 router 的 `--event-aggregator-socket` 是可选兼容开关；配置后则是强制
 启动门槛。router 在创建 SDK pipeline 之前等待同一
-`source run_id/session_epoch/trade_date` 的 READY，并额外要求
+`source run_id/session_epoch/trade_date` 及完整冻结 daily-catalog identity
+（digest、generation、version、scope、coverage、capacity/bound count）的
+READY，并额外要求
 `source_tick_consumed_sequence=0`、`event_published_sequence=0`。因此启用该
 门槛时，SDK 第一条 callback 不可能先于聚合器 READY。超时由
 `--event-aggregator-ready-timeout-ms` 控制。
 
-event control 使用固定宽度 Unix `SOCK_SEQPACKET` 协议、双向 same-UID
+event control V1.1 使用固定宽度 Unix `SOCK_SEQPACKET` 协议、双向 same-UID
 `SO_PEERCRED` 校验和 `SCM_RIGHTS`。只有 ACTIVE 且 coverage 未丢失时才传递
 O_RDONLY ring fd；source session 和 event session 是两个独立身份，重启聚合器
-不会静默复用旧 event session。
+不会静默复用旧 event session。V1.0 peer 因 minor 和消息尺寸不匹配而
+fail-closed。
 
 源端进入 `STOPPED_CLEAN` 后，进程先读尽最终 contiguous tick prefix，再把
 event ring 置为 `DRAINING/STOPPED_CLEAN`。这只是完整消费和干净进程边界，

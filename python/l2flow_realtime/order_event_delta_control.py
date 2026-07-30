@@ -20,7 +20,9 @@ from ._stream_control import (
     validate_timeout,
 )
 from .models import (
+    CatalogScope,
     ProtocolError,
+    SessionInfo,
     StaleSessionError,
     UnavailableError,
 )
@@ -33,7 +35,7 @@ from .order_event_delta_live import (
 
 CONTROL_MAGIC = b"L2FECT1\0"
 CONTROL_MAJOR = 1
-CONTROL_MINOR = 0
+CONTROL_MINOR = 1
 GET_SESSION = 1
 CONTROL_OK = 0
 CONTROL_INVALID_REQUEST = 1
@@ -42,9 +44,11 @@ CONTROL_UNAVAILABLE = 3
 CONTROL_SOURCE_SESSION_MISMATCH = 4
 CONTROL_INTERNAL_ERROR = 5
 
-_REQUEST = struct.Struct("<8sHHHHIIQ16sQIIQQ")
+_REQUEST = struct.Struct(
+    "<8sHHHHIIQ16s32sQQQIIIIIIQQ"
+)
 _RESPONSE = struct.Struct(
-    "<8sHHHHIIQ16sQII16sQII" + "Q" * 12
+    "<8sHHHHIIQ16s32sQQQIIIIII16sQIIII" + "Q" * 12
 )
 _UCRED = struct.Struct("3i")
 _UINT32_MAX = (1 << 32) - 1
@@ -57,8 +61,8 @@ _REQUIRED_SEALS = (
     | getattr(fcntl, "F_SEAL_FUTURE_WRITE", 0x0010)
 )
 
-assert _REQUEST.size == 80
-assert _RESPONSE.size == 192
+assert _REQUEST.size == 144
+assert _RESPONSE.size == 264
 assert _UCRED.size == 12
 
 
@@ -97,8 +101,16 @@ def _counter(value: object, field: str) -> int:
 @dataclass(frozen=True, slots=True)
 class LiveOrderEventDeltaSourceSession:
     run_id: bytes
+    catalog_digest: bytes
     session_epoch: int
+    catalog_generation: int
+    catalog_version: int
     trade_date: int
+    catalog_trade_date: int
+    capacity: int
+    bound_count: int
+    catalog_scope: CatalogScope
+    coverage_complete: bool
 
     def __post_init__(self) -> None:
         if (
@@ -107,11 +119,83 @@ class LiveOrderEventDeltaSourceSession:
             or not any(self.run_id)
         ):
             raise ValueError("source run_id must be 16 nonzero bytes")
+        if (
+            not isinstance(self.catalog_digest, bytes)
+            or len(self.catalog_digest) != 32
+            or not any(self.catalog_digest)
+        ):
+            raise ValueError(
+                "source catalog_digest must be 32 nonzero bytes"
+            )
         _positive_integer(
             self.session_epoch, "source session_epoch", _UINT64_MAX
         )
         _positive_integer(
+            self.catalog_generation,
+            "source catalog_generation",
+            _UINT64_MAX,
+        )
+        if self.catalog_generation != 1:
+            raise ValueError(
+                "source frozen catalog_generation must equal one"
+            )
+        _positive_integer(
+            self.catalog_version, "source catalog_version", _UINT64_MAX
+        )
+        _positive_integer(
             self.trade_date, "source trade_date", _UINT32_MAX
+        )
+        _positive_integer(
+            self.catalog_trade_date,
+            "source catalog_trade_date",
+            _UINT32_MAX,
+        )
+        if self.catalog_trade_date != self.trade_date:
+            raise ValueError(
+                "source catalog_trade_date does not match trade_date"
+            )
+        _positive_integer(
+            self.capacity, "source capacity", _UINT32_MAX
+        )
+        _positive_integer(
+            self.bound_count, "source bound_count", _UINT32_MAX
+        )
+        if self.bound_count != self.capacity:
+            raise ValueError(
+                "source daily catalog must bind every physical row"
+            )
+        try:
+            scope = CatalogScope(self.catalog_scope)
+        except (TypeError, ValueError) as error:
+            raise ValueError("source catalog_scope is invalid") from error
+        if scope is not CatalogScope.DECLARED_DAILY_A_SHARE:
+            raise ValueError(
+                "source catalog_scope must be DECLARED_DAILY_A_SHARE"
+            )
+        if self.coverage_complete is not True:
+            raise ValueError(
+                "source daily A-share catalog coverage must be complete"
+            )
+        object.__setattr__(self, "catalog_scope", scope)
+
+    @classmethod
+    def from_session_info(
+        cls, session: SessionInfo
+    ) -> "LiveOrderEventDeltaSourceSession":
+        if not isinstance(session, SessionInfo):
+            raise TypeError("session has the wrong type")
+        return cls(
+            run_id=session.run_id,
+            catalog_digest=session.catalog_digest,
+            session_epoch=session.session_epoch,
+            catalog_generation=session.catalog_generation,
+            catalog_version=session.catalog_version,
+            trade_date=session.trade_date,
+            catalog_trade_date=session.catalog_trade_date,
+            capacity=session.capacity,
+            bound_count=session.bound_count,
+            catalog_scope=session.catalog_scope,
+            coverage_complete=session.coverage_complete,
         )
 
 
@@ -199,9 +283,16 @@ def build_live_order_event_get_session_request(
         0,
         identifier,
         expected_source_session.run_id,
+        expected_source_session.catalog_digest,
         expected_source_session.session_epoch,
+        expected_source_session.catalog_generation,
+        expected_source_session.catalog_version,
         expected_source_session.trade_date,
-        0,
+        expected_source_session.catalog_trade_date,
+        expected_source_session.capacity,
+        expected_source_session.bound_count,
+        int(expected_source_session.catalog_scope),
+        int(expected_source_session.coverage_complete),
         0,
         0,
     )
@@ -300,13 +391,22 @@ def _snapshot_from_response(
         reserved0,
         response_request_id,
         source_run_id,
+        source_catalog_digest,
         source_session_epoch,
+        source_catalog_generation,
+        source_catalog_version,
         source_trade_date,
-        event_producer_state,
+        source_catalog_trade_date,
+        source_capacity,
+        source_bound_count,
+        source_catalog_scope,
+        source_coverage_complete,
         event_run_id,
         event_session_epoch,
         event_trade_date,
+        event_producer_state,
         event_header_flags,
+        reserved_event,
         event_ring_capacity,
         event_total_mapping_bytes,
         event_published_sequence,
@@ -322,15 +422,30 @@ def _snapshot_from_response(
         or message_bytes != _RESPONSE.size
         or reserved0 != 0
         or response_request_id != expected_request_id
+        or reserved_event != 0
         or any(reserved)
     ):
         raise ProtocolError("malformed event control response envelope")
     _raise_control_status(status)
     if (
         source_run_id != expected_source_session.run_id
+        or source_catalog_digest
+        != expected_source_session.catalog_digest
         or source_session_epoch
         != expected_source_session.session_epoch
+        or source_catalog_generation
+        != expected_source_session.catalog_generation
+        or source_catalog_version
+        != expected_source_session.catalog_version
         or source_trade_date != expected_source_session.trade_date
+        or source_catalog_trade_date
+        != expected_source_session.catalog_trade_date
+        or source_capacity != expected_source_session.capacity
+        or source_bound_count != expected_source_session.bound_count
+        or source_catalog_scope
+        != int(expected_source_session.catalog_scope)
+        or source_coverage_complete
+        != int(expected_source_session.coverage_complete)
     ):
         raise LiveOrderEventDeltaSourceSessionMismatchError(
             "event control response source identity changed"

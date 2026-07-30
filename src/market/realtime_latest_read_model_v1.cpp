@@ -1,7 +1,7 @@
 #include "l2flow/market/realtime_latest_read_model_v1.h"
 
 #include "l2flow/market/market_types_v1.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 
 #include <algorithm>
@@ -118,9 +118,9 @@ public:
     };
 
     Impl(
-        const ObservedInstrumentDirectoryV2* directory,
+        const InstrumentRuntimeStateV2* runtime_state,
         std::size_t slot_count)
-        : directory_(directory),
+        : runtime_state_(runtime_state),
           slot_count_(slot_count),
           snapshot_slots_(
               std::make_unique<PublishedSlot[]>(slot_count)),
@@ -174,8 +174,8 @@ public:
         }
 
         std::size_t ordinal = 0U;
-        if (directory_->ResolveBoundId(instrument_id, &ordinal) !=
-            ObservedInstrumentDirectoryErrorV2::kNone) {
+        if (runtime_state_->ResolveBoundId(instrument_id, &ordinal) !=
+            InstrumentRuntimeStateErrorV2::kNone) {
             output->status = RealtimeLatestRecordStatusV1::kUnbound;
             return;
         }
@@ -194,7 +194,7 @@ public:
         output->record = record;
     }
 
-    const ObservedInstrumentDirectoryV2* directory_ = nullptr;
+    const InstrumentRuntimeStateV2* runtime_state_ = nullptr;
     std::size_t slot_count_ = 0U;
     std::unique_ptr<PublishedSlot[]> snapshot_slots_;
     std::unique_ptr<PublishedSlot[]> tick_slots_;
@@ -209,13 +209,14 @@ RealtimeLatestReadModelV1::~RealtimeLatestReadModelV1() = default;
 
 RealtimeLatestReadModelCreateErrorV1
 RealtimeLatestReadModelV1::Create(
-    const ObservedInstrumentDirectoryV2* directory,
+    const InstrumentRuntimeStateV2* runtime_state,
     std::unique_ptr<RealtimeLatestReadModelV1>* output) noexcept {
     if (output == nullptr) {
         return RealtimeLatestReadModelCreateErrorV1::kNullOutput;
     }
     output->reset();
-    if (directory == nullptr || directory->capacity() == 0U) {
+    if (runtime_state == nullptr ||
+        runtime_state->capacity() == 0U) {
         return RealtimeLatestReadModelCreateErrorV1::
             kInvalidConfiguration;
     }
@@ -223,7 +224,7 @@ RealtimeLatestReadModelV1::Create(
     try {
         auto impl =
             std::make_unique<RealtimeLatestReadModelV1::Impl>(
-                directory, directory->capacity());
+                runtime_state, runtime_state->capacity());
         output->reset(new RealtimeLatestReadModelV1(std::move(impl)));
         return RealtimeLatestReadModelCreateErrorV1::kNone;
     } catch (...) {
@@ -250,9 +251,9 @@ RealtimeLatestReadModelV1::PublishApplied(
     if (ordinal >= impl_->slot_count_) {
         return RealtimeLatestPublishErrorV1::kInvalidOrdinal;
     }
-    ObservedInstrumentEntryViewV2 entry{};
-    if (impl_->directory_->LookupByOrdinal(ordinal, &entry) !=
-            ObservedInstrumentDirectoryErrorV2::kNone ||
+    InstrumentRuntimeEntryViewV2 entry{};
+    if (impl_->runtime_state_->LookupByOrdinal(ordinal, &entry) !=
+            InstrumentRuntimeStateErrorV2::kNone ||
         !entry.bound()) {
         return RealtimeLatestPublishErrorV1::kUnboundInstrument;
     }
@@ -289,7 +290,7 @@ RealtimeLatestReadModelV1::PublishApplied(
     if (current == record) {
         return RealtimeLatestPublishErrorV1::kNone;
     }
-    // Exactly one permanent owner publishes a directory ordinal. Readers use
+    // Exactly one permanent owner publishes a catalog ordinal. Readers use
     // acquire loads; a release store is sufficient and avoids a locked RMW on
     // every market event.
     target->store(record, std::memory_order_release);

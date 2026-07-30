@@ -1,6 +1,7 @@
 #pragma once
 
 #include "l2flow/common/identity128.h"
+#include "l2flow/common/sha256.h"
 #include "l2flow/ipc/order_event_delta_control_wire_v1.h"
 #include "l2flow/ipc/order_event_delta_ring_v1.h"
 
@@ -17,8 +18,16 @@ namespace l2flow::ipc {
 // session: restarting either process must not silently rebind the other.
 struct OrderEventDeltaSourceSessionV1 final {
     l2flow::common::Identity128 run_id{};
+    l2flow::common::Sha256Digest catalog_digest{};
     std::uint64_t session_epoch = 0U;
+    std::uint64_t catalog_generation = 0U;
+    std::uint64_t catalog_version = 0U;
     std::uint32_t trade_date = 0U;
+    std::uint32_t catalog_trade_date = 0U;
+    std::uint32_t capacity = 0U;
+    std::uint32_t bound_count = 0U;
+    std::uint32_t catalog_scope = 0U;
+    std::uint32_t coverage_complete = 0U;
 
     [[nodiscard]] friend bool operator==(
         const OrderEventDeltaSourceSessionV1&,
@@ -130,7 +139,7 @@ private:
 struct OrderEventDeltaControlClientConfigV1 final {
     std::filesystem::path control_socket_path;
     // Mandatory. The response and server-side request validation must both
-    // match this source run, epoch, and trading day exactly.
+    // match this source run and complete frozen daily-catalog identity.
     OrderEventDeltaSourceSessionV1 expected_source_session{};
     // Bounds connect + request + response as one operation.
     std::chrono::milliseconds timeout{

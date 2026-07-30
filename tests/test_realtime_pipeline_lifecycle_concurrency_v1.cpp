@@ -342,7 +342,13 @@ public:
         const auto characters =
             std::span<const char>(value.data(), value.size());
         const auto encoded = std::as_bytes(characters);
-        bytes_.insert(bytes_.end(), encoded.begin(), encoded.end());
+        bytes_.resize(start + encoded.size());
+        if (!encoded.empty()) {
+            std::memcpy(
+                bytes_.data() + start,
+                encoded.data(),
+                encoded.size());
+        }
     }
 
     [[nodiscard]] std::vector<std::byte> Take() && {
@@ -418,16 +424,60 @@ private:
     std::vector<std::byte> body_;
 };
 
+struct PipelineCatalogFixture final {
+    std::shared_ptr<const market::DailyInstrumentCatalogV2> catalog;
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+};
+
+[[nodiscard]] bool MakeCatalogFixture(
+    PipelineCatalogFixture* output) {
+    if (output == nullptr) {
+        return false;
+    }
+    *output = {};
+    market::DailyInstrumentSourceEntryV2 source{};
+    source.key.market = market::MarketV1::kShenzhen;
+    source.key.security_id_source = {
+        std::byte{'1'}, std::byte{'0'}, std::byte{'2'}, std::byte{' '}};
+    source.key.security_id = {
+        std::byte{'0'}, std::byte{'0'}, std::byte{'0'},
+        std::byte{'0'}, std::byte{'0'}, std::byte{'1'}};
+    source.metadata = market::InstrumentMetadataV2{
+        market::QuantityUnitV1::kShare,
+        market::SecurityTypeV1::kEquity,
+        market::AssetScopeV1::kDocumentedCore};
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = 20260724U;
+    config.catalog_version = 1U;
+    config.session_epoch = 171U;
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    if (market::DailyInstrumentCatalogV2::Create(
+            config, std::span(&source, 1U), &catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        catalog == nullptr) {
+        return false;
+    }
+    output->catalog =
+        std::shared_ptr<const market::DailyInstrumentCatalogV2>(
+            std::move(catalog));
+    return market::InstrumentRuntimeStateV2::Create(
+               *output->catalog, &output->runtime_state) ==
+               market::InstrumentRuntimeStateErrorV2::kNone &&
+           output->runtime_state != nullptr;
+}
+
 runtime::RealtimePipelineConfigV1 MakeConfig(
-    market::ObservedInstrumentDirectoryV2* directory) {
+    const PipelineCatalogFixture& fixture) {
     runtime::RealtimePipelineConfigV1 config{};
     config.run_id[0U] = std::byte{0x51U};
     config.run_id[15U] = std::byte{0xa7U};
     config.trade_date = 20260724U;
-    config.directory = directory;
+    config.daily_catalog = fixture.catalog;
+    config.runtime_state = fixture.runtime_state.get();
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.maximum_sdk_message_bytes = 4096U;
-    config.processing_queue_capacity = 16U;
     config.decoder_queue_capacity_per_source = 16U;
     config.store_worker_count = 1U;
     config.store_queue_capacity_per_source_worker = 16U;
@@ -486,21 +536,17 @@ int main() {
                 oversized == nullptr,
             "prewarm rejects an eager reservation above its byte cap");
     }
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    PipelineCatalogFixture fixture;
     test.Expect(
-        market::ObservedInstrumentDirectoryV2::Create(
-                market::ObservedInstrumentDirectoryConfigV2{8U, 171U},
-                &directory) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            directory != nullptr,
-        "observed directory creation");
-    if (directory == nullptr) {
+        MakeCatalogFixture(&fixture),
+        "daily catalog/runtime creation");
+    if (fixture.runtime_state == nullptr) {
         return 1;
     }
 
     {
         runtime::RealtimePipelineConfigV1 unordered_sdk =
-            MakeConfig(directory.get());
+            MakeConfig(fixture);
         unordered_sdk.sdk.io_threads = 2;
         std::unique_ptr<runtime::RealtimePipelineV1>
             rejected_pipeline;
@@ -523,7 +569,7 @@ int main() {
     std::string detail;
     test.Expect(
         runtime::RealtimePipelineV1::CreateForTest(
-            MakeConfig(directory.get()),
+            MakeConfig(fixture),
             std::make_shared<RecordingFactory>(state),
             &pipeline,
             &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&

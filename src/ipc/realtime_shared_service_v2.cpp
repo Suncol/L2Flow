@@ -1156,7 +1156,7 @@ bool EndpointSelfConsistent(
     if (!ByteDigestNonzero(endpoint.run_id) ||
         endpoint.session_epoch == 0U ||
         endpoint.generation == 0U ||
-        endpoint.catalog_generation != endpoint.bound_count ||
+        endpoint.catalog_generation != 1U ||
         endpoint.ingress_sequence_exclusive == 0U ||
         endpoint.tick_stream_sequence_exclusive == 0U ||
         endpoint.recv_monotonic_cut_ns == 0U ||
@@ -1175,8 +1175,9 @@ bool EndpointSelfConsistent(
             endpoint.factor_eligible_count) ||
         endpoint.catalog_scope !=
             static_cast<std::uint32_t>(
-                RealtimeCatalogScopeV2::kObservedOnly) ||
-        endpoint.coverage_complete != 0U ||
+                RealtimeCatalogScopeV2::kDeclaredDailyAShare) ||
+        endpoint.coverage_complete != 1U ||
+        endpoint.bound_count != endpoint.capacity ||
         (endpoint.flags & ~known_flags) != 0U ||
         (endpoint.flags &
          kRealtimeGenerationRecordCoverageCompleteV2) == 0U ||
@@ -1240,13 +1241,22 @@ bool BuildGenerationEndpoint(
         catalog == nullptr ||
         catalog.get() != generation.catalog_snapshot().get() ||
         catalog->session_epoch() != config.session_epoch ||
-        catalog->capacity() != config.directory->capacity() ||
+        catalog->capacity() !=
+            config.daily_catalog->instrument_count() ||
         catalog->capacity() >
             std::numeric_limits<std::uint32_t>::max() ||
         catalog->catalog_scope() !=
-            market::ObservedInstrumentCatalogScopeV2::kObservedOnly ||
-        catalog->coverage_complete() ||
-        catalog->catalog_generation() != catalog->bound_count() ||
+            market::InstrumentCatalogScopeV2::
+                kDeclaredDailyAShare ||
+        !catalog->coverage_complete() ||
+        catalog->trade_date() !=
+            config.daily_catalog->trade_date() ||
+        catalog->catalog_version() !=
+            config.daily_catalog->catalog_version() ||
+        catalog->catalog_digest() !=
+            config.daily_catalog->catalog_digest() ||
+        catalog->catalog_generation() != 1U ||
+        catalog->bound_count() != catalog->capacity() ||
         catalog->bound_count() >
             std::numeric_limits<std::uint32_t>::max() ||
         generation.instrument_count() != catalog->bound_count() ||
@@ -1327,8 +1337,8 @@ bool BuildGenerationEndpoint(
             catalog->factor_eligible_count());
     endpoint.catalog_scope =
         static_cast<std::uint32_t>(
-            RealtimeCatalogScopeV2::kObservedOnly);
-    endpoint.coverage_complete = 0U;
+            RealtimeCatalogScopeV2::kDeclaredDailyAShare);
+    endpoint.coverage_complete = 1U;
     endpoint.flags =
         kRealtimeGenerationRecordCoverageCompleteV2;
     if (generation.coverage_from_open()) {
@@ -1493,13 +1503,13 @@ bool BuildHistoryGenerationInfo(
         return false;
     }
     market::IntradayInstrumentSummaryV1 summary{};
-    market::ObservedInstrumentEntryViewV2 entry{};
+    market::InstrumentRuntimeEntryViewV2 entry{};
     if (generation.Find(instrument_id, &summary) !=
             market::IntradayInstrumentStoreQueryErrorV1::kNone ||
         generation.catalog_snapshot() == nullptr ||
         generation.catalog_snapshot()->LookupById(
             instrument_id, &entry) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            market::InstrumentRuntimeStateErrorV2::kNone ||
         !entry.bound() || entry.instrument_id != instrument_id ||
         entry.ordinal >= endpoint.bound_count ||
         entry.ordinal >
@@ -1560,13 +1570,13 @@ bool BuildTargetDeltaCheckpoint(
         return false;
     }
     market::IntradayInstrumentSummaryV1 summary{};
-    market::ObservedInstrumentEntryViewV2 entry{};
+    market::InstrumentRuntimeEntryViewV2 entry{};
     if (generation.Find(instrument_id, &summary) !=
             market::IntradayInstrumentStoreQueryErrorV1::kNone ||
         generation.catalog_snapshot() == nullptr ||
         generation.catalog_snapshot()->LookupById(
             instrument_id, &entry) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+            market::InstrumentRuntimeStateErrorV2::kNone ||
         !entry.bound() || entry.instrument_id != instrument_id ||
         entry.ordinal >= endpoint.bound_count ||
         entry.ordinal >
@@ -1617,7 +1627,8 @@ bool ComputeLayoutDigest(
         !HashU16(&hasher, kRealtimeWireMinorV2) ||
         !HashU32(
             &hasher,
-            static_cast<std::uint32_t>(config.directory->capacity())) ||
+            static_cast<std::uint32_t>(
+                config.daily_catalog->instrument_count())) ||
         !HashU32(
             &hasher,
             static_cast<std::uint32_t>(
@@ -1665,8 +1676,8 @@ std::string_view RealtimeSharedServiceCreateErrorNameV2(
             return "null_output";
         case RealtimeSharedServiceCreateErrorV2::kInvalidConfiguration:
             return "invalid_configuration";
-        case RealtimeSharedServiceCreateErrorV2::kDirectoryNotEmpty:
-            return "directory_not_empty";
+        case RealtimeSharedServiceCreateErrorV2::kCatalogMismatch:
+            return "catalog_mismatch";
         case RealtimeSharedServiceCreateErrorV2::kLayoutOverflow:
             return "layout_overflow";
         case RealtimeSharedServiceCreateErrorV2::kMappingCreateFailed:
@@ -1760,14 +1771,20 @@ public:
             return RealtimeSharedServiceCreateErrorV2::
                 kInvalidConfiguration;
         }
-        if (config_.directory == nullptr ||
+        if (config_.daily_catalog == nullptr ||
             common::IsZeroIdentity(config_.run_id) ||
             config_.session_epoch == 0U ||
-            config_.directory->session_epoch() !=
+            config_.daily_catalog->session_epoch() !=
                 config_.session_epoch ||
             config_.trade_date == 0U ||
-            config_.directory->capacity() == 0U ||
-            config_.directory->capacity() >=
+            config_.daily_catalog->trade_date() !=
+                config_.trade_date ||
+            config_.daily_catalog->catalog_version() == 0U ||
+            !config_.daily_catalog->coverage_complete() ||
+            config_.daily_catalog->market_scope() !=
+                market::kDailyCatalogMainlandScopeV2 ||
+            config_.daily_catalog->instrument_count() == 0U ||
+            config_.daily_catalog->instrument_count() >=
                 static_cast<std::size_t>(
                     std::numeric_limits<std::uint32_t>::max()) ||
             config_.tick_ring_capacity == 0U ||
@@ -1841,41 +1858,14 @@ public:
                 return left.window_id < right.window_id;
             });
 
-        std::shared_ptr<
-            const market::ObservedInstrumentCatalogSnapshotV2>
-            initial_catalog;
-        if (config_.directory->AcquireSnapshot(&initial_catalog) !=
-                market::ObservedInstrumentDirectoryErrorV2::kNone ||
-            initial_catalog == nullptr ||
-            initial_catalog->session_epoch() !=
-                config_.session_epoch ||
-            initial_catalog->capacity() !=
-                config_.directory->capacity() ||
-            initial_catalog->catalog_scope() !=
-                market::ObservedInstrumentCatalogScopeV2::
-                    kObservedOnly ||
-            initial_catalog->coverage_complete()) {
-            return RealtimeSharedServiceCreateErrorV2::
-                kInvalidConfiguration;
-        }
-        if (initial_catalog->bound_count() != 0U ||
-            initial_catalog->available_count() != 0U ||
-            initial_catalog->snapshot_available_count() != 0U ||
-            initial_catalog->tick_available_count() != 0U ||
-            initial_catalog->factor_eligible_count() != 0U) {
-            return RealtimeSharedServiceCreateErrorV2::
-                kDirectoryNotEmpty;
-        }
-        initial_catalog_generation_ =
-            initial_catalog->catalog_generation();
-        initial_data_state_generation_ =
-            initial_catalog->data_state_generation();
+        initial_catalog_generation_ = 1U;
+        initial_data_state_generation_ = 0U;
         initial_catalog_digest_ =
-            initial_catalog->catalog_digest();
+            config_.daily_catalog->catalog_digest();
 
         const std::uint64_t capacity =
             static_cast<std::uint64_t>(
-                config_.directory->capacity());
+                config_.daily_catalog->instrument_count());
         const std::uint64_t window_count =
             static_cast<std::uint64_t>(
                 config_.kline_windows.size());
@@ -2012,6 +2002,10 @@ public:
         header_ = static_cast<RealtimeWireHeaderV2*>(mapping_);
         InitializeHeader();
         InitializeWindows();
+        if (!InitializeCatalog()) {
+            return RealtimeSharedServiceCreateErrorV2::
+                kCatalogMismatch;
+        }
         try {
             ring_locks_ = std::make_unique<std::atomic_flag[]>(
                 static_cast<std::size_t>(
@@ -2077,177 +2071,11 @@ public:
         }
     }
 
-    [[nodiscard]] bool PublishObservedInstrumentBinding(
-        const market::ObservedInstrumentBindResultV2& binding)
-        noexcept {
-        if (header_ == nullptr || !binding.newly_bound ||
-            !binding.entry.bound() ||
-            binding.entry.binding_state !=
-                market::ObservedInstrumentBindingStateV2::
-                    kBoundNoData ||
-            binding.entry.has_snapshot || binding.entry.has_tick ||
-            binding.entry.factor_eligible ||
-            binding.entry.first_ingress_sequence != 0U ||
-            binding.entry.last_ingress_sequence != 0U ||
-            binding.entry.first_capture_sequence == 0U ||
-            binding.entry.ordinal >=
-                config_.directory->capacity() ||
-            binding.entry.instrument_id !=
-                binding.entry.ordinal + 1U ||
-            binding.bound_count != binding.entry.ordinal + 1U ||
-            binding.catalog_generation == 0U ||
-            !DigestNonzero(binding.catalog_digest) ||
-            binding.entry.key.market == market::MarketV1::kUnknown ||
-            binding.entry.key.security_id.empty() ||
-            binding.entry.key.security_id_source.size() >
-                static_cast<std::size_t>(
-                    std::numeric_limits<std::uint32_t>::max()) ||
-            binding.entry.key.security_id.size() >
-                static_cast<std::size_t>(
-                    std::numeric_limits<std::uint32_t>::max()) ||
-            static_cast<std::uint8_t>(
-                binding.entry.metadata.quantity_unit) >
-                static_cast<std::uint8_t>(
-                    market::QuantityUnitV1::kIndexUnit) ||
-            static_cast<std::uint8_t>(
-                binding.entry.metadata.security_type) >
-                static_cast<std::uint8_t>(
-                    market::SecurityTypeV1::kOption) ||
-            static_cast<std::uint8_t>(
-                binding.entry.metadata.asset_scope) >
-                static_cast<std::uint8_t>(
-                    market::AssetScopeV1::
-                        kOutsideDocumentedCore) ||
-            !StateAcceptsPublication(
-                Atomic(header_->server_state)
-                    .load(std::memory_order_acquire))) {
-            ReportFailure(
-                "binding_precondition",
-                binding.entry.ordinal,
-                binding.entry.instrument_id,
-                0U);
-            MarkCoverageLost();
-            return false;
-        }
-
-        const std::uint64_t source_bytes =
-            static_cast<std::uint64_t>(
-                binding.entry.key.security_id_source.size());
-        const std::uint64_t id_bytes =
-            static_cast<std::uint64_t>(
-                binding.entry.key.security_id.size());
-        const std::uint64_t used =
-            key_arena_used_.load(std::memory_order_acquire);
-        std::uint64_t id_offset = 0U;
-        std::uint64_t end = 0U;
-        if (!CheckedAdd(used, source_bytes, &id_offset) ||
-            !CheckedAdd(id_offset, id_bytes, &end) ||
-            end > config_.key_arena_bytes) {
-            ReportFailure(
-                "key_arena_exhausted",
-                binding.entry.ordinal,
-                binding.entry.instrument_id,
-                binding.entry.first_capture_sequence);
-            MarkCoverageLost();
-            return false;
-        }
-
-        // The binding sink is single-writer. Key bytes are copied before the
-        // immutable row, and the row is release-published before the catalog
-        // status cut advances.
-        std::byte* const arena = key_arena();
-        if (source_bytes != 0U) {
-            std::memcpy(
-                arena + used,
-                binding.entry.key.security_id_source.data(),
-                static_cast<std::size_t>(source_bytes));
-        }
-        std::memcpy(
-            arena + id_offset,
-            binding.entry.key.security_id.data(),
-            static_cast<std::size_t>(id_bytes));
-
-        RealtimeWireInstrumentV2& row =
-            instrument_rows()[binding.entry.ordinal];
-        std::uint64_t row_stable = 0U;
-        if (!AcquireSeqcount(
-                &row.publish_tag, &row_stable, true)) {
-            ReportFailure(
-                "binding_row_busy",
-                binding.entry.ordinal,
-                binding.entry.instrument_id,
-                binding.entry.first_capture_sequence);
-            MarkCoverageLost();
-            return false;
-        }
-        StoreBoundIdentityRow(
-            &row, binding, used, id_offset);
-        ReleaseSeqcount(&row.publish_tag, row_stable);
-
-        std::uint64_t status_stable = 0U;
-        if (!AcquireSeqcount(
-                &header_->status_publish_tag,
-                &status_stable,
-                false)) {
-            ReportFailure(
-                "binding_status_busy",
-                binding.entry.ordinal,
-                binding.entry.instrument_id,
-                binding.entry.first_capture_sequence);
-            MarkCoverageLost();
-            return false;
-        }
-        const std::uint32_t old_bound =
-            Atomic(header_->bound_count)
-                .load(std::memory_order_relaxed);
-        const std::uint64_t old_generation =
-            Atomic(header_->catalog_generation)
-                .load(std::memory_order_relaxed);
-        const bool coherent =
-            old_bound == binding.entry.ordinal &&
-            binding.bound_count == old_bound + 1U &&
-            old_generation !=
-                std::numeric_limits<std::uint64_t>::max() &&
-            binding.catalog_generation == old_generation + 1U &&
-            HeaderCountsValidLocked();
-        if (coherent) {
-            Atomic(header_->catalog_generation)
-                .store(
-                    binding.catalog_generation,
-                    std::memory_order_relaxed);
-            StoreDigest(
-                &header_->catalog_digest,
-                binding.catalog_digest);
-            Atomic(header_->bound_count)
-                .store(
-                    static_cast<std::uint32_t>(
-                        binding.bound_count),
-                    // Point readers acquire this field directly. The release
-                    // imports the already release-published immutable row and
-                    // its preceding key-arena copies without touching the
-                    // global status seqcount.
-                    std::memory_order_release);
-            key_arena_used_.store(end, std::memory_order_release);
-        }
-        ReleaseSeqcount(
-            &header_->status_publish_tag, status_stable);
-        if (!coherent) {
-            ReportFailure(
-                "binding_catalog_cut",
-                binding.entry.ordinal,
-                binding.entry.instrument_id,
-                binding.entry.first_capture_sequence);
-            MarkCoverageLost();
-            return false;
-        }
-        return true;
-    }
-
     [[nodiscard]] bool PublishApplied(
         std::size_t ordinal,
         const market::RealtimeHistoryRecordV1& record) noexcept {
         if (header_ == nullptr ||
-            ordinal >= config_.directory->capacity() ||
+            ordinal >= config_.daily_catalog->instrument_count() ||
             record.instrument_id() != ordinal + 1U ||
             record.ingress_sequence() == 0U ||
             !StateAcceptsPublication(
@@ -2504,11 +2332,20 @@ public:
             watermark.generation == 0U ||
             catalog == nullptr ||
             catalog->session_epoch() != config_.session_epoch ||
-            catalog->capacity() != config_.directory->capacity() ||
+            catalog->capacity() !=
+                config_.daily_catalog->instrument_count() ||
             catalog->catalog_scope() !=
-                market::ObservedInstrumentCatalogScopeV2::
-                    kObservedOnly ||
-            catalog->coverage_complete() ||
+                market::InstrumentCatalogScopeV2::
+                    kDeclaredDailyAShare ||
+            !catalog->coverage_complete() ||
+            catalog->trade_date() !=
+                config_.daily_catalog->trade_date() ||
+            catalog->catalog_version() !=
+                config_.daily_catalog->catalog_version() ||
+            catalog->catalog_digest() !=
+                config_.daily_catalog->catalog_digest() ||
+            catalog->catalog_generation() != 1U ||
+            catalog->bound_count() != catalog->capacity() ||
             !watermark.processing_progress.valid() ||
             generation.windows().size() !=
                 config_.kline_windows.size()) {
@@ -2559,7 +2396,7 @@ public:
         }
         const std::uint64_t logical_slot_count =
             static_cast<std::uint64_t>(
-                config_.directory->capacity()) *
+                config_.daily_catalog->instrument_count()) *
             static_cast<std::uint64_t>(
                 config_.kline_windows.size());
         const std::uint64_t table_index =
@@ -2570,9 +2407,9 @@ public:
         for (std::size_t ordinal = 0U;
              ordinal < catalog->bound_count();
              ++ordinal) {
-            market::ObservedInstrumentEntryViewV2 entry{};
+            market::InstrumentRuntimeEntryViewV2 entry{};
             if (catalog->EntryAt(ordinal, &entry) !=
-                    market::ObservedInstrumentDirectoryErrorV2::
+                    market::InstrumentRuntimeStateErrorV2::
                         kNone ||
                 !entry.bound() ||
                 entry.instrument_id != ordinal + 1U ||
@@ -2961,17 +2798,17 @@ private:
 
     void StoreBoundIdentityRow(
         RealtimeWireInstrumentV2* row,
-        const market::ObservedInstrumentBindResultV2& binding,
+        const market::DailyInstrumentCatalogEntryV2& entry,
         std::uint64_t source_offset,
         std::uint64_t id_offset) noexcept {
         Atomic(row->instrument_id)
             .store(
-                binding.entry.instrument_id,
+                entry.instrument_id,
                 std::memory_order_relaxed);
         Atomic(row->ordinal)
             .store(
                 static_cast<std::uint32_t>(
-                    binding.entry.ordinal),
+                    entry.ordinal),
                 std::memory_order_relaxed);
         Atomic(row->binding_state)
             .store(
@@ -2984,22 +2821,22 @@ private:
         Atomic(row->market)
             .store(
                 static_cast<std::uint8_t>(
-                    binding.entry.key.market),
+                    entry.key.market),
                 std::memory_order_relaxed);
         Atomic(row->quantity_unit)
             .store(
                 static_cast<std::uint8_t>(
-                    binding.entry.metadata.quantity_unit),
+                    entry.metadata.quantity_unit),
                 std::memory_order_relaxed);
         Atomic(row->security_type)
             .store(
                 static_cast<std::uint8_t>(
-                    binding.entry.metadata.security_type),
+                    entry.metadata.security_type),
                 std::memory_order_relaxed);
         Atomic(row->asset_scope)
             .store(
                 static_cast<std::uint8_t>(
-                    binding.entry.metadata.asset_scope),
+                    entry.metadata.asset_scope),
                 std::memory_order_relaxed);
         Atomic(row->security_id_source_offset)
             .store(source_offset, std::memory_order_relaxed);
@@ -3008,13 +2845,72 @@ private:
         Atomic(row->security_id_source_length)
             .store(
                 static_cast<std::uint32_t>(
-                    binding.entry.key.security_id_source.size()),
+                    entry.key.security_id_source.size()),
                 std::memory_order_relaxed);
         Atomic(row->security_id_length)
             .store(
                 static_cast<std::uint32_t>(
-                    binding.entry.key.security_id.size()),
+                    entry.key.security_id.size()),
                 std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool InitializeCatalog() noexcept {
+        if (header_ == nullptr || config_.daily_catalog == nullptr) {
+            return false;
+        }
+        std::uint64_t used = 0U;
+        std::byte* const arena = key_arena();
+        for (const market::DailyInstrumentCatalogEntryV2& entry :
+             config_.daily_catalog->entries()) {
+            if (entry.instrument_id != entry.ordinal + 1U ||
+                entry.ordinal >=
+                    config_.daily_catalog->instrument_count() ||
+                entry.key.market == market::MarketV1::kUnknown ||
+                entry.key.security_id.empty() ||
+                entry.key.security_id_source.size() >
+                    std::numeric_limits<std::uint32_t>::max() ||
+                entry.key.security_id.size() >
+                    std::numeric_limits<std::uint32_t>::max()) {
+                return false;
+            }
+            const std::uint64_t source_bytes =
+                static_cast<std::uint64_t>(
+                    entry.key.security_id_source.size());
+            const std::uint64_t id_bytes =
+                static_cast<std::uint64_t>(
+                    entry.key.security_id.size());
+            std::uint64_t id_offset = 0U;
+            std::uint64_t end = 0U;
+            if (!CheckedAdd(used, source_bytes, &id_offset) ||
+                !CheckedAdd(id_offset, id_bytes, &end) ||
+                end > config_.key_arena_bytes) {
+                return false;
+            }
+            if (source_bytes != 0U) {
+                std::memcpy(
+                    arena + used,
+                    entry.key.security_id_source.data(),
+                    static_cast<std::size_t>(source_bytes));
+            }
+            std::memcpy(
+                arena + id_offset,
+                entry.key.security_id.data(),
+                static_cast<std::size_t>(id_bytes));
+            RealtimeWireInstrumentV2& row =
+                instrument_rows()[entry.ordinal];
+            StoreBoundIdentityRow(
+                &row, entry, used, id_offset);
+            row.publish_tag = 2U;
+            if (!RealtimeWireInstrumentStateValidV2(
+                    row, header_->capacity)) {
+                return false;
+            }
+            used = end;
+        }
+        key_arena_used_.store(used, std::memory_order_release);
+        return used != 0U &&
+               header_->bound_count == header_->capacity &&
+               HeaderCountsValidLocked();
     }
 
     [[nodiscard]] bool UpdateAppliedRow(
@@ -3409,14 +3305,18 @@ private:
                 : kRealtimeHeaderKLineEnabledV2;
         header_->capacity =
             static_cast<std::uint32_t>(
-                config_.directory->capacity());
+                config_.daily_catalog->instrument_count());
         header_->window_count =
             static_cast<std::uint32_t>(
                 config_.kline_windows.size());
         header_->catalog_scope =
             static_cast<std::uint32_t>(
-                RealtimeCatalogScopeV2::kObservedOnly);
-        header_->coverage_complete = 0U;
+                RealtimeCatalogScopeV2::kDeclaredDailyAShare);
+        header_->coverage_complete = 1U;
+        header_->catalog_trade_date =
+            config_.daily_catalog->trade_date();
+        header_->catalog_version =
+            config_.daily_catalog->catalog_version();
         StoreDigest(&header_->layout_digest, layout_digest_);
         header_->catalog_generation =
             initial_catalog_generation_;
@@ -3425,6 +3325,7 @@ private:
         StoreDigest(
             &header_->catalog_digest,
             initial_catalog_digest_);
+        header_->bound_count = header_->capacity;
         header_->region_count =
             static_cast<std::uint32_t>(
                 kRealtimeWireRegionCountV2);
@@ -4061,13 +3962,13 @@ private:
             }
         }
         if (status == RealtimeHistoryControlStatusV2::kOk) {
-            market::ObservedInstrumentEntryViewV2 entry{};
+            market::InstrumentRuntimeEntryViewV2 entry{};
             const auto& catalog =
                 state.published->generation->catalog_snapshot();
             if (catalog == nullptr ||
                 catalog->LookupById(
                     request.instrument_id, &entry) ==
-                    market::ObservedInstrumentDirectoryErrorV2::
+                    market::InstrumentRuntimeStateErrorV2::
                         kNotFound) {
                 status =
                     RealtimeHistoryControlStatusV2::kNotFound;
@@ -4400,12 +4301,12 @@ private:
         }
 
         RealtimeInstrumentTickDeltaCheckpointV2 target{};
-        market::ObservedInstrumentEntryViewV2 entry{};
+        market::InstrumentRuntimeEntryViewV2 entry{};
         const auto& catalog =
             session->target->generation->catalog_snapshot();
         if (catalog == nullptr ||
             catalog->LookupById(request.instrument_id, &entry) ==
-                market::ObservedInstrumentDirectoryErrorV2::
+                market::InstrumentRuntimeStateErrorV2::
                     kNotFound) {
             return RealtimeInstrumentTickDeltaControlStatusV2::
                 kNotFound;
@@ -5295,14 +5196,6 @@ bool RealtimeSharedMarketServiceV2::Start(
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
            impl_->Start(system_error_number);
-}
-
-bool RealtimeSharedMarketServiceV2::
-    PublishObservedInstrumentBinding(
-        const market::ObservedInstrumentBindResultV2& binding)
-        noexcept {
-    return impl_ != nullptr &&
-           impl_->PublishObservedInstrumentBinding(binding);
 }
 
 bool RealtimeSharedMarketServiceV2::PublishApplied(

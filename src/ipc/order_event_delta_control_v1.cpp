@@ -1,4 +1,5 @@
 #include "l2flow/ipc/order_event_delta_control_v1.h"
+#include "l2flow/ipc/realtime_wire_v2.h"
 
 #include <algorithm>
 #include <array>
@@ -80,6 +81,21 @@ void CopyIdentity(
     }
 }
 
+[[nodiscard]] common::Sha256Digest DigestFromBytes(
+    const std::array<std::uint8_t, 32U>& bytes) noexcept {
+    common::Sha256Digest result{};
+    std::memcpy(result.data(), bytes.data(), result.size());
+    return result;
+}
+
+void CopyDigest(
+    const common::Sha256Digest& source,
+    std::array<std::uint8_t, 32U>* output) noexcept {
+    if (output != nullptr) {
+        std::memcpy(output->data(), source.data(), output->size());
+    }
+}
+
 template <typename Value>
 [[nodiscard]] bool ObjectBytesZero(const Value& value) noexcept {
     static_assert(std::is_trivially_copyable_v<Value>);
@@ -93,7 +109,55 @@ template <typename Value>
 [[nodiscard]] bool SourceSessionValid(
     const OrderEventDeltaSourceSessionV1& session) noexcept {
     return IdentityNonzero(session.run_id) &&
-           session.session_epoch != 0U && session.trade_date != 0U;
+           !ObjectBytesZero(session.catalog_digest) &&
+           session.session_epoch != 0U &&
+           session.catalog_generation == 1U &&
+           session.catalog_version != 0U &&
+           session.trade_date != 0U &&
+           session.catalog_trade_date == session.trade_date &&
+           session.capacity != 0U &&
+           session.bound_count == session.capacity &&
+           session.catalog_scope ==
+               static_cast<std::uint32_t>(
+                   RealtimeCatalogScopeV2::kDeclaredDailyAShare) &&
+           session.coverage_complete == 1U;
+}
+
+[[nodiscard]] OrderEventDeltaSourceSessionV1
+SourceSessionFromWire(
+    const OrderEventDeltaSourceSessionWireV1& wire) noexcept {
+    OrderEventDeltaSourceSessionV1 result{};
+    result.run_id = IdentityFromBytes(wire.run_id);
+    result.catalog_digest = DigestFromBytes(wire.catalog_digest);
+    result.session_epoch = wire.session_epoch;
+    result.catalog_generation = wire.catalog_generation;
+    result.catalog_version = wire.catalog_version;
+    result.trade_date = wire.trade_date;
+    result.catalog_trade_date = wire.catalog_trade_date;
+    result.capacity = wire.capacity;
+    result.bound_count = wire.bound_count;
+    result.catalog_scope = wire.catalog_scope;
+    result.coverage_complete = wire.coverage_complete;
+    return result;
+}
+
+void SourceSessionToWire(
+    const OrderEventDeltaSourceSessionV1& session,
+    OrderEventDeltaSourceSessionWireV1* wire) noexcept {
+    if (wire == nullptr) {
+        return;
+    }
+    CopyIdentity(session.run_id, &wire->run_id);
+    CopyDigest(session.catalog_digest, &wire->catalog_digest);
+    wire->session_epoch = session.session_epoch;
+    wire->catalog_generation = session.catalog_generation;
+    wire->catalog_version = session.catalog_version;
+    wire->trade_date = session.trade_date;
+    wire->catalog_trade_date = session.catalog_trade_date;
+    wire->capacity = session.capacity;
+    wire->bound_count = session.bound_count;
+    wire->catalog_scope = session.catalog_scope;
+    wire->coverage_complete = session.coverage_complete;
 }
 
 [[nodiscard]] bool EventSessionValid(
@@ -511,15 +575,8 @@ template <typename Packet>
 void SnapshotToResponse(
     const OrderEventDeltaControlSnapshotV1& snapshot,
     OrderEventDeltaControlGetSessionResponseV1* response) noexcept {
-    CopyIdentity(
-        snapshot.source_session.run_id,
-        &response->source_run_id);
-    response->source_session_epoch =
-        snapshot.source_session.session_epoch;
-    response->source_trade_date =
-        snapshot.source_session.trade_date;
-    response->event_producer_state =
-        snapshot.event_producer_state;
+    SourceSessionToWire(
+        snapshot.source_session, &response->source_session);
     CopyIdentity(
         snapshot.event_session.run_id,
         &response->event_run_id);
@@ -527,6 +584,8 @@ void SnapshotToResponse(
         snapshot.event_session.session_epoch;
     response->event_trade_date =
         snapshot.event_session.trade_date;
+    response->event_producer_state =
+        snapshot.event_producer_state;
     response->event_header_flags =
         snapshot.event_header_flags;
     response->event_ring_capacity =
@@ -548,12 +607,8 @@ SnapshotFromResponse(
     const OrderEventDeltaControlGetSessionResponseV1&
         response) noexcept {
     OrderEventDeltaControlSnapshotV1 result{};
-    result.source_session.run_id =
-        IdentityFromBytes(response.source_run_id);
-    result.source_session.session_epoch =
-        response.source_session_epoch;
-    result.source_session.trade_date =
-        response.source_trade_date;
+    result.source_session =
+        SourceSessionFromWire(response.source_session);
     result.event_session.run_id =
         IdentityFromBytes(response.event_run_id);
     result.event_session.session_epoch =
@@ -1076,19 +1131,18 @@ private:
 
         OrderEventDeltaControlStatusV1 status =
             OrderEventDeltaControlStatusV1::kOk;
+        const OrderEventDeltaSourceSessionV1 requested_source_session =
+            SourceSessionFromWire(
+                request.expected_source_session);
         if (request.magic != kOrderEventDeltaControlMagicV1 ||
             request.opcode != static_cast<std::uint16_t>(
                                   OrderEventDeltaControlOpcodeV1::
                                       kGetSession) ||
             request.message_bytes != sizeof(request) ||
             request.flags != 0U || request.reserved0 != 0U ||
-            request.request_id == 0U || request.reserved1 != 0U ||
+            request.request_id == 0U ||
             !ObjectBytesZero(request.reserved) ||
-            !IdentityNonzero(
-                IdentityFromBytes(
-                    request.expected_source_run_id)) ||
-            request.expected_source_session_epoch == 0U ||
-            request.expected_source_trade_date == 0U) {
+            !SourceSessionValid(requested_source_session)) {
             status =
                 OrderEventDeltaControlStatusV1::kInvalidRequest;
         } else if (
@@ -1099,12 +1153,7 @@ private:
             status = OrderEventDeltaControlStatusV1::
                 kUnsupportedVersion;
         } else if (
-            IdentityFromBytes(request.expected_source_run_id) !=
-                config_.source_session.run_id ||
-            request.expected_source_session_epoch !=
-                config_.source_session.session_epoch ||
-            request.expected_source_trade_date !=
-                config_.source_session.trade_date) {
+            requested_source_session != config_.source_session) {
             status = OrderEventDeltaControlStatusV1::
                 kSourceSessionMismatch;
         } else if (!snapshot_valid) {
@@ -1395,6 +1444,7 @@ namespace {
            response.message_bytes == sizeof(response) &&
            response.reserved0 == 0U &&
            response.request_id == request_id &&
+           response.reserved_event == 0U &&
            ObjectBytesZero(response.reserved);
 }
 
@@ -1466,13 +1516,9 @@ OrderEventDeltaControlGetSessionV1(
         request.message_bytes =
             static_cast<std::uint32_t>(sizeof(request));
         request.request_id = NextRequestId();
-        CopyIdentity(
-            config.expected_source_session.run_id,
-            &request.expected_source_run_id);
-        request.expected_source_session_epoch =
-            config.expected_source_session.session_epoch;
-        request.expected_source_trade_date =
-            config.expected_source_session.trade_date;
+        SourceSessionToWire(
+            config.expected_source_session,
+            &request.expected_source_session);
 
         IoResult io = SendPacket(
             socket_fd,

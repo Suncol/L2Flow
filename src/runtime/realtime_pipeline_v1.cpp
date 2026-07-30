@@ -462,7 +462,9 @@ private:
 
 class StageLatencyCollector final {
 public:
-    explicit StageLatencyCollector(std::uint32_t trade_date)
+    explicit StageLatencyCollector(
+        std::uint32_t trade_date,
+        std::size_t completion_window_slots)
         : trade_date_(trade_date),
           sdk_local_to_callback_success_(
               -60'000'000'000LL, 60'000'000'000LL, 100'000ULL),
@@ -473,9 +475,36 @@ public:
               0, 5'000'000'000LL, 5'000ULL),
           callback_entry_to_inprocess_latest_read_(
               0, 5'000'000'000LL, 5'000ULL),
-          append_call_(0, 20'000'000LL, 50ULL) {
+          append_call_(0, 20'000'000LL, 50ULL),
+          callback_to_store_applied_(
+              0, 5'000'000'000LL, 5'000ULL),
+          callback_to_ipc_visible_(
+              0, 5'000'000'000LL, 5'000ULL),
+          decode_applied_slot_count_(completion_window_slots),
+          decode_applied_slots_(
+              std::make_unique<DecodeAppliedTimingSlot[]>(
+                  completion_window_slots)) {
         trade_date_valid_ =
             FixedUtc8MidnightNs(trade_date_, &fixed_utc8_midnight_ns_);
+        for (std::size_t source = 0U;
+             source < market::kRealtimeHistorySourceCountV1;
+             ++source) {
+            callback_to_decoder_publish_[source] =
+                std::make_unique<ConcurrentLinearLatencyHistogram>(
+                    0, 20'000'000LL, 50ULL);
+            decoder_queue_dwell_[source] =
+                std::make_unique<ConcurrentLinearLatencyHistogram>(
+                    0, 5'000'000'000LL, 5'000ULL);
+            decode_duration_[source] =
+                std::make_unique<ConcurrentLinearLatencyHistogram>(
+                    0, 20'000'000LL, 50ULL);
+            decode_to_history_submit_[source] =
+                std::make_unique<ConcurrentLinearLatencyHistogram>(
+                    0, 20'000'000LL, 50ULL);
+            decode_to_applied_[source] =
+                std::make_unique<ConcurrentLinearLatencyHistogram>(
+                    0, 5'000'000'000LL, 5'000ULL);
+        }
     }
 
     void RecordCallback(
@@ -512,6 +541,157 @@ public:
         }
     }
 
+    void RecordDecoderPublish(
+        std::uint8_t source,
+        std::uint64_t callback_entry_monotonic_ns,
+        std::uint64_t queue_publish_monotonic_ns) noexcept {
+        if (source >= market::kRealtimeHistorySourceCountV1) {
+            return;
+        }
+        std::int64_t elapsed = 0;
+        if (callback_entry_monotonic_ns != 0U &&
+            queue_publish_monotonic_ns != 0U &&
+            UnsignedElapsed(
+                callback_entry_monotonic_ns,
+                queue_publish_monotonic_ns,
+                &elapsed)) {
+            callback_to_decoder_publish_[source]->Add(elapsed);
+        } else {
+            callback_to_decoder_publish_[source]->AddInvalid();
+        }
+    }
+
+    void RecordDecoderWork(
+        std::uint8_t source,
+        std::uint64_t queue_publish_monotonic_ns,
+        std::uint64_t dequeue_monotonic_ns,
+        std::uint64_t decode_start_monotonic_ns,
+        std::uint64_t decode_complete_monotonic_ns,
+        std::uint64_t history_submit_complete_monotonic_ns,
+        bool queue_clocks_valid,
+        bool decode_clock_valid,
+        bool history_submit_clock_valid) noexcept {
+        if (source >= market::kRealtimeHistorySourceCountV1) {
+            return;
+        }
+        std::int64_t elapsed = 0;
+        if (queue_clocks_valid &&
+            UnsignedElapsed(
+                queue_publish_monotonic_ns,
+                dequeue_monotonic_ns,
+                &elapsed)) {
+            decoder_queue_dwell_[source]->Add(elapsed);
+        } else {
+            decoder_queue_dwell_[source]->AddInvalid();
+        }
+        if (decode_clock_valid &&
+            UnsignedElapsed(
+                decode_start_monotonic_ns,
+                decode_complete_monotonic_ns,
+                &elapsed)) {
+            decode_duration_[source]->Add(elapsed);
+        } else {
+            decode_duration_[source]->AddInvalid();
+        }
+        if (history_submit_clock_valid &&
+            UnsignedElapsed(
+                decode_complete_monotonic_ns,
+                history_submit_complete_monotonic_ns,
+                &elapsed)) {
+            decode_to_history_submit_[source]->Add(elapsed);
+        } else {
+            decode_to_history_submit_[source]->AddInvalid();
+        }
+    }
+
+    void RecordDecodeAppliedOrigin(
+        std::uint8_t source,
+        std::uint64_t ingress_sequence,
+        std::uint64_t decode_complete_monotonic_ns,
+        bool clock_valid) noexcept {
+        if (source >= market::kRealtimeHistorySourceCountV1 ||
+            ingress_sequence == 0U ||
+            decode_applied_slot_count_ == 0U ||
+            decode_applied_slots_ == nullptr) {
+            return;
+        }
+        DecodeAppliedTimingSlot& slot =
+            decode_applied_slots_[
+                static_cast<std::size_t>(
+                    ingress_sequence %
+                    decode_applied_slot_count_)];
+        // D is strictly smaller than this ring. A slot therefore cannot be
+        // reused until its prior sequence has called RecordApplied and
+        // advanced the contiguous applied frontier.
+        slot.decode_complete_monotonic_ns.store(
+            decode_complete_monotonic_ns,
+            std::memory_order_relaxed);
+        slot.source.store(source, std::memory_order_relaxed);
+        slot.clock_valid.store(
+            clock_valid ? 1U : 0U,
+            std::memory_order_relaxed);
+        slot.ingress_sequence.store(
+            ingress_sequence,
+            std::memory_order_release);
+    }
+
+    void RecordApplied(
+        const market::RealtimeHistoryAppliedObservationV2& observation)
+        noexcept {
+        std::int64_t elapsed = 0;
+        if (observation.source_slot <
+                market::kRealtimeHistorySourceCountV1 &&
+            observation.ingress_sequence != 0U &&
+            decode_applied_slot_count_ != 0U &&
+            decode_applied_slots_ != nullptr) {
+            DecodeAppliedTimingSlot& slot =
+                decode_applied_slots_[
+                    static_cast<std::size_t>(
+                        observation.ingress_sequence %
+                        decode_applied_slot_count_)];
+            const std::uint64_t slot_sequence =
+                slot.ingress_sequence.load(std::memory_order_acquire);
+            const std::uint8_t slot_source =
+                slot.source.load(std::memory_order_relaxed);
+            const bool slot_clock_valid =
+                slot.clock_valid.load(std::memory_order_relaxed) != 0U;
+            const std::uint64_t decode_complete =
+                slot.decode_complete_monotonic_ns.load(
+                    std::memory_order_relaxed);
+            if (slot_sequence == observation.ingress_sequence) {
+                slot.ingress_sequence.store(
+                    0U, std::memory_order_release);
+            }
+            if (slot_sequence == observation.ingress_sequence &&
+                slot_source == observation.source_slot &&
+                slot_clock_valid &&
+                observation.applied_complete_clock_valid &&
+                UnsignedElapsed(
+                    decode_complete,
+                    observation.applied_complete_monotonic_ns,
+                    &elapsed)) {
+                decode_to_applied_[observation.source_slot]->Add(
+                    elapsed);
+            } else {
+                decode_to_applied_[observation.source_slot]
+                    ->AddInvalid();
+            }
+        }
+        if (observation.external_publication_present &&
+            observation.external_publication_clock_valid &&
+            observation.recv_monotonic_ns >= 0 &&
+            UnsignedElapsed(
+                static_cast<std::uint64_t>(
+                    observation.recv_monotonic_ns),
+                observation
+                    .external_publication_complete_monotonic_ns,
+                &elapsed)) {
+            callback_to_ipc_visible_.Add(elapsed);
+        } else {
+            callback_to_ipc_visible_.AddInvalid();
+        }
+    }
+
     void RecordAppend(
         const market::RealtimeHistoryAppendObservationV1& observation)
         noexcept {
@@ -530,8 +710,10 @@ public:
                 observation.append_complete_monotonic_ns,
                 &elapsed)) {
             callback_entry_to_append_complete_.Add(elapsed);
+            callback_to_store_applied_.Add(elapsed);
         } else {
             callback_entry_to_append_complete_.AddInvalid();
+            callback_to_store_applied_.AddInvalid();
         }
         if (observation.clock_observation_valid &&
             UnsignedElapsed(
@@ -596,10 +778,36 @@ public:
         result.callback_entry_to_inprocess_latest_read =
             callback_entry_to_inprocess_latest_read_.Snapshot();
         result.append_call = append_call_.Snapshot();
+        for (std::size_t source = 0U;
+             source < market::kRealtimeHistorySourceCountV1;
+             ++source) {
+            result.callback_to_decoder_publish[source] =
+                callback_to_decoder_publish_[source]->Snapshot();
+            result.decoder_queue_dwell[source] =
+                decoder_queue_dwell_[source]->Snapshot();
+            result.decode_duration[source] =
+                decode_duration_[source]->Snapshot();
+            result.decode_to_history_submit[source] =
+                decode_to_history_submit_[source]->Snapshot();
+            result.decode_to_applied[source] =
+                decode_to_applied_[source]->Snapshot();
+        }
+        result.callback_to_store_applied =
+            callback_to_store_applied_.Snapshot();
+        result.callback_to_ipc_visible =
+            callback_to_ipc_visible_.Snapshot();
         return result;
     }
 
 private:
+    struct DecodeAppliedTimingSlot final {
+        std::atomic<std::uint64_t> ingress_sequence{0U};
+        std::atomic<std::uint64_t>
+            decode_complete_monotonic_ns{0U};
+        std::atomic<std::uint8_t> source{0U};
+        std::atomic<std::uint8_t> clock_valid{0U};
+    };
+
     [[nodiscard]] bool VendorRealtimeNs(
         std::uint32_t raw,
         std::int64_t* output) const noexcept {
@@ -647,23 +855,55 @@ private:
     ConcurrentLinearLatencyHistogram
         callback_entry_to_inprocess_latest_read_;
     ConcurrentLinearLatencyHistogram append_call_;
+    ConcurrentLinearLatencyHistogram callback_to_store_applied_;
+    ConcurrentLinearLatencyHistogram callback_to_ipc_visible_;
+    std::array<std::unique_ptr<ConcurrentLinearLatencyHistogram>,
+               market::kRealtimeHistorySourceCountV1>
+        callback_to_decoder_publish_{};
+    std::array<std::unique_ptr<ConcurrentLinearLatencyHistogram>,
+               market::kRealtimeHistorySourceCountV1>
+        decoder_queue_dwell_{};
+    std::array<std::unique_ptr<ConcurrentLinearLatencyHistogram>,
+               market::kRealtimeHistorySourceCountV1>
+        decode_duration_{};
+    std::array<std::unique_ptr<ConcurrentLinearLatencyHistogram>,
+               market::kRealtimeHistorySourceCountV1>
+        decode_to_history_submit_{};
+    std::array<std::unique_ptr<ConcurrentLinearLatencyHistogram>,
+               market::kRealtimeHistorySourceCountV1>
+        decode_to_applied_{};
+    const std::size_t decode_applied_slot_count_;
+    std::unique_ptr<DecodeAppliedTimingSlot[]>
+        decode_applied_slots_;
 };
 
 [[nodiscard]] bool BoundedAppliedWindowCapacity(
     const RealtimePipelineConfigV1& config,
     std::size_t* output) noexcept {
+    constexpr std::size_t source_count =
+        market::kRealtimeHistorySourceCountV1;
     if (output == nullptr ||
+        config.decoder_queue_capacity_per_source == 0U ||
         config.decoder_queue_capacity_per_source >
-            (std::numeric_limits<std::size_t>::max() - 4U) / 4U) {
+            (std::numeric_limits<std::size_t>::max() -
+             source_count) /
+                source_count ||
+        config.completion_tracker_capacity < 2U ||
+        config.tick_ring_capacity < 2U) {
         return false;
     }
-    // This explicit dispatcher-side gate, rather than any expectation about
-    // queue drain speed, bounds how far completion may run ahead of a missing
-    // applied sequence.
-    const std::size_t maximum =
-        config.decoder_queue_capacity_per_source * 4U + 4U + 1U;
+    const std::size_t target =
+        config.decoder_queue_capacity_per_source * source_count +
+        source_count;
+    const std::size_t maximum = std::min(
+        {target,
+         config.completion_tracker_capacity - 1U,
+         config.tick_ring_capacity - 1U});
     if (maximum == 0U ||
-        maximum > realtime::kOwnedIngressMaximumInflightMessagesV1) {
+        maximum >= config.completion_tracker_capacity ||
+        maximum >= config.tick_ring_capacity ||
+        maximum >
+            realtime::kOwnedIngressMaximumInflightMessagesV1) {
         return false;
     }
     *output = maximum;
@@ -672,16 +912,27 @@ private:
 
 [[nodiscard]] bool BoundedIngressPoolCapacity(
     const RealtimePipelineConfigV1& config,
-    std::size_t applied_window,
     std::size_t* output) noexcept {
-    if (output == nullptr || applied_window == 0U) {
+    constexpr std::size_t source_count =
+        market::kRealtimeHistorySourceCountV1;
+    if (output == nullptr ||
+        config.decoder_queue_capacity_per_source == 0U ||
+        config.decoder_queue_capacity_per_source >
+            std::numeric_limits<std::size_t>::max() /
+                source_count) {
         return false;
     }
-    std::size_t maximum = applied_window;
+    std::size_t maximum =
+        config.decoder_queue_capacity_per_source * source_count;
+    // One message can be held by each decoder after it has left its queue.
+    // One is being constructed by the serialized callback. A source-count
+    // safety margin covers bounded lifecycle handoff without relying on
+    // History queue capacity (History never owns the raw SDK message).
+    constexpr std::size_t decoder_owners = source_count;
     constexpr std::size_t callback_owner = 1U;
-    const std::array<std::size_t, 2U> additions{
-        config.processing_queue_capacity,
-        callback_owner};
+    constexpr std::size_t safety_margin = source_count;
+    const std::array<std::size_t, 3U> additions{
+        decoder_owners, callback_owner, safety_margin};
     for (const std::size_t addition : additions) {
         if (addition >
             std::numeric_limits<std::size_t>::max() - maximum) {
@@ -735,9 +986,6 @@ std::string_view RealtimePipelineCreateErrorNameV1(
         case RealtimePipelineCreateErrorV1::
             kProgressThreadStartFailed:
             return "progress_thread_start_failed";
-        case RealtimePipelineCreateErrorV1::
-            kProcessingThreadStartFailed:
-            return "processing_thread_start_failed";
         case RealtimePipelineCreateErrorV1::kDecoderThreadStartFailed:
             return "decoder_thread_start_failed";
         case RealtimePipelineCreateErrorV1::kSdkLoadFailed:
@@ -779,9 +1027,8 @@ std::string_view RealtimePipelineIngressErrorNameV1(
             return "owned_message_rejected";
         case RealtimePipelineIngressErrorV1::kForbiddenCombinedTick:
             return "forbidden_combined_tick";
-        case RealtimePipelineIngressErrorV1::
-            kProcessingAdmissionFailed:
-            return "processing_admission_failed";
+        case RealtimePipelineIngressErrorV1::kDecoderAdmissionFailed:
+            return "decoder_admission_failed";
         case RealtimePipelineIngressErrorV1::kStopped:
             return "stopped";
         case RealtimePipelineIngressErrorV1::kFatal:
@@ -790,6 +1037,8 @@ std::string_view RealtimePipelineIngressErrorNameV1(
             return "filtered_non_a_share";
         case RealtimePipelineIngressErrorV1::kInstrumentKeyRejected:
             return "instrument_key_rejected";
+        case RealtimePipelineIngressErrorV1::kCatalogMiss:
+            return "catalog_miss";
     }
     return "unknown";
 }
@@ -811,12 +1060,14 @@ std::string_view RealtimePipelineCutErrorNameV1(
             return "clock_failure";
         case RealtimePipelineCutErrorV1::kWatermarkFailed:
             return "watermark_failed";
-        case RealtimePipelineCutErrorV1::kProcessingBarrierFailed:
-            return "processing_barrier_failed";
+        case RealtimePipelineCutErrorV1::kFenceArrivalFailed:
+            return "fence_arrival_failed";
         case RealtimePipelineCutErrorV1::kGenerationBeginFailed:
             return "generation_begin_failed";
-        case RealtimePipelineCutErrorV1::kMarkerAdmissionFailed:
-            return "marker_admission_failed";
+        case RealtimePipelineCutErrorV1::kFenceAdmissionFailed:
+            return "fence_admission_failed";
+        case RealtimePipelineCutErrorV1::kFenceSealFailed:
+            return "fence_seal_failed";
         case RealtimePipelineCutErrorV1::kGenerationWaitFailed:
             return "generation_wait_failed";
         case RealtimePipelineCutErrorV1::
@@ -838,250 +1089,185 @@ public:
         bool valid = false;
     };
 
+    struct DecoderTimingObservation final {
+        std::uint64_t decode_complete_monotonic_ns = 0U;
+        std::uint64_t history_submit_complete_monotonic_ns = 0U;
+        bool decode_complete_clock_valid = false;
+        bool history_submit_complete_clock_valid = false;
+    };
+
     enum class CommandKind : std::uint8_t {
         kMessage = 0U,
-        kGenerationMarker,
+        kGenerationFence,
     };
 
     struct DecoderCommand final {
         CommandKind kind = CommandKind::kMessage;
         realtime::OwnedIngressMessageHandleV1 message;
-        market::ObservedInstrumentIdentityViewV2 identity{};
+        market::DailyInstrumentIdentityViewV2 identity{};
         std::uint64_t generation = 0U;
+        std::uint64_t callback_entry_monotonic_ns = 0U;
+        std::uint64_t queue_publish_monotonic_ns = 0U;
     };
 
-    class ProcessingQueue final {
+    class DecoderQueue final {
     public:
-        explicit ProcessingQueue(std::size_t capacity)
-            : slots_(capacity + 1U) {}
+        explicit DecoderQueue(std::size_t message_capacity)
+            : message_capacity_(message_capacity),
+              // Q message slots, one reserved control slot, and one empty
+              // ring cell that distinguishes full from empty.
+              slots_(message_capacity + 2U) {}
 
-        ProcessingQueue(const ProcessingQueue&) = delete;
-        ProcessingQueue& operator=(const ProcessingQueue&) = delete;
+        DecoderQueue(const DecoderQueue&) = delete;
+        DecoderQueue& operator=(const DecoderQueue&) = delete;
 
         template <typename Commit>
-        [[nodiscard]] bool TryPush(
-            realtime::OwnedIngressMessageHandleV1 message,
+        [[nodiscard]] bool TryPushWithCommit(
+            DecoderCommand&& command,
             Commit&& commit) noexcept {
-            static_assert(std::is_nothrow_invocable_v<Commit&>);
-            if (!message) {
+            static_assert(
+                std::is_nothrow_invocable_v<
+                    Commit&, std::uint64_t>);
+            static_assert(
+                std::is_nothrow_move_constructible_v<DecoderCommand>);
+            if (command.kind != CommandKind::kMessage ||
+                !command.message) {
                 return false;
             }
             detail::CloseablePublicationGate::Lease publication =
                 publication_gate_.TryAcquire();
             if (!publication) {
+                return false;
+            }
+            if (!WakeEpochAvailable()) {
+                return false;
+            }
+            if (message_depth_.load(std::memory_order_acquire) >=
+                message_capacity_) {
+                full_count_.fetch_add(1U, std::memory_order_relaxed);
                 return false;
             }
             const std::size_t tail =
                 tail_.load(std::memory_order_relaxed);
             const std::size_t next = Increment(tail);
             if (next == head_.load(std::memory_order_acquire)) {
+                full_count_.fetch_add(1U, std::memory_order_relaxed);
                 return false;
             }
-            slots_[tail] = std::move(message);
-            // This is the admission linearization point. The slot is owned
-            // and no later operation can fail, but the consumer cannot see it
-            // until the release publication of tail below. The caller
-            // therefore commits accepted/capture state before any matching
-            // applied publication is possible.
-            std::forward<Commit>(commit)();
+            slots_[tail].emplace(std::move(command));
+            std::uint64_t queue_publish_monotonic_ns = 0U;
+            if (slots_[tail]->callback_entry_monotonic_ns != 0U) {
+                static_cast<void>(ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &queue_publish_monotonic_ns));
+            }
+            slots_[tail]->queue_publish_monotonic_ns =
+                queue_publish_monotonic_ns;
+            const std::size_t message_depth =
+                message_depth_.fetch_add(
+                    1U, std::memory_order_relaxed) +
+                1U;
+            total_depth_.fetch_add(1U, std::memory_order_relaxed);
+            UpdateHighWater(message_depth);
+
+            // Irreversible admission linearization point. Slot construction
+            // is complete and every later operation is a noexcept atomic
+            // publication. The consumer's acquire tail load therefore also
+            // observes all accepted-frontier writes made by commit.
+            std::forward<Commit>(commit)(
+                queue_publish_monotonic_ns);
             tail_.store(next, std::memory_order_release);
             WakeConsumer();
             return true;
         }
 
-        [[nodiscard]] bool Pop(
-            realtime::OwnedIngressMessageHandleV1* output) noexcept {
-            if (output == nullptr) {
+        [[nodiscard]] bool TryPushFence(
+            DecoderCommand&& command) noexcept {
+            static_assert(
+                std::is_nothrow_move_constructible_v<DecoderCommand>);
+            if (command.kind != CommandKind::kGenerationFence ||
+                command.message || command.generation == 0U) {
                 return false;
             }
-            output->reset();
-            for (;;) {
-                if (TryPop(output)) {
-                    return true;
-                }
-                if (publication_gate_.closed_and_quiesced()) {
-                    return false;
-                }
-                // This must be an RMW paired with WakeConsumer's exchange.
-                // With a plain store, the producer may publish the sole
-                // record and observe sleeping=false immediately before this
-                // store, while this thread subsequently observes the old
-                // tail and sleeps with no later producer to wake it. If the
-                // producer's exchange wins first, this acquire imports its
-                // preceding tail publication; if this exchange wins first,
-                // the producer observes true and notifies.
-                consumer_sleeping_.exchange(
-                    true, std::memory_order_acq_rel);
-                if (!Empty() ||
-                    publication_gate_.closed_and_quiesced()) {
-                    consumer_sleeping_.store(
-                        false, std::memory_order_release);
-                    continue;
-                }
-                consumer_sleeping_.wait(
-                    true, std::memory_order_acquire);
-            }
-        }
-
-        void RequestStop() noexcept {
-            // A callback that already crossed TryAcquire() must publish its
-            // tail before close returns. The callback itself never waits:
-            // only the closing thread waits for that bounded memory section.
-            publication_gate_.CloseAndWait();
-            consumer_sleeping_.store(
-                false, std::memory_order_release);
-            consumer_sleeping_.notify_all();
-        }
-
-    private:
-        [[nodiscard]] bool TryPop(
-            realtime::OwnedIngressMessageHandleV1* output) noexcept {
-            const std::size_t head =
-                head_.load(std::memory_order_relaxed);
-            const std::size_t tail =
-                tail_.load(std::memory_order_acquire);
-            if (head == tail) {
-                return false;
-            }
-            *output = std::move(slots_[head]);
-            slots_[head].reset();
-            head_.store(Increment(head), std::memory_order_release);
-            return static_cast<bool>(*output);
-        }
-
-        [[nodiscard]] bool Empty() const noexcept {
-            return head_.load(std::memory_order_acquire) ==
-                   tail_.load(std::memory_order_acquire);
-        }
-
-        void WakeConsumer() noexcept {
-            if (!consumer_sleeping_.exchange(
-                    false, std::memory_order_acq_rel)) {
-                return;
-            }
-            consumer_sleeping_.notify_one();
-        }
-
-        [[nodiscard]] std::size_t Increment(
-            std::size_t value) const noexcept {
-            ++value;
-            return value == slots_.size() ? 0U : value;
-        }
-
-        std::vector<realtime::OwnedIngressMessageHandleV1> slots_;
-        alignas(64) std::atomic<std::size_t> head_{0U};
-        alignas(64) std::atomic<std::size_t> tail_{0U};
-        detail::CloseablePublicationGate publication_gate_;
-        std::atomic<bool> consumer_sleeping_{false};
-    };
-
-    class DecoderQueue final {
-    public:
-        explicit DecoderQueue(std::size_t capacity)
-            : slots_(capacity + 1U) {}
-
-        DecoderQueue(const DecoderQueue&) = delete;
-        DecoderQueue& operator=(const DecoderQueue&) = delete;
-
-        [[nodiscard]] bool TryPush(DecoderCommand&& command) noexcept {
             detail::CloseablePublicationGate::Lease publication =
                 publication_gate_.TryAcquire();
-            if (!publication) {
+            if (!publication ||
+                !WakeEpochAvailable() ||
+                control_inflight_.load(std::memory_order_acquire)) {
                 return false;
             }
             const std::size_t tail =
                 tail_.load(std::memory_order_relaxed);
             const std::size_t next = Increment(tail);
-            const std::size_t head =
-                head_.load(std::memory_order_acquire);
-            if (next == head) {
+            if (next == head_.load(std::memory_order_acquire) ||
+                total_depth_.load(std::memory_order_acquire) >
+                    message_capacity_) {
                 return false;
             }
             slots_[tail].emplace(std::move(command));
+            control_inflight_.store(true, std::memory_order_relaxed);
+            total_depth_.fetch_add(1U, std::memory_order_relaxed);
             tail_.store(next, std::memory_order_release);
             WakeConsumer();
             return true;
         }
 
-        [[nodiscard]] bool PushUntil(
-            DecoderCommand command,
-            std::chrono::steady_clock::time_point deadline) noexcept {
-            try {
-                while (true) {
-                    if (TryPush(std::move(command))) {
-                        return true;
-                    }
-                    if (publication_gate_.close_requested()) {
-                        return false;
-                    }
-                    std::unique_lock<std::mutex> lock(wait_mutex_);
-                    producer_waiting_.exchange(
-                        true, std::memory_order_acq_rel);
-                    if (!Full()) {
-                        producer_waiting_.store(
-                            false, std::memory_order_release);
-                        continue;
-                    }
-                    const auto ready = [this] {
-                        return publication_gate_.close_requested() ||
-                               !producer_waiting_.load(
-                                   std::memory_order_acquire);
-                    };
-                    if (!not_full_.wait_until(lock, deadline, ready)) {
-                        producer_waiting_.store(
-                            false, std::memory_order_release);
-                        return false;
-                    }
-                    if (publication_gate_.close_requested()) {
-                        return false;
-                    }
-                }
-            } catch (...) {
-                return false;
-            }
+        void CompleteFence() noexcept {
+            control_inflight_.store(false, std::memory_order_release);
         }
 
         [[nodiscard]] bool Pop(DecoderCommand* output) noexcept {
             if (output == nullptr) {
                 return false;
             }
-            try {
-                while (true) {
-                    if (TryPop(output)) {
-                        return true;
-                    }
-                    if (publication_gate_.closed_and_quiesced()) {
-                        return false;
-                    }
-                    std::unique_lock<std::mutex> lock(wait_mutex_);
-                    consumer_sleeping_.exchange(
-                        true, std::memory_order_acq_rel);
-                    if (!Empty()) {
-                        consumer_sleeping_.store(
-                            false, std::memory_order_release);
-                        continue;
-                    }
-                    not_empty_.wait(lock, [this] {
-                        return publication_gate_
-                                   .closed_and_quiesced() ||
-                               !consumer_sleeping_.load(
-                                   std::memory_order_acquire);
-                    });
+            while (true) {
+                if (TryPop(output)) {
+                    return true;
                 }
-            } catch (...) {
-                return false;
+                if (publication_gate_.closed_and_quiesced()) {
+                    return false;
+                }
+                const std::uint64_t observed_epoch =
+                    wake_epoch_.load(std::memory_order_acquire);
+                // Close the window between observing an empty tail and
+                // arming the atomic wait. If publication wins either side,
+                // this pop sees the tail or wait observes a changed epoch.
+                if (TryPop(output)) {
+                    return true;
+                }
+                if (publication_gate_.closed_and_quiesced()) {
+                    return false;
+                }
+                wake_epoch_.wait(
+                    observed_epoch, std::memory_order_acquire);
             }
         }
 
         void RequestStop() noexcept {
-            // Marker/message producers that already passed admission publish
+            // Fence/message producers that already passed admission publish
             // before consumers are allowed to interpret closed+empty.
             publication_gate_.CloseAndWait();
-            consumer_sleeping_.store(false, std::memory_order_release);
-            producer_waiting_.store(false, std::memory_order_release);
-            std::lock_guard<std::mutex> lock(wait_mutex_);
-            not_empty_.notify_all();
-            not_full_.notify_all();
+            if (!stop_wake_published_.exchange(
+                    true, std::memory_order_acq_rel)) {
+                // Pushes reserve UINT64_MAX for this terminal wake.
+                wake_epoch_.fetch_add(1U, std::memory_order_release);
+                wake_epoch_.notify_all();
+            }
+        }
+
+        [[nodiscard]] RealtimeDecoderQueueSnapshotV1 Snapshot()
+            const noexcept {
+            RealtimeDecoderQueueSnapshotV1 result{};
+            result.message_capacity = message_capacity_;
+            result.message_depth =
+                message_depth_.load(std::memory_order_acquire);
+            result.total_depth =
+                total_depth_.load(std::memory_order_acquire);
+            result.message_high_water =
+                message_high_water_.load(std::memory_order_acquire);
+            result.full_count =
+                full_count_.load(std::memory_order_acquire);
+            return result;
         }
 
     private:
@@ -1096,45 +1282,38 @@ public:
             *output = std::move(*slots_[head]);
             slots_[head].reset();
             head_.store(Increment(head), std::memory_order_release);
-            WakeProducer();
+            total_depth_.fetch_sub(1U, std::memory_order_relaxed);
+            if (output->kind == CommandKind::kMessage) {
+                message_depth_.fetch_sub(
+                    1U, std::memory_order_release);
+            }
             return true;
         }
 
-        [[nodiscard]] bool Empty() const noexcept {
-            return head_.load(std::memory_order_acquire) ==
-                   tail_.load(std::memory_order_acquire);
-        }
-
-        [[nodiscard]] bool Full() const noexcept {
-            const std::size_t tail =
-                tail_.load(std::memory_order_acquire);
-            return Increment(tail) ==
-                   head_.load(std::memory_order_acquire);
-        }
-
         void WakeConsumer() noexcept {
-            // This RMW pairs with the waiter's exchange(true). A load-only
-            // shortcut is not correct: the producer could read the old
-            // sleeping=false while the waiter reads the old tail and then
-            // sleeps forever. If this exchange wins first, the waiter's
-            // acquire observes our prior tail publication; if the waiter
-            // wins first, we observe true and notify under the wait mutex.
-            if (!consumer_sleeping_.exchange(
-                    false, std::memory_order_acq_rel)) {
-                return;
-            }
-            std::lock_guard<std::mutex> lock(wait_mutex_);
-            not_empty_.notify_one();
+            // The caller checked that UINT64_MAX remains reserved for stop.
+            // These are the only post-commit operations: an atomic epoch
+            // publication and notification, both sequenced after the release
+            // tail store.
+            wake_epoch_.fetch_add(1U, std::memory_order_release);
+            wake_epoch_.notify_one();
         }
 
-        void WakeProducer() noexcept {
-            // Symmetric full->non-full handshake for marker backpressure.
-            if (!producer_waiting_.exchange(
-                    false, std::memory_order_acq_rel)) {
-                return;
+        [[nodiscard]] bool WakeEpochAvailable() const noexcept {
+            return wake_epoch_.load(std::memory_order_acquire) <
+                   std::numeric_limits<std::uint64_t>::max() - 1U;
+        }
+
+        void UpdateHighWater(std::size_t candidate) noexcept {
+            std::size_t current =
+                message_high_water_.load(std::memory_order_relaxed);
+            while (current < candidate &&
+                   !message_high_water_.compare_exchange_weak(
+                       current,
+                       candidate,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed)) {
             }
-            std::lock_guard<std::mutex> lock(wait_mutex_);
-            not_full_.notify_one();
         }
 
         [[nodiscard]] std::size_t Increment(std::size_t value) const noexcept {
@@ -1142,15 +1321,18 @@ public:
             return value == slots_.size() ? 0U : value;
         }
 
+        const std::size_t message_capacity_;
         std::vector<std::optional<DecoderCommand>> slots_;
         alignas(64) std::atomic<std::size_t> head_{0U};
         alignas(64) std::atomic<std::size_t> tail_{0U};
+        std::atomic<std::size_t> message_depth_{0U};
+        std::atomic<std::size_t> total_depth_{0U};
+        std::atomic<std::size_t> message_high_water_{0U};
+        std::atomic<std::uint64_t> full_count_{0U};
+        std::atomic<bool> control_inflight_{false};
         detail::CloseablePublicationGate publication_gate_;
-        std::atomic<bool> consumer_sleeping_{false};
-        std::atomic<bool> producer_waiting_{false};
-        std::mutex wait_mutex_;
-        std::condition_variable not_empty_;
-        std::condition_variable not_full_;
+        std::atomic<std::uint64_t> wake_epoch_{0U};
+        std::atomic<bool> stop_wake_published_{false};
     };
 
     struct DecoderLane final {
@@ -1161,42 +1343,6 @@ public:
         DecoderQueue queue;
         market::MarketDecoderV1 decoder;
         std::thread thread;
-    };
-
-    class DispatchBarrierLease final {
-    public:
-        explicit DispatchBarrierLease(Impl* owner) noexcept
-            : owner_(owner) {}
-
-        DispatchBarrierLease(const DispatchBarrierLease&) = delete;
-        DispatchBarrierLease& operator=(
-            const DispatchBarrierLease&) = delete;
-
-        ~DispatchBarrierLease() {
-            if (armed_) {
-                owner_->ReleaseDispatchBarrier();
-            }
-        }
-
-        [[nodiscard]] bool Arm(std::uint64_t sequence) noexcept {
-            if (armed_ || owner_ == nullptr ||
-                !owner_->ArmDispatchBarrier(sequence)) {
-                return false;
-            }
-            armed_ = true;
-            return true;
-        }
-
-        void Release() noexcept {
-            if (armed_) {
-                owner_->ReleaseDispatchBarrier();
-                armed_ = false;
-            }
-        }
-
-    private:
-        Impl* owner_ = nullptr;
-        bool armed_ = false;
     };
 
     Impl(RealtimePipelineConfigV1 config,
@@ -1218,10 +1364,17 @@ public:
 
     static bool ObserveAppliedSequence(
         void* context,
-        std::uint64_t ingress_sequence) noexcept {
+        const market::RealtimeHistoryAppliedObservationV2& observation)
+        noexcept {
         auto* const owner = static_cast<Impl*>(context);
-        return owner != nullptr &&
-               owner->CompleteAppliedSequence(ingress_sequence);
+        if (owner == nullptr) {
+            return false;
+        }
+        if (owner->latency_collector_ != nullptr) {
+            owner->latency_collector_->RecordApplied(observation);
+        }
+        return owner->CompleteAppliedSequence(
+            observation.ingress_sequence);
     }
 
     [[nodiscard]] RealtimePipelineCreateErrorV1 Initialize(
@@ -1239,7 +1392,6 @@ public:
                     config_, &applied_window) ||
                 !BoundedIngressPoolCapacity(
                     config_,
-                    applied_window,
                     &maximum_inflight_messages)) {
                 SetDetailLiteral(
                     detail, "invalid ingress pool capacity");
@@ -1254,10 +1406,10 @@ public:
             pool_config.prewarm_message_bytes = std::min(
                 config_.maximum_sdk_message_bytes,
                 kIngressPrewarmMessageBytes);
-            // Reserve the complete bounded in-flight window before SDK
-            // Connect. It covers the processing ring plus the independently
-            // bounded decoder/applied completion window, preventing allocator
-            // entry and first-touch faults in the callback as backlog grows. A
+            // Reserve every source queue, one current owner per decoder, the
+            // callback owner, and a bounded safety margin before SDK Connect.
+            // This prevents allocator entry and first-touch faults as a
+            // source-local backlog grows. A
             // <=4096-byte wire message occupies at most the 8192-byte size
             // class; the byte cap keeps unusually large configured windows
             // from turning startup into an unbounded eager allocation.
@@ -1288,11 +1440,12 @@ public:
             if (config_.measure_stage_latency) {
                 latency_collector_ =
                     std::make_unique<StageLatencyCollector>(
-                        config_.trade_date);
+                        config_.trade_date,
+                        config_.completion_tracker_capacity);
             }
 
             if (realtime::ContiguousSequenceTrackerV2::Create(
-                    applied_window,
+                    config_.completion_tracker_capacity,
                     &applied_tracker_) !=
                     realtime::ContiguousSequenceTrackerCreateErrorV2::
                         kNone ||
@@ -1303,8 +1456,6 @@ public:
                     kResourceExhausted;
             }
             applied_window_capacity_ = applied_window;
-            processing_queue_ = std::make_unique<ProcessingQueue>(
-                config_.processing_queue_capacity);
 
             market::RealtimeHistoryRuntimeConfigV1 history_config{};
             history_config.source_stream_ids = config_.source_stream_ids;
@@ -1314,12 +1465,14 @@ public:
             history_config.intraday_store = config_.intraday_store;
             history_config.kline = config_.kline;
             history_config.kline.trade_date = config_.trade_date;
-            history_config.directory = config_.directory;
+            history_config.runtime_state = config_.runtime_state;
             history_config.applied_record_sink =
                 config_.applied_record_sink;
             history_config.applied_observer =
                 &ObserveAppliedSequence;
             history_config.applied_observer_context = this;
+            history_config.measure_applied_latency =
+                latency_collector_ != nullptr;
             if (latency_collector_ != nullptr) {
                 history_config.append_observer = &ObserveAppend;
                 history_config.append_observer_context = this;
@@ -1395,13 +1548,6 @@ public:
                 SetDetailLiteral(detail, "cannot start all four decoder threads");
                 return RealtimePipelineCreateErrorV1::
                     kDecoderThreadStartFailed;
-            }
-            if (!StartProcessingThread()) {
-                SetDetailLiteral(
-                    detail,
-                    "cannot start ordered processing dispatcher");
-                return RealtimePipelineCreateErrorV1::
-                    kProcessingThreadStartFailed;
             }
             if (!StartProgressThread()) {
                 SetDetailLiteral(
@@ -1574,48 +1720,75 @@ public:
             }
         }
 
-        if (config_.enable_mainland_a_share_filter) {
-            market::MarketMessageViewV1 filter_view{};
-            filter_view.service_id = inspection.key().service_id;
-            filter_view.service_version =
-                inspection.key().service_version;
-            filter_view.message_id = inspection.key().message_id;
-            filter_view.body = inspection.body();
+        market::MarketMessageViewV1 admission_view{};
+        admission_view.service_id = inspection.key().service_id;
+        admission_view.service_version =
+            inspection.key().service_version;
+        admission_view.message_id = inspection.key().message_id;
+        admission_view.body = inspection.body();
 
-            market::ObservedInstrumentKeyViewV2 extracted{};
-            const market::MarketDecodeErrorV1 extraction_error =
-                market::ExtractObservedInstrumentKeyV2(
-                    filter_view,
-                    config_.decoder_limits.maximum_text_bytes,
-                    &extracted);
-            if (extraction_error !=
-                market::MarketDecodeErrorV1::kNone) {
-                last_decode_error_.store(
-                    static_cast<std::uint8_t>(extraction_error),
-                    std::memory_order_release);
-                result.error =
-                    RealtimePipelineIngressErrorV1::
-                        kInstrumentKeyRejected;
-                ReportPipelineFailure(
-                    "admission_instrument_key_extract",
-                    source_slot,
-                    0U,
-                    static_cast<std::uint64_t>(extraction_error));
-                ++rejected_messages_;
-                TripFatalWithAdmissionLockHeld();
-                return result;
-            }
-            if (!market::IsMainlandAShareSecurityIdV1(
-                    MainlandExchangeForMarket(extracted.market),
-                    extracted.security_id)) {
-                result.error =
-                    RealtimePipelineIngressErrorV1::
-                        kFilteredNonAShare;
-                ++filtered_messages_;
-                ++filtered_messages_by_source_[source_slot];
-                return result;
-            }
+        market::ExactInstrumentKeyViewV2 extracted{};
+        const market::MarketDecodeErrorV1 extraction_error =
+            market::ExtractExactInstrumentKeyV2(
+                admission_view,
+                config_.decoder_limits.maximum_text_bytes,
+                &extracted);
+        if (extraction_error != market::MarketDecodeErrorV1::kNone) {
+            last_decode_error_.store(
+                static_cast<std::uint8_t>(extraction_error),
+                std::memory_order_release);
+            result.error =
+                RealtimePipelineIngressErrorV1::kInstrumentKeyRejected;
+            ReportPipelineFailure(
+                "admission_instrument_key_extract",
+                source_slot,
+                0U,
+                static_cast<std::uint64_t>(extraction_error));
+            ++rejected_messages_;
+            TripFatalWithAdmissionLockHeld();
+            return result;
         }
+        if (!market::IsMainlandAShareSecurityIdV1(
+                MainlandExchangeForMarket(extracted.market),
+                extracted.security_id)) {
+            result.error =
+                RealtimePipelineIngressErrorV1::kFilteredNonAShare;
+            ++filtered_messages_;
+            ++filtered_messages_by_source_[source_slot];
+            return result;
+        }
+
+        const market::InstrumentKeyViewV1 catalog_key{
+            extracted.market,
+            extracted.security_id_source,
+            extracted.security_id};
+        const market::DailyInstrumentCatalogLookupResultV2 lookup =
+            config_.daily_catalog->Lookup(catalog_key);
+        if (!lookup.known()) {
+            result.error = RealtimePipelineIngressErrorV1::kCatalogMiss;
+            ReportPipelineFailure(
+                "daily_catalog_miss",
+                source_slot,
+                0U,
+                static_cast<std::uint64_t>(lookup.error));
+            ++rejected_messages_;
+            TripFatalWithAdmissionLockHeld();
+            return result;
+        }
+        const market::DailyInstrumentCatalogEntryV2& catalog_entry =
+            *lookup.entry;
+        market::DailyInstrumentIdentityViewV2 identity{};
+        identity.key.market = catalog_entry.key.market;
+        identity.key.security_id_source =
+            catalog_entry.key.security_id_source;
+        identity.key.security_id = catalog_entry.key.security_id;
+        identity.instrument_id = catalog_entry.instrument_id;
+        identity.ordinal = catalog_entry.ordinal;
+        identity.quantity_unit =
+            catalog_entry.metadata.quantity_unit;
+        identity.security_type =
+            catalog_entry.metadata.security_type;
+        identity.asset_scope = catalog_entry.metadata.asset_scope;
 
         constexpr std::uint64_t exhaustion_sentinel =
             std::numeric_limits<std::uint64_t>::max();
@@ -1655,20 +1828,28 @@ public:
             return result;
         }
 
-        // The payload is copied exactly once into the pool and its sole
-        // callback-owned handle is transferred to the ordered processing
-        // ring. The commit runs after an empty slot is secured but before the
-        // ring tail is release-published. It is therefore the irreversible
-        // admission point, and no consumer can apply this sequence before the
-        // accepted frontier below becomes visible.
-        if (processing_queue_ == nullptr ||
-            !processing_queue_->TryPush(
-                std::move(owned),
+        DecoderCommand command{};
+        command.kind = CommandKind::kMessage;
+        command.message = std::move(owned);
+        command.identity = identity;
+        if (latency_collector_ != nullptr) {
+            command.callback_entry_monotonic_ns = monotonic_ns;
+        }
+
+        // The pooled copy transfers directly to its source FIFO. Commit runs
+        // after the slot is fully constructed and before release-publishing
+        // the queue tail. A fast decoder can therefore never complete a
+        // sequence whose accepted frontier is not yet visible.
+        if (lanes_[source_slot] == nullptr ||
+            !lanes_[source_slot]->queue.TryPushWithCommit(
+                std::move(command),
                 [this,
                  &result,
                  &metadata,
                  source_slot,
-                 mixed_tick_source]() noexcept {
+                 mixed_tick_source](
+                    std::uint64_t queue_publish_monotonic_ns)
+                    noexcept {
                     global_ingress_sequence_ =
                         metadata.global_ingress_sequence;
                     source_sequences_[source_slot] =
@@ -1686,15 +1867,21 @@ public:
                     accepted_sequence_.store(
                         metadata.global_ingress_sequence,
                         std::memory_order_release);
+                    if (latency_collector_ != nullptr) {
+                        latency_collector_->RecordDecoderPublish(
+                            source_slot,
+                            metadata.recv_monotonic_ns,
+                            queue_publish_monotonic_ns);
+                    }
                 })) {
             result.error =
                 RealtimePipelineIngressErrorV1::
-                    kProcessingAdmissionFailed;
+                    kDecoderAdmissionFailed;
             ReportPipelineFailure(
-                "processing_queue_admission",
+                "decoder_queue_admission",
                 source_slot,
                 metadata.global_ingress_sequence,
-                config_.processing_queue_capacity);
+                config_.decoder_queue_capacity_per_source);
             ++rejected_messages_;
             TripFatalWithAdmissionLockHeld();
             return result;
@@ -1703,8 +1890,7 @@ public:
 
         // Successful admission is complete only after the serialized callback
         // authority has been released.  The completion clocks below therefore
-        // include the owned copy, the ordered queue commit, and the admission
-        // critical section.
+        // include the owned copy, source-queue commit, and admission section.
         admission.unlock();
         if (latency_collector_ != nullptr) {
             std::uint64_t success_monotonic_ns = 0U;
@@ -1818,7 +2004,6 @@ public:
             std::array<market::RealtimeSourceWatermarkV1,
                        market::kRealtimeHistorySourceCountV1>
                 sources{};
-            DispatchBarrierLease dispatch_barrier(this);
             {
                 std::unique_lock<std::mutex> admission(admission_mutex_);
                 const bool history_fatal = history_->fatal();
@@ -1873,41 +2058,64 @@ public:
                     sources[source].sequence_exclusive =
                         source_sequences_[source] + 1U;
                 }
-                // The barrier is armed while callback admission is
-                // serialized, so no sequence above this exact cut can reach
-                // Directory/Decoder/Store. Callbacks resume immediately and
-                // continue entering both asynchronous queues while cut work
-                // runs.
-                if (!dispatch_barrier.Arm(cut_sequence)) {
-                    result.error = RealtimePipelineCutErrorV1::
-                        kProcessingBarrierFailed;
+                if (!PrepareGenerationFence(generation)) {
+                    result.error =
+                        RealtimePipelineCutErrorV1::
+                            kFenceAdmissionFailed;
                     TripFatalWithAdmissionLockHeld();
                     return result;
                 }
+                // Each ring has Q logical message slots plus this one
+                // reserved control slot. No wait is permitted while callback
+                // admission is held, even when all Q message slots are full.
+                for (std::uint8_t source = 0U;
+                     source <
+                         market::kRealtimeHistorySourceCountV1;
+                     ++source) {
+                    DecoderCommand fence{};
+                    fence.kind = CommandKind::kGenerationFence;
+                    fence.generation = generation;
+                    if (lanes_[source] == nullptr ||
+                        !lanes_[source]->queue.TryPushFence(
+                            std::move(fence))) {
+                        result.error =
+                            RealtimePipelineCutErrorV1::
+                                kFenceAdmissionFailed;
+                        TripFatalWithAdmissionLockHeld();
+                        return result;
+                    }
+                }
             }
 
+            if (!WaitForFenceArrivals(generation, deadline)) {
+                result.error =
+                    RealtimePipelineCutErrorV1::kFenceArrivalFailed;
+                TripFatal();
+                return result;
+            }
             if (cut_sequence != 0U &&
                 !WaitAppliedThrough(cut_sequence, deadline)) {
-                result.error = RealtimePipelineCutErrorV1::
-                    kProcessingBarrierFailed;
+                result.error =
+                    RealtimePipelineCutErrorV1::kFenceArrivalFailed;
                 TripFatal();
                 return result;
             }
 
             std::shared_ptr<const
-                market::ObservedInstrumentCatalogSnapshotV2>
+                market::DailyInstrumentCatalogSnapshotV2>
                 catalog_snapshot;
-            if (config_.directory->AcquireSnapshot(
+            if (config_.runtime_state->AcquireSnapshot(
                     &catalog_snapshot) !=
-                    market::ObservedInstrumentDirectoryErrorV2::kNone ||
+                    market::InstrumentRuntimeStateErrorV2::kNone ||
                 catalog_snapshot == nullptr) {
                 result.error =
                     RealtimePipelineCutErrorV1::kWatermarkFailed;
                 TripFatal();
                 return result;
             }
-            // This immutable generation describes the exact accepted/applied
-            // prefix isolated by the processing barrier.
+            // All four lanes remain parked here. Every pre-cut message is
+            // applied and no post-cut message has entered History, so this
+            // availability snapshot is the exact cut state.
             const realtime::ProcessingProgressV2 progress{
                 cut_sequence,
                 cut_sequence};
@@ -1954,25 +2162,24 @@ public:
                 last_started_generation_ = generation;
             }
 
-            // Ordered in-memory processing is still paused immediately after
-            // the cut. Each source marker therefore follows all cut records
-            // and precedes every post-cut record without blocking SDK
-            // callbacks.
-            for (std::uint8_t source = 0U;
-                 source < market::kRealtimeHistorySourceCountV1;
-                 ++source) {
-                DecoderCommand marker{};
-                marker.kind = CommandKind::kGenerationMarker;
-                marker.generation = generation;
-                if (!lanes_[source]->queue.PushUntil(
-                        std::move(marker), deadline)) {
-                    result.error = RealtimePipelineCutErrorV1::
-                        kMarkerAdmissionFailed;
-                    TripFatal();
-                    return result;
-                }
+            RequestFenceSeal(generation);
+            if (!WaitForFenceSeals(
+                    generation, deadline, &result.generation_error)) {
+                result.error =
+                    RealtimePipelineCutErrorV1::kFenceSealFailed;
+                TripFatal();
+                return result;
             }
-            dispatch_barrier.Release();
+            // Release is one coordinator transition observed by every lane.
+            // Waiting for departure also guarantees the reserved control slot
+            // is reusable before a repeated generation can begin.
+            if (!ReleaseFenceAndWaitForDepartures(
+                    generation, deadline)) {
+                result.error =
+                    RealtimePipelineCutErrorV1::kFenceArrivalFailed;
+                TripFatal();
+                return result;
+            }
 
             result.generation_error = history_->WaitForGeneration(
                 generation,
@@ -2105,7 +2312,7 @@ public:
             std::lock_guard<std::mutex> admission(admission_mutex_);
             result.accepted_messages = accepted_messages_;
             result.filtered_messages = filtered_messages_;
-            result.filtered_messages_by_source =
+        result.filtered_messages_by_source =
                 filtered_messages_by_source_;
             result.ignored_messages = ignored_messages_;
             result.post_cut_messages = post_cut_messages_;
@@ -2135,14 +2342,20 @@ public:
         if (history_ != nullptr) {
             result.store = history_->StoreSnapshot();
         }
+        for (std::size_t source = 0U;
+             source < lanes_.size();
+             ++source) {
+            if (lanes_[source] != nullptr) {
+                result.decoder_queues[source] =
+                    lanes_[source]->queue.Snapshot();
+            }
+        }
         result.accepting = accepting_.load(std::memory_order_acquire);
         result.fatal = fatal_.load(std::memory_order_acquire) ||
                        (history_ != nullptr && history_->fatal());
         result.stopped = stopped_.load(std::memory_order_acquire);
         result.trade_date_boundary_reached =
             trade_date_boundary_reached_.load(std::memory_order_acquire);
-        result.mainland_a_share_filter_enabled =
-            config_.enable_mainland_a_share_filter;
         return result;
     }
 
@@ -2175,8 +2388,6 @@ public:
 
 private:
     void FinishStop() noexcept {
-        RequestProcessingStop();
-        JoinProcessingThread();
         RequestDecoderStop();
         JoinDecoderThreads();
         if (history_ != nullptr) {
@@ -2185,145 +2396,6 @@ private:
         RequestProgressStop();
         JoinProgressThread();
         stopped_.store(true, std::memory_order_release);
-    }
-
-    [[nodiscard]] bool RouteProcessingMessage(
-        realtime::OwnedIngressMessageHandleV1 message) noexcept {
-        if (!message ||
-            fatal_.load(std::memory_order_acquire) ||
-            config_.directory == nullptr) {
-            MarkAsyncFatal();
-            return false;
-        }
-        const std::uint8_t source = message->source_slot();
-        if (source >= market::kRealtimeHistorySourceCountV1 ||
-            lanes_[source] == nullptr ||
-            message->recv_realtime_ns() >
-                static_cast<std::uint64_t>(
-                    std::numeric_limits<std::int64_t>::max()) ||
-            message->recv_monotonic_ns() >
-                static_cast<std::uint64_t>(
-                    std::numeric_limits<std::int64_t>::max())) {
-            MarkAsyncFatal();
-            return false;
-        }
-        if (!WaitForDispatchBarrier(
-                message->global_ingress_sequence())) {
-            ReportPipelineFailure(
-                "generation_dispatch_barrier",
-                source,
-                message->global_ingress_sequence(),
-                dispatch_barrier_sequence_.load(
-                    std::memory_order_acquire));
-            MarkAsyncFatal();
-            return false;
-        }
-        if (!WaitForAppliedDispatchWindow(
-                message->global_ingress_sequence())) {
-            ReportPipelineFailure(
-                "applied_dispatch_window",
-                source,
-                message->global_ingress_sequence(),
-                applied_window_capacity_);
-            MarkAsyncFatal();
-            return false;
-        }
-
-        const sdk::VendorHeadView head = message->vendor_head();
-        market::MarketMessageViewV1 view{};
-        view.source_stream_id = config_.source_stream_ids[source];
-        view.trade_date = config_.trade_date;
-        view.source_sequence = message->source_sequence();
-        view.service_id = message->key().service_id;
-        view.service_version = message->key().service_version;
-        view.message_id = message->key().message_id;
-        view.message_encoding = head.message_encoding();
-        view.vendor_local_time_raw = head.local_time_raw();
-        view.vendor_sequence_id = head.sequence_id();
-        view.recv_realtime_ns =
-            static_cast<std::int64_t>(message->recv_realtime_ns());
-        view.recv_monotonic_ns =
-            static_cast<std::int64_t>(message->recv_monotonic_ns());
-        view.body = message->body();
-
-        market::ObservedInstrumentKeyViewV2 extracted{};
-        const market::MarketDecodeErrorV1 extraction_error =
-            market::ExtractObservedInstrumentKeyV2(
-                view,
-                config_.decoder_limits.maximum_text_bytes,
-                &extracted);
-        if (extraction_error != market::MarketDecodeErrorV1::kNone) {
-            last_decode_error_.store(
-                static_cast<std::uint8_t>(extraction_error),
-                std::memory_order_release);
-            ReportPipelineFailure(
-                "instrument_key_extract",
-                source,
-                message->global_ingress_sequence(),
-                static_cast<std::uint64_t>(extraction_error));
-            MarkAsyncFatal();
-            return false;
-        }
-
-        market::InstrumentKeyViewV1 key{
-            extracted.market,
-            extracted.security_id_source,
-            extracted.security_id};
-        market::ObservedInstrumentBindResultV2 binding{};
-        const market::ObservedInstrumentDirectoryErrorV2 bind_error =
-            config_.directory->BindOrGet(
-                key,
-                market::ObservedInstrumentMetadataV2{},
-                message->global_ingress_sequence(),
-                &binding);
-        if (bind_error !=
-                market::ObservedInstrumentDirectoryErrorV2::kNone ||
-            !binding.entry.bound()) {
-            ReportPipelineFailure(
-                "instrument_bind",
-                source,
-                message->global_ingress_sequence(),
-                static_cast<std::uint64_t>(bind_error));
-            MarkAsyncFatal();
-            return false;
-        }
-        if (binding.newly_bound &&
-            config_.instrument_binding_sink != nullptr &&
-            !config_.instrument_binding_sink
-                 ->PublishObservedInstrumentBinding(binding)) {
-            ReportPipelineFailure(
-                "instrument_binding_projection",
-                source,
-                message->global_ingress_sequence(),
-                binding.entry.instrument_id);
-            MarkAsyncFatal();
-            return false;
-        }
-
-        DecoderCommand command{};
-        command.kind = CommandKind::kMessage;
-        command.message = std::move(message);
-        command.identity.key.market = binding.entry.key.market;
-        command.identity.key.security_id_source =
-            binding.entry.key.security_id_source;
-        command.identity.key.security_id =
-            binding.entry.key.security_id;
-        command.identity.instrument_id =
-            binding.entry.instrument_id;
-        command.identity.ordinal = binding.entry.ordinal;
-        command.identity.quantity_unit =
-            binding.entry.metadata.quantity_unit;
-        command.identity.security_type =
-            binding.entry.metadata.security_type;
-        command.identity.asset_scope =
-            binding.entry.metadata.asset_scope;
-        if (!lanes_[source]->queue.PushUntil(
-                std::move(command),
-                std::chrono::steady_clock::time_point::max())) {
-            MarkAsyncFatal();
-            return false;
-        }
-        return true;
     }
 
     [[nodiscard]] bool CompleteAppliedSequence(
@@ -2357,55 +2429,209 @@ private:
         return !fatal_.load(std::memory_order_acquire);
     }
 
-    [[nodiscard]] bool ArmDispatchBarrier(
-        std::uint64_t sequence) noexcept {
+    [[nodiscard]] bool PrepareGenerationFence(
+        std::uint64_t generation) noexcept {
+        if (generation == 0U) {
+            return false;
+        }
         try {
-            std::lock_guard<std::mutex> lock(
-                dispatch_barrier_mutex_);
-            if (dispatch_barrier_active_.load(
-                    std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(generation_fence_mutex_);
+            if (active_fence_generation_ != 0U) {
                 return false;
             }
-            dispatch_barrier_sequence_.store(
-                sequence, std::memory_order_relaxed);
-            dispatch_barrier_active_.store(
-                true, std::memory_order_release);
+            active_fence_generation_ = generation;
+            seal_requested_generation_ = 0U;
+            release_fence_generation_ = 0U;
+            for (std::size_t source = 0U;
+                 source < fence_arrived_generation_.size();
+                 ++source) {
+                fence_seal_errors_[source] =
+                    market::RealtimeHistoryGenerationErrorV1::kNone;
+            }
             return true;
         } catch (...) {
             return false;
         }
     }
 
-    void ReleaseDispatchBarrier() noexcept {
-        dispatch_barrier_active_.store(
-            false, std::memory_order_release);
-        dispatch_barrier_cv_.notify_all();
-    }
-
-    [[nodiscard]] bool WaitForDispatchBarrier(
-        std::uint64_t sequence) noexcept {
-        if (!dispatch_barrier_active_.load(
-                std::memory_order_acquire) ||
-            sequence <= dispatch_barrier_sequence_.load(
-                            std::memory_order_acquire)) {
-            return true;
+    [[nodiscard]] bool ParkAtGenerationFence(
+        std::uint8_t source,
+        std::uint64_t generation) noexcept {
+        if (source >= market::kRealtimeHistorySourceCountV1 ||
+            generation == 0U || lanes_[source] == nullptr) {
+            return false;
         }
         try {
             std::unique_lock<std::mutex> lock(
-                dispatch_barrier_mutex_);
-            dispatch_barrier_cv_.wait(lock, [this, sequence] {
-                return fatal_.load(std::memory_order_acquire) ||
-                       !dispatch_barrier_active_.load(
-                           std::memory_order_acquire) ||
-                       sequence <=
-                           dispatch_barrier_sequence_.load(
-                               std::memory_order_acquire);
+                generation_fence_mutex_);
+            if (active_fence_generation_ != generation ||
+                fence_arrived_generation_[source] == generation) {
+                lock.unlock();
+                lanes_[source]->queue.CompleteFence();
+                return false;
+            }
+            fence_arrived_generation_[source] = generation;
+            generation_fence_cv_.notify_all();
+            while (!fatal_.load(std::memory_order_acquire) &&
+                   seal_requested_generation_ != generation) {
+                // A parked lane is a control-plane state, not a hot data
+                // path. Periodically rechecking the protected epoch prevents
+                // one missed or coalesced condition-variable wake from
+                // stranding every source indefinitely after the coordinator
+                // has already published the seal transition.
+                static_cast<void>(generation_fence_cv_.wait_for(
+                    lock, std::chrono::milliseconds(1)));
+            }
+            if (fatal_.load(std::memory_order_acquire)) {
+                lock.unlock();
+                lanes_[source]->queue.CompleteFence();
+                lock.lock();
+                fence_departed_generation_[source] = generation;
+                generation_fence_cv_.notify_all();
+                return false;
+            }
+            lock.unlock();
+
+            const market::RealtimeHistoryGenerationErrorV1 seal_error =
+                history_->SealSource(source, generation);
+
+            lock.lock();
+            fence_seal_errors_[source] = seal_error;
+            fence_sealed_generation_[source] = generation;
+            generation_fence_cv_.notify_all();
+            while (!fatal_.load(std::memory_order_acquire) &&
+                   release_fence_generation_ != generation) {
+                static_cast<void>(generation_fence_cv_.wait_for(
+                    lock, std::chrono::milliseconds(1)));
+            }
+            const bool released =
+                !fatal_.load(std::memory_order_acquire) &&
+                release_fence_generation_ == generation &&
+                seal_error ==
+                    market::RealtimeHistoryGenerationErrorV1::kNone;
+            lock.unlock();
+            lanes_[source]->queue.CompleteFence();
+            lock.lock();
+            fence_departed_generation_[source] = generation;
+            generation_fence_cv_.notify_all();
+            return released;
+        } catch (...) {
+            lanes_[source]->queue.CompleteFence();
+            return false;
+        }
+    }
+
+    template <typename Array>
+    [[nodiscard]] static bool AllFenceEpoch(
+        const Array& values,
+        std::uint64_t generation) noexcept {
+        return std::all_of(
+            values.begin(),
+            values.end(),
+            [generation](std::uint64_t value) noexcept {
+                return value == generation;
             });
-            return !fatal_.load(std::memory_order_acquire) &&
-                   (!dispatch_barrier_active_.load(
-                        std::memory_order_acquire) ||
-                    sequence <= dispatch_barrier_sequence_.load(
-                                    std::memory_order_acquire));
+    }
+
+    [[nodiscard]] bool WaitForFenceArrivals(
+        std::uint64_t generation,
+        std::chrono::steady_clock::time_point deadline) noexcept {
+        try {
+            std::unique_lock<std::mutex> lock(
+                generation_fence_mutex_);
+            const auto ready = [this, generation] {
+                return fatal_.load(std::memory_order_acquire) ||
+                       AllFenceEpoch(
+                           fence_arrived_generation_, generation);
+            };
+            return (ready() ||
+                    generation_fence_cv_.wait_until(
+                        lock, deadline, ready)) &&
+                   !fatal_.load(std::memory_order_acquire) &&
+                   AllFenceEpoch(
+                       fence_arrived_generation_, generation);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void RequestFenceSeal(std::uint64_t generation) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(generation_fence_mutex_);
+            if (active_fence_generation_ == generation) {
+                seal_requested_generation_ = generation;
+            }
+            generation_fence_cv_.notify_all();
+        } catch (...) {
+            MarkAsyncFatal();
+        }
+    }
+
+    [[nodiscard]] bool WaitForFenceSeals(
+        std::uint64_t generation,
+        std::chrono::steady_clock::time_point deadline,
+        market::RealtimeHistoryGenerationErrorV1* error) noexcept {
+        if (error == nullptr) {
+            return false;
+        }
+        *error = market::RealtimeHistoryGenerationErrorV1::kNone;
+        try {
+            std::unique_lock<std::mutex> lock(
+                generation_fence_mutex_);
+            const auto ready = [this, generation] {
+                return fatal_.load(std::memory_order_acquire) ||
+                       AllFenceEpoch(
+                           fence_sealed_generation_, generation);
+            };
+            if ((!ready() &&
+                 !generation_fence_cv_.wait_until(
+                     lock, deadline, ready)) ||
+                fatal_.load(std::memory_order_acquire) ||
+                !AllFenceEpoch(
+                    fence_sealed_generation_, generation)) {
+                return false;
+            }
+            for (const auto seal_error : fence_seal_errors_) {
+                if (seal_error !=
+                    market::RealtimeHistoryGenerationErrorV1::kNone) {
+                    *error = seal_error;
+                    return false;
+                }
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool ReleaseFenceAndWaitForDepartures(
+        std::uint64_t generation,
+        std::chrono::steady_clock::time_point deadline) noexcept {
+        try {
+            std::unique_lock<std::mutex> lock(
+                generation_fence_mutex_);
+            if (active_fence_generation_ != generation ||
+                !AllFenceEpoch(
+                    fence_sealed_generation_, generation)) {
+                return false;
+            }
+            release_fence_generation_ = generation;
+            generation_fence_cv_.notify_all();
+            const auto ready = [this, generation] {
+                return fatal_.load(std::memory_order_acquire) ||
+                       AllFenceEpoch(
+                           fence_departed_generation_, generation);
+            };
+            if ((!ready() &&
+                 !generation_fence_cv_.wait_until(
+                     lock, deadline, ready)) ||
+                fatal_.load(std::memory_order_acquire) ||
+                !AllFenceEpoch(
+                    fence_departed_generation_, generation)) {
+                return false;
+            }
+            active_fence_generation_ = 0U;
+            return true;
         } catch (...) {
             return false;
         }
@@ -2452,7 +2678,7 @@ private:
                 }
                 // Completion normally notifies immediately. The bounded wait
                 // also observes a History fatal that cannot itself call the
-                // applied observer, preventing dispatcher shutdown deadlock.
+                // applied observer, preventing decoder shutdown deadlock.
                 static_cast<void>(applied_progress_cv_.wait_for(
                     lock, std::chrono::milliseconds(1)));
             }
@@ -2491,16 +2717,11 @@ private:
     }
 
     void MarkAsyncFatal() noexcept {
-        accepting_.store(false, std::memory_order_release);
-        fatal_.store(true, std::memory_order_release);
-        if (history_ != nullptr) {
-            history_->MarkFatal();
-        }
-        RequestProcessingStop();
-        RequestDecoderStop();
-        RequestProgressStop();
-        applied_progress_cv_.notify_all();
-        dispatch_barrier_cv_.notify_all();
+        // Fatal admission and callback commit share one linearization mutex.
+        // Without it an asynchronous failure could publish fatal=true while
+        // an already-active callback subsequently commits a sequence whose
+        // decoder is then stopped before applying it.
+        TripFatal();
     }
 
     [[nodiscard]] bool WaitAppliedThrough(
@@ -2512,16 +2733,29 @@ private:
         }
         try {
             std::unique_lock<std::mutex> lock(applied_progress_mutex_);
-            const auto ready = [this, target_sequence] {
-                return applied_sequence_.load(
-                           std::memory_order_acquire) >= target_sequence ||
-                       fatal_.load(std::memory_order_acquire);
-            };
-            return (ready() ||
-                    applied_progress_cv_.wait_until(
-                        lock, deadline, ready)) &&
-                   applied_sequence_.load(std::memory_order_acquire) >=
-                       target_sequence;
+            for (;;) {
+                if (applied_sequence_.load(std::memory_order_acquire) >=
+                    target_sequence) {
+                    return true;
+                }
+                if (fatal_.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    return false;
+                }
+                // Applied completion deliberately does not take this global
+                // mutex on the History hot path. A notify can therefore land
+                // between this wait's predicate check and its atomic sleep
+                // transition. Bound that lost-notify case without adding a
+                // cross-lane completion lock.
+                static_cast<void>(applied_progress_cv_.wait_until(
+                    lock,
+                    std::min(
+                        deadline,
+                        now + std::chrono::milliseconds(1))));
+            }
         } catch (...) {
             return false;
         }
@@ -2531,20 +2765,31 @@ private:
         bool factory_is_test_override) const noexcept {
         std::size_t applied_window = 0U;
         std::size_t maximum_inflight_messages = 0U;
-        if (config_.directory == nullptr ||
-            config_.directory->capacity() == 0U ||
-            config_.directory->session_epoch() == 0U ||
+        if (config_.daily_catalog == nullptr ||
+            config_.runtime_state == nullptr ||
+            !config_.daily_catalog->coverage_complete() ||
+            config_.daily_catalog->market_scope() !=
+                market::kDailyCatalogMainlandScopeV2 ||
+            config_.daily_catalog->instrument_count() == 0U ||
+            config_.runtime_state->capacity() !=
+                config_.daily_catalog->instrument_count() ||
+            config_.runtime_state->session_epoch() !=
+                config_.daily_catalog->session_epoch() ||
+            config_.runtime_state->trade_date() !=
+                config_.daily_catalog->trade_date() ||
+            config_.runtime_state->catalog_version() !=
+                config_.daily_catalog->catalog_version() ||
             l2flow::common::IsZeroIdentity(config_.run_id) ||
             config_.trade_date == 0U ||
+            config_.trade_date != config_.daily_catalog->trade_date() ||
             config_.maximum_sdk_message_bytes < sdk::kVendorHeadBytes ||
             config_.maximum_sdk_message_bytes >
                 realtime::kOwnedIngressMaximumMessageBytesV1 ||
-            config_.processing_queue_capacity == 0U ||
-            config_.processing_queue_capacity ==
-                std::numeric_limits<std::size_t>::max() ||
             config_.decoder_queue_capacity_per_source == 0U ||
-            config_.decoder_queue_capacity_per_source ==
-                std::numeric_limits<std::size_t>::max() ||
+            config_.decoder_queue_capacity_per_source >
+                std::numeric_limits<std::size_t>::max() - 2U ||
+            config_.completion_tracker_capacity < 2U ||
+            config_.tick_ring_capacity < 2U ||
             config_.store_worker_count == 0U ||
             config_.store_queue_capacity_per_source_worker == 0U ||
             config_.intraday_store.segment_target_bytes <
@@ -2560,9 +2805,39 @@ private:
                 config_, &applied_window) ||
             !BoundedIngressPoolCapacity(
                 config_,
-                applied_window,
                 &maximum_inflight_messages)) {
             return false;
+        }
+        std::shared_ptr<const market::DailyInstrumentCatalogSnapshotV2>
+            initial_state;
+        if (config_.runtime_state->AcquireSnapshot(&initial_state) !=
+                market::InstrumentRuntimeStateErrorV2::kNone ||
+            initial_state == nullptr ||
+            initial_state->catalog_scope() !=
+                market::InstrumentCatalogScopeV2::
+                    kDeclaredDailyAShare ||
+            !initial_state->coverage_complete() ||
+            initial_state->trade_date() != config_.trade_date ||
+            initial_state->catalog_version() !=
+                config_.daily_catalog->catalog_version() ||
+            initial_state->catalog_digest() !=
+                config_.daily_catalog->catalog_digest() ||
+            initial_state->bound_count() !=
+                config_.daily_catalog->instrument_count() ||
+            initial_state->available_count() != 0U ||
+            initial_state->snapshot_available_count() != 0U ||
+            initial_state->tick_available_count() != 0U ||
+            initial_state->factor_eligible_count() != 0U) {
+            return false;
+        }
+        for (const market::DailyInstrumentCatalogEntryV2& entry :
+             config_.daily_catalog->entries()) {
+            if (entry.key.security_id.size() >
+                    config_.decoder_limits.maximum_text_bytes ||
+                entry.key.security_id_source.size() >
+                    config_.decoder_limits.maximum_text_bytes) {
+                return false;
+            }
         }
         const std::size_t maximum_body =
             static_cast<std::size_t>(config_.maximum_sdk_message_bytes) -
@@ -2625,21 +2900,6 @@ private:
         }
     }
 
-    [[nodiscard]] bool StartProcessingThread() noexcept {
-        if (processing_queue_ == nullptr ||
-            processing_thread_.joinable()) {
-            return false;
-        }
-        try {
-            processing_thread_ =
-                std::thread([this] { ProcessingLoop(); });
-            processing_thread_started_ = true;
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
     [[nodiscard]] bool StartProgressThread() noexcept {
         if (config_.processing_progress_sink == nullptr) {
             return true;
@@ -2653,18 +2913,6 @@ private:
             return true;
         } catch (...) {
             return false;
-        }
-    }
-
-    void ProcessingLoop() noexcept {
-        realtime::OwnedIngressMessageHandleV1 message;
-        while (processing_queue_ != nullptr &&
-               processing_queue_->Pop(&message)) {
-            if (!fatal_.load(std::memory_order_acquire) &&
-                !RouteProcessingMessage(std::move(message))) {
-                MarkAsyncFatal();
-            }
-            message.reset();
         }
     }
 
@@ -2813,21 +3061,67 @@ private:
     void DecoderLoop(std::uint8_t source) noexcept {
         DecoderCommand command{};
         while (lanes_[source]->queue.Pop(&command)) {
+            if (command.kind == CommandKind::kGenerationFence) {
+                if (!ParkAtGenerationFence(
+                        source, command.generation) &&
+                    !fatal_.load(std::memory_order_acquire)) {
+                    TripFatal();
+                }
+                command = DecoderCommand{};
+                continue;
+            }
             if (fatal_.load(std::memory_order_acquire)) {
                 command = DecoderCommand{};
                 continue;
             }
-            if (command.kind == CommandKind::kGenerationMarker) {
-                const market::RealtimeHistoryGenerationErrorV1 error =
-                    history_->SealSource(source, command.generation);
-                if (error !=
-                    market::RealtimeHistoryGenerationErrorV1::kNone) {
-                    TripFatal();
-                }
-            } else if (!DecodeOne(
-                           source,
-                           command.message,
-                           command.identity)) {
+
+            std::uint64_t dequeue_monotonic_ns = 0U;
+            if (latency_collector_ != nullptr) {
+                static_cast<void>(ReadClockNs(
+                    CLOCK_MONOTONIC, &dequeue_monotonic_ns));
+            }
+            if (!WaitForAppliedDispatchWindow(
+                    command.message->global_ingress_sequence())) {
+                ReportPipelineFailure(
+                    "applied_dispatch_window",
+                    source,
+                    command.message->global_ingress_sequence(),
+                    applied_window_capacity_);
+                TripFatal();
+                command = DecoderCommand{};
+                continue;
+            }
+            std::uint64_t decode_start_monotonic_ns = 0U;
+            if (latency_collector_ != nullptr) {
+                static_cast<void>(ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &decode_start_monotonic_ns));
+            }
+            DecoderTimingObservation timing{};
+            const bool decoded = DecodeOne(
+                source,
+                command.message,
+                command.identity,
+                latency_collector_ != nullptr ? &timing : nullptr);
+            if (latency_collector_ != nullptr) {
+                latency_collector_->RecordDecoderWork(
+                    source,
+                    command.queue_publish_monotonic_ns,
+                    dequeue_monotonic_ns,
+                    decode_start_monotonic_ns,
+                    timing.decode_complete_monotonic_ns,
+                    timing.history_submit_complete_monotonic_ns,
+                    command.queue_publish_monotonic_ns != 0U &&
+                        dequeue_monotonic_ns != 0U &&
+                        dequeue_monotonic_ns >=
+                            command.queue_publish_monotonic_ns,
+                    decoded && decode_start_monotonic_ns != 0U &&
+                        timing.decode_complete_clock_valid,
+                    decoded &&
+                        timing.decode_complete_clock_valid &&
+                        timing.history_submit_complete_clock_valid);
+            }
+            if (!decoded) {
                 TripFatal();
             }
             command = DecoderCommand{};
@@ -2837,8 +3131,12 @@ private:
     [[nodiscard]] bool DecodeOne(
         std::uint8_t source,
         const realtime::OwnedIngressMessageHandleV1& message,
-        const market::ObservedInstrumentIdentityViewV2& identity)
+        const market::DailyInstrumentIdentityViewV2& identity,
+        DecoderTimingObservation* timing)
         noexcept {
+        if (timing != nullptr) {
+            *timing = DecoderTimingObservation{};
+        }
         if (!message || message->source_slot() != source ||
             IsMixedTickSourceSlot(source) !=
                 (message->tick_stream_sequence() != 0U) ||
@@ -2886,7 +3184,7 @@ private:
                 static_cast<std::uint64_t>(decode_error));
             return false;
         }
-        if (!market::ApplyObservedInstrumentIdentityV2(
+        if (!market::ApplyDailyInstrumentIdentityV2(
                 identity, &decoded)) {
             ReportPipelineFailure(
                 "instrument_identity_apply",
@@ -2894,6 +3192,18 @@ private:
                 message->global_ingress_sequence(),
                 identity.instrument_id);
             return false;
+        }
+        if (timing != nullptr) {
+            timing->decode_complete_clock_valid = ReadClockNs(
+                CLOCK_MONOTONIC,
+                &timing->decode_complete_monotonic_ns);
+            if (latency_collector_ != nullptr) {
+                latency_collector_->RecordDecodeAppliedOrigin(
+                    source,
+                    message->global_ingress_sequence(),
+                    timing->decode_complete_monotonic_ns,
+                    timing->decode_complete_clock_valid);
+            }
         }
 
         std::optional<market::RealtimeHistoryEventInputV1> input =
@@ -2912,6 +3222,13 @@ private:
         }
         const market::RealtimeHistorySubmitErrorV1 submit_error =
             history_->TrySubmit(std::move(*input));
+        if (timing != nullptr) {
+            timing->history_submit_complete_clock_valid =
+                ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &timing
+                         ->history_submit_complete_monotonic_ns);
+        }
         if (submit_error !=
             market::RealtimeHistorySubmitErrorV1::kNone) {
             ReportPipelineFailure(
@@ -2987,11 +3304,10 @@ private:
             history_->MarkFatal();
         }
         fatal_.store(true, std::memory_order_release);
-        RequestProcessingStop();
         RequestDecoderStop();
         RequestProgressStop();
         applied_progress_cv_.notify_all();
-        dispatch_barrier_cv_.notify_all();
+        generation_fence_cv_.notify_all();
     }
 
     void TripFatal() noexcept {
@@ -3007,12 +3323,6 @@ private:
         }
     }
 
-    void RequestProcessingStop() noexcept {
-        if (processing_queue_ != nullptr) {
-            processing_queue_->RequestStop();
-        }
-    }
-
     void RequestProgressStop() noexcept {
         if (config_.processing_progress_sink == nullptr) {
             return;
@@ -3020,13 +3330,6 @@ private:
         progress_stop_requested_.store(
             true, std::memory_order_release);
         RequestProgressPublication();
-    }
-
-    void JoinProcessingThread() noexcept {
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
-        }
-        processing_thread_started_ = false;
     }
 
     void JoinProgressThread() noexcept {
@@ -3084,13 +3387,9 @@ private:
 
     RealtimePipelineConfigV1 config_{};
     // Declared before every possible handle owner so pool state is retired
-    // only after the processing and decoder rings have released their
-    // handles.
+    // only after all decoder rings have released their handles.
     std::unique_ptr<realtime::OwnedIngressMessagePoolV1> ingress_pool_;
     std::unique_ptr<StageLatencyCollector> latency_collector_;
-    std::unique_ptr<ProcessingQueue> processing_queue_;
-    std::thread processing_thread_;
-    bool processing_thread_started_ = false;
     std::thread progress_thread_;
     std::binary_semaphore progress_wake_{0};
     std::atomic<bool> progress_wake_pending_{false};
@@ -3109,10 +3408,23 @@ private:
     std::atomic<std::uint64_t> applied_sequence_{0U};
     std::mutex applied_progress_mutex_;
     std::condition_variable applied_progress_cv_;
-    std::mutex dispatch_barrier_mutex_;
-    std::condition_variable dispatch_barrier_cv_;
-    std::atomic<std::uint64_t> dispatch_barrier_sequence_{0U};
-    std::atomic<bool> dispatch_barrier_active_{false};
+    std::mutex generation_fence_mutex_;
+    std::condition_variable generation_fence_cv_;
+    std::uint64_t active_fence_generation_ = 0U;
+    std::uint64_t seal_requested_generation_ = 0U;
+    std::uint64_t release_fence_generation_ = 0U;
+    std::array<std::uint64_t,
+               market::kRealtimeHistorySourceCountV1>
+        fence_arrived_generation_{};
+    std::array<std::uint64_t,
+               market::kRealtimeHistorySourceCountV1>
+        fence_sealed_generation_{};
+    std::array<std::uint64_t,
+               market::kRealtimeHistorySourceCountV1>
+        fence_departed_generation_{};
+    std::array<market::RealtimeHistoryGenerationErrorV1,
+               market::kRealtimeHistorySourceCountV1>
+        fence_seal_errors_{};
 
     std::shared_ptr<sdk::SdkFactory> sdk_factory_;
     std::unique_ptr<sdk::SdkManager> sdk_manager_;

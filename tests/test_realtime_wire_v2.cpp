@@ -14,7 +14,7 @@ namespace {
 namespace ipc = l2flow::ipc;
 
 static_assert(ipc::kRealtimeWireMajorV2 == 2U);
-static_assert(ipc::kRealtimeWireMinorV2 == 1U);
+static_assert(ipc::kRealtimeWireMinorV2 == 2U);
 static_assert(
     ipc::kRealtimeShmMagicV2 ==
     std::array<std::uint8_t, 8U>{
@@ -108,11 +108,12 @@ bool TestDefaultHeaderSemantics() {
     ok &= Expect(
         header.catalog_scope ==
             static_cast<std::uint32_t>(
-                ipc::RealtimeCatalogScopeV2::kObservedOnly),
-        "default catalog scope is OBSERVED_ONLY");
+                ipc::RealtimeCatalogScopeV2::
+                    kDeclaredDailyAShare),
+        "default catalog scope is DECLARED_DAILY_A_SHARE");
     ok &= Expect(
-        header.coverage_complete == 0U,
-        "default header explicitly does not claim complete coverage");
+        header.coverage_complete == 1U,
+        "default header requires declared complete catalog coverage");
     ok &= Expect(
         header.catalog_generation == 0U &&
             header.data_state_generation == 0U &&
@@ -121,10 +122,19 @@ bool TestDefaultHeaderSemantics() {
             header.snapshot_available_count == 0U &&
             header.tick_available_count == 0U &&
             header.factor_eligible_count == 0U,
-        "default observed-universe generations and counts are empty");
+        "uninitialized header generations and counts are empty");
     ok &= Expect(
-        ipc::RealtimeWireHeaderStatusValidV2(header),
-        "default header status satisfies V2 invariants");
+        !ipc::RealtimeWireHeaderStatusValidV2(header),
+        "uninitialized header is not a publishable V2.2 session");
+    auto initialized = header;
+    initialized.trade_date = 20260730U;
+    initialized.catalog_trade_date = initialized.trade_date;
+    initialized.catalog_version = 17U;
+    initialized.catalog_generation = 1U;
+    initialized.bound_count = initialized.capacity;
+    ok &= Expect(
+        ipc::RealtimeWireHeaderStatusValidV2(initialized),
+        "frozen full catalog status satisfies V2.2 invariants");
     ok &= Expect(
         ipc::RealtimeStatusPublishTagStableV2(
             header.status_publish_tag) &&
@@ -221,7 +231,7 @@ bool TestCountInvariants() {
         ipc::RealtimeWireCountsValidV2(
             65'536U, 50'200U, 18'420U, 7'210U, 16'500U,
             6'990U),
-        "representative observed-universe counts are valid");
+        "representative count hierarchy is valid");
     ok &= Expect(
         !ipc::RealtimeWireCountsValidV2(
             65'536U, 65'537U, 1U, 1U, 1U, 1U),

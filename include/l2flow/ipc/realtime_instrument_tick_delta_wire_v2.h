@@ -329,11 +329,10 @@ namespace realtime_instrument_tick_delta_wire_v2_detail {
            left.reserved == right.reserved;
 }
 
-// A predecessor may have an earlier observed catalog. Catalog digests may
-// differ only when catalog_generation advances, while accepted-cut digests
-// need not match. Session/layout identity and source identities are stable,
-// while catalog/data watermarks, accepted and applied frontiers, source
-// frontiers, and monotonic observed counts cannot move backwards.
+// The daily catalog is immutable across predecessor/target generations.
+// Session, catalog and source identities must remain exact, while data
+// watermarks, accepted/applied frontiers, source frontiers, and monotonic
+// availability counts cannot move backwards.
 // factor_eligible_count is intentionally excluded because it is a live
 // eligibility count and is not monotonic.
 [[nodiscard]] constexpr bool EndpointPrecedes(
@@ -343,24 +342,25 @@ namespace realtime_instrument_tick_delta_wire_v2_detail {
         base.session_epoch != target.session_epoch ||
         base.trade_date != target.trade_date ||
         base.capacity != target.capacity ||
+        base.catalog_scope != target.catalog_scope ||
+        base.coverage_complete != target.coverage_complete ||
+        base.catalog_generation != target.catalog_generation ||
+        base.catalog_digest != target.catalog_digest ||
+        base.bound_count != target.bound_count ||
         base.source_stream_ids != target.source_stream_ids ||
         base.flags != target.flags ||
         target.generation < base.generation ||
-        target.catalog_generation < base.catalog_generation ||
         target.data_state_generation < base.data_state_generation ||
         target.ingress_sequence_exclusive <
             base.ingress_sequence_exclusive ||
         target.tick_stream_sequence_exclusive <
             base.tick_stream_sequence_exclusive ||
-        (target.catalog_generation == base.catalog_generation &&
-         target.catalog_digest != base.catalog_digest) ||
         target.recv_monotonic_cut_ns <
             base.recv_monotonic_cut_ns ||
         target.history_published_monotonic_ns <
             base.history_published_monotonic_ns ||
         target.accepted_sequence < base.accepted_sequence ||
         target.applied_sequence < base.applied_sequence ||
-        target.bound_count < base.bound_count ||
         target.available_count < base.available_count ||
         target.snapshot_available_count <
             base.snapshot_available_count ||

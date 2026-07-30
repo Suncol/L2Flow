@@ -537,6 +537,8 @@ def _session_to_c(session: SessionInfo) -> _SessionInfoC:
         "snapshot_available_count",
         "tick_available_count",
         "factor_eligible_count",
+        "catalog_trade_date",
+        "catalog_version",
     ):
         setattr(output, name, int(getattr(session, name)))
     output.server_state = int(session.server_state)
@@ -933,23 +935,23 @@ def _open_instrument_derived_event_history(
         lookup = client.resolve_key(instrument)
         if lookup.status is not InstrumentLookupStatus.FOUND:
             raise UnavailableError(
-                "derived history instrument key was not observed"
+                "derived history instrument key is absent from the daily catalog"
             )
         instrument_id = lookup.instrument_id
     elif isinstance(instrument, int) and not isinstance(instrument, bool):
         instrument_id = instrument
     else:
         raise TypeError("instrument must be an ID or InstrumentKey")
-    observed = client.instrument(instrument_id)
-    if observed.status not in (
+    catalog_entry = client.instrument(instrument_id)
+    if catalog_entry.status not in (
         InstrumentStatus.AVAILABLE,
         InstrumentStatus.BOUND_NO_DATA,
     ):
         raise UnavailableError(
-            "derived history instrument is not bound"
+            "derived history instrument is outside the daily catalog"
         )
     try:
-        market = Market(observed.market)
+        market = Market(catalog_entry.market)
     except ValueError as error:
         raise UnavailableError(
             "derived history instrument has unknown market"

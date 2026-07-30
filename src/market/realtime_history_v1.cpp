@@ -105,7 +105,7 @@ bool ComputeWatermarkIdentity(
     std::uint64_t generation,
     std::uint32_t trade_date,
     std::uint64_t ingress_sequence_exclusive,
-    const ObservedInstrumentCatalogSnapshotV2& catalog,
+    const DailyInstrumentCatalogSnapshotV2& catalog,
     l2flow::realtime::ProcessingProgressV2 progress,
     std::span<const RealtimeSourceWatermarkV1,
               kRealtimeHistorySourceCountV1> sources,
@@ -457,7 +457,7 @@ RealtimeHistoryWatermarkErrorV1 BuildRealtimeHistoryWatermarkV1(
     std::uint32_t trade_date,
     std::uint64_t ingress_sequence_exclusive,
     std::uint64_t recv_monotonic_cut_ns,
-    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+    std::shared_ptr<const DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot,
     l2flow::realtime::ProcessingProgressV2 processing_progress,
     std::span<const RealtimeSourceWatermarkV1,
@@ -481,12 +481,15 @@ RealtimeHistoryWatermarkErrorV1 BuildRealtimeHistoryWatermarkV1(
     if (catalog_snapshot == nullptr ||
         catalog_snapshot->session_epoch() == 0U ||
         catalog_snapshot->capacity() == 0U ||
+        catalog_snapshot->trade_date() != trade_date ||
+        catalog_snapshot->catalog_version() == 0U ||
         catalog_snapshot->catalog_scope() !=
-            ObservedInstrumentCatalogScopeV2::kObservedOnly ||
-        catalog_snapshot->coverage_complete() ||
-        catalog_snapshot->catalog_generation() !=
-            static_cast<std::uint64_t>(
-                catalog_snapshot->bound_count()) ||
+            InstrumentCatalogScopeV2::
+                kDeclaredDailyAShare ||
+        !catalog_snapshot->coverage_complete() ||
+        catalog_snapshot->catalog_generation() != 1U ||
+        catalog_snapshot->bound_count() !=
+            catalog_snapshot->capacity() ||
         !DigestNonzero(catalog_snapshot->catalog_digest())) {
         return RealtimeHistoryWatermarkErrorV1::kInvalidCatalog;
     }
@@ -1603,42 +1606,67 @@ public:
                 return false;
             }
         }
-        if (config_.applied_record_sink != nullptr &&
-            !config_.applied_record_sink->PublishApplied(
-                route.ordinal, *appended_record)) {
+        RealtimeHistoryAppliedObservationV2 applied_observation{};
+        applied_observation.ingress_sequence =
+            appended_record->ingress_sequence();
+        applied_observation.recv_monotonic_ns =
+            appended_record->recv_monotonic_ns();
+        applied_observation.source_slot =
+            appended_record->source_slot();
+        applied_observation.external_publication_present =
+            config_.applied_record_sink != nullptr;
+        if (config_.applied_record_sink != nullptr) {
+            if (!config_.applied_record_sink->PublishApplied(
+                    route.ordinal, *appended_record)) {
+                MarkLatestCoverageLost();
+                return false;
+            }
+            if (config_.measure_applied_latency) {
+                applied_observation
+                    .external_publication_clock_valid =
+                    ReadClockNs(
+                        CLOCK_MONOTONIC,
+                        &applied_observation
+                             .external_publication_complete_monotonic_ns);
+            }
+        }
+        if (config_.runtime_state == nullptr) {
             MarkLatestCoverageLost();
             return false;
         }
-        if (config_.directory == nullptr) {
-            MarkLatestCoverageLost();
-            return false;
-        }
-        const ObservedInstrumentDataKindV2 data_kind =
+        const InstrumentRuntimeDataKindV2 data_kind =
             IsSnapshotEventKindV1(appended_record->kind())
-                ? ObservedInstrumentDataKindV2::kSnapshot
-                : ObservedInstrumentDataKindV2::kTick;
-        if (config_.directory->MarkApplied(
+                ? InstrumentRuntimeDataKindV2::kSnapshot
+                : InstrumentRuntimeDataKindV2::kTick;
+        if (config_.runtime_state->MarkApplied(
                 route.ordinal,
                 appended_record->instrument_id(),
                 data_kind,
                 appended_record->ingress_sequence()) !=
-            ObservedInstrumentDirectoryErrorV2::kNone) {
+            InstrumentRuntimeStateErrorV2::kNone) {
             MarkLatestCoverageLost();
             return false;
         }
-        if (data_kind == ObservedInstrumentDataKindV2::kSnapshot &&
-            config_.directory->SetFactorEligible(
+        if (data_kind == InstrumentRuntimeDataKindV2::kSnapshot &&
+            config_.runtime_state->SetFactorEligible(
                 route.ordinal,
                 appended_record->instrument_id(),
                 SnapshotFactorEligible(*appended_record)) !=
-                ObservedInstrumentDirectoryErrorV2::kNone) {
+                InstrumentRuntimeStateErrorV2::kNone) {
             MarkLatestCoverageLost();
             return false;
+        }
+        if (config_.measure_applied_latency) {
+            applied_observation.applied_complete_clock_valid =
+                ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &applied_observation
+                         .applied_complete_monotonic_ns);
         }
         if (config_.applied_observer != nullptr &&
             !config_.applied_observer(
                 config_.applied_observer_context,
-                appended_record->ingress_sequence())) {
+                applied_observation)) {
             MarkLatestCoverageLost();
             return false;
         }
@@ -1740,7 +1768,7 @@ public:
                 return false;
             }
             std::shared_ptr<
-                const ObservedInstrumentCatalogSnapshotV2>
+                const DailyInstrumentCatalogSnapshotV2>
                 catalog_snapshot;
             {
                 std::lock_guard<std::mutex> lock(generation_mutex_);
@@ -2206,8 +2234,8 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
     if (output == nullptr) {
         return RealtimeHistoryCreateErrorV1::kNullOutput;
     }
-    if (config.directory == nullptr ||
-        config.directory->capacity() == 0U ||
+    if (config.runtime_state == nullptr ||
+        config.runtime_state->capacity() == 0U ||
         config.worker_count == 0U || config.worker_count > 256U ||
         config.queue_capacity_per_source_worker == 0U ||
         config.queue_capacity_per_source_worker >
@@ -2252,7 +2280,7 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
                 config.intraday_store,
                 config.worker_count,
                 config.source_stream_ids,
-                config.directory,
+                config.runtime_state,
                 &store);
         if (error != IntradayInstrumentStoreCreateErrorV1::kNone ||
             store == nullptr) {
@@ -2260,7 +2288,7 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
         }
         std::unique_ptr<RealtimeLatestReadModelV1> latest_read_model;
         if (RealtimeLatestReadModelV1::Create(
-                config.directory, &latest_read_model) !=
+                config.runtime_state, &latest_read_model) !=
                 RealtimeLatestReadModelCreateErrorV1::kNone ||
             latest_read_model == nullptr) {
             return RealtimeHistoryCreateErrorV1::
@@ -2272,10 +2300,10 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
             std::vector<std::size_t> worker_instrument_counts(
                 config.worker_count, 0U);
             const std::size_t base =
-                config.directory->capacity() /
+                config.runtime_state->capacity() /
                 static_cast<std::size_t>(config.worker_count);
             const std::size_t remainder =
-                config.directory->capacity() %
+                config.runtime_state->capacity() %
                 static_cast<std::size_t>(config.worker_count);
             for (std::uint32_t worker = 0U;
                  worker < config.worker_count;

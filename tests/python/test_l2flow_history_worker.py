@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -31,7 +32,6 @@ from l2flow_realtime import (  # noqa: E402
     InstrumentTickDeltaResultBatch,
     L2FlowClient,
     ProtocolError,
-    SessionIdentity,
     WireFormatError,
 )
 from l2flow_realtime._history_worker_protocol import (  # noqa: E402
@@ -78,6 +78,7 @@ from test_l2flow_history_v2 import (  # noqa: E402
     _delta_metadata,
     _delta_server,
     _endpoint,
+    _expected_session,
     _send_with_fd,
     _target_checkpoint,
 )
@@ -462,17 +463,29 @@ class FixedWorkerProtocolTests(unittest.TestCase):
 
 
 class IsolatedDeltaWorkerTests(unittest.TestCase):
-    def _start(self, path, **kwargs):
+    def _start(self, path, *, expected_session=None, **kwargs):
         return _start_instrument_tick_delta_worker(
             path,
-            session_identity=SessionIdentity(
-                RUN_ID, SESSION_EPOCH
+            expected_session=(
+                _expected_session()
+                if expected_session is None
+                else expected_session
             ),
-            trade_date=TRADE_DATE,
-            capacity=CAPACITY,
             timeout=2.0,
             **kwargs,
         )
+
+    def test_worker_rejects_another_daily_catalog(self):
+        with _UnixDeltaServer(_delta_server) as server:
+            with self._start(
+                server.path,
+                expected_session=replace(
+                    _expected_session(),
+                    catalog_digest=b"D" * 32,
+                ),
+            ) as worker:
+                with self.assertRaises(WireFormatError):
+                    worker.open_instrument(1, expected_generation=9)
 
     def test_raw_delta_peer_is_the_worker_and_results_are_lazy(self):
         with _UnixDeltaServer(_delta_server) as server:

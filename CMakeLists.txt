@@ -97,16 +97,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(l2flow_sdk PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-# Decoder, fixed-capacity observed directory, fixed-worker history, and
+# Decoder, frozen daily runtime state, fixed-worker history, and
 # whole-generation market publication.
 add_library(l2flow_market STATIC
     src/control/checked_body_view.cpp
+    src/market/daily_instrument_catalog_v2.cpp
+    src/market/daily_instrument_catalog_loader_v2.cpp
     src/market/intraday_instrument_store_v1.cpp
     src/market/kline_aggregator_v1.cpp
     src/market/mainland_a_share_filter_v1.cpp
     src/market/market_decoder.cpp
     src/market/market_types_v1.cpp
-    src/market/observed_instrument_directory_v2.cpp
+    src/market/instrument_runtime_state_v2.cpp
     src/market/realtime_history_v1.cpp
     src/market/realtime_kline_v1.cpp
     src/market/realtime_latest_read_model_v1.cpp
@@ -136,10 +138,10 @@ add_library(L2Flow::factor ALIAS l2flow_factor)
 l2flow_configure_target(l2flow_factor)
 target_link_libraries(l2flow_factor PUBLIC L2Flow::market)
 
-# The only production composition: callback admission gives one immutable
-# owned message to the ordered in-memory processing queue. The dispatcher
-# drives Decoder -> fixed-worker History -> generation barrier/watermark ->
-# Factor.
+# The production composition: serialized callback admission gives one
+# immutable owned message directly to one of four source decoder FIFOs.
+# Decoders drive fixed-worker History; parked all-lane fences establish exact
+# generation watermarks before whole-generation Factor publication.
 add_library(l2flow_realtime STATIC
     src/runtime/realtime_pipeline_v1.cpp)
 add_library(L2Flow::realtime ALIAS l2flow_realtime)
@@ -274,8 +276,10 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_phase4_market_decoder.cpp L2Flow::market)
     l2flow_add_test(test_mainland_a_share_filter
         tests/test_mainland_a_share_filter_v1.cpp L2Flow::market)
-    l2flow_add_test(test_observed_instrument_directory
-        tests/test_observed_instrument_directory_v2.cpp L2Flow::market)
+    l2flow_add_test(test_daily_instrument_catalog
+        tests/test_daily_instrument_catalog_v2.cpp L2Flow::market)
+    l2flow_add_test(test_instrument_runtime_state
+        tests/test_instrument_runtime_state_v2.cpp L2Flow::market)
     l2flow_add_test(test_observed_instrument_router
         tests/test_observed_instrument_router_v2.cpp L2Flow::market)
 
@@ -334,7 +338,7 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_realtime_factor_engine
         tests/test_realtime_factor_engine_v1.cpp L2Flow::factor)
     l2flow_add_test(test_realtime_pipeline
-        tests/test_observed_universe_pipeline_v2.cpp L2Flow::realtime)
+        tests/test_daily_catalog_pipeline_v2.cpp L2Flow::realtime)
     l2flow_add_test(test_realtime_pipeline_lifecycle_concurrency
         tests/test_realtime_pipeline_lifecycle_concurrency_v1.cpp
         L2Flow::realtime)

@@ -39,7 +39,7 @@ MAXIMUM_PAGE_RECORDS = 1_048_576
 
 
 class StreamNotFoundError(L2FlowRealtimeError):
-    """The pinned observed generation does not contain the requested ID."""
+    """The pinned daily-catalog generation does not contain the requested ID."""
 
 
 class StreamResourceExhaustedError(L2FlowRealtimeError):
@@ -177,7 +177,7 @@ def raise_status(operation: str, status: int) -> None:
         )
     if status == NOT_FOUND:
         raise StreamNotFoundError(
-            f"{operation}: ID is absent from the pinned observed generation"
+            f"{operation}: ID is absent from the pinned catalog generation"
         )
     if status == RESOURCE_EXHAUSTED:
         raise StreamResourceExhaustedError(

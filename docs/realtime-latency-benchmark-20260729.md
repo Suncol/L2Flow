@@ -1,8 +1,73 @@
-# Realtime Latency Benchmark — 2026-07-29
+# Realtime Latency Benchmark — 2026-07-29/30
+
+## Frozen-catalog/direct-decoder validation — 2026-07-30
+
+The current working tree on
+`feature/daily-catalog-direct-decoder-v2` was compared with the clean
+`8dd1505` baseline topology. The baseline was extracted into a temporary
+directory; only its opt-in benchmark fixture was changed to use the same
+12,000 valid Shenzhen A-share exact keys and the same 12,000-record replay as
+the current tree. Its production `ProcessingQueue`/`ProcessingLoop` code was
+not changed.
+
+Both sides used the same Release compiler flags, CPUs 8-15, message bytes and
+order, 4,096-slot message queues, four Store workers, 4,096 Store queue slots
+per source/worker, 32,768 tick-ring slots, 12,000 pre-measurement instruments,
+3,000-record burst, shared-memory capacity, and IPC reader workload. Stage
+measurement was enabled on both sides. Python inherited the same CPU 8-15
+affinity. Three independent runs were made on the same shared host. Values
+below are the median of the three run-level p50 estimates, followed by the
+run-level range; they are observations, not SLA claims.
+
+| Metric | Current direct-decoder | `8dd1505` baseline | Median change |
+|---|---:|---:|---:|
+| callback call duration | 3.600 us [3.391, 3.970] | 2.620 us [2.570, 2.690] | +37.4% |
+| strict callback origin to C IPC return | 21.420 us [21.040, 22.110] | 34.390 us [25.940, 39.750] | -37.7% |
+| strict callback origin to Python latest return | 65.951 us [65.920, 66.710] | 66.891 us [66.500, 67.181] | -1.4% |
+| callback to Store applied | 42.499 us [37.499, 42.499] | 47.499 us [47.499, 47.499] | -10.5% |
+| burst callback admission rate | 168,970/s [163,031, 302,836] | 216,430/s [193,156, 330,645] | -21.9% |
+
+The callback cost increase is expected: exact-key extraction, the mandatory
+A-share classifier, immutable-catalog lookup, pooled copy, and committed
+source-lane publication now happen before callback return. The lower
+callback-to-IPC and callback-to-Store medians show the benefit of deleting the
+serial processing hop. The burst-rate ranges are wide and overlap; the
+single-producer throughput difference is therefore recorded as a cost signal,
+not treated as a statistically stable regression claim.
+
+The current topology also produced the following source-stage p50 estimates
+for the active Shenzhen snapshot lane:
+
+| Current stage | Three-run median p50 [range] |
+|---|---:|
+| callback to decoder publication | 0.374 us [0.374, 0.424] |
+| decoder queue dwell | 17.499 us [12.499, 17.499] |
+| full decode | 0.774 us [0.774, 0.774] |
+| decode to History submit return | 3.324 us [3.324, 3.574] |
+| decode to applied | 27.499 us [22.499, 32.499] |
+| callback to required IPC visible | 47.499 us [47.499, 47.499] |
+
+After the 3,000-record burst, the source-local Shenzhen snapshot queue
+high-water was 1,560 records [1,271, 1,831], its full count was zero in every
+run, and the sampled accepted-minus-applied distance was 2,019 records
+[1,916, 2,425]. All other source queues remained at zero because this
+benchmark intentionally replays only Shenzhen snapshots. After drain, every
+queue depth and accepted-minus-applied distance were zero, with accepted and
+applied both equal to 37,000. The normal test suite separately exercises all
+four lanes, combined Shenzhen 6.33/6.36 ordering, a blocked source lane,
+queue-full failure, and generation/stop concurrency.
+
+Reproduction command:
+
+```bash
+taskset -c 8-15 \
+./build-release/test_realtime_shared_service_v2 \
+  --latency-benchmark-stages
+```
 
 > Historical scope: these measurements were collected from commit `3a6e5c5`,
-> before the current queue-only ingress replacement. They remain useful as a
-> point-read and fixed-ordinal baseline, but they are not current
+> before the frozen daily-catalog/direct-decoder replacement. They remain
+> useful as a point-read and fixed-ordinal baseline, but they are not current
 > callback-to-Python measurements. The current implementation must be
 > benchmark-confirmed separately.
 
@@ -262,14 +327,15 @@ statistics is consistent with a roughly 15-microsecond public read plus
 polling alignment and process scheduling. It is not a paired measurement of
 IPC-return-to-Python-return latency: the slot may become visible before
 `PublishApplied` returns. Because this historical run included background work
-that the current queue-only ingress no longer performs, its callback
+that the current direct source-lane ingress no longer performs, its callback
 distribution must not be presented as the current implementation's result.
 
 The benchmark deliberately matches the requested fresh early-session case.
 It does not test crash recovery, replay, checkpoints, rollover, capacity
 exhaustion, or more than 65,536 instruments.
 
-The fake SDK installs and invokes the real production handler and exercises:
+The fake SDK installed and invoked the production handler of that historical
+commit and exercised this retired topology:
 
 ```text
 OnMessage

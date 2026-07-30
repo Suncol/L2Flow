@@ -61,9 +61,9 @@ enum class OwnedIngressKeyErrorV1 : std::uint8_t {
     OwnedIngressSourceV1* output) noexcept;
 
 // Sequence values are assigned by the single serialized subscription
-// callback. They describe the dense prefix committed to the ordered
-// processing queue, not vendor event time. A queue-admission failure does not
-// commit its candidate sequence and fails the session closed.
+// callback. They describe the dense prefix committed directly to the four
+// source decoder FIFOs, not vendor event time. A source-lane admission
+// failure does not commit its candidate sequence and fails the session closed.
 // tick_stream_sequence is one dense order shared by Shanghai tick, Shenzhen
 // order, and Shenzhen transaction. Snapshot messages carry zero. UINT64_MAX
 // is reserved as the exhaustion sentinel so an exclusive generation cut can

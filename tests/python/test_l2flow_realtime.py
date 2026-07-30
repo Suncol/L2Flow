@@ -43,7 +43,7 @@ RUN_ID = b"R" * 16
 LAYOUT_DIGEST = b"L" * 32
 CATALOG_DIGEST = b"C" * 32
 SESSION_EPOCH = 17
-CAPACITY = 65_536
+CAPACITY = 4
 _COMMON = struct.Struct("<IIIIQQQQqqqQQQIIII6B10x")
 _DECIMAL = struct.Struct("<qqBBB5x")
 _QUANTITY = struct.Struct("<qBBB5x")
@@ -59,7 +59,7 @@ def session_info(**overrides) -> SessionInfo:
         "layout_digest": LAYOUT_DIGEST,
         "catalog_digest": CATALOG_DIGEST,
         "session_epoch": SESSION_EPOCH,
-        "catalog_generation": 3,
+        "catalog_generation": 1,
         "data_state_generation": 4,
         "accepted_sequence": 100,
         "applied_sequence": 99,
@@ -75,13 +75,15 @@ def session_info(**overrides) -> SessionInfo:
         "flags": 2,
         "capacity": CAPACITY,
         "window_count": 2,
-        "catalog_scope": CatalogScope.OBSERVED_ONLY,
-        "coverage_complete": False,
-        "bound_count": 2,
+        "catalog_scope": CatalogScope.DECLARED_DAILY_A_SHARE,
+        "coverage_complete": True,
+        "bound_count": CAPACITY,
         "available_count": 1,
         "snapshot_available_count": 1,
         "tick_available_count": 1,
         "factor_eligible_count": 1,
+        "catalog_trade_date": 20260729,
+        "catalog_version": 7,
     }
     values.update(overrides)
     return SessionInfo(**values)
@@ -278,7 +280,7 @@ class FakeV2Library:
             for index, byte in enumerate(source):
                 target[index] = byte
         result.session_epoch = SESSION_EPOCH
-        result.catalog_generation = 3
+        result.catalog_generation = 1
         result.data_state_generation = 4
         result.accepted_sequence = 100
         result.applied_sequence = 99
@@ -294,13 +296,17 @@ class FakeV2Library:
         result.flags = 2
         result.capacity = CAPACITY
         result.window_count = 2
-        result.catalog_scope = int(CatalogScope.OBSERVED_ONLY)
-        result.coverage_complete = 0
-        result.bound_count = 2
+        result.catalog_scope = int(
+            CatalogScope.DECLARED_DAILY_A_SHARE
+        )
+        result.coverage_complete = 1
+        result.bound_count = CAPACITY
         result.available_count = 1
         result.snapshot_available_count = 1
         result.tick_available_count = 1
         result.factor_eligible_count = 1
+        result.catalog_trade_date = 20260729
+        result.catalog_version = 7
         return native.OK
 
     @staticmethod
@@ -337,17 +343,8 @@ class FakeV2Library:
                 int(InstrumentStatus.INVALID_ID),
             )
             return native.OK
-        if instrument_id >= 3:
-            _set_scalar(source_written, ctypes.c_size_t, 0)
-            _set_scalar(id_written, ctypes.c_size_t, 0)
-            _set_scalar(
-                item_status,
-                ctypes.c_uint8,
-                int(InstrumentStatus.UNBOUND),
-            )
-            return native.OK
         source = b"XSHG"
-        security_id = b"600000" if instrument_id == 1 else b"600001"
+        security_id = f"{599999 + instrument_id:06d}".encode("ascii")
         status = (
             InstrumentStatus.AVAILABLE
             if instrument_id == 1
@@ -435,7 +432,7 @@ class FakeV2Library:
             0: LatestStatus.INVALID_INSTRUMENT_ID,
             1: LatestStatus.AVAILABLE,
             2: LatestStatus.BOUND_NO_DATA,
-            3: LatestStatus.UNBOUND,
+            3: LatestStatus.BOUND_NO_DATA,
             4: LatestStatus.TYPE_UNAVAILABLE,
         }.get(instrument_id, LatestStatus.INVALID_INSTRUMENT_ID)
 
@@ -529,8 +526,8 @@ class FakeV2Library:
         envelope_output,
     ):
         counts = {
-            int(SelectionScope.BOUND): 2,
-            int(SelectionScope.OBSERVED_ANY): 1,
+            int(SelectionScope.CATALOG_ALL): CAPACITY,
+            int(SelectionScope.AVAILABLE_ANY): 1,
             int(SelectionScope.SNAPSHOT_AVAILABLE): 1,
             int(SelectionScope.TICK_AVAILABLE): 1,
             int(SelectionScope.FACTOR_ELIGIBLE): 1,
@@ -547,15 +544,17 @@ class FakeV2Library:
             for index, byte in enumerate(source):
                 target[index] = byte
         envelope.session_epoch = SESSION_EPOCH
-        envelope.catalog_generation = 3
+        envelope.catalog_generation = 1
         envelope.data_state_generation = 4
         envelope.accepted_sequence = 100
         envelope.applied_sequence = 99
         envelope.processing_lag_records = 1
         envelope.capacity = CAPACITY
-        envelope.catalog_scope = int(CatalogScope.OBSERVED_ONLY)
-        envelope.coverage_complete = 0
-        envelope.bound_count = 2
+        envelope.catalog_scope = int(
+            CatalogScope.DECLARED_DAILY_A_SHARE
+        )
+        envelope.coverage_complete = 1
+        envelope.bound_count = CAPACITY
         envelope.available_count = 1
         envelope.snapshot_available_count = 1
         envelope.tick_available_count = 1
@@ -577,6 +576,10 @@ class AbiContractTests(unittest.TestCase):
         self.assertEqual(native._SessionInfoC.session_epoch.offset, 80)
         self.assertEqual(native._SessionInfoC.accepted_sequence.offset, 104)
         self.assertEqual(native._SessionInfoC.trade_date.offset, 176)
+        self.assertEqual(
+            native._SessionInfoC.catalog_trade_date.offset, 224
+        )
+        self.assertEqual(native._SessionInfoC.catalog_version.offset, 232)
         self.assertEqual(native._SelectionEnvelopeC.session_epoch.offset, 48)
         self.assertEqual(
             native._SelectionEnvelopeC.accepted_sequence.offset, 72
@@ -605,7 +608,7 @@ class AbiContractTests(unittest.TestCase):
         magic, major, minor = struct.unpack_from("<8sHH", request)
         self.assertEqual(magic, CONTROL_MAGIC)
         self.assertEqual((major, minor), (WIRE_MAJOR, WIRE_MINOR))
-        self.assertEqual((major, minor), (2, 1))
+        self.assertEqual((major, minor), (2, 2))
 
     def test_v2_history_modules_replace_removed_v1_surface(self):
         self.assertTrue(hasattr(l2flow_realtime, "HistoryCursor"))
@@ -644,11 +647,17 @@ class NativeReaderTests(unittest.TestCase):
     def tearDown(self):
         self.reader.close()
 
-    def test_session_has_observed_scope_counts_and_watermarks(self):
+    def test_session_has_daily_catalog_scope_counts_and_watermarks(self):
         session = self.reader.session()
         self.assertEqual(session.identity.session_epoch, SESSION_EPOCH)
-        self.assertIs(session.catalog_scope, CatalogScope.OBSERVED_ONLY)
-        self.assertFalse(session.coverage_complete)
+        self.assertIs(
+            session.catalog_scope,
+            CatalogScope.DECLARED_DAILY_A_SHARE,
+        )
+        self.assertTrue(session.coverage_complete)
+        self.assertEqual(session.catalog_generation, 1)
+        self.assertEqual(session.catalog_trade_date, session.trade_date)
+        self.assertEqual(session.catalog_version, 7)
         self.assertEqual(session.processing_lag_records, 1)
         self.assertEqual(
             (
@@ -658,7 +667,7 @@ class NativeReaderTests(unittest.TestCase):
                 session.bound_count,
                 session.capacity,
             ),
-            (1, 1, 1, 2, CAPACITY),
+            (1, 1, 1, CAPACITY, CAPACITY),
         )
 
     def test_health_reads_only_fixed_session_fields(self):
@@ -692,7 +701,8 @@ class NativeReaderTests(unittest.TestCase):
         self.assertIs(bound.status, InstrumentStatus.BOUND_NO_DATA)
         self.assertEqual(bound.first_ingress_sequence, 0)
         self.assertIs(
-            self.reader.instrument(3).status, InstrumentStatus.UNBOUND
+            self.reader.instrument(3).status,
+            InstrumentStatus.BOUND_NO_DATA,
         )
         self.assertIs(
             self.reader.instrument(0).status, InstrumentStatus.INVALID_ID
@@ -735,7 +745,7 @@ class NativeReaderTests(unittest.TestCase):
             (
                 LatestStatus.AVAILABLE,
                 LatestStatus.BOUND_NO_DATA,
-                LatestStatus.UNBOUND,
+                LatestStatus.BOUND_NO_DATA,
                 LatestStatus.TYPE_UNAVAILABLE,
                 LatestStatus.INVALID_INSTRUMENT_ID,
             ),
@@ -760,16 +770,19 @@ class NativeReaderTests(unittest.TestCase):
         )
         self.assertEqual(klines[0].close_price_p6, 11)
 
-    def test_selection_is_one_coherent_observed_envelope(self):
+    def test_selection_is_one_coherent_daily_catalog_envelope(self):
         selection = self.reader.select_instruments(
-            SelectionScope.BOUND
+            SelectionScope.CATALOG_ALL
         )
-        self.assertEqual(selection.instrument_ids, (1, 2))
-        self.assertEqual(selection.returned_row_count, 2)
+        self.assertEqual(selection.instrument_ids, (1, 2, 3, 4))
+        self.assertEqual(selection.returned_row_count, CAPACITY)
         self.assertIs(
-            selection.catalog_scope, CatalogScope.OBSERVED_ONLY
+            selection.catalog_scope,
+            CatalogScope.DECLARED_DAILY_A_SHARE,
         )
-        self.assertFalse(selection.coverage_complete)
+        self.assertTrue(selection.coverage_complete)
+        self.assertEqual(selection.catalog_generation, 1)
+        self.assertEqual(selection.bound_count, CAPACITY)
         self.assertEqual(selection.processing_lag_records, 1)
 
 
@@ -847,10 +860,22 @@ class ClientHotPathTests(unittest.TestCase):
         finally:
             reader.close()
 
-    def test_observed_only_is_normal_but_complete_claim_is_rejected(self):
-        self.assertFalse(session_info().coverage_complete)
+    def test_daily_catalog_contract_rejects_legacy_or_partial_claims(self):
+        self.assertTrue(session_info().coverage_complete)
         with self.assertRaises(ValueError):
-            session_info(coverage_complete=True)
+            session_info(coverage_complete=False)
+        with self.assertRaises(ValueError):
+            session_info(catalog_scope=1)
+        with self.assertRaises(ValueError):
+            session_info(catalog_generation=2)
+        with self.assertRaises(ValueError):
+            session_info(bound_count=CAPACITY - 1)
+        with self.assertRaises(ValueError):
+            session_info(catalog_trade_date=20260730)
+        with self.assertRaises(ValueError):
+            session_info(catalog_version=0)
+        with self.assertRaises(ValueError):
+            session_info(catalog_digest=b"\x00" * 32)
         with self.assertRaises(ValueError):
             session_info(
                 accepted_sequence=5,

@@ -710,7 +710,7 @@ DecodedMarketCommonV1 MakeCommon(
     return common;
 }
 
-void MarkInstrumentPendingObservedBinding(
+void MarkInstrumentAwaitingCatalogIdentity(
     DecodedMarketCommonV1* common) noexcept {
     common->quality_flags |=
         QualityBit(QualityFlagV1::kInstrumentUnknown);
@@ -1117,7 +1117,7 @@ MarketDecodeErrorV1 DecodeShanghaiSnapshot(
     }
     ApplyDepthQuality(bids.count, asks.count, &decoded.common);
     ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentPendingObservedBinding(&decoded.common);
+    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 #undef L2FLOW_DECODE_OR_RETURN
@@ -1411,7 +1411,7 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
     }
 
     ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentPendingObservedBinding(&decoded.common);
+    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 }
@@ -1599,7 +1599,7 @@ MarketDecodeErrorV1 DecodeShenzhenSnapshot(
     }
     ApplyDepthQuality(bids.count, asks.count, &decoded.common);
     ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentPendingObservedBinding(&decoded.common);
+    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 #undef L2FLOW_DECODE_OR_RETURN
@@ -1756,7 +1756,7 @@ MarketDecodeErrorV1 DecodeShenzhenOrder(
         }
     }
     ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentPendingObservedBinding(&decoded.common);
+    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 }
@@ -1874,7 +1874,7 @@ MarketDecodeErrorV1 DecodeShenzhenTransaction(
             QualityBit(QualityFlagV1::kUnknownEnum);
     }
     ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentPendingObservedBinding(&decoded.common);
+    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
     *output = std::move(decoded);
     return MarketDecodeErrorV1::kNone;
 }
@@ -1923,7 +1923,7 @@ bool RecognizedCoreMessage(
     return true;
 }
 
-[[nodiscard]] MarketDecodeErrorV1 ReadObservedKeyString(
+[[nodiscard]] MarketDecodeErrorV1 ReadExactKeyString(
     std::span<const std::byte> body,
     std::size_t descriptor_offset,
     std::size_t fixed_bytes,
@@ -1991,10 +1991,10 @@ bool RecognizedCoreMessage(
 
 }  // namespace
 
-MarketDecodeErrorV1 ExtractObservedInstrumentKeyV2(
+MarketDecodeErrorV1 ExtractExactInstrumentKeyV2(
     const MarketMessageViewV1& input,
     std::size_t maximum_text_bytes,
-    ObservedInstrumentKeyViewV2* output) noexcept {
+    ExactInstrumentKeyViewV2* output) noexcept {
     if (output == nullptr) {
         return MarketDecodeErrorV1::kNullOutput;
     }
@@ -2042,9 +2042,9 @@ MarketDecodeErrorV1 ExtractObservedInstrumentKeyV2(
         market = MarketV1::kShenzhen;
     }
 
-    ObservedInstrumentKeyViewV2 extracted{};
+    ExactInstrumentKeyViewV2 extracted{};
     extracted.market = market;
-    MarketDecodeErrorV1 error = ReadObservedKeyString(
+    MarketDecodeErrorV1 error = ReadExactKeyString(
         input.body,
         security_id_offset,
         fixed_bytes,
@@ -2054,7 +2054,7 @@ MarketDecodeErrorV1 ExtractObservedInstrumentKeyV2(
         return error;
     }
     if (market == MarketV1::kShenzhen) {
-        error = ReadObservedKeyString(
+        error = ReadExactKeyString(
             input.body,
             source_offset,
             fixed_bytes,
@@ -2073,8 +2073,8 @@ MarketDecodeErrorV1 ExtractObservedInstrumentKeyV2(
     return MarketDecodeErrorV1::kNone;
 }
 
-bool ApplyObservedInstrumentIdentityV2(
-    const ObservedInstrumentIdentityViewV2& identity,
+bool ApplyDailyInstrumentIdentityV2(
+    const DailyInstrumentIdentityViewV2& identity,
     DecodedMarketEventV1* event) noexcept {
     if (event == nullptr || identity.instrument_id == 0U ||
         identity.ordinal == std::numeric_limits<std::size_t>::max() ||

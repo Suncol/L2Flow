@@ -44,7 +44,10 @@ static_assert(
 static_assert(
     offsetof(l2flow_shm_session_info_v2, bound_count) == 204U);
 static_assert(
-    offsetof(l2flow_shm_session_info_v2, reserved) == 224U);
+    offsetof(
+        l2flow_shm_session_info_v2, catalog_trade_date) == 224U);
+static_assert(
+    offsetof(l2flow_shm_session_info_v2, catalog_version) == 232U);
 static_assert(sizeof(l2flow_selection_envelope_v2) == 144U);
 static_assert(
     offsetof(l2flow_selection_envelope_v2, session_epoch) == 48U);
@@ -398,14 +401,14 @@ StableCopyResult CopyCatalogCut(
         std::atomic_thread_fence(std::memory_order_acq_rel);
         const std::uint32_t end =
             Atomic(header.bound_count).load(std::memory_order_acquire);
-        if (begin != end ||
-            snapshot.catalog_generation != begin) {
-            // A binding publisher writes generation/digest before the
-            // release-store to bound_count. This is a transient cut, not a
-            // corrupt layout.
+        if (begin != end) {
             continue;
         }
-        if (begin != 0U && !AnyNonzero(snapshot.catalog_digest)) {
+        // Wire V2.2 publishes the complete dense daily catalog before
+        // ACTIVE. Identity never grows or renumbers during the session.
+        if (begin != header.capacity ||
+            snapshot.catalog_generation != 1U ||
+            !AnyNonzero(snapshot.catalog_digest)) {
             return StableCopyResult::kInvalid;
         }
         *output = snapshot;
@@ -1046,20 +1049,14 @@ PointRowResult ResolvePointOrdinal(
     }
     const std::size_t ordinal =
         static_cast<std::size_t>(instrument_id - 1U);
-    // Binding publication is:
-    //
-    //   key bytes -> row release tag -> bound_count release store.
-    //
-    // This acquire therefore linearizes whether the ordinal belongs to the
-    // committed prefix and imports its immutable identity publication.
+    // Wire V2.2 prepublishes every dense daily identity before ACTIVE.
+    // A partial bound prefix is therefore corruption, not an UNBOUND
+    // instrument state.
     const std::uint32_t bound_count =
         Atomic(reader.header->bound_count)
             .load(std::memory_order_acquire);
-    if (bound_count > reader.header->capacity) {
+    if (bound_count != reader.header->capacity) {
         return PointRowResult::kInvalidLayout;
-    }
-    if (ordinal >= bound_count) {
-        return PointRowResult::kUnbound;
     }
     *output = ordinal;
     return PointRowResult::kBound;
@@ -1503,7 +1500,7 @@ void FillSelectionEnvelope(
 bool SelectionScopeValid(std::uint32_t scope) noexcept {
     return scope >=
                static_cast<std::uint32_t>(
-                   RealtimeSelectionScopeV2::kBound) &&
+                   RealtimeSelectionScopeV2::kCatalogAll) &&
            scope <=
                static_cast<std::uint32_t>(
                    RealtimeSelectionScopeV2::kFactorEligible);
@@ -1513,9 +1510,9 @@ bool RowMatchesSelection(
     const RealtimeWireInstrumentV2& row,
     std::uint32_t scope) noexcept {
     switch (static_cast<RealtimeSelectionScopeV2>(scope)) {
-        case RealtimeSelectionScopeV2::kBound:
+        case RealtimeSelectionScopeV2::kCatalogAll:
             return true;
-        case RealtimeSelectionScopeV2::kObservedAny:
+        case RealtimeSelectionScopeV2::kAvailableAny:
             return row.binding_state ==
                    static_cast<std::uint32_t>(
                        RealtimeInstrumentBindingStateV2::kAvailable);
@@ -1539,9 +1536,9 @@ std::uint32_t SelectionCount(
     const StatusSnapshot& status,
     std::uint32_t scope) noexcept {
     switch (static_cast<RealtimeSelectionScopeV2>(scope)) {
-        case RealtimeSelectionScopeV2::kBound:
+        case RealtimeSelectionScopeV2::kCatalogAll:
             return status.bound_count;
-        case RealtimeSelectionScopeV2::kObservedAny:
+        case RealtimeSelectionScopeV2::kAvailableAny:
             return status.available_count;
         case RealtimeSelectionScopeV2::kSnapshotAvailable:
             return status.snapshot_available_count;
@@ -1657,8 +1654,11 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
             std::numeric_limits<std::uint32_t>::max() &&
         header->catalog_scope ==
             static_cast<std::uint32_t>(
-                RealtimeCatalogScopeV2::kObservedOnly) &&
-        header->coverage_complete == 0U &&
+                RealtimeCatalogScopeV2::kDeclaredDailyAShare) &&
+        header->coverage_complete == 1U &&
+        header->catalog_trade_date == header->trade_date &&
+        header->reserved_catalog == 0U &&
+        header->catalog_version != 0U &&
         AnyNonzero(header->layout_digest) &&
         KnownServerState(initial_state) &&
         HeaderFlagsValid(initial_flags) &&
@@ -1890,6 +1890,10 @@ extern "C" int l2flow_shm_reader_session_v2(
     result.tick_available_count = status.tick_available_count;
     result.factor_eligible_count =
         status.factor_eligible_count;
+    result.catalog_trade_date =
+        reader->header->catalog_trade_date;
+    result.catalog_version =
+        reader->header->catalog_version;
     if (!KnownServerState(result.server_state) ||
         !HeaderFlagsValid(result.flags) ||
         result.tick_contiguous_published_sequence >
@@ -2488,7 +2492,7 @@ extern "C" int l2flow_shm_reader_select_instruments_v2(
                  ++ordinal) {
                 if (selection_scope ==
                     static_cast<std::uint32_t>(
-                        RealtimeSelectionScopeV2::kBound)) {
+                        RealtimeSelectionScopeV2::kCatalogAll)) {
                     if (!PublishedBoundIdentityValid(
                             *reader, ordinal)) {
                         return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
@@ -2527,7 +2531,7 @@ extern "C" int l2flow_shm_reader_select_instruments_v2(
             const bool bound_selection =
                 selection_scope ==
                 static_cast<std::uint32_t>(
-                    RealtimeSelectionScopeV2::kBound);
+                    RealtimeSelectionScopeV2::kCatalogAll);
             if (!(bound_selection
                       ? CatalogCutEqual(status, end_status)
                       : SelectionStateCutEqual(
@@ -2636,27 +2640,30 @@ bool ObjectBytesZero(const Value& value) noexcept {
         [](std::uint8_t byte) noexcept { return byte == 0U; });
 }
 
+template <std::size_t Size>
+bool CByteArrayAnyNonzero(
+    const std::uint8_t (&value)[Size]) noexcept {
+    return std::any_of(
+        value,
+        value + Size,
+        [](std::uint8_t byte) noexcept { return byte != 0U; });
+}
+
 bool SessionExpectationValid(
     const l2flow_shm_session_info_v2& session) noexcept {
-    return AnyNonzero(std::array<std::uint8_t, 16U>{
-               session.run_id[0U],
-               session.run_id[1U],
-               session.run_id[2U],
-               session.run_id[3U],
-               session.run_id[4U],
-               session.run_id[5U],
-               session.run_id[6U],
-               session.run_id[7U],
-               session.run_id[8U],
-               session.run_id[9U],
-               session.run_id[10U],
-               session.run_id[11U],
-               session.run_id[12U],
-               session.run_id[13U],
-               session.run_id[14U],
-               session.run_id[15U]}) &&
+    return CByteArrayAnyNonzero(session.run_id) &&
+           CByteArrayAnyNonzero(session.catalog_digest) &&
            session.session_epoch != 0U && session.trade_date != 0U &&
-           session.capacity != 0U;
+           session.capacity != 0U &&
+           session.catalog_scope ==
+               static_cast<std::uint32_t>(
+                   RealtimeCatalogScopeV2::kDeclaredDailyAShare) &&
+           session.coverage_complete == 1U &&
+           session.catalog_generation == 1U &&
+           session.bound_count == session.capacity &&
+           session.catalog_trade_date == session.trade_date &&
+           session.reserved_catalog == 0U &&
+           session.catalog_version != 0U;
 }
 
 bool EndpointMatchesSession(
@@ -2668,7 +2675,17 @@ bool EndpointMatchesSession(
                session.run_id) &&
            endpoint.session_epoch == session.session_epoch &&
            endpoint.trade_date == session.trade_date &&
-           endpoint.capacity == session.capacity;
+           endpoint.capacity == session.capacity &&
+           endpoint.catalog_generation ==
+               session.catalog_generation &&
+           endpoint.bound_count == session.bound_count &&
+           endpoint.catalog_scope == session.catalog_scope &&
+           endpoint.coverage_complete ==
+               session.coverage_complete &&
+           std::memcmp(
+               endpoint.catalog_digest.data(),
+               session.catalog_digest,
+               sizeof(session.catalog_digest)) == 0;
 }
 
 void ReleaseHistoryPage(

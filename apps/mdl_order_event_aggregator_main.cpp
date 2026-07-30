@@ -678,13 +678,23 @@ struct SourceResponse final {
         return SourceAttachError::kReader;
     }
     if (!AnyNonzero(session.run_id, sizeof(session.run_id)) ||
+        !AnyNonzero(
+            session.catalog_digest,
+            sizeof(session.catalog_digest)) ||
         session.session_epoch != options.session_epoch ||
         session.trade_date != options.trade_date ||
+        session.catalog_generation != 1U ||
+        session.catalog_trade_date != options.trade_date ||
+        session.catalog_version == 0U ||
+        session.capacity == 0U ||
         session.tick_ring_capacity == 0U ||
-        session.coverage_complete != 0U ||
+        session.coverage_complete != 1U ||
+        session.bound_count != session.capacity ||
+        session.reserved_catalog != 0U ||
         session.catalog_scope !=
             static_cast<std::uint32_t>(
-                ipc::RealtimeCatalogScopeV2::kObservedOnly)) {
+                ipc::RealtimeCatalogScopeV2::
+                    kDeclaredDailyAShare)) {
         return SourceAttachError::kIdentity;
     }
     *output_session = session;
@@ -701,7 +711,17 @@ struct SourceResponse final {
                sizeof(left.run_id)) == 0 &&
            left.session_epoch == right.session_epoch &&
            left.trade_date == right.trade_date &&
+           left.catalog_generation ==
+               right.catalog_generation &&
+           left.catalog_trade_date == right.catalog_trade_date &&
+           left.catalog_version == right.catalog_version &&
+           std::memcmp(
+               left.catalog_digest,
+               right.catalog_digest,
+               sizeof(left.catalog_digest)) == 0 &&
            left.tick_ring_capacity == right.tick_ring_capacity &&
+           left.capacity == right.capacity &&
+           left.bound_count == right.bound_count &&
            left.catalog_scope == right.catalog_scope &&
            left.coverage_complete == right.coverage_complete;
 }
@@ -768,8 +788,21 @@ SourceSession(
         result.run_id[index] =
             static_cast<std::byte>(source.run_id[index]);
     }
+    for (std::size_t index = 0U;
+         index < result.catalog_digest.size(); ++index) {
+        result.catalog_digest[index] =
+            static_cast<std::byte>(
+                source.catalog_digest[index]);
+    }
     result.session_epoch = source.session_epoch;
+    result.catalog_generation = source.catalog_generation;
+    result.catalog_version = source.catalog_version;
     result.trade_date = source.trade_date;
+    result.catalog_trade_date = source.catalog_trade_date;
+    result.capacity = source.capacity;
+    result.bound_count = source.bound_count;
+    result.catalog_scope = source.catalog_scope;
+    result.coverage_complete = source.coverage_complete;
     return result;
 }
 

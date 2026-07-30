@@ -1,4 +1,4 @@
-"""Small, read-only client for one observed-universe Wire V2 session."""
+"""Small, read-only client for one declared daily-catalog Wire V2 session."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
+from ._generation import DailyCatalogSessionIdentity
 from ._history_worker_protocol import (
     ALL_RESULT_COLUMNS,
     DEFAULT_RESULT_COLUMNS,
@@ -407,9 +408,9 @@ class L2FlowClient:
         """Attach to the live derived-event ring for this source session.
 
         The event aggregator has a distinct control socket and session. This
-        method sends the current Wire V2 run/epoch/trading-date identity,
-        validates the returned ring, and rechecks the Wire V2 session after
-        the potentially blocking Unix control exchange.
+        method sends the complete immutable Wire V2 daily-catalog identity,
+        validates the returned ring, and rechecks that identity after the
+        potentially blocking Unix control exchange.
         """
 
         from .order_event_delta_control import (
@@ -424,10 +425,10 @@ class L2FlowClient:
             )
         with self._lock:
             session = self._checked_session()
-            expected_source = LiveOrderEventDeltaSourceSession(
-                run_id=session.run_id,
-                session_epoch=session.session_epoch,
-                trade_date=session.trade_date,
+            expected_source = (
+                LiveOrderEventDeltaSourceSession.from_session_info(
+                    session
+                )
             )
             effective_timeout = (
                 self._control_timeout
@@ -463,10 +464,10 @@ class L2FlowClient:
         try:
             with self._lock:
                 current = self._checked_session()
-                current_source = LiveOrderEventDeltaSourceSession(
-                    run_id=current.run_id,
-                    session_epoch=current.session_epoch,
-                    trade_date=current.trade_date,
+                current_source = (
+                    LiveOrderEventDeltaSourceSession.from_session_info(
+                        current
+                    )
                 )
                 if current_source != expected_source:
                     raise StaleSessionError(
@@ -505,10 +506,11 @@ class L2FlowClient:
                     "history requires a client opened through the "
                     "Wire V2 control socket"
                 )
-            run_id = session.run_id
-            session_epoch = session.session_epoch
-            trade_date = session.trade_date
-            capacity = session.capacity
+            expected_session = (
+                DailyCatalogSessionIdentity.from_session_info(
+                    session
+                )
+            )
         # Socket connect and OPEN are deliberately outside the client lock:
         # a slow history service cannot stall latest_snapshot/latest_tick.
         cursor = _open_instrument_history(
@@ -520,18 +522,24 @@ class L2FlowClient:
                 if expected_generation is None
                 else expected_generation
             ),
-            expected_run_id=run_id,
-            expected_session_epoch=session_epoch,
-            expected_trade_date=trade_date,
-            expected_capacity=capacity,
+            expected_session=expected_session,
             timeout=self._control_timeout,
         )
         try:
             with self._lock:
-                self._checked_session()
-                if self._identity != cursor.generation.session_identity:
+                current_session = (
+                    DailyCatalogSessionIdentity.from_session_info(
+                        self._checked_session()
+                    )
+                )
+                if (
+                    current_session != expected_session
+                    or self._identity
+                    != cursor.generation.session_identity
+                ):
                     raise StaleSessionError(
-                        "history cursor belongs to another session"
+                        "history cursor belongs to another "
+                        "session or daily catalog"
                     )
             return cursor
         except BaseException:
@@ -557,10 +565,11 @@ class L2FlowClient:
                     "tick deltas require a client opened through the "
                     "Wire V2 control socket"
                 )
-            run_id = session.run_id
-            session_epoch = session.session_epoch
-            trade_date = session.trade_date
-            capacity = session.capacity
+            expected_session = (
+                DailyCatalogSessionIdentity.from_session_info(
+                    session
+                )
+            )
         delta_session = _open_instrument_tick_delta_session(
             path,
             expected_generation=(
@@ -568,21 +577,24 @@ class L2FlowClient:
                 if expected_generation is None
                 else expected_generation
             ),
-            expected_run_id=run_id,
-            expected_session_epoch=session_epoch,
-            expected_trade_date=trade_date,
-            expected_capacity=capacity,
+            expected_session=expected_session,
             timeout=self._control_timeout,
         )
         try:
             with self._lock:
-                self._checked_session()
+                current_session = (
+                    DailyCatalogSessionIdentity.from_session_info(
+                        self._checked_session()
+                    )
+                )
                 if (
-                    self._identity
+                    current_session != expected_session
+                    or self._identity
                     != delta_session.generation.session_identity
                 ):
                     raise StaleSessionError(
-                        "delta session belongs to another realtime session"
+                        "delta session belongs to another "
+                        "realtime session or daily catalog"
                     )
             return delta_session
         except BaseException:
@@ -615,17 +627,17 @@ class L2FlowClient:
                     "the history worker requires a client opened through "
                     "the Wire V2 control socket"
                 )
-            identity = session.identity
-            trade_date = session.trade_date
-            capacity = session.capacity
+            expected_session = (
+                DailyCatalogSessionIdentity.from_session_info(
+                    session
+                )
+            )
             timeout = self._control_timeout
         # Process startup and its fixed INIT handshake are deliberately
         # outside the latest-reader lock.
         worker = _start_instrument_tick_delta_worker(
             path,
-            session_identity=identity,
-            trade_date=trade_date,
-            capacity=capacity,
+            expected_session=expected_session,
             result_columns=result_columns,
             ring_slots=ring_slots,
             result_batch_records=result_batch_records,
@@ -633,10 +645,15 @@ class L2FlowClient:
         )
         try:
             with self._lock:
-                current = self._checked_session()
-                if current.identity != identity:
+                current = (
+                    DailyCatalogSessionIdentity.from_session_info(
+                        self._checked_session()
+                    )
+                )
+                if current != expected_session:
                     raise StaleSessionError(
-                        "realtime session changed during worker startup"
+                        "realtime session or daily catalog changed "
+                        "during worker startup"
                     )
             return worker
         except BaseException:

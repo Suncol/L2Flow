@@ -178,9 +178,9 @@ checkpoint's `coverage_from_open`, `record_coverage_complete`, and
 `tick_record_coverage_complete` flags.
 
 Numeric IDs are valid only in their `SessionIdentity`. Exact keys are resolved
-against the reader's current observed session. An unobserved key raises
-`InstrumentRawEventLookupError`; absence means “not observed in this
-session,” not “the security does not exist.”
+against the reader's frozen daily catalog. A missing key raises
+`InstrumentRawEventLookupError`; absence means “not declared in this
+session's subscribed A-share catalog,” not “the security does not exist.”
 
 ## Rolling updates
 

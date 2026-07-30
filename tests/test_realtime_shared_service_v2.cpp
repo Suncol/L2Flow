@@ -6,7 +6,7 @@
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/ipc/realtime_shm_reader_c_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 #include "l2flow/sdk/market_message_catalog_v1.h"
@@ -230,6 +230,31 @@ std::vector<std::byte> PipelineShenzhenOrderBody(
         value /= 10U;
     }
     return result;
+}
+
+// Enumerates the documented Shenzhen A-share ranges in exact byte-sort
+// order. The synthetic performance fixtures therefore exercise the same
+// classifier and immutable-catalog contract as production.
+[[nodiscard]] std::string ShenzhenAShareSecurityId(
+    std::uint32_t ordinal) {
+    constexpr std::uint32_t kFirstRangeCount = 999U;
+    constexpr std::uint32_t kSecondRangeCount = 3'800U;
+    constexpr std::uint32_t kMaximumOrdinal = 14'599U;
+    if (ordinal == 0U || ordinal > kMaximumOrdinal) {
+        return {};
+    }
+    std::uint32_t numeric = 0U;
+    if (ordinal <= kFirstRangeCount) {
+        numeric = ordinal;
+    } else if (
+        ordinal <= kFirstRangeCount + kSecondRangeCount) {
+        numeric = 1'200U + ordinal - kFirstRangeCount - 1U;
+    } else {
+        numeric =
+            300'000U + ordinal -
+            kFirstRangeCount - kSecondRangeCount - 1U;
+    }
+    return SixDigitSecurityId(numeric);
 }
 
 class FakeSdkMessage final : public mdl::MDLMessage {
@@ -688,6 +713,17 @@ void PrintStageLatency(
         << " max_ns=" << distribution.maximum_ns
         << " bucket_width_ns="
         << distribution.histogram_bucket_width_ns << '\n';
+}
+
+[[nodiscard]] constexpr std::string_view DecoderLaneName(
+    std::size_t source) noexcept {
+    constexpr std::array<std::string_view, 4U> names{
+        "sh_snapshot",
+        "sh_ngts_tick",
+        "sz_snapshot",
+        "sz_tick",
+    };
+    return source < names.size() ? names[source] : "invalid";
 }
 
 [[nodiscard]] std::string CpuAffinityText() {
@@ -1897,19 +1933,6 @@ template <typename Message>
 #endif
 }
 
-std::unique_ptr<market::ObservedInstrumentDirectoryV2>
-MakeDirectory(std::size_t capacity, std::uint64_t epoch) {
-    market::ObservedInstrumentDirectoryConfigV2 config{};
-    config.capacity = capacity;
-    config.session_epoch = epoch;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> result;
-    return market::ObservedInstrumentDirectoryV2::Create(
-               config, &result) ==
-               market::ObservedInstrumentDirectoryErrorV2::kNone
-           ? std::move(result)
-           : nullptr;
-}
-
 market::InstrumentKeyV1 Key(
     std::string_view source,
     std::string_view security_id) {
@@ -1920,13 +1943,129 @@ market::InstrumentKeyV1 Key(
     return result;
 }
 
-market::ObservedInstrumentMetadataV2 Metadata() {
-    market::ObservedInstrumentMetadataV2 result{};
+market::InstrumentRuntimeMetadataV2 Metadata() {
+    market::InstrumentRuntimeMetadataV2 result{};
     result.quantity_unit = market::QuantityUnitV1::kShare;
     result.security_type = market::SecurityTypeV1::kEquity;
     result.asset_scope =
         market::AssetScopeV1::kDocumentedCore;
     return result;
+}
+
+struct DailyRuntimeFixture final {
+    std::shared_ptr<const market::DailyInstrumentCatalogV2> catalog;
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return catalog != nullptr && runtime_state != nullptr;
+    }
+};
+
+[[nodiscard]] DailyRuntimeFixture MakeDailyFixture(
+    std::span<const market::InstrumentKeyV1> keys,
+    std::uint64_t epoch) {
+    DailyRuntimeFixture result{};
+    if (keys.empty() || epoch == 0U) {
+        return result;
+    }
+    std::vector<market::DailyInstrumentSourceEntryV2> source;
+    try {
+        source.reserve(keys.size());
+        for (const market::InstrumentKeyV1& key : keys) {
+            market::DailyInstrumentSourceEntryV2 entry{};
+            entry.key = key;
+            entry.metadata = Metadata();
+            source.push_back(std::move(entry));
+        }
+    } catch (...) {
+        return result;
+    }
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = kTradeDate;
+    config.catalog_version = epoch;
+    config.session_epoch = epoch;
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    if (market::DailyInstrumentCatalogV2::Create(
+            config, source, &catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        catalog == nullptr) {
+        return result;
+    }
+    result.catalog =
+        std::shared_ptr<const market::DailyInstrumentCatalogV2>(
+            std::move(catalog));
+    if (market::InstrumentRuntimeStateV2::Create(
+            *result.catalog, &result.runtime_state) !=
+        market::InstrumentRuntimeStateErrorV2::kNone) {
+        result = {};
+    }
+    return result;
+}
+
+[[nodiscard]] DailyRuntimeFixture MakeManualDailyFixture(
+    std::size_t capacity,
+    std::uint64_t epoch) {
+    std::vector<market::InstrumentKeyV1> keys;
+    try {
+        keys.reserve(capacity);
+        for (std::size_t index = 0U; index < capacity; ++index) {
+            keys.push_back(Key(
+                "",
+                SixDigitSecurityId(
+                    static_cast<std::uint32_t>(
+                        600'001U + index))));
+        }
+    } catch (...) {
+        return {};
+    }
+    return MakeDailyFixture(keys, epoch);
+}
+
+[[nodiscard]] DailyRuntimeFixture MakePipelineDailyFixture(
+    std::uint64_t epoch) {
+    market::InstrumentKeyV1 key{};
+    key.market = market::MarketV1::kShenzhen;
+    key.security_id_source = Bytes("102 ");
+    key.security_id = Bytes("000001");
+    return MakeDailyFixture(std::span(&key, 1U), epoch);
+}
+
+[[nodiscard]] DailyRuntimeFixture MakeBenchmarkDailyFixture(
+    std::size_t shenzhen_instrument_count,
+    std::uint64_t epoch,
+    bool include_shanghai_tick_instrument) {
+    if (shenzhen_instrument_count > 14'599U) {
+        return {};
+    }
+    std::vector<market::InstrumentKeyV1> keys;
+    try {
+        keys.reserve(
+            shenzhen_instrument_count +
+            (include_shanghai_tick_instrument ? 1U : 0U));
+        if (include_shanghai_tick_instrument) {
+            keys.push_back(Key("", "600001"));
+        }
+        for (std::size_t index = 1U;
+             index <= shenzhen_instrument_count;
+             ++index) {
+            const std::string security_id =
+                ShenzhenAShareSecurityId(
+                    static_cast<std::uint32_t>(index));
+            if (security_id.empty()) {
+                return {};
+            }
+            market::InstrumentKeyV1 key{};
+            key.market = market::MarketV1::kShenzhen;
+            key.security_id_source = Bytes("102 ");
+            key.security_id = Bytes(security_id);
+            keys.push_back(std::move(key));
+        }
+    } catch (...) {
+        return {};
+    }
+    return MakeDailyFixture(keys, epoch);
 }
 
 void FillCommon(
@@ -2540,6 +2679,86 @@ bool ReadNativeRawEventHistory(
     return ok;
 }
 
+bool CheckHistoryExpectedDailyCatalogIdentity(
+    const std::filesystem::path& socket_path,
+    const l2flow_shm_session_info_v2& expected_session,
+    std::uint64_t expected_generation) {
+    bool ok = true;
+    const auto expect_invalid =
+        [&](auto mutate, std::string_view label) {
+            l2flow_shm_session_info_v2 candidate =
+                expected_session;
+            mutate(candidate);
+            ipc::InstrumentRawEventHistorySessionV2 session;
+            ok &= Expect(
+                ipc::InstrumentRawEventHistorySessionV2::Open(
+                    socket_path.c_str(),
+                    candidate,
+                    expected_generation,
+                    3'000U,
+                    &session) ==
+                        ipc::InstrumentRawEventHistoryErrorV2::
+                            kInvalidArgument &&
+                    !session.is_open(),
+                label);
+        };
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            value.catalog_scope = 1U;
+        },
+        "history rejects legacy catalog scope before connect");
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            value.coverage_complete = 0U;
+        },
+        "history rejects incomplete daily catalog before connect");
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            value.catalog_generation = 2U;
+        },
+        "history rejects mutable catalog generation before connect");
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            --value.bound_count;
+        },
+        "history rejects partial daily catalog before connect");
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            ++value.catalog_trade_date;
+        },
+        "history rejects mismatched catalog trade date before connect");
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            value.catalog_version = 0U;
+        },
+        "history rejects zero catalog version before connect");
+    expect_invalid(
+        [](l2flow_shm_session_info_v2& value) {
+            std::fill(
+                std::begin(value.catalog_digest),
+                std::end(value.catalog_digest),
+                0U);
+        },
+        "history rejects zero catalog digest before connect");
+
+    l2flow_shm_session_info_v2 different_catalog =
+        expected_session;
+    different_catalog.catalog_digest[0U] ^= 0xffU;
+    ipc::InstrumentRawEventHistorySessionV2 session;
+    ok &= Expect(
+        ipc::InstrumentRawEventHistorySessionV2::Open(
+            socket_path.c_str(),
+            different_catalog,
+            expected_generation,
+            3'000U,
+            &session) ==
+                ipc::InstrumentRawEventHistoryErrorV2::
+                    kProtocolError &&
+            !session.is_open(),
+        "history rejects same session tuple with another catalog digest");
+    return ok;
+}
+
 bool DrainDerivedEventHistory(
     ipc::InstrumentDerivedEventHistorySessionV1* session,
     std::vector<ipc::InstrumentDerivedEventV1>* events,
@@ -2677,9 +2896,18 @@ bool TestMalformedHistoryResponseClosesReceivedDescriptor() {
 
     l2flow_shm_session_info_v2 expected{};
     expected.run_id[0U] = 1U;
+    expected.catalog_digest[0U] = 1U;
     expected.session_epoch = 1U;
     expected.trade_date = kTradeDate;
     expected.capacity = 1U;
+    expected.catalog_scope =
+        static_cast<std::uint32_t>(
+            L2FLOW_CATALOG_DECLARED_DAILY_A_SHARE_V2);
+    expected.coverage_complete = 1U;
+    expected.catalog_generation = 1U;
+    expected.bound_count = expected.capacity;
+    expected.catalog_trade_date = expected.trade_date;
+    expected.catalog_version = 1U;
     l2flow_instrument_raw_event_history_session_v2* session =
         nullptr;
     const int error =
@@ -2707,9 +2935,10 @@ bool TestMalformedHistoryResponseClosesReceivedDescriptor() {
 
 bool TestServiceEndToEnd() {
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(4U, kSessionEpoch);
+    DailyRuntimeFixture fixture =
+        MakeManualDailyFixture(4U, kSessionEpoch);
     if (!Expect(temporary.valid(), "create secure temp directory") ||
-        !Expect(directory != nullptr, "create observed directory")) {
+        !Expect(static_cast<bool>(fixture), "create daily catalog")) {
         return false;
     }
     const std::filesystem::path socket_path =
@@ -2720,7 +2949,7 @@ bool TestServiceEndToEnd() {
     service_config.run_id = run_id;
     service_config.session_epoch = kSessionEpoch;
     service_config.trade_date = kTradeDate;
-    service_config.directory = directory.get();
+    service_config.daily_catalog = fixture.catalog;
     service_config.kline_windows = {{
         kWindowId,
         kWindowDurationNs,
@@ -2749,7 +2978,7 @@ bool TestServiceEndToEnd() {
     }
     ok &= Expect(
         service->Start(&system_error) && system_error == 0,
-        "start service with empty observed catalog");
+        "start service with prepublished daily catalog");
 
     SessionTransfer invalid =
         RequestSession(socket_path, 2U);
@@ -2806,48 +3035,28 @@ bool TestServiceEndToEnd() {
             session.server_state ==
                 static_cast<std::uint32_t>(
                     ipc::RealtimeServerStateV2::kActive) &&
-            session.capacity == 4U && session.bound_count == 0U &&
+            session.capacity == 4U && session.bound_count == 4U &&
             session.available_count == 0U &&
             session.catalog_scope ==
                 static_cast<std::uint32_t>(
-                    ipc::RealtimeCatalogScopeV2::kObservedOnly) &&
-            session.coverage_complete == 0U,
-        "bound=0 mapping is immediately ACTIVE and observed-only");
+                    ipc::RealtimeCatalogScopeV2::
+                        kDeclaredDailyAShare) &&
+            session.coverage_complete == 1U &&
+            session.catalog_trade_date == kTradeDate &&
+            session.catalog_version == kSessionEpoch,
+        "complete daily catalog mapping is ACTIVE before ingress");
 
-    market::InstrumentKeyV1 key = Key("101", "600001");
-    market::ObservedInstrumentBindResultV2 binding{};
-    ok &= Expect(
-        directory->BindOrGet(
-            key, Metadata(), 1U, &binding) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            binding.newly_bound &&
-            service->PublishObservedInstrumentBinding(binding),
-        "release-publish first dynamic binding");
     const std::uint64_t used_after_binding =
         service->key_arena_used_bytes();
     ok &= Expect(
-        used_after_binding == 9U,
-        "binding consumes exact opaque key bytes");
-
-    market::ObservedInstrumentBindResultV2 repeated_binding{};
-    ok &= Expect(
-        directory->BindOrGet(
-            key, Metadata(), 2U, &repeated_binding) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            !repeated_binding.newly_bound &&
-            repeated_binding.catalog_generation ==
-                binding.catalog_generation &&
-            repeated_binding.catalog_digest ==
-                binding.catalog_digest &&
-            service->key_arena_used_bytes() ==
-                used_after_binding,
-        "repeated BindOrGet does not republish catalog or key arena");
+        used_after_binding != 0U,
+        "startup prepublication consumes exact opaque key bytes once");
 
     market::RealtimeHistoryRuntimeConfigV1 runtime_config{};
     runtime_config.source_stream_ids = kSourceStreamIds;
     runtime_config.worker_count = 1U;
     runtime_config.queue_capacity_per_source_worker = 16U;
-    runtime_config.directory = directory.get();
+    runtime_config.runtime_state = fixture.runtime_state.get();
     runtime_config.intraday_store.segment_target_bytes =
         market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     runtime_config.intraday_store.maximum_session_records = 16U;
@@ -2875,11 +3084,11 @@ bool TestServiceEndToEnd() {
     }
 
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         catalog;
     ok &= Expect(
-        directory->AcquireSnapshot(&catalog) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        fixture.runtime_state->AcquireSnapshot(&catalog) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             catalog != nullptr,
         "capture bound no-data catalog snapshot");
     const std::array<market::RealtimeSourceWatermarkV1, 4U>
@@ -2928,13 +3137,17 @@ bool TestServiceEndToEnd() {
             empty_store_generation != nullptr &&
             empty_kline_generation != nullptr,
         "build bound no-data immutable generation");
-    ok &= Expect(
+    const bool empty_kline_published =
         empty_kline_generation != nullptr &&
-            service->PublishKLineGeneration(
-                *empty_kline_generation) &&
-            service->PublishStoreGeneration(
-                empty_store_generation),
-        "publish bound no-data generation");
+        service->PublishKLineGeneration(*empty_kline_generation);
+    const bool empty_store_published =
+        empty_kline_published &&
+        service->PublishStoreGeneration(empty_store_generation);
+    ok &= Expect(
+        empty_kline_published && empty_store_published,
+        std::string("publish bound no-data generation kline=") +
+            (empty_kline_published ? "1" : "0") +
+            " store=" + (empty_store_published ? "1" : "0"));
     ok &= RunPythonHistoryDeltaSmoke(
         socket_path, 1U, 0U, false);
 
@@ -2946,10 +3159,10 @@ bool TestServiceEndToEnd() {
     ok &= Expect(
         WaitUntil([&] {
             std::shared_ptr<
-                const market::ObservedInstrumentCatalogSnapshotV2>
+                const market::DailyInstrumentCatalogSnapshotV2>
                 snapshot;
-            return directory->AcquireSnapshot(&snapshot) ==
-                       market::ObservedInstrumentDirectoryErrorV2::
+            return fixture.runtime_state->AcquireSnapshot(&snapshot) ==
+                       market::InstrumentRuntimeStateErrorV2::
                            kNone &&
                    snapshot != nullptr &&
                    snapshot->available_count() == 1U &&
@@ -2960,8 +3173,8 @@ bool TestServiceEndToEnd() {
         "history applies availability to the directory");
 
     ok &= Expect(
-        directory->AcquireSnapshot(&catalog) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        fixture.runtime_state->AcquireSnapshot(&catalog) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             catalog != nullptr,
         "capture generation catalog snapshot");
     const std::array<market::RealtimeSourceWatermarkV1, 4U>
@@ -2984,7 +3197,7 @@ bool TestServiceEndToEnd() {
             sources,
             &watermark) ==
             market::RealtimeHistoryWatermarkErrorV1::kNone,
-        "build observed-universe generation watermark");
+        "build frozen daily-catalog generation watermark");
     ok &= Expect(
         runtime->BeginGeneration(watermark) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
@@ -3031,6 +3244,8 @@ bool TestServiceEndToEnd() {
             reader.get(), &session) ==
             L2FLOW_SHM_READER_OK_V2,
         "refresh shared-memory identity before native history");
+    ok &= CheckHistoryExpectedDailyCatalogIdentity(
+        socket_path, session, 2U);
     ipc::InstrumentRawEventHistoryCheckpointV2 first_checkpoint{};
     const std::array<std::uint64_t, 1U> first_ingress{{3U}};
     const std::array<std::uint64_t, 1U> first_ticks{{1U}};
@@ -3256,8 +3471,8 @@ bool TestServiceEndToEnd() {
         }),
         "rolling-update tick reaches Store and Wire latest");
     ok &= Expect(
-        directory->AcquireSnapshot(&catalog) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        fixture.runtime_state->AcquireSnapshot(&catalog) ==
+                market::InstrumentRuntimeStateErrorV2::kNone &&
             catalog != nullptr,
         "capture catalog for native rolling generation");
     const std::array<market::RealtimeSourceWatermarkV1, 4U>
@@ -3562,7 +3777,7 @@ bool TestServiceEndToEnd() {
         l2flow_shm_reader_session_v2(
             reader.get(), &session) ==
                 L2FLOW_SHM_READER_OK_V2 &&
-            session.bound_count == 1U &&
+            session.bound_count == 4U &&
             session.available_count == 1U &&
             session.snapshot_available_count == 1U &&
             session.tick_available_count == 1U &&
@@ -3698,7 +3913,7 @@ bool TestServiceEndToEnd() {
                 session.catalog_digest,
                 catalog_digest.data(),
                 catalog_digest.size()) == 0 &&
-            session.bound_count == 1U &&
+            session.bound_count == 4U &&
             session.available_count == 1U &&
             session.snapshot_available_count == 1U &&
             session.tick_available_count == 1U &&
@@ -3727,9 +3942,9 @@ bool TestServiceEndToEnd() {
 
 bool TestProcessingAdmissionPublishesWireLatest() {
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(4U, 33U);
+    DailyRuntimeFixture fixture = MakePipelineDailyFixture(33U);
     if (!Expect(
-            temporary.valid() && directory != nullptr,
+            temporary.valid() && static_cast<bool>(fixture),
             "create processing-to-Wire integration fixture")) {
         return false;
     }
@@ -3742,7 +3957,7 @@ bool TestProcessingAdmissionPublishesWireLatest() {
     service_config.run_id = run_id;
     service_config.session_epoch = 33U;
     service_config.trade_date = kTradeDate;
-    service_config.directory = directory.get();
+    service_config.daily_catalog = fixture.catalog;
     service_config.tick_ring_capacity = 16U;
     service_config.key_arena_bytes = 128U;
     service_config.maximum_mapping_bytes =
@@ -3783,7 +3998,7 @@ bool TestProcessingAdmissionPublishesWireLatest() {
                 transfer.fd.get(), reader.output()) ==
                 L2FLOW_SHM_READER_OK_V2 &&
             reader.get() != nullptr,
-        "open real C Reader before the first instrument is observed");
+        "open real C Reader after the daily catalog is prepublished");
     if (reader.get() == nullptr) {
         service->MarkFailed();
         service->StopControl();
@@ -3796,11 +4011,16 @@ bool TestProcessingAdmissionPublishesWireLatest() {
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = kTradeDate;
-    pipeline_config.directory = directory.get();
+    pipeline_config.daily_catalog = fixture.catalog;
+    pipeline_config.runtime_state = fixture.runtime_state.get();
     pipeline_config.source_stream_ids = kSourceStreamIds;
     pipeline_config.maximum_sdk_message_bytes = 4096U;
-    pipeline_config.processing_queue_capacity = 16U;
-    pipeline_config.decoder_queue_capacity_per_source = 1U;
+    // This integration deliberately offers six callbacks back-to-back on
+    // one source. Direct source-local admission is fail-closed when that
+    // source FIFO fills, so size the test lane for the offered burst.
+    pipeline_config.decoder_queue_capacity_per_source = 8U;
+    pipeline_config.completion_tracker_capacity = 16U;
+    pipeline_config.tick_ring_capacity = 16U;
     pipeline_config.store_worker_count = 1U;
     pipeline_config.store_queue_capacity_per_source_worker = 16U;
     pipeline_config.intraday_store.segment_target_bytes =
@@ -3811,7 +4031,6 @@ bool TestProcessingAdmissionPublishesWireLatest() {
     pipeline_config.intraday_store.maximum_records_per_batch = 16U;
     pipeline_config.intraday_store.coverage_from_open = true;
     pipeline_config.applied_record_sink = service;
-    pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
     pipeline_config.store_generation_sink = service;
     pipeline_config.sdk.enabled = false;
@@ -3843,7 +4062,7 @@ bool TestProcessingAdmissionPublishesWireLatest() {
     ok &= Expect(
         first_ingress.accepted() &&
             first_ingress.global_ingress_sequence == 1U,
-        "first capture is admitted to ordered processing");
+        "first capture is admitted directly to its decoder lane");
     for (std::uint64_t sequence = 2U;
          sequence <= kCaptureCount;
          ++sequence) {
@@ -3852,7 +4071,7 @@ bool TestProcessingAdmissionPublishesWireLatest() {
         ok &= Expect(
             ingress.accepted() &&
                 ingress.global_ingress_sequence == sequence,
-            "subsequent callback preserves dense processing admission");
+            "subsequent callback preserves dense direct admission");
     }
 
     l2flow_shm_session_info_v2 session{};
@@ -3869,8 +4088,12 @@ bool TestProcessingAdmissionPublishesWireLatest() {
                        ipc::RealtimeServerStateV2::kActive) &&
                session.catalog_scope ==
                    static_cast<std::uint32_t>(
-                       ipc::RealtimeCatalogScopeV2::kObservedOnly) &&
-               session.coverage_complete == 0U &&
+                       ipc::RealtimeCatalogScopeV2::
+                           kDeclaredDailyAShare) &&
+               session.coverage_complete == 1U &&
+               session.catalog_trade_date == kTradeDate &&
+               session.catalog_version == 33U &&
+               session.catalog_generation == 1U &&
                session.bound_count == 1U &&
                session.available_count == 1U &&
                session.snapshot_available_count == 1U &&
@@ -3933,9 +4156,9 @@ bool TestProcessingAdmissionPublishesWireLatest() {
 
 bool TestKeyArenaExhaustionIsFatal() {
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(2U, 30U);
+    DailyRuntimeFixture fixture = MakeManualDailyFixture(2U, 30U);
     if (!Expect(
-            temporary.valid() && directory != nullptr,
+            temporary.valid() && static_cast<bool>(fixture),
             "create exhaustion fixture")) {
         return false;
     }
@@ -3943,50 +4166,28 @@ bool TestKeyArenaExhaustionIsFatal() {
     config.run_id = RunId(0x30U);
     config.session_epoch = 30U;
     config.trade_date = kTradeDate;
-    config.directory = directory.get();
+    config.daily_catalog = fixture.catalog;
     config.tick_ring_capacity = 2U;
     config.key_arena_bytes = 2U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
     config.control_socket_path =
         temporary.path() / "exhaust.sock";
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
-    bool ok = Expect(
+    const bool ok = Expect(
         ipc::RealtimeSharedMarketServiceV2::Create(
             config, &service) ==
-                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
-            service != nullptr,
-        "create fixed tiny key arena");
-    if (!ok) {
-        return false;
-    }
-    market::ObservedInstrumentBindResultV2 first{};
-    market::InstrumentKeyV1 first_key = Key("A", "1");
-    ok &= Expect(
-        directory->BindOrGet(
-            first_key, Metadata(), 1U, &first) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            service->PublishObservedInstrumentBinding(first) &&
-            service->key_arena_used_bytes() == 2U,
-        "fill fixed key arena exactly");
-    market::ObservedInstrumentBindResultV2 second{};
-    market::InstrumentKeyV1 second_key = Key("", "22");
-    ok &= Expect(
-        directory->BindOrGet(
-            second_key, Metadata(), 2U, &second) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            !service->PublishObservedInstrumentBinding(second) &&
-            service->failed() &&
-            service->key_arena_used_bytes() == 2U,
-        "key arena exhaustion fails session without rollover");
-    service->StopControl();
+                ipc::RealtimeSharedServiceCreateErrorV2::
+                    kCatalogMismatch &&
+            service == nullptr,
+        "daily catalog key arena exhaustion fails before ACTIVE");
     return ok;
 }
 
 bool TestStoppedCleanRejectsMismatchedWatermark() {
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(1U, 31U);
+    DailyRuntimeFixture fixture = MakeManualDailyFixture(1U, 31U);
     if (!Expect(
-            temporary.valid() && directory != nullptr,
+            temporary.valid() && static_cast<bool>(fixture),
             "create terminal-watermark fixture")) {
         return false;
     }
@@ -3994,7 +4195,7 @@ bool TestStoppedCleanRejectsMismatchedWatermark() {
     config.run_id = RunId(0x31U);
     config.session_epoch = 31U;
     config.trade_date = kTradeDate;
-    config.directory = directory.get();
+    config.daily_catalog = fixture.catalog;
     config.tick_ring_capacity = 2U;
     config.key_arena_bytes = 16U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -4020,9 +4221,9 @@ bool TestStoppedCleanRejectsMismatchedWatermark() {
 
 bool TestTickRingRejectsUnclosedGapOverwrite() {
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(1U, 32U);
+    DailyRuntimeFixture fixture = MakeManualDailyFixture(1U, 32U);
     if (!Expect(
-            temporary.valid() && directory != nullptr,
+            temporary.valid() && static_cast<bool>(fixture),
             "create tick-gap fixture")) {
         return false;
     }
@@ -4030,7 +4231,7 @@ bool TestTickRingRejectsUnclosedGapOverwrite() {
     config.run_id = RunId(0x32U);
     config.session_epoch = 32U;
     config.trade_date = kTradeDate;
-    config.directory = directory.get();
+    config.daily_catalog = fixture.catalog;
     config.tick_ring_capacity = 2U;
     config.key_arena_bytes = 32U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -4047,20 +4248,11 @@ bool TestTickRingRejectsUnclosedGapOverwrite() {
         return false;
     }
 
-    market::ObservedInstrumentBindResultV2 binding{};
-    market::InstrumentKeyV1 key = Key("101", "600001");
-    ok &= Expect(
-        directory->BindOrGet(
-            key, Metadata(), 1U, &binding) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            service->PublishObservedInstrumentBinding(binding),
-        "bind tick-gap instrument");
-
     market::RealtimeHistoryRuntimeConfigV1 runtime_config{};
     runtime_config.source_stream_ids = kSourceStreamIds;
     runtime_config.worker_count = 1U;
     runtime_config.queue_capacity_per_source_worker = 4U;
-    runtime_config.directory = directory.get();
+    runtime_config.runtime_state = fixture.runtime_state.get();
     runtime_config.intraday_store.segment_target_bytes =
         market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     runtime_config.intraday_store.maximum_session_records = 4U;
@@ -4086,10 +4278,10 @@ bool TestTickRingRejectsUnclosedGapOverwrite() {
         Submit(runtime.get(), TickInput(1U, 2U, 2U)) &&
             WaitUntil([&] {
                 std::shared_ptr<
-                    const market::ObservedInstrumentCatalogSnapshotV2>
+                    const market::DailyInstrumentCatalogSnapshotV2>
                     snapshot;
-                return directory->AcquireSnapshot(&snapshot) ==
-                           market::ObservedInstrumentDirectoryErrorV2::
+                return fixture.runtime_state->AcquireSnapshot(&snapshot) ==
+                           market::InstrumentRuntimeStateErrorV2::
                                kNone &&
                        snapshot != nullptr &&
                        snapshot->tick_available_count() == 1U &&
@@ -4107,8 +4299,8 @@ bool TestTickRingRejectsUnclosedGapOverwrite() {
 }
 
 bool RunLatencyBenchmark(bool measure_stage_latency) {
-    constexpr std::size_t kCapacity = 65'536U;
-    constexpr std::size_t kActiveInstrumentCount = 60'000U;
+    constexpr std::size_t kCapacity = 12'000U;
+    constexpr std::size_t kActiveInstrumentCount = kCapacity;
     constexpr std::size_t kFillBatchSize = 512U;
     constexpr std::size_t kWarmupSamples = 1'000U;
     constexpr std::size_t kMeasuredSamples = 10'000U;
@@ -4129,7 +4321,6 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     std::cout
         << "ENV capacity=" << kCapacity
         << " worker_count=" << kStoreWorkerCount
-        << " processing_queue=" << kQueueCapacity
         << " decoder_queue_per_source=" << kQueueCapacity
         << " store_queue_per_source_worker=" << kQueueCapacity
         << " tick_ring_capacity=" << kTickRingCapacity
@@ -4150,10 +4341,11 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         << '\n';
 
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(kCapacity, 47U);
+    DailyRuntimeFixture fixture =
+        MakeBenchmarkDailyFixture(kCapacity, 47U, false);
     if (!Expect(
-            temporary.valid() && directory != nullptr,
-            "create latency benchmark directory")) {
+            temporary.valid() && static_cast<bool>(fixture),
+            "create latency benchmark daily catalog")) {
         return false;
     }
     const common::Identity128 run_id = RunId(0x47U);
@@ -4164,7 +4356,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     service_config.run_id = run_id;
     service_config.session_epoch = 47U;
     service_config.trade_date = kTradeDate;
-    service_config.directory = directory.get();
+    service_config.daily_catalog = fixture.catalog;
     service_config.tick_ring_capacity = kTickRingCapacity;
     service_config.control_socket_path = socket_path;
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
@@ -4205,12 +4397,13 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = kTradeDate;
-    pipeline_config.directory = directory.get();
+    pipeline_config.daily_catalog = fixture.catalog;
+    pipeline_config.runtime_state = fixture.runtime_state.get();
     pipeline_config.source_stream_ids = kSourceStreamIds;
     pipeline_config.maximum_sdk_message_bytes = 4'096U;
-    pipeline_config.processing_queue_capacity = kQueueCapacity;
     pipeline_config.decoder_queue_capacity_per_source =
         kQueueCapacity;
+    pipeline_config.tick_ring_capacity = kTickRingCapacity;
     pipeline_config.store_worker_count = kStoreWorkerCount;
     pipeline_config.store_queue_capacity_per_source_worker =
         kQueueCapacity;
@@ -4223,11 +4416,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
     pipeline_config.intraday_store.coverage_from_open = true;
-    // This synthetic capacity benchmark intentionally enumerates 000001
-    // through 060000, not an exchange-valid A-share universe.
-    pipeline_config.enable_mainland_a_share_filter = false;
     pipeline_config.applied_record_sink = timed_sink;
-    pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
     pipeline_config.store_generation_sink = service;
     pipeline_config.measure_stage_latency =
@@ -4330,7 +4519,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         for (std::size_t instrument = first;
              instrument <= last;
              ++instrument) {
-            const std::string security_id = SixDigitSecurityId(
+            const std::string security_id = ShenzhenAShareSecurityId(
                 static_cast<std::uint32_t>(instrument));
             if (!Expect(
                     security_id.size() == 6U,
@@ -4363,11 +4552,11 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     }
 
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         fill_catalog;
     if (!Expect(
-            directory->AcquireSnapshot(&fill_catalog) ==
-                    market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            fixture.runtime_state->AcquireSnapshot(&fill_catalog) ==
+                    market::InstrumentRuntimeStateErrorV2::kNone &&
                 fill_catalog != nullptr &&
                 fill_catalog->bound_count() ==
                     kActiveInstrumentCount &&
@@ -4378,7 +4567,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                 fill_catalog->tick_available_count() == 0U &&
                 fill_catalog->factor_eligible_count() ==
                     kActiveInstrumentCount,
-            "working-set catalog has 60000 snapshot instruments")) {
+            "working-set catalog has all daily instruments available")) {
         return false;
     }
 
@@ -4400,8 +4589,9 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
             break;
         }
         session_matches_fill =
-            fill_session.catalog_generation ==
-                kActiveInstrumentCount &&
+            fill_session.catalog_generation == 1U &&
+            fill_session.catalog_trade_date == kTradeDate &&
+            fill_session.catalog_version == 47U &&
             fill_session.accepted_sequence ==
                 kActiveInstrumentCount &&
             fill_session.applied_sequence ==
@@ -4423,7 +4613,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     }
     if (!Expect(
             session_matches_fill,
-            "Wire session exposes the complete 60000-instrument fill")) {
+            "Wire session exposes the complete daily-catalog fill")) {
         return false;
     }
 
@@ -4452,7 +4642,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                     kActiveInstrumentCount &&
                 boundary_latest[1U].common.ingress_sequence ==
                     kActiveInstrumentCount,
-            "C Reader verifies ID1 and ID60000 latest snapshots")) {
+            "C Reader verifies first and last daily IDs")) {
         return false;
     }
 
@@ -4887,6 +5077,8 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     const std::uint64_t burst_last =
         burst_first + kBurstSamples - 1U;
     next_sequence = burst_last + 1U;
+    const runtime::RealtimePipelineSnapshotV1 after_burst_admission =
+        pipeline->Snapshot();
     if (!Expect(
             burst_start != 0U && burst_end > burst_start,
             "measure burst producer duration")) {
@@ -4983,6 +5175,28 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         << " producer_records_per_second="
         << std::fixed << std::setprecision(3) << burst_rate
         << std::defaultfloat << '\n';
+    std::cout
+        << "PROGRESS phase=after_burst_admission accepted="
+        << after_burst_admission.processing_progress.accepted_sequence
+        << " applied="
+        << after_burst_admission.processing_progress.applied_sequence
+        << " accepted_minus_applied="
+        << after_burst_admission.processing_progress
+               .processing_lag_records()
+        << '\n';
+    for (std::size_t source = 0U;
+         source < market::kRealtimeHistorySourceCountV1;
+         ++source) {
+        const runtime::RealtimeDecoderQueueSnapshotV1& queue =
+            after_burst_admission.decoder_queues[source];
+        std::cout
+            << "DECODER_QUEUE phase=after_burst_admission lane="
+            << DecoderLaneName(source)
+            << " message_depth=" << queue.message_depth
+            << " message_high_water=" << queue.message_high_water
+            << " full_count=" << queue.full_count
+            << '\n';
+    }
     PrintLatency(
         "burst_strict_callback_origin_to_ipc_begin",
         burst_strict_callback_to_ipc_begin);
@@ -5011,6 +5225,32 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
             "callback_entry_to_inprocess_latest",
             stages.callback_entry_to_inprocess_latest_read);
         PrintStageLatency("store_append_call", stages.append_call);
+        for (std::size_t source = 0U;
+             source < market::kRealtimeHistorySourceCountV1;
+             ++source) {
+            const std::string lane{DecoderLaneName(source)};
+            PrintStageLatency(
+                "callback_to_decoder_publish{" + lane + "}",
+                stages.callback_to_decoder_publish[source]);
+            PrintStageLatency(
+                "decoder_queue_dwell{" + lane + "}",
+                stages.decoder_queue_dwell[source]);
+            PrintStageLatency(
+                "decode_duration{" + lane + "}",
+                stages.decode_duration[source]);
+            PrintStageLatency(
+                "decode_to_history_submit{" + lane + "}",
+                stages.decode_to_history_submit[source]);
+            PrintStageLatency(
+                "decode_to_applied{" + lane + "}",
+                stages.decode_to_applied[source]);
+        }
+        PrintStageLatency(
+            "callback_to_store_applied",
+            stages.callback_to_store_applied);
+        PrintStageLatency(
+            "callback_to_ipc_visible",
+            stages.callback_to_ipc_visible);
     }
     std::cout
         << "STAGE_COUNTS enabled=" << (stages.enabled ? 1 : 0)
@@ -5023,8 +5263,64 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
 
     const runtime::RealtimePipelineSnapshotV1 final_state =
         pipeline->Snapshot();
+    std::cout
+        << "PROGRESS phase=final accepted="
+        << final_state.processing_progress.accepted_sequence
+        << " applied="
+        << final_state.processing_progress.applied_sequence
+        << " accepted_minus_applied="
+        << final_state.processing_progress.processing_lag_records()
+        << '\n';
+    for (std::size_t source = 0U;
+         source < market::kRealtimeHistorySourceCountV1;
+         ++source) {
+        const runtime::RealtimeDecoderQueueSnapshotV1& queue =
+            final_state.decoder_queues[source];
+        std::cout
+            << "DECODER_QUEUE phase=final lane="
+            << DecoderLaneName(source)
+            << " message_depth=" << queue.message_depth
+            << " message_high_water=" << queue.message_high_water
+            << " full_count=" << queue.full_count
+            << '\n';
+    }
+    const auto metric_attempts = [](
+        const runtime::RealtimeLatencyDistributionV1& distribution) {
+        return distribution.samples + distribution.invalid_samples;
+    };
+    std::uint64_t decoder_publish_attempts = 0U;
+    std::uint64_t queue_dwell_attempts = 0U;
+    std::uint64_t decode_attempts = 0U;
+    std::uint64_t history_submit_attempts = 0U;
+    std::uint64_t decode_to_applied_attempts = 0U;
+    for (std::size_t source = 0U;
+         source < market::kRealtimeHistorySourceCountV1;
+         ++source) {
+        decoder_publish_attempts += metric_attempts(
+            stages.callback_to_decoder_publish[source]);
+        queue_dwell_attempts += metric_attempts(
+            stages.decoder_queue_dwell[source]);
+        decode_attempts += metric_attempts(
+            stages.decode_duration[source]);
+        history_submit_attempts += metric_attempts(
+            stages.decode_to_history_submit[source]);
+        decode_to_applied_attempts += metric_attempts(
+            stages.decode_to_applied[source]);
+    }
+    const bool stage_metric_counts_match =
+        !measure_stage_latency ||
+        (decoder_publish_attempts == burst_last &&
+         queue_dwell_attempts == burst_last &&
+         decode_attempts == burst_last &&
+         history_submit_attempts == burst_last &&
+         decode_to_applied_attempts == burst_last &&
+         metric_attempts(stages.callback_to_store_applied) ==
+             burst_last &&
+         metric_attempts(stages.callback_to_ipc_visible) ==
+             burst_last);
     bool ok = Expect(
         stages.enabled == measure_stage_latency &&
+            stage_metric_counts_match &&
             !pipeline->fatal() &&
             !final_state.fatal &&
             final_state.accepted_messages == burst_last &&
@@ -5033,7 +5329,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
             final_state.processing_progress.applied_sequence ==
                 burst_last &&
             !service->failed(),
-        "latency benchmark retains the complete accepted/applied prefix");
+        "latency benchmark retains the complete prefix and stage metrics");
 
     l2flow_shm_session_info_v2 final_session{};
     bool wire_matches_final_prefix = false;
@@ -5059,11 +5355,13 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                     ipc::RealtimeServerStateV2::kActive) &&
             final_session.catalog_scope ==
                 static_cast<std::uint32_t>(
-                    ipc::RealtimeCatalogScopeV2::kObservedOnly) &&
-            final_session.coverage_complete == 0U &&
+                    ipc::RealtimeCatalogScopeV2::
+                        kDeclaredDailyAShare) &&
+            final_session.coverage_complete == 1U &&
             final_session.capacity == kCapacity &&
-            final_session.catalog_generation ==
-                kActiveInstrumentCount &&
+            final_session.catalog_generation == 1U &&
+            final_session.catalog_trade_date == kTradeDate &&
+            final_session.catalog_version == 47U &&
             final_session.bound_count ==
                 kActiveInstrumentCount &&
             final_session.available_count ==
@@ -5083,7 +5381,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     }
     ok &= Expect(
         wire_matches_final_prefix,
-        "Wire session publishes the complete 85000-record prefix");
+        "Wire session publishes the complete benchmark prefix");
 
     service->MarkDraining();
     ok &= Expect(
@@ -5094,8 +5392,8 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
 }
 
 bool RunHistoryLatencyBenchmark() {
-    constexpr std::size_t kCapacity = 65'536U;
-    constexpr std::size_t kBoundInstrumentCount = 60'000U;
+    constexpr std::size_t kCapacity = 12'000U;
+    constexpr std::size_t kBoundInstrumentCount = kCapacity;
     constexpr std::size_t kSnapshotFillCount =
         kBoundInstrumentCount - 1U;
     constexpr std::size_t kQueueCapacity = 8'192U;
@@ -5103,9 +5401,10 @@ bool RunHistoryLatencyBenchmark() {
     constexpr std::size_t kMaximumSequence = 250'000U;
     constexpr std::uint64_t kTickRingCapacity = 262'144U;
     constexpr std::uint32_t kStoreWorkerCount = 4U;
-    constexpr std::uint32_t kPureTickInstrument =
-        static_cast<std::uint32_t>(kBoundInstrumentCount);
-    constexpr std::uint32_t kMixedInstrument = 1U;
+    // Exact-key sorting assigns the sole Shanghai entry ID 1, followed by
+    // the Shenzhen range. 000001 is therefore the mixed instrument ID 2.
+    constexpr std::uint32_t kPureTickInstrument = 1U;
+    constexpr std::uint32_t kMixedInstrument = 2U;
     constexpr std::size_t kPriceRepeats = 20U;
     constexpr std::size_t kAllColumnRepeats = 10U;
 
@@ -5114,7 +5413,6 @@ bool RunHistoryLatencyBenchmark() {
         << " bound_instruments=" << kBoundInstrumentCount
         << " snapshot_fill=" << kSnapshotFillCount
         << " worker_count=" << kStoreWorkerCount
-        << " processing_queue=" << kQueueCapacity
         << " tick_ring_capacity=" << kTickRingCapacity
         << " requested_page_records=4096"
         << " price_repeats=" << kPriceRepeats
@@ -5123,9 +5421,10 @@ bool RunHistoryLatencyBenchmark() {
         << " affinity=" << CpuAffinityText() << '\n';
 
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory(kCapacity, 67U);
+    DailyRuntimeFixture fixture = MakeBenchmarkDailyFixture(
+        kSnapshotFillCount, 67U, true);
     if (!Expect(
-            temporary.valid() && directory != nullptr,
+            temporary.valid() && static_cast<bool>(fixture),
             "create history latency fixture")) {
         return false;
     }
@@ -5138,7 +5437,7 @@ bool RunHistoryLatencyBenchmark() {
     service_config.run_id = run_id;
     service_config.session_epoch = 67U;
     service_config.trade_date = kTradeDate;
-    service_config.directory = directory.get();
+    service_config.daily_catalog = fixture.catalog;
     service_config.tick_ring_capacity = kTickRingCapacity;
     service_config.maximum_history_readers = 8U;
     service_config.maximum_history_page_records = 4'096U;
@@ -5173,12 +5472,13 @@ bool RunHistoryLatencyBenchmark() {
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = kTradeDate;
-    pipeline_config.directory = directory.get();
+    pipeline_config.daily_catalog = fixture.catalog;
+    pipeline_config.runtime_state = fixture.runtime_state.get();
     pipeline_config.source_stream_ids = kSourceStreamIds;
     pipeline_config.maximum_sdk_message_bytes = 4'096U;
-    pipeline_config.processing_queue_capacity = kQueueCapacity;
     pipeline_config.decoder_queue_capacity_per_source =
         kQueueCapacity;
+    pipeline_config.tick_ring_capacity = kTickRingCapacity;
     pipeline_config.store_worker_count = kStoreWorkerCount;
     pipeline_config.store_queue_capacity_per_source_worker =
         kQueueCapacity;
@@ -5191,11 +5491,7 @@ bool RunHistoryLatencyBenchmark() {
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
     pipeline_config.intraday_store.coverage_from_open = true;
-    // This synthetic capacity benchmark intentionally enumerates 000001
-    // through 060000, not an exchange-valid A-share universe.
-    pipeline_config.enable_mainland_a_share_filter = false;
     pipeline_config.applied_record_sink = timed_applied;
-    pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
     pipeline_config.store_generation_sink = service;
     pipeline_config.sdk.enabled = true;
@@ -5263,13 +5559,13 @@ bool RunHistoryLatencyBenchmark() {
             FakeSdkMessage snapshot(
                 sdk::kProductionMessageKeysV1[2U],
                 PipelineShenzhenSnapshotBody(
-                    SixDigitSecurityId(id)));
+                    ShenzhenAShareSecurityId(id)));
             handler->OnMessage(nullptr, &snapshot);
             ++next_sequence;
         }
         if (!Expect(
                 wait_prefix(next_sequence - 1U),
-                "fill 59,999 observed snapshots")) {
+                "fill daily Shenzhen snapshot working set")) {
             service->MarkFailed();
             service->StopControl();
             return false;

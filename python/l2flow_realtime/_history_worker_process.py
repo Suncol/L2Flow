@@ -323,10 +323,7 @@ def _run(control_fd: int, ring_fd: int) -> int:
         ):
             raise ProtocolError("history worker INIT is noncanonical")
         (
-            run_id,
-            session_epoch,
-            trade_date,
-            capacity,
+            expected_session,
             timeout_ns,
             result_column_mask,
             control_path,
@@ -402,10 +399,7 @@ def _run(control_fd: int, ring_fd: int) -> int:
             session = _open_instrument_tick_delta_session(
                 control_path,
                 expected_generation=expected_generation,
-                expected_run_id=run_id,
-                expected_session_epoch=session_epoch,
-                expected_trade_date=trade_date,
-                expected_capacity=capacity,
+                expected_session=expected_session,
                 timeout=timeout,
             )
             try:

@@ -11,6 +11,7 @@ import socket
 import struct
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -25,6 +26,7 @@ from l2flow_realtime.models import (
 )
 from l2flow_realtime.order_event_delta_control import (
     CONTROL_MAGIC,
+    CONTROL_MINOR,
     CONTROL_OK,
     CONTROL_SOURCE_SESSION_MISMATCH,
     CONTROL_UNAVAILABLE,
@@ -49,6 +51,9 @@ _EVENT_RUN_ID = bytes(range(17, 33))
 _SOURCE_EPOCH = 71
 _EVENT_EPOCH = 19
 _TRADE_DATE = 20260730
+_CATALOG_DIGEST = bytes(range(33, 65))
+_CATALOG_VERSION = 2026073001
+_CATALOG_CAPACITY = 4
 _RING_CAPACITY = 8
 _MAPPING_BYTES = 8192
 _REQUIRED_SEALS = (
@@ -199,13 +204,29 @@ class _CompletedThread:
 def _source_session(
     *,
     run_id=_SOURCE_RUN_ID,
+    catalog_digest=_CATALOG_DIGEST,
     session_epoch=_SOURCE_EPOCH,
+    catalog_generation=1,
+    catalog_version=_CATALOG_VERSION,
     trade_date=_TRADE_DATE,
+    catalog_trade_date=_TRADE_DATE,
+    capacity=_CATALOG_CAPACITY,
+    bound_count=_CATALOG_CAPACITY,
+    catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
+    coverage_complete=True,
 ):
     return LiveOrderEventDeltaSourceSession(
         run_id=run_id,
+        catalog_digest=catalog_digest,
         session_epoch=session_epoch,
+        catalog_generation=catalog_generation,
+        catalog_version=catalog_version,
         trade_date=trade_date,
+        catalog_trade_date=catalog_trade_date,
+        capacity=capacity,
+        bound_count=bound_count,
+        catalog_scope=catalog_scope,
+        coverage_complete=coverage_complete,
     )
 
 
@@ -214,10 +235,19 @@ def _response(
     *,
     status=CONTROL_OK,
     magic=CONTROL_MAGIC,
+    minor=CONTROL_MINOR,
     response_request_id=None,
     source_run_id=_SOURCE_RUN_ID,
+    source_catalog_digest=_CATALOG_DIGEST,
     source_session_epoch=_SOURCE_EPOCH,
+    source_catalog_generation=1,
+    source_catalog_version=_CATALOG_VERSION,
     source_trade_date=_TRADE_DATE,
+    source_catalog_trade_date=_TRADE_DATE,
+    source_capacity=_CATALOG_CAPACITY,
+    source_bound_count=_CATALOG_CAPACITY,
+    source_catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
+    source_coverage_complete=1,
     producer_state=LiveOrderEventDeltaProducerState.ACTIVE,
     event_run_id=_EVENT_RUN_ID,
     event_session_epoch=_EVENT_EPOCH,
@@ -225,6 +255,7 @@ def _response(
     event_header_flags=0,
     event_ring_capacity=_RING_CAPACITY,
     event_total_mapping_bytes=_MAPPING_BYTES,
+    reserved_event=0,
     reserved=None,
 ):
     request_fields = _REQUEST.unpack(request)
@@ -236,20 +267,29 @@ def _response(
     return _RESPONSE.pack(
         magic,
         1,
-        0,
+        minor,
         status,
         0,
         _RESPONSE.size,
         0,
         identifier,
         source_run_id,
+        source_catalog_digest,
         source_session_epoch,
+        source_catalog_generation,
+        source_catalog_version,
         source_trade_date,
-        int(producer_state),
+        source_catalog_trade_date,
+        source_capacity,
+        source_bound_count,
+        int(source_catalog_scope),
+        source_coverage_complete,
         event_run_id,
         event_session_epoch,
         event_trade_date,
+        int(producer_state),
         event_header_flags,
+        reserved_event,
         event_ring_capacity,
         event_total_mapping_bytes,
         23,
@@ -314,11 +354,16 @@ def _exchange(response_builder, attached_fds=()):
     )
 
 
-def _session_info(*, trade_date=_TRADE_DATE):
+def _session_info(
+    *,
+    trade_date=_TRADE_DATE,
+    catalog_digest=_CATALOG_DIGEST,
+    catalog_version=_CATALOG_VERSION,
+):
     return SessionInfo(
         run_id=_SOURCE_RUN_ID,
         layout_digest=b"L" * 32,
-        catalog_digest=b"C" * 32,
+        catalog_digest=catalog_digest,
         session_epoch=_SOURCE_EPOCH,
         catalog_generation=1,
         data_state_generation=1,
@@ -336,13 +381,15 @@ def _session_info(*, trade_date=_TRADE_DATE):
         flags=0,
         capacity=4,
         window_count=0,
-        catalog_scope=CatalogScope.OBSERVED_ONLY,
-        coverage_complete=False,
-        bound_count=0,
+        catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
+        coverage_complete=True,
+        bound_count=4,
         available_count=0,
         snapshot_available_count=0,
         tick_available_count=0,
         factor_eligible_count=0,
+        catalog_trade_date=trade_date,
+        catalog_version=catalog_version,
     )
 
 
@@ -370,8 +417,9 @@ class _FakeConnectedReader:
 
 class LiveOrderEventDeltaControlTests(unittest.TestCase):
     def test_ctypes_and_control_wire_sizes_match_native_abi(self):
-        self.assertEqual(_REQUEST.size, 80)
-        self.assertEqual(_RESPONSE.size, 192)
+        self.assertEqual(_REQUEST.size, 144)
+        self.assertEqual(_RESPONSE.size, 264)
+        self.assertEqual(CONTROL_MINOR, 1)
         self.assertEqual(ctypes.sizeof(_LiveSessionC), 64)
         self.assertEqual(ctypes.sizeof(_LiveReadResultC), 80)
         self.assertEqual(ctypes.sizeof(_DerivedEventRowC), 320)
@@ -435,12 +483,22 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
 
             request = _REQUEST.unpack(captured["request"])
             self.assertEqual(request[0], CONTROL_MAGIC)
-            self.assertEqual(request[1:7], (1, 0, 1, 0, 80, 0))
+            self.assertEqual(request[1:7], (1, 1, 1, 0, 144, 0))
             self.assertEqual(request[7], 1234)
             self.assertEqual(request[8], _SOURCE_RUN_ID)
-            self.assertEqual(request[9], _SOURCE_EPOCH)
-            self.assertEqual(request[10], _TRADE_DATE)
-            self.assertEqual(request[11:], (0, 0, 0))
+            self.assertEqual(request[9], _CATALOG_DIGEST)
+            self.assertEqual(request[10], _SOURCE_EPOCH)
+            self.assertEqual(request[11], 1)
+            self.assertEqual(request[12], _CATALOG_VERSION)
+            self.assertEqual(request[13:19], (
+                _TRADE_DATE,
+                _TRADE_DATE,
+                _CATALOG_CAPACITY,
+                _CATALOG_CAPACITY,
+                int(CatalogScope.DECLARED_DAILY_A_SHARE),
+                1,
+            ))
+            self.assertEqual(request[19:], (0, 0))
             self.assertEqual(len(captured["timeouts"]), 3)
             self.assertTrue(
                 all(
@@ -464,8 +522,16 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
     def test_success_requires_full_source_identity(self):
         variants = (
             {"source_run_id": b"X" * 16},
+            {"source_catalog_digest": b"X" * 32},
             {"source_session_epoch": _SOURCE_EPOCH + 1},
+            {"source_catalog_generation": 2},
+            {"source_catalog_version": _CATALOG_VERSION + 1},
             {"source_trade_date": _TRADE_DATE + 1},
+            {"source_catalog_trade_date": _TRADE_DATE + 1},
+            {"source_capacity": _CATALOG_CAPACITY + 1},
+            {"source_bound_count": _CATALOG_CAPACITY - 1},
+            {"source_catalog_scope": 1},
+            {"source_coverage_complete": 0},
         )
         for override in variants:
             with self.subTest(override=override):
@@ -694,6 +760,12 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
     def test_malformed_envelope_and_non_active_ring_are_rejected(self):
         for name, builder in (
             (
+                "old_minor",
+                lambda request: _response(
+                    request, minor=0
+                ),
+            ),
+            (
                 "magic",
                 lambda request: _response(
                     request, magic=b"NOT-EVT\0"
@@ -703,6 +775,12 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                 "request_id",
                 lambda request: _response(
                     request, response_request_id=999
+                ),
+            ),
+            (
+                "reserved_event",
+                lambda request: _response(
+                    request, reserved_event=1
                 ),
             ),
             (
@@ -826,6 +904,46 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                 client.open_live_order_events("/event.sock")
         self.assertTrue(connected.closed)
         client.close()
+
+    def test_client_helper_closes_reader_if_catalog_changes(self):
+        native = _ClientNative()
+        client = L2FlowClient(native, stale_after_ns=None)
+        connected = _FakeConnectedReader(
+            LiveOrderEventDeltaSourceSession.from_session_info(
+                native.current
+            )
+        )
+
+        def connector(_path, **_arguments):
+            native.current = _session_info(
+                catalog_digest=b"D" * 32
+            )
+            return connected
+
+        with mock.patch(
+            "l2flow_realtime.order_event_delta_control."
+            "open_live_order_events",
+            side_effect=connector,
+        ):
+            with self.assertRaises(StaleSessionError):
+                client.open_live_order_events("/event.sock")
+        self.assertTrue(connected.closed)
+        client.close()
+
+    def test_source_session_rejects_noncanonical_catalog_identity(self):
+        source = _source_session()
+        for override in (
+            {"catalog_digest": bytes(32)},
+            {"catalog_generation": 2},
+            {"catalog_version": 0},
+            {"catalog_trade_date": _TRADE_DATE + 1},
+            {"bound_count": _CATALOG_CAPACITY - 1},
+            {"catalog_scope": 1},
+            {"coverage_complete": False},
+        ):
+            with self.subTest(override=override):
+                with self.assertRaises(ValueError):
+                    replace(source, **override)
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 #include "l2flow/common/identity128.h"
 #include "l2flow/common/sha256.h"
 #include "l2flow/market/intraday_instrument_store_v1.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/market_types_v1.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/market/realtime_kline_v1.h"
 #include "l2flow/market/realtime_latest_read_model_v1.h"
 #include "l2flow/realtime/processing_progress_v2.h"
@@ -31,17 +31,17 @@ struct RealtimeSourceWatermarkV1 final {
     std::uint64_t sequence_exclusive = 0U;
 };
 
-// Immutable identity of one processed observed-universe generation. The
-// source sequence vector proves the process-owned input prefix, while the
-// exact CatalogSnapshot fixes the bound set and its observed-only semantics.
-// It never claims that the exchange's authoritative universe is complete.
+// Immutable identity of one frozen daily-catalog generation. The source
+// sequence vector proves the process-owned input prefix, while the exact
+// runtime-state snapshot fixes catalog identity and data availability. Its
+// completeness claim is limited to the declared subscribed A-share scope.
 struct RealtimeHistoryWatermarkV1 final {
     l2flow::common::Identity128 run_id{};
     std::uint64_t generation = 0U;
     std::uint32_t trade_date = 0U;
     std::uint64_t ingress_sequence_exclusive = 0U;
     std::uint64_t recv_monotonic_cut_ns = 0U;
-    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+    std::shared_ptr<const DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
     l2flow::realtime::ProcessingProgressV2 processing_progress{};
     std::array<RealtimeSourceWatermarkV1,
@@ -74,7 +74,7 @@ BuildRealtimeHistoryWatermarkV1(
     std::uint32_t trade_date,
     std::uint64_t ingress_sequence_exclusive,
     std::uint64_t recv_monotonic_cut_ns,
-    std::shared_ptr<const ObservedInstrumentCatalogSnapshotV2>
+    std::shared_ptr<const DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot,
     l2flow::realtime::ProcessingProgressV2 processing_progress,
     std::span<const RealtimeSourceWatermarkV1,
@@ -311,12 +311,27 @@ using RealtimeHistoryAppendObserverV1 = void (*)(
     const RealtimeHistoryAppendObservationV1& observation) noexcept;
 
 // Called only after Store, KLine, latest projection, required external
-// projection, and directory availability have all succeeded. The callback
-// advances the global contiguous applied prefix; it must be nonblocking,
-// allocation-free, and noexcept.
+// projection, and runtime availability have all succeeded. When timing is
+// enabled, external_publication_complete_monotonic_ns is sampled immediately
+// after the required applied_record_sink returns success. Store-append timing
+// is carried by RealtimeHistoryAppendObservationV1 at its exact earlier
+// boundary. applied_complete_monotonic_ns is sampled after the dense runtime
+// state update. The callback advances the global contiguous applied prefix;
+// it must be nonblocking, allocation-free, and noexcept.
+struct RealtimeHistoryAppliedObservationV2 final {
+    std::uint64_t ingress_sequence = 0U;
+    std::int64_t recv_monotonic_ns = 0;
+    std::uint64_t external_publication_complete_monotonic_ns = 0U;
+    std::uint64_t applied_complete_monotonic_ns = 0U;
+    std::uint8_t source_slot = 0U;
+    bool external_publication_present = false;
+    bool external_publication_clock_valid = false;
+    bool applied_complete_clock_valid = false;
+};
+
 using RealtimeHistoryAppliedObserverV2 = bool (*)(
     void* context,
-    std::uint64_t ingress_sequence) noexcept;
+    const RealtimeHistoryAppliedObservationV2& observation) noexcept;
 
 struct RealtimeHistoryRuntimeConfigV1 final {
     std::array<std::uint32_t, kRealtimeHistorySourceCountV1>
@@ -325,9 +340,9 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     // Maximum in-flight record handoffs per source×worker. The command ring
     // reserves one additional internal slot for the generation fence.
     std::size_t queue_capacity_per_source_worker = 0U;
-    // Borrowed stable directory. It owns all capacity slots for the complete
-    // runtime lifetime; Store and latest reads use the same fixed ordinals.
-    ObservedInstrumentDirectoryV2* directory = nullptr;
+    // Borrowed dense runtime state. Its immutable identity covers every daily
+    // catalog row; Store and latest reads use the same fixed ordinals.
+    InstrumentRuntimeStateV2* runtime_state = nullptr;
     IntradayInstrumentStoreConfigV1 intraday_store{};
     // Empty windows disable KLine aggregation. When enabled, trade_date must
     // be the server/operator date used by the decoder. maximum_bars may be
@@ -337,6 +352,7 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     std::shared_ptr<RealtimeAppliedRecordSinkV1> applied_record_sink;
     RealtimeHistoryAppendObserverV1 append_observer = nullptr;
     void* append_observer_context = nullptr;
+    bool measure_applied_latency = false;
     RealtimeHistoryAppliedObserverV2 applied_observer = nullptr;
     void* applied_observer_context = nullptr;
 };
@@ -393,7 +409,7 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
 // a second cross-source sequence authority. Internally there is one SPSC queue
 // per source×worker. An instrument is permanently owned by
 // ordinal % worker_count, and IntradayInstrumentStoreV1 is the only retained
-// record container. The observed directory referenced by config must outlive
+// record container. The runtime state referenced by config must outlive
 // the runtime and every snapshot/generation derived from it.
 class RealtimeHistoryRuntimeV1 final {
 public:

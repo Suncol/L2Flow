@@ -15,6 +15,10 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Optional
 
+from ._generation import (
+    DailyCatalogSessionIdentity,
+    validate_same_session,
+)
 from ._history_worker_protocol import (
     DEFAULT_RESULT_COLUMNS,
     NO_SLOT,
@@ -809,6 +813,10 @@ class InstrumentTickDeltaResultCursor:
         checkpoint = InstrumentTickDeltaCheckpoint.from_wire(
             header.checkpoint_wire
         )
+        validate_same_session(
+            checkpoint.endpoint,
+            expected=self._worker.expected_session,
+        )
         checkpoint.ensure_session(
             run_id=self._worker.session_identity.run_id,
             session_epoch=(
@@ -1021,9 +1029,7 @@ class InstrumentTickDeltaWorker:
         "_result_columns",
         "_process",
         "_pid",
-        "_session_identity",
-        "_trade_date",
-        "_capacity",
+        "_expected_session",
         "_timeout",
         "_active",
         "_next_transfer_sequence",
@@ -1042,9 +1048,7 @@ class InstrumentTickDeltaWorker:
         result_column_mask: int,
         process: subprocess.Popen,
         pid: int,
-        session_identity: SessionIdentity,
-        trade_date: int,
-        capacity: int,
+        expected_session: DailyCatalogSessionIdentity,
         timeout: Optional[float],
     ) -> None:
         self._channel = channel
@@ -1054,9 +1058,7 @@ class InstrumentTickDeltaWorker:
         self._result_columns = column_names(result_column_mask)
         self._process = process
         self._pid = pid
-        self._session_identity = session_identity
-        self._trade_date = trade_date
-        self._capacity = capacity
+        self._expected_session = expected_session
         self._timeout = timeout
         self._active: Optional[
             InstrumentTickDeltaResultCursor
@@ -1081,15 +1083,19 @@ class InstrumentTickDeltaWorker:
 
     @property
     def session_identity(self) -> SessionIdentity:
-        return self._session_identity
+        return self._expected_session.session_identity
 
     @property
     def trade_date(self) -> int:
-        return self._trade_date
+        return self._expected_session.trade_date
 
     @property
     def capacity(self) -> int:
-        return self._capacity
+        return self._expected_session.capacity
+
+    @property
+    def expected_session(self) -> DailyCatalogSessionIdentity:
+        return self._expected_session
 
     @property
     def ring_slots(self) -> int:
@@ -1168,10 +1174,14 @@ class InstrumentTickDeltaWorker:
                     "base_checkpoint must be a verified V2 checkpoint"
                 )
             base_checkpoint.ensure_session(
-                run_id=self._session_identity.run_id,
-                session_epoch=self._session_identity.session_epoch,
-                trade_date=self._trade_date,
-                capacity=self._capacity,
+                run_id=self.session_identity.run_id,
+                session_epoch=self.session_identity.session_epoch,
+                trade_date=self.trade_date,
+                capacity=self.capacity,
+            )
+            validate_same_session(
+                base_checkpoint.endpoint,
+                expected=self._expected_session,
             )
             if base_checkpoint.instrument_id != instrument_id:
                 raise ValueError(
@@ -1204,6 +1214,7 @@ class InstrumentTickDeltaWorker:
             )
             response = self._recv()
             if response.opcode is WorkerOpcode.ERROR:
+                self._fail()
                 _raise_worker_error(response)
             if (
                 response.opcode is not WorkerOpcode.OPENED
@@ -1324,28 +1335,19 @@ class InstrumentTickDeltaWorker:
 def _start_instrument_tick_delta_worker(
     control_socket_path,
     *,
-    session_identity: SessionIdentity,
-    trade_date: int,
-    capacity: int,
+    expected_session: DailyCatalogSessionIdentity,
     result_columns: Sequence[str] = DEFAULT_RESULT_COLUMNS,
     ring_slots: int = 4,
     result_batch_records: int = 4096,
     timeout: Optional[float] = 1.0,
 ) -> InstrumentTickDeltaWorker:
     path = validate_socket_path(control_socket_path)
-    if not isinstance(session_identity, SessionIdentity):
-        raise TypeError("session_identity must be SessionIdentity")
-    if (
-        not isinstance(trade_date, int)
-        or isinstance(trade_date, bool)
-        or trade_date <= 0
-        or trade_date > 0xFFFFFFFF
-        or not isinstance(capacity, int)
-        or isinstance(capacity, bool)
-        or capacity <= 0
-        or capacity > 0xFFFFFFFF
+    if not isinstance(
+        expected_session, DailyCatalogSessionIdentity
     ):
-        raise ValueError("worker trade_date/capacity must be uint32")
+        raise TypeError(
+            "expected_session must be DailyCatalogSessionIdentity"
+        )
     timeout = validate_timeout(timeout)
     mask = column_mask(result_columns)
     layout = make_ring_layout(ring_slots, result_batch_records)
@@ -1429,10 +1431,7 @@ def _start_instrument_tick_delta_worker(
                 WorkerOpcode.INIT,
                 request_id=request_id,
                 payload=pack_init_payload(
-                    run_id=session_identity.run_id,
-                    session_epoch=session_identity.session_epoch,
-                    trade_date=trade_date,
-                    capacity=capacity,
+                    expected_session=expected_session,
                     timeout_ns=_timeout_ns(timeout),
                     result_column_mask=mask,
                     control_socket_path=path,
@@ -1468,9 +1467,7 @@ def _start_instrument_tick_delta_worker(
             result_column_mask=mask,
             process=process,
             pid=process.pid,
-            session_identity=session_identity,
-            trade_date=trade_date,
-            capacity=capacity,
+            expected_session=expected_session,
             timeout=timeout,
         )
         parent_channel = None

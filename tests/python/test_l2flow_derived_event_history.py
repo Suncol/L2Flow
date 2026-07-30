@@ -8,8 +8,10 @@ from l2flow_realtime.instrument_derived_event_history import (
     _BUFFER_TOO_SMALL,
     _DerivedCheckpointC,
     _DerivedEventRowC,
+    _session_to_c,
 )
 from test_l2flow_history_v2 import _target_checkpoint
+from test_l2flow_realtime import session_info
 
 
 def _set_size(pointer, value):
@@ -170,6 +172,29 @@ def _reader(library):
 
 
 class DerivedEventHistoryTests(unittest.TestCase):
+    def test_session_bridge_copies_complete_daily_catalog_identity(self):
+        session = session_info()
+        value = _session_to_c(session)
+        self.assertEqual(bytes(value.run_id), session.run_id)
+        self.assertEqual(
+            bytes(value.catalog_digest), session.catalog_digest
+        )
+        self.assertEqual(
+            value.catalog_generation, session.catalog_generation
+        )
+        self.assertEqual(value.bound_count, session.bound_count)
+        self.assertEqual(
+            value.catalog_scope, int(session.catalog_scope)
+        )
+        self.assertEqual(value.coverage_complete, 1)
+        self.assertEqual(
+            value.catalog_trade_date, session.catalog_trade_date
+        )
+        self.assertEqual(
+            value.catalog_version, session.catalog_version
+        )
+        self.assertEqual(value.reserved_catalog, 0)
+
     def test_full_update_empty_and_buffer_retry(self):
         library = _FakeDerivedLibrary()
         reader = _reader(library)

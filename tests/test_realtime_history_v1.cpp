@@ -1,5 +1,6 @@
 #include "l2flow/market/realtime_history_v1.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/market/daily_instrument_catalog_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 
 #include <array>
 #include <chrono>
@@ -20,53 +21,70 @@ namespace {
 namespace common = l2flow::common;
 namespace market = l2flow::market;
 
+constexpr std::uint32_t kTradeDate = 20260724U;
+constexpr std::uint64_t kSessionEpoch = 7U;
+constexpr std::uint64_t kCatalogVersion = 17U;
+
 std::vector<std::byte> Bytes(std::string_view text) {
     const auto bytes = std::as_bytes(std::span(text));
     return {bytes.begin(), bytes.end()};
 }
 
-struct ObservedDirectoryFixture final {
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
-    std::array<market::ObservedInstrumentBindResultV2, 3U> bindings{};
+struct DailyRuntimeFixture final {
+    std::shared_ptr<const market::DailyInstrumentCatalogV2> catalog;
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+    std::array<market::InstrumentRuntimeEntryViewV2, 4U> entries{};
 };
 
-std::unique_ptr<ObservedDirectoryFixture> MakeDirectory() {
-    auto fixture = std::make_unique<ObservedDirectoryFixture>();
-    market::ObservedInstrumentDirectoryConfigV2 config{};
-    config.capacity = 4U;
-    config.session_epoch = 7U;
-    if (market::ObservedInstrumentDirectoryV2::Create(
-            config, &fixture->directory) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
-        fixture->directory == nullptr) {
-        return nullptr;
-    }
-
-    constexpr std::array<std::string_view, 3U> security_ids{
-        "600001", "600002", "600009"};
-    const market::ObservedInstrumentMetadataV2 metadata{
+std::unique_ptr<DailyRuntimeFixture> MakeDailyRuntimeFixture() {
+    auto fixture = std::make_unique<DailyRuntimeFixture>();
+    constexpr std::array<std::string_view, 4U> security_ids{
+        "600001", "600002", "600009", "600010"};
+    const market::InstrumentMetadataV2 metadata{
         market::QuantityUnitV1::kShare,
         market::SecurityTypeV1::kEquity,
         market::AssetScopeV1::kDocumentedCore};
-    for (std::size_t index = 0U;
-         index < fixture->bindings.size();
+    std::array<market::DailyInstrumentSourceEntryV2, 4U> source{};
+    for (std::size_t index = 0U; index < source.size(); ++index) {
+        source[index].key.market = market::MarketV1::kShanghai;
+        source[index].key.security_id_source = {};
+        source[index].key.security_id = Bytes(security_ids[index]);
+        source[index].metadata = metadata;
+    }
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = kTradeDate;
+    config.catalog_version = kCatalogVersion;
+    config.session_epoch = kSessionEpoch;
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    if (market::DailyInstrumentCatalogV2::Create(
+            config, source, &catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        catalog == nullptr) {
+        return nullptr;
+    }
+    fixture->catalog =
+        std::shared_ptr<const market::DailyInstrumentCatalogV2>(
+            std::move(catalog));
+    if (market::InstrumentRuntimeStateV2::Create(
+            *fixture->catalog, &fixture->runtime_state) !=
+            market::InstrumentRuntimeStateErrorV2::kNone ||
+        fixture->runtime_state == nullptr) {
+        return nullptr;
+    }
+    for (std::size_t index = 0U; index < fixture->entries.size();
          ++index) {
-        market::InstrumentKeyV1 key{};
-        key.market = market::MarketV1::kShanghai;
-        key.security_id_source = Bytes("101");
-        key.security_id = Bytes(security_ids[index]);
-        market::ObservedInstrumentBindResultV2& binding =
-            fixture->bindings[index];
-        if (fixture->directory->BindOrGet(
-                key,
-                metadata,
-                static_cast<std::uint64_t>(index) + 1U,
-                &binding) !=
-                market::ObservedInstrumentDirectoryErrorV2::kNone ||
-            !binding.newly_bound || !binding.entry.bound() ||
-            binding.entry.instrument_id !=
+        market::InstrumentRuntimeEntryViewV2& entry =
+            fixture->entries[index];
+        if (fixture->runtime_state->LookupById(
+                static_cast<std::uint32_t>(index) + 1U,
+                &entry) !=
+                market::InstrumentRuntimeStateErrorV2::kNone ||
+            !entry.bound() ||
+            entry.instrument_id !=
                 static_cast<std::uint32_t>(index) + 1U ||
-            binding.entry.ordinal != index) {
+            entry.ordinal != index) {
             return nullptr;
         }
     }
@@ -74,28 +92,28 @@ std::unique_ptr<ObservedDirectoryFixture> MakeDirectory() {
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
-    const market::ObservedInstrumentBindResultV2& binding,
+    const market::InstrumentRuntimeEntryViewV2& instrument,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::int64_t price,
     std::uint64_t tick_stream_sequence = 0U) {
-    if (!binding.entry.bound()) {
+    if (!instrument.bound()) {
         return std::nullopt;
     }
     market::ShanghaiSnapshotV1 snapshot{};
     snapshot.common.kind = market::MarketEventKindV1::kShanghaiSnapshot;
     snapshot.common.market = market::MarketV1::kShanghai;
     snapshot.common.origin.source_stream_id = 11U;
-    snapshot.common.origin.trade_date = 20260724U;
+    snapshot.common.origin.trade_date = kTradeDate;
     snapshot.common.origin.source_sequence = source_sequence;
-    snapshot.common.instrument_id = binding.entry.instrument_id;
-    snapshot.common.ordinal = binding.entry.ordinal;
+    snapshot.common.instrument_id = instrument.instrument_id;
+    snapshot.common.ordinal = instrument.ordinal;
     snapshot.common.quantity_unit =
-        binding.entry.metadata.quantity_unit;
+        instrument.metadata.quantity_unit;
     snapshot.common.security_type =
-        binding.entry.metadata.security_type;
+        instrument.metadata.security_type;
     snapshot.common.asset_scope =
-        binding.entry.metadata.asset_scope;
+        instrument.metadata.asset_scope;
     snapshot.last_price.valid = true;
     snapshot.last_price.raw = price;
     snapshot.last_price.normalized_p6 = price;
@@ -110,28 +128,28 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeRecord(
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeTickRecord(
-    const market::ObservedInstrumentBindResultV2& binding,
+    const market::InstrumentRuntimeEntryViewV2& instrument,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::int64_t price,
     std::uint64_t tick_stream_sequence) {
-    if (!binding.entry.bound()) {
+    if (!instrument.bound()) {
         return std::nullopt;
     }
     market::ShanghaiTickV1 tick{};
     tick.common.kind = market::MarketEventKindV1::kShanghaiTick;
     tick.common.market = market::MarketV1::kShanghai;
     tick.common.origin.source_stream_id = 12U;
-    tick.common.origin.trade_date = 20260724U;
+    tick.common.origin.trade_date = kTradeDate;
     tick.common.origin.source_sequence = source_sequence;
-    tick.common.instrument_id = binding.entry.instrument_id;
-    tick.common.ordinal = binding.entry.ordinal;
+    tick.common.instrument_id = instrument.instrument_id;
+    tick.common.ordinal = instrument.ordinal;
     tick.common.quantity_unit =
-        binding.entry.metadata.quantity_unit;
+        instrument.metadata.quantity_unit;
     tick.common.security_type =
-        binding.entry.metadata.security_type;
+        instrument.metadata.security_type;
     tick.common.asset_scope =
-        binding.entry.metadata.asset_scope;
+        instrument.metadata.asset_scope;
     tick.fields.price.valid = true;
     tick.fields.price.raw = price;
     tick.fields.price.normalized_p6 = price;
@@ -161,7 +179,7 @@ constexpr std::uint64_t TimeSinceMidnightNs(
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
-    const market::ObservedInstrumentBindResultV2& binding,
+    const market::InstrumentRuntimeEntryViewV2& instrument,
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
     std::uint32_t raw_exchange_time,
@@ -170,18 +188,18 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
     std::int64_t quantity,
     std::int64_t recv_realtime_ns,
     std::int64_t recv_monotonic_ns) {
-    if (!binding.entry.bound()) {
+    if (!instrument.bound()) {
         return std::nullopt;
     }
     market::ShanghaiTickV1 tick{};
     tick.common.kind = market::MarketEventKindV1::kShanghaiTick;
     tick.common.market = market::MarketV1::kShanghai;
     tick.common.origin.source_stream_id = 12U;
-    tick.common.origin.trade_date = 20260724U;
+    tick.common.origin.trade_date = kTradeDate;
     tick.common.origin.source_sequence = source_sequence;
     tick.common.origin.recv_realtime_ns = recv_realtime_ns;
     tick.common.origin.recv_monotonic_ns = recv_monotonic_ns;
-    tick.common.instrument_id = binding.entry.instrument_id;
+    tick.common.instrument_id = instrument.instrument_id;
     if (exchange_time_ns_since_midnight >
             static_cast<std::uint64_t>(
                 std::numeric_limits<std::int64_t>::max()) ||
@@ -189,13 +207,13 @@ std::optional<market::RealtimeHistoryEventInputV1> MakeKLineTradeRecord(
             market::kKLineNanosecondsPerDayV1) {
         return std::nullopt;
     }
-    tick.common.ordinal = binding.entry.ordinal;
+    tick.common.ordinal = instrument.ordinal;
     tick.common.quantity_unit =
-        binding.entry.metadata.quantity_unit;
+        instrument.metadata.quantity_unit;
     tick.common.security_type =
-        binding.entry.metadata.security_type;
+        instrument.metadata.security_type;
     tick.common.asset_scope =
-        binding.entry.metadata.asset_scope;
+        instrument.metadata.asset_scope;
     tick.common.exchange_time.raw_hhmmssmmm = raw_exchange_time;
     tick.common.exchange_time.nanoseconds_since_midnight =
         exchange_time_ns_since_midnight;
@@ -235,7 +253,7 @@ market::RealtimeHistorySubmitErrorV1 Submit(
 }
 
 market::RealtimeHistoryWatermarkV1 MakeWatermark(
-    const market::ObservedInstrumentDirectoryV2& directory,
+    const market::InstrumentRuntimeStateV2& runtime_state,
     std::uint64_t generation,
     std::uint64_t ingress_exclusive,
     std::uint64_t sh_snapshot_exclusive,
@@ -244,10 +262,10 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
         return {};
     }
     std::shared_ptr<
-        const market::ObservedInstrumentCatalogSnapshotV2>
+        const market::DailyInstrumentCatalogSnapshotV2>
         catalog_snapshot;
-    if (directory.AcquireSnapshot(&catalog_snapshot) !=
-            market::ObservedInstrumentDirectoryErrorV2::kNone ||
+    if (runtime_state.AcquireSnapshot(&catalog_snapshot) !=
+            market::InstrumentRuntimeStateErrorV2::kNone ||
         catalog_snapshot == nullptr) {
         return {};
     }
@@ -267,7 +285,7 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
     if (market::BuildRealtimeHistoryWatermarkV1(
             run_id,
             generation,
-            20260724U,
+            kTradeDate,
             ingress_exclusive,
             1000U + generation,
             std::move(catalog_snapshot),
@@ -380,17 +398,38 @@ bool Expect(bool condition, std::string_view message) {
 }  // namespace
 
 int main() {
-    std::unique_ptr<ObservedDirectoryFixture> fixture =
-        MakeDirectory();
+    std::unique_ptr<DailyRuntimeFixture> fixture =
+        MakeDailyRuntimeFixture();
     if (!Expect(
-            fixture != nullptr && fixture->directory != nullptr,
-            "observed directory creation and ordered binding")) {
+            fixture != nullptr && fixture->catalog != nullptr &&
+                fixture->runtime_state != nullptr,
+            "frozen daily catalog and runtime-state creation")) {
         return 1;
     }
-    const market::ObservedInstrumentBindResultV2& instrument1 =
-        fixture->bindings[0U];
-    const market::ObservedInstrumentBindResultV2& instrument2 =
-        fixture->bindings[1U];
+    const market::InstrumentRuntimeEntryViewV2& instrument1 =
+        fixture->entries[0U];
+    const market::InstrumentRuntimeEntryViewV2& instrument2 =
+        fixture->entries[1U];
+
+    std::shared_ptr<const market::DailyInstrumentCatalogSnapshotV2>
+        initial_catalog_snapshot;
+    if (!Expect(
+            fixture->runtime_state->AcquireSnapshot(
+                &initial_catalog_snapshot) ==
+                    market::InstrumentRuntimeStateErrorV2::kNone &&
+                initial_catalog_snapshot != nullptr &&
+                initial_catalog_snapshot->catalog_scope() ==
+                    market::InstrumentCatalogScopeV2::
+                        kDeclaredDailyAShare &&
+                initial_catalog_snapshot->coverage_complete() &&
+                initial_catalog_snapshot->catalog_generation() == 1U &&
+                initial_catalog_snapshot->bound_count() ==
+                    initial_catalog_snapshot->capacity() &&
+                initial_catalog_snapshot->bound_count() ==
+                    fixture->catalog->instrument_count(),
+            "runtime snapshot is the complete generation-1 daily catalog")) {
+        return 1;
+    }
 
     market::RealtimeHistoryRuntimeConfigV1 config{};
     config.source_stream_ids = {11U, 12U, 13U, 14U};
@@ -402,7 +441,7 @@ int main() {
     config.intraday_store.maximum_session_accounted_bytes = 1U << 20U;
     config.intraday_store.maximum_records_per_batch = 4U;
     config.intraday_store.coverage_from_open = true;
-    config.directory = fixture->directory.get();
+    config.runtime_state = fixture->runtime_state.get();
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
     if (!Expect(
             market::RealtimeHistoryRuntimeV1::Create(config, &runtime) ==
@@ -417,14 +456,16 @@ int main() {
                  "instrument 2 ordinal has fixed worker 1");
     ok &= Expect(runtime->WorkerForInstrument(3U) == 0U,
                  "instrument 3 ordinal has fixed worker 0");
+    ok &= Expect(runtime->WorkerForInstrument(4U) == 1U,
+                 "instrument 4 ordinal has fixed worker 1");
     ok &= Expect(
         MakeWatermark(
-            *fixture->directory, 99U, 4U, 2U, 2U)
+            *fixture->runtime_state, 99U, 4U, 2U, 2U)
                 .generation == 0U,
         "watermark rejects contradictory global/source prefix counts");
     ok &= Expect(
         MakeWatermark(
-            *fixture->directory,
+            *fixture->runtime_state,
             99U,
             std::numeric_limits<std::uint64_t>::max(),
             std::numeric_limits<std::uint64_t>::max(),
@@ -454,7 +495,7 @@ int main() {
         "snapshot/tick stream sequence consistency is validated");
 
     const auto generation1 = MakeWatermark(
-        *fixture->directory, 1U, 4U, 3U, 2U);
+        *fixture->runtime_state, 1U, 4U, 3U, 2U);
     ok &= Expect(
         runtime->BeginGeneration(generation1) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
@@ -520,9 +561,9 @@ int main() {
             runtime->AcquireLatestGeneration() == nullptr,
         "latest snapshot/tick are visible after apply without waiting for a generation");
 
-    const std::array<std::uint32_t, 5U> live_ids{
-        1U, 2U, 3U, 4U, 0U};
-    std::array<market::RealtimeLatestRecordViewV1, 5U>
+    const std::array<std::uint32_t, 6U> live_ids{
+        1U, 2U, 3U, 4U, 5U, 0U};
+    std::array<market::RealtimeLatestRecordViewV1, 6U>
         live_snapshots{};
     ok &= Expect(
         runtime->GetLatestSnapshots(live_ids, live_snapshots) ==
@@ -536,11 +577,14 @@ int main() {
                     kBoundNoTypeData &&
             live_snapshots[3U].status ==
                 market::RealtimeLatestRecordStatusV1::
-                    kUnbound &&
+                    kBoundNoTypeData &&
             live_snapshots[4U].status ==
                 market::RealtimeLatestRecordStatusV1::
+                    kInvalidInstrumentId &&
+            live_snapshots[5U].status ==
+                market::RealtimeLatestRecordStatusV1::
                     kInvalidInstrumentId,
-        "batch latest snapshots distinguish bound-no-data and unbound slots");
+        "batch latest snapshots expose all daily identities as bound");
 
     // Source 0 is fenced first. Its next record is legal realtime work, but
     // every worker must park it until all four generation-1 fences arrive.
@@ -568,10 +612,11 @@ int main() {
             1U, std::chrono::seconds(2), &first) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "wait generation 1");
-    ok &= Expect(first != nullptr && first->instrument_count() == 3U,
-                 "generation 1 has exact bound observed universe");
+    ok &= Expect(first != nullptr && first->instrument_count() == 4U,
+                 "generation 1 has the complete frozen daily catalog");
     if (first != nullptr) {
-        const std::array<std::uint32_t, 3U> expected_ids{1U, 2U, 3U};
+        const std::array<std::uint32_t, 4U> expected_ids{
+            1U, 2U, 3U, 4U};
         for (std::size_t ordinal = 0U; ordinal < expected_ids.size();
              ++ordinal) {
             market::IntradayInstrumentSummaryV1 ordinal_summary{};
@@ -579,7 +624,7 @@ int main() {
                 first->SummaryAt(ordinal, &ordinal_summary) ==
                         market::IntradayInstrumentStoreQueryErrorV1::kNone &&
                     ordinal_summary.instrument_id == expected_ids[ordinal],
-                "SummaryAt exposes the capture-ordered bound universe");
+                "SummaryAt exposes the sorted dense daily catalog");
         }
         market::IntradayInstrumentSummaryV1 first_summary{};
         ok &= Expect(
@@ -611,7 +656,7 @@ int main() {
     }
 
     const auto generation2 = MakeWatermark(
-        *fixture->directory, 2U, 5U, 4U, 2U);
+        *fixture->runtime_state, 2U, 5U, 4U, 2U);
     ok &= Expect(
         runtime->BeginGeneration(generation2) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
@@ -672,14 +717,14 @@ int main() {
         1U << 20U;
     kline_config.intraday_store.maximum_records_per_batch = 4U;
     kline_config.intraday_store.coverage_from_open = true;
-    kline_config.kline.trade_date = 20260724U;
+    kline_config.kline.trade_date = kTradeDate;
     kline_config.kline.windows = {
         {1U, market::kKLineNanosecondsPerSecondV1},
         {2U, 5U * market::kKLineNanosecondsPerSecondV1},
     };
     // Leave maximum_bars at zero so history derives the bounded capacity
     // from its retained-record limit and the two configured windows.
-    kline_config.directory = fixture->directory.get();
+    kline_config.runtime_state = fixture->runtime_state.get();
 
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> kline_runtime;
     ok &= Expect(
@@ -715,7 +760,7 @@ int main() {
 
     const auto kline_generation1_watermark =
         MakeWatermark(
-            *fixture->directory, 1U, 6U, 1U, 6U);
+            *fixture->runtime_state, 1U, 6U, 1U, 6U);
     ok &= Expect(
         kline_runtime->BeginGeneration(
             kline_generation1_watermark) ==
@@ -936,7 +981,7 @@ int main() {
 
     const auto kline_generation2_watermark =
         MakeWatermark(
-            *fixture->directory, 2U, 7U, 1U, 7U);
+            *fixture->runtime_state, 2U, 7U, 1U, 7U);
     ok &= Expect(
         kline_runtime->BeginGeneration(
             kline_generation2_watermark) ==

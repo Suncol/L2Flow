@@ -8,7 +8,7 @@
 
 namespace l2flow::market {
 
-class ObservedInstrumentDirectoryV2;
+class InstrumentRuntimeStateV2;
 class RealtimeHistoryRecordV1;
 
 // The live read model deliberately has only two record classes.  "Tick"
@@ -79,14 +79,14 @@ struct RealtimeLatestRecordViewV1 final {
 
 // Allocation occurs only in Create.  PublishApplied is invoked by the one
 // permanent instrument owner after the matching Store/KLine applied boundary;
-// concurrent publishers for one directory ordinal are outside this contract.
+// concurrent publishers for one catalog ordinal are outside this contract.
 // Queries are read-only, allocation-free acquire loads.  A batch is coherent
 // per returned row, not a cross-instrument generation cut; consumers needing
 // one exact market-wide prefix must use IntradayInstrumentStoreGenerationV1.
 // This is a latest-point cache: a slower polling consumer is not guaranteed to
 // observe every intermediate record.
 //
-// The stable directory must outlive this object. The Store session must
+// The runtime state must outlive this object. The Store session must
 // outlive this object and every borrowed record returned by it.
 class RealtimeLatestReadModelV1 final {
 public:
@@ -101,7 +101,7 @@ public:
     ~RealtimeLatestReadModelV1();
 
     [[nodiscard]] static RealtimeLatestReadModelCreateErrorV1 Create(
-        const ObservedInstrumentDirectoryV2* directory,
+        const InstrumentRuntimeStateV2* runtime_state,
         std::unique_ptr<RealtimeLatestReadModelV1>* output) noexcept;
 
     // An older ingress sequence is ignored defensively: kNone is returned
@@ -118,9 +118,9 @@ public:
         std::uint32_t instrument_id,
         RealtimeLatestRecordViewV1* output) const noexcept;
 
-    // output.size() must equal instrument_ids.size().  Results preserve input
-    // order and report unknown/unobserved instruments independently, so a
-    // partially available batch is still kNone.
+    // output.size() must equal instrument_ids.size(). Results preserve input
+    // order and report out-of-catalog or unavailable instruments
+    // independently, so a partially available batch is still kNone.
     [[nodiscard]] RealtimeLatestQueryErrorV1 GetLatestRecords(
         RealtimeLatestRecordKindV1 kind,
         std::span<const std::uint32_t> instrument_ids,

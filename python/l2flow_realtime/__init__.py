@@ -1,4 +1,4 @@
-"""Observed-universe, read-only Python client for L2Flow Wire V2."""
+"""Daily-catalog, read-only Python client for L2Flow Wire V2."""
 
 from .client import DEFAULT_STALE_AFTER_NS, L2FlowClient
 from .checkpoint import InstrumentTickDeltaCheckpoint

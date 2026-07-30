@@ -11,6 +11,7 @@ from enum import IntEnum
 from typing import Iterator, Optional, Union
 
 from ._generation import (
+    DailyCatalogSessionIdentity,
     GenerationEndpoint,
     parse_generation_endpoint,
     validate_same_session,
@@ -441,6 +442,7 @@ class InstrumentTickDeltaSession:
     __slots__ = (
         "_channel",
         "_generation",
+        "_expected_session",
         "_session_token",
         "_closed",
         "_active_cursor",
@@ -451,10 +453,12 @@ class InstrumentTickDeltaSession:
         self,
         channel: socket.socket,
         endpoint: GenerationEndpoint,
+        expected_session: DailyCatalogSessionIdentity,
         session_token: int,
     ) -> None:
         self._channel = channel
         self._generation = InstrumentTickDeltaGeneration(endpoint)
+        self._expected_session = expected_session
         if (
             not isinstance(session_token, int)
             or isinstance(session_token, bool)
@@ -525,6 +529,10 @@ class InstrumentTickDeltaSession:
                 ),
                 trade_date=self._generation.endpoint.trade_date,
                 capacity=self._generation.endpoint.capacity,
+            )
+            validate_same_session(
+                base_checkpoint.endpoint,
+                expected=self._expected_session,
             )
             if base_checkpoint.instrument_id != instrument_id:
                 raise ValueError(
@@ -1329,10 +1337,7 @@ def _open_instrument_tick_delta_session(
     control_socket_path: Union[str, bytes],
     *,
     expected_generation: int,
-    expected_run_id: bytes,
-    expected_session_epoch: int,
-    expected_trade_date: int,
-    expected_capacity: int,
+    expected_session: DailyCatalogSessionIdentity,
     timeout: Optional[float],
 ) -> InstrumentTickDeltaSession:
     path = validate_socket_path(control_socket_path)
@@ -1343,6 +1348,12 @@ def _open_instrument_tick_delta_session(
         or expected_generation > UINT64_MAX
     ):
         raise ValueError("expected_generation must be a uint64")
+    if not isinstance(
+        expected_session, DailyCatalogSessionIdentity
+    ):
+        raise TypeError(
+            "expected_session must be DailyCatalogSessionIdentity"
+        )
     timeout = validate_timeout(timeout)
     channel = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     channel.settimeout(timeout)
@@ -1403,12 +1414,11 @@ def _open_instrument_tick_delta_session(
                 )
             validate_same_session(
                 endpoint,
-                run_id=expected_run_id,
-                session_epoch=expected_session_epoch,
-                trade_date=expected_trade_date,
-                capacity=expected_capacity,
+                expected=expected_session,
             )
-        return InstrumentTickDeltaSession(channel, endpoint, token)
+        return InstrumentTickDeltaSession(
+            channel, endpoint, expected_session, token
+        )
     except BaseException:
         channel.close()
         raise

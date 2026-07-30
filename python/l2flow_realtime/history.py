@@ -1,4 +1,4 @@
-"""Wire V2 complete-history cursor for one observed instrument.
+"""Wire V2 complete-history cursor for one daily-catalog instrument.
 
 The cursor owns a stateful ``SOCK_SEQPACKET`` connection.  Each nonterminal
 READ copies one independently sealed memfd into client-owned column blocks.
@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Iterator, Mapping, Optional, Union
 
 from ._generation import (
+    DailyCatalogSessionIdentity,
     GenerationEndpoint,
     parse_generation_endpoint,
     validate_same_session,
@@ -287,7 +288,7 @@ def _parse_generation(
         raise WireFormatError("history generation instrument ID is invalid")
     if instrument_id > endpoint.bound_count:
         raise WireFormatError(
-            "history instrument is outside the observed bound prefix"
+            "history instrument is outside the frozen daily catalog"
         )
     if reserved0 or any(reserved):
         raise WireFormatError("history generation reserved bytes are nonzero")
@@ -1051,10 +1052,7 @@ def _open_instrument_history(
     instrument_id: int,
     requested_page_records: int,
     expected_generation: int,
-    expected_run_id: bytes,
-    expected_session_epoch: int,
-    expected_trade_date: int,
-    expected_capacity: int,
+    expected_session: DailyCatalogSessionIdentity,
     timeout: Optional[float],
 ) -> HistoryCursor:
     path = validate_socket_path(control_socket_path)
@@ -1069,6 +1067,12 @@ def _open_instrument_history(
         or expected_generation > UINT64_MAX
     ):
         raise ValueError("expected_generation must be a uint64")
+    if not isinstance(
+        expected_session, DailyCatalogSessionIdentity
+    ):
+        raise TypeError(
+            "expected_session must be DailyCatalogSessionIdentity"
+        )
     timeout = validate_timeout(timeout)
     channel = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     channel.settimeout(timeout)
@@ -1134,10 +1138,7 @@ def _open_instrument_history(
                 )
             validate_same_session(
                 generation.endpoint,
-                run_id=expected_run_id,
-                session_epoch=expected_session_epoch,
-                trade_date=expected_trade_date,
-                capacity=expected_capacity,
+                expected=expected_session,
             )
         return HistoryCursor(
             channel,

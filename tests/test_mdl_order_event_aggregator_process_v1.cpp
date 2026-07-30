@@ -1,6 +1,8 @@
 #include "l2flow/ipc/order_event_delta_control_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
-#include "l2flow/market/observed_instrument_directory_v2.h"
+#include "l2flow/ipc/realtime_wire_v2.h"
+#include "l2flow/market/daily_instrument_catalog_v2.h"
+#include "l2flow/market/instrument_runtime_state_v2.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -12,6 +14,7 @@
 #include <iostream>
 #include <memory>
 #include <poll.h>
+#include <span>
 #include <spawn.h>
 #include <string>
 #include <string_view>
@@ -270,17 +273,75 @@ private:
     int output_fd_ = -1;
 };
 
-std::unique_ptr<market::ObservedInstrumentDirectoryV2>
-MakeDirectory() {
-    market::ObservedInstrumentDirectoryConfigV2 config{};
-    config.capacity = 1U;
+std::vector<std::byte> Bytes(std::string_view text) {
+    const std::span<const char> characters(text.data(), text.size());
+    const std::span<const std::byte> bytes =
+        std::as_bytes(characters);
+    return {bytes.begin(), bytes.end()};
+}
+
+struct DailyRuntimeFixture final {
+    std::shared_ptr<const market::DailyInstrumentCatalogV2> catalog;
+    std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return catalog != nullptr && runtime_state != nullptr;
+    }
+};
+
+DailyRuntimeFixture MakeDailyRuntimeFixture() {
+    market::DailyInstrumentSourceEntryV2 entry{};
+    entry.key.market = market::MarketV1::kShanghai;
+    entry.key.security_id = Bytes("600001");
+    entry.metadata.quantity_unit = market::QuantityUnitV1::kShare;
+    entry.metadata.security_type = market::SecurityTypeV1::kEquity;
+    entry.metadata.asset_scope =
+        market::AssetScopeV1::kDocumentedCore;
+
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = kTradeDate;
+    config.catalog_version = kEpoch;
     config.session_epoch = kEpoch;
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> result;
-    return market::ObservedInstrumentDirectoryV2::Create(
-               config, &result) ==
-               market::ObservedInstrumentDirectoryErrorV2::kNone
-           ? std::move(result)
-           : nullptr;
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+
+    DailyRuntimeFixture result{};
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    if (market::DailyInstrumentCatalogV2::Create(
+            config, std::span(&entry, 1U), &catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        catalog == nullptr) {
+        return result;
+    }
+    result.catalog =
+        std::shared_ptr<const market::DailyInstrumentCatalogV2>(
+            std::move(catalog));
+    if (market::InstrumentRuntimeStateV2::Create(
+            *result.catalog, &result.runtime_state) !=
+        market::InstrumentRuntimeStateErrorV2::kNone) {
+        return {};
+    }
+    return result;
+}
+
+ipc::OrderEventDeltaSourceSessionV1 SourceSession(
+    const common::Identity128& run_id,
+    const market::DailyInstrumentCatalogV2& catalog) {
+    ipc::OrderEventDeltaSourceSessionV1 result{};
+    result.run_id = run_id;
+    result.catalog_digest = catalog.catalog_digest();
+    result.session_epoch = kEpoch;
+    result.catalog_generation = 1U;
+    result.catalog_version = catalog.catalog_version();
+    result.trade_date = kTradeDate;
+    result.catalog_trade_date = catalog.trade_date();
+    result.capacity =
+        static_cast<std::uint32_t>(catalog.instrument_count());
+    result.bound_count = result.capacity;
+    result.catalog_scope = static_cast<std::uint32_t>(
+        ipc::RealtimeCatalogScopeV2::kDeclaredDailyAShare);
+    result.coverage_complete = 1U;
+    return result;
 }
 
 }  // namespace
@@ -292,9 +353,9 @@ int main(int argc, char** argv) {
     }
     bool ok = true;
     ScopedTempDirectory temporary;
-    auto directory = MakeDirectory();
+    DailyRuntimeFixture fixture = MakeDailyRuntimeFixture();
     if (!Expect(
-            temporary.valid() && directory != nullptr,
+            temporary.valid() && static_cast<bool>(fixture),
             "create process fixture")) {
         return 1;
     }
@@ -307,7 +368,7 @@ int main(int argc, char** argv) {
     config.run_id = RunId();
     config.session_epoch = kEpoch;
     config.trade_date = kTradeDate;
-    config.directory = directory.get();
+    config.daily_catalog = fixture.catalog;
     config.tick_ring_capacity = 8U;
     config.key_arena_bytes = 64U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -349,9 +410,8 @@ int main(int argc, char** argv) {
 
     ipc::OrderEventDeltaControlClientConfigV1 client_config{};
     client_config.control_socket_path = event_socket;
-    client_config.expected_source_session.run_id = RunId();
-    client_config.expected_source_session.session_epoch = kEpoch;
-    client_config.expected_source_session.trade_date = kTradeDate;
+    client_config.expected_source_session =
+        SourceSession(RunId(), *fixture.catalog);
     client_config.timeout = std::chrono::seconds(1);
     ipc::OrderEventDeltaControlSnapshotV1 snapshot{};
     std::unique_ptr<ipc::OrderEventDeltaRingReaderV1> event_reader;
@@ -378,14 +438,14 @@ int main(int argc, char** argv) {
         "source clean stop drains aggregator and clean-stops event ring");
     service->StopControl();
 
-    auto second_directory = MakeDirectory();
+    DailyRuntimeFixture second_fixture = MakeDailyRuntimeFixture();
     const std::filesystem::path second_source_socket =
         temporary.path() / "source-signal.sock";
     const std::filesystem::path second_event_socket =
         temporary.path() / "events-signal.sock";
     ipc::RealtimeSharedServiceConfigV2 second_config = config;
     second_config.run_id = RunId(0x43U);
-    second_config.directory = second_directory.get();
+    second_config.daily_catalog = second_fixture.catalog;
     second_config.control_socket_path = second_source_socket;
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV2>
         second_service;
@@ -394,7 +454,7 @@ int main(int argc, char** argv) {
         ipc::RealtimeSharedMarketServiceV2::Create(
             second_config, &second_service, &system_error);
     ok &= Expect(
-        second_directory != nullptr &&
+        static_cast<bool>(second_fixture) &&
             second_create_error ==
                 ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
             second_service != nullptr &&
@@ -420,12 +480,8 @@ int main(int argc, char** argv) {
         interrupted_client_config{};
     interrupted_client_config.control_socket_path =
         second_event_socket;
-    interrupted_client_config.expected_source_session.run_id =
-        RunId(0x43U);
-    interrupted_client_config.expected_source_session.session_epoch =
-        kEpoch;
-    interrupted_client_config.expected_source_session.trade_date =
-        kTradeDate;
+    interrupted_client_config.expected_source_session =
+        SourceSession(RunId(0x43U), *second_fixture.catalog);
     interrupted_client_config.timeout = std::chrono::seconds(1);
     ipc::OrderEventDeltaControlSnapshotV1 interrupted_snapshot{};
     std::unique_ptr<ipc::OrderEventDeltaRingReaderV1>
