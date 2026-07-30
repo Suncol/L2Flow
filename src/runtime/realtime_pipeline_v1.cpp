@@ -1748,9 +1748,44 @@ public:
             TripFatalWithAdmissionLockHeld();
             return result;
         }
+        realtime::NativeSequenceDescriptorV1 native_descriptor{};
+        bool native_sequence_tracked = false;
+        if (config_.native_sequence_observation_sink != nullptr) {
+            const realtime::NativeSequenceExtractErrorV1
+                native_extract_error =
+                    realtime::ExtractNativeSequenceV1(
+                        inspection.key(),
+                        inspection.body(),
+                        &native_descriptor);
+            native_sequence_tracked =
+                native_extract_error ==
+                realtime::NativeSequenceExtractErrorV1::kNone;
+            if (!native_sequence_tracked &&
+                native_extract_error !=
+                    realtime::NativeSequenceExtractErrorV1::
+                        kNotTracked) {
+                config_.native_sequence_observation_sink
+                    ->MarkNativeSequenceObservationFailure(
+                        realtime::
+                            NativeSequenceObservationFailureV1::
+                                kExtraction,
+                        inspection.key());
+            }
+        }
         if (!market::IsMainlandAShareSecurityIdV1(
                 MainlandExchangeForMarket(extracted.market),
                 extracted.security_id)) {
+            if (native_sequence_tracked) {
+                realtime::NativeSequenceObservationV1 observation{};
+                observation.descriptor = native_descriptor;
+                observation.message_key = inspection.key();
+                observation.record_class =
+                    realtime::
+                        NativeSequenceRecoveryRecordClassV1::
+                            kFiltered;
+                config_.native_sequence_observation_sink
+                    ->ObserveNativeSequence(observation);
+            }
             result.error =
                 RealtimePipelineIngressErrorV1::kFilteredNonAShare;
             ++filtered_messages_;
@@ -1847,7 +1882,10 @@ public:
                  &result,
                  &metadata,
                  source_slot,
-                 mixed_tick_source](
+                 mixed_tick_source,
+                 native_sequence_tracked,
+                 native_descriptor,
+                 message_key = inspection.key()](
                     std::uint64_t queue_publish_monotonic_ns)
                     noexcept {
                     global_ingress_sequence_ =
@@ -1867,6 +1905,21 @@ public:
                     accepted_sequence_.store(
                         metadata.global_ingress_sequence,
                         std::memory_order_release);
+                    if (native_sequence_tracked) {
+                        realtime::NativeSequenceObservationV1
+                            observation{};
+                        observation.descriptor =
+                            native_descriptor;
+                        observation.message_key = message_key;
+                        observation.record_class =
+                            realtime::
+                                NativeSequenceRecoveryRecordClassV1::
+                                    kTarget;
+                        observation.ingress_sequence =
+                            metadata.global_ingress_sequence;
+                        config_.native_sequence_observation_sink
+                            ->ObserveNativeSequence(observation);
+                    }
                     if (latency_collector_ != nullptr) {
                         latency_collector_->RecordDecoderPublish(
                             source_slot,

@@ -354,6 +354,37 @@ private:
     bool release_first_applied_ = false;
 };
 
+class NativeSequenceObservationProbe final
+    : public realtime::NativeSequenceObservationSinkV1 {
+public:
+    void ObserveNativeSequence(
+        const realtime::NativeSequenceObservationV1& observation)
+        noexcept override {
+        observations_.push_back(observation);
+    }
+
+    void MarkNativeSequenceObservationFailure(
+        realtime::NativeSequenceObservationFailureV1,
+        const sdk::MessageKey&) noexcept override {
+        ++failures_;
+    }
+
+    [[nodiscard]] const std::vector<
+        realtime::NativeSequenceObservationV1>&
+    observations() const noexcept {
+        return observations_;
+    }
+
+    [[nodiscard]] std::uint64_t failures() const noexcept {
+        return failures_;
+    }
+
+private:
+    std::vector<realtime::NativeSequenceObservationV1>
+        observations_;
+    std::uint64_t failures_ = 0U;
+};
+
 class GenerationPublicationOrder final {
 public:
     [[nodiscard]] bool ObserveSink(
@@ -952,8 +983,12 @@ void CheckMainlandAShareIngressFilter(TestContext* test) {
 
     const auto filtered_projection =
         std::make_shared<ProjectionProbe>();
+    const auto native_observations =
+        std::make_shared<NativeSequenceObservationProbe>();
     runtime::RealtimePipelineConfigV1 filtered_config =
         MakeConfig(filtered_fixture, filtered_projection);
+    filtered_config.native_sequence_observation_sink =
+        native_observations;
     std::unique_ptr<runtime::RealtimePipelineV1> filtered_pipeline;
     std::string detail;
     test->Expect(
@@ -1052,6 +1087,35 @@ void CheckMainlandAShareIngressFilter(TestContext* test) {
             second_result.tick_stream_sequence == 2U,
         "allowed-filtered-allowed callbacks retain dense global, source, "
         "and mixed-tick sequences");
+    const auto& observations =
+        native_observations->observations();
+    const std::size_t observation_count = observations.size();
+    test->Expect(
+        native_observations->failures() == 0U &&
+            observation_count >= 3U &&
+            observations[observation_count - 3U]
+                    .descriptor.sequence == 901U &&
+            observations[observation_count - 3U].record_class ==
+                realtime::NativeSequenceRecoveryRecordClassV1::
+                    kTarget &&
+            observations[observation_count - 3U]
+                    .ingress_sequence == 1U &&
+            observations[observation_count - 2U]
+                    .descriptor.sequence == 902U &&
+            observations[observation_count - 2U].record_class ==
+                realtime::NativeSequenceRecoveryRecordClassV1::
+                    kFiltered &&
+            observations[observation_count - 2U]
+                    .ingress_sequence == 0U &&
+            observations[observation_count - 1U]
+                    .descriptor.sequence == 903U &&
+            observations[observation_count - 1U].record_class ==
+                realtime::NativeSequenceRecoveryRecordClassV1::
+                    kTarget &&
+            observations[observation_count - 1U]
+                    .ingress_sequence == 2U,
+        "native observer sees target-filtered-target in callback order "
+        "without assigning a FAST ingress identity to the skip marker");
 
     const bool filtered_applied_before_cut = WaitUntil([&] {
         const runtime::RealtimePipelineSnapshotV1 snapshot =

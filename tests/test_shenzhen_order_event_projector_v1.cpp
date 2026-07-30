@@ -910,6 +910,83 @@ void TestInputOrdering(bool* ok) {
         "ApplSeqNum regression is rejected before state mutation");
 }
 
+void TestCanonicalOrdering(bool* ok) {
+    auto projector = Projector(ok);
+    if (projector == nullptr) {
+        return;
+    }
+    std::vector<market::ShenzhenOrderEventV1> events;
+    auto first = Order(
+        200,
+        market::SideV1::kBuy,
+        market::OrderTypeV1::kLimit,
+        10);
+    first.anchor.source_sequence = 21'000U;
+    first.anchor.ingress_sequence = 22'000U;
+    first.anchor.tick_stream_sequence = 23'000U;
+    *ok &= Expect(
+        projector->ConsumeCanonical(first, 1U, &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::
+                    kNone &&
+            events.size() == 1U,
+        "consume first Shenzhen canonical input");
+
+    auto second = Order(
+        201,
+        market::SideV1::kSell,
+        market::OrderTypeV1::kLimit,
+        20);
+    second.anchor.source_sequence = 21'001U;
+    second.anchor.ingress_sequence = 22'001U;
+    second.anchor.tick_stream_sequence = 22'999U;
+    *ok &= Expect(
+        second.anchor.tick_stream_sequence <
+                first.anchor.tick_stream_sequence &&
+            projector->ConsumeCanonical(second, 2U, &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::
+                    kNone &&
+            events.size() == 1U,
+        "monotonic Shenzhen canonical order accepts regressed arrival tick sequence");
+    const auto* canonical_revision =
+        events.empty() ? nullptr : Revision(events.front());
+    *ok &= Expect(
+        canonical_revision != nullptr &&
+            canonical_revision->source_anchor.source_sequence ==
+                second.anchor.source_sequence &&
+            canonical_revision->source_anchor.ingress_sequence ==
+                second.anchor.ingress_sequence &&
+            canonical_revision->source_anchor
+                    .tick_stream_sequence ==
+                second.anchor.tick_stream_sequence &&
+            canonical_revision->order.first_anchor.source_sequence ==
+                second.anchor.source_sequence &&
+            canonical_revision->order.first_anchor.ingress_sequence ==
+                second.anchor.ingress_sequence &&
+            canonical_revision->order.first_anchor
+                    .tick_stream_sequence ==
+                second.anchor.tick_stream_sequence,
+        "Shenzhen canonical output preserves original source, ingress, and tick anchors");
+
+    auto blocked = Order(
+        202,
+        market::SideV1::kBuy,
+        market::OrderTypeV1::kLimit,
+        30);
+    blocked.anchor.tick_stream_sequence = 22'998U;
+    *ok &= Expect(
+        projector->ConsumeCanonical(blocked, 2U, &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::
+                    kOutOfOrderInput &&
+            events.empty() && projector->order_count() == 2U,
+        "duplicate Shenzhen canonical sequence is rejected before mutation");
+    *ok &= Expect(
+        projector->ConsumeCanonical(blocked, 1U, &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::
+                    kOutOfOrderInput &&
+            events.empty() && projector->order_count() == 2U,
+        "regressed Shenzhen canonical sequence is rejected before mutation");
+}
+
 }  // namespace
 
 int main() {
@@ -922,5 +999,6 @@ int main() {
     TestKeyIsolationAndFinalization(&ok);
     TestDecodedProjection(&ok);
     TestInputOrdering(&ok);
+    TestCanonicalOrdering(&ok);
     return ok ? 0 : 1;
 }

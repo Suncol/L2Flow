@@ -805,6 +805,98 @@ int main() {
     {
         std::unique_ptr<market::ShanghaiOrderEventAggregatorV1>
             aggregator = Aggregator(4U, &ok);
+        market::ShanghaiOrderEventInputV1 first = Add(
+            90,
+            9'000,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'000'000,
+            10,
+            0);
+        first.anchor.source_sequence = 11'000U;
+        first.anchor.ingress_sequence = 12'000U;
+        first.anchor.tick_stream_sequence = 13'000U;
+        ok &= Expect(
+            aggregator->ConsumeCanonical(first, 1U, &events) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kNone &&
+                events.size() == 1U,
+            "consume first Shanghai canonical input");
+
+        market::ShanghaiOrderEventInputV1 second = Add(
+            91,
+            9'001,
+            market::SideV1::kSell,
+            market::TradingPhaseV1::kContinuous,
+            10'100'000,
+            20,
+            0);
+        second.anchor.source_sequence = 11'001U;
+        second.anchor.ingress_sequence = 12'001U;
+        second.anchor.tick_stream_sequence = 12'999U;
+        ok &= Expect(
+            second.anchor.tick_stream_sequence <
+                    first.anchor.tick_stream_sequence &&
+                aggregator->ConsumeCanonical(
+                    second, 2U, &events) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kNone &&
+                events.size() == 1U,
+            "monotonic Shanghai canonical order accepts regressed arrival tick sequence");
+        const auto* canonical_revision =
+            events.empty()
+                ? nullptr
+                : std::get_if<
+                      market::ShanghaiOrderRevisionEventV1>(
+                      &events.front());
+        ok &= Expect(
+            canonical_revision != nullptr &&
+                canonical_revision->source_anchor.source_sequence ==
+                    second.anchor.source_sequence &&
+                canonical_revision->source_anchor.ingress_sequence ==
+                    second.anchor.ingress_sequence &&
+                canonical_revision->source_anchor
+                        .tick_stream_sequence ==
+                    second.anchor.tick_stream_sequence &&
+                canonical_revision->order.first_anchor
+                        .source_sequence ==
+                    second.anchor.source_sequence &&
+                canonical_revision->order.first_anchor
+                        .ingress_sequence ==
+                    second.anchor.ingress_sequence &&
+                canonical_revision->order.first_anchor
+                        .tick_stream_sequence ==
+                    second.anchor.tick_stream_sequence,
+            "Shanghai canonical output preserves original source, ingress, and tick anchors");
+
+        market::ShanghaiOrderEventInputV1 blocked = Add(
+            92,
+            9'002,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'200'000,
+            30,
+            0);
+        blocked.anchor.tick_stream_sequence = 12'998U;
+        ok &= Expect(
+            aggregator->ConsumeCanonical(
+                blocked, 2U, &events) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kOutOfOrderInput &&
+                events.empty() && aggregator->order_count() == 2U,
+            "duplicate Shanghai canonical sequence is rejected before mutation");
+        ok &= Expect(
+            aggregator->ConsumeCanonical(
+                blocked, 1U, &events) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kOutOfOrderInput &&
+                events.empty() && aggregator->order_count() == 2U,
+            "regressed Shanghai canonical sequence is rejected before mutation");
+    }
+
+    {
+        std::unique_ptr<market::ShanghaiOrderEventAggregatorV1>
+            aggregator = Aggregator(4U, &ok);
         ok &= Consume(
             aggregator.get(),
             Trade(

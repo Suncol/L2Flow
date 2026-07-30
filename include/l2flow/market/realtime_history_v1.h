@@ -168,6 +168,13 @@ public:
         std::size_t ordinal,
         const RealtimeHistoryRecordV1& record) noexcept = 0;
     virtual void MarkCoverageLost() noexcept = 0;
+
+    // History calls this terminal lifecycle barrier after every worker has
+    // stopped publishing and before its append-only Store can be destroyed.
+    // A sink that retained borrowed RealtimeHistoryRecordV1 pointers must
+    // synchronously stop using them before returning. Most sinks copy/project
+    // during PublishApplied and therefore need no work here.
+    virtual void QuiesceRecordReferences() noexcept {}
 };
 
 // Move-only decoder output envelope. It contains no retained heap control

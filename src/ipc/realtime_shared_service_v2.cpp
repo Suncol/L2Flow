@@ -3,6 +3,7 @@
 #include "l2flow/common/sha256.h"
 #include "l2flow/ipc/realtime_history_wire_v2.h"
 #include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
+#include "l2flow/ipc/realtime_wire_projection_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
 #include "l2flow/market/market_types_v1.h"
 
@@ -1666,6 +1667,13 @@ bool ComputeLayoutDigest(
 }
 
 }  // namespace
+
+bool ProjectRealtimeWireTickPayloadV2(
+    const market::RealtimeHistoryRecordV1& record,
+    std::size_t ordinal,
+    RealtimeWireTickPayloadV2* output) noexcept {
+    return ProjectTick(record, ordinal, output);
+}
 
 std::string_view RealtimeSharedServiceCreateErrorNameV2(
     RealtimeSharedServiceCreateErrorV2 error) noexcept {

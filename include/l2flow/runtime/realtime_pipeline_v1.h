@@ -8,6 +8,7 @@
 #include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/realtime/contiguous_sequence_tracker_v2.h"
+#include "l2flow/realtime/native_sequence_observer_v1.h"
 #include "l2flow/realtime/owned_ingress_message_v1.h"
 #include "l2flow/realtime/processing_progress_v2.h"
 #include "l2flow/sdk/sdk_runtime.h"
@@ -100,6 +101,13 @@ struct RealtimePipelineConfigV1 final {
     // boundary to History.
     std::shared_ptr<l2flow::market::RealtimeAppliedRecordSinkV1>
         applied_record_sink;
+    // Optional exchange-native continuity tap. The production composition
+    // enables it by default, while tests and deployments may leave it null to
+    // retain the literal pre-certification hot path. Its failures can affect
+    // only CERTIFIED and are never promoted to Pipeline/FAST failures.
+    std::shared_ptr<
+        l2flow::realtime::NativeSequenceObservationSinkV1>
+        native_sequence_observation_sink;
     std::shared_ptr<l2flow::realtime::ProcessingProgressSinkV2>
         processing_progress_sink;
     // Optional required Wire V2 immutable-generation publication. When

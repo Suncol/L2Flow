@@ -601,6 +601,7 @@ public:
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 Consume(
         const ShanghaiOrderEventInputV1& input,
+        std::uint64_t ordering_sequence,
         std::vector<ShanghaiOrderEventV1>* output) {
         if (output == nullptr) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kNullOutput;
@@ -613,7 +614,9 @@ public:
             return ShanghaiOrderAggregatorConsumeErrorV1::
                 kAlreadyFinalized;
         }
-        if (!ValidInput(input)) {
+        if (!ValidInput(input) || ordering_sequence == 0U ||
+            ordering_sequence ==
+                std::numeric_limits<std::uint64_t>::max()) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
         }
         if (input.trade_date != config_.trade_date) {
@@ -623,9 +626,8 @@ public:
             last_native_sequence_by_channel_.try_emplace(
                 input.channel, 0);
         static_cast<void>(channel_inserted);
-        if ((last_tick_stream_sequence_ != 0U &&
-             input.anchor.tick_stream_sequence <=
-                 last_tick_stream_sequence_) ||
+        if ((last_ordering_sequence_ != 0U &&
+             ordering_sequence <= last_ordering_sequence_) ||
             (channel_position->second != 0 &&
              input.anchor.native_event_sequence <=
                  channel_position->second)) {
@@ -652,8 +654,7 @@ public:
                     kInvalidInput;
         }
         if (error == ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
-            last_tick_stream_sequence_ =
-                input.anchor.tick_stream_sequence;
+            last_ordering_sequence_ = ordering_sequence;
             channel_position->second =
                 input.anchor.native_event_sequence;
         }
@@ -1183,7 +1184,7 @@ private:
     std::map<ShanghaiOrderKeyV1, OrderState> orders_;
     std::map<std::int32_t, std::int64_t>
         last_native_sequence_by_channel_;
-    std::uint64_t last_tick_stream_sequence_ = 0U;
+    std::uint64_t last_ordering_sequence_ = 0U;
     bool finalized_ = false;
     bool failed_ = false;
 };
@@ -1286,6 +1287,15 @@ ShanghaiOrderAggregatorConsumeErrorV1
 ShanghaiOrderEventAggregatorV1::Consume(
     const ShanghaiOrderEventInputV1& input,
     std::vector<ShanghaiOrderEventV1>* output) noexcept {
+    return ConsumeCanonical(
+        input, input.anchor.tick_stream_sequence, output);
+}
+
+ShanghaiOrderAggregatorConsumeErrorV1
+ShanghaiOrderEventAggregatorV1::ConsumeCanonical(
+    const ShanghaiOrderEventInputV1& input,
+    std::uint64_t canonical_apply_sequence,
+    std::vector<ShanghaiOrderEventV1>* output) noexcept {
     if (impl_ == nullptr) {
         if (output != nullptr) {
             output->clear();
@@ -1293,7 +1303,8 @@ ShanghaiOrderEventAggregatorV1::Consume(
         return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
     }
     try {
-        return impl_->Consume(input, output);
+        return impl_->Consume(
+            input, canonical_apply_sequence, output);
     } catch (const std::bad_alloc&) {
         if (output != nullptr) {
             output->clear();

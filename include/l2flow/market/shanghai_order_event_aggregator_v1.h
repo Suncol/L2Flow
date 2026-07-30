@@ -336,6 +336,17 @@ public:
         const ShanghaiOrderEventInputV1& input,
         std::vector<ShanghaiOrderEventV1>* output) noexcept;
 
+    // Recovery/certification path. canonical_apply_sequence is a dense,
+    // process-owned publication order supplied by a gap coordinator. It is
+    // used only for the global monotonic-consume guard; every source anchor in
+    // input and output retains the original arrival tick_stream_sequence.
+    // Native BizIndex monotonicity remains enforced independently per channel.
+    // Do not mix Consume and ConsumeCanonical on one instance.
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeCanonical(
+        const ShanghaiOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence,
+        std::vector<ShanghaiOrderEventV1>* output) noexcept;
+
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeDecoded(
         const DecodedMarketEventV1& event,
         std::uint64_t ingress_sequence,

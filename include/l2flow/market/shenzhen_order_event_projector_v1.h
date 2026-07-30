@@ -269,6 +269,17 @@ public:
         const ShenzhenOrderEventInputV1& input,
         std::vector<ShenzhenOrderEventV1>* output) noexcept;
 
+    // Recovery/certification path. canonical_apply_sequence is a dense,
+    // process-owned publication order used only for the global monotonic
+    // consume guard. Source anchors retain their original arrival
+    // tick_stream_sequence, while ApplSeqNum monotonicity remains enforced per
+    // channel across the merged 6.33/6.36 stream. Do not mix this method with
+    // Consume on one instance.
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1 ConsumeCanonical(
+        const ShenzhenOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence,
+        std::vector<ShenzhenOrderEventV1>* output) noexcept;
+
     [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1 ConsumeDecoded(
         const DecodedMarketEventV1& event,
         std::uint64_t ingress_sequence,

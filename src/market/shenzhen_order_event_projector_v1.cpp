@@ -546,7 +546,7 @@ public:
     std::map<ShenzhenOrderKeyV1, OrderState> orders;
     std::map<std::uint32_t, std::int64_t>
         last_native_sequence_by_channel;
-    std::uint64_t last_tick_stream_sequence = 0U;
+    std::uint64_t last_ordering_sequence = 0U;
     bool finalized = false;
     bool failed = false;
 };
@@ -649,6 +649,15 @@ ShenzhenOrderProjectorConsumeErrorV1
 ShenzhenOrderEventProjectorV1::Consume(
     const ShenzhenOrderEventInputV1& input,
     std::vector<ShenzhenOrderEventV1>* output) noexcept {
+    return ConsumeCanonical(
+        input, input.anchor.tick_stream_sequence, output);
+}
+
+ShenzhenOrderProjectorConsumeErrorV1
+ShenzhenOrderEventProjectorV1::ConsumeCanonical(
+    const ShenzhenOrderEventInputV1& input,
+    std::uint64_t canonical_apply_sequence,
+    std::vector<ShenzhenOrderEventV1>* output) noexcept {
     if (output == nullptr) {
         return ShenzhenOrderProjectorConsumeErrorV1::kNullOutput;
     }
@@ -659,7 +668,9 @@ ShenzhenOrderEventProjectorV1::Consume(
     if (impl_->failed) {
         return ShenzhenOrderProjectorConsumeErrorV1::kFailed;
     }
-    if (!ValidInput(input)) {
+    if (!ValidInput(input) || canonical_apply_sequence == 0U ||
+        canonical_apply_sequence ==
+            std::numeric_limits<std::uint64_t>::max()) {
         return ShenzhenOrderProjectorConsumeErrorV1::kInvalidInput;
     }
     if (input.trade_date != impl_->config.trade_date) {
@@ -676,9 +687,9 @@ ShenzhenOrderEventProjectorV1::Consume(
             impl_->last_native_sequence_by_channel.try_emplace(
                 input.channel, 0);
         static_cast<void>(channel_inserted);
-        if ((impl_->last_tick_stream_sequence != 0U &&
-             input.anchor.tick_stream_sequence <=
-                 impl_->last_tick_stream_sequence) ||
+        if ((impl_->last_ordering_sequence != 0U &&
+             canonical_apply_sequence <=
+                 impl_->last_ordering_sequence) ||
             (channel_position->second != 0 &&
              input.anchor.native_event_sequence <=
                  channel_position->second)) {
@@ -899,8 +910,8 @@ ShenzhenOrderEventProjectorV1::Consume(
             }
         }
         if (result == ShenzhenOrderProjectorConsumeErrorV1::kNone) {
-            impl_->last_tick_stream_sequence =
-                input.anchor.tick_stream_sequence;
+            impl_->last_ordering_sequence =
+                canonical_apply_sequence;
             channel_position->second =
                 input.anchor.native_event_sequence;
         }

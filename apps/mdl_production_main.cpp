@@ -4,6 +4,7 @@
 #error "mdl-production-router requires Linux realtime IPC Wire V2"
 #endif
 #include "l2flow/ipc/order_event_delta_control_v1.h"
+#include "l2flow/ipc/realtime_certified_service_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
 #include "l2flow/market/daily_instrument_catalog_loader_v2.h"
@@ -163,6 +164,12 @@ struct Options final {
         16ULL * 1024ULL * 1024ULL;
     std::uint64_t ipc_maximum_mapping_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
+    // Native-gap recovery and its independent CERTIFIED sidecar are enabled
+    // by default. --disable-native-gap-recovery restores the literal legacy
+    // FAST composition.
+    bool native_gap_recovery_enabled = true;
+    std::filesystem::path certified_ipc_socket;
+    bool certified_ipc_socket_set = false;
 };
 
 void PrintUsage(std::ostream& output) {
@@ -197,6 +204,12 @@ void PrintUsage(std::ostream& output) {
         << "  --ipc-tick-ring-records N     positive u64, default 262144\n"
         << "  --ipc-key-arena-mib N         positive u64, default 16\n"
         << "  --ipc-max-mapping-mib N       positive u64, default 2048\n"
+        << "  --certified-ipc-socket PATH   optional absolute CERTIFIED "
+           "sidecar UDS;\n"
+        << "                                default <ipc-socket>.certified\n"
+        << "  --disable-native-gap-recovery disable the default CERTIFIED "
+           "recovery sidecar;\n"
+        << "                                FAST Wire V2 remains unchanged\n"
         << "  --event-aggregator-socket PATH\n"
         << "                                optional absolute event-delta "
            "GET_SESSION UDS;\n"
@@ -357,6 +370,14 @@ bool ParseOptions(
             parsed.intraday_store_from_open = true;
             continue;
         }
+        if (option == "--disable-native-gap-recovery") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate option: " + std::string(option);
+                return false;
+            }
+            parsed.native_gap_recovery_enabled = false;
+            continue;
+        }
 
         if (option != "--sdk-library" &&
             option != "--session-epoch" &&
@@ -379,7 +400,8 @@ bool ParseOptions(
             option != "--event-aggregator-ready-timeout-ms" &&
             option != "--ipc-tick-ring-records" &&
             option != "--ipc-key-arena-mib" &&
-            option != "--ipc-max-mapping-mib") {
+            option != "--ipc-max-mapping-mib" &&
+            option != "--certified-ipc-socket") {
             *error = "unknown option: " + std::string(option);
             return false;
         }
@@ -553,6 +575,9 @@ bool ParseOptions(
                     "byte conversion does not overflow";
                 return false;
             }
+        } else if (option == "--certified-ipc-socket") {
+            parsed.certified_ipc_socket = std::string(value);
+            parsed.certified_ipc_socket_set = true;
         }
     }
 
@@ -580,6 +605,32 @@ bool ParseOptions(
         *error =
             "--event-aggregator-socket must be an absolute path";
         return false;
+    }
+    if (parsed.certified_ipc_socket_set &&
+        !parsed.native_gap_recovery_enabled) {
+        *error =
+            "--certified-ipc-socket cannot be combined with "
+            "--disable-native-gap-recovery";
+        return false;
+    }
+    if (parsed.native_gap_recovery_enabled) {
+        if (!parsed.certified_ipc_socket_set) {
+            parsed.certified_ipc_socket =
+                parsed.ipc_socket.string() + ".certified";
+        }
+        if (!parsed.certified_ipc_socket.is_absolute()) {
+            *error = "--certified-ipc-socket must be an absolute path";
+            return false;
+        }
+        if (parsed.certified_ipc_socket == parsed.ipc_socket ||
+            (!parsed.event_aggregator_socket.empty() &&
+             parsed.certified_ipc_socket ==
+                 parsed.event_aggregator_socket)) {
+            *error =
+                "--certified-ipc-socket must be distinct from other "
+                "control sockets";
+            return false;
+        }
     }
     if (parsed.event_aggregator_socket.empty() &&
         parsed.event_aggregator_ready_timeout_set) {
@@ -1026,7 +1077,97 @@ int Run(const Options& options) {
             << " event_published_sequence=0\n";
     }
 
+    std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
+        certified_service;
+    // FAST is the required service. CERTIFIED is enabled by default, but it
+    // remains an optional, fail-open sidecar: configuration, allocation,
+    // socket, or thread-start failures must not make an otherwise healthy
+    // FAST session unavailable.
     pipeline_config.applied_record_sink = ipc_service;
+    if (options.native_gap_recovery_enabled) {
+        constexpr std::size_t maximum_size =
+            std::numeric_limits<std::size_t>::max();
+        const bool certified_capacity_representable =
+            options.intraday_store_maximum_records <= maximum_size &&
+            options.intraday_store_maximum_records <=
+                maximum_size / 4U;
+        if (!certified_capacity_representable) {
+            std::cerr
+                << "mdl-production-router: CERTIFIED V1 DEGRADED: "
+                   "capacity cannot represent four derived events per "
+                   "stored record; FAST remains ACTIVE\n";
+        } else {
+            const std::size_t maximum_order_states =
+                static_cast<std::size_t>(
+                    options.intraday_store_maximum_records);
+            const std::size_t maximum_derived_events =
+                maximum_order_states * 4U;
+
+            ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
+            certified_config.run_id = run_id;
+            certified_config.session_epoch = options.session_epoch;
+            certified_config.trade_date = options.trade_date;
+            certified_config.daily_catalog = daily_catalog;
+            certified_config.fast_sink = ipc_service;
+            certified_config.certified_tick_ring_capacity =
+                options.ipc_tick_ring_records;
+            certified_config.maximum_mapping_bytes =
+                options.ipc_maximum_mapping_bytes;
+            certified_config.maximum_order_states =
+                maximum_order_states;
+            certified_config.maximum_derived_events =
+                maximum_derived_events;
+            certified_config.control_socket_path =
+                options.certified_ipc_socket;
+            int certified_system_error = 0;
+            const ipc::RealtimeCertifiedServiceCreateErrorV1
+                certified_error =
+                    ipc::RealtimeCertifiedMarketServiceV1::Create(
+                        std::move(certified_config),
+                        &certified_service,
+                        &certified_system_error);
+            if (certified_error !=
+                    ipc::RealtimeCertifiedServiceCreateErrorV1::kNone ||
+                certified_service == nullptr) {
+                std::cerr
+                    << "mdl-production-router: CERTIFIED V1 DEGRADED: "
+                       "service create failed: "
+                    << ipc::RealtimeCertifiedServiceCreateErrorNameV1(
+                           certified_error)
+                    << " errno=" << certified_system_error
+                    << "; FAST remains ACTIVE\n";
+                certified_service.reset();
+            } else {
+                certified_system_error = 0;
+                if (!certified_service->Start(
+                        &certified_system_error)) {
+                    std::cerr
+                        << "mdl-production-router: CERTIFIED V1 "
+                           "DEGRADED: control start failed: errno="
+                        << certified_system_error
+                        << "; FAST remains ACTIVE\n";
+                    certified_service->StopControl();
+                    certified_service.reset();
+                }
+            }
+        }
+        if (certified_service != nullptr) {
+            std::cerr
+                << "mdl-production-router: CERTIFIED V1 ACTIVE: socket="
+                << certified_service->control_socket_path()
+                << " mapping_bytes="
+                << certified_service->mapping_bytes()
+                << " native_gap_recovery=true"
+                << " fast_wire_abi_unchanged=true\n";
+            pipeline_config.applied_record_sink = certified_service;
+            pipeline_config.native_sequence_observation_sink =
+                certified_service;
+        }
+    } else {
+        std::cerr
+            << "mdl-production-router: native gap recovery disabled; "
+               "FAST Wire V2 only\n";
+    }
     pipeline_config.processing_progress_sink = ipc_service;
     pipeline_config.store_generation_sink = ipc_service;
 
@@ -1043,6 +1184,9 @@ int Run(const Options& options) {
             << runtime::RealtimePipelineCreateErrorNameV1(
                    create_error)
             << (detail.empty() ? "" : ": ") << detail << '\n';
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
         ipc_service->MarkFailed();
         ipc_service->StopControl();
         return 1;
@@ -1134,6 +1278,9 @@ int Run(const Options& options) {
     if (!ipc_service->failed()) {
         ipc_service->MarkDraining();
     }
+    if (certified_service != nullptr) {
+        certified_service->MarkDraining();
+    }
 
     if (exit_code == 0 && !pipeline->fatal()) {
         const runtime::RealtimePipelineCutResultV1 final_cut =
@@ -1170,6 +1317,19 @@ int Run(const Options& options) {
             << "mdl-production-router: IPC V2 projection ended in "
                "FAILED state\n";
         exit_code = 1;
+    }
+
+    ipc::RealtimeCertifiedServiceSnapshotV1 certified_snapshot{};
+    if (certified_service != nullptr) {
+        if (exit_code == 0) {
+            certified_service->MarkStoppedClean();
+        } else {
+            certified_snapshot = certified_service->Snapshot();
+            certified_service->StopControl();
+        }
+        if (exit_code == 0) {
+            certified_snapshot = certified_service->Snapshot();
+        }
     }
 
     if (exit_code == 0) {
@@ -1249,6 +1409,31 @@ int Run(const Options& options) {
                    catalog_snapshot_error);
     }
     std::cerr << '\n';
+
+    if (certified_service != nullptr) {
+        std::cerr
+            << "mdl-production-router: CERTIFIED final: state="
+            << static_cast<std::uint32_t>(
+                   certified_snapshot.state)
+            << " canonical_apply_frontier="
+            << certified_snapshot.canonical_apply_frontier
+            << " observed_native_messages="
+            << certified_snapshot.observed_native_message_count
+            << " exact_duplicates="
+            << certified_snapshot.exact_duplicate_message_count
+            << " gaps_opened="
+            << certified_snapshot.gap_opened_count
+            << " gaps_recovered="
+            << certified_snapshot.gap_recovered_count
+            << " conflicts="
+            << certified_snapshot.conflicting_duplicate_count
+            << " resource_exhaustions="
+            << certified_snapshot.resource_exhaustion_count
+            << " dropped_handoffs="
+            << certified_snapshot.dropped_handoffs
+            << " fast_remained_independent=true\n";
+        certified_service->StopControl();
+    }
 
     ipc_service->StopControl();
     return exit_code;

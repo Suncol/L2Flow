@@ -124,6 +124,7 @@ target_link_libraries(l2flow_market
 # The single-copy ownership boundary and contiguous completion tracker.
 add_library(l2flow_realtime_ingress STATIC
     src/realtime/contiguous_sequence_tracker_v2.cpp
+    src/realtime/native_sequence_recovery_v1.cpp
     src/realtime/owned_ingress_message_v1.cpp)
 add_library(L2Flow::realtime_ingress ALIAS l2flow_realtime_ingress)
 l2flow_configure_target(l2flow_realtime_ingress)
@@ -159,11 +160,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # composition dependency; the core realtime pipeline has no edge back to
     # sockets, memfd, Python, Arrow, or Polars.
     add_library(l2flow_ipc STATIC
+        src/ipc/certified_order_event_journal_v1.cpp
+        src/ipc/certified_order_event_reader_v1.cpp
+        src/ipc/certified_order_event_history_v1.cpp
+        src/ipc/certified_order_event_wire_v1.cpp
         src/ipc/instrument_derived_event_history_v1.cpp
+        src/ipc/instrument_derived_event_wire_v1.cpp
         src/ipc/order_event_delta_control_v1.cpp
         src/ipc/order_event_delta_ring_v1.cpp
         src/ipc/order_event_live_aggregation_engine_v1.cpp
         src/ipc/order_event_wire_adapter_v2.cpp
+        src/ipc/realtime_certified_reader_v1.cpp
+        src/ipc/realtime_certified_service_v1.cpp
         src/ipc/realtime_shared_service_v2.cpp)
     add_library(L2Flow::ipc ALIAS l2flow_ipc)
     l2flow_configure_target(l2flow_ipc)
@@ -171,7 +179,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(l2flow_ipc PRIVATE _GNU_SOURCE)
     target_link_libraries(l2flow_ipc
-        PUBLIC L2Flow::market L2Flow::common Threads::Threads)
+        PUBLIC
+            L2Flow::market
+            L2Flow::realtime_ingress
+            L2Flow::common
+            Threads::Threads)
 
     # Stable native acquire/seqcount helper. Python loads this with ctypes;
     # it has no Python, Arrow, or Polars build dependency.
@@ -321,6 +333,9 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_contiguous_sequence_tracker
         tests/test_contiguous_sequence_tracker_v2.cpp
         L2Flow::realtime_ingress)
+    l2flow_add_test(test_native_sequence_recovery
+        tests/test_native_sequence_recovery_v1.cpp
+        L2Flow::realtime_ingress)
     l2flow_add_test(test_closeable_publication_gate
         tests/test_closeable_publication_gate.cpp Threads::Threads)
     l2flow_add_test(test_realtime_history
@@ -345,6 +360,31 @@ if(L2FLOW_BUILD_TESTS)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         l2flow_add_test(test_realtime_wire_v2
             tests/test_realtime_wire_v2.cpp L2Flow::common)
+        l2flow_add_test(test_realtime_certified_wire_v1
+            tests/test_realtime_certified_wire_v1.cpp
+            L2Flow::common)
+        l2flow_add_test(test_realtime_certified_reader_v1
+            tests/test_realtime_certified_reader_v1.cpp
+            L2Flow::ipc)
+        l2flow_add_test(test_certified_order_event_journal_v1
+            tests/test_certified_order_event_journal_v1.cpp
+            L2Flow::ipc)
+        l2flow_add_test(test_realtime_certified_service_v1
+            tests/test_realtime_certified_service_v1.cpp
+            L2Flow::ipc)
+        target_link_libraries(test_realtime_certified_service_v1
+            PRIVATE L2Flow::realtime)
+        # Explicit, bounded latency probe. It is intentionally not registered
+        # with ctest because stable measurements require operator-selected CPU
+        # affinity and repeated/interleaved runs.
+        add_executable(benchmark_realtime_certified_v1
+            tests/benchmark_realtime_certified_v1.cpp)
+        l2flow_configure_target(benchmark_realtime_certified_v1)
+        target_link_libraries(benchmark_realtime_certified_v1
+            PRIVATE L2Flow::ipc L2Flow::realtime)
+        l2flow_add_test(test_certified_order_event_history_v1
+            tests/test_certified_order_event_history_v1.cpp
+            L2Flow::ipc)
         l2flow_add_test(test_realtime_history_wire_v2
             tests/test_realtime_history_wire_v2.cpp L2Flow::common)
         l2flow_add_test(test_order_event_wire_adapter_v2

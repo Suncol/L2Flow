@@ -2179,6 +2179,9 @@ public:
         if (builder_thread_.joinable()) {
             builder_thread_.join();
         }
+        if (config_.applied_record_sink != nullptr) {
+            config_.applied_record_sink->QuiesceRecordReferences();
+        }
         stop_complete_ = true;
     }
 
