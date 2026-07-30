@@ -1036,6 +1036,13 @@ struct PythonHistoryCommandResult final {
     std::vector<std::uint64_t> factor_column_ns;
     std::vector<std::uint64_t> factor_math_ns;
     std::vector<std::uint64_t> consume_nonfactor_ns;
+    std::vector<std::uint64_t> worker_page_read_ns;
+    std::vector<std::uint64_t> worker_pipeline_ns;
+    std::vector<std::uint64_t>
+        selected_column_tuple_materialize_ns;
+    std::vector<std::uint64_t>
+        summed_ring_publish_to_validated_ready_ns;
+    std::vector<std::uint64_t> parent_complete_consumption_ns;
 };
 
 [[nodiscard]] bool RunPythonHistoryCommand(
@@ -1161,6 +1168,129 @@ struct PythonHistoryCommandResult final {
                 scan_start < cursor_open_return) {
                 return false;
             }
+            if (sample == 0U) {
+                result.first_cursor_open_start_ns =
+                    cursor_open_start;
+                result.first_cursor_open_return_ns =
+                    cursor_open_return;
+            }
+        } else if (sample_tag == "WORKER_DELTA_SAMPLE") {
+            std::uint64_t cursor_open_start = 0U;
+            std::uint64_t cursor_open_return = 0U;
+            std::uint64_t worker_page_read = 0U;
+            std::uint64_t worker_pipeline = 0U;
+            std::uint64_t materialize = 0U;
+            std::uint64_t summed_publish_to_ready = 0U;
+            std::uint64_t parent_complete_consumption = 0U;
+            std::uint64_t worker_pipeline_begin = 0U;
+            std::uint64_t worker_publish_return = 0U;
+            std::uint64_t parent_complete_ready = 0U;
+            std::uint64_t checkpoint_access = 0U;
+            std::uint64_t open_to_complete = 0U;
+            std::uint64_t main_pid = 0U;
+            std::uint64_t worker_pid = 0U;
+            if (!ParseLineUnsignedField(
+                    line, "open_call_start_ns", &open_start) ||
+                !ParseLineUnsignedField(
+                    line, "open_return_ns", &open_return) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_call_start_ns",
+                    &cursor_open_start) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_return_ns",
+                    &cursor_open_return) ||
+                !ParseLineUnsignedField(
+                    line, "scan_start_ns", &scan_start) ||
+                !ParseLineUnsignedField(
+                    line, "checkpoint_return_ns", &complete) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "worker_page_read_ns",
+                    &worker_page_read) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "worker_pipeline_ns",
+                    &worker_pipeline) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "selected_column_tuple_materialize_ns",
+                    &materialize) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "summed_ring_publish_to_validated_ready_ns",
+                    &summed_publish_to_ready) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "parent_complete_consumption_ns",
+                    &parent_complete_consumption) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "worker_pipeline_begin_ns",
+                    &worker_pipeline_begin) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "worker_complete_ring_publish_return_ns",
+                    &worker_publish_return) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "parent_complete_ready_ns",
+                    &parent_complete_ready) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "checkpoint_access_ns",
+                    &checkpoint_access) ||
+                !ParseLineUnsignedField(
+                    line,
+                    "cursor_open_return_to_checkpoint_ns",
+                    &open_to_complete) ||
+                !ParseLineUnsignedField(
+                    line, "main_pid", &main_pid) ||
+                !ParseLineUnsignedField(
+                    line, "worker_pid", &worker_pid)) {
+                return false;
+            }
+            if (main_pid == 0U || worker_pid == 0U ||
+                main_pid == worker_pid ||
+                cursor_open_start != open_start ||
+                cursor_open_return != open_return ||
+                scan_start < cursor_open_return ||
+                open_return < open_start ||
+                complete < scan_start ||
+                open_to_complete != complete - open_return ||
+                parent_complete_consumption !=
+                    complete - scan_start ||
+                worker_pipeline_begin < open_start ||
+                worker_publish_return < worker_pipeline_begin ||
+                parent_complete_ready < worker_publish_return ||
+                complete < parent_complete_ready ||
+                worker_page_read > worker_pipeline ||
+                worker_pipeline !=
+                    worker_publish_return -
+                        worker_pipeline_begin ||
+                materialize > parent_complete_consumption) {
+                return false;
+            }
+            result.cursor_open_ns.push_back(
+                open_return - open_start);
+            result.scan_ns.push_back(
+                complete - scan_start);
+            result.open_return_to_complete_ns.push_back(
+                open_to_complete);
+            result.checkpoint_access_ns.push_back(
+                checkpoint_access);
+            result.worker_page_read_ns.push_back(
+                worker_page_read);
+            result.worker_pipeline_ns.push_back(
+                worker_pipeline);
+            result.selected_column_tuple_materialize_ns.push_back(
+                materialize);
+            result.summed_ring_publish_to_validated_ready_ns
+                .push_back(
+                summed_publish_to_ready);
+            result.parent_complete_consumption_ns.push_back(
+                parent_complete_consumption);
             if (sample == 0U) {
                 result.first_cursor_open_start_ns =
                     cursor_open_start;
@@ -2076,6 +2206,7 @@ bool RunPythonHistoryDeltaSmoke(
     }
     PythonHistoryCommandResult history_result{};
     PythonHistoryCommandResult delta_result{};
+    PythonHistoryCommandResult worker_delta_result{};
     const std::string history_command =
         "HISTORY 1 " + std::to_string(generation) +
         " price 1 " + std::to_string(history_records);
@@ -2106,6 +2237,29 @@ bool RunPythonHistoryDeltaSmoke(
                 &delta_result) &&
                 delta_result.checkpoint_access_ns.size() == 1U,
             "Python returns the tick checkpoint only after delta EOF")) {
+        return false;
+    }
+    const std::string worker_delta_command =
+        "WORKER_DELTA_ORIGIN 1 " + std::to_string(generation) +
+        " price 1 1";
+    if (include_delta &&
+        !Expect(
+            RunPythonHistoryCommand(
+                stream_protocol,
+                worker_delta_command,
+                "WORKER_DELTA_SAMPLE",
+                1U,
+                1U,
+                &worker_delta_result) &&
+                worker_delta_result.worker_page_read_ns.size() ==
+                    1U &&
+                worker_delta_result.worker_pipeline_ns.size() ==
+                    1U &&
+                worker_delta_result
+                        .selected_column_tuple_materialize_ns
+                        .size() ==
+                    1U,
+            "isolated worker consumes delta and returns fixed-ring result")) {
         return false;
     }
     if (!Expect(
@@ -4679,6 +4833,43 @@ bool RunHistoryLatencyBenchmark() {
         "delta_origin_65536_price",
         delta_origin,
         65'536U);
+    PythonHistoryCommandResult worker_delta_origin{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "WORKER_DELTA_ORIGIN " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(generation_65536) + " price " +
+                std::to_string(kPriceRepeats) + " 65536",
+            "WORKER_DELTA_SAMPLE",
+            kPriceRepeats,
+            65'536U,
+            &worker_delta_origin)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "worker_delta_origin_65536_price",
+        history_stages.Take());
+    print_python_distribution(
+        "worker_delta_origin_65536_price",
+        worker_delta_origin,
+        65'536U);
+    PrintLatency(
+        "worker_delta_origin_65536_wire_page_read",
+        worker_delta_origin.worker_page_read_ns);
+    PrintLatency(
+        "worker_delta_origin_65536_pipeline",
+        worker_delta_origin.worker_pipeline_ns);
+    PrintLatency(
+        "worker_delta_origin_65536_selected_column_tuple_materialize",
+        worker_delta_origin.selected_column_tuple_materialize_ns);
+    PrintLatency(
+        "worker_delta_origin_65536_summed_ring_publish_to_validated_ready",
+        worker_delta_origin
+            .summed_ring_publish_to_validated_ready_ns);
+    PrintLatency(
+        "worker_delta_origin_65536_parent_complete_consumption",
+        worker_delta_origin.parent_complete_consumption_ns);
 
     auto cut_without_history =
         [&](std::uint64_t target_tick_count,
@@ -4754,6 +4945,20 @@ bool RunHistoryLatencyBenchmark() {
         "delta_verified_4096_price",
         delta_price,
         4'096U);
+    if (!Expect(
+            delta_price.published_ns >=
+                    delta_price_boundary.applied_observed_ns &&
+                delta_price.first_open_start_ns >=
+                    delta_price.published_ns &&
+                delta_price.first_complete_ns >=
+                    delta_price.first_cursor_open_return_ns &&
+                delta_price_boundary.applied_observed_ns >=
+                    delta_price_boundary.ipc_return_ns &&
+                delta_price_boundary.ipc_return_ns >=
+                    delta_price_boundary.callback_start_ns,
+            "direct delta callback-to-consumption times are monotonic")) {
+        return false;
+    }
     std::cout
         << "DELTA_BOUNDARY workload=verified_4096_price"
         << " generation=" << delta_price_generation
@@ -4781,6 +4986,27 @@ bool RunHistoryLatencyBenchmark() {
             delta_price_boundary.callback_start_ns)
         << '\n';
 
+    // Advance the independent worker checkpoint to the direct benchmark's
+    // generation.  This single unreported synchronization scan lets the
+    // next generation measure worker callback-to-complete latency without
+    // including the preceding direct benchmark.
+    PythonHistoryCommandResult worker_delta_sync{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "WORKER_DELTA_FROM_VERIFIED " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(delta_price_generation) +
+                " validate 1 4096",
+            "WORKER_DELTA_SAMPLE",
+            1U,
+            4'096U,
+            &worker_delta_sync) ||
+        history_stages.failed()) {
+        return false;
+    }
+    history_stages.Clear();
+
     CallbackBoundary delta_all_boundary{};
     std::uint64_t delta_all_generation = 0U;
     if (!Expect(
@@ -4791,6 +5017,88 @@ bool RunHistoryLatencyBenchmark() {
             "publish second 4,096-record delta target")) {
         return false;
     }
+    PythonHistoryCommandResult worker_delta_price{};
+    history_stages.Clear();
+    if (!RunPythonHistoryCommand(
+            protocol,
+            "WORKER_DELTA_FROM_VERIFIED " +
+                std::to_string(kPureTickInstrument) + " " +
+                std::to_string(delta_all_generation) +
+                " price " + std::to_string(kPriceRepeats) +
+                " 4096",
+            "WORKER_DELTA_SAMPLE",
+            kPriceRepeats,
+            4'096U,
+            &worker_delta_price)) {
+        return false;
+    }
+    PrintHistoryPageStages(
+        "worker_delta_verified_4096_price",
+        history_stages.Take());
+    print_python_distribution(
+        "worker_delta_verified_4096_price",
+        worker_delta_price,
+        4'096U);
+    PrintLatency(
+        "worker_delta_verified_4096_wire_page_read",
+        worker_delta_price.worker_page_read_ns);
+    PrintLatency(
+        "worker_delta_verified_4096_pipeline",
+        worker_delta_price.worker_pipeline_ns);
+    PrintLatency(
+        "worker_delta_verified_4096_selected_column_tuple_materialize",
+        worker_delta_price.selected_column_tuple_materialize_ns);
+    PrintLatency(
+        "worker_delta_verified_4096_summed_ring_publish_to_validated_ready",
+        worker_delta_price
+            .summed_ring_publish_to_validated_ready_ns);
+    PrintLatency(
+        "worker_delta_verified_4096_parent_complete_consumption",
+        worker_delta_price.parent_complete_consumption_ns);
+    if (!Expect(
+            worker_delta_price.published_ns >=
+                    delta_all_boundary.applied_observed_ns &&
+                worker_delta_price.first_open_start_ns >=
+                    worker_delta_price.published_ns &&
+                worker_delta_price.first_complete_ns >=
+                    worker_delta_price.first_open_return_ns &&
+                delta_all_boundary.applied_observed_ns >=
+                    delta_all_boundary.ipc_return_ns &&
+                delta_all_boundary.ipc_return_ns >=
+                    delta_all_boundary.callback_start_ns,
+            "worker delta callback-to-consumption times are monotonic")) {
+        return false;
+    }
+    std::cout
+        << "WORKER_DELTA_BOUNDARY workload=verified_4096_price"
+        << " generation=" << delta_all_generation
+        << " worker_page_read_ns="
+        << worker_delta_price.worker_page_read_ns.front()
+        << " worker_pipeline_ns="
+        << worker_delta_price.worker_pipeline_ns.front()
+        << " parent_selected_column_tuple_materialize_ns="
+        << worker_delta_price
+               .selected_column_tuple_materialize_ns.front()
+        << " summed_ring_publish_to_validated_ready_ns="
+        << worker_delta_price
+               .summed_ring_publish_to_validated_ready_ns.front()
+        << " parent_complete_consumption_ns="
+        << worker_delta_price
+               .parent_complete_consumption_ns.front()
+        << " generation_publish_wait_ns="
+        << (worker_delta_price.published_ns -
+            delta_all_boundary.applied_observed_ns)
+        << " publication_to_open_call_ns="
+        << (worker_delta_price.first_open_start_ns -
+            worker_delta_price.published_ns)
+        << " publication_to_complete_ns="
+        << (worker_delta_price.first_complete_ns -
+            worker_delta_price.published_ns)
+        << " callback_to_complete_ns="
+        << (worker_delta_price.first_complete_ns -
+            delta_all_boundary.callback_start_ns)
+        << '\n';
+
     PythonHistoryCommandResult delta_all{};
     history_stages.Clear();
     if (!RunPythonHistoryCommand(
@@ -5147,6 +5455,9 @@ bool RunHistoryLatencyBenchmark() {
 
     std::string line;
     history_stages.Clear();
+    std::uint64_t worker_loop_pid = 0U;
+    std::uint64_t worker_loop_start_scans = 0U;
+    std::uint64_t worker_loop_start_records = 0U;
     if (!protocol->SendLine(
             "START_HISTORY_LOOP " +
             std::to_string(kPureTickInstrument) + " " +
@@ -5180,73 +5491,88 @@ bool RunHistoryLatencyBenchmark() {
         "same_process_concurrent_scan_loop",
         history_stages.Take());
 
-    PythonLatencyProcess isolated_scan_python;
-    if (!SpawnPythonHistoryLatencyProbe(
-            socket_path, &isolated_scan_python) ||
-        isolated_scan_python.channel() == nullptr) {
-        return false;
-    }
-    ProtocolChannel* const isolated_scan_protocol =
-        isolated_scan_python.channel();
-    if (!isolated_scan_protocol->ReadLine(
-            std::chrono::seconds(30), &line) ||
-        !line.starts_with("READY ")) {
-        std::cerr << "isolated history probe startup: "
-                  << line << '\n';
-        return false;
-    }
-    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
     history_stages.Clear();
-    if (!isolated_scan_protocol->SendLine(
-            "START_HISTORY_LOOP " +
+    if (!protocol->SendLine(
+            "START_WORKER_DELTA_LOOP " +
             std::to_string(kPureTickInstrument) + " " +
             std::to_string(mixed_generation) +
-            " all 81920") ||
-        !isolated_scan_protocol->ReadLine(
+            " 81920") ||
+        !protocol->ReadLine(
             std::chrono::seconds(120), &line) ||
-        !line.starts_with("HISTORY_LOOP_STARTED ")) {
-        std::cerr << "isolated history loop start: "
+        !line.starts_with("WORKER_DELTA_LOOP_STARTED ") ||
+        !ParseLineUnsignedField(
+            line, "worker_pid", &worker_loop_pid) ||
+        !ParseLineUnsignedField(
+            line, "scans", &worker_loop_start_scans) ||
+        !ParseLineUnsignedField(
+            line, "records", &worker_loop_start_records) ||
+        worker_loop_pid == 0U ||
+        worker_loop_start_scans != 1U ||
+        worker_loop_start_records != 81'920U) {
+        std::cerr << "isolated worker delta loop start: "
                   << line << '\n';
         return false;
     }
-    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
-    LatestSeriesResult latest_with_isolated_scan{};
+    std::cout << "PYTHON_" << line << '\n';
+    LatestSeriesResult latest_with_worker_scan{};
     if (!run_latest_series(
-            "latest_with_isolated_process_history_scan",
+            "latest_with_isolated_worker_delta_tuple_materialization",
             kInterferenceSamples,
-            &latest_with_isolated_scan)) {
+            &latest_with_worker_scan)) {
         return false;
     }
-    if (!isolated_scan_protocol->SendLine("STOP_HISTORY_LOOP") ||
-        !isolated_scan_protocol->ReadLine(
+    std::uint64_t worker_loop_stop_pid = 0U;
+    std::uint64_t worker_loop_stop_scans = 0U;
+    std::uint64_t worker_loop_stop_records = 0U;
+    if (!protocol->SendLine("STOP_WORKER_DELTA_LOOP") ||
+        !protocol->ReadLine(
             std::chrono::seconds(120), &line) ||
-        !line.starts_with("HISTORY_LOOP_STOPPED ")) {
-        std::cerr << "isolated history loop stop: "
+        !line.starts_with("WORKER_DELTA_LOOP_STOPPED ") ||
+        !ParseLineUnsignedField(
+            line, "worker_pid", &worker_loop_stop_pid) ||
+        !ParseLineUnsignedField(
+            line, "scans", &worker_loop_stop_scans) ||
+        !ParseLineUnsignedField(
+            line, "records", &worker_loop_stop_records) ||
+        worker_loop_stop_pid != worker_loop_pid ||
+        worker_loop_stop_scans < 2U ||
+        worker_loop_stop_scans >
+            std::numeric_limits<std::uint64_t>::max() /
+                81'920U ||
+        worker_loop_stop_records !=
+            worker_loop_stop_scans * 81'920U) {
+        std::cerr << "isolated worker delta loop stop: "
                   << line << '\n';
         return false;
     }
-    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
-    if (!isolated_scan_protocol->SendLine("QUIT") ||
-        !isolated_scan_protocol->ReadLine(
-            std::chrono::seconds(30), &line) ||
-        !line.starts_with("BYE ") ||
-        !isolated_scan_python.Wait(std::chrono::seconds(30))) {
-        std::cerr << "isolated history probe shutdown: "
-                  << line << '\n';
-        return false;
-    }
-    std::cout << "ISOLATED_SCAN_PYTHON_" << line << '\n';
+    std::cout << "PYTHON_" << line << '\n';
     PrintHistoryPageStages(
-        "isolated_process_concurrent_scan_loop",
+        "isolated_worker_delta_tuple_materialization_loop",
         history_stages.Take());
+    LatestSeriesResult latest_baseline_after{};
+    if (!run_latest_series(
+            "latest_baseline_after_worker_scan",
+            kInterferenceSamples,
+            &latest_baseline_after)) {
+        return false;
+    }
 
-    const LatencySummary baseline = SummarizeLatency(
+    const LatencySummary baseline_before = SummarizeLatency(
         latest_baseline.strict_callback_to_python_ns);
+    const LatencySummary baseline_after = SummarizeLatency(
+        latest_baseline_after.strict_callback_to_python_ns);
+    LatencySummary baseline{};
+    baseline.p50_ns = std::max(
+        baseline_before.p50_ns, baseline_after.p50_ns);
+    baseline.p95_ns = std::max(
+        baseline_before.p95_ns, baseline_after.p95_ns);
+    baseline.p99_ns = std::max(
+        baseline_before.p99_ns, baseline_after.p99_ns);
     const LatencySummary with_same_process_scan = SummarizeLatency(
         latest_with_same_process_scan
             .strict_callback_to_python_ns);
-    const LatencySummary with_isolated_scan = SummarizeLatency(
-        latest_with_isolated_scan
+    const LatencySummary with_worker_scan = SummarizeLatency(
+        latest_with_worker_scan
             .strict_callback_to_python_ns);
     auto ratio = [](std::uint64_t numerator,
                     std::uint64_t denominator) {
@@ -5279,21 +5605,57 @@ bool RunHistoryLatencyBenchmark() {
                baseline.p99_ns)
         << std::defaultfloat << '\n';
     std::cout
-        << "HISTORY_SCAN_INTERFERENCE mode=isolated_python_process"
+        << "HISTORY_SCAN_INTERFERENCE"
+        << " mode=isolated_worker_fixed_result_ring_tuple_materialization"
         << " samples=" << kInterferenceSamples
         << " baseline_p50_ns=" << baseline.p50_ns
-        << " scan_p50_ns=" << with_isolated_scan.p50_ns
+        << " scan_p50_ns=" << with_worker_scan.p50_ns
         << " p50_ratio=" << std::fixed << std::setprecision(3)
-        << ratio(with_isolated_scan.p50_ns, baseline.p50_ns)
+        << ratio(with_worker_scan.p50_ns, baseline.p50_ns)
         << " baseline_p95_ns=" << baseline.p95_ns
-        << " scan_p95_ns=" << with_isolated_scan.p95_ns
+        << " scan_p95_ns=" << with_worker_scan.p95_ns
         << " p95_ratio="
-        << ratio(with_isolated_scan.p95_ns, baseline.p95_ns)
+        << ratio(with_worker_scan.p95_ns, baseline.p95_ns)
         << " baseline_p99_ns=" << baseline.p99_ns
-        << " scan_p99_ns=" << with_isolated_scan.p99_ns
+        << " scan_p99_ns=" << with_worker_scan.p99_ns
         << " p99_ratio="
-        << ratio(with_isolated_scan.p99_ns, baseline.p99_ns)
+        << ratio(with_worker_scan.p99_ns, baseline.p99_ns)
         << std::defaultfloat << '\n';
+    auto saturating_add = [](std::uint64_t value,
+                             std::uint64_t increment) {
+        return value >
+                       std::numeric_limits<std::uint64_t>::max() -
+                           increment
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : value + increment;
+    };
+    auto saturating_double = [](std::uint64_t value) {
+        return value >
+                       std::numeric_limits<std::uint64_t>::max() /
+                           2U
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : value * 2U;
+    };
+    const std::uint64_t worker_p95_limit = std::max(
+        saturating_double(baseline.p95_ns),
+        saturating_add(baseline.p95_ns, 250'000U));
+    const std::uint64_t worker_p99_limit = std::max(
+        saturating_double(baseline.p99_ns),
+        saturating_add(baseline.p99_ns, 500'000U));
+    if (!Expect(
+            baseline.p95_ns > 0U && baseline.p99_ns > 0U &&
+                with_worker_scan.p95_ns <= worker_p95_limit &&
+                with_worker_scan.p99_ns <= worker_p99_limit,
+            "isolated worker scan preserves latest p95/p99 bounds")) {
+        std::cerr
+            << "worker latest limits p95_limit_ns="
+            << worker_p95_limit
+            << " actual_p95_ns=" << with_worker_scan.p95_ns
+            << " p99_limit_ns=" << worker_p99_limit
+            << " actual_p99_ns=" << with_worker_scan.p99_ns
+            << '\n';
+        return false;
+    }
     if (!Expect(
             wait_prefix(next_sequence - 1U, true),
             "concurrent latest samples reach durable/applied prefix")) {

@@ -16,6 +16,15 @@ from .history import (
     HistoryGenerationChangedError,
     HistoryPage,
 )
+from .history_worker import (
+    HistoryWorkerClosedError,
+    HistoryWorkerError,
+    HistoryWorkerInternalError,
+    InstrumentTickDeltaResultBatch,
+    InstrumentTickDeltaResultColumns,
+    InstrumentTickDeltaResultCursor,
+    InstrumentTickDeltaWorker,
+)
 from .instrument_delta import (
     DeltaCheckpointUnverifiedError,
     InstrumentTickDeltaBaseKind,
@@ -100,8 +109,12 @@ __all__ = [
     "InstrumentTickDeltaGeneration",
     "InstrumentTickDeltaMetadata",
     "InstrumentTickDeltaPage",
+    "InstrumentTickDeltaResultBatch",
+    "InstrumentTickDeltaResultColumns",
+    "InstrumentTickDeltaResultCursor",
     "InstrumentTickDeltaSession",
     "InstrumentTickDeltaSessionClosedError",
+    "InstrumentTickDeltaWorker",
     "InstrumentTickColumns",
     "InstrumentTickRollingCommit",
     "InstrumentTickRollingFactor",
@@ -122,6 +135,9 @@ __all__ = [
     "HistoryGeneration",
     "HistoryGenerationChangedError",
     "HistoryPage",
+    "HistoryWorkerClosedError",
+    "HistoryWorkerError",
+    "HistoryWorkerInternalError",
     "LatestKLine",
     "LatestSnapshot",
     "LatestStatus",

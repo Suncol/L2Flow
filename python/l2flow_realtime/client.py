@@ -7,6 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
+from ._history_worker_protocol import DEFAULT_RESULT_COLUMNS
 from ._stream_control import validate_socket_path, validate_timeout
 from .control import discover_session_fd
 from .models import (
@@ -30,6 +31,7 @@ from .native import MAX_BATCH_RECORDS, NativeReader
 
 if TYPE_CHECKING:
     from .history import HistoryCursor
+    from .history_worker import InstrumentTickDeltaWorker
     from .instrument_delta import InstrumentTickDeltaSession
 
 
@@ -484,6 +486,60 @@ class L2FlowClient:
             return delta_session
         except BaseException:
             delta_session.close()
+            raise
+
+    def open_instrument_tick_delta_worker(
+        self,
+        *,
+        result_columns: Sequence[str] = DEFAULT_RESULT_COLUMNS,
+        ring_slots: int = 4,
+        result_batch_records: int = 4096,
+    ) -> "InstrumentTickDeltaWorker":
+        """Start a separate-GIL process for raw V2 delta consumption.
+
+        The child process alone receives and maps raw history page memfds.
+        This process receives only the selected fixed-schema numeric columns
+        through the shared result ring.
+        """
+
+        from .history_worker import (
+            _start_instrument_tick_delta_worker,
+        )
+
+        with self._lock:
+            session = self._checked_session()
+            path = self._control_socket_path
+            if path is None:
+                raise UnavailableError(
+                    "the history worker requires a client opened through "
+                    "the Wire V2 control socket"
+                )
+            identity = session.identity
+            trade_date = session.trade_date
+            capacity = session.capacity
+            timeout = self._control_timeout
+        # Process startup and its fixed INIT handshake are deliberately
+        # outside the latest-reader lock.
+        worker = _start_instrument_tick_delta_worker(
+            path,
+            session_identity=identity,
+            trade_date=trade_date,
+            capacity=capacity,
+            result_columns=result_columns,
+            ring_slots=ring_slots,
+            result_batch_records=result_batch_records,
+            timeout=timeout,
+        )
+        try:
+            with self._lock:
+                current = self._checked_session()
+                if current.identity != identity:
+                    raise StaleSessionError(
+                        "realtime session changed during worker startup"
+                    )
+            return worker
+        except BaseException:
+            worker.close()
             raise
 
     def _validate_latest(self, results, ids, expected_type) -> None:

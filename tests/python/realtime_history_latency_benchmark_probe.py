@@ -21,6 +21,12 @@ After one ``READY`` line, stdin accepts these exact commands:
     START_HISTORY_LOOP \
         INSTRUMENT GENERATION price|all EXPECTED_RECORDS
     STOP_HISTORY_LOOP
+    START_WORKER_DELTA_LOOP INSTRUMENT GENERATION EXPECTED_RECORDS
+    STOP_WORKER_DELTA_LOOP
+    WORKER_DELTA_ORIGIN \
+        INSTRUMENT GENERATION validate|price REPEATS EXPECTED_RECORDS
+    WORKER_DELTA_FROM_VERIFIED \
+        INSTRUMENT GENERATION validate|price REPEATS EXPECTED_RECORDS
     LATEST_SERIES INSTRUMENT FIRST_INGRESS COUNT
     QUIT
 
@@ -491,6 +497,110 @@ class _HistoryLoop:
         return scan
 
 
+class _WorkerDeltaLoop(_HistoryLoop):
+    """Repeated delta scans with raw pages confined to another CPython."""
+
+    def __init__(
+        self,
+        worker,
+        *,
+        instrument_id: int,
+        expected_generation: int,
+        expected_records: int,
+    ) -> None:
+        super().__init__(
+            None,
+            instrument_id=instrument_id,
+            expected_generation=expected_generation,
+            projection="price",
+            expected_records=expected_records,
+        )
+        self._worker = worker
+        self._thread = threading.Thread(
+            target=self._run,
+            name="l2flow-worker-delta-result-loop",
+            daemon=False,
+        )
+
+    def _scan_once(self) -> _Scan:
+        cursor = self._worker.open_instrument(
+            self.instrument_id,
+            expected_generation=self.expected_generation,
+            requested_page_records=_PAGE_RECORDS,
+        )
+        _require(
+            cursor.generation == self.expected_generation
+            and cursor.expected_record_count
+            == self.expected_records,
+            "worker delta loop OPEN metadata differs",
+        )
+        scan_start_ns = _now_ns()
+        records = 0
+        pages = 0
+        projected = 0
+        checksum = _CHECKSUM_OFFSET
+        with cursor:
+            for batch in cursor.batches():
+                pages += 1
+                records += len(batch)
+                prices = batch.read_columns("price_p6")[
+                    "price_p6"
+                ]
+                count = len(prices)
+                _require(
+                    count == len(batch),
+                    "worker result tuple has the wrong row count",
+                )
+                first = 0 if count == 0 else prices[0]
+                last = 0 if count == 0 else prices[-1]
+                _require(
+                    isinstance(first, int)
+                    and not isinstance(first, bool)
+                    and isinstance(last, int)
+                    and not isinstance(last, bool),
+                    "worker result boundaries are not integers",
+                )
+                # Every selected value is materialized into an owned tuple.
+                # The page bound keeps each main-GIL hold short; O(1)
+                # boundary/count validation avoids adding an unrelated
+                # Python factor loop to this column-construction workload.
+                checksum ^= 0x574B444C
+                checksum = (
+                    checksum * _CHECKSUM_PRIME
+                ) & _CHECKSUM_MASK
+                checksum ^= count
+                checksum = (
+                    checksum * _CHECKSUM_PRIME
+                ) & _CHECKSUM_MASK
+                checksum ^= first & _CHECKSUM_MASK
+                checksum = (
+                    checksum * _CHECKSUM_PRIME
+                ) & _CHECKSUM_MASK
+                checksum ^= last & _CHECKSUM_MASK
+                checksum &= _CHECKSUM_MASK
+                projected += count
+            checkpoint = cursor.verified_checkpoint
+        complete_ns = _now_ns()
+        _require(
+            records == self.expected_records
+            and projected == records
+            and checkpoint.generation == self.expected_generation,
+            "worker delta loop did not consume its complete target",
+        )
+        return _Scan(
+            data_page_count=pages,
+            terminal_page_count=1,
+            mapping_bytes=records * 8,
+            record_count=records,
+            snapshot_count=0,
+            tick_count=records,
+            projected_value_count=projected,
+            checksum=checksum,
+            scan_start_ns=scan_start_ns,
+            eof_columns_complete_ns=complete_ns,
+        )
+
+
 def _consume_delta_page(
     page,
     projection: str,
@@ -635,6 +745,34 @@ def _parse_history_loop(
         allow_zero=True,
     )
     return instrument_id, generation, projection, expected_records
+
+
+def _parse_worker_delta_loop(
+    words: list[str],
+) -> tuple[int, int, int]:
+    _require(
+        len(words) == 4,
+        "START_WORKER_DELTA_LOOP requires three arguments",
+    )
+    instrument_id = _decimal(
+        words[1],
+        "instrument",
+        maximum=_UINT32_MAX,
+        allow_zero=False,
+    )
+    generation = _decimal(
+        words[2],
+        "generation",
+        maximum=_UINT64_MAX,
+        allow_zero=False,
+    )
+    expected_records = _decimal(
+        words[3],
+        "expected_records",
+        maximum=_UINT64_MAX,
+        allow_zero=True,
+    )
+    return instrument_id, generation, expected_records
 
 
 def _parse_rolling_measurement(
@@ -920,6 +1058,218 @@ def _run_delta(
             "DELTA_ORIGIN" if origin else "DELTA_FROM_VERIFIED"
         ),
         samples=repeats,
+        saved_generation=first_target.generation,
+        saved_tick_record_count=(
+            first_target.instrument_tick_record_count
+        ),
+    )
+
+
+def _run_worker_delta(
+    worker,
+    checkpoints: dict[int, object],
+    *,
+    command_index: int,
+    origin: bool,
+    instrument_id: int,
+    expected_generation: int,
+    projection: str,
+    repeats: int,
+    expected_records: int,
+) -> None:
+    _require(
+        projection in ("validate", "price"),
+        "worker delta projection must be validate or price",
+    )
+    if origin:
+        base_checkpoint = None
+    else:
+        _require(
+            instrument_id in checkpoints,
+            "WORKER_DELTA_FROM_VERIFIED has no checkpoint",
+        )
+        base_checkpoint = checkpoints[instrument_id]
+
+    targets: list[object] = []
+    for sample in range(repeats):
+        open_start_ns = _now_ns()
+        cursor = worker.open_instrument(
+            instrument_id,
+            base_checkpoint=base_checkpoint,
+            requested_page_records=_PAGE_RECORDS,
+            expected_generation=expected_generation,
+        )
+        open_return_ns = _now_ns()
+        records = 0
+        page_count = 0
+        projected = 0
+        checksum = _CHECKSUM_OFFSET
+        selected_column_tuple_materialize_ns = 0
+        summed_publish_to_validated_ready_ns = 0
+        first_worker_read_ns = 0
+        worker_page_read_ns = 0
+        with cursor:
+            scan_start_ns = _now_ns()
+            for batch in cursor.batches():
+                if first_worker_read_ns == 0:
+                    first_worker_read_ns = (
+                        batch.worker_read_start_ns
+                    )
+                worker_page_read_ns += (
+                    batch.worker_read_return_ns
+                    - batch.worker_read_start_ns
+                )
+                _require(
+                    batch.result_ready_ns
+                    >= batch.worker_publish_begin_ns,
+                    "worker result notification precedes publication",
+                )
+                summed_publish_to_validated_ready_ns += (
+                    batch.result_ready_ns
+                    - batch.worker_ring_publish_return_ns
+                )
+                page_count += 1
+                records += len(batch)
+                if projection == "price":
+                    column_start_ns = _now_ns()
+                    values = batch.read_columns("price_p6")[
+                        "price_p6"
+                    ]
+                    column_return_ns = _now_ns()
+                    selected_column_tuple_materialize_ns += (
+                        column_return_ns - column_start_ns
+                    )
+                    checksum, count = _fold_column(
+                        checksum, values, 0x574B4450
+                    )
+                    projected += count
+            checkpoint_start_ns = _now_ns()
+            checkpoint = cursor.verified_checkpoint
+            checkpoint_return_ns = _now_ns()
+            summed_publish_to_validated_ready_ns += (
+                cursor.complete_ready_ns
+                - cursor.complete_ring_publish_return_ns
+            )
+            worker_pipeline_begin_ns = (
+                cursor.eof_worker_read_start_ns
+                if first_worker_read_ns == 0
+                else first_worker_read_ns
+            )
+            worker_page_read_ns += (
+                cursor.eof_worker_read_return_ns
+                - cursor.eof_worker_read_start_ns
+            )
+            worker_pipeline_ns = (
+                cursor.complete_ring_publish_return_ns
+                - worker_pipeline_begin_ns
+            )
+        _require(
+            records == expected_records
+            and cursor.cumulative_record_count == expected_records,
+            "worker delta result count differs from expected",
+        )
+        _require(
+            (projection == "validate" and projected == 0)
+            or (projection == "price" and projected == records),
+            "worker delta projected count is inconsistent",
+        )
+        base_tick_count = (
+            0
+            if base_checkpoint is None
+            else base_checkpoint.instrument_tick_record_count
+        )
+        _require(
+            checkpoint.instrument_tick_record_count
+            - base_tick_count
+            == expected_records,
+            "worker verified checkpoint delta is inconsistent",
+        )
+        published_ns = checkpoint.history_published_monotonic_ns
+        _require(
+            published_ns <= open_start_ns
+            and scan_start_ns >= open_return_ns
+            and checkpoint_return_ns >= scan_start_ns
+            and worker_pipeline_begin_ns >= open_start_ns
+            and cursor.complete_ring_publish_return_ns
+            >= worker_pipeline_begin_ns
+            and cursor.complete_ready_ns
+            >= cursor.complete_ring_publish_return_ns
+            and checkpoint_return_ns >= cursor.complete_ready_ns
+            and worker_page_read_ns <= worker_pipeline_ns
+            and selected_column_tuple_materialize_ns
+            <= checkpoint_return_ns - scan_start_ns,
+            "worker delta parent timestamps are non-monotonic",
+        )
+        targets.append(checkpoint)
+        _emit(
+            "WORKER_DELTA_SAMPLE",
+            command=command_index,
+            sample=sample,
+            mode="origin" if origin else "verified",
+            projection=projection,
+            main_pid=os.getpid(),
+            worker_pid=worker.pid,
+            instrument_id=instrument_id,
+            expected_generation=expected_generation,
+            checkpoint_generation=checkpoint.generation,
+            expected_records=expected_records,
+            record_count=records,
+            projected_value_count=projected,
+            page_count=page_count,
+            checksum=checksum,
+            history_published_monotonic_ns=published_ns,
+            open_call_start_ns=open_start_ns,
+            open_return_ns=open_return_ns,
+            cursor_open_call_start_ns=open_start_ns,
+            cursor_open_return_ns=open_return_ns,
+            scan_start_ns=scan_start_ns,
+            checkpoint_return_ns=checkpoint_return_ns,
+            worker_pipeline_begin_ns=worker_pipeline_begin_ns,
+            worker_eof_read_return_ns=(
+                cursor.eof_worker_read_return_ns
+            ),
+            worker_complete_publish_begin_ns=(
+                cursor.complete_publish_begin_ns
+            ),
+            worker_complete_ring_publish_return_ns=(
+                cursor.complete_ring_publish_return_ns
+            ),
+            parent_complete_ready_ns=cursor.complete_ready_ns,
+            worker_page_read_ns=worker_page_read_ns,
+            worker_pipeline_ns=worker_pipeline_ns,
+            selected_column_tuple_materialize_ns=(
+                selected_column_tuple_materialize_ns
+            ),
+            summed_ring_publish_to_validated_ready_ns=(
+                summed_publish_to_validated_ready_ns
+            ),
+            parent_complete_consumption_ns=(
+                checkpoint_return_ns - scan_start_ns
+            ),
+            checkpoint_access_ns=(
+                checkpoint_return_ns - checkpoint_start_ns
+            ),
+            cursor_open_return_to_checkpoint_ns=(
+                checkpoint_return_ns - open_return_ns
+            ),
+        )
+
+    first_target = targets[0]
+    _require(
+        all(target == first_target for target in targets),
+        "repeated worker deltas returned conflicting checkpoints",
+    )
+    checkpoints[instrument_id] = first_target
+    _emit(
+        "DONE",
+        command=command_index,
+        operation=(
+            "WORKER_DELTA_ORIGIN"
+            if origin
+            else "WORKER_DELTA_FROM_VERIFIED"
+        ),
+        samples=repeats,
+        worker_pid=worker.pid,
         saved_generation=first_target.generation,
         saved_tick_record_count=(
             first_target.instrument_tick_record_count
@@ -1266,6 +1616,88 @@ def _stop_history_loop(
     )
 
 
+def _start_worker_delta_loop(
+    worker,
+    *,
+    command_index: int,
+    instrument_id: int,
+    expected_generation: int,
+    expected_records: int,
+) -> _WorkerDeltaLoop:
+    loop = _WorkerDeltaLoop(
+        worker,
+        instrument_id=instrument_id,
+        expected_generation=expected_generation,
+        expected_records=expected_records,
+    )
+    first = loop.start_and_wait_for_first_scan()
+    try:
+        _emit(
+            "WORKER_DELTA_LOOP_STARTED",
+            command=command_index,
+            main_pid=os.getpid(),
+            worker_pid=worker.pid,
+            instrument_id=instrument_id,
+            generation=expected_generation,
+            expected_records=expected_records,
+            requested_page_records=_PAGE_RECORDS,
+            scans=first.scans,
+            records=first.records,
+            data_page_count=first.data_page_count,
+            terminal_page_count=first.terminal_page_count,
+            projected_value_count=first.projected_value_count,
+            checksum=first.checksum,
+            scan_ns=first.scan_ns,
+            started_ns=first.started_ns,
+            first_complete_ns=first.updated_ns,
+        )
+    except BaseException:
+        loop.stop_and_join()
+        raise
+    loop.continue_after_started_response()
+    return loop
+
+
+def _stop_worker_delta_loop(
+    loop: _WorkerDeltaLoop,
+    *,
+    command_index: int,
+) -> None:
+    stopped_ns = _now_ns()
+    final = loop.stop_and_join()
+    joined_ns = _now_ns()
+    _require(
+        final.scans >= 1,
+        "worker delta loop stopped without one complete scan",
+    )
+    rate = (
+        0
+        if final.scan_ns == 0
+        else final.records * 1_000_000_000 // final.scan_ns
+    )
+    _emit(
+        "WORKER_DELTA_LOOP_STOPPED",
+        command=command_index,
+        main_pid=os.getpid(),
+        worker_pid=loop._worker.pid,
+        instrument_id=loop.instrument_id,
+        generation=loop.expected_generation,
+        expected_records=loop.expected_records,
+        scans=final.scans,
+        records=final.records,
+        data_page_count=final.data_page_count,
+        terminal_page_count=final.terminal_page_count,
+        projected_value_count=final.projected_value_count,
+        checksum=final.checksum,
+        scan_ns=final.scan_ns,
+        scan_records_per_second=rate,
+        stop_call_ns=stopped_ns,
+        joined_ns=joined_ns,
+        wall_elapsed_ns=joined_ns - final.started_ns,
+        join_wait_ns=joined_ns - stopped_ns,
+    )
+
+
 def _parse_latest_series(
     words: list[str],
 ) -> tuple[int, int, int]:
@@ -1466,6 +1898,7 @@ def main(argv: list[str]) -> int:
     )
 
     checkpoints: dict[int, object] = {}
+    worker_checkpoints: dict[int, object] = {}
     rolling_lanes: dict[
         tuple[int, str, int], list[_RollingLane]
     ] = {}
@@ -1475,6 +1908,11 @@ def main(argv: list[str]) -> int:
         timeout=5.0,
         stale_after_ns=None,
     ) as client:
+        delta_worker = client.open_instrument_tick_delta_worker(
+            result_columns=("price_p6",),
+            ring_slots=4,
+            result_batch_records=_PAGE_RECORDS,
+        )
         session = client.session_info()
         clock = time.get_clock_info("monotonic")
         _emit(
@@ -1492,10 +1930,17 @@ def main(argv: list[str]) -> int:
                 1, round(clock.resolution * 1_000_000_000)
             ),
             gc_enabled=gc.isenabled(),
+            main_pid=os.getpid(),
+            worker_pid=delta_worker.pid,
+            worker_ring_slots=delta_worker.ring_slots,
+            worker_result_batch_records=(
+                delta_worker.result_batch_records
+            ),
         )
 
         command_index = 0
         history_loop: Optional[_HistoryLoop] = None
+        worker_loop: Optional[_WorkerDeltaLoop] = None
         try:
             for line in sys.stdin:
                 words = line.strip().split()
@@ -1507,8 +1952,8 @@ def main(argv: list[str]) -> int:
                         "QUIT takes no arguments",
                     )
                     _require(
-                        history_loop is None,
-                        "STOP_HISTORY_LOOP is required before QUIT",
+                        history_loop is None and worker_loop is None,
+                        "all scan loops must stop before QUIT",
                     )
                     _emit("BYE", commands=command_index)
                     return 0
@@ -1528,12 +1973,30 @@ def main(argv: list[str]) -> int:
                     )
                     history_loop = None
                     continue
+                if operation == "STOP_WORKER_DELTA_LOOP":
+                    _require(
+                        len(words) == 1,
+                        "STOP_WORKER_DELTA_LOOP takes no arguments",
+                    )
+                    _require(
+                        worker_loop is not None,
+                        "no worker delta loop is running",
+                    )
+                    command_index += 1
+                    _stop_worker_delta_loop(
+                        worker_loop,
+                        command_index=command_index,
+                    )
+                    worker_loop = None
+                    continue
                 if history_loop is not None:
                     history_loop.ensure_healthy()
+                if worker_loop is not None:
+                    worker_loop.ensure_healthy()
                 if operation == "START_HISTORY_LOOP":
                     _require(
-                        history_loop is None,
-                        "a history loop is already running",
+                        history_loop is None and worker_loop is None,
+                        "a scan loop is already running",
                     )
                     (
                         instrument_id,
@@ -1551,6 +2014,25 @@ def main(argv: list[str]) -> int:
                         expected_records=expected_records,
                     )
                     continue
+                if operation == "START_WORKER_DELTA_LOOP":
+                    _require(
+                        history_loop is None and worker_loop is None,
+                        "a scan loop is already running",
+                    )
+                    (
+                        instrument_id,
+                        generation,
+                        expected_records,
+                    ) = _parse_worker_delta_loop(words)
+                    command_index += 1
+                    worker_loop = _start_worker_delta_loop(
+                        delta_worker,
+                        command_index=command_index,
+                        instrument_id=instrument_id,
+                        expected_generation=generation,
+                        expected_records=expected_records,
+                    )
+                    continue
                 if operation == "LATEST_SERIES":
                     (
                         instrument_id,
@@ -1562,7 +2044,11 @@ def main(argv: list[str]) -> int:
                         client,
                         LatestStatus,
                         InconsistentReadError,
-                        history_loop,
+                        (
+                            history_loop
+                            if history_loop is not None
+                            else worker_loop
+                        ),
                         command_index=command_index,
                         instrument_id=instrument_id,
                         first_ingress=first_ingress,
@@ -1577,10 +2063,34 @@ def main(argv: list[str]) -> int:
                         "DELTA_FROM_VERIFIED",
                         "ROLLING_ORIGIN",
                         "ROLLING_FROM_VERIFIED",
+                        "WORKER_DELTA_ORIGIN",
+                        "WORKER_DELTA_FROM_VERIFIED",
                     ),
                     "unknown probe command",
                 )
                 command_index += 1
+                if operation.startswith("WORKER_DELTA_"):
+                    (
+                        instrument_id,
+                        generation,
+                        projection,
+                        repeats,
+                        expected_records,
+                    ) = _parse_measurement(words)
+                    _run_worker_delta(
+                        delta_worker,
+                        worker_checkpoints,
+                        command_index=command_index,
+                        origin=(
+                            operation == "WORKER_DELTA_ORIGIN"
+                        ),
+                        instrument_id=instrument_id,
+                        expected_generation=generation,
+                        projection=projection,
+                        repeats=repeats,
+                        expected_records=expected_records,
+                    )
+                    continue
                 if operation.startswith("ROLLING_"):
                     (
                         instrument_id,
@@ -1639,6 +2149,12 @@ def main(argv: list[str]) -> int:
                     history_loop.stop_and_join()
                 except BaseException:
                     pass
+            if worker_loop is not None:
+                try:
+                    worker_loop.stop_and_join()
+                except BaseException:
+                    pass
+            delta_worker.close()
     raise RuntimeError("stdin reached EOF before QUIT")
 
 
