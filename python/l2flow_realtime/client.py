@@ -7,7 +7,10 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional, Sequence, Union
 
-from ._history_worker_protocol import DEFAULT_RESULT_COLUMNS
+from ._history_worker_protocol import (
+    ALL_RESULT_COLUMNS,
+    DEFAULT_RESULT_COLUMNS,
+)
 from ._stream_control import validate_socket_path, validate_timeout
 from .control import discover_session_fd
 from .models import (
@@ -32,11 +35,17 @@ from .native import MAX_BATCH_RECORDS, NativeReader
 if TYPE_CHECKING:
     from .history import HistoryCursor
     from .history_worker import InstrumentTickDeltaWorker
+    from .instrument_derived_event_history import (
+        InstrumentDerivedEventHistoryReader,
+    )
+    from .instrument_raw_event_history import InstrumentRawEventHistoryReader
     from .instrument_delta import InstrumentTickDeltaSession
+    from .order_event_delta_live import LiveOrderEventDeltaReader
 
 
 DEFAULT_STALE_AFTER_NS = 3_000_000_000
 MAX_HEALTH_CHECK_INTERVAL_NS = 100_000_000
+_USE_CLIENT_CONTROL_TIMEOUT = object()
 
 
 def _uint32(value, field: str) -> int:
@@ -385,6 +394,98 @@ class L2FlowClient:
                 )
             return results
 
+    def open_live_order_events(
+        self,
+        event_control_socket_path,
+        *,
+        native_library=None,
+        native_library_path=None,
+        timeout=_USE_CLIENT_CONTROL_TIMEOUT,
+        batch_records: int = 4096,
+        _socket_factory=None,
+    ) -> "LiveOrderEventDeltaReader":
+        """Attach to the live derived-event ring for this source session.
+
+        The event aggregator has a distinct control socket and session. This
+        method sends the current Wire V2 run/epoch/trading-date identity,
+        validates the returned ring, and rechecks the Wire V2 session after
+        the potentially blocking Unix control exchange.
+        """
+
+        from .order_event_delta_control import (
+            LiveOrderEventDeltaSourceSession,
+            open_live_order_events,
+        )
+
+        if native_library is not None and native_library_path is not None:
+            raise ValueError(
+                "native_library and native_library_path are mutually "
+                "exclusive"
+            )
+        with self._lock:
+            session = self._checked_session()
+            expected_source = LiveOrderEventDeltaSourceSession(
+                run_id=session.run_id,
+                session_epoch=session.session_epoch,
+                trade_date=session.trade_date,
+            )
+            effective_timeout = (
+                self._control_timeout
+                if timeout is _USE_CLIENT_CONTROL_TIMEOUT
+                else timeout
+            )
+            effective_library = native_library
+            if (
+                effective_library is None
+                and native_library_path is None
+            ):
+                effective_library = getattr(
+                    self._native, "_library", None
+                )
+                if effective_library is None:
+                    raise UnavailableError(
+                        "an event-delta native library or path is required"
+                    )
+
+        # Do not hold the latest-read lock during a control socket exchange.
+        connector_arguments = {}
+        if _socket_factory is not None:
+            connector_arguments["_socket_factory"] = _socket_factory
+        reader = open_live_order_events(
+            event_control_socket_path,
+            expected_source_session=expected_source,
+            native_library=effective_library,
+            native_library_path=native_library_path,
+            timeout=effective_timeout,
+            batch_records=batch_records,
+            **connector_arguments,
+        )
+        try:
+            with self._lock:
+                current = self._checked_session()
+                current_source = LiveOrderEventDeltaSourceSession(
+                    run_id=current.run_id,
+                    session_epoch=current.session_epoch,
+                    trade_date=current.trade_date,
+                )
+                if current_source != expected_source:
+                    raise StaleSessionError(
+                        "Wire V2 source session changed while opening "
+                        "live order events"
+                    )
+                snapshot = reader.control_snapshot
+                if (
+                    snapshot is None
+                    or snapshot.source_session != expected_source
+                ):
+                    raise StaleSessionError(
+                        "live event reader has the wrong source session"
+                    )
+            return reader
+        except BaseException:
+            reader.close()
+            raise
+
     def open_instrument_history(
         self,
         instrument_id: int,
@@ -541,6 +642,66 @@ class L2FlowClient:
         except BaseException:
             worker.close()
             raise
+
+    def open_instrument_raw_event_history(
+        self,
+        *,
+        raw_event_columns: Sequence[str] = (
+            ALL_RESULT_COLUMNS
+        ),
+        ring_slots: int = 4,
+        batch_capacity: int = 4096,
+    ) -> "InstrumentRawEventHistoryReader":
+        """Open the public full/rolling raw instrument-event reader.
+
+        One isolated worker process is created here and reused by every
+        sequential ``read_all`` or ``read_updates`` call on the returned
+        reader.  It contains normalized Wire V2 tick/order/transaction
+        records from source slots 1/3 only; snapshots and derived canonical
+        events are not included.
+        """
+
+        from .instrument_raw_event_history import (
+            InstrumentRawEventHistoryReader,
+        )
+
+        worker = self.open_instrument_tick_delta_worker(
+            result_columns=raw_event_columns,
+            ring_slots=ring_slots,
+            result_batch_records=batch_capacity,
+        )
+        try:
+            return InstrumentRawEventHistoryReader(self, worker)
+        except BaseException:
+            worker.close()
+            raise
+
+    def open_instrument_derived_event_history(
+        self,
+        instrument,
+        *,
+        maximum_order_states: int = 1_000_000,
+        page_records: int = 4096,
+    ) -> "InstrumentDerivedEventHistoryReader":
+        """Open one stateful full/rolling derived-event reader.
+
+        The reader is permanently bound to ``instrument`` and directly uses
+        the native Shanghai or Shenzhen order-event core. It returns source
+        TRADE/CANCEL/STATUS events and revisioned order snapshots, not raw
+        Wire rows. Sequential updates preserve the native order state built
+        by the initial full scan.
+        """
+
+        from .instrument_derived_event_history import (
+            _open_instrument_derived_event_history,
+        )
+
+        return _open_instrument_derived_event_history(
+            self,
+            instrument,
+            maximum_order_states=maximum_order_states,
+            page_records=page_records,
+        )
 
     def _validate_latest(self, results, ids, expected_type) -> None:
         if len(results) != len(ids):

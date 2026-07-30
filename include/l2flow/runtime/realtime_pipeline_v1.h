@@ -31,6 +31,11 @@ struct RealtimePipelineSdkConfigV1 final {
     bool enabled = false;
     std::filesystem::path library_path;
     int work_threads = 1;
+    // V1 production capture requires exactly one SDK I/O thread and creates
+    // the Subscriber with multithread_callback=false. This preserves the
+    // already-merged callback order required by the Shenzhen 6.33/6.36
+    // channel ApplSeqNum contract; the downstream projector additionally
+    // fail-closes on a non-increasing sequence.
     int io_threads = 1;
     std::string log_prefix = "l2flow-realtime";
     bool log_to_console = false;

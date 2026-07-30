@@ -5,7 +5,6 @@ L2Flow is a C++20 realtime market-data runtime. The production chain is:
 ```text
 vendor SDK callback
   -> bounded owned-message copy
-  -> mandatory nonblocking Journal-queue admission
   -> nonblocking ordered-processing-queue admission
   -> callback return
 
@@ -15,10 +14,6 @@ ordered in-memory processing dispatcher
   -> intraday Store, latest IPC, and KLine
   -> contiguous applied watermark
   -> immutable Store/Factor generation
-
-independent Journal writer
-  -> batch write and fdatasync
-  -> durable watermark
 ```
 
 This branch implements a hard Wire V2 replacement. There is no immutable
@@ -58,9 +53,8 @@ The live status contains:
 - `snapshot_available_count`, `tick_available_count`, and
   `factor_eligible_count`;
 - `catalog_generation`, `data_state_generation`, and `catalog_digest`;
-- `accepted_sequence`, `durable_sequence`, and `applied_sequence`;
+- `accepted_sequence` and `applied_sequence`;
 - `processing_lag_records = accepted_sequence - applied_sequence`;
-- `durability_lag_records = accepted_sequence - durable_sequence`.
 
 The enforced relations are:
 
@@ -68,26 +62,22 @@ The enforced relations are:
 factor_eligible_count <= snapshot_available_count
 snapshot_available_count <= available_count <= bound_count <= capacity
 tick_available_count <= available_count
-durable_sequence <= accepted_sequence
 applied_sequence <= accepted_sequence
 ```
 
 Readers become usable while `bound_count == 0`; neither catalog completion nor
-either progress lag is a startup gate. There is deliberately no ordering
-requirement between `durable_sequence` and `applied_sequence`.
+processing lag is a startup gate.
 
 ## Latency-sensitive path
 
 The SDK callback performs no file I/O and no catalog scan. It copies into a
-bounded pool once, gives the same immutable message two intrusive references,
-and nonblockingly admits the Journal reference before the ordered-processing
-reference. Journal-queue exhaustion fails the session closed instead of
-silently dropping the record; successful admission never waits for `write` or
-`fdatasync`.
+bounded pool once and nonblockingly transfers the immutable message to the
+ordered-processing queue. Queue exhaustion fails the session closed instead
+of silently dropping the record.
 
 Before the SDK connects, the pool prewarms the complete bounded in-flight
 window for wire messages up to 4,096 bytes and physically touches those
-pages. The window includes Journal, ordered processing, decoder, batch, and
+pages. The window includes ordered processing, decoder, batch, and
 applied-completion ownership, whose retained sequence ranges need not overlap.
 Prewarming is capped at 256 MiB, so unusually large configured windows do not
 turn startup into an unbounded reservation. Larger legal messages retain the
@@ -100,15 +90,9 @@ an explicit applied-sequence window `W`: a record with capture sequence `s`
 is routed only while
 `0 < s - applied_sequence <= W`, and the IPC tick ring is required to have at
 least `W` slots. This bounds out-of-order completion without making the SDK
-callback wait on decoder, Store, IPC, or disk work.
+callback wait on decoder, Store, or IPC work.
 
-The independent Journal writer collects at most 64 records, with a default
-maximum batch-collection delay of 50 microseconds, then writes, calls
-`fdatasync`, and advances `durable_sequence`. A writer failure is terminal for
-the session, but durability never gates Decoder, Store, IPC, or Python
-visibility.
-
-The accepted/durable/applied status tuple is coalesced by a background
+The accepted/applied status tuple is coalesced by a background
 publisher on a 1 ms cadence. Per-record progress notifications therefore do
 not compete continuously with early-session binding and first-availability
 updates; latest slot publication and reads do not wait for this status
@@ -125,21 +109,19 @@ operation whose local sorted index is rebuilt lazily only when
 `catalog_generation` changes.
 
 An explicit Store/Factor generation cut installs a processing-dispatch barrier
-at the accepted sequence under a short admission lock. Callbacks resume both
-queue admissions immediately; the cut waits only for that prefix to become
+at the accepted sequence under a short admission lock. Callbacks resume queue
+admission immediately; the cut waits only for that prefix to become
 applied, then freezes its Catalog Snapshot and enqueues Store/Factor markers.
-Its durability watermark is an independent observation and is not awaited.
 Each Store/KLine owner publishes a constant-size cut token after its source
 fences; it does not scan or copy its instrument partition. The first post-cut
 update to a row lazily freezes that row's pre-cut endpoint, while a background
 builder materializes only the Catalog Snapshot's bound prefix. Unbound capacity
 rows are not emitted. The cut is not a gate for live latest reads.
 
-The Journal is a fresh per-session asynchronous capture file, not a recovery
-engine. This implementation has no startup replay gate, intraday replay,
-checkpoint, clean-stop marker, or durability-before-visibility rule. After an
-abnormal process loss, records that were visible beyond `durable_sequence`
-are not promised to be recoverable.
+The runtime itself does not persist captured messages. It has no startup
+replay gate, Raw WAL, intraday replay, or crash-recovery path. Deployments that
+need recovery must retain an independent source capture and replay it in a
+separate recovery workflow.
 
 ## Build and test
 
@@ -167,9 +149,8 @@ The production executable is `build/mdl-production-router`. Use
 ```bash
 build/mdl-production-router \
   --sdk-library /absolute/path/to/vendor.so \
-  --journal-path /absolute/path/to/fresh-session.journal \
   --session-epoch 1 \
-  --trade-date 20260729 \
+  --trade-date 20260730 \
   --server-address HOST:PORT \
   --user-name USER \
   --ipc-socket /absolute/path/to/l2flow.sock \
@@ -178,9 +159,35 @@ build/mdl-production-router \
   --intraday-store-from-open
 ```
 
-The Journal path and control socket must not already exist. Operational code
-must assert `--intraday-store-from-open`; this replacement runtime does not
-offer a partial-session or recovery startup mode.
+The control socket must not already exist. Operational code must assert
+`--intraday-store-from-open`; this replacement runtime does not offer a
+partial-session or recovery startup mode.
+
+For the strict live order-event path, add
+`--event-aggregator-socket /absolute/private/events.sock` to the router and
+start `build/mdl-order-event-aggregator` against the router's source socket:
+
+```bash
+build/mdl-order-event-aggregator \
+  --source-socket /absolute/private/l2flow.sock \
+  --event-socket /absolute/private/events.sock \
+  --session-epoch 1 \
+  --trade-date 20260730 \
+  --shanghai-state-capacity 5000000 \
+  --shenzhen-state-capacity 5000000 \
+  --event-ring-capacity 1048576 \
+  --event-maximum-mapping-bytes 1073741824 \
+  --read-batch-records 4096 \
+  --poll-ms 1 \
+  --timeout-ms 1000
+```
+
+Both socket parents must be same-UID, owner-only directories and neither
+socket may already exist. With the event socket configured, the router starts
+its source IPC service, then waits for an exact source run/epoch/day event
+service at the zero-prefix origin before creating the SDK pipeline. Size the
+source and event rings for measured rates and maximum reader pauses; an
+overrun fails closed and this version does not catch up or recover.
 
 ### Default Mainland A-share admission filter
 
@@ -262,6 +269,98 @@ with L2FlowClient.connect("/absolute/path/to/l2flow.sock") as client:
 `select()` returns its IDs and counts in one coherent observed-universe
 envelope. Once a caller has a session-scoped ID, `latest_snapshot()`,
 `latest_tick()`, and `latest_kline()` use the direct known-ID path.
+
+The market library also provides deterministic order-analysis cores for the
+Shanghai 4.24 combined order/trade stream and the Shenzhen 6.33/6.36 streams.
+They preserve raw trades/cancels, publish revisioned order states, keep
+source/ingress/tick sequence domains separate, and use integer fixed-point
+arithmetic throughout. The Shanghai T-only reconstruction reports fill volume
+as a lower bound and BUY-max/SELL-min fill price as an inferred execution
+boundary, never as a proven original limit. See
+[`docs/order-event-reconstruction-v1.md`](docs/order-event-reconstruction-v1.md)
+for phase, quantity, sequence, and quality-flag semantics.
+
+The supported per-instrument raw/normalized event history API provides both an
+initial finite read and checkpoint-based rolling updates through one reusable
+isolated worker process:
+
+```python
+with L2FlowClient.connect("/absolute/path/to/l2flow.sock") as client:
+    with client.open_instrument_raw_event_history(
+        raw_event_columns=(
+            "ingress_sequence",
+            "tick_stream_sequence",
+            "action",
+            "primary_order_id",
+            "buy_order_id",
+            "sell_order_id",
+            "price_p6",
+            "quantity_raw",
+            "quantity_scale",
+        )
+    ) as history:
+        with history.read_all(1) as initial:
+            for batch in initial.batches():
+                consume(batch.materialize_all())
+            checkpoint = initial.verified_checkpoint
+
+        with history.read_updates(1, checkpoint) as update:
+            for batch in update.batches():
+                consume(batch.materialize_all())
+            checkpoint = update.verified_checkpoint
+```
+
+This interface contains Wire V2 source-slot 1/3 Shanghai tick events and
+Shenzhen order/transaction events. It is suitable as aggregator replay input;
+it contains neither snapshots nor derived canonical order-lifecycle events.
+A checkpoint becomes usable only after explicit EOF has been consumed. See
+[`docs/instrument-raw-event-history-api.md`](docs/instrument-raw-event-history-api.md)
+for lifecycle, coverage, column-selection, and ordering details.
+
+The formal derived history reader is instrument-bound and keeps the same
+native Shanghai/Shenzhen order state across the initial replay and rolling
+updates:
+
+```python
+with client.open_instrument_derived_event_history(1) as history:
+    with history.read_all() as initial:
+        for batch in initial.batches():
+            consume(tuple(batch))
+        checkpoint = initial.verified_checkpoint
+
+    with history.read_updates(checkpoint) as update:
+        for batch in update.batches():
+            consume(tuple(batch))
+        checkpoint = update.verified_checkpoint
+```
+
+It returns source trades/cancels/status plus revisioned order snapshots; it is
+not the raw Wire API above. A generation boundary never finalizes orders, so
+T-to-A transitions remain continuous across updates. See
+[`docs/instrument-derived-event-history-api.md`](docs/instrument-derived-event-history-api.md).
+
+The standalone `mdl-order-event-aggregator` consumes every record in the
+dense global tick ring and publishes a fail-closed event-delta memfd ring. It
+assigns a distinct dense derived-event sequence, advances the source-tick
+cursor even for zero-event ticks, and publishes each source cursor only after
+that tick's complete derived batch. C++, stable C ABI, and Python readers use
+an authenticated same-UID control socket and an O_RDONLY sealed mapping:
+
+```python
+with client.open_live_order_events(
+    "/absolute/private/events.sock"
+) as live:
+    for batch in live.read_available(maximum_batches=8):
+        consume_zero_copy(batch.buffer)
+```
+
+A finite reader batch can split an already committed source tick; consumers
+which need tick-atomic upserts group by `tick_stream_sequence` and use
+`batch.drains_published_prefix` before committing the trailing group. Source
+clean-stop drains and clean-stops the event ring, but does not invent a
+source-free Shenzhen end-of-day finalization. See
+[`docs/order-event-reconstruction-v1.md`](docs/order-event-reconstruction-v1.md)
+for the control protocol, capacity invariant, and failure semantics.
 
 The precise runtime, count, generation, and bias semantics are documented in
 [`docs/observed-universe-runtime-v2.md`](docs/observed-universe-runtime-v2.md).

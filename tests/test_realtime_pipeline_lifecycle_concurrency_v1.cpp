@@ -498,6 +498,26 @@ int main() {
         return 1;
     }
 
+    {
+        runtime::RealtimePipelineConfigV1 unordered_sdk =
+            MakeConfig(directory.get());
+        unordered_sdk.sdk.io_threads = 2;
+        std::unique_ptr<runtime::RealtimePipelineV1>
+            rejected_pipeline;
+        std::string rejected_detail;
+        test.Expect(
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(unordered_sdk),
+                std::make_shared<RecordingFactory>(
+                    std::make_shared<LifecycleState>()),
+                &rejected_pipeline,
+                &rejected_detail) ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kInvalidConfiguration &&
+                rejected_pipeline == nullptr,
+            "production capture rejects multiple SDK I/O threads");
+    }
+
     auto state = std::make_shared<LifecycleState>();
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
     std::string detail;

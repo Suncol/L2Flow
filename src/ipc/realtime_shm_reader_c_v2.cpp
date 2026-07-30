@@ -1,22 +1,29 @@
 #include "l2flow/ipc/realtime_shm_reader_c_v2.h"
 
+#include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <new>
+#include <type_traits>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #ifndef F_SEAL_FUTURE_WRITE
@@ -55,6 +62,85 @@ static_assert(
 static_assert(
     offsetof(l2flow_selection_envelope_v2, reserved) == 136U);
 static_assert(
+    sizeof(l2flow_instrument_raw_event_history_endpoint_v2) == 248U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_endpoint_v2,
+        session_epoch) == 16U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_endpoint_v2,
+        catalog_digest) == 96U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_endpoint_v2,
+        source_stream_ids) == 160U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_endpoint_v2,
+        source_sequence_exclusive) == 176U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_endpoint_v2,
+        trade_date) == 208U);
+static_assert(
+    sizeof(l2flow_instrument_raw_event_history_checkpoint_v2) == 312U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_checkpoint_v2,
+        instrument_id) == 248U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_checkpoint_v2,
+        instrument_event_source_record_counts) == 256U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_checkpoint_v2,
+        reserved) == 304U);
+static_assert(
+    sizeof(l2flow_instrument_raw_event_history_metadata_v2) == 720U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_metadata_v2,
+        base_checkpoint) == 8U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_metadata_v2,
+        target_checkpoint) == 320U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_metadata_v2,
+        delta_event_source_record_counts) == 632U);
+static_assert(
+    offsetof(
+        l2flow_instrument_raw_event_history_metadata_v2,
+        reserved) == 712U);
+static_assert(
+    std::is_trivially_copyable_v<
+        l2flow_instrument_raw_event_history_endpoint_v2>);
+static_assert(
+    std::is_trivially_copyable_v<
+        l2flow_instrument_raw_event_history_checkpoint_v2>);
+static_assert(
+    std::is_trivially_copyable_v<
+        l2flow_instrument_raw_event_history_metadata_v2>);
+static_assert(
+    static_cast<std::uint32_t>(
+        L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SOURCE_MASK_V2) ==
+    l2flow::ipc::kRealtimeInstrumentTickDeltaSourceMaskV2);
+static_assert(
+    static_cast<std::uint32_t>(
+        L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_EVENT_COVERAGE_COMPLETE_V2) ==
+    static_cast<std::uint32_t>(
+        l2flow::ipc::
+            kRealtimeInstrumentTickDeltaTickRecordCoverageCompleteV2));
+static_assert(
+    L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CORE_WIRE_V2 ==
+    static_cast<int>(
+        l2flow::ipc::
+            RealtimeInstrumentTickDeltaPayloadProjectionV2::
+                kCoreV2));
+static_assert(
     std::atomic_ref<std::uint8_t>::is_always_lock_free,
     "Wire V2 row publication requires lock-free byte atomic_ref");
 static_assert(
@@ -73,7 +159,20 @@ static_assert(
 namespace {
 
 using l2flow::ipc::RealtimeCatalogScopeV2;
+using l2flow::ipc::RealtimeGenerationEndpointV2;
 using l2flow::ipc::RealtimeInstrumentBindingStateV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaBaseKindV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaCheckpointV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaControlOpcodeV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaControlStatusV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaMetadataV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaOpenInstrumentRequestV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaOpenInstrumentResponseV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaOpenSessionRequestV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaPageHeaderV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaReadRequestV2;
+using l2flow::ipc::RealtimeInstrumentTickDeltaReadResponseV2;
 using l2flow::ipc::RealtimeRegionKindV2;
 using l2flow::ipc::RealtimeSelectionScopeV2;
 using l2flow::ipc::RealtimeServerStateV2;
@@ -2468,5 +2567,1256 @@ extern "C" int l2flow_shm_reader_select_instruments_v2(
         return L2FLOW_SHM_READER_INCONSISTENT_READ_V2;
     } catch (...) {
         return L2FLOW_SHM_READER_SYSTEM_ERROR_V2;
+    }
+}
+
+struct l2flow_instrument_raw_event_history_cursor_v2;
+
+struct l2flow_instrument_raw_event_history_session_v2 final {
+    int socket_fd = -1;
+    RealtimeGenerationEndpointV2 target{};
+    std::uint64_t session_token = 0U;
+    l2flow_instrument_raw_event_history_cursor_v2* active_cursor =
+        nullptr;
+};
+
+struct l2flow_instrument_raw_event_history_cursor_v2 final {
+    l2flow_instrument_raw_event_history_session_v2* session = nullptr;
+    RealtimeInstrumentTickDeltaMetadataV2 metadata{};
+    std::uint32_t requested_page_records = 0U;
+    std::uint64_t read_token = 0U;
+    std::uint64_t next_page_index = 0U;
+    std::uint64_t cumulative_record_count = 0U;
+    std::array<std::uint64_t, 4U>
+        cumulative_source_record_counts{};
+    std::array<std::uint64_t, 4U> last_source_sequences{};
+    std::uint64_t last_ingress_sequence = 0U;
+    std::uint64_t last_tick_stream_sequence = 0U;
+    const void* page_mapping = MAP_FAILED;
+    std::size_t page_mapping_bytes = 0U;
+    bool eof = false;
+    bool failed = false;
+};
+
+namespace {
+
+constexpr std::uint32_t kMaximumEventHistoryPageRecords =
+    1024U * 1024U;
+
+static_assert(
+    sizeof(RealtimeGenerationEndpointV2) ==
+    sizeof(l2flow_instrument_raw_event_history_endpoint_v2));
+static_assert(
+    sizeof(RealtimeInstrumentTickDeltaCheckpointV2) ==
+    sizeof(l2flow_instrument_raw_event_history_checkpoint_v2));
+static_assert(
+    sizeof(RealtimeInstrumentTickDeltaMetadataV2) ==
+    sizeof(l2flow_instrument_raw_event_history_metadata_v2));
+
+template <typename Destination, typename Source>
+void CopyObjectBytes(
+    Destination* destination,
+    const Source& source) noexcept {
+    static_assert(sizeof(Destination) == sizeof(Source));
+    static_assert(std::is_trivially_copyable_v<Destination>);
+    static_assert(std::is_trivially_copyable_v<Source>);
+    std::memcpy(
+        static_cast<void*>(destination),
+        static_cast<const void*>(&source),
+        sizeof(source));
+}
+
+template <typename Value>
+bool ObjectBytesZero(const Value& value) noexcept {
+    const auto* const bytes =
+        reinterpret_cast<const std::uint8_t*>(&value);
+    return std::all_of(
+        bytes,
+        bytes + sizeof(value),
+        [](std::uint8_t byte) noexcept { return byte == 0U; });
+}
+
+bool SessionExpectationValid(
+    const l2flow_shm_session_info_v2& session) noexcept {
+    return AnyNonzero(std::array<std::uint8_t, 16U>{
+               session.run_id[0U],
+               session.run_id[1U],
+               session.run_id[2U],
+               session.run_id[3U],
+               session.run_id[4U],
+               session.run_id[5U],
+               session.run_id[6U],
+               session.run_id[7U],
+               session.run_id[8U],
+               session.run_id[9U],
+               session.run_id[10U],
+               session.run_id[11U],
+               session.run_id[12U],
+               session.run_id[13U],
+               session.run_id[14U],
+               session.run_id[15U]}) &&
+           session.session_epoch != 0U && session.trade_date != 0U &&
+           session.capacity != 0U;
+}
+
+bool EndpointMatchesSession(
+    const RealtimeGenerationEndpointV2& endpoint,
+    const l2flow_shm_session_info_v2& session) noexcept {
+    return std::equal(
+               endpoint.run_id.begin(),
+               endpoint.run_id.end(),
+               session.run_id) &&
+           endpoint.session_epoch == session.session_epoch &&
+           endpoint.trade_date == session.trade_date &&
+           endpoint.capacity == session.capacity;
+}
+
+void ReleaseHistoryPage(
+    l2flow_instrument_raw_event_history_cursor_v2* cursor) noexcept {
+    if (cursor == nullptr) {
+        return;
+    }
+    if (cursor->page_mapping != MAP_FAILED &&
+        cursor->page_mapping_bytes != 0U) {
+        static_cast<void>(::munmap(
+            const_cast<void*>(cursor->page_mapping),
+            cursor->page_mapping_bytes));
+    }
+    cursor->page_mapping = MAP_FAILED;
+    cursor->page_mapping_bytes = 0U;
+}
+
+void CloseHistoryTransport(
+    l2flow_instrument_raw_event_history_session_v2* session) noexcept {
+    if (session == nullptr || session->socket_fd < 0) {
+        return;
+    }
+    static_cast<void>(::shutdown(session->socket_fd, SHUT_RDWR));
+    static_cast<void>(::close(session->socket_fd));
+    session->socket_fd = -1;
+    session->session_token = 0U;
+}
+
+void FailHistoryCursor(
+    l2flow_instrument_raw_event_history_cursor_v2* cursor) noexcept {
+    if (cursor == nullptr) {
+        return;
+    }
+    ReleaseHistoryPage(cursor);
+    cursor->failed = true;
+    cursor->read_token = 0U;
+    if (cursor->session != nullptr) {
+        if (cursor->session->active_cursor == cursor) {
+            cursor->session->active_cursor = nullptr;
+        }
+        CloseHistoryTransport(cursor->session);
+        cursor->session = nullptr;
+    }
+}
+
+std::uint64_t NextHistoryRequestId() noexcept {
+    static std::atomic<std::uint64_t> next{1U};
+    const std::uint64_t value =
+        next.fetch_add(1U, std::memory_order_relaxed);
+    if (value != 0U) {
+        return value;
+    }
+    return next.fetch_add(1U, std::memory_order_relaxed);
+}
+
+bool SendHistoryRequest(
+    int socket_fd,
+    const void* request,
+    std::size_t request_bytes) noexcept {
+    if (socket_fd < 0 || request == nullptr || request_bytes == 0U) {
+        return false;
+    }
+    ssize_t result = -1;
+    do {
+        result = ::send(
+            socket_fd,
+            request,
+            request_bytes,
+            MSG_NOSIGNAL);
+    } while (result < 0 && errno == EINTR);
+    return result >= 0 &&
+           static_cast<std::size_t>(result) == request_bytes;
+}
+
+template <typename Response>
+int ReceiveHistoryResponse(
+    int socket_fd,
+    Response* output,
+    int* received_fd,
+    std::size_t* received_fd_count) noexcept {
+    if (socket_fd < 0 || output == nullptr ||
+        received_fd == nullptr || received_fd_count == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    *output = {};
+    *received_fd = -1;
+    *received_fd_count = 0U;
+    std::array<std::byte, CMSG_SPACE(sizeof(int) * 2U)> control{};
+    iovec vector{};
+    vector.iov_base = output;
+    vector.iov_len = sizeof(Response);
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1U;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    ssize_t result = -1;
+    do {
+        result = ::recvmsg(
+            socket_fd,
+            &message,
+#ifdef MSG_CMSG_CLOEXEC
+            MSG_CMSG_CLOEXEC
+#else
+            0
+#endif
+        );
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+    }
+    const bool packet_shape_valid =
+        result >= 0 &&
+        static_cast<std::size_t>(result) == sizeof(Response) &&
+        (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) == 0;
+    bool ancillary_valid = true;
+    if (result >= 0) {
+        for (cmsghdr* header = CMSG_FIRSTHDR(&message);
+             header != nullptr;
+             header = CMSG_NXTHDR(&message, header)) {
+            if (header->cmsg_level != SOL_SOCKET ||
+                header->cmsg_type != SCM_RIGHTS ||
+                header->cmsg_len < CMSG_LEN(sizeof(int))) {
+                ancillary_valid = false;
+                continue;
+            }
+            const std::size_t payload_bytes =
+                header->cmsg_len - CMSG_LEN(0U);
+            if (payload_bytes % sizeof(int) != 0U) {
+                ancillary_valid = false;
+                continue;
+            }
+            const std::size_t count =
+                payload_bytes / sizeof(int);
+            const auto* const descriptors =
+                reinterpret_cast<const int*>(CMSG_DATA(header));
+            for (std::size_t index = 0U; index < count; ++index) {
+                if (*received_fd_count == 0U) {
+                    *received_fd = descriptors[index];
+                } else {
+                    static_cast<void>(::close(descriptors[index]));
+                }
+                ++(*received_fd_count);
+            }
+        }
+    }
+    if (!packet_shape_valid || !ancillary_valid ||
+        *received_fd_count > 1U) {
+        if (*received_fd >= 0) {
+            static_cast<void>(::close(*received_fd));
+            *received_fd = -1;
+        }
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+#ifndef MSG_CMSG_CLOEXEC
+    if (*received_fd >= 0) {
+        const int flags = ::fcntl(*received_fd, F_GETFD);
+        if (flags < 0 ||
+            ::fcntl(*received_fd, F_SETFD, flags | FD_CLOEXEC) !=
+                0) {
+            static_cast<void>(::close(*received_fd));
+            *received_fd = -1;
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+        }
+    }
+#endif
+    return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+}
+
+template <typename Response>
+bool HistoryResponsePrefixValid(
+    const Response& response,
+    std::uint64_t request_id,
+    std::uint16_t known_flags) noexcept {
+    return response.magic == l2flow::ipc::kRealtimeControlMagicV2 &&
+           response.protocol_major ==
+               l2flow::ipc::kRealtimeWireMajorV2 &&
+           response.protocol_minor ==
+               l2flow::ipc::kRealtimeWireMinorV2 &&
+           response.message_bytes == sizeof(Response) &&
+           response.request_id == request_id &&
+           (response.flags & ~known_flags) == 0U;
+}
+
+int MapHistoryStatus(std::uint16_t status) noexcept {
+    switch (
+        static_cast<RealtimeInstrumentTickDeltaControlStatusV2>(
+            status)) {
+        case RealtimeInstrumentTickDeltaControlStatusV2::kOk:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::
+            kInvalidRequest:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::
+            kUnsupportedVersion:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_ABI_MISMATCH_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::kUnavailable:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_UNAVAILABLE_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::kNotFound:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_NOT_FOUND_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::
+            kResourceExhausted:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_RESOURCE_EXHAUSTED_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::
+            kInternalFailure:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+        case RealtimeInstrumentTickDeltaControlStatusV2::
+            kCheckpointMismatch:
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CHECKPOINT_MISMATCH_V2;
+    }
+    return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+}
+
+bool ErrorResponseCanonical(
+    const RealtimeInstrumentTickDeltaOpenSessionResponseV2&
+        response) noexcept {
+    return response.flags == 0U && response.reserved0 == 0U &&
+           ObjectBytesZero(response.target_generation) &&
+           response.delta_session_token == 0U;
+}
+
+bool ErrorResponseCanonical(
+    const RealtimeInstrumentTickDeltaOpenInstrumentResponseV2&
+        response) noexcept {
+    return response.flags == 0U && response.reserved0 == 0U &&
+           response.initial_read_token == 0U &&
+           ObjectBytesZero(response.metadata);
+}
+
+bool ErrorResponseCanonical(
+    const RealtimeInstrumentTickDeltaReadResponseV2&
+        response) noexcept {
+    return response.flags == 0U && response.record_count == 0U &&
+           response.page_mapping_bytes == 0U &&
+           response.page_index == 0U &&
+           response.target_generation == 0U &&
+           response.next_read_token == 0U;
+}
+
+bool ConfigureHistoryTimeout(
+    int socket_fd,
+    std::uint32_t timeout_ms) noexcept {
+    if (timeout_ms == 0U) {
+        return true;
+    }
+    timeval timeout{};
+    timeout.tv_sec =
+        static_cast<time_t>(timeout_ms / 1000U);
+    timeout.tv_usec =
+        static_cast<suseconds_t>(
+            (timeout_ms % 1000U) * 1000U);
+    return ::setsockopt(
+               socket_fd,
+               SOL_SOCKET,
+               SO_RCVTIMEO,
+               &timeout,
+               sizeof(timeout)) == 0 &&
+           ::setsockopt(
+               socket_fd,
+               SOL_SOCKET,
+               SO_SNDTIMEO,
+               &timeout,
+           sizeof(timeout)) == 0;
+}
+
+bool HistorySocketPathSyntaxValid(const char* path) noexcept {
+    if (path == nullptr || path[0U] != '/') {
+        return false;
+    }
+    sockaddr_un address{};
+    const std::size_t path_length =
+        ::strnlen(path, sizeof(address.sun_path));
+    return path_length != 0U &&
+           path_length < sizeof(address.sun_path);
+}
+
+int ConnectHistorySocket(
+    const char* path,
+    std::uint32_t timeout_ms) noexcept {
+    if (!HistorySocketPathSyntaxValid(path)) {
+        return -1;
+    }
+    sockaddr_un address{};
+    const std::size_t path_length =
+        ::strnlen(path, sizeof(address.sun_path));
+    if (path_length == 0U ||
+        path_length >= sizeof(address.sun_path)) {
+        return -1;
+    }
+    struct stat path_stat {};
+    if (::lstat(path, &path_stat) != 0 ||
+        !S_ISSOCK(path_stat.st_mode) ||
+        path_stat.st_uid != ::geteuid()) {
+        return -1;
+    }
+    const int socket_fd =
+        ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0 ||
+        !ConfigureHistoryTimeout(socket_fd, timeout_ms)) {
+        if (socket_fd >= 0) {
+            static_cast<void>(::close(socket_fd));
+        }
+        return -1;
+    }
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path, path_length + 1U);
+    if (::connect(
+            socket_fd,
+            reinterpret_cast<const sockaddr*>(&address),
+            static_cast<socklen_t>(sizeof(address))) != 0) {
+        static_cast<void>(::close(socket_fd));
+        return -1;
+    }
+    return socket_fd;
+}
+
+bool HistoryPageDescriptorValid(
+    int descriptor,
+    std::uint64_t mapping_bytes) noexcept {
+    if (descriptor < 0 ||
+        mapping_bytes <
+            l2flow::ipc::
+                kRealtimeInstrumentTickDeltaPageHeaderBytesV2 ||
+        mapping_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
+        return false;
+    }
+    const int descriptor_flags = ::fcntl(descriptor, F_GETFL);
+    const int seals = ::fcntl(descriptor, F_GET_SEALS);
+    constexpr int required_seals =
+        F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    struct stat descriptor_stat {};
+    return descriptor_flags >= 0 && seals >= 0 &&
+           (descriptor_flags & O_ACCMODE) == O_RDONLY &&
+           (seals & required_seals) == required_seals &&
+           ::fstat(descriptor, &descriptor_stat) == 0 &&
+           S_ISREG(descriptor_stat.st_mode) &&
+           descriptor_stat.st_size >= 0 &&
+           static_cast<std::uint64_t>(descriptor_stat.st_size) ==
+               mapping_bytes;
+}
+
+bool DeltaMetadataEqual(
+    const RealtimeInstrumentTickDeltaMetadataV2& left,
+    const RealtimeInstrumentTickDeltaMetadataV2& right) noexcept {
+    return std::memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool ValidateHistoryPayloads(
+    l2flow_instrument_raw_event_history_cursor_v2* cursor,
+    const RealtimeWireTickPayloadV2* records,
+    std::size_t record_count,
+    const RealtimeInstrumentTickDeltaPageHeaderV2& header) noexcept {
+    if (cursor == nullptr || records == nullptr ||
+        record_count == 0U) {
+        return false;
+    }
+    const auto& metadata = cursor->metadata;
+    const auto& target = metadata.target_checkpoint;
+    std::array<std::uint64_t, 4U> source_counts =
+        cursor->cumulative_source_record_counts;
+    std::array<std::uint64_t, 4U> last_sources =
+        cursor->last_source_sequences;
+    std::uint64_t prior_ingress = cursor->last_ingress_sequence;
+    std::uint64_t prior_tick =
+        cursor->last_tick_stream_sequence;
+    std::array<std::uint64_t, 4U> base_source_ends{
+        1U, 1U, 1U, 1U};
+    if (metadata.base_kind ==
+        static_cast<std::uint32_t>(
+            RealtimeInstrumentTickDeltaBaseKindV2::
+                kCheckpoint)) {
+        base_source_ends =
+            metadata.base_checkpoint.generation
+                .source_sequence_exclusive;
+    }
+
+    std::uint64_t first_ingress = 0U;
+    std::uint64_t last_ingress = 0U;
+    std::uint64_t first_tick = 0U;
+    std::uint64_t last_tick = 0U;
+    for (std::size_t index = 0U; index < record_count; ++index) {
+        const RealtimeWireTickPayloadV2& payload = records[index];
+        const auto& common = payload.common;
+        std::uint8_t expected_slot = 0xffU;
+        std::uint8_t expected_market = 0xffU;
+        if (common.event_kind == 2U) {
+            expected_slot = 1U;
+            expected_market = 1U;
+        } else if (
+            common.event_kind == 4U ||
+            common.event_kind == 5U) {
+            expected_slot = 3U;
+            expected_market = 2U;
+        }
+        if (!TickPayloadCanonical(payload) ||
+            expected_slot == 0xffU ||
+            common.instrument_id != target.instrument_id ||
+            common.ordinal != target.ordinal ||
+            common.source_slot != expected_slot ||
+            common.market != expected_market ||
+            common.source_stream_id !=
+                target.generation
+                    .source_stream_ids[expected_slot] ||
+            common.trade_date != target.generation.trade_date ||
+            common.ingress_sequence <
+                metadata.ingress_sequence_begin_inclusive ||
+            common.ingress_sequence >=
+                metadata.ingress_sequence_end_exclusive ||
+            common.tick_stream_sequence <
+                metadata
+                    .tick_stream_sequence_begin_inclusive ||
+            common.tick_stream_sequence >=
+                metadata.tick_stream_sequence_end_exclusive ||
+            common.tick_stream_sequence >
+                common.ingress_sequence ||
+            common.source_sequence <
+                base_source_ends[expected_slot] ||
+            common.source_sequence >=
+                target.generation
+                    .source_sequence_exclusive[expected_slot] ||
+            common.ingress_sequence <= prior_ingress ||
+            common.tick_stream_sequence <= prior_tick ||
+            common.source_sequence <=
+                last_sources[expected_slot]) {
+            return false;
+        }
+        prior_ingress = common.ingress_sequence;
+        prior_tick = common.tick_stream_sequence;
+        last_sources[expected_slot] = common.source_sequence;
+        if (source_counts[expected_slot] ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            return false;
+        }
+        ++source_counts[expected_slot];
+        if (source_counts[expected_slot] >
+            metadata
+                .delta_tick_source_record_counts[expected_slot]) {
+            return false;
+        }
+        if (index == 0U) {
+            first_ingress = common.ingress_sequence;
+            first_tick = common.tick_stream_sequence;
+        }
+        last_ingress = common.ingress_sequence;
+        last_tick = common.tick_stream_sequence;
+    }
+    if (header.first_ingress_sequence != first_ingress ||
+        header.last_ingress_sequence != last_ingress ||
+        header.first_tick_stream_sequence != first_tick ||
+        header.last_tick_stream_sequence != last_tick ||
+        cursor->cumulative_record_count >
+            std::numeric_limits<std::uint64_t>::max() -
+                record_count ||
+        cursor->cumulative_record_count + record_count >
+            metadata.delta_tick_record_count) {
+        return false;
+    }
+    cursor->cumulative_record_count += record_count;
+    cursor->cumulative_source_record_counts = source_counts;
+    cursor->last_source_sequences = last_sources;
+    cursor->last_ingress_sequence = prior_ingress;
+    cursor->last_tick_stream_sequence = prior_tick;
+    return true;
+}
+
+bool ValidateMappedHistoryPage(
+    l2flow_instrument_raw_event_history_cursor_v2* cursor,
+    const void* mapping,
+    std::size_t mapping_bytes,
+    const RealtimeInstrumentTickDeltaReadResponseV2& response,
+    const RealtimeWireTickPayloadV2** records) noexcept {
+    if (cursor == nullptr || mapping == nullptr ||
+        mapping == MAP_FAILED || records == nullptr ||
+        mapping_bytes <
+            sizeof(RealtimeInstrumentTickDeltaPageHeaderV2)) {
+        return false;
+    }
+    const auto* const header =
+        static_cast<const RealtimeInstrumentTickDeltaPageHeaderV2*>(
+            mapping);
+    const std::uint64_t payload_bytes =
+        static_cast<std::uint64_t>(response.record_count) *
+        sizeof(RealtimeWireTickPayloadV2);
+    const std::uint64_t expected_mapping_bytes =
+        l2flow::ipc::
+            kRealtimeInstrumentTickDeltaPageHeaderBytesV2 +
+        payload_bytes;
+    if (header->magic !=
+            l2flow::ipc::
+                kRealtimeInstrumentTickDeltaPageMagicV2 ||
+        header->abi_major !=
+            l2flow::ipc::kRealtimeWireMajorV2 ||
+        header->abi_minor !=
+            l2flow::ipc::kRealtimeWireMinorV2 ||
+        header->header_bytes !=
+            l2flow::ipc::
+                kRealtimeInstrumentTickDeltaPageHeaderBytesV2 ||
+        header->endian_marker !=
+            l2flow::ipc::kRealtimeLittleEndianMarkerV2 ||
+        header->flags != 0U ||
+        header->total_mapping_bytes != mapping_bytes ||
+        header->total_mapping_bytes != expected_mapping_bytes ||
+        header->page_index != response.page_index ||
+        header->record_count != response.record_count ||
+        header->tick_payload_bytes !=
+            sizeof(RealtimeWireTickPayloadV2) ||
+        header->tick_payloads_offset !=
+            l2flow::ipc::
+                kRealtimeInstrumentTickDeltaPageHeaderBytesV2 ||
+        !DeltaMetadataEqual(header->metadata, cursor->metadata) ||
+        !AllZero(header->reserved)) {
+        return false;
+    }
+    const auto* const bytes =
+        static_cast<const std::byte*>(mapping);
+    *records =
+        reinterpret_cast<const RealtimeWireTickPayloadV2*>(
+            bytes + header->tick_payloads_offset);
+    return ValidateHistoryPayloads(
+        cursor,
+        *records,
+        response.record_count,
+        *header);
+}
+
+int OpenHistoryCursor(
+    l2flow_instrument_raw_event_history_session_v2* session,
+    std::uint32_t instrument_id,
+    std::uint32_t requested_page_records,
+    const RealtimeInstrumentTickDeltaCheckpointV2* checkpoint,
+    l2flow_instrument_raw_event_history_cursor_v2** output) noexcept {
+    if (output == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    *output = nullptr;
+    if (session == nullptr || session->socket_fd < 0 ||
+        session->session_token == 0U) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2;
+    }
+    if (instrument_id == 0U || requested_page_records == 0U ||
+        requested_page_records >
+            kMaximumEventHistoryPageRecords ||
+        session->active_cursor != nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    const bool update = checkpoint != nullptr;
+    if (update &&
+        (!l2flow::ipc::
+             RealtimeInstrumentTickDeltaCheckpointCanonicalV2(
+                 *checkpoint) ||
+         checkpoint->instrument_id != instrument_id)) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+
+    RealtimeInstrumentTickDeltaOpenInstrumentRequestV2 request{};
+    request.magic = l2flow::ipc::kRealtimeControlMagicV2;
+    request.protocol_major = l2flow::ipc::kRealtimeWireMajorV2;
+    request.protocol_minor = l2flow::ipc::kRealtimeWireMinorV2;
+    request.opcode = static_cast<std::uint16_t>(
+        RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kOpenInstrumentDelta);
+    request.message_bytes =
+        static_cast<std::uint32_t>(sizeof(request));
+    request.request_id = NextHistoryRequestId();
+    request.instrument_id = instrument_id;
+    request.requested_page_records = requested_page_records;
+    request.base_kind = static_cast<std::uint32_t>(
+        update
+            ? RealtimeInstrumentTickDeltaBaseKindV2::kCheckpoint
+            : RealtimeInstrumentTickDeltaBaseKindV2::kOrigin);
+    request.delta_session_token = session->session_token;
+    if (update) {
+        request.base_checkpoint = *checkpoint;
+    }
+    if (!SendHistoryRequest(
+            session->socket_fd, &request, sizeof(request))) {
+        CloseHistoryTransport(session);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+    }
+    RealtimeInstrumentTickDeltaOpenInstrumentResponseV2 response{};
+    int received_fd = -1;
+    std::size_t fd_count = 0U;
+    const int receive_error = ReceiveHistoryResponse(
+        session->socket_fd,
+        &response,
+        &received_fd,
+        &fd_count);
+    if (receive_error !=
+        L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2) {
+        CloseHistoryTransport(session);
+        return receive_error;
+    }
+    if (received_fd >= 0) {
+        static_cast<void>(::close(received_fd));
+    }
+    if (!HistoryResponsePrefixValid(response, request.request_id, 0U) ||
+        fd_count != 0U) {
+        CloseHistoryTransport(session);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    const int status = MapHistoryStatus(response.status);
+    if (status != L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2) {
+        const bool canonical = ErrorResponseCanonical(response);
+        CloseHistoryTransport(session);
+        return canonical
+                   ? status
+                   : L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    if (response.flags != 0U || response.reserved0 != 0U ||
+        response.initial_read_token == 0U ||
+        !l2flow::ipc::
+             RealtimeInstrumentTickDeltaMetadataCanonicalV2(
+                 response.metadata) ||
+        response.metadata.target_checkpoint.instrument_id !=
+            instrument_id ||
+        !l2flow::ipc::
+             realtime_instrument_tick_delta_wire_v2_detail::
+                 EndpointsEqual(
+                     response.metadata.target_checkpoint.generation,
+                     session->target) ||
+        response.metadata.base_kind != request.base_kind ||
+        (update &&
+         !l2flow::ipc::
+              realtime_instrument_tick_delta_wire_v2_detail::
+                  CheckpointsEqual(
+                      response.metadata.base_checkpoint,
+                      *checkpoint))) {
+        CloseHistoryTransport(session);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    try {
+        auto* const cursor =
+            new l2flow_instrument_raw_event_history_cursor_v2{};
+        cursor->session = session;
+        cursor->metadata = response.metadata;
+        cursor->requested_page_records = requested_page_records;
+        cursor->read_token = response.initial_read_token;
+        session->active_cursor = cursor;
+        *output = cursor;
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+    } catch (...) {
+        CloseHistoryTransport(session);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_RESOURCE_EXHAUSTED_V2;
+    }
+}
+
+void FillHistoryPageView(
+    const l2flow_instrument_raw_event_history_cursor_v2& cursor,
+    const RealtimeWireTickPayloadV2* records,
+    std::size_t record_count,
+    std::uint64_t mapping_bytes,
+    std::uint64_t page_index,
+    std::uint64_t first_ingress,
+    std::uint64_t last_ingress,
+    std::uint64_t first_tick,
+    std::uint64_t last_tick,
+    bool eof,
+    l2flow_instrument_raw_event_history_page_v2* output) noexcept {
+    l2flow_instrument_raw_event_history_page_v2 page{};
+    page.event_records = records;
+    page.event_record_count = record_count;
+    page.event_record_stride = sizeof(RealtimeWireTickPayloadV2);
+    page.mapping_bytes = mapping_bytes;
+    page.page_index = page_index;
+    page.first_ingress_sequence = first_ingress;
+    page.last_ingress_sequence = last_ingress;
+    page.first_tick_stream_sequence = first_tick;
+    page.last_tick_stream_sequence = last_tick;
+    page.cumulative_record_count =
+        cursor.cumulative_record_count;
+    std::copy(
+        cursor.cumulative_source_record_counts.begin(),
+        cursor.cumulative_source_record_counts.end(),
+        page.cumulative_source_record_counts);
+    page.eof = eof ? 1U : 0U;
+    *output = page;
+}
+
+}  // namespace
+
+extern "C" int
+l2flow_instrument_raw_event_history_session_open_v2(
+    const char* absolute_control_socket_path,
+    const l2flow_shm_session_info_v2* expected_session,
+    std::uint64_t expected_generation,
+    std::uint32_t timeout_ms,
+    l2flow_instrument_raw_event_history_session_v2** output) {
+    if (output == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    *output = nullptr;
+    if (absolute_control_socket_path == nullptr ||
+        expected_session == nullptr ||
+        !SessionExpectationValid(*expected_session) ||
+        !HistorySocketPathSyntaxValid(
+            absolute_control_socket_path)) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    if constexpr (std::endian::native != std::endian::little) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_ABI_MISMATCH_V2;
+    }
+    const int socket_fd =
+        ConnectHistorySocket(
+            absolute_control_socket_path, timeout_ms);
+    if (socket_fd < 0) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+    }
+
+    RealtimeInstrumentTickDeltaOpenSessionRequestV2 request{};
+    request.magic = l2flow::ipc::kRealtimeControlMagicV2;
+    request.protocol_major = l2flow::ipc::kRealtimeWireMajorV2;
+    request.protocol_minor = l2flow::ipc::kRealtimeWireMinorV2;
+    request.opcode = static_cast<std::uint16_t>(
+        RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kOpenDeltaSession);
+    request.message_bytes =
+        static_cast<std::uint32_t>(sizeof(request));
+    request.request_id = NextHistoryRequestId();
+    request.expected_generation = expected_generation;
+    if (!SendHistoryRequest(socket_fd, &request, sizeof(request))) {
+        static_cast<void>(::close(socket_fd));
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+    }
+    RealtimeInstrumentTickDeltaOpenSessionResponseV2 response{};
+    int received_fd = -1;
+    std::size_t fd_count = 0U;
+    const int receive_error = ReceiveHistoryResponse(
+        socket_fd,
+        &response,
+        &received_fd,
+        &fd_count);
+    if (receive_error !=
+        L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2) {
+        static_cast<void>(::close(socket_fd));
+        return receive_error;
+    }
+    if (received_fd >= 0) {
+        static_cast<void>(::close(received_fd));
+    }
+    if (!HistoryResponsePrefixValid(response, request.request_id, 0U) ||
+        fd_count != 0U) {
+        static_cast<void>(::close(socket_fd));
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    const int status = MapHistoryStatus(response.status);
+    if (status != L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2) {
+        const bool canonical = ErrorResponseCanonical(response);
+        static_cast<void>(::close(socket_fd));
+        return canonical
+                   ? status
+                   : L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    if (response.flags != 0U || response.reserved0 != 0U ||
+        response.delta_session_token == 0U ||
+        !l2flow::ipc::RealtimeGenerationEndpointCanonicalV2(
+            response.target_generation) ||
+        !EndpointMatchesSession(
+            response.target_generation, *expected_session) ||
+        (expected_generation != 0U &&
+         response.target_generation.generation !=
+             expected_generation)) {
+        static_cast<void>(::close(socket_fd));
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    try {
+        auto* const session =
+            new l2flow_instrument_raw_event_history_session_v2{};
+        session->socket_fd = socket_fd;
+        session->target = response.target_generation;
+        session->session_token = response.delta_session_token;
+        *output = session;
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+    } catch (...) {
+        static_cast<void>(::close(socket_fd));
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_RESOURCE_EXHAUSTED_V2;
+    }
+}
+
+extern "C" void
+l2flow_instrument_raw_event_history_session_close_v2(
+    l2flow_instrument_raw_event_history_session_v2* session) {
+    if (session == nullptr) {
+        return;
+    }
+    if (session->active_cursor != nullptr) {
+        ReleaseHistoryPage(session->active_cursor);
+        session->active_cursor->failed = true;
+        session->active_cursor->read_token = 0U;
+        session->active_cursor->session = nullptr;
+        session->active_cursor = nullptr;
+    }
+    CloseHistoryTransport(session);
+    delete session;
+}
+
+extern "C" int
+l2flow_instrument_raw_event_history_session_target_v2(
+    const l2flow_instrument_raw_event_history_session_v2* session,
+    l2flow_instrument_raw_event_history_endpoint_v2* output) {
+    if (output == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    if (session == nullptr || session->socket_fd < 0) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2;
+    }
+    CopyObjectBytes(output, session->target);
+    return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+}
+
+extern "C" int
+l2flow_instrument_raw_event_history_open_full_v2(
+    l2flow_instrument_raw_event_history_session_v2* session,
+    std::uint32_t instrument_id,
+    std::uint32_t requested_page_records,
+    l2flow_instrument_raw_event_history_cursor_v2** output) {
+    return OpenHistoryCursor(
+        session,
+        instrument_id,
+        requested_page_records,
+        nullptr,
+        output);
+}
+
+extern "C" int
+l2flow_instrument_raw_event_history_open_update_v2(
+    l2flow_instrument_raw_event_history_session_v2* session,
+    std::uint32_t instrument_id,
+    std::uint32_t requested_page_records,
+    const l2flow_instrument_raw_event_history_checkpoint_v2*
+        base_checkpoint,
+    l2flow_instrument_raw_event_history_cursor_v2** output) {
+    if (base_checkpoint == nullptr) {
+        if (output != nullptr) {
+            *output = nullptr;
+        }
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    RealtimeInstrumentTickDeltaCheckpointV2 checkpoint{};
+    CopyObjectBytes(&checkpoint, *base_checkpoint);
+    return OpenHistoryCursor(
+        session,
+        instrument_id,
+        requested_page_records,
+        &checkpoint,
+        output);
+}
+
+extern "C" void
+l2flow_instrument_raw_event_history_cursor_close_v2(
+    l2flow_instrument_raw_event_history_cursor_v2* cursor) {
+    if (cursor == nullptr) {
+        return;
+    }
+    ReleaseHistoryPage(cursor);
+    if (cursor->session != nullptr) {
+        if (cursor->session->active_cursor == cursor) {
+            cursor->session->active_cursor = nullptr;
+        }
+        if (!cursor->eof) {
+            CloseHistoryTransport(cursor->session);
+        }
+        cursor->session = nullptr;
+    }
+    delete cursor;
+}
+
+extern "C" int
+l2flow_instrument_raw_event_history_cursor_metadata_v2(
+    const l2flow_instrument_raw_event_history_cursor_v2* cursor,
+    l2flow_instrument_raw_event_history_metadata_v2* output) {
+    if (cursor == nullptr || output == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    if (cursor->failed) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2;
+    }
+    CopyObjectBytes(output, cursor->metadata);
+    return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+}
+
+extern "C" int
+l2flow_instrument_raw_event_history_cursor_read_v2(
+    l2flow_instrument_raw_event_history_cursor_v2* cursor,
+    l2flow_instrument_raw_event_history_page_v2* output) {
+    if (cursor == nullptr || output == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    *output = {};
+    ReleaseHistoryPage(cursor);
+    if (cursor->failed) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2;
+    }
+    if (cursor->eof) {
+        FillHistoryPageView(
+            *cursor,
+            nullptr,
+            0U,
+            0U,
+            cursor->next_page_index,
+            0U,
+            0U,
+            0U,
+            0U,
+            true,
+            output);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+    }
+    if (cursor->session == nullptr ||
+        cursor->session->socket_fd < 0 ||
+        cursor->session->active_cursor != cursor ||
+        cursor->read_token == 0U) {
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2;
+    }
+
+    RealtimeInstrumentTickDeltaReadRequestV2 request{};
+    request.magic = l2flow::ipc::kRealtimeControlMagicV2;
+    request.protocol_major = l2flow::ipc::kRealtimeWireMajorV2;
+    request.protocol_minor = l2flow::ipc::kRealtimeWireMinorV2;
+    request.opcode = static_cast<std::uint16_t>(
+        RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kReadInstrumentDelta);
+    request.message_bytes =
+        static_cast<std::uint32_t>(sizeof(request));
+    request.request_id = NextHistoryRequestId();
+    request.expected_page_index = cursor->next_page_index;
+    request.read_token = cursor->read_token;
+    if (!SendHistoryRequest(
+            cursor->session->socket_fd,
+            &request,
+            sizeof(request))) {
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+    }
+    RealtimeInstrumentTickDeltaReadResponseV2 response{};
+    int page_fd = -1;
+    std::size_t fd_count = 0U;
+    const int receive_error = ReceiveHistoryResponse(
+        cursor->session->socket_fd,
+        &response,
+        &page_fd,
+        &fd_count);
+    if (receive_error !=
+        L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2) {
+        FailHistoryCursor(cursor);
+        return receive_error;
+    }
+    if (!HistoryResponsePrefixValid(
+            response,
+            request.request_id,
+            l2flow::ipc::
+                kRealtimeInstrumentTickDeltaResponseTerminalV2)) {
+        if (page_fd >= 0) {
+            static_cast<void>(::close(page_fd));
+        }
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    const int status = MapHistoryStatus(response.status);
+    if (status != L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2) {
+        const bool canonical =
+            fd_count == 0U && ErrorResponseCanonical(response);
+        if (page_fd >= 0) {
+            static_cast<void>(::close(page_fd));
+        }
+        FailHistoryCursor(cursor);
+        return canonical
+                   ? status
+                   : L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    if (response.target_generation !=
+            cursor->metadata.target_checkpoint.generation.generation ||
+        response.page_index != cursor->next_page_index) {
+        if (page_fd >= 0) {
+            static_cast<void>(::close(page_fd));
+        }
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+
+    const bool terminal =
+        (response.flags &
+         l2flow::ipc::
+             kRealtimeInstrumentTickDeltaResponseTerminalV2) !=
+        0U;
+    if (terminal) {
+        const bool reconciled =
+            response.flags ==
+                l2flow::ipc::
+                    kRealtimeInstrumentTickDeltaResponseTerminalV2 &&
+            response.record_count == 0U &&
+            response.page_mapping_bytes == 0U &&
+            response.next_read_token == 0U && fd_count == 0U &&
+            page_fd < 0 &&
+            cursor->cumulative_record_count ==
+                cursor->metadata.delta_tick_record_count &&
+            cursor->cumulative_source_record_counts ==
+                cursor->metadata
+                    .delta_tick_source_record_counts;
+        if (!reconciled) {
+            if (page_fd >= 0) {
+                static_cast<void>(::close(page_fd));
+            }
+            FailHistoryCursor(cursor);
+            return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+        }
+        cursor->eof = true;
+        cursor->read_token = 0U;
+        if (cursor->session != nullptr &&
+            cursor->session->active_cursor == cursor) {
+            cursor->session->active_cursor = nullptr;
+        }
+        cursor->session = nullptr;
+        FillHistoryPageView(
+            *cursor,
+            nullptr,
+            0U,
+            0U,
+            response.page_index,
+            0U,
+            0U,
+            0U,
+            0U,
+            true,
+            output);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+    }
+
+    const std::uint64_t expected_mapping_bytes =
+        l2flow::ipc::
+            kRealtimeInstrumentTickDeltaPageHeaderBytesV2 +
+        static_cast<std::uint64_t>(response.record_count) *
+            sizeof(RealtimeWireTickPayloadV2);
+    if (response.flags != 0U || response.record_count == 0U ||
+        response.record_count > cursor->requested_page_records ||
+        response.page_mapping_bytes != expected_mapping_bytes ||
+        response.next_read_token == 0U ||
+        response.next_read_token == cursor->read_token ||
+        fd_count != 1U || page_fd < 0 ||
+        !HistoryPageDescriptorValid(
+            page_fd, response.page_mapping_bytes)) {
+        if (page_fd >= 0) {
+            static_cast<void>(::close(page_fd));
+        }
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    void* const mapping = ::mmap(
+        nullptr,
+        static_cast<std::size_t>(response.page_mapping_bytes),
+        PROT_READ,
+        MAP_SHARED,
+        page_fd,
+        0);
+    static_cast<void>(::close(page_fd));
+    if (mapping == MAP_FAILED) {
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2;
+    }
+    const RealtimeWireTickPayloadV2* records = nullptr;
+    if (!ValidateMappedHistoryPage(
+            cursor,
+            mapping,
+            static_cast<std::size_t>(
+                response.page_mapping_bytes),
+            response,
+            &records)) {
+        static_cast<void>(::munmap(
+            mapping,
+            static_cast<std::size_t>(
+                response.page_mapping_bytes)));
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    cursor->page_mapping = mapping;
+    cursor->page_mapping_bytes =
+        static_cast<std::size_t>(response.page_mapping_bytes);
+    cursor->read_token = response.next_read_token;
+    if (cursor->next_page_index ==
+        std::numeric_limits<std::uint64_t>::max()) {
+        FailHistoryCursor(cursor);
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2;
+    }
+    ++cursor->next_page_index;
+    const auto* const header =
+        static_cast<const RealtimeInstrumentTickDeltaPageHeaderV2*>(
+            mapping);
+    FillHistoryPageView(
+        *cursor,
+        records,
+        response.record_count,
+        response.page_mapping_bytes,
+        response.page_index,
+        header->first_ingress_sequence,
+        header->last_ingress_sequence,
+        header->first_tick_stream_sequence,
+        header->last_tick_stream_sequence,
+        false,
+        output);
+    return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+}
+
+extern "C" int
+l2flow_instrument_raw_event_history_cursor_verified_checkpoint_v2(
+    const l2flow_instrument_raw_event_history_cursor_v2* cursor,
+    l2flow_instrument_raw_event_history_checkpoint_v2* output) {
+    if (cursor == nullptr || output == nullptr) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2;
+    }
+    if (cursor->failed) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2;
+    }
+    if (!cursor->eof) {
+        return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_NOT_READY_V2;
+    }
+    CopyObjectBytes(
+        output, cursor->metadata.target_checkpoint);
+    return L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2;
+}
+
+extern "C" const char*
+l2flow_instrument_raw_event_history_error_name_v2(int error) {
+    switch (error) {
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_OK_V2:
+            return "none";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_INVALID_ARGUMENT_V2:
+            return "invalid_argument";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_SYSTEM_ERROR_V2:
+            return "system_error";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2:
+            return "protocol_error";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_ABI_MISMATCH_V2:
+            return "abi_mismatch";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_UNAVAILABLE_V2:
+            return "unavailable";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_NOT_FOUND_V2:
+            return "not_found";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_RESOURCE_EXHAUSTED_V2:
+            return "resource_exhausted";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CHECKPOINT_MISMATCH_V2:
+            return "checkpoint_mismatch";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_NOT_READY_V2:
+            return "not_ready";
+        case L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CLOSED_V2:
+            return "closed";
+        default:
+            return "unknown";
     }
 }

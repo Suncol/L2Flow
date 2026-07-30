@@ -83,6 +83,8 @@ add_library(l2flow_common STATIC
     src/common/sha256.cpp)
 add_library(L2Flow::common ALIAS l2flow_common)
 l2flow_configure_target(l2flow_common)
+set_target_properties(l2flow_common PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
 
 # Physical SDK lifecycle and the single five-message subscription catalog.
 add_library(l2flow_sdk STATIC
@@ -107,9 +109,13 @@ add_library(l2flow_market STATIC
     src/market/observed_instrument_directory_v2.cpp
     src/market/realtime_history_v1.cpp
     src/market/realtime_kline_v1.cpp
-    src/market/realtime_latest_read_model_v1.cpp)
+    src/market/realtime_latest_read_model_v1.cpp
+    src/market/shanghai_order_event_aggregator_v1.cpp
+    src/market/shenzhen_order_event_projector_v1.cpp)
 add_library(L2Flow::market ALIAS l2flow_market)
 l2flow_configure_target(l2flow_market)
+set_target_properties(l2flow_market PROPERTIES
+    POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(l2flow_market
     PUBLIC L2Flow::common Threads::Threads)
 
@@ -151,9 +157,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # composition dependency; the core realtime pipeline has no edge back to
     # sockets, memfd, Python, Arrow, or Polars.
     add_library(l2flow_ipc STATIC
+        src/ipc/instrument_derived_event_history_v1.cpp
+        src/ipc/order_event_delta_control_v1.cpp
+        src/ipc/order_event_delta_ring_v1.cpp
+        src/ipc/order_event_live_aggregation_engine_v1.cpp
+        src/ipc/order_event_wire_adapter_v2.cpp
         src/ipc/realtime_shared_service_v2.cpp)
     add_library(L2Flow::ipc ALIAS l2flow_ipc)
     l2flow_configure_target(l2flow_ipc)
+    set_target_properties(l2flow_ipc PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(l2flow_ipc PRIVATE _GNU_SOURCE)
     target_link_libraries(l2flow_ipc
         PUBLIC L2Flow::market L2Flow::common Threads::Threads)
@@ -161,15 +174,27 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Stable native acquire/seqcount helper. Python loads this with ctypes;
     # it has no Python, Arrow, or Polars build dependency.
     add_library(l2flow_shm_reader SHARED
+        src/ipc/instrument_derived_event_history_c_v1.cpp
+        src/ipc/order_event_delta_ring_c_v1.cpp
         src/ipc/realtime_shm_reader_c_v2.cpp)
     l2flow_configure_target(l2flow_shm_reader)
     target_compile_definitions(l2flow_shm_reader PRIVATE _GNU_SOURCE)
+    target_link_libraries(l2flow_shm_reader PRIVATE L2Flow::ipc)
     set_target_properties(l2flow_shm_reader PROPERTIES
         OUTPUT_NAME "l2flow_shm_reader"
         VERSION 2.0.0
         SOVERSION 2
         CXX_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN YES)
+
+    # Formal C++ link surface for the stateful per-instrument derived-history
+    # session.  The implementation reduces immutable raw Wire pages in C++;
+    # the shared reader supplies the stable raw-history/C ABI used by both C++
+    # and Python clients.
+    add_library(l2flow_derived_history INTERFACE)
+    add_library(L2Flow::derived_history ALIAS l2flow_derived_history)
+    target_link_libraries(l2flow_derived_history
+        INTERFACE L2Flow::ipc l2flow_shm_reader)
 endif()
 
 add_executable(mdl_production_router apps/mdl_production_main.cpp)
@@ -183,6 +208,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 set_target_properties(mdl_production_router PROPERTIES
     OUTPUT_NAME "mdl-production-router")
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(mdl_order_event_aggregator
+        apps/mdl_order_event_aggregator_main.cpp)
+    l2flow_configure_target(mdl_order_event_aggregator)
+    target_compile_definitions(
+        mdl_order_event_aggregator PRIVATE _GNU_SOURCE)
+    target_link_libraries(
+        mdl_order_event_aggregator
+        PRIVATE L2Flow::ipc l2flow_shm_reader)
+    set_target_properties(mdl_order_event_aggregator PROPERTIES
+        OUTPUT_NAME "mdl-order-event-aggregator")
+endif()
 
 if(L2FLOW_BUILD_FEEDER_PROBE)
     add_executable(mdl_sdk_feeder_probe tools/mdl_sdk_feeder_probe.cpp)
@@ -289,6 +327,10 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_kline_aggregator_v1.cpp L2Flow::market)
     l2flow_add_test(test_intraday_instrument_store
         tests/test_intraday_instrument_store_v1.cpp L2Flow::market)
+    l2flow_add_test(test_shanghai_order_event_aggregator
+        tests/test_shanghai_order_event_aggregator_v1.cpp L2Flow::market)
+    l2flow_add_test(test_shenzhen_order_event_projector
+        tests/test_shenzhen_order_event_projector_v1.cpp L2Flow::market)
     l2flow_add_test(test_realtime_factor_engine
         tests/test_realtime_factor_engine_v1.cpp L2Flow::factor)
     l2flow_add_test(test_realtime_pipeline
@@ -301,19 +343,72 @@ if(L2FLOW_BUILD_TESTS)
             tests/test_realtime_wire_v2.cpp L2Flow::common)
         l2flow_add_test(test_realtime_history_wire_v2
             tests/test_realtime_history_wire_v2.cpp L2Flow::common)
+        l2flow_add_test(test_order_event_wire_adapter_v2
+            tests/test_order_event_wire_adapter_v2.cpp L2Flow::ipc)
+        l2flow_add_test(test_order_event_delta_ring_v1
+            tests/test_order_event_delta_ring_v1.cpp L2Flow::ipc)
+        l2flow_add_test(test_order_event_delta_control_v1
+            tests/test_order_event_delta_control_v1.cpp L2Flow::ipc)
+        l2flow_add_test(test_order_event_delta_ring_c_v1
+            tests/test_order_event_delta_ring_c_v1.cpp
+            L2Flow::derived_history)
+        l2flow_add_test(test_order_event_live_aggregation_engine_v1
+            tests/test_order_event_live_aggregation_engine_v1.cpp
+            L2Flow::ipc)
+        l2flow_add_test(test_mdl_order_event_aggregator_cli_v1
+            tests/test_mdl_order_event_aggregator_cli_v1.cpp
+            L2Flow::ipc)
+        add_executable(test_mdl_order_event_aggregator_process_v1
+            tests/test_mdl_order_event_aggregator_process_v1.cpp)
+        l2flow_configure_target(
+            test_mdl_order_event_aggregator_process_v1)
+        target_compile_definitions(
+            test_mdl_order_event_aggregator_process_v1
+            PRIVATE _GNU_SOURCE)
+        target_link_libraries(
+            test_mdl_order_event_aggregator_process_v1
+            PRIVATE L2Flow::ipc)
+        add_dependencies(
+            test_mdl_order_event_aggregator_process_v1
+            mdl_order_event_aggregator)
+        add_test(
+            NAME test_mdl_order_event_aggregator_process_v1
+            COMMAND
+                test_mdl_order_event_aggregator_process_v1
+                $<TARGET_FILE:mdl_order_event_aggregator>)
         l2flow_add_test(test_realtime_shm_reader_v2
             tests/test_realtime_shm_reader_v2.cpp
             l2flow_shm_reader)
         l2flow_add_test(test_realtime_shared_service_v2
             tests/test_realtime_shared_service_v2.cpp
-            L2Flow::ipc)
+            L2Flow::derived_history)
         target_link_libraries(test_realtime_shared_service_v2
-            PRIVATE L2Flow::realtime l2flow_shm_reader)
+            PRIVATE L2Flow::realtime)
 
         # The Python client core and its regression suite are stdlib-only.
         # Missing Python, PyArrow, or Polars never blocks the C++ build.
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            add_executable(test_order_event_delta_live_python_host_v1
+                tests/order_event_delta_live_python_host_v1.cpp)
+            l2flow_configure_target(
+                test_order_event_delta_live_python_host_v1)
+            target_link_libraries(
+                test_order_event_delta_live_python_host_v1
+                PRIVATE L2Flow::ipc)
+            add_test(
+                NAME test_order_event_delta_live_python_e2e
+                COMMAND
+                    test_order_event_delta_live_python_host_v1
+                    ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/python/order_event_delta_live_probe.py
+                    $<TARGET_FILE:l2flow_shm_reader>)
+            set_tests_properties(
+                test_order_event_delta_live_python_e2e
+                PROPERTIES
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    ENVIRONMENT
+                        "PYTHONDONTWRITEBYTECODE=1;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python")
             target_compile_definitions(
                 test_realtime_shared_service_v2
                 PRIVATE
@@ -321,6 +416,7 @@ if(L2FLOW_BUILD_TESTS)
                     L2FLOW_V2_PYTHON_PROBE_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_hot_read_probe.py"
                     L2FLOW_V2_PYTHON_LATENCY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_latency_benchmark_probe.py"
                     L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/realtime_history_latency_benchmark_probe.py"
+                    L2FLOW_V2_PYTHON_DERIVED_HISTORY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/derived_event_history_probe.py"
                     L2FLOW_V2_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python"
                     L2FLOW_V2_PYTHON_READER_LIBRARY="$<TARGET_FILE:l2flow_shm_reader>")
             add_test(

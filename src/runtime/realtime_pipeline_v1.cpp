@@ -2597,7 +2597,7 @@ private:
         return (factory_is_test_override ||
                 config_.enforce_receive_trade_date) &&
                config_.sdk.work_threads > 0 &&
-               config_.sdk.io_threads > 0 &&
+               config_.sdk.io_threads == 1 &&
                TextValid(config_.sdk.log_prefix, true) &&
                TextValid(config_.sdk.server_address, true) &&
                TextValid(config_.sdk.user_name, true) &&

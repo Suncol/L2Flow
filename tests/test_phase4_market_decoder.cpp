@@ -1516,6 +1516,40 @@ void TestMatchedQuantityDomainAndFailureAtomicity(TestContext* context) {
             "SH A negative divisible raw is domain-invalid, not non-integral");
     }
 
+    sh_spec.type = "T";
+    sh_spec.tick_flag = "B";
+    sh_spec.trade_money_p3 =
+        std::numeric_limits<std::int64_t>::min() + 1;
+    body = MakeShanghaiTickWire(sh_spec);
+    context->Expect(
+        decoder.Decode(
+            Message(
+                kShanghaiService,
+                kShanghaiTickMessage,
+                body,
+                sequence++),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "SH T negative extreme amount remains an auditable record");
+    tick = std::get_if<market::ShanghaiTickV1>(&event);
+    if (tick != nullptr) {
+        context->Expect(
+            tick->fields.trade_amount.raw ==
+                    std::numeric_limits<std::int64_t>::min() + 1 &&
+                tick->fields.trade_amount.normalized_p6 == 0 &&
+                !tick->fields.trade_amount.valid &&
+                !tick->fields.trade_amount.is_null &&
+                (tick->fields.validity_bitmap &
+                 market::kTickTradeAmountValidV1) == 0U &&
+                HasNotice(
+                    tick->common,
+                    market::MarketNoticeV1::
+                        kTradeAmountDomainInvalid) &&
+                !HasQuality(
+                    tick->common,
+                    control::QualityFlagV1::kNullValuePresent),
+            "SH T negative amount retains raw but is never advertised valid");
+    }
+
     market::MarketDecoderConfigV1 too_small_config;
     too_small_config.trade_date = kTradeDate;
     too_small_config.source_stream_id = kSourceStreamId;

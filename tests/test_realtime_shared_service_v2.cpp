@@ -1,3 +1,6 @@
+#include "l2flow/ipc/instrument_raw_event_history_v2.h"
+#include "l2flow/ipc/instrument_derived_event_history_c_v1.h"
+#include "l2flow/ipc/instrument_derived_event_history_v1.h"
 #include "l2flow/ipc/realtime_history_wire_v2.h"
 #include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
@@ -22,6 +25,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -37,6 +41,7 @@
 #include <utility>
 #include <vector>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -2006,19 +2011,100 @@ std::optional<market::RealtimeHistoryEventInputV1> TickInput(
         static_cast<std::int64_t>(500U + source_sequence);
     tick.channel = 9;
     tick.fields.action = market::TickActionV1::kTrade;
-    tick.fields.side = market::SideV1::kBuy;
-    tick.fields.order_type = market::OrderTypeV1::kLimit;
+    tick.fields.side = market::SideV1::kUnknown;
+    tick.fields.order_type = market::OrderTypeV1::kUnknown;
+    tick.fields.aggressor = market::AggressorV1::kBuy;
+    tick.fields.phase = market::TradingPhaseV1::kContinuous;
+    tick.fields.buy_order_id = 11'001;
+    tick.fields.sell_order_id = 22'002;
     tick.fields.price.valid = true;
-    tick.fields.price.raw = 1'235'000;
+    tick.fields.price.raw = 1'235;
     tick.fields.price.normalized_p6 = 1'235'000;
-    tick.fields.price.scale = 6U;
+    tick.fields.price.scale = 3U;
     tick.fields.quantity.valid = true;
     tick.fields.quantity.raw = 101;
     tick.fields.quantity.scale = 0U;
+    tick.fields.trade_amount.valid = true;
+    tick.fields.trade_amount.raw = 124'735;
+    tick.fields.trade_amount.normalized_p6 = 124'735'000;
+    tick.fields.trade_amount.scale = 3U;
     tick.fields.validity_bitmap =
         market::kTickPriceValidV1 |
         market::kTickQuantityValidV1 |
+        market::kTickTradeAmountValidV1 |
+        market::kTickExchangeTimeValidV1 |
+        market::kTickBuyOrderIdValidV1 |
+        market::kTickSellOrderIdValidV1 |
+        market::kTickAggressorValidV1 |
+        market::kTickPhaseValidV1;
+    tick.raw_type = "T";
+    tick.raw_tick_flag = "B";
+    market::DecodedMarketEventV1 event(std::move(tick));
+    return market::RealtimeHistoryEventInputV1::Create(
+        1U,
+        ingress_sequence,
+        std::move(event),
+        tick_stream_sequence);
+}
+
+std::optional<market::RealtimeHistoryEventInputV1> AddInput(
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence) {
+    market::ShanghaiTickV1 tick{};
+    FillCommon(
+        &tick.common,
+        market::MarketEventKindV1::kShanghaiTick,
+        1U,
+        source_sequence,
+        ingress_sequence,
+        1U,
+        0U);
+    tick.common.exchange_time.raw_hhmmssmmm = 93000000U;
+    tick.common.exchange_time.nanoseconds_since_midnight =
+        34'200'000'000'000ULL + ingress_sequence;
+    tick.common.exchange_time.unix_nanoseconds =
+        1'785'254'400'000'000'000LL +
+        static_cast<std::int64_t>(
+            tick.common.exchange_time
+                .nanoseconds_since_midnight);
+    tick.common.exchange_time.valid = true;
+    tick.common.exchange_time.unix_nanoseconds_valid = true;
+    tick.business_index =
+        static_cast<std::int64_t>(500U + source_sequence);
+    tick.channel = 9;
+    tick.fields.action = market::TickActionV1::kAdd;
+    tick.fields.side = market::SideV1::kBuy;
+    tick.fields.order_type = market::OrderTypeV1::kUnknown;
+    tick.fields.aggressor = market::AggressorV1::kUnknown;
+    tick.fields.phase = market::TradingPhaseV1::kContinuous;
+    tick.fields.primary_order_id = 11'001;
+    tick.fields.buy_order_id = 11'001;
+    tick.fields.price.valid = true;
+    tick.fields.price.raw = 1'236;
+    tick.fields.price.normalized_p6 = 1'236'000;
+    tick.fields.price.scale = 3U;
+    tick.fields.quantity.valid = true;
+    tick.fields.quantity.raw = 50;
+    tick.fields.quantity.scale = 0U;
+    // For an A message the decoder retains source TradeMoney in its p3
+    // decimal field and separately projects the documented matched quantity.
+    tick.fields.trade_amount.valid = false;
+    tick.fields.trade_amount.raw = 101'000;
+    tick.fields.trade_amount.scale = 3U;
+    tick.fields.matched_quantity.valid = true;
+    tick.fields.matched_quantity.raw = 101;
+    tick.fields.matched_quantity.scale = 0U;
+    tick.fields.validity_bitmap =
+        market::kTickPriceValidV1 |
+        market::kTickQuantityValidV1 |
+        market::kTickMatchedQuantityValidV1 |
+        market::kTickPrimaryOrderIdValidV1 |
+        market::kTickSideValidV1 |
+        market::kTickPhaseValidV1 |
         market::kTickExchangeTimeValidV1;
+    tick.raw_type = "A";
+    tick.raw_tick_flag = "B";
     market::DecodedMarketEventV1 event(std::move(tick));
     return market::RealtimeHistoryEventInputV1::Create(
         1U,
@@ -2108,6 +2194,73 @@ bool RunPythonKnownIdProbe(
     }
 #else
     static_cast<void>(socket_path);
+    return true;
+#endif
+}
+
+bool RunPythonDerivedHistorySmoke(
+    const std::filesystem::path& socket_path,
+    std::uint64_t generation) {
+#if defined(L2FLOW_V2_PYTHON_PROBE_EXECUTABLE) && \
+    defined(L2FLOW_V2_PYTHON_DERIVED_HISTORY_SCRIPT) && \
+    defined(L2FLOW_V2_PYTHON_SOURCE) && \
+    defined(L2FLOW_V2_PYTHON_READER_LIBRARY)
+    std::array<std::string, 8U> arguments{{
+        L2FLOW_V2_PYTHON_PROBE_EXECUTABLE,
+        "-B",
+        L2FLOW_V2_PYTHON_DERIVED_HISTORY_SCRIPT,
+        socket_path.string(),
+        L2FLOW_V2_PYTHON_READER_LIBRARY,
+        L2FLOW_V2_PYTHON_SOURCE,
+        "1",
+        std::to_string(generation),
+    }};
+    std::array<char*, 9U> argv{};
+    for (std::size_t index = 0U; index < arguments.size(); ++index) {
+        argv[index] = arguments[index].data();
+    }
+    pid_t child = -1;
+    const int spawn_error = ::posix_spawn(
+        &child,
+        argv[0U],
+        nullptr,
+        nullptr,
+        argv.data(),
+        environ);
+    if (!Expect(
+            spawn_error == 0 && child > 0,
+            "spawn real Python derived-history probe")) {
+        return false;
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    int status = 0;
+    for (;;) {
+        const pid_t result = ::waitpid(child, &status, WNOHANG);
+        if (result == child) {
+            return Expect(
+                WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "real Python derived-history probe passes");
+        }
+        if (result < 0 && errno != EINTR) {
+            return Expect(
+                false, "wait for Python derived-history probe");
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            static_cast<void>(::kill(child, SIGKILL));
+            do {
+                errno = 0;
+            } while (::waitpid(child, &status, 0) < 0 &&
+                     errno == EINTR);
+            return Expect(
+                false, "Python derived-history probe timed out");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#else
+    static_cast<void>(socket_path);
+    static_cast<void>(generation);
     return true;
 #endif
 }
@@ -2216,6 +2369,340 @@ bool RunPythonHistoryDeltaSmoke(
     static_cast<void>(include_delta);
     return true;
 #endif
+}
+
+bool ReadNativeRawEventHistory(
+    const std::filesystem::path& socket_path,
+    const l2flow_shm_session_info_v2& expected_session,
+    std::uint64_t expected_generation,
+    const ipc::InstrumentRawEventHistoryCheckpointV2*
+        base_checkpoint,
+    std::span<const std::uint64_t> expected_ingress_sequences,
+    std::span<const std::uint64_t> expected_tick_sequences,
+    ipc::InstrumentRawEventHistoryCheckpointV2* checkpoint_output,
+    std::string_view label) {
+    if (checkpoint_output == nullptr ||
+        expected_ingress_sequences.size() !=
+            expected_tick_sequences.size()) {
+        return false;
+    }
+    ipc::InstrumentRawEventHistorySessionV2 session;
+    const auto open_error =
+        ipc::InstrumentRawEventHistorySessionV2::Open(
+            socket_path.c_str(),
+            expected_session,
+            expected_generation,
+            3'000U,
+            &session);
+    bool ok = Expect(
+        open_error ==
+                ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+            session.is_open(),
+        std::string(label) + " opens pinned native session");
+    if (!ok) {
+        std::cerr
+            << label << " session error="
+            << ipc::InstrumentRawEventHistoryErrorNameV2(
+                   open_error)
+            << '\n';
+        return false;
+    }
+    ipc::InstrumentRawEventHistoryEndpointV2 target{};
+    ok &= Expect(
+        session.Target(&target) ==
+                ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+            target.generation == expected_generation &&
+            target.session_epoch == expected_session.session_epoch &&
+            target.trade_date == expected_session.trade_date,
+        std::string(label) + " exposes the pinned target identity");
+
+    ipc::InstrumentRawEventHistoryCursorV2 cursor;
+    const auto cursor_error =
+        base_checkpoint == nullptr
+            ? session.OpenFull(1U, 1U, &cursor)
+            : session.OpenUpdate(
+                  1U, 1U, *base_checkpoint, &cursor);
+    ok &= Expect(
+        cursor_error ==
+                ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+            cursor.is_open(),
+        std::string(label) + " opens one raw-event cursor");
+    if (cursor_error !=
+            ipc::InstrumentRawEventHistoryErrorV2::kNone ||
+        !cursor.is_open()) {
+        std::cerr
+            << label << " cursor error="
+            << ipc::InstrumentRawEventHistoryErrorNameV2(
+                   cursor_error)
+            << '\n';
+        return false;
+    }
+
+    ipc::InstrumentRawEventHistoryMetadataV2 metadata{};
+    ok &= Expect(
+        cursor.Metadata(&metadata) ==
+                ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+            metadata.base_kind ==
+                (base_checkpoint == nullptr
+                     ? L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_ORIGIN_V2
+                     : L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_CHECKPOINT_V2) &&
+            metadata.target_checkpoint.instrument_id == 1U &&
+            metadata.target_checkpoint.generation.generation ==
+                expected_generation &&
+            metadata.delta_event_record_count ==
+                expected_ingress_sequences.size(),
+        std::string(label) +
+            " returns exact raw-event delta metadata");
+    ipc::InstrumentRawEventHistoryCheckpointV2 unverified{};
+    ok &= Expect(
+        cursor.VerifiedCheckpoint(&unverified) ==
+            ipc::InstrumentRawEventHistoryErrorV2::kNotReady,
+        std::string(label) +
+            " withholds checkpoint before explicit EOF");
+
+    std::vector<std::uint64_t> ingress_sequences;
+    std::vector<std::uint64_t> tick_sequences;
+    bool observed_eof = false;
+    while (!observed_eof && ok) {
+        ipc::InstrumentRawEventHistoryPageViewV2 page;
+        const auto read_error = cursor.ReadPage(&page);
+        ok &= Expect(
+            read_error ==
+                ipc::InstrumentRawEventHistoryErrorV2::kNone,
+            std::string(label) + " reads one immutable native page");
+        if (read_error !=
+            ipc::InstrumentRawEventHistoryErrorV2::kNone) {
+            std::cerr
+                << label << " read error="
+                << ipc::InstrumentRawEventHistoryErrorNameV2(
+                       read_error)
+                << '\n';
+            break;
+        }
+        if (page.eof()) {
+            observed_eof = true;
+            ok &= Expect(
+                page.records().empty() &&
+                    page.mapping_bytes() == 0U &&
+                    page.cumulative_record_count() ==
+                        expected_ingress_sequences.size(),
+                std::string(label) +
+                    " reaches reconciled explicit EOF");
+            continue;
+        }
+        const auto records = page.records();
+        ok &= Expect(
+            records.size() == 1U &&
+                page.mapping_bytes() ==
+                    ipc::
+                        kRealtimeInstrumentTickDeltaPageHeaderBytesV2 +
+                        sizeof(ipc::RealtimeWireTickPayloadV2),
+            std::string(label) +
+                " exposes one borrowed normalized Wire tick");
+        for (const ipc::RealtimeWireTickPayloadV2& record :
+             records) {
+            ingress_sequences.push_back(
+                record.common.ingress_sequence);
+            tick_sequences.push_back(
+                record.common.tick_stream_sequence);
+            ok &= record.common.instrument_id == 1U &&
+                  record.common.source_slot == 1U &&
+                  record.common.event_kind == 2U;
+        }
+    }
+    ok &= Expect(
+        observed_eof &&
+            std::equal(
+                ingress_sequences.begin(),
+                ingress_sequences.end(),
+                expected_ingress_sequences.begin(),
+                expected_ingress_sequences.end()) &&
+            std::equal(
+                tick_sequences.begin(),
+                tick_sequences.end(),
+                expected_tick_sequences.begin(),
+                expected_tick_sequences.end()),
+        std::string(label) +
+            " preserves exact raw ingress/tick order");
+    ok &= Expect(
+        cursor.VerifiedCheckpoint(checkpoint_output) ==
+                ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+            checkpoint_output->generation.generation ==
+                expected_generation &&
+            checkpoint_output->instrument_event_record_count ==
+                (base_checkpoint == nullptr
+                     ? expected_ingress_sequences.size()
+                     : base_checkpoint
+                               ->instrument_event_record_count +
+                           expected_ingress_sequences.size()),
+        std::string(label) +
+            " releases checkpoint only after EOF reconciliation");
+    return ok;
+}
+
+bool DrainDerivedEventHistory(
+    ipc::InstrumentDerivedEventHistorySessionV1* session,
+    std::vector<ipc::InstrumentDerivedEventV1>* events,
+    ipc::InstrumentDerivedEventCheckpointV1* checkpoint,
+    std::string_view label) {
+    if (session == nullptr || events == nullptr ||
+        checkpoint == nullptr) {
+        return false;
+    }
+    events->clear();
+    bool ok = true;
+    bool eof = false;
+    while (!eof && ok) {
+        ipc::InstrumentDerivedEventHistoryPageV1 page;
+        const auto error = session->ReadPage(&page);
+        ok &= Expect(
+            error ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone,
+            std::string(label) + " reads one derived page");
+        if (error !=
+            ipc::InstrumentDerivedEventHistoryErrorV1::kNone) {
+            std::cerr
+                << label << " derived read error="
+                << ipc::InstrumentDerivedEventHistoryErrorNameV1(
+                       error)
+                << " raw_error="
+                << ipc::InstrumentRawEventHistoryErrorNameV2(
+                       session->last_raw_error())
+                << '\n';
+            break;
+        }
+        eof = page.eof;
+        events->insert(
+            events->end(),
+            std::make_move_iterator(page.events.begin()),
+            std::make_move_iterator(page.events.end()));
+    }
+    ok &= Expect(
+        eof &&
+            session->VerifiedCheckpoint(checkpoint) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone,
+        std::string(label) +
+            " releases checkpoint only after explicit EOF");
+    return ok;
+}
+
+std::size_t CountOpenFileDescriptors() {
+    DIR* const directory = ::opendir("/proc/self/fd");
+    if (directory == nullptr) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    std::size_t count = 0U;
+    while (dirent* const entry = ::readdir(directory)) {
+        if (std::strcmp(entry->d_name, ".") != 0 &&
+            std::strcmp(entry->d_name, "..") != 0) {
+            ++count;
+        }
+    }
+    static_cast<void>(::closedir(directory));
+    return count;
+}
+
+bool TestMalformedHistoryResponseClosesReceivedDescriptor() {
+    ScopedTempDirectory temporary;
+    if (!Expect(
+            temporary.valid(),
+            "create malformed-history-response fixture")) {
+        return false;
+    }
+    const std::filesystem::path socket_path =
+        temporary.path() / "malformed-history.sock";
+    UniqueFd listener(
+        ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const std::string path = socket_path.string();
+    if (listener.get() < 0 ||
+        path.size() >= sizeof(address.sun_path)) {
+        return false;
+    }
+    std::memcpy(
+        address.sun_path, path.c_str(), path.size() + 1U);
+    if (::bind(
+            listener.get(),
+            reinterpret_cast<const sockaddr*>(&address),
+            static_cast<socklen_t>(
+                offsetof(sockaddr_un, sun_path) +
+                path.size() + 1U)) != 0 ||
+        ::listen(listener.get(), 1) != 0) {
+        return false;
+    }
+    const std::size_t before = CountOpenFileDescriptors();
+    std::atomic<bool> server_ok{false};
+    std::thread server([&] {
+        UniqueFd client(::accept4(
+            listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
+        std::array<std::byte, 64U> request{};
+        if (client.get() < 0 ||
+            ::recv(
+                client.get(),
+                request.data(),
+                request.size(),
+                0) <= 0) {
+            return;
+        }
+        UniqueFd transferred(::open("/dev/null", O_RDONLY | O_CLOEXEC));
+        if (transferred.get() < 0) {
+            return;
+        }
+        std::array<std::byte, 8U> short_response{};
+        iovec vector{};
+        vector.iov_base = short_response.data();
+        vector.iov_len = short_response.size();
+        std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1U;
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        cmsghdr* const header = CMSG_FIRSTHDR(&message);
+        if (header == nullptr) {
+            return;
+        }
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int));
+        const int descriptor = transferred.get();
+        std::memcpy(
+            CMSG_DATA(header), &descriptor, sizeof(descriptor));
+        server_ok.store(
+            ::sendmsg(client.get(), &message, MSG_NOSIGNAL) ==
+                static_cast<ssize_t>(short_response.size()),
+            std::memory_order_release);
+    });
+
+    l2flow_shm_session_info_v2 expected{};
+    expected.run_id[0U] = 1U;
+    expected.session_epoch = 1U;
+    expected.trade_date = kTradeDate;
+    expected.capacity = 1U;
+    l2flow_instrument_raw_event_history_session_v2* session =
+        nullptr;
+    const int error =
+        l2flow_instrument_raw_event_history_session_open_v2(
+            socket_path.c_str(),
+            &expected,
+            0U,
+            3'000U,
+            &session);
+    server.join();
+    listener.Reset();
+    static_cast<void>(::unlink(socket_path.c_str()));
+    const std::size_t after = CountOpenFileDescriptors();
+    l2flow_instrument_raw_event_history_session_close_v2(session);
+    return Expect(
+        server_ok.load(std::memory_order_acquire) &&
+            error ==
+                L2FLOW_INSTRUMENT_RAW_EVENT_HISTORY_PROTOCOL_ERROR_V2 &&
+            session == nullptr &&
+            before != std::numeric_limits<std::size_t>::max() &&
+            before > 0U &&
+            after == before - 1U,
+        "short history response is protocol-fatal and closes every received SCM_RIGHTS fd");
 }
 
 bool TestServiceEndToEnd() {
@@ -2540,6 +3027,534 @@ bool TestServiceEndToEnd() {
         socket_path, 2U, 3U, true);
 
     ok &= Expect(
+        l2flow_shm_reader_session_v2(
+            reader.get(), &session) ==
+            L2FLOW_SHM_READER_OK_V2,
+        "refresh shared-memory identity before native history");
+    ipc::InstrumentRawEventHistoryCheckpointV2 first_checkpoint{};
+    const std::array<std::uint64_t, 1U> first_ingress{{3U}};
+    const std::array<std::uint64_t, 1U> first_ticks{{1U}};
+    ok &= ReadNativeRawEventHistory(
+        socket_path,
+        session,
+        2U,
+        nullptr,
+        first_ingress,
+        first_ticks,
+        &first_checkpoint,
+        "native origin");
+
+    l2flow_instrument_derived_event_history_session_v1*
+        derived_c_raw = nullptr;
+    ok &= Expect(
+        l2flow_instrument_derived_event_history_session_open_v1(
+            socket_path.c_str(),
+            &session,
+            1U,
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1,
+            100U,
+            3'000U,
+            &derived_c_raw) ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+            derived_c_raw != nullptr,
+        "derived C ABI opens one instrument-bound stateful session");
+    const auto derived_c_deleter = [](
+                                       l2flow_instrument_derived_event_history_session_v1*
+                                           value) noexcept {
+        l2flow_instrument_derived_event_history_session_close_v1(
+            value);
+    };
+    std::unique_ptr<
+        l2flow_instrument_derived_event_history_session_v1,
+        decltype(derived_c_deleter)>
+        derived_c_history(derived_c_raw, derived_c_deleter);
+    l2flow_instrument_derived_event_checkpoint_v1
+        first_derived_c_checkpoint{};
+    if (derived_c_history != nullptr) {
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_begin_full_v1(
+                derived_c_history.get(), 2U, 1U) ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1,
+            "derived C ABI begins retained full replay");
+        std::array<l2flow_instrument_derived_event_row_v1, 1U>
+            undersized_rows{};
+        std::size_t derived_c_count = 0U;
+        std::uint32_t derived_c_eof = 0U;
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_read_v1(
+                derived_c_history.get(),
+                undersized_rows.data(),
+                undersized_rows.size(),
+                &derived_c_count,
+                &derived_c_eof) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_BUFFER_TOO_SMALL_V1 &&
+                derived_c_count == 2U && derived_c_eof == 0U,
+            "derived C ABI reports exact required capacity without "
+            "advancing the page");
+        std::array<l2flow_instrument_derived_event_row_v1, 2U>
+            derived_c_rows{};
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_read_v1(
+                derived_c_history.get(),
+                derived_c_rows.data(),
+                derived_c_rows.size(),
+                &derived_c_count,
+                &derived_c_eof) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                derived_c_count == derived_c_rows.size() &&
+                derived_c_eof == 0U,
+            "derived C ABI retries the same full-replay page");
+        bool c_trade_seen = false;
+        bool c_order_seen = false;
+        for (const auto& row : derived_c_rows) {
+            c_trade_seen =
+                c_trade_seen ||
+                (row.record_schema_version == 1U &&
+                 row.record_bytes == sizeof(row) &&
+                 row.event_kind ==
+                     L2FLOW_INSTRUMENT_DERIVED_EVENT_TRADE_V1 &&
+                 row.quantity == 101);
+            c_order_seen =
+                c_order_seen ||
+                (row.record_schema_version == 1U &&
+                 row.record_bytes == sizeof(row) &&
+                 row.event_kind ==
+                     L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+                 row.order_id == 11'001 &&
+                 row.original_quantity_valid == 1U &&
+                 row.original_quantity == 101 &&
+                 row.apply_to_book == 0U);
+        }
+        ok &= Expect(
+            c_trade_seen && c_order_seen,
+            "derived C ABI flattens the full T source event and "
+            "synthetic order revision");
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_verified_checkpoint_v1(
+                derived_c_history.get(),
+                &first_derived_c_checkpoint) ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_INVALID_STATE_V1,
+            "derived C ABI withholds checkpoint before explicit EOF");
+        derived_c_count = std::numeric_limits<std::size_t>::max();
+        derived_c_eof = 0U;
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_read_v1(
+                derived_c_history.get(),
+                nullptr,
+                0U,
+                &derived_c_count,
+                &derived_c_eof) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                derived_c_count == 0U && derived_c_eof == 1U &&
+                l2flow_instrument_derived_event_history_verified_checkpoint_v1(
+                    derived_c_history.get(),
+                    &first_derived_c_checkpoint) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                first_derived_c_checkpoint
+                        .derived_event_sequence_exclusive ==
+                    3U &&
+                first_derived_c_checkpoint.order_state_count == 1U,
+            "derived C ABI releases its checkpoint only after EOF");
+    }
+
+    std::unique_ptr<
+        ipc::InstrumentDerivedEventHistorySessionV1>
+        derived_history;
+    ipc::InstrumentDerivedEventHistoryConfigV1 derived_config{};
+    derived_config.control_socket_path = socket_path.string();
+    derived_config.expected_session = session;
+    derived_config.instrument_id = 1U;
+    derived_config.market = market::MarketV1::kShanghai;
+    derived_config.maximum_order_states = 100U;
+    derived_config.timeout_ms = 3'000U;
+    ok &= Expect(
+        ipc::InstrumentDerivedEventHistorySessionV1::Create(
+            std::move(derived_config), &derived_history) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone &&
+            derived_history != nullptr &&
+            derived_history->BeginFull(2U, 1U) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone,
+        "derived history opens full replay on the first generation");
+    ipc::InstrumentDerivedEventCheckpointV1
+        unverified_derived_checkpoint{};
+    ok &= Expect(
+        derived_history != nullptr &&
+            derived_history->VerifiedCheckpoint(
+                &unverified_derived_checkpoint) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::
+                    kInvalidState,
+        "derived history withholds checkpoint before explicit EOF");
+    std::vector<ipc::InstrumentDerivedEventV1>
+        first_derived_events;
+    ipc::InstrumentDerivedEventCheckpointV1
+        first_derived_checkpoint{};
+    if (derived_history != nullptr) {
+        ok &= DrainDerivedEventHistory(
+            derived_history.get(),
+            &first_derived_events,
+            &first_derived_checkpoint,
+            "derived full T");
+    }
+    const market::ShanghaiTradeEventV1* derived_trade =
+        nullptr;
+    const market::ShanghaiOrderRevisionEventV1*
+        first_order_revision = nullptr;
+    for (const auto& event : first_derived_events) {
+        if (const auto* trade =
+                std::get_if<market::ShanghaiTradeEventV1>(
+                    &event.payload)) {
+            derived_trade = trade;
+        }
+        if (const auto* order =
+                std::get_if<
+                    market::ShanghaiOrderRevisionEventV1>(
+                    &event.payload)) {
+            first_order_revision = order;
+        }
+    }
+    ok &= Expect(
+        first_derived_events.size() == 2U &&
+            derived_trade != nullptr &&
+            derived_trade->buy_order_id == 11'001 &&
+            derived_trade->quantity == 101 &&
+            first_order_revision != nullptr &&
+            first_order_revision->order.order_source ==
+                market::ShanghaiOrderSourceV1::
+                    kReconstructedFromTrades &&
+            first_order_revision->order.original_quantity == 101 &&
+            first_order_revision->order.original_quantity_status ==
+                market::ShanghaiOriginalQuantityStatusV1::
+                    kLowerBound &&
+            first_order_revision->order.price_p6 == 1'235'000 &&
+            first_order_revision->order.price_source ==
+                market::ShanghaiOrderPriceSourceV1::
+                    kBuyMaximumExecution &&
+            !first_order_revision->order.apply_to_book,
+        "full T emits trade plus provisional synthetic lower-bound order");
+
+    ok &= Expect(
+        Submit(runtime.get(), AddInput(2U, 4U, 2U)),
+        "append matching A for native rolling update");
+    ipc::RealtimeWireTickPayloadV2 rolling_latest{};
+    std::uint8_t rolling_status = 0xffU;
+    constexpr std::uint32_t rolling_instrument_id = 1U;
+    ok &= Expect(
+        WaitUntil([&] {
+            rolling_status = 0xffU;
+            return l2flow_shm_reader_latest_ticks_v2(
+                       reader.get(),
+                       &rolling_instrument_id,
+                       1U,
+                       &rolling_latest,
+                       sizeof(rolling_latest),
+                       &rolling_status) ==
+                       L2FLOW_SHM_READER_OK_V2 &&
+                   rolling_status ==
+                       L2FLOW_LATEST_AVAILABLE_V2 &&
+                   rolling_latest.common.tick_stream_sequence ==
+                       2U;
+        }),
+        "rolling-update tick reaches Store and Wire latest");
+    ok &= Expect(
+        directory->AcquireSnapshot(&catalog) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            catalog != nullptr,
+        "capture catalog for native rolling generation");
+    const std::array<market::RealtimeSourceWatermarkV1, 4U>
+        rolling_sources{{
+            {11U, 3U},
+            {12U, 3U},
+            {13U, 1U},
+            {14U, 1U},
+        }};
+    market::RealtimeHistoryWatermarkV1 rolling_watermark{};
+    ok &= Expect(
+        market::BuildRealtimeHistoryWatermarkV1(
+            run_id,
+            3U,
+            kTradeDate,
+            5U,
+            60'000U,
+            catalog,
+            realtime::ProcessingProgressV2{4U, 4U},
+            rolling_sources,
+            &rolling_watermark) ==
+            market::RealtimeHistoryWatermarkErrorV1::kNone,
+        "build next immutable generation for native rolling update");
+    ok &= Expect(
+        runtime->BeginGeneration(rolling_watermark) ==
+            market::RealtimeHistoryGenerationErrorV1::kNone,
+        "begin native rolling generation");
+    for (std::uint8_t source = 0U; source < 4U; ++source) {
+        ok &= Expect(
+            runtime->SealSource(source, 3U) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone,
+            "seal native rolling generation source");
+    }
+    std::shared_ptr<
+        const market::IntradayInstrumentStoreGenerationV1>
+        rolling_store_generation;
+    std::shared_ptr<const market::RealtimeKLineGenerationV1>
+        rolling_kline_generation;
+    ok &= Expect(
+        runtime->WaitForGeneration(
+            3U,
+            std::chrono::seconds(3),
+            &rolling_store_generation,
+            &rolling_kline_generation) ==
+                market::RealtimeHistoryGenerationErrorV1::kNone &&
+            rolling_store_generation != nullptr &&
+            rolling_kline_generation != nullptr &&
+            service->PublishStoreGeneration(
+                rolling_store_generation),
+        "publish next Store generation for native rolling update");
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(
+            reader.get(), &session) ==
+            L2FLOW_SHM_READER_OK_V2,
+        "refresh identity for native rolling target");
+    ipc::InstrumentRawEventHistoryCheckpointV2
+        second_checkpoint{};
+    const std::array<std::uint64_t, 1U> second_ingress{{4U}};
+    const std::array<std::uint64_t, 1U> second_ticks{{2U}};
+    ok &= ReadNativeRawEventHistory(
+        socket_path,
+        session,
+        3U,
+        &first_checkpoint,
+        second_ingress,
+        second_ticks,
+        &second_checkpoint,
+        "native rolling suffix");
+    std::vector<ipc::InstrumentDerivedEventV1>
+        second_derived_events;
+    ipc::InstrumentDerivedEventCheckpointV1
+        second_derived_checkpoint{};
+    if (derived_history != nullptr) {
+        ok &= Expect(
+            derived_history->BeginUpdate(
+                first_derived_checkpoint, 3U, 1U) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone,
+            "derived rolling update starts from exact full checkpoint");
+        ok &= DrainDerivedEventHistory(
+            derived_history.get(),
+            &second_derived_events,
+            &second_derived_checkpoint,
+            "derived rolling A");
+    }
+    const market::ShanghaiOrderRevisionEventV1*
+        second_order_revision = nullptr;
+    for (const auto& event : second_derived_events) {
+        if (const auto* order =
+                std::get_if<
+                    market::ShanghaiOrderRevisionEventV1>(
+                    &event.payload)) {
+            second_order_revision = order;
+        }
+    }
+    ok &= Expect(
+        second_derived_events.size() == 1U &&
+            second_order_revision != nullptr &&
+            second_order_revision->operation ==
+                market::ShanghaiOrderDeltaOperationV1::kUpdate &&
+            second_order_revision->order.revision == 2U &&
+            second_order_revision->order.order_source ==
+                market::ShanghaiOrderSourceV1::kSourceAdd &&
+            second_order_revision->order.original_quantity == 151 &&
+            second_order_revision->order.original_quantity_status ==
+                market::ShanghaiOriginalQuantityStatusV1::kExact &&
+            second_order_revision->order
+                    .observed_pre_add_trade_quantity == 101 &&
+            second_order_revision->order.source_matched_quantity == 101 &&
+            second_order_revision->order.published_quantity == 50 &&
+            second_order_revision->order.remaining_quantity == 50 &&
+            second_order_revision->order.price_p6 == 1'236'000 &&
+            second_order_revision->order.price_source ==
+                market::ShanghaiOrderPriceSourceV1::kSourceAdd &&
+            second_order_revision->order.apply_to_book &&
+            second_derived_checkpoint
+                    .derived_event_sequence_exclusive ==
+                first_derived_checkpoint
+                        .derived_event_sequence_exclusive +
+                    1U,
+        "rolling A revises T-only order to exact A-backed quantity/state");
+    if (derived_c_history != nullptr) {
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_begin_update_v1(
+                derived_c_history.get(),
+                &first_derived_c_checkpoint,
+                3U,
+                1U) ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1,
+            "derived C ABI begins rolling update from its exact checkpoint");
+        std::array<l2flow_instrument_derived_event_row_v1, 1U>
+            derived_c_update_rows{};
+        std::size_t derived_c_update_count = 0U;
+        std::uint32_t derived_c_update_eof = 0U;
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_read_v1(
+                derived_c_history.get(),
+                derived_c_update_rows.data(),
+                derived_c_update_rows.size(),
+                &derived_c_update_count,
+                &derived_c_update_eof) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                derived_c_update_count == 1U &&
+                derived_c_update_eof == 0U &&
+                derived_c_update_rows[0].event_kind ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+                derived_c_update_rows[0].operation ==
+                    static_cast<std::uint8_t>(
+                        market::ShanghaiOrderDeltaOperationV1::kUpdate) &&
+                derived_c_update_rows[0].revision == 2U &&
+                derived_c_update_rows[0].original_quantity_valid == 1U &&
+                derived_c_update_rows[0].original_quantity == 151 &&
+                derived_c_update_rows[0]
+                        .observed_pre_add_trade_quantity ==
+                    101 &&
+                derived_c_update_rows[0]
+                        .source_matched_quantity_valid ==
+                    1U &&
+                derived_c_update_rows[0].source_matched_quantity ==
+                    101 &&
+                derived_c_update_rows[0].remaining_quantity_valid == 1U &&
+                derived_c_update_rows[0].remaining_quantity == 50 &&
+                derived_c_update_rows[0].apply_to_book == 1U,
+            "derived C ABI preserves the native T-to-A exact revision");
+        derived_c_update_count =
+            std::numeric_limits<std::size_t>::max();
+        derived_c_update_eof = 0U;
+        l2flow_instrument_derived_event_checkpoint_v1
+            second_derived_c_checkpoint{};
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_read_v1(
+                derived_c_history.get(),
+                nullptr,
+                0U,
+                &derived_c_update_count,
+                &derived_c_update_eof) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                derived_c_update_count == 0U &&
+                derived_c_update_eof == 1U &&
+                l2flow_instrument_derived_event_history_verified_checkpoint_v1(
+                    derived_c_history.get(),
+                    &second_derived_c_checkpoint) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                second_derived_c_checkpoint
+                        .derived_event_sequence_exclusive ==
+                    first_derived_c_checkpoint
+                            .derived_event_sequence_exclusive +
+                        1U,
+            "derived C ABI verifies the rolling suffix after EOF");
+        std::size_t derived_c_finalize_count = 0U;
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_finalize_v1(
+                derived_c_history.get(),
+                nullptr,
+                0U,
+                &derived_c_finalize_count) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_BUFFER_TOO_SMALL_V1 &&
+                derived_c_finalize_count == 1U,
+            "derived C ABI finalization reports its required capacity "
+            "without losing the revision");
+        std::array<l2flow_instrument_derived_event_row_v1, 1U>
+            derived_c_finalize_rows{};
+        ok &= Expect(
+            l2flow_instrument_derived_event_history_finalize_v1(
+                derived_c_history.get(),
+                derived_c_finalize_rows.data(),
+                derived_c_finalize_rows.size(),
+                &derived_c_finalize_count) ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
+                derived_c_finalize_count == 1U &&
+                derived_c_finalize_rows[0].event_kind ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+                derived_c_finalize_rows[0].operation ==
+                    static_cast<std::uint8_t>(
+                        market::ShanghaiOrderDeltaOperationV1::kFinalize) &&
+                derived_c_finalize_rows[0].revision == 3U &&
+                derived_c_finalize_rows[0].remaining_quantity_valid ==
+                    1U &&
+                derived_c_finalize_rows[0].remaining_quantity == 50 &&
+                (derived_c_finalize_rows[0].quality_flags &
+                 market::ShanghaiOrderQualityBitV1(
+                     market::ShanghaiOrderQualityFlagV1::
+                         kEndedWithObservedBalance)) != 0U,
+            "derived C ABI retains explicit clean-boundary finalization "
+            "across buffer retry");
+    }
+    std::vector<ipc::InstrumentDerivedEventV1>
+        empty_derived_events;
+    ipc::InstrumentDerivedEventCheckpointV1
+        empty_derived_checkpoint{};
+    if (derived_history != nullptr) {
+        ok &= Expect(
+            derived_history->BeginUpdate(
+                second_derived_checkpoint, 3U, 1U) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone,
+            "derived empty update accepts latest exact checkpoint");
+        ok &= DrainDerivedEventHistory(
+            derived_history.get(),
+            &empty_derived_events,
+            &empty_derived_checkpoint,
+            "derived empty update");
+    }
+    ok &= Expect(
+        empty_derived_events.empty() &&
+            empty_derived_checkpoint
+                    .derived_event_sequence_exclusive ==
+                second_derived_checkpoint
+                    .derived_event_sequence_exclusive &&
+            std::memcmp(
+                &empty_derived_checkpoint.raw_checkpoint,
+                &second_derived_checkpoint.raw_checkpoint,
+                sizeof(
+                    empty_derived_checkpoint.raw_checkpoint)) == 0,
+        "empty derived update advances no derived sequence/state");
+    ok &= RunPythonDerivedHistorySmoke(socket_path, 3U);
+    ipc::InstrumentRawEventHistoryCheckpointV2 empty_checkpoint{};
+    const std::array<std::uint64_t, 0U> empty_sequences{};
+    ok &= ReadNativeRawEventHistory(
+        socket_path,
+        session,
+        3U,
+        &second_checkpoint,
+        empty_sequences,
+        empty_sequences,
+        &empty_checkpoint,
+        "native empty suffix");
+    ok &= Expect(
+        std::memcmp(
+            &empty_checkpoint,
+            &second_checkpoint,
+            sizeof(empty_checkpoint)) == 0,
+        "empty rolling suffix preserves the exact verified checkpoint");
+    {
+        ipc::InstrumentRawEventHistorySessionV2 abandoned_session;
+        ipc::InstrumentRawEventHistoryCursorV2 abandoned_cursor;
+        ipc::InstrumentRawEventHistoryEndpointV2 abandoned_target{};
+        ok &= Expect(
+            ipc::InstrumentRawEventHistorySessionV2::Open(
+                socket_path.c_str(),
+                session,
+                3U,
+                3'000U,
+                &abandoned_session) ==
+                    ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+                abandoned_session.OpenFull(
+                    1U, 1U, &abandoned_cursor) ==
+                    ipc::InstrumentRawEventHistoryErrorV2::kNone &&
+                abandoned_session.is_open(),
+            "native early-close fixture opens an active cursor");
+        abandoned_cursor.Reset();
+        ok &= Expect(
+            !abandoned_session.is_open() &&
+                abandoned_session.Target(&abandoned_target) ==
+                    ipc::InstrumentRawEventHistoryErrorV2::kClosed,
+            "closing before EOF truthfully fail-closes the native session");
+    }
+
+    ok &= Expect(
         service->PublishProcessingProgress({10U, 9U}) &&
             service->PublishProcessingProgress({9U, 7U}),
         "progress publication merges concurrent-stale pairs monotonically");
@@ -2650,7 +3665,7 @@ bool TestServiceEndToEnd() {
 
     service->MarkDraining();
     ok &= Expect(
-        Submit(runtime.get(), TickInput(2U, 4U, 2U)),
+        Submit(runtime.get(), TickInput(3U, 5U, 3U)),
         "DRAINING still accepts an existing-ID publication");
     ipc::RealtimeWireTickPayloadV2 latest_tick{};
     ok &= Expect(
@@ -2665,7 +3680,7 @@ bool TestServiceEndToEnd() {
                        &item_status) ==
                        L2FLOW_SHM_READER_OK_V2 &&
                    item_status == L2FLOW_LATEST_AVAILABLE_V2 &&
-                   latest_tick.common.tick_stream_sequence == 2U;
+                   latest_tick.common.tick_stream_sequence == 3U;
         }),
         "DRAINING tick reaches latest and contiguous ring");
     ok &= Expect(
@@ -2694,7 +3709,7 @@ bool TestServiceEndToEnd() {
 
     runtime->StopAndDrain();
     ok &= Expect(
-        service->MarkStoppedClean(2U),
+        service->MarkStoppedClean(3U),
         "STOPPED_CLEAN requires exact highest and contiguous tick watermarks");
     ok &= Expect(
         l2flow_shm_reader_session_v2(
@@ -2703,8 +3718,8 @@ bool TestServiceEndToEnd() {
             session.server_state ==
                 static_cast<std::uint32_t>(
                     ipc::RealtimeServerStateV2::kStoppedClean) &&
-            session.tick_highest_published_sequence == 2U &&
-            session.tick_contiguous_published_sequence == 2U,
+            session.tick_highest_published_sequence == 3U &&
+            session.tick_contiguous_published_sequence == 3U,
         "clean terminal mapping preserves exact ring watermark");
     service->StopControl();
     return ok && !service->failed();
@@ -5559,7 +6574,8 @@ int main(int argc, char** argv) {
                "|--history-latency-benchmark]\n";
         return 2;
     }
-    if (!TestServiceEndToEnd() ||
+    if (!TestMalformedHistoryResponseClosesReceivedDescriptor() ||
+        !TestServiceEndToEnd() ||
         !TestProcessingAdmissionPublishesWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||
         !TestStoppedCleanRejectsMismatchedWatermark() ||

@@ -22,7 +22,14 @@ sys.path.insert(0, str(REPOSITORY / "python"))
 from l2flow_realtime import (  # noqa: E402
     DeltaCheckpointUnverifiedError,
     HistoryWorkerClosedError,
+    InstrumentRawEventBatch,
+    InstrumentRawEventHistoryReader,
+    InstrumentRawEventLookupError,
+    InstrumentKey,
+    InstrumentLookupResult,
+    InstrumentLookupStatus,
     InstrumentTickDeltaResultBatch,
+    L2FlowClient,
     ProtocolError,
     SessionIdentity,
     WireFormatError,
@@ -46,9 +53,11 @@ from l2flow_realtime.history_worker import (  # noqa: E402
     _start_instrument_tick_delta_worker,
 )
 from l2flow_realtime.instrument_delta import (  # noqa: E402
+    DELTA_SELECTED_SOURCE_MASK,
     DELTA_PAGE_ENDIAN_MARKER,
     DELTA_PAGE_HEADER_BYTES,
     DELTA_PAGE_MAGIC,
+    _METADATA_TAIL,
     _OPEN_SESSION_REQUEST,
     _PAGE_PREFIX,
     _READ_REQUEST,
@@ -78,7 +87,7 @@ from l2flow_realtime._generation import (  # noqa: E402
 
 
 class _UnixDeltaServer:
-    def __init__(self, handler) -> None:
+    def __init__(self, handler, *, connections: int = 1) -> None:
         self._temporary = tempfile.TemporaryDirectory(
             prefix="l2flow-worker-"
         )
@@ -91,6 +100,7 @@ class _UnixDeltaServer:
         self._listener.bind(self.path)
         self._listener.listen(1)
         self._handler = handler
+        self._connections = connections
         self._thread = threading.Thread(
             target=self._run, name="worker-delta-test-server"
         )
@@ -99,13 +109,16 @@ class _UnixDeltaServer:
 
     def _run(self) -> None:
         try:
-            channel, _address = self._listener.accept()
-            credentials = channel.getsockopt(
-                socket.SOL_SOCKET, socket.SO_PEERCRED, 12
-            )
-            self.peer_pid = struct.unpack("3i", credentials)[0]
-            with channel:
-                self._handler(channel)
+            for _index in range(self._connections):
+                channel, _address = self._listener.accept()
+                credentials = channel.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, 12
+                )
+                self.peer_pid = struct.unpack(
+                    "3i", credentials
+                )[0]
+                with channel:
+                    self._handler(channel)
         except BaseException as error:
             self.error = error
 
@@ -243,6 +256,95 @@ def _split_delta_server(channel: socket.socket) -> None:
             request_id,
             0,
             len(TICKS),
+            _endpoint().generation,
+            0,
+        )
+    )
+
+
+def _empty_successor_delta_server(channel: socket.socket) -> None:
+    """Serve an empty finite delta based on the full-read checkpoint."""
+
+    request = channel.recv(_OPEN_SESSION_REQUEST.size)
+    if not request:
+        return
+    request_id = struct.unpack_from("<Q", request, 24)[0]
+    channel.send(
+        struct.pack(
+            "<8sHHHHIIQ",
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            0,
+            288,
+            0,
+            request_id,
+        )
+        + pack_generation_endpoint(_endpoint())
+        + struct.pack("<Q", 301)
+    )
+    request = channel.recv(376)
+    if not request:
+        return
+    if len(request) != 376:
+        raise RuntimeError("short successor instrument OPEN")
+    if struct.unpack_from("<I", request, 40)[0] != 2:
+        raise RuntimeError("successor OPEN did not use checkpoint base")
+    checkpoint = _target_checkpoint()
+    if request[56:368] != checkpoint.to_wire():
+        raise RuntimeError("successor OPEN changed its base checkpoint")
+    metadata = (
+        struct.pack("<II", 2, DELTA_SELECTED_SOURCE_MASK)
+        + checkpoint.to_wire()
+        + checkpoint.to_wire()
+        + _METADATA_TAIL.pack(
+            0,
+            0,
+            0,
+            0,
+            0,
+            checkpoint.ingress_sequence_exclusive,
+            checkpoint.ingress_sequence_exclusive,
+            checkpoint.tick_stream_sequence_exclusive,
+            checkpoint.tick_stream_sequence_exclusive,
+            1,
+            1,
+            b"\x00" * 8,
+        )
+    )
+    request_id = struct.unpack_from("<Q", request, 24)[0]
+    channel.send(
+        struct.pack(
+            "<8sHHHHIIQQ",
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            0,
+            760,
+            0,
+            request_id,
+            302,
+        )
+        + metadata
+    )
+    request = channel.recv(_READ_REQUEST.size)
+    if not request:
+        return
+    request_id = struct.unpack_from("<Q", request, 24)[0]
+    channel.send(
+        _READ_RESPONSE.pack(
+            CONTROL_MAGIC,
+            WIRE_MAJOR,
+            WIRE_MINOR,
+            0,
+            1,
+            _READ_RESPONSE.size,
+            0,
+            request_id,
+            0,
+            0,
             _endpoint().generation,
             0,
         )
@@ -495,6 +597,200 @@ class IsolatedDeltaWorkerTests(unittest.TestCase):
                     self.assertEqual(
                         cursor.verified_checkpoint.generation, 9
                     )
+
+    def test_public_raw_event_history_reuses_worker_for_full_and_updates(self):
+        handlers = iter(
+            (_delta_server, _empty_successor_delta_server)
+        )
+
+        def serve_next(channel):
+            next(handlers)(channel)
+
+        key = InstrumentKey(1, b"XSHG", b"600010")
+        unknown_key = InstrumentKey(1, b"XSHG", b"600011")
+
+        class KeyResolver:
+            def __init__(self, worker):
+                self.worker = worker
+                self.worker_open_args = None
+
+            def resolve_key(self, requested):
+                if requested == unknown_key:
+                    return InstrumentLookupResult(
+                        SESSION_EPOCH,
+                        requested,
+                        InstrumentLookupStatus.UNKNOWN,
+                        0,
+                    )
+                if requested != key:
+                    raise AssertionError("unexpected instrument key")
+                return InstrumentLookupResult(
+                    SESSION_EPOCH,
+                    requested,
+                    InstrumentLookupStatus.FOUND,
+                    1,
+                )
+
+            def open_instrument_tick_delta_worker(self, **kwargs):
+                self.worker_open_args = kwargs
+                return self.worker
+
+        with _UnixDeltaServer(
+            serve_next, connections=2
+        ) as server:
+            worker = self._start(
+                server.path,
+                result_columns=(
+                    "ingress_sequence",
+                    "action",
+                    "primary_order_id",
+                    "price_p6",
+                ),
+                ring_slots=2,
+                result_batch_records=2,
+            )
+            resolver = KeyResolver(worker)
+            with L2FlowClient.open_instrument_raw_event_history(
+                resolver,
+                raw_event_columns=(
+                    "ingress_sequence",
+                    "action",
+                    "primary_order_id",
+                    "price_p6",
+                ),
+                ring_slots=2,
+                batch_capacity=2,
+            ) as history:
+                self.assertIsInstance(
+                    history, InstrumentRawEventHistoryReader
+                )
+                self.assertEqual(
+                    resolver.worker_open_args,
+                    {
+                        "result_columns": (
+                            "ingress_sequence",
+                            "action",
+                            "primary_order_id",
+                            "price_p6",
+                        ),
+                        "ring_slots": 2,
+                        "result_batch_records": 2,
+                    },
+                )
+                self.assertEqual(
+                    history.raw_event_columns,
+                    (
+                        "ingress_sequence",
+                        "action",
+                        "primary_order_id",
+                        "price_p6",
+                    ),
+                )
+                with self.assertRaises(
+                    InstrumentRawEventLookupError
+                ) as lookup_error:
+                    history.read_all(unknown_key)
+                self.assertIs(
+                    lookup_error.exception.status,
+                    InstrumentLookupStatus.UNKNOWN,
+                )
+                worker_pid = history.worker_pid
+                with history.read_all(
+                    key, expected_generation=9
+                ) as full:
+                    self.assertTrue(full.is_full_read)
+                    self.assertEqual(full.worker_pid, worker_pid)
+                    with self.assertRaises(
+                        DeltaCheckpointUnverifiedError
+                    ):
+                        _ = full.verified_checkpoint
+                    seen_ingress = []
+                    batches = []
+                    for batch in full.batches():
+                        batches.append(batch)
+                        self.assertIsInstance(
+                            batch, InstrumentRawEventBatch
+                        )
+                        seen_ingress.extend(
+                            batch.read_columns(
+                                "ingress_sequence"
+                            )["ingress_sequence"]
+                        )
+                    self.assertEqual(seen_ingress, [1, 2])
+                    self.assertEqual(len(batches), 1)
+                    self.assertTrue(batches[0].closed)
+                    checkpoint = full.verified_checkpoint
+                    self.assertEqual(
+                        full.cumulative_record_count, 2
+                    )
+
+                with history.read_updates(
+                    1,
+                    checkpoint,
+                    expected_generation=9,
+                ) as updates:
+                    self.assertFalse(updates.is_full_read)
+                    self.assertEqual(updates.worker_pid, worker_pid)
+                    self.assertIsNone(updates.read_batch())
+                    self.assertTrue(updates.eof)
+                    self.assertEqual(
+                        updates.expected_record_count, 0
+                    )
+                    self.assertEqual(
+                        updates.verified_checkpoint,
+                        checkpoint,
+                    )
+                self.assertEqual(history.worker_pid, worker_pid)
+        self.assertEqual(server.peer_pid, worker_pid)
+
+    def test_early_cursor_close_cancels_once_and_worker_is_reusable(self):
+        handlers = iter((_split_delta_server, _delta_server))
+
+        def serve_next(channel):
+            next(handlers)(channel)
+
+        with _UnixDeltaServer(
+            serve_next, connections=2
+        ) as server:
+            worker = self._start(
+                server.path,
+                result_columns=("ingress_sequence",),
+                ring_slots=1,
+                result_batch_records=2,
+            )
+
+            class NumericOnlyClient:
+                pass
+
+            with InstrumentRawEventHistoryReader(
+                NumericOnlyClient(), worker
+            ) as history:
+                worker_pid = history.worker_pid
+                canceled = history.read_all(
+                    1, expected_generation=9
+                )
+                canceled.close()
+                self.assertTrue(canceled.closed)
+                self.assertFalse(history.closed)
+                self.assertFalse(history.failed)
+
+                with history.read_all(
+                    1, expected_generation=9
+                ) as retry:
+                    ingress = []
+                    for batch in retry.batches():
+                        ingress.extend(
+                            batch.read_columns(
+                                "ingress_sequence"
+                            )["ingress_sequence"]
+                        )
+                    self.assertEqual(ingress, [1, 2])
+                    self.assertEqual(
+                        retry.verified_checkpoint,
+                        _target_checkpoint(),
+                    )
+                    self.assertEqual(retry.worker_pid, worker_pid)
+        self.assertEqual(server.peer_pid, worker_pid)
 
 
 if __name__ == "__main__":

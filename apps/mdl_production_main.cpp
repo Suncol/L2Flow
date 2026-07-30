@@ -2,6 +2,7 @@
 #if !defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V2)
 #error "mdl-production-router requires Linux realtime IPC Wire V2"
 #endif
+#include "l2flow/ipc/order_event_delta_control_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/market/observed_instrument_directory_v2.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
@@ -156,6 +157,9 @@ struct Options final {
     std::uint32_t generation_timeout_ms = 10'000U;
 
     std::filesystem::path ipc_socket;
+    std::filesystem::path event_aggregator_socket;
+    std::uint32_t event_aggregator_ready_timeout_ms = 30'000U;
+    bool event_aggregator_ready_timeout_set = false;
     std::uint64_t ipc_tick_ring_records = 262'144U;
     std::uint64_t ipc_key_arena_bytes =
         16ULL * 1024ULL * 1024ULL;
@@ -196,6 +200,14 @@ void PrintUsage(std::ostream& output) {
         << "  --ipc-tick-ring-records N     positive u64, default 262144\n"
         << "  --ipc-key-arena-mib N         positive u64, default 16\n"
         << "  --ipc-max-mapping-mib N       positive u64, default 2048\n"
+        << "  --event-aggregator-socket PATH\n"
+        << "                                optional absolute event-delta "
+           "GET_SESSION UDS;\n"
+        << "                                when set, SDK connect waits for "
+           "an exact-session READY\n"
+        << "  --event-aggregator-ready-timeout-ms N\n"
+        << "                                1..600000, default 30000; "
+           "requires event socket\n"
         << "  --help\n\n"
         << "The session exposes only the observed universe. Capacity and key "
            "arena exhaustion are fatal; this process does not roll over or "
@@ -382,6 +394,8 @@ bool ParseOptions(
             option != "--generation-interval-ms" &&
             option != "--generation-timeout-ms" &&
             option != "--ipc-socket" &&
+            option != "--event-aggregator-socket" &&
+            option != "--event-aggregator-ready-timeout-ms" &&
             option != "--ipc-tick-ring-records" &&
             option != "--ipc-key-arena-mib" &&
             option != "--ipc-max-mapping-mib") {
@@ -524,6 +538,21 @@ bool ParseOptions(
             }
         } else if (option == "--ipc-socket") {
             parsed.ipc_socket = std::string(value);
+        } else if (option == "--event-aggregator-socket") {
+            parsed.event_aggregator_socket = std::string(value);
+        } else if (
+            option == "--event-aggregator-ready-timeout-ms") {
+            if (!ParseU32(
+                    value,
+                    &parsed.event_aggregator_ready_timeout_ms) ||
+                parsed.event_aggregator_ready_timeout_ms == 0U ||
+                parsed.event_aggregator_ready_timeout_ms > 600'000U) {
+                *error =
+                    "--event-aggregator-ready-timeout-ms must be "
+                    "1..600000";
+                return false;
+            }
+            parsed.event_aggregator_ready_timeout_set = true;
         } else if (option == "--ipc-tick-ring-records") {
             if (!ParseU64(
                     value, &parsed.ipc_tick_ring_records) ||
@@ -570,6 +599,19 @@ bool ParseOptions(
     }
     if (!parsed.ipc_socket.is_absolute()) {
         *error = "--ipc-socket must be an absolute path";
+        return false;
+    }
+    if (!parsed.event_aggregator_socket.empty() &&
+        !parsed.event_aggregator_socket.is_absolute()) {
+        *error =
+            "--event-aggregator-socket must be an absolute path";
+        return false;
+    }
+    if (parsed.event_aggregator_socket.empty() &&
+        parsed.event_aggregator_ready_timeout_set) {
+        *error =
+            "--event-aggregator-ready-timeout-ms requires "
+            "--event-aggregator-socket";
         return false;
     }
     if (!parsed.intraday_store_maximum_records_set ||
@@ -659,6 +701,126 @@ void ReportFatalSnapshot(
         << " last_decode_error="
         << static_cast<unsigned int>(snapshot.last_decode_error)
         << '\n';
+}
+
+bool EventAggregatorProbeErrorIsRetryable(
+    ipc::OrderEventDeltaControlClientErrorV1 error) noexcept {
+    using Error = ipc::OrderEventDeltaControlClientErrorV1;
+    return error == Error::kConnectFailed ||
+           error == Error::kTimeout ||
+           error == Error::kTransportFailed ||
+           error == Error::kUnavailable;
+}
+
+bool WaitForEventAggregatorReady(
+    const Options& options,
+    const common::Identity128& source_run_id,
+    ipc::OrderEventDeltaControlSnapshotV1* output_snapshot,
+    std::string* output_detail) {
+    if (output_snapshot == nullptr || output_detail == nullptr ||
+        options.event_aggregator_socket.empty()) {
+        return false;
+    }
+    *output_snapshot = {};
+    output_detail->clear();
+
+    ipc::OrderEventDeltaControlClientConfigV1 config{};
+    config.control_socket_path = options.event_aggregator_socket;
+    config.expected_source_session.run_id = source_run_id;
+    config.expected_source_session.session_epoch =
+        options.session_epoch;
+    config.expected_source_session.trade_date = options.trade_date;
+
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(
+            options.event_aggregator_ready_timeout_ms);
+    ipc::OrderEventDeltaControlClientErrorV1 last_error =
+        ipc::OrderEventDeltaControlClientErrorV1::kConnectFailed;
+    int last_system_error = 0;
+
+    for (;;) {
+        if (g_stop_requested != 0) {
+            *output_detail = "stop signal while waiting for READY";
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            *output_detail =
+                "READY timeout: last_error=" +
+                std::string(
+                    ipc::OrderEventDeltaControlClientErrorNameV1(
+                        last_error)) +
+                " errno=" + std::to_string(last_system_error);
+            return false;
+        }
+
+        auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now);
+        if (remaining.count() == 0) {
+            remaining = std::chrono::milliseconds(1);
+        }
+        config.timeout = std::min(
+            remaining, std::chrono::milliseconds(250));
+
+        ipc::OrderEventDeltaControlSnapshotV1 snapshot{};
+        int system_error = 0;
+        const ipc::OrderEventDeltaControlClientErrorV1 probe_error =
+            ipc::OrderEventDeltaControlProbeV1(
+                config, &snapshot, &system_error);
+        if (probe_error ==
+            ipc::OrderEventDeltaControlClientErrorV1::kNone) {
+            // The source pipeline has not been created, so an exact-session
+            // event service can only be a pre-ingress READY if both public
+            // prefixes are still empty. This is the startup guarantee that
+            // prevents silently beginning after the first callback.
+            if (snapshot.source_tick_consumed_sequence != 0U ||
+                snapshot.event_published_sequence != 0U) {
+                *output_detail =
+                    "READY service is not at the pre-ingress origin";
+                return false;
+            }
+            *output_snapshot = snapshot;
+            return true;
+        }
+        last_error = probe_error;
+        last_system_error = system_error;
+        if (!EventAggregatorProbeErrorIsRetryable(probe_error)) {
+            *output_detail =
+                "READY probe failed: error=" +
+                std::string(
+                    ipc::OrderEventDeltaControlClientErrorNameV1(
+                        probe_error)) +
+                " errno=" + std::to_string(system_error);
+            return false;
+        }
+
+        const auto after_probe = std::chrono::steady_clock::now();
+        if (after_probe >= deadline) {
+            continue;
+        }
+        const auto retry_delay = std::min(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - after_probe),
+            std::chrono::milliseconds(25));
+        const IntervalWaitResult wait =
+            WaitForInterval(retry_delay, options.trade_date);
+        if (wait == IntervalWaitResult::kSignal) {
+            *output_detail = "stop signal while waiting for READY";
+            return false;
+        }
+        if (wait == IntervalWaitResult::kTradeDateBoundary) {
+            *output_detail =
+                "trade-date boundary while waiting for READY";
+            return false;
+        }
+        if (wait == IntervalWaitResult::kClockFailure) {
+            *output_detail =
+                "clock failure while waiting for READY";
+            return false;
+        }
+    }
 }
 
 int Run(const Options& options) {
@@ -813,6 +975,31 @@ int Run(const Options& options) {
                 ? "true"
                 : "false")
         << '\n';
+
+    if (!options.event_aggregator_socket.empty()) {
+        ipc::OrderEventDeltaControlSnapshotV1 event_snapshot{};
+        std::string ready_detail;
+        if (!WaitForEventAggregatorReady(
+                options,
+                run_id,
+                &event_snapshot,
+                &ready_detail)) {
+            std::cerr
+                << "mdl-production-router: event aggregator READY "
+                   "gate failed: "
+                << ready_detail << '\n';
+            ipc_service->MarkFailed();
+            ipc_service->StopControl();
+            return 1;
+        }
+        std::cerr
+            << "mdl-production-router: event aggregator READY: socket="
+            << options.event_aggregator_socket
+            << " event_ring_capacity="
+            << event_snapshot.event_session.ring_capacity
+            << " source_tick_consumed_sequence=0"
+            << " event_published_sequence=0\n";
+    }
 
     pipeline_config.applied_record_sink = ipc_service;
     pipeline_config.instrument_binding_sink = ipc_service;

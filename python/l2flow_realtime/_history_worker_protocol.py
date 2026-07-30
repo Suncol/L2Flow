@@ -156,6 +156,9 @@ RESULT_COLUMN_SPECS = tuple(
     ResultColumnSpec(name, format_, _scalar_width(format_))
     for name, format_ in _RESULT_COLUMN_LAYOUT
 )
+ALL_RESULT_COLUMNS = tuple(
+    spec.name for spec in RESULT_COLUMN_SPECS
+)
 RESULT_COLUMN_BY_NAME = {
     spec.name: spec for spec in RESULT_COLUMN_SPECS
 }
@@ -1020,6 +1023,7 @@ if sys.byteorder != "little":
 
 
 __all__ = [
+    "ALL_RESULT_COLUMNS",
     "CONTROL_PACKET_BYTES",
     "DEFAULT_RESULT_COLUMNS",
     "MAX_RESULT_BATCH_RECORDS",

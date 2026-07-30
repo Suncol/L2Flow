@@ -1328,9 +1328,20 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         if (error != MarketDecodeErrorV1::kNone) {
             return error;
         }
-        error = NormalizeDecimalP6(&decoded.fields.trade_amount);
-        if (error != MarketDecodeErrorV1::kNone) {
-            return error;
+        if (decoded.fields.trade_amount.is_null) {
+            // Preserve the source null sentinel and its existing quality bit.
+        } else if (decoded.fields.trade_amount.raw < 0) {
+            // A transaction amount cannot be negative. Retain the exact raw
+            // diagnostic, but reject it before p6 multiplication so a
+            // negative extreme is not promoted to a valid amount or turned
+            // into a decoder-wide overflow failure.
+            decoded.common.market_notices |= MarketNoticeBitV1(
+                MarketNoticeV1::kTradeAmountDomainInvalid);
+        } else {
+            error = NormalizeDecimalP6(&decoded.fields.trade_amount);
+            if (error != MarketDecodeErrorV1::kNone) {
+                return error;
+            }
         }
         if (decoded.fields.price.valid) {
             decoded.fields.validity_bitmap |= kTickPriceValidV1;

@@ -196,6 +196,7 @@ enum class MarketNoticeV1 : std::uint8_t {
     kAbsolutePriceDomainInvalid,
     kProductApplicabilityUnknown,
     kMaximumDurationUnavailable,
+    kTradeAmountDomainInvalid,
 };
 
 [[nodiscard]] constexpr std::uint64_t MarketNoticeBitV1(
