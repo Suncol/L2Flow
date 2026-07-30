@@ -265,7 +265,338 @@ enum class ByteOrder : std::uint8_t {
     return hasher.Finalize(output);
 }
 
+// This non-cryptographic hash exists only inside the frozen session index.
+// It is never persisted or treated as identity; every candidate is verified
+// against the exact opaque key bytes before it can be returned.
+constexpr std::uint64_t kLookupHashDomain =
+    0x4c32464c4f4f4f4bULL;
+constexpr std::uint64_t kFnv1aOffsetBasis =
+    14'695'981'039'346'656'037ULL;
+constexpr std::uint64_t kFnv1aPrime = 1'099'511'628'211ULL;
+constexpr std::uint32_t kMaximumLookupProbeDistance = 64U;
+constexpr std::uint32_t kLookupSeedAttempts = 8U;
+constexpr std::size_t kInitialLookupCapacityMultiplier = 2U;
+constexpr std::size_t kExpandedLookupCapacityMultiplier = 4U;
+
+static_assert(
+    sizeof(std::size_t) <= sizeof(std::uint64_t),
+    "lookup hash length encoding requires size_t to fit in uint64_t");
+
+[[nodiscard]] std::uint64_t Avalanche64(
+    std::uint64_t value) noexcept {
+    value ^= value >> 33U;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33U;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33U;
+    return value;
+}
+
+[[nodiscard]] std::uint64_t LookupSeed(
+    const l2flow::common::Sha256Digest& digest,
+    std::uint64_t session_epoch,
+    std::size_t capacity,
+    std::uint32_t attempt) noexcept {
+    std::uint64_t digest_word = 0U;
+    for (std::size_t index = 0U; index < sizeof(digest_word); ++index) {
+        digest_word |=
+            static_cast<std::uint64_t>(
+                std::to_integer<std::uint8_t>(digest[index]))
+            << (index * 8U);
+    }
+    const std::uint64_t capacity_word =
+        static_cast<std::uint64_t>(capacity);
+    const std::uint64_t attempt_word =
+        static_cast<std::uint64_t>(attempt);
+    return Avalanche64(
+        kLookupHashDomain ^ digest_word ^
+        Avalanche64(session_epoch + 0x9e3779b97f4a7c15ULL) ^
+        Avalanche64(capacity_word + 0xd6e8feb86659fd93ULL) ^
+        (attempt_word * 0xa0761d6478bd642fULL));
+}
+
+void HashByte(
+    std::uint64_t* state,
+    std::uint8_t value) noexcept {
+    *state ^= static_cast<std::uint64_t>(value);
+    *state *= kFnv1aPrime;
+}
+
+void HashLength(
+    std::uint64_t* state,
+    std::size_t length) noexcept {
+    *state ^= Avalanche64(
+        static_cast<std::uint64_t>(length) +
+        0x9e3779b97f4a7c15ULL);
+    *state *= kFnv1aPrime;
+}
+
+void HashBytes(
+    std::uint64_t* state,
+    std::span<const std::byte> bytes) noexcept {
+    for (const std::byte byte : bytes) {
+        HashByte(state, std::to_integer<std::uint8_t>(byte));
+    }
+}
+
+[[nodiscard]] std::uint64_t HashExactKey(
+    const InstrumentKeyViewV1& key,
+    std::uint64_t seed) noexcept {
+    std::uint64_t state =
+        kFnv1aOffsetBasis ^ Avalanche64(seed ^ kLookupHashDomain);
+    HashByte(&state, static_cast<std::uint8_t>(key.market));
+    HashLength(&state, key.security_id_source.size());
+    HashBytes(&state, key.security_id_source);
+    HashLength(&state, key.security_id.size());
+    HashBytes(&state, key.security_id);
+    return Avalanche64(state ^ seed);
+}
+
+[[nodiscard]] std::uint64_t HashExactKey(
+    const InstrumentKeyV1& key,
+    std::uint64_t seed) noexcept {
+    return HashExactKey(
+        InstrumentKeyViewV1{
+            key.market,
+            key.security_id_source,
+            key.security_id},
+        seed);
+}
+
+[[nodiscard]] bool LookupCapacity(
+    std::size_t entry_count,
+    std::size_t multiplier,
+    std::size_t* output) noexcept {
+    if (output == nullptr || entry_count == 0U ||
+        multiplier == 0U ||
+        entry_count >
+            std::numeric_limits<std::size_t>::max() / multiplier) {
+        return false;
+    }
+    const std::size_t required = entry_count * multiplier;
+    std::size_t capacity = 1U;
+    while (capacity < required) {
+        if (capacity >
+            std::numeric_limits<std::size_t>::max() / 2U) {
+            return false;
+        }
+        capacity *= 2U;
+    }
+    *output = std::max<std::size_t>(capacity, 2U);
+    return true;
+}
+
 }  // namespace
+
+class DailyInstrumentCatalogV2::LookupIndex final {
+public:
+    enum class CreateResult : std::uint8_t {
+        kSuccess = 0U,
+        kResourceExhausted,
+        kUnusableDistribution,
+        kInvariantFailure,
+    };
+
+    [[nodiscard]] static CreateResult Create(
+        std::span<const DailyInstrumentCatalogEntryV2> entries,
+        const l2flow::common::Sha256Digest& digest,
+        std::uint64_t session_epoch,
+        std::unique_ptr<const LookupIndex>* output) {
+        if (output == nullptr) {
+            return CreateResult::kUnusableDistribution;
+        }
+        output->reset();
+
+        constexpr std::array<std::size_t, 2U> multipliers{
+            kInitialLookupCapacityMultiplier,
+            kExpandedLookupCapacityMultiplier};
+        for (const std::size_t multiplier : multipliers) {
+            std::size_t capacity = 0U;
+            if (!LookupCapacity(
+                    entries.size(), multiplier, &capacity)) {
+                return CreateResult::kResourceExhausted;
+            }
+            for (std::uint32_t attempt = 0U;
+                 attempt < kLookupSeedAttempts;
+                 ++attempt) {
+                const std::uint64_t seed = LookupSeed(
+                    digest, session_epoch, capacity, attempt);
+                std::unique_ptr<LookupIndex> candidate(
+                    new LookupIndex(capacity, seed));
+                bool inserted = true;
+                for (const DailyInstrumentCatalogEntryV2& entry :
+                     entries) {
+                    if (!candidate->Insert(entry)) {
+                        inserted = false;
+                        break;
+                    }
+                }
+                if (inserted) {
+                    if (!candidate->Validate(entries)) {
+                        return CreateResult::kInvariantFailure;
+                    }
+                    *output = std::move(candidate);
+                    return CreateResult::kSuccess;
+                }
+            }
+        }
+        return CreateResult::kUnusableDistribution;
+    }
+
+    [[nodiscard]] const DailyInstrumentCatalogEntryV2* Find(
+        const InstrumentKeyViewV1& key,
+        std::span<const DailyInstrumentCatalogEntryV2> entries)
+        const noexcept {
+        const std::uint64_t hash = HashExactKey(key, seed_);
+        std::size_t bucket_index =
+            static_cast<std::size_t>(hash) & mask_;
+        for (std::uint32_t probe_distance = 0U;
+             probe_distance <= maximum_probe_distance_;
+             ++probe_distance) {
+            const Bucket& bucket = buckets_[bucket_index];
+            if (bucket.instrument_id == 0U ||
+                bucket.probe_distance < probe_distance) {
+                return nullptr;
+            }
+            if (bucket.hash == hash) {
+                const std::size_t ordinal =
+                    static_cast<std::size_t>(
+                        bucket.instrument_id - 1U);
+                if (ordinal < entries.size()) {
+                    const DailyInstrumentCatalogEntryV2& entry =
+                        entries[ordinal];
+                    if (entry.instrument_id ==
+                            bucket.instrument_id &&
+                        CompareKey(entry.key, key) ==
+                            ByteOrder::kEqual) {
+                        return &entry;
+                    }
+                }
+            }
+            bucket_index = (bucket_index + 1U) & mask_;
+        }
+        return nullptr;
+    }
+
+private:
+    struct Bucket final {
+        std::uint64_t hash = 0U;
+        std::uint32_t instrument_id = 0U;
+        std::uint32_t probe_distance = 0U;
+    };
+
+    LookupIndex(
+        std::size_t capacity,
+        std::uint64_t seed)
+        : buckets_(capacity), mask_(capacity - 1U), seed_(seed) {}
+
+    [[nodiscard]] bool Insert(
+        const DailyInstrumentCatalogEntryV2& entry) noexcept {
+        Bucket candidate{
+            HashExactKey(entry.key, seed_),
+            entry.instrument_id,
+            0U};
+        std::size_t bucket_index =
+            static_cast<std::size_t>(candidate.hash) & mask_;
+        for (;;) {
+            Bucket& resident = buckets_[bucket_index];
+            if (resident.instrument_id == 0U) {
+                resident = candidate;
+                ++occupied_count_;
+                maximum_probe_distance_ = std::max(
+                    maximum_probe_distance_,
+                    candidate.probe_distance);
+                return true;
+            }
+            if (resident.probe_distance <
+                candidate.probe_distance) {
+                std::swap(resident, candidate);
+                maximum_probe_distance_ = std::max(
+                    maximum_probe_distance_,
+                    resident.probe_distance);
+            }
+            if (candidate.probe_distance >=
+                kMaximumLookupProbeDistance) {
+                return false;
+            }
+            ++candidate.probe_distance;
+            bucket_index = (bucket_index + 1U) & mask_;
+        }
+    }
+
+    [[nodiscard]] bool Validate(
+        std::span<const DailyInstrumentCatalogEntryV2> entries)
+        const noexcept {
+        if (buckets_.empty() ||
+            mask_ != buckets_.size() - 1U ||
+            (buckets_.size() & mask_) != 0U ||
+            occupied_count_ != entries.size() ||
+            maximum_probe_distance_ >
+                kMaximumLookupProbeDistance) {
+            return false;
+        }
+        std::size_t validated_occupancy = 0U;
+        std::uint32_t validated_maximum_probe = 0U;
+        for (std::size_t bucket_index = 0U;
+             bucket_index < buckets_.size();
+             ++bucket_index) {
+            const Bucket& bucket = buckets_[bucket_index];
+            if (bucket.instrument_id == 0U) {
+                continue;
+            }
+            ++validated_occupancy;
+            const std::size_t ordinal = static_cast<std::size_t>(
+                bucket.instrument_id - 1U);
+            if (ordinal >= entries.size() ||
+                entries[ordinal].instrument_id !=
+                    bucket.instrument_id ||
+                HashExactKey(entries[ordinal].key, seed_) !=
+                    bucket.hash) {
+                return false;
+            }
+            const std::size_t home =
+                static_cast<std::size_t>(bucket.hash) & mask_;
+            const std::size_t actual_distance =
+                bucket_index >= home
+                    ? bucket_index - home
+                    : buckets_.size() - (home - bucket_index);
+            if (actual_distance !=
+                    static_cast<std::size_t>(
+                        bucket.probe_distance) ||
+                actual_distance >
+                    static_cast<std::size_t>(
+                        kMaximumLookupProbeDistance)) {
+                return false;
+            }
+            validated_maximum_probe = std::max(
+                validated_maximum_probe,
+                bucket.probe_distance);
+        }
+        if (validated_occupancy != occupied_count_ ||
+            validated_maximum_probe !=
+                maximum_probe_distance_) {
+            return false;
+        }
+        for (const DailyInstrumentCatalogEntryV2& entry : entries) {
+            const DailyInstrumentCatalogEntryV2* found = Find(
+                InstrumentKeyViewV1{
+                    entry.key.market,
+                    entry.key.security_id_source,
+                    entry.key.security_id},
+                entries);
+            if (found != &entry) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::vector<Bucket> buckets_;
+    std::size_t mask_ = 0U;
+    std::uint64_t seed_ = 0U;
+    std::uint32_t maximum_probe_distance_ = 0U;
+    std::size_t occupied_count_ = 0U;
+};
 
 std::string_view DailyInstrumentCatalogCreateErrorNameV2(
     DailyInstrumentCatalogCreateErrorV2 error) noexcept {
@@ -321,11 +652,15 @@ DailyInstrumentCatalogV2::DailyInstrumentCatalogV2(
     DailyInstrumentCatalogConfigV2 config,
     std::vector<DailyInstrumentCatalogEntryV2> entries,
     std::size_t filtered_non_a_share_count,
-    l2flow::common::Sha256Digest digest) noexcept
+    l2flow::common::Sha256Digest digest,
+    std::unique_ptr<const LookupIndex> lookup_index) noexcept
     : config_(config),
       entries_(std::move(entries)),
       filtered_non_a_share_count_(filtered_non_a_share_count),
-      catalog_digest_(digest) {}
+      catalog_digest_(digest),
+      lookup_index_(std::move(lookup_index)) {}
+
+DailyInstrumentCatalogV2::~DailyInstrumentCatalogV2() = default;
 
 DailyInstrumentCatalogCreateErrorV2 DailyInstrumentCatalogV2::Create(
     DailyInstrumentCatalogConfigV2 config,
@@ -420,11 +755,38 @@ DailyInstrumentCatalogCreateErrorV2 DailyInstrumentCatalogV2::Create(
         if (!ComputeDigest(config, entries, &digest)) {
             return DailyInstrumentCatalogCreateErrorV2::kHashFailure;
         }
+        std::unique_ptr<const LookupIndex> lookup_index;
+        const LookupIndex::CreateResult lookup_result =
+            LookupIndex::Create(
+                entries,
+                digest,
+                config.session_epoch,
+                &lookup_index);
+        if (lookup_result ==
+            LookupIndex::CreateResult::kResourceExhausted) {
+            return DailyInstrumentCatalogCreateErrorV2::
+                kResourceExhausted;
+        }
+        if (lookup_result ==
+                LookupIndex::CreateResult::kInvariantFailure ||
+            (lookup_result ==
+                 LookupIndex::CreateResult::kSuccess &&
+             lookup_index == nullptr)) {
+            return DailyInstrumentCatalogCreateErrorV2::kHashFailure;
+        }
+        // The side index is an optimization, not part of catalog identity.
+        // A pathologically clustered but otherwise valid catalog retains the
+        // canonical sorted lookup instead of changing Create semantics.
+        if (lookup_result ==
+            LookupIndex::CreateResult::kUnusableDistribution) {
+            lookup_index.reset();
+        }
         output->reset(new DailyInstrumentCatalogV2(
             config,
             std::move(entries),
             filtered_non_a_share_count,
-            digest));
+            digest,
+            std::move(lookup_index)));
         return DailyInstrumentCatalogCreateErrorV2::kNone;
     } catch (const std::bad_alloc&) {
         return DailyInstrumentCatalogCreateErrorV2::kResourceExhausted;
@@ -445,6 +807,21 @@ DailyInstrumentCatalogLookupResultV2 DailyInstrumentCatalogV2::Lookup(
         result.error = DailyInstrumentCatalogLookupErrorV2::kInvalidKey;
         return result;
     }
+    if (lookup_index_ != nullptr) {
+        const DailyInstrumentCatalogEntryV2* indexed =
+            lookup_index_->Find(key, entries_);
+        if (indexed != nullptr) {
+            result.error =
+                DailyInstrumentCatalogLookupErrorV2::kNone;
+            result.entry = indexed;
+            return result;
+        }
+    }
+
+    // Keep the canonical sorted table as a correctness fallback. A true
+    // catalog miss is not a normal callback path, so paying the binary-search
+    // cost there is preferable to ever turning an index defect into a false
+    // fail-closed catalog miss.
     std::size_t first = 0U;
     std::size_t count = entries_.size();
     while (count != 0U) {

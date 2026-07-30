@@ -99,6 +99,10 @@ inline constexpr std::string_view kDailyInstrumentCatalogDigestDomainV2 =
 // admission, rejects key shapes that callback extraction cannot produce,
 // sorts by the exact opaque key, coalesces byte-identical duplicates, assigns
 // dense IDs, and computes a canonical SHA-256 digest.
+// Create also freezes a bounded flat-hash side index for normal exact-key
+// lookup. The canonical sorted table remains the identity source and the
+// correctness fallback if a usable bounded hash distribution cannot be
+// constructed.
 // Every const lookup is allocation-free and lock-free.
 class DailyInstrumentCatalogV2 final {
 public:
@@ -107,7 +111,7 @@ public:
         const DailyInstrumentCatalogV2&) = delete;
     DailyInstrumentCatalogV2(DailyInstrumentCatalogV2&&) = delete;
     DailyInstrumentCatalogV2& operator=(DailyInstrumentCatalogV2&&) = delete;
-    ~DailyInstrumentCatalogV2() = default;
+    ~DailyInstrumentCatalogV2();
 
     [[nodiscard]] static DailyInstrumentCatalogCreateErrorV2 Create(
         DailyInstrumentCatalogConfigV2 config,
@@ -154,16 +158,20 @@ public:
     }
 
 private:
+    class LookupIndex;
+
     DailyInstrumentCatalogV2(
         DailyInstrumentCatalogConfigV2 config,
         std::vector<DailyInstrumentCatalogEntryV2> entries,
         std::size_t filtered_non_a_share_count,
-        l2flow::common::Sha256Digest digest) noexcept;
+        l2flow::common::Sha256Digest digest,
+        std::unique_ptr<const LookupIndex> lookup_index) noexcept;
 
     DailyInstrumentCatalogConfigV2 config_{};
     std::vector<DailyInstrumentCatalogEntryV2> entries_;
     std::size_t filtered_non_a_share_count_ = 0U;
     l2flow::common::Sha256Digest catalog_digest_{};
+    std::unique_ptr<const LookupIndex> lookup_index_;
 };
 
 }  // namespace l2flow::market

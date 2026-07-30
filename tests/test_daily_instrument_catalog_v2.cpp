@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -43,6 +45,16 @@ market::DailyInstrumentSourceEntryV2 Entry(
     result.metadata.asset_scope =
         market::AssetScopeV1::kDocumentedCore;
     result.external_instrument_id = Bytes(external);
+    return result;
+}
+
+std::string SixDigitSecurityId(std::size_t value) {
+    std::string result(6U, '0');
+    for (std::size_t index = result.size(); index != 0U; --index) {
+        result[index - 1U] = static_cast<char>(
+            '0' + static_cast<int>(value % 10U));
+        value /= 10U;
+    }
     return result;
 }
 
@@ -238,6 +250,214 @@ void TestRealtimeExactKeyContract(Test* test) {
         "catalog rejects key bytes that callback extraction cannot produce");
 }
 
+void TestFrozenLookupIndexLargeRoundTrip(Test* test) {
+    constexpr std::size_t kInstrumentCount = 12'000U;
+    std::vector<market::DailyInstrumentSourceEntryV2> input;
+    input.reserve(kInstrumentCount);
+    for (std::size_t index = 0U; index < kInstrumentCount; ++index) {
+        std::size_t numeric_id = 0U;
+        if (index < 999U) {
+            numeric_id = index + 1U;
+        } else if (index < 4'799U) {
+            numeric_id = 1'200U + (index - 999U);
+        } else {
+            numeric_id = 300'000U + (index - 4'799U);
+        }
+        input.push_back(Entry(
+            market::MarketV1::kShenzhen,
+            "102 ",
+            SixDigitSecurityId(numeric_id)));
+    }
+
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog =
+        MakeCatalog(test, input);
+    if (catalog == nullptr) {
+        return;
+    }
+    test->Expect(
+        catalog->instrument_count() == kInstrumentCount,
+        "frozen lookup index retains a 12k A-share catalog");
+
+    bool round_trip = true;
+    for (std::size_t index = 0U;
+         index < kInstrumentCount;
+         ++index) {
+        const auto known = catalog->Lookup(input[index].key);
+        const auto by_id = catalog->LookupById(
+            static_cast<std::uint32_t>(index + 1U));
+        const auto* expected = catalog->EntryAt(index);
+        if (!known.known() || known.entry != expected ||
+            by_id.entry != expected ||
+            known.entry->instrument_id != index + 1U) {
+            round_trip = false;
+            break;
+        }
+    }
+    test->Expect(
+        round_trip,
+        "every large-catalog exact key round-trips to its dense ID");
+
+    constexpr std::size_t kReaderCount = 4U;
+    constexpr std::size_t kLookupsPerReader = 50'000U;
+    std::atomic<bool> concurrent_round_trip{true};
+    std::vector<std::thread> readers;
+    readers.reserve(kReaderCount);
+    for (std::size_t reader = 0U;
+         reader < kReaderCount;
+         ++reader) {
+        readers.emplace_back([&, reader]() {
+            for (std::size_t iteration = 0U;
+                 iteration < kLookupsPerReader;
+                 ++iteration) {
+                const std::size_t index =
+                    (iteration * 4'099U + reader * 997U) %
+                    kInstrumentCount;
+                const auto known =
+                    catalog->Lookup(input[index].key);
+                if (!known.known() ||
+                    known.entry != catalog->EntryAt(index)) {
+                    concurrent_round_trip.store(
+                        false, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+    }
+    for (std::thread& reader : readers) {
+        reader.join();
+    }
+    test->Expect(
+        concurrent_round_trip.load(std::memory_order_relaxed),
+        "frozen lookup index supports concurrent immutable reads");
+}
+
+void TestFrozenLookupIndexExactBytes(Test* test) {
+    std::vector<market::DailyInstrumentSourceEntryV2> input{
+        Entry(market::MarketV1::kShenzhen, "102", "000001"),
+        Entry(market::MarketV1::kShenzhen, "102 ", "000001"),
+        Entry(market::MarketV1::kShenzhen, "102  ", "000001"),
+        Entry(market::MarketV1::kShenzhen, "103", "000001"),
+    };
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog =
+        MakeCatalog(test, input);
+    if (catalog == nullptr) {
+        return;
+    }
+
+    bool variants_known = true;
+    for (const auto& source : input) {
+        const auto known = catalog->Lookup(source.key);
+        if (!known.known() ||
+            known.entry->key.security_id_source !=
+                source.key.security_id_source) {
+            variants_known = false;
+            break;
+        }
+    }
+    test->Expect(
+        variants_known,
+        "source length and raw bytes remain part of exact hash identity");
+
+    const auto absent_source = Bytes("102   ");
+    const market::InstrumentKeyViewV1 absent{
+        market::MarketV1::kShenzhen,
+        absent_source,
+        input.front().key.security_id};
+    test->Expect(
+        catalog->Lookup(absent).error ==
+            market::DailyInstrumentCatalogLookupErrorV2::
+                kUnknownInstrument,
+        "nearby SecurityIDSource bytes do not alias a catalog key");
+
+    std::string long_source_text(512U, 'A');
+    const std::vector<market::DailyInstrumentSourceEntryV2> long_input{
+        Entry(
+            market::MarketV1::kShenzhen,
+            long_source_text,
+            "000002")};
+    std::unique_ptr<market::DailyInstrumentCatalogV2> long_catalog =
+        MakeCatalog(test, long_input);
+    if (long_catalog == nullptr) {
+        return;
+    }
+    const auto exact_source = Bytes(long_source_text);
+    const auto exact_id = Bytes("000002");
+    const auto lookup_source =
+        [&](const std::vector<std::byte>& source) {
+            return long_catalog->Lookup(
+                market::InstrumentKeyViewV1{
+                    market::MarketV1::kShenzhen,
+                    source,
+                    exact_id});
+        };
+    test->Expect(
+        lookup_source(exact_source).known(),
+        "long exact source bytes resolve through the frozen index");
+
+    std::vector<std::byte> changed_first = exact_source;
+    std::vector<std::byte> changed_last = exact_source;
+    std::vector<std::byte> shortened = exact_source;
+    std::vector<std::byte> extended = exact_source;
+    changed_first.front() = std::byte{'B'};
+    changed_last.back() = std::byte{'B'};
+    shortened.pop_back();
+    extended.push_back(std::byte{'A'});
+    test->Expect(
+        !lookup_source(changed_first).known() &&
+            !lookup_source(changed_last).known() &&
+            !lookup_source(shortened).known() &&
+            !lookup_source(extended).known(),
+        "long source prefix, suffix, and length changes remain distinct");
+}
+
+void TestFrozenLookupIndexPreservesLookupErrors(Test* test) {
+    const std::vector<market::DailyInstrumentSourceEntryV2> input{
+        Entry(market::MarketV1::kShanghai, "", "600001"),
+        Entry(market::MarketV1::kShenzhen, "102", "000001"),
+    };
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog =
+        MakeCatalog(test, input);
+    if (catalog == nullptr) {
+        return;
+    }
+
+    const auto sh_id = Bytes("600001");
+    const auto sz_id = Bytes("000001");
+    const auto nonempty_source = Bytes("101");
+    const market::InstrumentKeyViewV1 invalid_market{
+        static_cast<market::MarketV1>(0xffU), {}, sh_id};
+    const market::InstrumentKeyViewV1 empty_id{
+        market::MarketV1::kShanghai, {}, {}};
+    const market::InstrumentKeyViewV1 sz_empty_source{
+        market::MarketV1::kShenzhen, {}, sz_id};
+    const market::InstrumentKeyViewV1 sh_nonempty_source{
+        market::MarketV1::kShanghai, nonempty_source, sh_id};
+    std::vector<std::byte> nonprintable_source = Bytes("102");
+    nonprintable_source[1U] = std::byte{0U};
+    const market::InstrumentKeyViewV1 nonprintable{
+        market::MarketV1::kShenzhen, nonprintable_source, sz_id};
+
+    test->Expect(
+        catalog->Lookup(invalid_market).error ==
+                market::DailyInstrumentCatalogLookupErrorV2::
+                    kInvalidKey &&
+            catalog->Lookup(empty_id).error ==
+                market::DailyInstrumentCatalogLookupErrorV2::
+                    kInvalidKey,
+        "index preserves invalid lookup-key errors");
+    test->Expect(
+        catalog->Lookup(sz_empty_source).error ==
+                market::DailyInstrumentCatalogLookupErrorV2::
+                    kUnknownInstrument &&
+            catalog->Lookup(sh_nonempty_source).error ==
+                market::DailyInstrumentCatalogLookupErrorV2::
+                    kUnknownInstrument &&
+            catalog->Lookup(nonprintable).error ==
+                market::DailyInstrumentCatalogLookupErrorV2::
+                    kUnknownInstrument,
+        "index preserves valid-span unknown-instrument behavior");
+}
+
 class ScopedTempDirectory final {
 public:
     ScopedTempDirectory() {
@@ -390,6 +610,9 @@ int main() {
     TestCatalogMissAndRuntimeFreeze(&test);
     TestConflictingDuplicateRejected(&test);
     TestRealtimeExactKeyContract(&test);
+    TestFrozenLookupIndexLargeRoundTrip(&test);
+    TestFrozenLookupIndexExactBytes(&test);
+    TestFrozenLookupIndexPreservesLookupErrors(&test);
     TestStrictFileLoader(&test);
     if (test.failures != 0) {
         std::cerr << test.failures << " daily catalog test(s) failed\n";
