@@ -61,11 +61,9 @@ enum class OwnedIngressKeyErrorV1 : std::uint8_t {
     OwnedIngressSourceV1* output) noexcept;
 
 // Sequence values are assigned by the single serialized subscription
-// callback. They describe prefixes admitted by the Mandatory Journal, not
-// vendor event time and not Journal durability. Journal admission owns its
-// sequence exactly once. If the following processing-queue admission fails,
-// the callback is terminally rejected but that already-owned accepted
-// sequence is intentionally retained.
+// callback. They describe the dense prefix committed to the ordered
+// processing queue, not vendor event time. A queue-admission failure does not
+// commit its candidate sequence and fails the session closed.
 // tick_stream_sequence is one dense order shared by Shanghai tick, Shenzhen
 // order, and Shenzhen transaction. Snapshot messages carry zero. UINT64_MAX
 // is reserved as the exhaustion sentinel so an exclusive generation cut can
@@ -208,9 +206,9 @@ private:
     const OwnedIngressMessageV1* message_ = nullptr;
 };
 
-// Immutable ownership boundary between the vendor callback and downstream
-// Journal/decoder consumers. Object storage and body bytes occupy one size-class
-// pool block; the body starts immediately after this object.
+// Immutable ownership boundary between the vendor callback and the ordered
+// processing/decoder consumers. Object storage and body bytes occupy one
+// size-class pool block; the body starts immediately after this object.
 class OwnedIngressMessageV1 final {
 public:
     OwnedIngressMessageV1(const OwnedIngressMessageV1&) = delete;

@@ -263,10 +263,8 @@ class SessionInfo:
     catalog_generation: int
     data_state_generation: int
     accepted_sequence: int
-    durable_sequence: int
     applied_sequence: int
     processing_lag_records: int
-    durability_lag_records: int
     tick_ring_capacity: int
     tick_highest_published_sequence: int
     tick_contiguous_published_sequence: int
@@ -297,10 +295,8 @@ class SessionInfo:
             (self.catalog_generation, "catalog_generation"),
             (self.data_state_generation, "data_state_generation"),
             (self.accepted_sequence, "accepted_sequence"),
-            (self.durable_sequence, "durable_sequence"),
             (self.applied_sequence, "applied_sequence"),
             (self.processing_lag_records, "processing_lag_records"),
-            (self.durability_lag_records, "durability_lag_records"),
             (self.tick_ring_capacity, "tick_ring_capacity"),
             (
                 self.tick_highest_published_sequence,
@@ -333,8 +329,6 @@ class SessionInfo:
             raise ValueError("Wire V2 catalog scope must be OBSERVED_ONLY")
         if self.coverage_complete is not False:
             raise ValueError("observed-universe coverage cannot be complete")
-        if self.durable_sequence > self.accepted_sequence:
-            raise ValueError("durable_sequence exceeds accepted_sequence")
         if self.applied_sequence > self.accepted_sequence:
             raise ValueError("applied_sequence exceeds accepted_sequence")
         if (
@@ -343,13 +337,6 @@ class SessionInfo:
         ):
             raise ValueError(
                 "processing_lag_records does not match sequence watermarks"
-            )
-        if (
-            self.durability_lag_records
-            != self.accepted_sequence - self.durable_sequence
-        ):
-            raise ValueError(
-                "durability_lag_records does not match sequence watermarks"
             )
         if (
             self.tick_contiguous_published_sequence
@@ -730,10 +717,8 @@ class SelectionEnvelope:
     catalog_generation: int
     data_state_generation: int
     accepted_sequence: int
-    durable_sequence: int
     applied_sequence: int
     processing_lag_records: int
-    durability_lag_records: int
     capacity: int
     catalog_scope: CatalogScope
     coverage_complete: bool
@@ -756,10 +741,8 @@ class SelectionEnvelope:
             (self.catalog_generation, "catalog_generation"),
             (self.data_state_generation, "data_state_generation"),
             (self.accepted_sequence, "accepted_sequence"),
-            (self.durable_sequence, "durable_sequence"),
             (self.applied_sequence, "applied_sequence"),
             (self.processing_lag_records, "processing_lag_records"),
-            (self.durability_lag_records, "durability_lag_records"),
         ):
             _uint64(value, name)
         if self.accepted_sequence == _UINT64_MAX:
@@ -770,8 +753,6 @@ class SelectionEnvelope:
             raise ValueError("selection must use OBSERVED_ONLY catalog scope")
         if self.coverage_complete is not False:
             raise ValueError("observed-universe selection cannot be complete")
-        if self.durable_sequence > self.accepted_sequence:
-            raise ValueError("durable_sequence exceeds accepted_sequence")
         if self.applied_sequence > self.accepted_sequence:
             raise ValueError("applied_sequence exceeds accepted_sequence")
         if (
@@ -780,13 +761,6 @@ class SelectionEnvelope:
         ):
             raise ValueError(
                 "processing_lag_records does not match sequence watermarks"
-            )
-        if (
-            self.durability_lag_records
-            != self.accepted_sequence - self.durable_sequence
-        ):
-            raise ValueError(
-                "durability_lag_records does not match sequence watermarks"
             )
         _validate_counts(
             self.capacity,

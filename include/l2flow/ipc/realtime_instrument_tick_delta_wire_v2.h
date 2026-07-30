@@ -80,38 +80,38 @@ struct RealtimeInstrumentTickDeltaCheckpointV2 final {
     std::array<std::uint8_t, 8U> reserved{};
 };
 static_assert(
-    sizeof(RealtimeInstrumentTickDeltaCheckpointV2) == 320U);
+    sizeof(RealtimeInstrumentTickDeltaCheckpointV2) == 312U);
 static_assert(
     std::is_standard_layout_v<
         RealtimeInstrumentTickDeltaCheckpointV2>);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        instrument_id) == 256U);
+        instrument_id) == 248U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        ordinal) == 260U);
+        ordinal) == 252U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        instrument_tick_source_record_counts) == 264U);
+        instrument_tick_source_record_counts) == 256U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        instrument_tick_record_count) == 296U);
+        instrument_tick_record_count) == 288U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        payload_projection) == 304U);
+        payload_projection) == 296U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        flags) == 308U);
+        flags) == 300U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaCheckpointV2,
-        reserved) == 312U);
+        reserved) == 304U);
 
 [[nodiscard]] constexpr bool
 RealtimeInstrumentTickDeltaCheckpointCanonicalV2(
@@ -180,7 +180,7 @@ struct RealtimeInstrumentTickDeltaMetadataV2 final {
     std::array<std::uint8_t, 8U> reserved{};
 };
 static_assert(
-    sizeof(RealtimeInstrumentTickDeltaMetadataV2) == 736U);
+    sizeof(RealtimeInstrumentTickDeltaMetadataV2) == 720U);
 static_assert(
     std::is_standard_layout_v<
         RealtimeInstrumentTickDeltaMetadataV2>);
@@ -191,41 +191,41 @@ static_assert(
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        target_checkpoint) == 328U);
+        target_checkpoint) == 320U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        delta_tick_source_record_counts) == 648U);
+        delta_tick_source_record_counts) == 632U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        delta_tick_record_count) == 680U);
+        delta_tick_record_count) == 664U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        ingress_sequence_begin_inclusive) == 688U);
+        ingress_sequence_begin_inclusive) == 672U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        ingress_sequence_end_exclusive) == 696U);
+        ingress_sequence_end_exclusive) == 680U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        tick_stream_sequence_begin_inclusive) == 704U);
+        tick_stream_sequence_begin_inclusive) == 688U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        tick_stream_sequence_end_exclusive) == 712U);
+        tick_stream_sequence_end_exclusive) == 696U);
 static_assert(
-    offsetof(RealtimeInstrumentTickDeltaMetadataV2, flags) == 720U);
-static_assert(
-    offsetof(
-        RealtimeInstrumentTickDeltaMetadataV2,
-        payload_projection) == 724U);
+    offsetof(RealtimeInstrumentTickDeltaMetadataV2, flags) == 704U);
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaMetadataV2,
-        reserved) == 728U);
+        payload_projection) == 708U);
+static_assert(
+    offsetof(
+        RealtimeInstrumentTickDeltaMetadataV2,
+        reserved) == 712U);
 
 namespace realtime_instrument_tick_delta_wire_v2_detail {
 
@@ -241,7 +241,6 @@ namespace realtime_instrument_tick_delta_wire_v2_detail {
            endpoint.recv_monotonic_cut_ns == 0U &&
            endpoint.history_published_monotonic_ns == 0U &&
            endpoint.accepted_sequence == 0U &&
-           endpoint.durable_sequence == 0U &&
            endpoint.applied_sequence == 0U &&
            realtime_history_wire_v2_detail::AllZero(
                endpoint.catalog_digest) &&
@@ -293,7 +292,6 @@ namespace realtime_instrument_tick_delta_wire_v2_detail {
            left.history_published_monotonic_ns ==
                right.history_published_monotonic_ns &&
            left.accepted_sequence == right.accepted_sequence &&
-           left.durable_sequence == right.durable_sequence &&
            left.applied_sequence == right.applied_sequence &&
            left.catalog_digest == right.catalog_digest &&
            left.input_identity_sha256 ==
@@ -334,7 +332,7 @@ namespace realtime_instrument_tick_delta_wire_v2_detail {
 // A predecessor may have an earlier observed catalog. Catalog digests may
 // differ only when catalog_generation advances, while accepted-cut digests
 // need not match. Session/layout identity and source identities are stable,
-// while catalog/data watermarks, durable and applied frontiers, source
+// while catalog/data watermarks, accepted and applied frontiers, source
 // frontiers, and monotonic observed counts cannot move backwards.
 // factor_eligible_count is intentionally excluded because it is a live
 // eligibility count and is not monotonic.
@@ -361,7 +359,6 @@ namespace realtime_instrument_tick_delta_wire_v2_detail {
         target.history_published_monotonic_ns <
             base.history_published_monotonic_ns ||
         target.accepted_sequence < base.accepted_sequence ||
-        target.durable_sequence < base.durable_sequence ||
         target.applied_sequence < base.applied_sequence ||
         target.bound_count < base.bound_count ||
         target.available_count < base.available_count ||
@@ -539,7 +536,7 @@ struct RealtimeInstrumentTickDeltaOpenSessionResponseV2 final {
 };
 static_assert(
     sizeof(RealtimeInstrumentTickDeltaOpenSessionResponseV2) ==
-    296U);
+    288U);
 static_assert(
     std::is_standard_layout_v<
         RealtimeInstrumentTickDeltaOpenSessionResponseV2>);
@@ -550,7 +547,7 @@ static_assert(
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaOpenSessionResponseV2,
-        delta_session_token) == 288U);
+        delta_session_token) == 280U);
 
 struct RealtimeInstrumentTickDeltaOpenInstrumentRequestV2 final {
     std::array<std::uint8_t, 8U> magic{};
@@ -571,7 +568,7 @@ struct RealtimeInstrumentTickDeltaOpenInstrumentRequestV2 final {
 };
 static_assert(
     sizeof(RealtimeInstrumentTickDeltaOpenInstrumentRequestV2) ==
-    384U);
+    376U);
 static_assert(
     std::is_standard_layout_v<
         RealtimeInstrumentTickDeltaOpenInstrumentRequestV2>);
@@ -590,7 +587,7 @@ static_assert(
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaOpenInstrumentRequestV2,
-        reserved2) == 376U);
+        reserved2) == 368U);
 
 struct RealtimeInstrumentTickDeltaOpenInstrumentResponseV2 final {
     std::array<std::uint8_t, 8U> magic{};
@@ -607,7 +604,7 @@ struct RealtimeInstrumentTickDeltaOpenInstrumentResponseV2 final {
 static_assert(
     sizeof(
         RealtimeInstrumentTickDeltaOpenInstrumentResponseV2) ==
-    776U);
+    760U);
 static_assert(
     std::is_standard_layout_v<
         RealtimeInstrumentTickDeltaOpenInstrumentResponseV2>);
@@ -709,7 +706,7 @@ struct alignas(4096) RealtimeInstrumentTickDeltaPageHeaderV2 final {
     std::uint64_t first_tick_stream_sequence = 0U;
     std::uint64_t last_tick_stream_sequence = 0U;
     RealtimeInstrumentTickDeltaMetadataV2 metadata{};
-    std::array<std::uint8_t, 3272U> reserved{};
+    std::array<std::uint8_t, 3288U> reserved{};
 };
 static_assert(
     sizeof(RealtimeInstrumentTickDeltaPageHeaderV2) ==
@@ -738,6 +735,6 @@ static_assert(
 static_assert(
     offsetof(
         RealtimeInstrumentTickDeltaPageHeaderV2,
-        reserved) == 824U);
+        reserved) == 808U);
 
 }  // namespace l2flow::ipc

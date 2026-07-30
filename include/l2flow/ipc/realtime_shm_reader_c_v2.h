@@ -72,10 +72,8 @@ typedef struct l2flow_shm_session_info_v2 {
     uint64_t catalog_generation;
     uint64_t data_state_generation;
     uint64_t accepted_sequence;
-    uint64_t durable_sequence;
     uint64_t applied_sequence;
     uint64_t processing_lag_records;
-    uint64_t durability_lag_records;
     uint64_t tick_ring_capacity;
     uint64_t tick_highest_published_sequence;
     uint64_t tick_contiguous_published_sequence;
@@ -109,9 +107,8 @@ typedef struct l2flow_shm_health_v2 {
 
 // A selection envelope and its ID array describe one stable structural cut.
 // The catalog/data-state identity and selected rows are validated together;
-// accepted/durable/applied progress comes from one coherent status read
-// taken after that validation. Progress-only changes do not restart the row
-// scan.
+// accepted/applied progress comes from one coherent status read taken after
+// that validation. Progress-only changes do not restart the row scan.
 // returned_row_count is the logical number of selected rows and therefore
 // also the required ID-buffer length. It is populated on BUFFER_TOO_SMALL;
 // the undersized ID buffer itself is left untouched.
@@ -122,10 +119,8 @@ typedef struct l2flow_selection_envelope_v2 {
     uint64_t catalog_generation;
     uint64_t data_state_generation;
     uint64_t accepted_sequence;
-    uint64_t durable_sequence;
     uint64_t applied_sequence;
     uint64_t processing_lag_records;
-    uint64_t durability_lag_records;
     uint32_t capacity;
     uint32_t catalog_scope;
     uint32_t coverage_complete;
@@ -139,7 +134,7 @@ typedef struct l2flow_selection_envelope_v2 {
     uint32_t reserved[2];
 } l2flow_selection_envelope_v2;
 
-// Maps fd read-only and accepts only the sealed Wire V2.0 layout. The caller
+// Maps fd read-only and accepts only the sealed Wire V2.1 layout. The caller
 // retains ownership of fd and may close it immediately after this function
 // returns.
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_open_fd_v2(

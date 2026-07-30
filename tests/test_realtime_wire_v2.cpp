@@ -14,7 +14,7 @@ namespace {
 namespace ipc = l2flow::ipc;
 
 static_assert(ipc::kRealtimeWireMajorV2 == 2U);
-static_assert(ipc::kRealtimeWireMinorV2 == 0U);
+static_assert(ipc::kRealtimeWireMinorV2 == 1U);
 static_assert(
     ipc::kRealtimeShmMagicV2 ==
     std::array<std::uint8_t, 8U>{
@@ -44,10 +44,6 @@ static_assert(
     0U);
 static_assert(
     offsetof(ipc::RealtimeWireHeaderV2, accepted_sequence) %
-        alignof(std::uint64_t) ==
-    0U);
-static_assert(
-    offsetof(ipc::RealtimeWireHeaderV2, durable_sequence) %
         alignof(std::uint64_t) ==
     0U);
 static_assert(
@@ -252,56 +248,36 @@ bool TestCountInvariants() {
 bool TestProcessingSequenceInvariants() {
     bool ok = true;
     std::uint64_t processing_lag_records = 99U;
-    std::uint64_t durability_lag_records = 99U;
     ok &= Expect(
         ipc::RealtimeWireProcessingSequencesValidV2(
-            10'000'000U, 9'700'000U, 9'950'000U) &&
+            10'000'000U, 9'950'000U) &&
             ipc::RealtimeWireProcessingLagRecordsV2(
                 10'000'000U,
                 9'950'000U,
                 &processing_lag_records) &&
-            ipc::RealtimeWireDurabilityLagRecordsV2(
-                10'000'000U,
-                9'700'000U,
-                &durability_lag_records) &&
-            processing_lag_records == 50'000U &&
-            durability_lag_records == 300'000U,
-        "accepted-relative lags permit applied to lead durability");
+            processing_lag_records == 50'000U,
+        "processing lag is the exact accepted-minus-applied distance");
 
     processing_lag_records = 99U;
     ok &= Expect(
-        !ipc::RealtimeWireProcessingSequencesValidV2(9U, 8U, 10U) &&
+        !ipc::RealtimeWireProcessingSequencesValidV2(9U, 10U) &&
             !ipc::RealtimeWireProcessingLagRecordsV2(
                 9U, 10U, &processing_lag_records) &&
             processing_lag_records == 99U,
         "applied cannot exceed accepted and failed lag leaves output intact");
 
-    durability_lag_records = 99U;
-    ok &= Expect(
-        !ipc::RealtimeWireProcessingSequencesValidV2(9U, 10U, 8U) &&
-            !ipc::RealtimeWireDurabilityLagRecordsV2(
-                9U, 10U, &durability_lag_records) &&
-            durability_lag_records == 99U,
-        "durable cannot exceed accepted and failed lag leaves output intact");
-
     processing_lag_records = 99U;
-    durability_lag_records = 99U;
     ok &= Expect(
         ipc::RealtimeWireProcessingLagRecordsV2(
             12U, 12U, &processing_lag_records) &&
-            ipc::RealtimeWireDurabilityLagRecordsV2(
-                12U, 12U, &durability_lag_records) &&
-            processing_lag_records == 0U &&
-            durability_lag_records == 0U,
-        "fully processed and durable accepted prefix has zero lags");
+            processing_lag_records == 0U,
+        "a fully processed accepted prefix has zero lag");
     ok &= Expect(
-        !ipc::RealtimeWireProcessingLagRecordsV2(12U, 12U, nullptr) &&
-            !ipc::RealtimeWireDurabilityLagRecordsV2(
-                12U, 12U, nullptr),
+        !ipc::RealtimeWireProcessingLagRecordsV2(12U, 12U, nullptr),
         "lag helpers reject null output");
     ok &= Expect(
         !ipc::RealtimeWireProcessingSequencesValidV2(
-            std::numeric_limits<std::uint64_t>::max(), 0U, 0U),
+            std::numeric_limits<std::uint64_t>::max(), 0U),
         "UINT64_MAX remains the reserved unpublished sequence sentinel");
     return ok;
 }

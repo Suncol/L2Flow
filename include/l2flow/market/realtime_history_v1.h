@@ -24,9 +24,8 @@ namespace l2flow::market {
 inline constexpr std::size_t kRealtimeHistorySourceCountV1 = 4U;
 
 // A source cut is an exclusive prefix of the sequence assigned by this
-// process. It is intentionally unrelated to vendor sequence numbers or
-// Journal byte offsets: source_sequence < sequence_exclusive belongs to this
-// generation.
+// process. It is intentionally unrelated to vendor sequence numbers:
+// source_sequence < sequence_exclusive belongs to this generation.
 struct RealtimeSourceWatermarkV1 final {
     std::uint32_t source_stream_id = 0U;
     std::uint64_t sequence_exclusive = 0U;
@@ -171,9 +170,9 @@ public:
     virtual void MarkCoverageLost() noexcept = 0;
 };
 
-// Move-only decoder output envelope.  It contains no durable owner or heap
-// control block: the history handoff pool bounds its transient lifetime, and
-// the instrument owner worker consumes it into the store arena.
+// Move-only decoder output envelope. It contains no retained heap control
+// block: the history handoff pool bounds its transient lifetime, and the
+// instrument owner worker consumes it into the store arena.
 class RealtimeHistoryEventInputV1 final {
 public:
     RealtimeHistoryEventInputV1(

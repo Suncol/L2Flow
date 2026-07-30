@@ -149,7 +149,10 @@ def validate_response_prefix(
     if magic != CONTROL_MAGIC:
         raise ProtocolError(f"{operation}: control magic mismatch")
     if (major, minor) != (WIRE_MAJOR, WIRE_MINOR):
-        raise ProtocolError(f"{operation}: protocol is not Wire V2.0")
+        raise ProtocolError(
+            f"{operation}: protocol is not Wire "
+            f"{WIRE_MAJOR}.{WIRE_MINOR}"
+        )
     if message_bytes != expected_bytes:
         raise ProtocolError(f"{operation}: message_bytes mismatch")
     if response_id != expected_request_id:

@@ -112,11 +112,9 @@ l2flow_configure_target(l2flow_market)
 target_link_libraries(l2flow_market
     PUBLIC L2Flow::common Threads::Threads)
 
-# The single-copy ownership boundary, contiguous completion tracker, and
-# mandatory asynchronous Journal sink.
+# The single-copy ownership boundary and contiguous completion tracker.
 add_library(l2flow_realtime_ingress STATIC
     src/realtime/contiguous_sequence_tracker_v2.cpp
-    src/realtime/mandatory_journal_v2.cpp
     src/realtime/owned_ingress_message_v1.cpp)
 add_library(L2Flow::realtime_ingress ALIAS l2flow_realtime_ingress)
 l2flow_configure_target(l2flow_realtime_ingress)
@@ -132,10 +130,9 @@ l2flow_configure_target(l2flow_factor)
 target_link_libraries(l2flow_factor PUBLIC L2Flow::market)
 
 # The only production composition: callback admission gives one immutable
-# owned message to the mandatory Journal queue and the ordered in-memory
-# processing queue. The dispatcher drives Decoder -> fixed-worker History ->
-# generation barrier/watermark -> Factor, while the Journal writer advances
-# durability independently.
+# owned message to the ordered in-memory processing queue. The dispatcher
+# drives Decoder -> fixed-worker History -> generation barrier/watermark ->
+# Factor.
 add_library(l2flow_realtime STATIC
     src/runtime/realtime_pipeline_v1.cpp)
 add_library(L2Flow::realtime ALIAS l2flow_realtime)
@@ -281,8 +278,6 @@ if(L2FLOW_BUILD_TESTS)
         L2Flow::realtime_ingress)
     l2flow_add_test(test_closeable_publication_gate
         tests/test_closeable_publication_gate.cpp Threads::Threads)
-    l2flow_add_test(test_mandatory_journal
-        tests/test_mandatory_journal_v2.cpp L2Flow::realtime_ingress)
     l2flow_add_test(test_realtime_history
         tests/test_realtime_history_v1.cpp L2Flow::market)
     l2flow_add_test(test_realtime_latest_read_model

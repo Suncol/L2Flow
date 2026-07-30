@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from .models import CatalogScope, SessionIdentity, WireFormatError
 
 
-ENDPOINT_BYTES = 256
+ENDPOINT_BYTES = 248
 ENDPOINT_FLAG_COVERAGE_FROM_OPEN = 1 << 0
 ENDPOINT_FLAG_RECORD_COVERAGE_COMPLETE = 1 << 1
 ENDPOINT_FLAGS_MASK = (
@@ -16,7 +16,7 @@ ENDPOINT_FLAGS_MASK = (
     | ENDPOINT_FLAG_RECORD_COVERAGE_COMPLETE
 )
 
-_ENDPOINT = struct.Struct("<16s11Q32s32s4I4Q10I")
+_ENDPOINT = struct.Struct("<16s10Q32s32s4I4Q10I")
 assert _ENDPOINT.size == ENDPOINT_BYTES
 
 
@@ -92,7 +92,6 @@ class GenerationEndpoint:
     recv_monotonic_cut_ns: int
     history_published_monotonic_ns: int
     accepted_sequence: int
-    durable_sequence: int
     applied_sequence: int
     catalog_digest: bytes
     input_identity_sha256: bytes
@@ -144,28 +143,27 @@ def parse_generation_endpoint(
         recv_monotonic_cut_ns=values[7],
         history_published_monotonic_ns=values[8],
         accepted_sequence=values[9],
-        durable_sequence=values[10],
-        applied_sequence=values[11],
-        catalog_digest=values[12],
-        input_identity_sha256=values[13],
-        source_stream_ids=tuple(values[14:18]),  # type: ignore[arg-type]
+        applied_sequence=values[10],
+        catalog_digest=values[11],
+        input_identity_sha256=values[12],
+        source_stream_ids=tuple(values[13:17]),  # type: ignore[arg-type]
         source_sequence_exclusive=tuple(
-            values[18:22]
+            values[17:21]
         ),  # type: ignore[arg-type]
-        trade_date=values[22],
-        capacity=values[23],
-        bound_count=values[24],
-        available_count=values[25],
-        snapshot_available_count=values[26],
-        tick_available_count=values[27],
-        factor_eligible_count=values[28],
-        catalog_scope=CatalogScope(values[29])
-        if values[29] == int(CatalogScope.OBSERVED_ONLY)
-        else _unsupported_scope(values[29]),
+        trade_date=values[21],
+        capacity=values[22],
+        bound_count=values[23],
+        available_count=values[24],
+        snapshot_available_count=values[25],
+        tick_available_count=values[26],
+        factor_eligible_count=values[27],
+        catalog_scope=CatalogScope(values[28])
+        if values[28] == int(CatalogScope.OBSERVED_ONLY)
+        else _unsupported_scope(values[28]),
         coverage_complete=_wire_bool(
-            values[30], "generation.coverage_complete"
+            values[29], "generation.coverage_complete"
         ),
-        flags=values[31],
+        flags=values[30],
     )
     return result
 
@@ -196,7 +194,6 @@ def validate_generation_endpoint(value: GenerationEndpoint) -> None:
         "recv_monotonic_cut_ns",
         "history_published_monotonic_ns",
         "accepted_sequence",
-        "durable_sequence",
         "applied_sequence",
     ):
         _uint(getattr(value, name), 64, f"generation.{name}")
@@ -290,10 +287,6 @@ def validate_generation_endpoint(value: GenerationEndpoint) -> None:
         "immutable history generation lacks record coverage",
     )
     _fail(
-        value.durable_sequence > value.accepted_sequence,
-        "durable_sequence exceeds accepted_sequence",
-    )
-    _fail(
         value.applied_sequence > value.accepted_sequence,
         "applied_sequence exceeds accepted_sequence",
     )
@@ -362,7 +355,6 @@ def pack_generation_endpoint(value: GenerationEndpoint) -> bytes:
         value.recv_monotonic_cut_ns,
         value.history_published_monotonic_ns,
         value.accepted_sequence,
-        value.durable_sequence,
         value.applied_sequence,
         value.catalog_digest,
         value.input_identity_sha256,

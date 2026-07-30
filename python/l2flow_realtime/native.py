@@ -66,10 +66,8 @@ class _SessionInfoC(ctypes.Structure):
         ("catalog_generation", ctypes.c_uint64),
         ("data_state_generation", ctypes.c_uint64),
         ("accepted_sequence", ctypes.c_uint64),
-        ("durable_sequence", ctypes.c_uint64),
         ("applied_sequence", ctypes.c_uint64),
         ("processing_lag_records", ctypes.c_uint64),
-        ("durability_lag_records", ctypes.c_uint64),
         ("tick_ring_capacity", ctypes.c_uint64),
         ("tick_highest_published_sequence", ctypes.c_uint64),
         ("tick_contiguous_published_sequence", ctypes.c_uint64),
@@ -100,10 +98,8 @@ class _SelectionEnvelopeC(ctypes.Structure):
         ("catalog_generation", ctypes.c_uint64),
         ("data_state_generation", ctypes.c_uint64),
         ("accepted_sequence", ctypes.c_uint64),
-        ("durable_sequence", ctypes.c_uint64),
         ("applied_sequence", ctypes.c_uint64),
         ("processing_lag_records", ctypes.c_uint64),
-        ("durability_lag_records", ctypes.c_uint64),
         ("capacity", ctypes.c_uint32),
         ("catalog_scope", ctypes.c_uint32),
         ("coverage_complete", ctypes.c_uint32),
@@ -128,8 +124,8 @@ class _HealthC(ctypes.Structure):
     ]
 
 
-assert ctypes.sizeof(_SessionInfoC) == 256
-assert ctypes.sizeof(_SelectionEnvelopeC) == 160
+assert ctypes.sizeof(_SessionInfoC) == 240
+assert ctypes.sizeof(_SelectionEnvelopeC) == 144
 assert ctypes.sizeof(_HealthC) == 32
 
 
@@ -337,10 +333,8 @@ def _session_from_c(value: _SessionInfoC) -> SessionInfo:
             catalog_generation=value.catalog_generation,
             data_state_generation=value.data_state_generation,
             accepted_sequence=value.accepted_sequence,
-            durable_sequence=value.durable_sequence,
             applied_sequence=value.applied_sequence,
             processing_lag_records=value.processing_lag_records,
-            durability_lag_records=value.durability_lag_records,
             tick_ring_capacity=value.tick_ring_capacity,
             tick_highest_published_sequence=(
                 value.tick_highest_published_sequence
@@ -386,10 +380,8 @@ def _selection_from_c(
             catalog_generation=value.catalog_generation,
             data_state_generation=value.data_state_generation,
             accepted_sequence=value.accepted_sequence,
-            durable_sequence=value.durable_sequence,
             applied_sequence=value.applied_sequence,
             processing_lag_records=value.processing_lag_records,
-            durability_lag_records=value.durability_lag_records,
             capacity=value.capacity,
             catalog_scope=CatalogScope(value.catalog_scope),
             coverage_complete=False,

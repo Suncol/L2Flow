@@ -101,12 +101,12 @@ template <typename T, std::size_t Size>
 
 }  // namespace realtime_history_wire_v2_detail
 
-// One immutable observed-universe Store generation endpoint. The independent
-// accepted/durable/applied fields deliberately do not impose an ordering
-// between durable and applied. history_published_monotonic_ns is the t2
-// release-publication boundary for callback-to-history latency measurement.
-// input_identity_sha256 identifies the accepted-process cut and catalog; it
-// is not a digest of serialized page payload bytes.
+// One immutable observed-universe Store generation endpoint. The accepted
+// processing-queue prefix and applied Store prefix identify the generation
+// cut. history_published_monotonic_ns is the t2 release-publication boundary
+// for callback-to-history latency measurement. input_identity_sha256
+// identifies the accepted-process cut and catalog; it is not a digest of
+// serialized page payload bytes.
 struct RealtimeGenerationEndpointV2 final {
     std::array<std::uint8_t, 16U> run_id{};
     std::uint64_t session_epoch = 0U;
@@ -118,7 +118,6 @@ struct RealtimeGenerationEndpointV2 final {
     std::uint64_t recv_monotonic_cut_ns = 0U;
     std::uint64_t history_published_monotonic_ns = 0U;
     std::uint64_t accepted_sequence = 0U;
-    std::uint64_t durable_sequence = 0U;
     std::uint64_t applied_sequence = 0U;
     std::array<std::uint8_t, 32U> catalog_digest{};
     std::array<std::uint8_t, 32U> input_identity_sha256{};
@@ -135,7 +134,7 @@ struct RealtimeGenerationEndpointV2 final {
     std::uint32_t coverage_complete = 0U;
     std::uint32_t flags = 0U;
 };
-static_assert(sizeof(RealtimeGenerationEndpointV2) == 256U);
+static_assert(sizeof(RealtimeGenerationEndpointV2) == 248U);
 static_assert(std::is_standard_layout_v<RealtimeGenerationEndpointV2>);
 static_assert(offsetof(RealtimeGenerationEndpointV2, run_id) == 0U);
 static_assert(
@@ -162,49 +161,46 @@ static_assert(
 static_assert(
     offsetof(RealtimeGenerationEndpointV2, accepted_sequence) == 80U);
 static_assert(
-    offsetof(RealtimeGenerationEndpointV2, durable_sequence) == 88U);
+    offsetof(RealtimeGenerationEndpointV2, applied_sequence) == 88U);
 static_assert(
-    offsetof(RealtimeGenerationEndpointV2, applied_sequence) == 96U);
-static_assert(
-    offsetof(RealtimeGenerationEndpointV2, catalog_digest) == 104U);
+    offsetof(RealtimeGenerationEndpointV2, catalog_digest) == 96U);
 static_assert(
     offsetof(
         RealtimeGenerationEndpointV2,
-        input_identity_sha256) == 136U);
+        input_identity_sha256) == 128U);
 static_assert(
-    offsetof(RealtimeGenerationEndpointV2, source_stream_ids) == 168U);
-static_assert(
-    offsetof(
-        RealtimeGenerationEndpointV2,
-        source_sequence_exclusive) == 184U);
-static_assert(
-    offsetof(RealtimeGenerationEndpointV2, trade_date) == 216U);
-static_assert(offsetof(RealtimeGenerationEndpointV2, capacity) == 220U);
-static_assert(
-    offsetof(RealtimeGenerationEndpointV2, bound_count) == 224U);
-static_assert(
-    offsetof(RealtimeGenerationEndpointV2, available_count) == 228U);
+    offsetof(RealtimeGenerationEndpointV2, source_stream_ids) == 160U);
 static_assert(
     offsetof(
         RealtimeGenerationEndpointV2,
-        snapshot_available_count) == 232U);
+        source_sequence_exclusive) == 176U);
+static_assert(
+    offsetof(RealtimeGenerationEndpointV2, trade_date) == 208U);
+static_assert(offsetof(RealtimeGenerationEndpointV2, capacity) == 212U);
+static_assert(
+    offsetof(RealtimeGenerationEndpointV2, bound_count) == 216U);
+static_assert(
+    offsetof(RealtimeGenerationEndpointV2, available_count) == 220U);
 static_assert(
     offsetof(
         RealtimeGenerationEndpointV2,
-        tick_available_count) == 236U);
+        snapshot_available_count) == 224U);
 static_assert(
     offsetof(
         RealtimeGenerationEndpointV2,
-        factor_eligible_count) == 240U);
+        tick_available_count) == 228U);
 static_assert(
-    offsetof(RealtimeGenerationEndpointV2, catalog_scope) == 244U);
+    offsetof(
+        RealtimeGenerationEndpointV2,
+        factor_eligible_count) == 232U);
 static_assert(
-    offsetof(RealtimeGenerationEndpointV2, coverage_complete) == 248U);
-static_assert(offsetof(RealtimeGenerationEndpointV2, flags) == 252U);
+    offsetof(RealtimeGenerationEndpointV2, catalog_scope) == 236U);
+static_assert(
+    offsetof(RealtimeGenerationEndpointV2, coverage_complete) == 240U);
+static_assert(offsetof(RealtimeGenerationEndpointV2, flags) == 244U);
 
 // Canonical immutable-generation identity. A generation is an applied Store
 // cut, so its accepted/applied frontier is exactly ingress_exclusive - 1.
-// Journal durability remains independent and may trail that frontier.
 [[nodiscard]] constexpr bool RealtimeGenerationEndpointCanonicalV2(
     const RealtimeGenerationEndpointV2& endpoint) noexcept {
     constexpr std::uint32_t known_flags =
@@ -234,7 +230,6 @@ static_assert(offsetof(RealtimeGenerationEndpointV2, flags) == 252U);
         endpoint.accepted_sequence !=
             endpoint.ingress_sequence_exclusive - 1U ||
         endpoint.applied_sequence != endpoint.accepted_sequence ||
-        endpoint.durable_sequence > endpoint.accepted_sequence ||
         endpoint.catalog_generation != endpoint.bound_count ||
         endpoint.bound_count > endpoint.capacity ||
         endpoint.available_count > endpoint.bound_count ||
@@ -296,39 +291,39 @@ struct RealtimeHistoryGenerationInfoV2 final {
     std::uint32_t reserved0 = 0U;
     std::array<std::uint8_t, 8U> reserved{};
 };
-static_assert(sizeof(RealtimeHistoryGenerationInfoV2) == 336U);
+static_assert(sizeof(RealtimeHistoryGenerationInfoV2) == 328U);
 static_assert(
     std::is_standard_layout_v<RealtimeHistoryGenerationInfoV2>);
 static_assert(
     offsetof(RealtimeHistoryGenerationInfoV2, endpoint) == 0U);
 static_assert(
-    offsetof(RealtimeHistoryGenerationInfoV2, instrument_id) == 256U);
+    offsetof(RealtimeHistoryGenerationInfoV2, instrument_id) == 248U);
 static_assert(
-    offsetof(RealtimeHistoryGenerationInfoV2, ordinal) == 260U);
-static_assert(
-    offsetof(
-        RealtimeHistoryGenerationInfoV2,
-        instrument_source_record_counts) == 264U);
+    offsetof(RealtimeHistoryGenerationInfoV2, ordinal) == 252U);
 static_assert(
     offsetof(
         RealtimeHistoryGenerationInfoV2,
-        instrument_record_count) == 296U);
+        instrument_source_record_counts) == 256U);
 static_assert(
     offsetof(
         RealtimeHistoryGenerationInfoV2,
-        snapshot_record_count) == 304U);
+        instrument_record_count) == 288U);
 static_assert(
     offsetof(
         RealtimeHistoryGenerationInfoV2,
-        tick_record_count) == 312U);
+        snapshot_record_count) == 296U);
 static_assert(
     offsetof(
         RealtimeHistoryGenerationInfoV2,
-        payload_projection) == 320U);
+        tick_record_count) == 304U);
 static_assert(
-    offsetof(RealtimeHistoryGenerationInfoV2, reserved0) == 324U);
+    offsetof(
+        RealtimeHistoryGenerationInfoV2,
+        payload_projection) == 312U);
 static_assert(
-    offsetof(RealtimeHistoryGenerationInfoV2, reserved) == 328U);
+    offsetof(RealtimeHistoryGenerationInfoV2, reserved0) == 316U);
+static_assert(
+    offsetof(RealtimeHistoryGenerationInfoV2, reserved) == 320U);
 
 [[nodiscard]] constexpr bool RealtimeHistoryGenerationInfoCanonicalV2(
     const RealtimeHistoryGenerationInfoV2& info) noexcept {
@@ -420,7 +415,7 @@ struct RealtimeHistoryOpenResponseV2 final {
     std::uint64_t initial_read_token = 0U;
     RealtimeHistoryGenerationInfoV2 generation{};
 };
-static_assert(sizeof(RealtimeHistoryOpenResponseV2) == 376U);
+static_assert(sizeof(RealtimeHistoryOpenResponseV2) == 368U);
 static_assert(std::is_standard_layout_v<RealtimeHistoryOpenResponseV2>);
 static_assert(
     offsetof(
@@ -541,7 +536,7 @@ struct alignas(4096) RealtimeHistoryPageHeaderV2 final {
     std::uint64_t first_ingress_sequence = 0U;
     std::uint64_t last_ingress_sequence = 0U;
     RealtimeHistoryGenerationInfoV2 generation{};
-    std::array<std::uint8_t, 3656U> reserved{};
+    std::array<std::uint8_t, 3664U> reserved{};
 };
 static_assert(
     sizeof(RealtimeHistoryPageHeaderV2) ==
@@ -567,6 +562,6 @@ static_assert(
 static_assert(
     offsetof(RealtimeHistoryPageHeaderV2, generation) == 104U);
 static_assert(
-    offsetof(RealtimeHistoryPageHeaderV2, reserved) == 440U);
+    offsetof(RealtimeHistoryPageHeaderV2, reserved) == 432U);
 
 }  // namespace l2flow::ipc

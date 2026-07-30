@@ -15,7 +15,7 @@ inline constexpr std::array<std::uint8_t, 8U> kRealtimeShmMagicV2{
 inline constexpr std::array<std::uint8_t, 8U> kRealtimeControlMagicV2{
     'L', '2', 'F', 'C', 'T', 'L', '2', '\0'};
 inline constexpr std::uint16_t kRealtimeWireMajorV2 = 2U;
-inline constexpr std::uint16_t kRealtimeWireMinorV2 = 0U;
+inline constexpr std::uint16_t kRealtimeWireMinorV2 = 1U;
 inline constexpr std::uint32_t kRealtimeLittleEndianMarkerV2 =
     0x01020304U;
 inline constexpr std::uint32_t kRealtimeDefaultInstrumentCapacityV2 =
@@ -178,7 +178,6 @@ struct alignas(4096) RealtimeWireHeaderV2 final {
     std::uint32_t factor_eligible_count = 0U;
     std::uint32_t reserved_count = 0U;
     std::uint64_t accepted_sequence = 0U;
-    std::uint64_t durable_sequence = 0U;
     std::uint64_t applied_sequence = 0U;
 
     // Independently release-published live/stream state retained from the
@@ -195,7 +194,7 @@ struct alignas(4096) RealtimeWireHeaderV2 final {
     std::array<RealtimeWireRegionDescriptorV2,
                kRealtimeWireRegionCountV2>
         regions{};
-    std::array<std::uint8_t, 3248U> reserved{};
+    std::array<std::uint8_t, 3256U> reserved{};
 };
 static_assert(sizeof(RealtimeWireHeaderV2) == 4096U);
 static_assert(alignof(RealtimeWireHeaderV2) == 4096U);
@@ -214,11 +213,12 @@ static_assert(
 static_assert(offsetof(RealtimeWireHeaderV2, catalog_digest) == 136U);
 static_assert(offsetof(RealtimeWireHeaderV2, bound_count) == 168U);
 static_assert(offsetof(RealtimeWireHeaderV2, accepted_sequence) == 192U);
-static_assert(offsetof(RealtimeWireHeaderV2, durable_sequence) == 200U);
 static_assert(
-    offsetof(RealtimeWireHeaderV2, heartbeat_monotonic_ns) == 216U);
-static_assert(offsetof(RealtimeWireHeaderV2, regions) == 272U);
-static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 848U);
+    offsetof(RealtimeWireHeaderV2, applied_sequence) == 200U);
+static_assert(
+    offsetof(RealtimeWireHeaderV2, heartbeat_monotonic_ns) == 208U);
+static_assert(offsetof(RealtimeWireHeaderV2, regions) == 264U);
+static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 840U);
 
 // One physical ordinal slot. Instrument identity and key bytes are published
 // once and never changed or rebound within a session. Availability flags and
@@ -515,11 +515,9 @@ static_assert(sizeof(RealtimeControlResponseV2) == 64U);
 
 [[nodiscard]] constexpr bool RealtimeWireProcessingSequencesValidV2(
     std::uint64_t accepted_sequence,
-    std::uint64_t durable_sequence,
     std::uint64_t applied_sequence) noexcept {
     return accepted_sequence !=
                std::numeric_limits<std::uint64_t>::max() &&
-           durable_sequence <= accepted_sequence &&
            applied_sequence <= accepted_sequence;
 }
 
@@ -530,24 +528,10 @@ static_assert(sizeof(RealtimeControlResponseV2) == 64U);
     std::uint64_t* output) noexcept {
     if (output == nullptr ||
         !RealtimeWireProcessingSequencesValidV2(
-            accepted_sequence, 0U, applied_sequence)) {
+            accepted_sequence, applied_sequence)) {
         return false;
     }
     *output = accepted_sequence - applied_sequence;
-    return true;
-}
-
-// On failure output is left untouched.
-[[nodiscard]] constexpr bool RealtimeWireDurabilityLagRecordsV2(
-    std::uint64_t accepted_sequence,
-    std::uint64_t durable_sequence,
-    std::uint64_t* output) noexcept {
-    if (output == nullptr ||
-        !RealtimeWireProcessingSequencesValidV2(
-            accepted_sequence, durable_sequence, 0U)) {
-        return false;
-    }
-    *output = accepted_sequence - durable_sequence;
     return true;
 }
 
@@ -567,7 +551,6 @@ static_assert(sizeof(RealtimeControlResponseV2) == 64U);
                header.factor_eligible_count) &&
            RealtimeWireProcessingSequencesValidV2(
                header.accepted_sequence,
-               header.durable_sequence,
                header.applied_sequence);
 }
 

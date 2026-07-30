@@ -72,7 +72,7 @@ HISTORY_PAGE_ENDIAN_MARKER = 0x01020304
 HISTORY_PROJECTION_FLAGS_MASK = 0x3
 
 _OPEN_REQUEST = struct.Struct("<8sHHHHIIQIIQ2Q")
-_OPEN_RESPONSE_BYTES = 376
+_OPEN_RESPONSE_BYTES = 368
 _READ_REQUEST = struct.Struct("<8sHHHHIIQQQ")
 _READ_RESPONSE = struct.Struct("<8sHHHHIIQQQQQ")
 _HISTORY_LOCAL = struct.Struct("<II4Q3QII8s")
@@ -151,20 +151,12 @@ class HistoryGeneration:
         return self.endpoint.accepted_sequence
 
     @property
-    def durable_sequence(self) -> int:
-        return self.endpoint.durable_sequence
-
-    @property
     def applied_sequence(self) -> int:
         return self.endpoint.applied_sequence
 
     @property
     def processing_lag_records(self) -> int:
         return self.accepted_sequence - self.applied_sequence
-
-    @property
-    def durability_lag_records(self) -> int:
-        return self.accepted_sequence - self.durable_sequence
 
     @property
     def catalog_generation(self) -> int:
@@ -282,7 +274,7 @@ def _parse_generation(
     data: bytes | memoryview, offset: int = 0
 ) -> HistoryGeneration:
     endpoint = parse_generation_endpoint(data, offset)
-    fields = _HISTORY_LOCAL.unpack_from(data, offset + 256)
+    fields = _HISTORY_LOCAL.unpack_from(data, offset + 248)
     (
         instrument_id,
         ordinal,
@@ -654,7 +646,7 @@ class HistoryCursor:
                 raise WireFormatError(
                     "history page header is not canonical Wire V2"
                 )
-            if flags != 0 or any(mapped[440:HISTORY_PAGE_HEADER_BYTES]):
+            if flags != 0 or any(mapped[432:HISTORY_PAGE_HEADER_BYTES]):
                 raise WireFormatError(
                     "history page flags/reserved bytes are nonzero"
                 )

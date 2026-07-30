@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -20,8 +19,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-#include <stdlib.h>
 
 namespace factor = l2flow::factor;
 namespace ipc = l2flow::ipc;
@@ -49,84 +46,6 @@ public:
 
 private:
     int failures_ = 0;
-};
-
-class TemporaryDirectory final {
-public:
-    TemporaryDirectory() {
-        std::array<char, 64U> pattern{};
-        constexpr char literal[] =
-            "/tmp/l2flow-observed-pipeline-v2-XXXXXX";
-        static_assert(sizeof(literal) <= pattern.size());
-        std::memcpy(pattern.data(), literal, sizeof(literal));
-        char* const created = ::mkdtemp(pattern.data());
-        if (created != nullptr) {
-            path_ = created;
-        }
-    }
-
-    ~TemporaryDirectory() {
-        if (!path_.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove_all(path_, ignored);
-        }
-    }
-
-    TemporaryDirectory(const TemporaryDirectory&) = delete;
-    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
-
-    [[nodiscard]] const std::filesystem::path& path() const noexcept {
-        return path_;
-    }
-
-private:
-    std::filesystem::path path_;
-};
-
-class JournalSyncBlocker final {
-public:
-    static void BeforeSync(void* context) noexcept {
-        auto* const blocker = static_cast<JournalSyncBlocker*>(context);
-        if (blocker == nullptr) {
-            return;
-        }
-        try {
-            std::unique_lock<std::mutex> lock(blocker->mutex_);
-            blocker->entered_ = true;
-            blocker->condition_.notify_all();
-            blocker->condition_.wait(lock, [blocker] {
-                return blocker->released_;
-            });
-        } catch (...) {
-            // The production path never installs this deterministic test seam.
-        }
-    }
-
-    [[nodiscard]] bool WaitUntilEntered(
-        std::chrono::nanoseconds timeout) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        return condition_.wait_for(lock, timeout, [this] {
-            return entered_;
-        });
-    }
-
-    void Release() noexcept {
-        try {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                released_ = true;
-            }
-            condition_.notify_all();
-        } catch (...) {
-            condition_.notify_all();
-        }
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    bool entered_ = false;
-    bool released_ = false;
 };
 
 class WireWriter final {
@@ -338,7 +257,6 @@ public:
             return false;
         }
         UpdateMaximum(&accepted_, progress.accepted_sequence);
-        UpdateMaximum(&durable_, progress.durable_sequence);
         UpdateMaximum(&applied_, progress.applied_sequence);
         return true;
     }
@@ -348,9 +266,6 @@ public:
     }
     [[nodiscard]] std::uint64_t binding_mask() const noexcept {
         return binding_mask_.load(std::memory_order_acquire);
-    }
-    [[nodiscard]] std::uint64_t durable() const noexcept {
-        return durable_.load(std::memory_order_acquire);
     }
     [[nodiscard]] std::uint64_t accepted() const noexcept {
         return accepted_.load(std::memory_order_acquire);
@@ -393,7 +308,6 @@ private:
     std::atomic<std::uint64_t> applied_mask_{0U};
     std::atomic<std::uint64_t> binding_mask_{0U};
     std::atomic<std::uint64_t> accepted_{0U};
-    std::atomic<std::uint64_t> durable_{0U};
     std::atomic<std::uint64_t> applied_{0U};
     std::atomic<bool> coverage_lost_{false};
     bool block_first_applied_ = false;
@@ -522,7 +436,6 @@ private:
 
 [[nodiscard]] runtime::RealtimePipelineConfigV1 MakeConfig(
     market::ObservedInstrumentDirectoryV2* directory,
-    const std::filesystem::path& journal_path,
     const std::shared_ptr<ProjectionProbe>& projection) {
     runtime::RealtimePipelineConfigV1 config{};
     config.run_id[0U] = std::byte{0x31U};
@@ -541,10 +454,6 @@ private:
     config.intraday_store.maximum_records_per_batch = 64U;
     config.intraday_store.coverage_from_open = true;
     config.enforce_receive_trade_date = false;
-    config.journal.path = journal_path.string();
-    config.journal.queue_capacity = 32U;
-    config.journal.max_batch_records = 8U;
-    config.journal.max_batch_delay = 50us;
     config.applied_record_sink = projection;
     config.instrument_binding_sink = projection;
     config.processing_progress_sink = projection;
@@ -553,8 +462,7 @@ private:
 }
 
 void CheckStoreGenerationSinkOrderingAndFailure(
-    TestContext* test,
-    const std::filesystem::path& journal_path) {
+    TestContext* test) {
     std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
     test->Expect(
         market::ObservedInstrumentDirectoryV2::Create(
@@ -574,7 +482,7 @@ void CheckStoreGenerationSinkOrderingAndFailure(
     const auto calculator =
         std::make_shared<OrderedFactorCalculator>(order);
     runtime::RealtimePipelineConfigV1 config =
-        MakeConfig(directory.get(), journal_path, projection);
+        MakeConfig(directory.get(), projection);
     config.store_generation_sink = sink;
     config.factor_calculator = calculator;
 
@@ -659,8 +567,7 @@ void CheckEmptyGeneration(
             cut.store_generation->instrument_count() == 0U &&
             cut.factor_generation != nullptr &&
             cut.factor_generation->points().empty() &&
-            cut.factor_generation->processing_lag_records() == 0U &&
-            cut.factor_generation->durability_lag_records() == 0U,
+            cut.factor_generation->processing_lag_records() == 0U,
         "empty generation retains explicit observed-universe semantics");
 }
 
@@ -700,7 +607,7 @@ void CheckPopulatedGeneration(
         pipeline->CutAndPublishGeneration(5s);
     test->Expect(
         cut.published(),
-        "applied prefix publishes without waiting for Journal durability");
+        "applied prefix publishes as one immutable generation");
     if (!cut.published()) {
         return;
     }
@@ -730,13 +637,10 @@ void CheckPopulatedGeneration(
         cut.store_generation->watermark().processing_progress;
     test->Expect(
         progress.accepted_sequence == 3U &&
-            progress.durable_sequence <= 3U &&
             progress.applied_sequence == 3U &&
             progress.processing_lag_records() == 0U &&
-            progress.durability_lag_records() ==
-                3U - progress.durable_sequence &&
             cut.store_generation->instrument_count() == 2U,
-        "generation carries independent accepted, durable, and applied watermarks");
+        "generation carries the exact accepted and applied watermarks");
 
     market::RealtimeLatestRecordViewV1 latest_snapshot{};
     market::RealtimeLatestRecordViewV1 latest_tick_one{};
@@ -782,16 +686,14 @@ void CheckPopulatedGeneration(
             return projection->binding_mask() == 0b11U &&
                    projection->applied_mask() == 0b111U &&
                    projection->accepted() == 3U &&
-                   projection->durable() <= 3U &&
                    projection->applied() == 3U &&
                    !projection->coverage_lost();
         }),
-        "external binding/data/progress projections expose independent progress");
+        "external binding/data/progress projections expose processing progress");
 }
 
 void CheckExplicitAppliedDispatchWindow(
-    TestContext* test,
-    const std::filesystem::path& journal_path) {
+    TestContext* test) {
     std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
     test->Expect(
         market::ObservedInstrumentDirectoryV2::Create(
@@ -805,13 +707,11 @@ void CheckExplicitAppliedDispatchWindow(
     }
     const auto projection =
         std::make_shared<ProjectionProbe>(true);
-    runtime::RealtimePipelineConfigV1 config = MakeConfig(
-        directory.get(), journal_path, projection);
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(directory.get(), projection);
     config.decoder_queue_capacity_per_source = 1U;
     config.store_worker_count = 2U;
     config.store_queue_capacity_per_source_worker = 64U;
-    config.journal.queue_capacity = 32U;
-    config.journal.max_batch_records = 1U;
 
     std::size_t window = 0U;
     test->Expect(
@@ -871,14 +771,13 @@ void CheckExplicitAppliedDispatchWindow(
         WaitUntil([&] {
             const runtime::RealtimePipelineSnapshotV1 snapshot =
                 pipeline->Snapshot();
-            return snapshot.journal.durable_sequence >= window + 1U &&
-                   snapshot.decoded_messages == window &&
+            return snapshot.decoded_messages == window &&
                    snapshot.processing_progress.accepted_sequence ==
                        window + 1U &&
                    snapshot.processing_progress.applied_sequence == 0U &&
                    !snapshot.fatal;
         }),
-        "W+1 is durable but cannot overrun the W-sized completion tracker");
+        "W+1 is accepted but cannot overrun the W-sized completion tracker");
 
     projection->ReleaseFirstApplied();
     const runtime::RealtimePipelineCutResultV1 cut =
@@ -894,9 +793,183 @@ void CheckExplicitAppliedDispatchWindow(
     pipeline->StopAndDrain();
 }
 
+void CheckProcessingQueueFullKeepsAcceptedPrefix(
+    TestContext* test) {
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
+    test->Expect(
+        market::ObservedInstrumentDirectoryV2::Create(
+            market::ObservedInstrumentDirectoryConfigV2{4U, 22U},
+            &directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            directory != nullptr,
+        "create queue-full directory");
+    if (directory == nullptr) {
+        return;
+    }
+
+    const auto projection =
+        std::make_shared<ProjectionProbe>(true);
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(directory.get(), projection);
+    config.processing_queue_capacity = 1U;
+    config.decoder_queue_capacity_per_source = 1U;
+    config.store_worker_count = 2U;
+    config.store_queue_capacity_per_source_worker = 64U;
+
+    std::size_t window = 0U;
+    test->Expect(
+        runtime::RealtimePipelineAppliedWindowCapacityV1(
+            config, &window) &&
+            window == 9U,
+        "derive completion window for queue-full test");
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create queue-full pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    FakeMessage first(
+        sdk::kProductionMessageKeysV1[2U],
+        ShenzhenSnapshotBody(12'345'600));
+    const runtime::RealtimePipelineIngressResultV1 first_result =
+        pipeline->InjectSdkMessageForTest(&first);
+    first.DestroyCallbackBytes();
+    test->Expect(
+        first_result.accepted() &&
+            projection->WaitUntilFirstAppliedBlocked(3s),
+        "queue-full test blocks the first applied sequence");
+
+    bool prefix_accepted = first_result.accepted();
+    runtime::RealtimePipelineIngressResultV1 last_accepted_result =
+        first_result;
+    for (std::uint64_t sequence = 2U;
+         sequence <= static_cast<std::uint64_t>(window) + 1U;
+         ++sequence) {
+        FakeMessage message(
+            sdk::kProductionMessageKeysV1[1U],
+            ShanghaiTradeBody(400U + sequence));
+        const runtime::RealtimePipelineIngressResultV1 result =
+            pipeline->InjectSdkMessageForTest(&message);
+        message.DestroyCallbackBytes();
+        prefix_accepted = prefix_accepted && result.accepted();
+        if (result.accepted()) {
+            last_accepted_result = result;
+        }
+        if (sequence <= static_cast<std::uint64_t>(window)) {
+            test->Expect(
+                WaitUntil([&] {
+                    return pipeline->Snapshot().decoded_messages >=
+                           sequence;
+                }),
+                "queue-full prefix dispatches within the completion window");
+        }
+    }
+    test->Expect(
+        prefix_accepted &&
+            WaitUntil([&] {
+                const auto snapshot = pipeline->Snapshot();
+                return snapshot.decoded_messages == window &&
+                       snapshot.processing_progress
+                               .accepted_sequence ==
+                           window + 1U &&
+                       snapshot.processing_progress.applied_sequence ==
+                           0U &&
+                       !snapshot.fatal;
+            }),
+        "dispatcher is blocked with one free processing slot");
+
+    runtime::RealtimePipelineIngressResultV1 overflow_result{};
+    bool saw_overflow = false;
+    for (std::uint64_t attempt = 0U;
+         attempt < 3U && !saw_overflow;
+         ++attempt) {
+        FakeMessage candidate(
+            sdk::kProductionMessageKeysV1[1U],
+            ShanghaiTradeBody(500U + attempt));
+        const runtime::RealtimePipelineIngressResultV1 result =
+            pipeline->InjectSdkMessageForTest(&candidate);
+        candidate.DestroyCallbackBytes();
+        if (result.accepted()) {
+            last_accepted_result = result;
+        } else {
+            overflow_result = result;
+            saw_overflow = true;
+        }
+    }
+    const runtime::RealtimePipelineSnapshotV1 failed =
+        pipeline->Snapshot();
+    const bool prefix_preserved =
+        saw_overflow &&
+            overflow_result.error ==
+                runtime::RealtimePipelineIngressErrorV1::
+                    kProcessingAdmissionFailed &&
+            !overflow_result.accepted() &&
+            overflow_result.global_ingress_sequence == 0U &&
+            overflow_result.source_sequence == 0U &&
+            overflow_result.tick_stream_sequence == 0U &&
+            failed.accepted_messages ==
+                last_accepted_result.global_ingress_sequence &&
+            failed.global_ingress_sequence ==
+                last_accepted_result.global_ingress_sequence &&
+            failed.processing_progress.accepted_sequence ==
+                last_accepted_result.global_ingress_sequence &&
+            failed.processing_progress.applied_sequence <=
+                failed.processing_progress.accepted_sequence &&
+            failed.processing_progress.processing_lag_records() ==
+                failed.processing_progress.accepted_sequence -
+                    failed.processing_progress.applied_sequence &&
+            failed.tick_stream_sequence ==
+                last_accepted_result.tick_stream_sequence &&
+            failed.source_sequences[
+                last_accepted_result.source_slot] ==
+                last_accepted_result.source_sequence &&
+            failed.rejected_messages == 1U && failed.fatal;
+    test->Expect(
+        prefix_preserved,
+        "queue-full failure does not advance any accepted capture counter");
+    if (!prefix_preserved) {
+        std::cerr
+            << "queue-full diagnostic saw_overflow=" << saw_overflow
+            << " error="
+            << runtime::RealtimePipelineIngressErrorNameV1(
+                   overflow_result.error)
+            << " overflow_global="
+            << overflow_result.global_ingress_sequence
+            << " overflow_source=" << overflow_result.source_sequence
+            << " overflow_tick="
+            << overflow_result.tick_stream_sequence
+            << " expected=" << last_accepted_result.global_ingress_sequence
+            << " accepted_messages=" << failed.accepted_messages
+            << " global=" << failed.global_ingress_sequence
+            << " accepted="
+            << failed.processing_progress.accepted_sequence
+            << " applied="
+            << failed.processing_progress.applied_sequence
+            << " expected_tick="
+            << last_accepted_result.tick_stream_sequence
+            << " tick=" << failed.tick_stream_sequence
+            << " expected_source="
+            << last_accepted_result.source_sequence
+            << " source="
+            << failed.source_sequences[
+                   last_accepted_result.source_slot]
+            << " rejected=" << failed.rejected_messages
+            << " fatal=" << failed.fatal << '\n';
+    }
+
+    projection->ReleaseFirstApplied();
+    pipeline->StopAndDrain();
+}
+
 void CheckProcessingQueueIdleBoundaryLastMessage(
-    TestContext* test,
-    const std::filesystem::path& journal_path) {
+    TestContext* test) {
     std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
     test->Expect(
         market::ObservedInstrumentDirectoryV2::Create(
@@ -914,8 +987,8 @@ void CheckProcessingQueueIdleBoundaryLastMessage(
     constexpr std::uint64_t total_records =
         rounds * records_per_round;
     const std::shared_ptr<ProjectionProbe> no_projection;
-    runtime::RealtimePipelineConfigV1 config = MakeConfig(
-        directory.get(), journal_path, no_projection);
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(directory.get(), no_projection);
     config.processing_queue_capacity = 2U;
     config.decoder_queue_capacity_per_source = 2U;
     config.store_queue_capacity_per_source_worker = 8U;
@@ -923,12 +996,6 @@ void CheckProcessingQueueIdleBoundaryLastMessage(
         total_records + 64U;
     config.intraday_store.maximum_session_accounted_bytes =
         128U * 1024U * 1024U;
-    // Keep persistence admitted but out of the scheduling experiment. The
-    // queue can retain the entire finite run, so disk speed cannot turn this
-    // processing-wakeup regression into a Journal-capacity failure.
-    config.journal.queue_capacity =
-        static_cast<std::size_t>(total_records + 64U);
-    config.journal.max_batch_records = 64U;
 
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
     std::string detail;
@@ -1006,134 +1073,10 @@ void CheckProcessingQueueIdleBoundaryLastMessage(
     pipeline->StopAndDrain();
 }
 
-void CheckBlockedJournalDoesNotBlockLatest(
-    TestContext* test,
-    const std::filesystem::path& journal_path) {
-    std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
-    test->Expect(
-        market::ObservedInstrumentDirectoryV2::Create(
-            market::ObservedInstrumentDirectoryConfigV2{4U, 19U},
-            &directory) ==
-                market::ObservedInstrumentDirectoryErrorV2::kNone &&
-            directory != nullptr,
-        "create blocked-Journal directory");
-    if (directory == nullptr) {
-        return;
-    }
-
-    JournalSyncBlocker sync_blocker;
-    const auto projection = std::make_shared<ProjectionProbe>();
-    const auto publication_order =
-        std::make_shared<GenerationPublicationOrder>();
-    const auto generation_sink =
-        std::make_shared<StoreGenerationSinkProbe>(
-            publication_order);
-    const auto factor_calculator =
-        std::make_shared<OrderedFactorCalculator>(
-            publication_order);
-    runtime::RealtimePipelineConfigV1 config = MakeConfig(
-        directory.get(), journal_path, projection);
-    config.store_generation_sink = generation_sink;
-    config.factor_calculator = factor_calculator;
-    config.journal.max_batch_records = 1U;
-    config.journal.before_sync_for_test =
-        &JournalSyncBlocker::BeforeSync;
-    config.journal.before_sync_context_for_test = &sync_blocker;
-
-    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
-    std::string detail;
-    test->Expect(
-        runtime::RealtimePipelineV1::Create(
-            config, &pipeline, &detail) ==
-                runtime::RealtimePipelineCreateErrorV1::kNone &&
-            pipeline != nullptr,
-        "create pipeline with deterministically blocked Journal sync: " +
-            detail);
-    if (pipeline == nullptr) {
-        return;
-    }
-
-    FakeMessage snapshot(
-        sdk::kProductionMessageKeysV1[2U],
-        ShenzhenSnapshotBody(12'345'600));
-    const runtime::RealtimePipelineIngressResultV1 ingress =
-        pipeline->InjectSdkMessageForTest(&snapshot);
-    snapshot.DestroyCallbackBytes();
-    test->Expect(
-        ingress.accepted() &&
-            sync_blocker.WaitUntilEntered(3s),
-        "writer reaches the blocked fdatasync after callback admission");
-
-    market::RealtimeLatestRecordViewV1 latest{};
-    test->Expect(
-        WaitUntil([&] {
-            const runtime::RealtimePipelineSnapshotV1 state =
-                pipeline->Snapshot();
-            const bool latest_visible =
-                pipeline->GetLatestSnapshot(1U, &latest) ==
-                    market::RealtimeLatestQueryErrorV1::kNone &&
-                latest.record != nullptr &&
-                latest.record->ingress_sequence() == 1U;
-            return state.processing_progress.accepted_sequence == 1U &&
-                   state.processing_progress.applied_sequence == 1U &&
-                   state.processing_progress.durable_sequence == 0U &&
-                   state.processing_progress.processing_lag_records() ==
-                       0U &&
-                   state.processing_progress.durability_lag_records() ==
-                       1U &&
-                   state.journal.written_sequence == 1U &&
-                   state.journal.durable_sequence == 0U &&
-                   projection->accepted() == 1U &&
-                   projection->applied() == 1U &&
-                   projection->durable() == 0U &&
-                   latest_visible;
-        }),
-        "applied progress and latest data advance while fdatasync is blocked");
-
-    const runtime::RealtimePipelineCutResultV1 cut =
-        pipeline->CutAndPublishGeneration(3s);
-    test->Expect(
-        cut.published() && cut.store_generation != nullptr &&
-            cut.store_generation->watermark()
-                    .processing_progress.accepted_sequence == 1U &&
-            cut.store_generation->watermark()
-                    .processing_progress.applied_sequence == 1U &&
-            cut.store_generation->watermark()
-                    .processing_progress.durable_sequence == 0U &&
-            generation_sink->last_generation().get() ==
-                cut.store_generation.get() &&
-            publication_order->sink_calls() == 1U &&
-            publication_order->factor_calls() == 1U &&
-            !publication_order->invalid_order(),
-        "Store generation reaches its sink before Factor without waiting "
-        "for durability");
-
-    sync_blocker.Release();
-    test->Expect(
-        WaitUntil([&] {
-            const runtime::RealtimePipelineSnapshotV1 state =
-                pipeline->Snapshot();
-            return state.processing_progress.durable_sequence == 1U &&
-                   state.processing_progress.durability_lag_records() ==
-                       0U &&
-                   projection->durable() == 1U;
-        }),
-        "durable progress advances independently after sync is released");
-    pipeline->StopAndDrain();
-}
-
 }  // namespace
 
 int main() {
     TestContext test;
-    TemporaryDirectory temporary;
-    test.Expect(
-        !temporary.path().empty(),
-        "temporary Journal directory is available");
-    if (temporary.path().empty()) {
-        return 1;
-    }
-
     std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
     test.Expect(
         market::ObservedInstrumentDirectoryV2::Create(
@@ -1151,10 +1094,7 @@ int main() {
     std::string detail;
     test.Expect(
         runtime::RealtimePipelineV1::Create(
-            MakeConfig(
-                directory.get(),
-                temporary.path() / "capture.journal",
-                projection),
+            MakeConfig(directory.get(), projection),
             &pipeline,
             &detail) ==
                 runtime::RealtimePipelineCreateErrorV1::kNone &&
@@ -1174,31 +1114,23 @@ int main() {
         before_stop.accepted_messages == 3U &&
             before_stop.decoded_messages == 3U &&
             before_stop.processing_progress.accepted_sequence == 3U &&
-            before_stop.processing_progress.durable_sequence <= 3U &&
             before_stop.processing_progress.applied_sequence == 3U &&
             !before_stop.fatal,
-        "pipeline snapshot exposes independent healthy progress prefixes");
+        "pipeline snapshot exposes a healthy processing prefix");
 
     pipeline->StopAndDrain();
     const runtime::RealtimePipelineSnapshotV1 stopped =
         pipeline->Snapshot();
     test.Expect(
         stopped.stopped && !stopped.accepting && !stopped.fatal &&
-            stopped.journal.finished &&
-            stopped.journal.durable_sequence == 3U &&
             stopped.processing_progress.accepted_sequence == 3U &&
-            stopped.processing_progress.durable_sequence == 3U &&
             stopped.processing_progress.applied_sequence == 3U,
-        "mandatory Journal and all workers stop after draining");
+        "all processing workers stop after draining");
 
-    CheckExplicitAppliedDispatchWindow(
-        &test, temporary.path() / "window.journal");
-    CheckStoreGenerationSinkOrderingAndFailure(
-        &test, temporary.path() / "generation-sink.journal");
-    CheckProcessingQueueIdleBoundaryLastMessage(
-        &test, temporary.path() / "processing-idle-boundary.journal");
-    CheckBlockedJournalDoesNotBlockLatest(
-        &test, temporary.path() / "blocked-sync.journal");
+    CheckExplicitAppliedDispatchWindow(&test);
+    CheckProcessingQueueFullKeepsAcceptedPrefix(&test);
+    CheckStoreGenerationSinkOrderingAndFailure(&test);
+    CheckProcessingQueueIdleBoundaryLastMessage(&test);
 
     return test.failures() == 0 ? 0 : 1;
 }

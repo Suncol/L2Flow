@@ -105,7 +105,7 @@ RealtimeSharedServiceCreateErrorNameV2(
 
 // Hard Wire V2 replacement. There is no V1 adapter or authoritative-catalog
 // mode. History and delta readers bind to one immutable observed-universe
-// generation and never touch the asynchronous Journal.
+// generation and never enter the live callback/processing path.
 class RealtimeSharedMarketServiceV2 final
     : public l2flow::market::RealtimeAppliedRecordSinkV1,
       public l2flow::market::ObservedInstrumentBindingSinkV2,

@@ -166,7 +166,7 @@ struct MarketMessageViewV1 final {
     std::uint32_t source_stream_id = 0U;
     std::uint32_t trade_date = 0U;
     // A caller-owned, dense per-source ingress order. Zero is not accepted;
-    // the value has no Journal-position or exchange-time meaning.
+    // the value has no persistence-position or exchange-time meaning.
     std::uint64_t source_sequence = 0U;
     std::uint8_t service_id = 0U;
     std::uint16_t service_version = 0U;

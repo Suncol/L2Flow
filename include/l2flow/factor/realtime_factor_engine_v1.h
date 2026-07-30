@@ -177,16 +177,9 @@ public:
         const noexcept {
         return watermark_.processing_progress.accepted_sequence;
     }
-    [[nodiscard]] std::uint64_t capture_durable_sequence() const noexcept {
-        return watermark_.processing_progress.durable_sequence;
-    }
     [[nodiscard]] std::uint64_t processing_lag_records()
         const noexcept {
         return watermark_.processing_progress.processing_lag_records();
-    }
-    [[nodiscard]] std::uint64_t durability_lag_records()
-        const noexcept {
-        return watermark_.processing_progress.durability_lag_records();
     }
 
 private:

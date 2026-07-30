@@ -23,37 +23,37 @@
 #define F_SEAL_FUTURE_WRITE 0x0010
 #endif
 
-static_assert(sizeof(l2flow_shm_session_info_v2) == 256U);
+static_assert(sizeof(l2flow_shm_session_info_v2) == 240U);
 static_assert(
     offsetof(l2flow_shm_session_info_v2, session_epoch) == 80U);
 static_assert(
     offsetof(l2flow_shm_session_info_v2, accepted_sequence) == 104U);
 static_assert(
-    offsetof(l2flow_shm_session_info_v2, tick_ring_capacity) == 144U);
+    offsetof(l2flow_shm_session_info_v2, tick_ring_capacity) == 128U);
 static_assert(
-    offsetof(l2flow_shm_session_info_v2, trade_date) == 192U);
+    offsetof(l2flow_shm_session_info_v2, trade_date) == 176U);
 static_assert(
-    offsetof(l2flow_shm_session_info_v2, capacity) == 204U);
+    offsetof(l2flow_shm_session_info_v2, capacity) == 188U);
 static_assert(
-    offsetof(l2flow_shm_session_info_v2, bound_count) == 220U);
+    offsetof(l2flow_shm_session_info_v2, bound_count) == 204U);
 static_assert(
-    offsetof(l2flow_shm_session_info_v2, reserved) == 240U);
-static_assert(sizeof(l2flow_selection_envelope_v2) == 160U);
+    offsetof(l2flow_shm_session_info_v2, reserved) == 224U);
+static_assert(sizeof(l2flow_selection_envelope_v2) == 144U);
 static_assert(
     offsetof(l2flow_selection_envelope_v2, session_epoch) == 48U);
 static_assert(
     offsetof(
         l2flow_selection_envelope_v2, accepted_sequence) == 72U);
 static_assert(
-    offsetof(l2flow_selection_envelope_v2, capacity) == 112U);
+    offsetof(l2flow_selection_envelope_v2, capacity) == 96U);
 static_assert(
     offsetof(l2flow_selection_envelope_v2, selection_scope) ==
-    144U);
+    128U);
 static_assert(
     offsetof(l2flow_selection_envelope_v2, returned_row_count) ==
-    148U);
+    132U);
 static_assert(
-    offsetof(l2flow_selection_envelope_v2, reserved) == 152U);
+    offsetof(l2flow_selection_envelope_v2, reserved) == 136U);
 static_assert(
     std::atomic_ref<std::uint8_t>::is_always_lock_free,
     "Wire V2 row publication requires lock-free byte atomic_ref");
@@ -180,7 +180,6 @@ struct StatusSnapshot final {
     std::uint32_t factor_eligible_count = 0U;
     std::uint32_t reserved_count = 0U;
     std::uint64_t accepted_sequence = 0U;
-    std::uint64_t durable_sequence = 0U;
     std::uint64_t applied_sequence = 0U;
 };
 
@@ -240,9 +239,6 @@ StableCopyResult CopyStatus(
         snapshot.accepted_sequence =
             Atomic(header.accepted_sequence)
                 .load(std::memory_order_relaxed);
-        snapshot.durable_sequence =
-            Atomic(header.durable_sequence)
-                .load(std::memory_order_relaxed);
         snapshot.applied_sequence =
             Atomic(header.applied_sequence)
                 .load(std::memory_order_relaxed);
@@ -264,7 +260,6 @@ StableCopyResult CopyStatus(
                 snapshot.factor_eligible_count) ||
             !l2flow::ipc::RealtimeWireProcessingSequencesValidV2(
                 snapshot.accepted_sequence,
-                snapshot.durable_sequence,
                 snapshot.applied_sequence) ||
             (snapshot.bound_count != 0U &&
              !AnyNonzero(snapshot.catalog_digest))) {
@@ -1386,12 +1381,9 @@ void FillSelectionEnvelope(
     envelope.data_state_generation =
         status.data_state_generation;
     envelope.accepted_sequence = status.accepted_sequence;
-    envelope.durable_sequence = status.durable_sequence;
     envelope.applied_sequence = status.applied_sequence;
     envelope.processing_lag_records =
         status.accepted_sequence - status.applied_sequence;
-    envelope.durability_lag_records =
-        status.accepted_sequence - status.durable_sequence;
     envelope.capacity = reader.header->capacity;
     envelope.catalog_scope = reader.header->catalog_scope;
     envelope.coverage_complete =
@@ -1759,12 +1751,9 @@ extern "C" int l2flow_shm_reader_session_v2(
     result.catalog_generation = status.catalog_generation;
     result.data_state_generation = status.data_state_generation;
     result.accepted_sequence = status.accepted_sequence;
-    result.durable_sequence = status.durable_sequence;
     result.applied_sequence = status.applied_sequence;
     result.processing_lag_records =
         status.accepted_sequence - status.applied_sequence;
-    result.durability_lag_records =
-        status.accepted_sequence - status.durable_sequence;
     result.tick_ring_capacity = reader->tick_ring_capacity;
     result.tick_contiguous_published_sequence =
         Atomic(

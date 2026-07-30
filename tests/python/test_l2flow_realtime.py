@@ -62,10 +62,8 @@ def session_info(**overrides) -> SessionInfo:
         "catalog_generation": 3,
         "data_state_generation": 4,
         "accepted_sequence": 100,
-        "durable_sequence": 97,
         "applied_sequence": 99,
         "processing_lag_records": 1,
-        "durability_lag_records": 3,
         "tick_ring_capacity": 1024,
         "tick_highest_published_sequence": 7,
         "tick_contiguous_published_sequence": 7,
@@ -283,10 +281,8 @@ class FakeV2Library:
         result.catalog_generation = 3
         result.data_state_generation = 4
         result.accepted_sequence = 100
-        result.durable_sequence = 97
         result.applied_sequence = 99
         result.processing_lag_records = 1
-        result.durability_lag_records = 3
         result.tick_ring_capacity = 1024
         result.tick_highest_published_sequence = 7
         result.tick_contiguous_published_sequence = 7
@@ -554,10 +550,8 @@ class FakeV2Library:
         envelope.catalog_generation = 3
         envelope.data_state_generation = 4
         envelope.accepted_sequence = 100
-        envelope.durable_sequence = 97
         envelope.applied_sequence = 99
         envelope.processing_lag_records = 1
-        envelope.durability_lag_records = 3
         envelope.capacity = CAPACITY
         envelope.catalog_scope = int(CatalogScope.OBSERVED_ONLY)
         envelope.coverage_complete = 0
@@ -577,17 +571,17 @@ class FakeV2Library:
 
 class AbiContractTests(unittest.TestCase):
     def test_v2_ctypes_layout_and_symbol_binding(self):
-        self.assertEqual(ctypes.sizeof(native._SessionInfoC), 256)
-        self.assertEqual(ctypes.sizeof(native._SelectionEnvelopeC), 160)
+        self.assertEqual(ctypes.sizeof(native._SessionInfoC), 240)
+        self.assertEqual(ctypes.sizeof(native._SelectionEnvelopeC), 144)
         self.assertEqual(ctypes.sizeof(native._HealthC), 32)
         self.assertEqual(native._SessionInfoC.session_epoch.offset, 80)
         self.assertEqual(native._SessionInfoC.accepted_sequence.offset, 104)
-        self.assertEqual(native._SessionInfoC.trade_date.offset, 192)
+        self.assertEqual(native._SessionInfoC.trade_date.offset, 176)
         self.assertEqual(native._SelectionEnvelopeC.session_epoch.offset, 48)
         self.assertEqual(
             native._SelectionEnvelopeC.accepted_sequence.offset, 72
         )
-        self.assertEqual(native._SelectionEnvelopeC.capacity.offset, 112)
+        self.assertEqual(native._SelectionEnvelopeC.capacity.offset, 96)
 
         library = FakeV2Library()
         native._bind_library(library)
@@ -611,7 +605,7 @@ class AbiContractTests(unittest.TestCase):
         magic, major, minor = struct.unpack_from("<8sHH", request)
         self.assertEqual(magic, CONTROL_MAGIC)
         self.assertEqual((major, minor), (WIRE_MAJOR, WIRE_MINOR))
-        self.assertEqual((major, minor), (2, 0))
+        self.assertEqual((major, minor), (2, 1))
 
     def test_v2_history_modules_replace_removed_v1_surface(self):
         self.assertTrue(hasattr(l2flow_realtime, "HistoryCursor"))
@@ -656,10 +650,6 @@ class NativeReaderTests(unittest.TestCase):
         self.assertIs(session.catalog_scope, CatalogScope.OBSERVED_ONLY)
         self.assertFalse(session.coverage_complete)
         self.assertEqual(session.processing_lag_records, 1)
-        self.assertEqual(session.durability_lag_records, 3)
-        self.assertGreater(
-            session.applied_sequence, session.durable_sequence
-        )
         self.assertEqual(
             (
                 session.factor_eligible_count,
@@ -781,10 +771,6 @@ class NativeReaderTests(unittest.TestCase):
         )
         self.assertFalse(selection.coverage_complete)
         self.assertEqual(selection.processing_lag_records, 1)
-        self.assertEqual(selection.durability_lag_records, 3)
-        self.assertGreater(
-            selection.applied_sequence, selection.durable_sequence
-        )
 
 
 class ClientHotPathTests(unittest.TestCase):
@@ -868,18 +854,8 @@ class ClientHotPathTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             session_info(
                 accepted_sequence=5,
-                durable_sequence=5,
                 applied_sequence=6,
                 processing_lag_records=0,
-                durability_lag_records=0,
-            )
-        with self.assertRaises(ValueError):
-            session_info(
-                accepted_sequence=5,
-                durable_sequence=6,
-                applied_sequence=5,
-                processing_lag_records=0,
-                durability_lag_records=0,
             )
         with self.assertRaises(ValueError):
             session_info(
@@ -889,10 +865,8 @@ class ClientHotPathTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             session_info(
                 accepted_sequence=(1 << 64) - 1,
-                durable_sequence=97,
                 applied_sequence=99,
                 processing_lag_records=(1 << 64) - 100,
-                durability_lag_records=(1 << 64) - 98,
             )
 
 

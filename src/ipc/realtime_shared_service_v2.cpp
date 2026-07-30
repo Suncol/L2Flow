@@ -1126,7 +1126,6 @@ bool ComputeEndpointInputIdentity(
         !HashU64(&hasher, endpoint.tick_available_count) ||
         !HashU64(&hasher, endpoint.factor_eligible_count) ||
         !HashU64(&hasher, endpoint.accepted_sequence) ||
-        !HashU64(&hasher, endpoint.durable_sequence) ||
         !HashU64(&hasher, endpoint.applied_sequence)) {
         return false;
     }
@@ -1166,7 +1165,6 @@ bool EndpointSelfConsistent(
         endpoint.accepted_sequence !=
             endpoint.ingress_sequence_exclusive - 1U ||
         endpoint.applied_sequence != endpoint.accepted_sequence ||
-        endpoint.durable_sequence > endpoint.accepted_sequence ||
         endpoint.capacity == 0U ||
         !RealtimeWireCountsValidV2(
             endpoint.capacity,
@@ -1281,8 +1279,6 @@ bool BuildGenerationEndpoint(
         published_monotonic_ns;
     endpoint.accepted_sequence =
         watermark.processing_progress.accepted_sequence;
-    endpoint.durable_sequence =
-        watermark.processing_progress.durable_sequence;
     endpoint.applied_sequence =
         watermark.processing_progress.applied_sequence;
     std::memcpy(
@@ -1454,7 +1450,6 @@ bool EndpointIsValidPredecessor(
         base.history_published_monotonic_ns >
             target.history_published_monotonic_ns ||
         base.accepted_sequence > target.accepted_sequence ||
-        base.durable_sequence > target.durable_sequence ||
         base.applied_sequence > target.applied_sequence ||
         base.catalog_generation > target.catalog_generation ||
         base.data_state_generation >
@@ -2359,26 +2354,18 @@ public:
         const std::uint64_t old_accepted =
             Atomic(header_->accepted_sequence)
                 .load(std::memory_order_relaxed);
-        const std::uint64_t old_durable =
-            Atomic(header_->durable_sequence)
-                .load(std::memory_order_relaxed);
         const std::uint64_t old_applied =
             Atomic(header_->applied_sequence)
                 .load(std::memory_order_relaxed);
         const std::uint64_t accepted =
             std::max(old_accepted, progress.accepted_sequence);
-        const std::uint64_t durable =
-            std::max(old_durable, progress.durable_sequence);
         const std::uint64_t applied =
             std::max(old_applied, progress.applied_sequence);
         const bool coherent =
-            durable <= accepted && applied <= accepted &&
-            HeaderCountsValidLocked();
+            applied <= accepted && HeaderCountsValidLocked();
         if (coherent) {
             Atomic(header_->accepted_sequence)
                 .store(accepted, std::memory_order_relaxed);
-            Atomic(header_->durable_sequence)
-                .store(durable, std::memory_order_relaxed);
             Atomic(header_->applied_sequence)
                 .store(applied, std::memory_order_relaxed);
         }
@@ -2729,7 +2716,7 @@ public:
             // rows can be release-published independently after the table
             // commit. Hold the global status writer only for the short
             // version bump; a full-capacity KLine generation must not stall
-            // concurrent durable/applied progress publishers.
+            // concurrent accepted/applied progress publishers.
             std::uint64_t status_stable = 0U;
             const bool status_locked = AcquireSeqcount(
                 &header_->status_publish_tag,
@@ -2967,8 +2954,6 @@ private:
                        .load(std::memory_order_relaxed)) &&
                RealtimeWireProcessingSequencesValidV2(
                    Atomic(header_->accepted_sequence)
-                       .load(std::memory_order_relaxed),
-                   Atomic(header_->durable_sequence)
                        .load(std::memory_order_relaxed),
                    Atomic(header_->applied_sequence)
                        .load(std::memory_order_relaxed));

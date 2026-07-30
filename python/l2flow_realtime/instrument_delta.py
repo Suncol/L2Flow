@@ -70,9 +70,9 @@ DELTA_CHECKPOINT_MISMATCH = 7
 DELTA_SELECTED_SOURCE_MASK = (1 << 1) | (1 << 3)
 
 _OPEN_SESSION_REQUEST = struct.Struct("<8sHHHHIIQQ")
-_OPEN_SESSION_RESPONSE_BYTES = 296
+_OPEN_SESSION_RESPONSE_BYTES = 288
 _OPEN_INSTRUMENT_PREFIX = struct.Struct("<8sHHHHIIQIIIIQ")
-_OPEN_INSTRUMENT_RESPONSE_BYTES = 776
+_OPEN_INSTRUMENT_RESPONSE_BYTES = 760
 _READ_REQUEST = struct.Struct("<8sHHHHIIQQQ")
 _READ_RESPONSE = struct.Struct("<8sHHHHIIQQQQQ")
 _METADATA_PREFIX = struct.Struct("<II")
@@ -159,20 +159,12 @@ class InstrumentTickDeltaGeneration:
         return self.endpoint.accepted_sequence
 
     @property
-    def durable_sequence(self) -> int:
-        return self.endpoint.durable_sequence
-
-    @property
     def applied_sequence(self) -> int:
         return self.endpoint.applied_sequence
 
     @property
     def processing_lag_records(self) -> int:
         return self.accepted_sequence - self.applied_sequence
-
-    @property
-    def durability_lag_records(self) -> int:
-        return self.accepted_sequence - self.durable_sequence
 
     @property
     def catalog_generation(self) -> int:
@@ -335,7 +327,7 @@ def _parse_checkpoint(
 def _parse_metadata(
     data: bytes | memoryview, offset: int = 0
 ) -> InstrumentTickDeltaMetadata:
-    if len(data) < offset + 736:
+    if len(data) < offset + 720:
         raise WireFormatError("tick delta metadata is truncated")
     base_value, selected_mask = _METADATA_PREFIX.unpack_from(data, offset)
     try:
@@ -344,7 +336,7 @@ def _parse_metadata(
         raise WireFormatError(
             "tick delta base kind is unsupported"
         ) from error
-    base_wire = bytes(data[offset + 8 : offset + 328])
+    base_wire = bytes(data[offset + 8 : offset + 320])
     if base_kind is InstrumentTickDeltaBaseKind.ORIGIN:
         if any(base_wire):
             raise WireFormatError(
@@ -353,8 +345,8 @@ def _parse_metadata(
         base_checkpoint = None
     else:
         base_checkpoint = _parse_checkpoint(data, offset + 8)
-    target = _parse_checkpoint(data, offset + 328)
-    tail = _METADATA_TAIL.unpack_from(data, offset + 648)
+    target = _parse_checkpoint(data, offset + 320)
+    tail = _METADATA_TAIL.unpack_from(data, offset + 632)
     source_counts = tuple(tail[:4])
     (
         record_count,
@@ -548,7 +540,7 @@ class InstrumentTickDeltaSession:
                 WIRE_MINOR,
                 DELTA_OPEN_INSTRUMENT_OPCODE,
                 0,
-                384,
+                376,
                 0,
                 open_id,
                 instrument_id,
@@ -1003,7 +995,7 @@ class InstrumentTickDeltaCursor:
                 raise WireFormatError(
                     "tick delta page is not canonical Wire V2"
                 )
-            if flags != 0 or any(mapped[824:DELTA_PAGE_HEADER_BYTES]):
+            if flags != 0 or any(mapped[808:DELTA_PAGE_HEADER_BYTES]):
                 raise WireFormatError(
                     "tick delta page flags/reserved bytes are nonzero"
                 )
@@ -1397,7 +1389,7 @@ def _open_instrument_tick_delta_session(
                     )
                 raise_status("tick delta OPEN_SESSION", status)
             endpoint = parse_generation_endpoint(packet.data, 32)
-            token = struct.unpack_from("<Q", packet.data, 288)[0]
+            token = struct.unpack_from("<Q", packet.data, 280)[0]
             if token == 0:
                 raise ProtocolError(
                     "delta session OPEN returned zero token"

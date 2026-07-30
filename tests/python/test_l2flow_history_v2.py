@@ -119,7 +119,6 @@ def _assert_endpoint_properties(
         "recv_monotonic_cut_ns",
         "history_published_monotonic_ns",
         "accepted_sequence",
-        "durable_sequence",
         "applied_sequence",
         "catalog_digest",
         "input_identity_sha256",
@@ -143,10 +142,6 @@ def _assert_endpoint_properties(
         generation.processing_lag_records,
         endpoint.accepted_sequence - endpoint.applied_sequence,
     )
-    case.assertEqual(
-        generation.durability_lag_records,
-        endpoint.accepted_sequence - endpoint.durable_sequence,
-    )
 
 
 def _endpoint() -> GenerationEndpoint:
@@ -161,7 +156,6 @@ def _endpoint() -> GenerationEndpoint:
         recv_monotonic_cut_ns=10_000,
         history_published_monotonic_ns=11_000,
         accepted_sequence=2,
-        durable_sequence=0,
         applied_sequence=2,
         catalog_digest=CATALOG_DIGEST,
         input_identity_sha256=INPUT_DIGEST,
@@ -285,7 +279,7 @@ def _history_page() -> bytes:
         1,
         2,
     )
-    header[104:440] = _history_generation_bytes()
+    header[104:432] = _history_generation_bytes()
     return bytes(header) + descriptors + tick_block
 
 
@@ -305,7 +299,7 @@ def _delta_metadata() -> bytes:
         struct.pack(
             "<II", 1, DELTA_SELECTED_SOURCE_MASK
         )
-        + b"\x00" * 320
+        + b"\x00" * 312
         + _target_checkpoint().to_wire()
         + _METADATA_TAIL.pack(
             0,
@@ -348,7 +342,7 @@ def _delta_page() -> bytes:
         1,
         2,
     )
-    header[88:824] = metadata
+    header[88:808] = metadata
     return bytes(header) + tick_block
 
 
@@ -452,7 +446,7 @@ def _history_server(channel: socket.socket, block_first_read=None) -> None:
         WIRE_MINOR,
         0,
         0,
-        376,
+        368,
         0,
         request_id,
         101,
@@ -518,7 +512,7 @@ def _delta_server(channel: socket.socket, block_first_read=None) -> None:
             WIRE_MINOR,
             0,
             0,
-            296,
+            288,
             0,
             request_id,
         )
@@ -526,10 +520,10 @@ def _delta_server(channel: socket.socket, block_first_read=None) -> None:
         + struct.pack("<Q", 201)
     )
 
-    request = channel.recv(384)
+    request = channel.recv(376)
     if not request:
         return
-    if len(request) != 384:
+    if len(request) != 376:
         raise RuntimeError("short delta instrument OPEN")
     request_id = struct.unpack_from("<Q", request, 24)[0]
     channel.send(
@@ -540,7 +534,7 @@ def _delta_server(channel: socket.socket, block_first_read=None) -> None:
             WIRE_MINOR,
             0,
             0,
-            776,
+            760,
             0,
             request_id,
             202,
@@ -610,7 +604,7 @@ def _history_read_server(channel: socket.socket, responder) -> None:
             WIRE_MINOR,
             0,
             0,
-            376,
+            368,
             0,
             open_id,
             101,
@@ -635,14 +629,14 @@ def _delta_read_server(channel: socket.socket, responder) -> None:
             WIRE_MINOR,
             0,
             0,
-            296,
+            288,
             0,
             open_id,
         )
         + pack_generation_endpoint(_endpoint())
         + struct.pack("<Q", 201)
     )
-    request = channel.recv(384)
+    request = channel.recv(376)
     if not request:
         return
     instrument_open_id = struct.unpack_from("<Q", request, 24)[0]
@@ -654,7 +648,7 @@ def _delta_read_server(channel: socket.socket, responder) -> None:
             WIRE_MINOR,
             0,
             0,
-            776,
+            760,
             0,
             instrument_open_id,
             202,
@@ -961,7 +955,6 @@ def _rolling_checkpoint(
         recv_monotonic_cut_ns=recv_monotonic_ns,
         history_published_monotonic_ns=published_monotonic_ns,
         accepted_sequence=record_count,
-        durable_sequence=max(0, record_count - 1),
         applied_sequence=record_count,
         source_sequence_exclusive=(
             1,
@@ -1959,14 +1952,14 @@ class ProtocolFailureTests(unittest.TestCase):
                     WIRE_MINOR,
                     0,
                     0,
-                    296,
+                    288,
                     0,
                     open_id,
                 )
                 + pack_generation_endpoint(_endpoint())
                 + struct.pack("<Q", 201)
             )
-            request = channel.recv(384)
+            request = channel.recv(376)
             instrument_open_id = struct.unpack_from(
                 "<Q", request, 24
             )[0]
@@ -1978,11 +1971,11 @@ class ProtocolFailureTests(unittest.TestCase):
                     WIRE_MINOR,
                     4,
                     0,
-                    776,
+                    760,
                     0,
                     instrument_open_id,
                 )
-                + b"\x00" * (776 - 32)
+                + b"\x00" * (760 - 32)
             )
 
         with _SocketPairServer(handler) as server, mock.patch(
@@ -2058,8 +2051,8 @@ class StrictPublicModelTests(unittest.TestCase):
     def test_generation_endpoint_rejects_invalid_unsigned_values(self):
         invalid = (
             ("session_epoch", -1),
-            ("durable_sequence", -1),
-            ("durable_sequence", True),
+            ("applied_sequence", -1),
+            ("applied_sequence", True),
             ("history_published_monotonic_ns", 1 << 64),
             ("capacity", 1 << 32),
             ("source_stream_ids", (11, 12, 13, 1 << 32)),
@@ -2095,7 +2088,7 @@ class StrictPublicModelTests(unittest.TestCase):
         checkpoint = _target_checkpoint()
         invalid = (
             ("session_epoch", -1),
-            ("durable_sequence", True),
+            ("applied_sequence", True),
             ("capacity", 1 << 32),
             ("instrument_id", -1),
             ("instrument_id", True),
@@ -2179,7 +2172,6 @@ class GenerationValidationTests(unittest.TestCase):
             ingress_sequence_exclusive=1,
             tick_stream_sequence_exclusive=1,
             accepted_sequence=0,
-            durable_sequence=0,
             applied_sequence=0,
             source_sequence_exclusive=(1, 1, 1, 1),
             available_count=0,
@@ -2188,7 +2180,7 @@ class GenerationValidationTests(unittest.TestCase):
             factor_eligible_count=0,
         )
         validate_generation_endpoint(endpoint)
-        self.assertEqual(len(pack_generation_endpoint(endpoint)), 256)
+        self.assertEqual(len(pack_generation_endpoint(endpoint)), 248)
 
     def test_catalog_generation_must_equal_bound_count(self):
         with self.assertRaises(WireFormatError):

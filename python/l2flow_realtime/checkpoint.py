@@ -22,7 +22,7 @@ from .models import (
 )
 
 
-CHECKPOINT_BYTES = 320
+CHECKPOINT_BYTES = 312
 TICK_RECORD_COVERAGE_COMPLETE = 1 << 0
 PAYLOAD_PROJECTION_CORE_V2 = 1
 
@@ -44,7 +44,6 @@ class InstrumentTickDeltaCheckpoint:
     recv_monotonic_cut_ns: int
     history_published_monotonic_ns: int
     accepted_sequence: int
-    durable_sequence: int
     applied_sequence: int
     catalog_digest: bytes
     input_identity_sha256: bytes
@@ -192,7 +191,6 @@ class InstrumentTickDeltaCheckpoint:
                 self.history_published_monotonic_ns
             ),
             accepted_sequence=self.accepted_sequence,
-            durable_sequence=self.durable_sequence,
             applied_sequence=self.applied_sequence,
             catalog_digest=self.catalog_digest,
             input_identity_sha256=self.input_identity_sha256,
@@ -287,7 +285,6 @@ class InstrumentTickDeltaCheckpoint:
             and self.data_state_generation
             >= base.data_state_generation
             and self.accepted_sequence >= base.accepted_sequence
-            and self.durable_sequence >= base.durable_sequence
             and self.applied_sequence >= base.applied_sequence
             and self.ingress_sequence_exclusive
             >= base.ingress_sequence_exclusive
@@ -374,7 +371,7 @@ class InstrumentTickDeltaCheckpoint:
                 )
             endpoint = parse_generation_endpoint(value, offset)
             fields = _CHECKPOINT_LOCAL.unpack_from(
-                value, offset + 256
+                value, offset + 248
             )
             instrument_id, ordinal = fields[:2]
             counts = tuple(fields[2:6])
@@ -435,7 +432,6 @@ class InstrumentTickDeltaCheckpoint:
                 endpoint.history_published_monotonic_ns
             ),
             accepted_sequence=endpoint.accepted_sequence,
-            durable_sequence=endpoint.durable_sequence,
             applied_sequence=endpoint.applied_sequence,
             catalog_digest=endpoint.catalog_digest,
             input_identity_sha256=endpoint.input_identity_sha256,

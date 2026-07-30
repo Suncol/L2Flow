@@ -713,8 +713,6 @@ void FillSummary(
            left.catalog_snapshot == right.catalog_snapshot &&
            left.processing_progress.accepted_sequence ==
                right.processing_progress.accepted_sequence &&
-           left.processing_progress.durable_sequence ==
-               right.processing_progress.durable_sequence &&
            left.processing_progress.applied_sequence ==
                right.processing_progress.applied_sequence &&
            same_sources &&

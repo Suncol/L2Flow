@@ -160,7 +160,7 @@ def _split_delta_page(
         tick_stream_sequence,
         tick_stream_sequence,
     )
-    header[88:824] = _delta_metadata()
+    header[88:808] = _delta_metadata()
     return bytes(header) + tick
 
 
@@ -177,14 +177,14 @@ def _split_delta_server(channel: socket.socket) -> None:
             WIRE_MINOR,
             0,
             0,
-            296,
+            288,
             0,
             request_id,
         )
         + pack_generation_endpoint(_endpoint())
         + struct.pack("<Q", 201)
     )
-    request = channel.recv(384)
+    request = channel.recv(376)
     if not request:
         return
     request_id = struct.unpack_from("<Q", request, 24)[0]
@@ -196,7 +196,7 @@ def _split_delta_server(channel: socket.socket) -> None:
             WIRE_MINOR,
             0,
             0,
-            776,
+            760,
             0,
             request_id,
             202,

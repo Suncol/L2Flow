@@ -299,7 +299,7 @@ PublishStoreGeneration(
     std::array<std::uint64_t,
                market::kRealtimeHistorySourceCountV1>
         source_sequence_exclusive,
-    std::uint64_t durable_sequence) {
+    std::uint64_t accepted_sequence) {
     std::shared_ptr<
         const market::ObservedInstrumentCatalogSnapshotV2>
         catalog_snapshot;
@@ -330,9 +330,8 @@ PublishStoreGeneration(
         ingress_sequence_exclusive - 1U;
     l2flow::realtime::ProcessingProgressV2 progress{};
     progress.applied_sequence = applied_sequence;
-    progress.durable_sequence =
-        std::max(durable_sequence, applied_sequence);
-    progress.accepted_sequence = progress.durable_sequence;
+    progress.accepted_sequence =
+        std::max(accepted_sequence, applied_sequence);
 
     market::RealtimeHistoryWatermarkV1 watermark{};
     test->Expect(
@@ -397,8 +396,6 @@ template <typename Value>
             left.catalog_snapshot, right.catalog_snapshot) ||
         left.processing_progress.accepted_sequence !=
             right.processing_progress.accepted_sequence ||
-        left.processing_progress.durable_sequence !=
-            right.processing_progress.durable_sequence ||
         left.processing_progress.applied_sequence !=
             right.processing_progress.applied_sequence ||
         left.input_identity_sha256 != right.input_identity_sha256) {
@@ -722,10 +719,8 @@ void CheckEligibilityCountsProjectionAndLifetime(TestContext* test) {
             first.generation->tick_available_count() == 1U &&
             first.generation->factor_eligible_count() == 1U &&
             first.generation->capture_accepted_sequence() == 10U &&
-            first.generation->capture_durable_sequence() == 10U &&
             first.generation->input_applied_sequence() == 6U &&
-            first.generation->processing_lag_records() == 4U &&
-            first.generation->durability_lag_records() == 0U,
+            first.generation->processing_lag_records() == 4U,
         "factor envelope exposes exact observed counts, identity, and "
         "processing lag");
     test->Expect(
@@ -817,8 +812,7 @@ void CheckEmptyBoundAndEmptyEligibleGenerations(TestContext* test) {
             empty.generation->available_count() == 0U &&
             empty.generation->factor_eligible_count() == 0U &&
             empty.generation->points().empty() &&
-            empty.generation->input_applied_sequence() == 0U &&
-            empty.generation->capture_durable_sequence() == 0U,
+            empty.generation->input_applied_sequence() == 0U,
         "an empty observed catalog is a legal factor generation");
 
     const std::uint32_t first = BindInstrument(

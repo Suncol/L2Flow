@@ -262,7 +262,7 @@ market::RealtimeHistoryWatermarkV1 MakeWatermark(
     const std::uint64_t applied_sequence =
         ingress_exclusive - 1U;
     const l2flow::realtime::ProcessingProgressV2 progress{
-        applied_sequence, applied_sequence, applied_sequence};
+        applied_sequence, applied_sequence};
     market::RealtimeHistoryWatermarkV1 watermark{};
     if (market::BuildRealtimeHistoryWatermarkV1(
             run_id,

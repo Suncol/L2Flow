@@ -25,7 +25,6 @@ MakeEndpoint(bool target) noexcept {
     endpoint.history_published_monotonic_ns =
         target ? 150U : 90U;
     endpoint.accepted_sequence = target ? 10U : 4U;
-    endpoint.durable_sequence = target ? 8U : 3U;
     endpoint.applied_sequence = target ? 10U : 4U;
     endpoint.catalog_digest[0U] = target ? 0x22U : 0x11U;
     endpoint.input_identity_sha256[0U] =
@@ -123,15 +122,15 @@ MakeOriginDelta() noexcept {
 }
 
 static_assert(
-    sizeof(ipc::RealtimeGenerationEndpointV2) == 256U);
+    sizeof(ipc::RealtimeGenerationEndpointV2) == 248U);
 static_assert(
-    sizeof(ipc::RealtimeHistoryGenerationInfoV2) == 336U);
+    sizeof(ipc::RealtimeHistoryGenerationInfoV2) == 328U);
 static_assert(
     sizeof(ipc::RealtimeHistoryPageHeaderV2) == 4096U);
 static_assert(
-    sizeof(ipc::RealtimeInstrumentTickDeltaCheckpointV2) == 320U);
+    sizeof(ipc::RealtimeInstrumentTickDeltaCheckpointV2) == 312U);
 static_assert(
-    sizeof(ipc::RealtimeInstrumentTickDeltaMetadataV2) == 736U);
+    sizeof(ipc::RealtimeInstrumentTickDeltaMetadataV2) == 720U);
 static_assert(
     sizeof(ipc::RealtimeInstrumentTickDeltaPageHeaderV2) == 4096U);
 static_assert(
@@ -224,11 +223,6 @@ static_assert([]() constexpr {
 }());
 static_assert([]() constexpr {
     auto endpoint = MakeEndpoint(true);
-    endpoint.durable_sequence = endpoint.accepted_sequence + 1U;
-    return !ipc::RealtimeGenerationEndpointCanonicalV2(endpoint);
-}());
-static_assert([]() constexpr {
-    auto endpoint = MakeEndpoint(true);
     endpoint.source_stream_ids[3U] =
         endpoint.source_stream_ids[1U];
     return !ipc::RealtimeGenerationEndpointCanonicalV2(endpoint);
@@ -307,13 +301,6 @@ static_assert([]() constexpr {
     auto metadata = MakeCheckpointDelta();
     metadata.base_checkpoint.generation.flags =
         ipc::kRealtimeGenerationRecordCoverageCompleteV2;
-    return !ipc::
-        RealtimeInstrumentTickDeltaMetadataCanonicalV2(metadata);
-}());
-static_assert([]() constexpr {
-    auto metadata = MakeCheckpointDelta();
-    metadata.base_checkpoint.generation.durable_sequence =
-        metadata.target_checkpoint.generation.durable_sequence + 1U;
     return !ipc::
         RealtimeInstrumentTickDeltaMetadataCanonicalV2(metadata);
 }());

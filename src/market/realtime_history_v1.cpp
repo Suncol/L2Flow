@@ -152,7 +152,6 @@ bool ComputeWatermarkIdentity(
             static_cast<std::uint64_t>(
                 catalog.factor_eligible_count())) ||
         !HashU64(&hasher, progress.accepted_sequence) ||
-        !HashU64(&hasher, progress.durable_sequence) ||
         !HashU64(&hasher, progress.applied_sequence)) {
         return false;
     }

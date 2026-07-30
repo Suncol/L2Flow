@@ -19,7 +19,8 @@ namespace l2flow::ipc {
 //
 // The shared_ptr is the exact History-owned generation handle and permits a
 // sink to retain its immutable Store arena while publishing reader-owned
-// resources. Implementations must not wait for Journal durability.
+// resources. Implementations must not introduce an additional ingress or
+// processing-watermark gate.
 class RealtimeStoreGenerationSinkV2 {
 public:
     virtual ~RealtimeStoreGenerationSinkV2() = default;

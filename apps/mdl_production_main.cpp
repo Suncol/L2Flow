@@ -30,7 +30,6 @@ namespace common = l2flow::common;
 namespace factor = l2flow::factor;
 namespace ipc = l2flow::ipc;
 namespace market = l2flow::market;
-namespace realtime = l2flow::realtime;
 namespace runtime = l2flow::runtime;
 
 static_assert(
@@ -132,7 +131,6 @@ IntervalWaitResult WaitForInterval(
 
 struct Options final {
     std::filesystem::path sdk_library;
-    std::filesystem::path journal_path;
     std::uint64_t session_epoch = 0U;
     std::uint32_t instrument_capacity = static_cast<std::uint32_t>(
         market::kObservedInstrumentDirectoryDefaultCapacityV2);
@@ -168,8 +166,6 @@ void PrintUsage(std::ostream& output) {
         << "Usage: mdl-production-router [required options] [optional]\n"
         << "Required:\n"
         << "  --sdk-library PATH            vendor .so selected by operator\n"
-        << "  --journal-path PATH           fresh mandatory journal path; "
-           "must not exist\n"
         << "  --session-epoch N             positive u64 session identity\n"
         << "  --trade-date YYYYMMDD         fixed UTC+08:00 trading date\n"
         << "  --server-address HOST:PORT    vendor endpoint\n"
@@ -349,7 +345,6 @@ bool ParseOptions(
         }
 
         if (option != "--sdk-library" &&
-            option != "--journal-path" &&
             option != "--session-epoch" &&
             option != "--instrument-capacity" &&
             option != "--trade-date" &&
@@ -383,8 +378,6 @@ bool ParseOptions(
         }
         if (option == "--sdk-library") {
             parsed.sdk_library = std::string(value);
-        } else if (option == "--journal-path") {
-            parsed.journal_path = std::string(value);
         } else if (option == "--session-epoch") {
             if (!ParseU64(value, &parsed.session_epoch) ||
                 parsed.session_epoch == 0U) {
@@ -535,7 +528,6 @@ bool ParseOptions(
     }
 
     if (parsed.sdk_library.empty() ||
-        parsed.journal_path.empty() ||
         parsed.session_epoch == 0U ||
         parsed.trade_date == 0U ||
         parsed.server_address.empty() ||
@@ -546,10 +538,6 @@ bool ParseOptions(
     }
     if (!parsed.ipc_socket.is_absolute()) {
         *error = "--ipc-socket must be an absolute path";
-        return false;
-    }
-    if (parsed.journal_path == parsed.ipc_socket) {
-        *error = "--journal-path and --ipc-socket must differ";
         return false;
     }
     if (!parsed.intraday_store_maximum_records_set ||
@@ -629,20 +617,12 @@ bool PublishKLineGeneration(
 void ReportFatalSnapshot(
     const runtime::RealtimePipelineSnapshotV1& snapshot) {
     std::cerr
-        << "mdl-production-router: pipeline failed: journal_failure="
-        << realtime::MandatoryJournalFailureKindNameV2(
-               snapshot.journal.failure_kind)
-        << " journal_errno=" << snapshot.journal.error_number
-        << " accepted_sequence="
+        << "mdl-production-router: pipeline failed: accepted_sequence="
         << snapshot.processing_progress.accepted_sequence
-        << " durable_sequence="
-        << snapshot.processing_progress.durable_sequence
         << " applied_sequence="
         << snapshot.processing_progress.applied_sequence
         << " processing_lag_records="
         << snapshot.processing_progress.processing_lag_records()
-        << " durability_lag_records="
-        << snapshot.processing_progress.durability_lag_records()
         << " last_decode_error="
         << static_cast<unsigned int>(snapshot.last_decode_error)
         << '\n';
@@ -717,7 +697,6 @@ int Run(const Options& options) {
         options.intraday_store_from_open;
     pipeline_config.kline.windows = kline_windows;
     pipeline_config.enforce_receive_trade_date = true;
-    pipeline_config.journal.path = options.journal_path.string();
     pipeline_config.sdk.enabled = true;
     pipeline_config.sdk.library_path = options.sdk_library;
     pipeline_config.sdk.server_address = options.server_address;
@@ -981,14 +960,10 @@ int Run(const Options& options) {
         << (final_kline == nullptr ? 0U : final_kline->bar_count())
         << " accepted_sequence="
         << final_snapshot.processing_progress.accepted_sequence
-        << " durable_sequence="
-        << final_snapshot.processing_progress.durable_sequence
         << " applied_sequence="
         << final_snapshot.processing_progress.applied_sequence
         << " processing_lag_records="
-        << final_snapshot.processing_progress.processing_lag_records()
-        << " durability_lag_records="
-        << final_snapshot.processing_progress.durability_lag_records();
+        << final_snapshot.processing_progress.processing_lag_records();
     if (catalog_snapshot_error ==
             market::ObservedInstrumentDirectoryErrorV2::kNone &&
         final_catalog != nullptr) {

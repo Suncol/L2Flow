@@ -26,8 +26,8 @@ namespace {
 
 namespace ipc = l2flow::ipc;
 
-static_assert(sizeof(l2flow_shm_session_info_v2) == 256U);
-static_assert(sizeof(l2flow_selection_envelope_v2) == 160U);
+static_assert(sizeof(l2flow_shm_session_info_v2) == 240U);
+static_assert(sizeof(l2flow_selection_envelope_v2) == 144U);
 static_assert(sizeof(l2flow_shm_health_v2) == 32U);
 
 constexpr std::uint32_t kCapacity = 4U;
@@ -296,7 +296,6 @@ public:
         header_->tick_available_count = 1U;
         header_->factor_eligible_count = 1U;
         header_->accepted_sequence = 100U;
-        header_->durable_sequence = 90U;
         header_->applied_sequence = 99U;
         header_->heartbeat_monotonic_ns = 777U;
         header_->tick_highest_published_sequence = 1U;
@@ -623,16 +622,14 @@ bool TestSessionAndPointStates() {
             session.tick_available_count == 1U &&
             session.factor_eligible_count == 1U &&
             session.accepted_sequence == 100U &&
-            session.durable_sequence == 90U &&
             session.applied_sequence == 99U &&
             session.processing_lag_records == 1U &&
-            session.durability_lag_records == 10U &&
             session.tick_ring_capacity == kRingCapacity &&
             session.tick_highest_published_sequence == 1U &&
             session.tick_contiguous_published_sequence == 1U &&
             session.kline_generation == 1U &&
             session.heartbeat_monotonic_ns == 777U,
-        "session reports independent processing and durability lags");
+        "session reports its exact processing lag");
     ok &= Expect(
         std::any_of(
             std::begin(session.layout_digest),
@@ -933,10 +930,8 @@ bool TestResolveRefreshAndSelections() {
             envelope.catalog_generation == 3U &&
             envelope.data_state_generation == 4U &&
             envelope.accepted_sequence == 100U &&
-            envelope.durable_sequence == 90U &&
             envelope.applied_sequence == 99U &&
-            envelope.processing_lag_records == 1U &&
-            envelope.durability_lag_records == 10U,
+            envelope.processing_lag_records == 1U,
         "BOUND selection returns ordinal IDs and one coherent envelope");
 
     selected.fill(99U);

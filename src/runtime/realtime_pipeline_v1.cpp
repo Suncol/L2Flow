@@ -16,6 +16,7 @@
 #include <semaphore>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -664,10 +665,8 @@ private:
     }
     std::size_t maximum = applied_window;
     constexpr std::size_t callback_owner = 1U;
-    const std::array<std::size_t, 4U> additions{
+    const std::array<std::size_t, 2U> additions{
         config.processing_queue_capacity,
-        config.journal.queue_capacity,
-        config.journal.max_batch_records,
         callback_owner};
     for (const std::size_t addition : additions) {
         if (addition >
@@ -717,8 +716,6 @@ std::string_view RealtimePipelineCreateErrorNameV1(
         case RealtimePipelineCreateErrorV1::
             kLatestReadModelCreateFailed:
             return "latest_read_model_create_failed";
-        case RealtimePipelineCreateErrorV1::kJournalCreateFailed:
-            return "journal_create_failed";
         case RealtimePipelineCreateErrorV1::kFactorCreateFailed:
             return "factor_create_failed";
         case RealtimePipelineCreateErrorV1::
@@ -768,8 +765,6 @@ std::string_view RealtimePipelineIngressErrorNameV1(
             return "owned_message_rejected";
         case RealtimePipelineIngressErrorV1::kForbiddenCombinedTick:
             return "forbidden_combined_tick";
-        case RealtimePipelineIngressErrorV1::kJournalAdmissionFailed:
-            return "journal_admission_failed";
         case RealtimePipelineIngressErrorV1::
             kProcessingAdmissionFailed:
             return "processing_admission_failed";
@@ -845,8 +840,11 @@ public:
         ProcessingQueue(const ProcessingQueue&) = delete;
         ProcessingQueue& operator=(const ProcessingQueue&) = delete;
 
+        template <typename Commit>
         [[nodiscard]] bool TryPush(
-            realtime::OwnedIngressMessageHandleV1 message) noexcept {
+            realtime::OwnedIngressMessageHandleV1 message,
+            Commit&& commit) noexcept {
+            static_assert(std::is_nothrow_invocable_v<Commit&>);
             if (!message) {
                 return false;
             }
@@ -862,6 +860,12 @@ public:
                 return false;
             }
             slots_[tail] = std::move(message);
+            // This is the admission linearization point. The slot is owned
+            // and no later operation can fail, but the consumer cannot see it
+            // until the release publication of tail below. The caller
+            // therefore commits accepted/capture state before any matching
+            // applied publication is possible.
+            std::forward<Commit>(commit)();
             tail_.store(next, std::memory_order_release);
             WakeConsumer();
             return true;
@@ -1194,37 +1198,6 @@ public:
         }
     }
 
-    static void ObserveDurableSequence(
-        void* context,
-        std::uint64_t durable_sequence) noexcept {
-        auto* const owner = static_cast<Impl*>(context);
-        if (owner != nullptr) {
-            std::uint64_t accepted =
-                owner->accepted_sequence_.load(
-                    std::memory_order_acquire);
-            while (accepted < durable_sequence &&
-                   !owner->accepted_sequence_.compare_exchange_weak(
-                       accepted,
-                       durable_sequence,
-                       std::memory_order_release,
-                       std::memory_order_acquire)) {
-            }
-            owner->durable_sequence_.store(
-                durable_sequence, std::memory_order_release);
-            owner->RequestProgressPublication();
-        }
-    }
-
-    static void ObserveJournalFailure(
-        void* context,
-        realtime::MandatoryJournalFailureKindV2,
-        int) noexcept {
-        auto* const owner = static_cast<Impl*>(context);
-        if (owner != nullptr) {
-            owner->MarkAsyncFatal();
-        }
-    }
-
     static bool ObserveAppliedSequence(
         void* context,
         std::uint64_t ingress_sequence) noexcept {
@@ -1264,11 +1237,9 @@ public:
                 config_.maximum_sdk_message_bytes,
                 kIngressPrewarmMessageBytes);
             // Reserve the complete bounded in-flight window before SDK
-            // Connect. Journal and processing can advance at different rates,
-            // so their retained sequence ranges need not overlap: limiting
-            // this reservation to the two ingress rings would reintroduce
-            // allocator entry and first-touch faults in the callback once
-            // decoder/applied backlog grows past that smaller hot set. A
+            // Connect. It covers the processing ring plus the independently
+            // bounded decoder/applied completion window, preventing allocator
+            // entry and first-touch faults in the callback as backlog grows. A
             // <=4096-byte wire message occupies at most the 8192-byte size
             // class; the byte cap keeps unusually large configured windows
             // from turning startup into an unbounded eager allocation.
@@ -1422,31 +1393,6 @@ public:
                     kProgressThreadStartFailed;
             }
 
-            config_.journal.durable = &ObserveDurableSequence;
-            config_.journal.durable_context = this;
-            config_.journal.failure = &ObserveJournalFailure;
-            config_.journal.failure_context = this;
-            config_.journal.maximum_message_bytes =
-                config_.maximum_sdk_message_bytes;
-            int journal_errno = 0;
-            const realtime::MandatoryJournalCreateErrorV2 journal_error =
-                realtime::MandatoryJournalV2::Create(
-                    config_.journal,
-                    &journal_,
-                    &journal_errno);
-            if (journal_error !=
-                    realtime::MandatoryJournalCreateErrorV2::kNone ||
-                journal_ == nullptr) {
-                SetDetail(
-                    detail,
-                    "mandatory Journal create failed: " +
-                        std::string(
-                            realtime::MandatoryJournalCreateErrorNameV2(
-                                journal_error)) +
-                        " errno=" + std::to_string(journal_errno));
-                return RealtimePipelineCreateErrorV1::
-                    kJournalCreateFailed;
-            }
             const RealtimePipelineCreateErrorV1 sdk_error =
                 StartSdk(factory_is_test_override, detail);
             if (sdk_error != RealtimePipelineCreateErrorV1::kNone) {
@@ -1647,50 +1593,38 @@ public:
             return result;
         }
 
-        // The payload is copied exactly once into the pool. Journal and
-        // realtime processing retain separate intrusive references to those
-        // same immutable bytes.
-        realtime::OwnedIngressMessageHandleV1 processing_message = owned;
-        result.journal_result =
-            journal_->TryAppend(std::move(owned));
-        if (result.journal_result !=
-            realtime::MandatoryJournalAppendResultV2::kAccepted) {
-            result.error =
-                RealtimePipelineIngressErrorV1::
-                    kJournalAdmissionFailed;
-            ReportPipelineFailure(
-                "mandatory_journal_admission",
-                source_slot,
-                metadata.global_ingress_sequence,
-                static_cast<std::uint64_t>(
-                    result.journal_result));
-            ++rejected_messages_;
-            TripFatalWithAdmissionLockHeld();
-            return result;
-        }
-
-        // Journal admission cannot be rolled back. Publish the accepted
-        // capture prefix before the writer can report an equal durable
-        // prefix, then commit the serialized source counters.
-        accepted_sequence_.store(
-            metadata.global_ingress_sequence,
-            std::memory_order_release);
-        global_ingress_sequence_ = metadata.global_ingress_sequence;
-        source_sequences_[source_slot] = metadata.source_sequence;
-        if (mixed_tick_source) {
-            tick_stream_sequence_ = metadata.tick_stream_sequence;
-        }
-        result.global_ingress_sequence = metadata.global_ingress_sequence;
-        result.source_sequence = metadata.source_sequence;
-        result.tick_stream_sequence = metadata.tick_stream_sequence;
-        ++accepted_messages_;
-
-        // Journal must accept first. Processing admission remains
-        // allocation-free and nonblocking; failure is terminal because the
-        // already-journaled sequence cannot be skipped or reordered.
+        // The payload is copied exactly once into the pool and its sole
+        // callback-owned handle is transferred to the ordered processing
+        // ring. The commit runs after an empty slot is secured but before the
+        // ring tail is release-published. It is therefore the irreversible
+        // admission point, and no consumer can apply this sequence before the
+        // accepted frontier below becomes visible.
         if (processing_queue_ == nullptr ||
             !processing_queue_->TryPush(
-                std::move(processing_message))) {
+                std::move(owned),
+                [this,
+                 &result,
+                 &metadata,
+                 source_slot,
+                 mixed_tick_source]() noexcept {
+                    global_ingress_sequence_ =
+                        metadata.global_ingress_sequence;
+                    source_sequences_[source_slot] =
+                        metadata.source_sequence;
+                    if (mixed_tick_source) {
+                        tick_stream_sequence_ =
+                            metadata.tick_stream_sequence;
+                    }
+                    result.global_ingress_sequence =
+                        metadata.global_ingress_sequence;
+                    result.source_sequence = metadata.source_sequence;
+                    result.tick_stream_sequence =
+                        metadata.tick_stream_sequence;
+                    ++accepted_messages_;
+                    accepted_sequence_.store(
+                        metadata.global_ingress_sequence,
+                        std::memory_order_release);
+                })) {
             result.error =
                 RealtimePipelineIngressErrorV1::
                     kProcessingAdmissionFailed;
@@ -1703,11 +1637,12 @@ public:
             TripFatalWithAdmissionLockHeld();
             return result;
         }
+        RequestProgressPublication();
 
         // Successful admission is complete only after the serialized callback
         // authority has been released.  The completion clocks below therefore
-        // include owned-copy, both in-memory queue enqueues, and the admission
-        // critical section, but no Journal write or fdatasync.
+        // include the owned copy, the ordered queue commit, and the admission
+        // critical section.
         admission.unlock();
         if (latency_collector_ != nullptr) {
             std::uint64_t success_monotonic_ns = 0U;
@@ -1784,10 +1719,9 @@ public:
                 }
             }
 
-            // Shutdown is the callback-quiescence boundary. Every callback
-            // admitted before it owns a Journal sequence and either has an
-            // in-memory processing entry or has already failed the session
-            // closed; later callbacks are outside the accepted prefix.
+            // Shutdown is the callback-quiescence boundary. Every accepted
+            // callback already owns an ordered in-memory processing entry;
+            // later callbacks are outside the accepted prefix.
             StopSdk();
             if (result.error == RealtimePipelineCutErrorV1::kNone) {
                 result = CutWithLock(timeout, true, terminal_cut_ns);
@@ -1910,16 +1844,10 @@ public:
                 TripFatal();
                 return result;
             }
-            const std::uint64_t durable_at_generation =
-                std::min(
-                    durable_sequence_.load(std::memory_order_acquire),
-                    cut_sequence);
             // This immutable generation describes the exact accepted/applied
-            // prefix isolated by the processing barrier. Journal durability
-            // is sampled independently and capped to that prefix.
+            // prefix isolated by the processing barrier.
             const realtime::ProcessingProgressV2 progress{
                 cut_sequence,
-                durable_at_generation,
                 cut_sequence};
             market::RealtimeHistoryWatermarkV1 watermark{};
             result.watermark_error =
@@ -1967,7 +1895,7 @@ public:
             // Ordered in-memory processing is still paused immediately after
             // the cut. Each source marker therefore follows all cut records
             // and precedes every post-cut record without blocking SDK
-            // callbacks or the independent Journal writer.
+            // callbacks.
             for (std::uint8_t source = 0U;
                  source < market::kRealtimeHistorySourceCountV1;
                  ++source) {
@@ -2132,11 +2060,6 @@ public:
         if (ingress_pool_ != nullptr) {
             result.ingress_pool = ingress_pool_->Snapshot();
         }
-        if (journal_ != nullptr) {
-            result.journal = journal_->Snapshot();
-        }
-        result.processing_progress.durable_sequence =
-            durable_sequence_.load(std::memory_order_acquire);
         result.processing_progress.applied_sequence =
             applied_sequence_.load(std::memory_order_acquire);
         // Read downstream publications first. Their release chains originate
@@ -2149,8 +2072,7 @@ public:
         }
         result.accepting = accepting_.load(std::memory_order_acquire);
         result.fatal = fatal_.load(std::memory_order_acquire) ||
-                       (history_ != nullptr && history_->fatal()) ||
-                       result.journal.failed();
+                       (history_ != nullptr && history_->fatal());
         result.stopped = stopped_.load(std::memory_order_acquire);
         result.trade_date_boundary_reached =
             trade_date_boundary_reached_.load(std::memory_order_acquire);
@@ -2166,8 +2088,7 @@ public:
 
     [[nodiscard]] bool fatal() const noexcept {
         return fatal_.load(std::memory_order_acquire) ||
-               (history_ != nullptr && history_->fatal()) ||
-               (journal_ != nullptr && journal_->Snapshot().failed());
+               (history_ != nullptr && history_->fatal());
     }
 
     void StopAndDrain() noexcept {
@@ -2188,9 +2109,6 @@ public:
 private:
     void FinishStop() noexcept {
         RequestProcessingStop();
-        if (journal_ != nullptr) {
-            journal_->StopAndDrain();
-        }
         JoinProcessingThread();
         RequestDecoderStop();
         JoinDecoderThreads();
@@ -2343,7 +2261,10 @@ private:
 
     [[nodiscard]] bool CompleteAppliedSequence(
         std::uint64_t ingress_sequence) noexcept {
-        if (applied_tracker_ == nullptr ||
+        const std::uint64_t accepted =
+            accepted_sequence_.load(std::memory_order_acquire);
+        if (ingress_sequence == 0U || ingress_sequence > accepted ||
+            applied_tracker_ == nullptr ||
             applied_tracker_->MarkCompleted(ingress_sequence) !=
                 realtime::ContiguousSequenceMarkErrorV2::kNone) {
             MarkAsyncFatal();
@@ -2351,6 +2272,10 @@ private:
         }
         const std::uint64_t completed =
             applied_tracker_->contiguous_sequence();
+        if (completed > accepted) {
+            MarkAsyncFatal();
+            return false;
+        }
         std::uint64_t published =
             applied_sequence_.load(std::memory_order_acquire);
         while (published < completed &&
@@ -2482,11 +2407,9 @@ private:
             return true;
         }
         realtime::ProcessingProgressV2 progress{};
-        progress.durable_sequence =
-            durable_sequence_.load(std::memory_order_acquire);
         progress.applied_sequence =
             applied_sequence_.load(std::memory_order_acquire);
-        // Both downstream release chains begin after accepted publication.
+        // The downstream release chain begins after accepted publication.
         // Reading accepted last prevents a concurrent completion from
         // creating a transient downstream>accepted sample.
         progress.accepted_sequence =
@@ -2541,9 +2464,6 @@ private:
         bool factory_is_test_override) const noexcept {
         std::size_t applied_window = 0U;
         std::size_t maximum_inflight_messages = 0U;
-        const bool before_sync_hook_is_paired =
-            (config_.journal.before_sync_for_test == nullptr) ==
-            (config_.journal.before_sync_context_for_test == nullptr);
         if (config_.directory == nullptr ||
             config_.directory->capacity() == 0U ||
             config_.directory->session_epoch() == 0U ||
@@ -2569,19 +2489,6 @@ private:
             config_.intraday_store.maximum_records_per_batch == 0U ||
             config_.intraday_store.maximum_records_per_batch >
                 market::kIntradayInstrumentStoreMaximumBatchRecordsV1 ||
-            config_.journal.path.empty() ||
-            config_.journal.path.find('\0') != std::string::npos ||
-            config_.journal.queue_capacity == 0U ||
-            config_.journal.max_batch_records == 0U ||
-            config_.journal.max_batch_records >
-                config_.journal.queue_capacity ||
-            config_.journal.max_batch_delay <=
-                std::chrono::microseconds::zero() ||
-            config_.journal.durable != nullptr ||
-            config_.journal.durable_context != nullptr ||
-            config_.journal.failure != nullptr ||
-            config_.journal.failure_context != nullptr ||
-            !before_sync_hook_is_paired ||
             !BoundedAppliedWindowCapacity(
                 config_, &applied_window) ||
             !BoundedIngressPoolCapacity(
@@ -2611,9 +2518,6 @@ private:
         }
         if (!config_.sdk.enabled) {
             return !factory_is_test_override && sdk_factory_ == nullptr;
-        }
-        if (config_.journal.before_sync_for_test != nullptr) {
-            return false;
         }
         if (factory_is_test_override) {
             if (sdk_factory_ == nullptr) {
@@ -2708,7 +2612,7 @@ private:
                     publication_deadline);
             if (woke) {
                 // Keep wake_pending set through the rest of this interval.
-                // accepted/applied/durable can advance on every record, but
+                // accepted/applied can advance on every record, but
                 // the IPC status tuple needs only a bounded-delay aggregate.
                 // This prevents the progress writer from repeatedly
                 // contending with early-session binding and first-availability
@@ -2732,16 +2636,12 @@ private:
                     std::memory_order_acquire);
 
             realtime::ProcessingProgressV2 current{};
-            current.durable_sequence =
-                durable_sequence_.load(std::memory_order_acquire);
             current.applied_sequence =
                 applied_sequence_.load(std::memory_order_acquire);
             current.accepted_sequence =
                 accepted_sequence_.load(std::memory_order_acquire);
             if (current.accepted_sequence !=
                     last_published.accepted_sequence ||
-                current.durable_sequence !=
-                    last_published.durable_sequence ||
                 current.applied_sequence !=
                     last_published.applied_sequence) {
                 if (!PublishProcessingProgressNow()) {
@@ -3117,7 +3017,7 @@ private:
 
     RealtimePipelineConfigV1 config_{};
     // Declared before every possible handle owner so pool state is retired
-    // only after decoder rings and the mandatory Journal have released their
+    // only after the processing and decoder rings have released their
     // handles.
     std::unique_ptr<realtime::OwnedIngressMessagePoolV1> ingress_pool_;
     std::unique_ptr<StageLatencyCollector> latency_collector_;
@@ -3138,9 +3038,7 @@ private:
     std::unique_ptr<realtime::ContiguousSequenceTrackerV2>
         applied_tracker_;
     std::size_t applied_window_capacity_ = 0U;
-    std::unique_ptr<realtime::MandatoryJournalV2> journal_;
     std::atomic<std::uint64_t> accepted_sequence_{0U};
-    std::atomic<std::uint64_t> durable_sequence_{0U};
     std::atomic<std::uint64_t> applied_sequence_{0U};
     std::mutex applied_progress_mutex_;
     std::condition_variable applied_progress_cv_;

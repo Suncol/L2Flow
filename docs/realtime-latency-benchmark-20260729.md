@@ -1,5 +1,11 @@
 # Realtime Latency Benchmark — 2026-07-29
 
+> Historical scope: these measurements were collected from commit `3a6e5c5`,
+> before the current queue-only ingress replacement. They remain useful as a
+> point-read and fixed-ordinal baseline, but they are not current
+> callback-to-Python measurements. The current implementation must be
+> benchmark-confirmed separately.
+
 ## Result
 
 The observed-universe runtime was measured with 60,000 bound and
@@ -59,8 +65,11 @@ capture_sequence 1 ... 60000
 ```
 
 Messages are admitted in batches of 512. Between setup batches the driver
-waits for both the applied and durable dense prefixes. This avoids
+waits for the offered prefix to settle before continuing. This avoids
 intentionally overflowing a bounded queue while building the working set.
+The historical runner also waited for a now-removed background-persistence
+signal between batches. That signal was outside the timed point-read regions;
+the current replacement benchmark must wait only for `applied_sequence`.
 Before measuring reads, the benchmark requires:
 
 ```text
@@ -74,7 +83,6 @@ factor_eligible_count       = 60000
 
 accepted_sequence           = 60000
 applied_sequence            = 60000
-durable_sequence            = 60000
 ```
 
 It also reads IDs 1 and 60000 through the C Reader and verifies that their
@@ -89,15 +97,13 @@ The full test sequence is:
 82001 ... 85000   open-loop burst
 ```
 
-The terminal assertion requires
-`accepted_sequence == applied_sequence == durable_sequence == 85000`.
+The terminal data-path assertion requires
+`accepted_sequence == applied_sequence == 85000`.
 
 The mapping is 343,937,024 bytes, the 60,000 keys consume 600,000 bytes of the
 key arena, and GNU `time -v` reported a maximum resident set of 970,752 KiB in
-each pinned run. Working-set construction converged to the durable prefix in
-5.44-6.13 seconds. After the final setup callback, the complete applied prefix
-became visible in 0.861-1.093 milliseconds and durable in
-10.946-11.309 milliseconds.
+each pinned run. After the final setup callback, the complete applied prefix
+became visible in 0.861-1.093 milliseconds.
 
 ## Measurement definitions
 
@@ -143,10 +149,12 @@ The payload's internal receive timestamp is reported separately and is about
 0.5 microseconds later in the production-default, stage-disabled path.
 
 There are 1,000 warmup and 10,000 measured samples for both C and Python.
-Every 512 samples, and at each phase tail, the driver waits for durability
-only after the current consumer has seen the value and its latency has been
-recorded. That pacing barrier is between samples. It is not a Reader gate and
-does not enter any sample's callback-to-consumer duration.
+Every 512 samples, and at each phase tail, the driver waits for the applied
+prefix only after the current consumer has seen the value and its latency has
+been recorded. That pacing barrier is between samples. It is not a Reader
+gate and does not enter any sample's callback-to-consumer duration.
+The historical runner additionally waited for its retired persistence signal
+at these boundaries. Current runs must not recreate that path.
 
 Production-default stage instrumentation is disabled in the primary mode.
 The test-only timed IPC sink still places clock observations around
@@ -155,10 +163,10 @@ return is a completion upper bound, not the exact release instruction.
 
 ### Open-loop burst
 
-The final 3,000 callbacks have no per-record acknowledgement or durability
-barrier. This is within the default 4,096 queue capacity. Since latest is a
-one-slot projection, Python is not expected to observe every intermediate
-sequence. The benchmark reports:
+The final 3,000 callbacks have no per-record acknowledgement or applied-prefix
+barrier. This is within the default 4,096 processing-queue capacity. Since
+latest is a one-slot projection, Python is not expected to observe every
+intermediate sequence. The benchmark reports:
 
 - how many sequence values survived long enough to be observed;
 - how many were overwritten between reads;
@@ -225,42 +233,13 @@ The three producer rates were 197k, 218k, and 214k callbacks/second. Python
 observed 2,415-2,602 of the 3,000 latest values and skipped 398-585
 intermediate sequence values. The median run observed 2,526 values (84.2%).
 This is legal latest-slot overwrite, not Pipeline loss: the final assertions
-still require every sequence through 85,000 to be applied and durable.
+still require every sequence through 85,000 to be applied.
 
 Per-record callback-to-IPC return latency under this overload had run-level
 median p50/p95/p99 values of 17.466/28.974/29.534 milliseconds. Successful
 Python reads of new survivor values still took about 15-16 microseconds; the
 millisecond age came from processing backlog created by a roughly
 200k-record/second producer, not from catalog lookup.
-
-## Mandatory Journal queue stress finding
-
-An earlier unpaced 10,000-sample sustained C closed loop used the default
-4,096 Journal
-queue without the between-window durability barriers. On this host it failed
-closed at capture sequence 68,898:
-
-```text
-first fatal reason = mandatory_journal_admission
-detail             = 3
-detail meaning     = MandatoryJournalAppendResultV2::kQueueFull
-```
-
-The failure occurred after 8,898 post-fill callbacks had been offered while
-real processing was ahead of `fdatasync`. In that run, the observation
-demonstrated both intended properties:
-
-1. realtime visibility does not wait for durability; and
-2. mandatory admission is bounded and never silently drops on overflow.
-
-It also means the default 4,096 Journal queue cannot absorb that particular
-uninterrupted synthetic burst on this storage. Queue sizing must cover the
-deployment's maximum arrival-minus-durability backlog. This benchmark does
-not establish the required production size because it does not reproduce the
-real feed rate, storage device, batching schedule, or callback distribution.
-The final latency runs retain the default queue and use explicit 512-record
-measurement windows; the separate 3,000-record open-loop test remains
-unpaced.
 
 ## Interpretation and limits
 
@@ -282,9 +261,9 @@ The approximately 21-microsecond difference between the two run-level p50
 statistics is consistent with a roughly 15-microsecond public read plus
 polling alignment and process scheduling. It is not a paired measurement of
 IPC-return-to-Python-return latency: the slot may become visible before
-`PublishApplied` returns. The realtime path does not synchronously wait on
-Journal I/O; background Journal work can still contribute indirect CPU,
-cache, or storage contention.
+`PublishApplied` returns. Because this historical run included background work
+that the current queue-only ingress no longer performs, its callback
+distribution must not be presented as the current implementation's result.
 
 The benchmark deliberately matches the requested fresh early-session case.
 It does not test crash recovery, replay, checkpoints, rollover, capacity
@@ -295,7 +274,6 @@ The fake SDK installs and invokes the real production handler and exercises:
 ```text
 OnMessage
 -> owned ingress copy
--> mandatory Journal admission
 -> ordered processing
 -> dynamic BindOrGet
 -> decoder

@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -19,8 +18,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
-#include <stdlib.h>
 
 namespace {
 
@@ -421,41 +418,8 @@ private:
     std::vector<std::byte> body_;
 };
 
-class TemporaryDirectory final {
-public:
-    TemporaryDirectory() {
-        std::array<char, 64U> pattern{};
-        constexpr char literal[] =
-            "/tmp/l2flow-pipeline-lifecycle-v2-XXXXXX";
-        static_assert(sizeof(literal) <= pattern.size());
-        std::memcpy(pattern.data(), literal, sizeof(literal));
-        char* const created = ::mkdtemp(pattern.data());
-        if (created != nullptr) {
-            path_ = created;
-        }
-    }
-
-    ~TemporaryDirectory() {
-        if (!path_.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove_all(path_, ignored);
-        }
-    }
-
-    TemporaryDirectory(const TemporaryDirectory&) = delete;
-    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
-
-    [[nodiscard]] const std::filesystem::path& path() const noexcept {
-        return path_;
-    }
-
-private:
-    std::filesystem::path path_;
-};
-
 runtime::RealtimePipelineConfigV1 MakeConfig(
-    market::ObservedInstrumentDirectoryV2* directory,
-    const std::filesystem::path& journal_path) {
+    market::ObservedInstrumentDirectoryV2* directory) {
     runtime::RealtimePipelineConfigV1 config{};
     config.run_id[0U] = std::byte{0x51U};
     config.run_id[15U] = std::byte{0xa7U};
@@ -477,10 +441,6 @@ runtime::RealtimePipelineConfigV1 MakeConfig(
         market::KLineWindowSpecV1{
             1U, market::kKLineNanosecondsPerSecondV1});
     config.enforce_receive_trade_date = false;
-    config.journal.path = journal_path.string();
-    config.journal.queue_capacity = 16U;
-    config.journal.max_batch_records = 4U;
-    config.journal.max_batch_delay = 50us;
     config.sdk.enabled = true;
     config.sdk.server_address = "127.0.0.1:9112";
     config.sdk.user_name = "lifecycle-test";
@@ -526,17 +486,15 @@ int main() {
                 oversized == nullptr,
             "prewarm rejects an eager reservation above its byte cap");
     }
-    TemporaryDirectory temporary;
     std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
     test.Expect(
-        !temporary.path().empty() &&
-            market::ObservedInstrumentDirectoryV2::Create(
+        market::ObservedInstrumentDirectoryV2::Create(
                 market::ObservedInstrumentDirectoryConfigV2{8U, 171U},
                 &directory) ==
                 market::ObservedInstrumentDirectoryErrorV2::kNone &&
             directory != nullptr,
-        "observed directory and Journal directory creation");
-    if (directory == nullptr || temporary.path().empty()) {
+        "observed directory creation");
+    if (directory == nullptr) {
         return 1;
     }
 
@@ -545,9 +503,7 @@ int main() {
     std::string detail;
     test.Expect(
         runtime::RealtimePipelineV1::CreateForTest(
-            MakeConfig(
-                directory.get(),
-                temporary.path() / "capture.journal"),
+            MakeConfig(directory.get()),
             std::make_shared<RecordingFactory>(state),
             &pipeline,
             &detail) == runtime::RealtimePipelineCreateErrorV1::kNone &&

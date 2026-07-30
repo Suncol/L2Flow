@@ -87,85 +87,22 @@ common::Identity128 RunId(std::uint8_t first) {
     return result;
 }
 
-class JournalSyncBlocker final {
+class PipelineCleanup final {
 public:
-    ~JournalSyncBlocker() { Release(); }
-
-    JournalSyncBlocker(const JournalSyncBlocker&) = delete;
-    JournalSyncBlocker& operator=(const JournalSyncBlocker&) = delete;
-    JournalSyncBlocker() = default;
-
-    static void BeforeSync(void* context) noexcept {
-        auto* const blocker =
-            static_cast<JournalSyncBlocker*>(context);
-        if (blocker == nullptr) {
-            return;
-        }
-        try {
-            std::unique_lock<std::mutex> lock(blocker->mutex_);
-            blocker->entered_ = true;
-            blocker->condition_.notify_all();
-            blocker->condition_.wait(lock, [blocker] {
-                return blocker->released_;
-            });
-        } catch (...) {
-            blocker->Release();
-        }
-    }
-
-    [[nodiscard]] bool WaitUntilEntered(
-        std::chrono::nanoseconds timeout) {
-        try {
-            std::unique_lock<std::mutex> lock(mutex_);
-            return condition_.wait_for(lock, timeout, [this] {
-                return entered_;
-            });
-        } catch (...) {
-            return false;
-        }
-    }
-
-    void Release() noexcept {
-        try {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                released_ = true;
-            }
-            condition_.notify_all();
-        } catch (...) {
-            condition_.notify_all();
-        }
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    bool entered_ = false;
-    bool released_ = false;
-};
-
-class PipelineJournalCleanup final {
-public:
-    PipelineJournalCleanup(
-        JournalSyncBlocker* blocker,
+    explicit PipelineCleanup(
         std::unique_ptr<runtime::RealtimePipelineV1>* pipeline)
-        : blocker_(blocker), pipeline_(pipeline) {}
+        : pipeline_(pipeline) {}
 
-    PipelineJournalCleanup(const PipelineJournalCleanup&) = delete;
-    PipelineJournalCleanup& operator=(
-        const PipelineJournalCleanup&) = delete;
+    PipelineCleanup(const PipelineCleanup&) = delete;
+    PipelineCleanup& operator=(const PipelineCleanup&) = delete;
 
-    ~PipelineJournalCleanup() {
-        if (blocker_ != nullptr) {
-            blocker_->Release();
-        }
+    ~PipelineCleanup() {
         if (pipeline_ != nullptr && *pipeline_ != nullptr) {
             (*pipeline_)->StopAndDrain();
         }
     }
 
 private:
-    JournalSyncBlocker* blocker_ = nullptr;
     std::unique_ptr<runtime::RealtimePipelineV1>* pipeline_ = nullptr;
 };
 
@@ -2556,7 +2493,7 @@ bool TestServiceEndToEnd() {
             4U,
             50'000U,
             catalog,
-            realtime::ProcessingProgressV2{3U, 3U, 3U},
+            realtime::ProcessingProgressV2{3U, 3U},
             sources,
             &watermark) ==
             market::RealtimeHistoryWatermarkErrorV1::kNone,
@@ -2603,8 +2540,8 @@ bool TestServiceEndToEnd() {
         socket_path, 2U, 3U, true);
 
     ok &= Expect(
-        service->PublishProcessingProgress({10U, 7U, 9U}) &&
-            service->PublishProcessingProgress({9U, 8U, 7U}),
+        service->PublishProcessingProgress({10U, 9U}) &&
+            service->PublishProcessingProgress({9U, 7U}),
         "progress publication merges concurrent-stale pairs monotonically");
     ok &= Expect(
         l2flow_shm_reader_session_v2(
@@ -2616,10 +2553,8 @@ bool TestServiceEndToEnd() {
             session.tick_available_count == 1U &&
             session.factor_eligible_count == 1U &&
             session.accepted_sequence == 10U &&
-            session.durable_sequence == 8U &&
             session.applied_sequence == 9U &&
             session.processing_lag_records == 1U &&
-            session.durability_lag_records == 2U &&
             session.kline_generation == 2U &&
             service->key_arena_used_bytes() ==
                 used_after_binding,
@@ -2634,8 +2569,6 @@ bool TestServiceEndToEnd() {
             session.tick_available_count <=
                 session.available_count &&
             session.applied_sequence <=
-                session.accepted_sequence &&
-            session.durable_sequence <=
                 session.accepted_sequence,
         "wire count and processing inequalities hold");
 
@@ -2736,7 +2669,7 @@ bool TestServiceEndToEnd() {
         }),
         "DRAINING tick reaches latest and contiguous ring");
     ok &= Expect(
-        service->PublishProcessingProgress({12U, 11U, 12U}),
+        service->PublishProcessingProgress({12U, 12U}),
         "DRAINING accepts progress publication");
     ok &= Expect(
         l2flow_shm_reader_session_v2(
@@ -2756,7 +2689,6 @@ bool TestServiceEndToEnd() {
             session.tick_available_count == 1U &&
             session.factor_eligible_count == 1U &&
             session.accepted_sequence == 12U &&
-            session.durable_sequence == 11U &&
             session.applied_sequence == 12U,
         "repeated existing-ID traffic leaves catalog/key/counts unchanged");
 
@@ -2778,20 +2710,18 @@ bool TestServiceEndToEnd() {
     return ok && !service->failed();
 }
 
-bool TestBlockedJournalDoesNotGateWireLatest() {
+bool TestProcessingAdmissionPublishesWireLatest() {
     ScopedTempDirectory temporary;
     auto directory = MakeDirectory(4U, 33U);
     if (!Expect(
             temporary.valid() && directory != nullptr,
-            "create async-Journal integration fixture")) {
+            "create processing-to-Wire integration fixture")) {
         return false;
     }
 
     const common::Identity128 run_id = RunId(0x33U);
     const std::filesystem::path socket_path =
-        temporary.path() / "async-journal.sock";
-    const std::filesystem::path journal_path =
-        temporary.path() / "async-capture.journal";
+        temporary.path() / "processing-latest.sock";
 
     ipc::RealtimeSharedServiceConfigV2 service_config{};
     service_config.run_id = run_id;
@@ -2813,7 +2743,7 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
         service_error ==
                 ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
             service != nullptr && system_error == 0,
-        "create async-Journal Wire V2 service");
+        "create processing-to-Wire V2 service");
     if (!ok) {
         std::cerr
             << "create error="
@@ -2824,7 +2754,7 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
     }
     ok &= Expect(
         service->Start(&system_error) && system_error == 0,
-        "start async-Journal Wire V2 control plane");
+        "start processing-to-Wire V2 control plane");
     if (!ok) {
         service->StopControl();
         return false;
@@ -2846,13 +2776,8 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
     }
     transfer.fd.Reset();
 
-    JournalSyncBlocker sync_blocker;
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
-    // This guard is destroyed before both objects: every return first
-    // releases a possibly blocked writer and then joins the Pipeline while
-    // the hook context remains alive.
-    PipelineJournalCleanup pipeline_cleanup(
-        &sync_blocker, &pipeline);
+    PipelineCleanup pipeline_cleanup(&pipeline);
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = kTradeDate;
@@ -2870,24 +2795,12 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
         1U << 20U;
     pipeline_config.intraday_store.maximum_records_per_batch = 16U;
     pipeline_config.intraday_store.coverage_from_open = true;
-    pipeline_config.journal.path = journal_path.string();
-    pipeline_config.journal.queue_capacity = 8U;
-    pipeline_config.journal.max_batch_records = 1U;
-    pipeline_config.journal.max_batch_delay =
-        std::chrono::microseconds(50);
-    pipeline_config.journal.before_sync_for_test =
-        &JournalSyncBlocker::BeforeSync;
-    pipeline_config.journal.before_sync_context_for_test =
-        &sync_blocker;
     pipeline_config.applied_record_sink = service;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
     pipeline_config.store_generation_sink = service;
     pipeline_config.sdk.enabled = false;
 
-    ok &= Expect(
-        !std::filesystem::exists(journal_path),
-        "mandatory Journal path is fresh before Pipeline creation");
     std::string pipeline_detail;
     const runtime::RealtimePipelineCreateErrorV1 pipeline_error =
         runtime::RealtimePipelineV1::Create(
@@ -2909,55 +2822,46 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
     FakeSdkMessage snapshot(
         sdk::kProductionMessageKeysV1[2U],
         PipelineShenzhenSnapshotBody());
-    constexpr std::uint64_t kBlockedCaptureCount = 6U;
+    constexpr std::uint64_t kCaptureCount = 6U;
     const runtime::RealtimePipelineIngressResultV1 first_ingress =
         pipeline->InjectSdkMessageForTest(&snapshot);
-    const bool writer_is_blocked =
-        sync_blocker.WaitUntilEntered(std::chrono::seconds(3));
     ok &= Expect(
         first_ingress.accepted() &&
-            first_ingress.global_ingress_sequence == 1U &&
-            writer_is_blocked,
-        "capture is admitted and writer blocks immediately before fdatasync");
+            first_ingress.global_ingress_sequence == 1U,
+        "first capture is admitted to ordered processing");
     for (std::uint64_t sequence = 2U;
-         sequence <= kBlockedCaptureCount;
+         sequence <= kCaptureCount;
          ++sequence) {
         const runtime::RealtimePipelineIngressResultV1 ingress =
             pipeline->InjectSdkMessageForTest(&snapshot);
         ok &= Expect(
             ingress.accepted() &&
                 ingress.global_ingress_sequence == sequence,
-            "subsequent callback returns while the Journal writer remains "
-            "blocked");
+            "subsequent callback preserves dense processing admission");
     }
 
-    l2flow_shm_session_info_v2 blocked_session{};
+    l2flow_shm_session_info_v2 session{};
     ipc::RealtimeWireSnapshotPayloadV2 latest{};
     std::uint8_t latest_status = 0xffU;
     constexpr std::uint32_t instrument_id = 1U;
-    const bool visible_while_not_durable = WaitUntil([&] {
+    const bool visible = WaitUntil([&] {
         latest_status = 0xffU;
         return l2flow_shm_reader_session_v2(
-                   reader.get(), &blocked_session) ==
+                   reader.get(), &session) ==
                    L2FLOW_SHM_READER_OK_V2 &&
-               blocked_session.server_state ==
+               session.server_state ==
                    static_cast<std::uint32_t>(
                        ipc::RealtimeServerStateV2::kActive) &&
-               blocked_session.catalog_scope ==
+               session.catalog_scope ==
                    static_cast<std::uint32_t>(
                        ipc::RealtimeCatalogScopeV2::kObservedOnly) &&
-               blocked_session.coverage_complete == 0U &&
-               blocked_session.bound_count == 1U &&
-               blocked_session.available_count == 1U &&
-               blocked_session.snapshot_available_count == 1U &&
-               blocked_session.accepted_sequence ==
-                   kBlockedCaptureCount &&
-               blocked_session.applied_sequence ==
-                   kBlockedCaptureCount &&
-               blocked_session.durable_sequence == 0U &&
-               blocked_session.processing_lag_records == 0U &&
-               blocked_session.durability_lag_records ==
-                   kBlockedCaptureCount &&
+               session.coverage_complete == 0U &&
+               session.bound_count == 1U &&
+               session.available_count == 1U &&
+               session.snapshot_available_count == 1U &&
+               session.accepted_sequence == kCaptureCount &&
+               session.applied_sequence == kCaptureCount &&
+               session.processing_lag_records == 0U &&
                l2flow_shm_reader_latest_snapshots_v2(
                    reader.get(),
                    &instrument_id,
@@ -2970,16 +2874,16 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
                latest.common.instrument_id == instrument_id &&
                latest.common.ordinal == 0U &&
                latest.common.ingress_sequence ==
-                   kBlockedCaptureCount &&
+                   kCaptureCount &&
                latest.last_price.valid == 1U &&
                latest.last_price.normalized_p6 == 12'345'600;
     });
     ok &= Expect(
-        visible_while_not_durable,
+        visible,
         "real C Reader sees the full accepted/applied capture prefix and "
-        "latest while durable=0");
+        "latest record");
 
-    if (visible_while_not_durable) {
+    if (visible) {
         ok &= RunPythonKnownIdProbe(socket_path);
         l2flow_shm_session_info_v2 after_python{};
         ok &= Expect(
@@ -2987,43 +2891,27 @@ bool TestBlockedJournalDoesNotGateWireLatest() {
                 reader.get(), &after_python) ==
                     L2FLOW_SHM_READER_OK_V2 &&
                 after_python.accepted_sequence ==
-                    kBlockedCaptureCount &&
+                    kCaptureCount &&
                 after_python.applied_sequence ==
-                    kBlockedCaptureCount &&
-                after_python.durable_sequence == 0U,
-            "Python hot reads complete while Journal sync remains blocked");
+                    kCaptureCount &&
+                after_python.processing_lag_records == 0U,
+            "Python hot reads consume the applied processing prefix");
     }
 
-    sync_blocker.Release();
-    const bool durable_after_release = WaitUntil([&] {
-        l2flow_shm_session_info_v2 session{};
-        const runtime::RealtimePipelineSnapshotV1 state =
-            pipeline->Snapshot();
-        return l2flow_shm_reader_session_v2(
-                   reader.get(), &session) ==
-                   L2FLOW_SHM_READER_OK_V2 &&
-               session.accepted_sequence == kBlockedCaptureCount &&
-               session.applied_sequence == kBlockedCaptureCount &&
-               session.durable_sequence == kBlockedCaptureCount &&
-               session.processing_lag_records == 0U &&
-               session.durability_lag_records == 0U &&
-               state.processing_progress.accepted_sequence ==
-                   kBlockedCaptureCount &&
-               state.processing_progress.applied_sequence ==
-                   kBlockedCaptureCount &&
-               state.processing_progress.durable_sequence ==
-                   kBlockedCaptureCount &&
-               !state.fatal;
-    });
+    const runtime::RealtimePipelineSnapshotV1 state =
+        pipeline->Snapshot();
     ok &= Expect(
-        durable_after_release,
-        "durable sequence advances independently after releasing fdatasync");
+        state.processing_progress.accepted_sequence == kCaptureCount &&
+            state.processing_progress.applied_sequence == kCaptureCount &&
+            state.processing_progress.processing_lag_records() == 0U &&
+            !state.fatal,
+        "Pipeline preserves accepted/applied ordering through publication");
 
     pipeline->StopAndDrain();
     service->MarkDraining();
     ok &= Expect(
         service->MarkStoppedClean(0U),
-        "async-Journal integration service stops with no tick gap");
+        "processing-to-Wire integration service stops with no tick gap");
     service->StopControl();
     return ok && !pipeline->fatal() && !service->failed();
 }
@@ -3212,7 +3100,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     constexpr std::size_t kBurstSamples = 3'000U;
     constexpr std::size_t kMaximumSequence = 100'000U;
     constexpr std::size_t kQueueCapacity = 4'096U;
-    constexpr std::size_t kClosedLoopDurabilityBarrierRecords = 512U;
+    constexpr std::size_t kClosedLoopAppliedBarrierRecords = 512U;
     constexpr std::uint32_t kStoreWorkerCount = 4U;
     constexpr std::uint64_t kTickRingCapacity = 32'768U;
     static_assert(
@@ -3227,14 +3115,13 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         << "ENV capacity=" << kCapacity
         << " worker_count=" << kStoreWorkerCount
         << " processing_queue=" << kQueueCapacity
-        << " journal_queue=" << kQueueCapacity
         << " decoder_queue_per_source=" << kQueueCapacity
         << " store_queue_per_source_worker=" << kQueueCapacity
         << " tick_ring_capacity=" << kTickRingCapacity
         << " active_instrument_count=" << kActiveInstrumentCount
         << " fill_batch_size=" << kFillBatchSize
-        << " closed_loop_durability_barrier_records="
-        << kClosedLoopDurabilityBarrierRecords
+        << " closed_loop_applied_barrier_records="
+        << kClosedLoopAppliedBarrierRecords
         << " barrier_scope=between_samples_not_reader_gate"
         << " burst_records=" << kBurstSamples
         << " burst_scope=within_default_queue_capacity"
@@ -3257,8 +3144,6 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     const common::Identity128 run_id = RunId(0x47U);
     const std::filesystem::path socket_path =
         temporary.path() / "latency.sock";
-    const std::filesystem::path journal_path =
-        temporary.path() / "latency.journal";
 
     ipc::RealtimeSharedServiceConfigV2 service_config{};
     service_config.run_id = run_id;
@@ -3301,7 +3186,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     auto sdk_factory =
         std::make_shared<LatencySdkFactory>(sdk_state);
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
-    PipelineJournalCleanup pipeline_cleanup(nullptr, &pipeline);
+    PipelineCleanup pipeline_cleanup(&pipeline);
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = kTradeDate;
@@ -3323,8 +3208,6 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
     pipeline_config.intraday_store.coverage_from_open = true;
-    pipeline_config.journal.path = journal_path.string();
-    pipeline_config.journal.queue_capacity = kQueueCapacity;
     pipeline_config.applied_record_sink = timed_sink;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
@@ -3388,7 +3271,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         };
 
     auto wait_pipeline_prefix =
-        [&](std::uint64_t sequence, bool require_durable) {
+        [&](std::uint64_t sequence) {
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::seconds(30);
@@ -3402,18 +3285,13 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                     state.processing_progress.accepted_sequence ==
                         sequence &&
                     state.processing_progress.applied_sequence ==
-                        sequence &&
-                    (!require_durable ||
-                     state.processing_progress.durable_sequence ==
-                         sequence)) {
+                        sequence) {
                     return true;
                 }
                 if (state.accepted_messages > sequence ||
                     state.processing_progress.accepted_sequence >
                         sequence ||
                     state.processing_progress.applied_sequence >
-                        sequence ||
-                    state.processing_progress.durable_sequence >
                         sequence ||
                     std::chrono::steady_clock::now() >= deadline) {
                     return false;
@@ -3425,7 +3303,6 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     const std::uint64_t fill_start = MonotonicNowNs();
     std::uint64_t fill_accepted = 0U;
     std::uint64_t fill_visible = 0U;
-    std::uint64_t fill_durable = 0U;
     for (std::size_t first = 1U;
          first <= kActiveInstrumentCount;
          first += kFillBatchSize) {
@@ -3452,27 +3329,17 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         }
         if (!Expect(
                 wait_pipeline_prefix(
-                    static_cast<std::uint64_t>(last), false),
+                    static_cast<std::uint64_t>(last)),
                 "working-set batch reaches applied prefix")) {
             return false;
         }
         if (last == kActiveInstrumentCount) {
             fill_visible = MonotonicNowNs();
         }
-        if (!Expect(
-                wait_pipeline_prefix(
-                    static_cast<std::uint64_t>(last), true),
-                "working-set batch reaches durable prefix")) {
-            return false;
-        }
-        if (last == kActiveInstrumentCount) {
-            fill_durable = MonotonicNowNs();
-        }
     }
     if (!Expect(
             fill_start != 0U && fill_accepted >= fill_start &&
-                fill_visible >= fill_accepted &&
-                fill_durable >= fill_visible,
+                fill_visible >= fill_accepted,
             "measure working-set fill boundaries")) {
         return false;
     }
@@ -3521,10 +3388,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                 kActiveInstrumentCount &&
             fill_session.applied_sequence ==
                 kActiveInstrumentCount &&
-            fill_session.durable_sequence ==
-                kActiveInstrumentCount &&
             fill_session.processing_lag_records == 0U &&
-            fill_session.durability_lag_records == 0U &&
             fill_session.bound_count ==
                 kActiveInstrumentCount &&
             fill_session.available_count ==
@@ -3586,12 +3450,8 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         << fill_accepted - fill_start
         << " accepted_to_visible_ns="
         << fill_visible - fill_accepted
-        << " accepted_to_durable_ns="
-        << fill_durable - fill_accepted
         << " start_to_visible_ns="
         << fill_visible - fill_start
-        << " start_to_durable_ns="
-        << fill_durable - fill_start
         << " mapping_bytes=" << service->mapping_bytes()
         << " key_arena_used_bytes="
         << service->key_arena_used_bytes() << '\n';
@@ -3718,13 +3578,13 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         }
         const std::size_t completed_samples = index + 1U;
         if ((completed_samples %
-                 kClosedLoopDurabilityBarrierRecords ==
+                 kClosedLoopAppliedBarrierRecords ==
              0U) ||
             completed_samples ==
                 kWarmupSamples + kMeasuredSamples) {
             if (!Expect(
-                    wait_pipeline_prefix(expected, true),
-                    "C closed-loop durability barrier")) {
+                    wait_pipeline_prefix(expected),
+                    "C closed-loop applied barrier")) {
                 return false;
             }
         }
@@ -3918,13 +3778,13 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
         }
         const std::size_t completed_samples = index + 1U;
         if ((completed_samples %
-                 kClosedLoopDurabilityBarrierRecords ==
+                 kClosedLoopAppliedBarrierRecords ==
              0U) ||
             completed_samples ==
                 kWarmupSamples + kMeasuredSamples) {
             if (!Expect(
-                    wait_pipeline_prefix(expected, true),
-                    "Python closed-loop durability barrier")) {
+                    wait_pipeline_prefix(expected),
+                    "Python closed-loop applied barrier")) {
                 return false;
             }
         }
@@ -4154,8 +4014,6 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                 burst_last &&
             final_state.processing_progress.applied_sequence ==
                 burst_last &&
-            final_state.processing_progress.durable_sequence ==
-                burst_last &&
             !service->failed(),
         "latency benchmark retains the complete accepted/applied prefix");
 
@@ -4199,9 +4057,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
                 kActiveInstrumentCount &&
             final_session.accepted_sequence == burst_last &&
             final_session.applied_sequence == burst_last &&
-            final_session.durable_sequence == burst_last &&
-            final_session.processing_lag_records == 0U &&
-            final_session.durability_lag_records == 0U;
+            final_session.processing_lag_records == 0U;
         if (wire_matches_final_prefix) {
             break;
         }
@@ -4241,7 +4097,6 @@ bool RunHistoryLatencyBenchmark() {
         << " snapshot_fill=" << kSnapshotFillCount
         << " worker_count=" << kStoreWorkerCount
         << " processing_queue=" << kQueueCapacity
-        << " journal_queue=" << kQueueCapacity
         << " tick_ring_capacity=" << kTickRingCapacity
         << " requested_page_records=4096"
         << " price_repeats=" << kPriceRepeats
@@ -4259,8 +4114,6 @@ bool RunHistoryLatencyBenchmark() {
     const common::Identity128 run_id = RunId(0x67U);
     const std::filesystem::path socket_path =
         temporary.path() / "history-latency.sock";
-    const std::filesystem::path journal_path =
-        temporary.path() / "history-latency.journal";
     HistoryStageCollector history_stages;
 
     ipc::RealtimeSharedServiceConfigV2 service_config{};
@@ -4298,7 +4151,7 @@ bool RunHistoryLatencyBenchmark() {
     auto sdk_factory =
         std::make_shared<LatencySdkFactory>(sdk_state);
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
-    PipelineJournalCleanup pipeline_cleanup(nullptr, &pipeline);
+    PipelineCleanup pipeline_cleanup(&pipeline);
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = run_id;
     pipeline_config.trade_date = kTradeDate;
@@ -4320,8 +4173,6 @@ bool RunHistoryLatencyBenchmark() {
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
     pipeline_config.intraday_store.coverage_from_open = true;
-    pipeline_config.journal.path = journal_path.string();
-    pipeline_config.journal.queue_capacity = kQueueCapacity;
     pipeline_config.applied_record_sink = timed_applied;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
@@ -4357,7 +4208,7 @@ bool RunHistoryLatencyBenchmark() {
     }
 
     auto wait_prefix =
-        [&](std::uint64_t sequence, bool require_durable) {
+        [&](std::uint64_t sequence) {
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::seconds(60);
@@ -4371,10 +4222,7 @@ bool RunHistoryLatencyBenchmark() {
                     state.processing_progress.accepted_sequence ==
                         sequence &&
                     state.processing_progress.applied_sequence ==
-                        sequence &&
-                    (!require_durable ||
-                     state.processing_progress.durable_sequence ==
-                         sequence)) {
+                        sequence) {
                     return true;
                 }
                 std::this_thread::yield();
@@ -4399,7 +4247,7 @@ bool RunHistoryLatencyBenchmark() {
             ++next_sequence;
         }
         if (!Expect(
-                wait_prefix(next_sequence - 1U, true),
+                wait_prefix(next_sequence - 1U),
                 "fill 59,999 observed snapshots")) {
             service->MarkFailed();
             service->StopControl();
@@ -4441,7 +4289,7 @@ bool RunHistoryLatencyBenchmark() {
                 ++*current_count;
                 ++next_sequence;
                 if ((*current_count % kFillBatch) == 0U &&
-                    !wait_prefix(next_sequence - 1U, true)) {
+                    !wait_prefix(next_sequence - 1U)) {
                     const auto state = pipeline->Snapshot();
                     std::cerr
                         << "append wait failed target_count="
@@ -4454,11 +4302,6 @@ bool RunHistoryLatencyBenchmark() {
                         << " rejected=" << state.rejected_messages
                         << " applied="
                         << state.processing_progress.applied_sequence
-                        << " durable="
-                        << state.processing_progress.durable_sequence
-                        << " journal_failure="
-                        << static_cast<unsigned int>(
-                               state.journal.failure_kind)
                         << " decode_error="
                         << static_cast<unsigned int>(
                                state.last_decode_error)
@@ -4475,7 +4318,7 @@ bool RunHistoryLatencyBenchmark() {
                 }
             }
             if (next_sequence > 1U &&
-                !wait_prefix(next_sequence - 1U, true)) {
+                !wait_prefix(next_sequence - 1U)) {
                 const auto state = pipeline->Snapshot();
                 std::cerr
                     << "append pre-final wait failed target_count="
@@ -4486,8 +4329,6 @@ bool RunHistoryLatencyBenchmark() {
                     << " accepted=" << state.accepted_messages
                     << " applied="
                     << state.processing_progress.applied_sequence
-                    << " durable="
-                    << state.processing_progress.durable_sequence
                     << " fatal=" << state.fatal << '\n';
                 return false;
             }
@@ -4899,8 +4740,6 @@ bool RunHistoryLatencyBenchmark() {
                     << " accepted=" << state.accepted_messages
                     << " applied="
                     << state.processing_progress.applied_sequence
-                    << " durable="
-                    << state.processing_progress.durable_sequence
                     << " last_started="
                     << state.last_started_generation
                     << " last_published="
@@ -5657,8 +5496,8 @@ bool RunHistoryLatencyBenchmark() {
         return false;
     }
     if (!Expect(
-            wait_prefix(next_sequence - 1U, true),
-            "concurrent latest samples reach durable/applied prefix")) {
+            wait_prefix(next_sequence - 1U),
+            "concurrent latest samples reach the applied prefix")) {
         return false;
     }
 
@@ -5715,7 +5554,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!TestServiceEndToEnd() ||
-        !TestBlockedJournalDoesNotGateWireLatest() ||
+        !TestProcessingAdmissionPublishesWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||
         !TestStoppedCleanRejectsMismatchedWatermark() ||
         !TestTickRingRejectsUnclosedGapOverwrite()) {

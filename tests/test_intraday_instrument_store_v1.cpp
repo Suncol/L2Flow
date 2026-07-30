@@ -285,7 +285,6 @@ market::RealtimeHistoryWatermarkV1 MakeWatermarkForSnapshot(
     }
     l2flow::realtime::ProcessingProgressV2 progress{};
     progress.accepted_sequence = ingress_sequence_exclusive - 1U;
-    progress.durable_sequence = ingress_sequence_exclusive - 1U;
     progress.applied_sequence = ingress_sequence_exclusive - 1U;
     if (market::BuildRealtimeHistoryWatermarkV1(
             run_id,
