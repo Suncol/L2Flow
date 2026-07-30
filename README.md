@@ -182,6 +182,59 @@ The Journal path and control socket must not already exist. Operational code
 must assert `--intraday-store-from-open`; this replacement runtime does not
 offer a partial-session or recovery startup mode.
 
+### Default Mainland A-share admission filter
+
+`RealtimePipelineConfigV1::enable_mainland_a_share_filter` and the production
+option `--enable-mainland-a-share-filter true|false` both default to `true`.
+The filter applies the following complete rule:
+
+1. The classification predicate accepts a `SecurityID` only when it is
+   exactly six ASCII decimal digits. Signs, spaces, shorter IDs, and longer
+   IDs do not match.
+2. The exchange comes from the trusted supported message tuple, never from
+   the code text alone.
+3. The exchange-specific allow-list is:
+
+   | Exchange | Accepted A-share code |
+   | --- | --- |
+   | Shanghai | `600xxx`, `601xxx`, `603xxx`, `605xxx`, `688xxx` |
+   | Shenzhen | `000001-000999`, `001200-004999`, `300000-309799` |
+   | Beijing | `920000-920999` |
+
+This deliberately excludes, among other products, Shanghai B shares and
+funds, Shenzhen B shares, main-board and ChiNext depositary receipts, and the
+non-`920` Beijing codes. Beijing completed the migration of listed stocks to
+`920xxx` on 2025-10-09; `83`/`87`/`88` identify National Equities
+Exchange and Quotations ordinary shares under the current rule. Historical
+replay across the Beijing migration requires the official per-security
+mapping and trade date, not a legacy-prefix rule or a mechanical replacement
+of the first three digits.
+
+A well-formed supported non-match is returned as
+`filtered_non_a_share`, counted separately per source, and discarded before
+owned-message acquisition or global/source/mixed-tick sequence allocation.
+Unsupported tuples remain `ignored_unsupported`. A structurally malformed
+required instrument key (including an invalid descriptor, empty value,
+overlap, embedded NUL, or other non-printable/non-ASCII bytes) is fatal and
+is counted as rejected, not filtered.
+The receive trade-date guard runs before the filter so that a non-A-share
+callback on the next civil date still closes the prior-day session.
+
+The classifier includes the Beijing rule, but the current production message
+catalog contains only Shanghai and Shenzhen tuples
+(`4.101.{4,24}` and `6.101.{28,33,36}`). Enabling this filter does not add a
+Beijing subscription or decoder. Set
+`--enable-mainland-a-share-filter false` only when the operator intentionally
+wants the previous all-supported-products behavior.
+
+The rule baseline is 2026-07-30:
+[SSE code allocation guide (2026 second revision)](https://www.sse.com.cn/lawandrules/guide/stock/jyglywznylc/zn/c/c_20260713_10825354.shtml),
+[SZSE security code ranges (2026-03)](https://www.szse.cn/marketServices/technicalservice/doc/P020260306733846760075.pdf),
+and the
+[BSE 920 code rule](https://www.bse.cn/uploads/6/file/public/202404/20240419164341_dntowohn65.pdf).
+Update the centralized predicate and its boundary tests together if an
+exchange revises these allocations.
+
 ## Python Wire V2 reader
 
 The Python package is stdlib-only and loads `libl2flow_shm_reader.so` through

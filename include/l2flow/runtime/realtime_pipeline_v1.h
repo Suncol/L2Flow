@@ -104,6 +104,13 @@ struct RealtimePipelineConfigV1 final {
     // When enabled, LatencySnapshot() exposes the SDK-header-to-callback and
     // append-stage distributions defined below.
     bool measure_stage_latency = false;
+    // Enabled by default. Supported SDK messages are admitted only when their
+    // source market and exact SecurityID match the centralized current
+    // Mainland A-share code rules. A filtered callback consumes no capture,
+    // source, or mixed-tick sequence and enters no owned pool or queue. This
+    // switch does not add a data source: the current production catalog still
+    // contains only the Shanghai and Shenzhen message tuples.
+    bool enable_mainland_a_share_filter = true;
 };
 
 // Returns the finite completion window enforced by the ordered in-memory
@@ -223,6 +230,13 @@ enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     kProcessingAdmissionFailed,
     kStopped,
     kFatal,
+    // A well-formed supported message whose source-market SecurityID is
+    // outside the configured Mainland A-share rules. It consumes no sequence.
+    kFilteredNonAShare,
+    // A supported body could not yield a structurally valid exact instrument
+    // key. This is malformed required data and fails closed; it is never
+    // counted as a normal filter decision.
+    kInstrumentKeyRejected,
 };
 
 [[nodiscard]] std::string_view RealtimePipelineIngressErrorNameV1(
@@ -320,6 +334,14 @@ struct RealtimePipelineSnapshotV1 final {
     bool stopped = false;
     bool trade_date_boundary_reached = false;
     l2flow::market::IntradayInstrumentStoreSnapshotV1 store{};
+    // Well-formed supported callbacks excluded before sequence allocation,
+    // owned copy, and queue admission. Appended to preserve the offsets of
+    // the pre-existing snapshot fields.
+    std::uint64_t filtered_messages = 0U;
+    std::array<std::uint64_t,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        filtered_messages_by_source{};
+    bool mainland_a_share_filter_enabled = true;
 };
 
 // Owns the single production data chain. The observed directory and

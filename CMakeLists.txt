@@ -101,6 +101,7 @@ add_library(l2flow_market STATIC
     src/control/checked_body_view.cpp
     src/market/intraday_instrument_store_v1.cpp
     src/market/kline_aggregator_v1.cpp
+    src/market/mainland_a_share_filter_v1.cpp
     src/market/market_decoder.cpp
     src/market/market_types_v1.cpp
     src/market/observed_instrument_directory_v2.cpp
@@ -233,6 +234,8 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_sha256.cpp L2Flow::common)
     l2flow_add_test(test_market_decoder
         tests/test_phase4_market_decoder.cpp L2Flow::market)
+    l2flow_add_test(test_mainland_a_share_filter
+        tests/test_mainland_a_share_filter_v1.cpp L2Flow::market)
     l2flow_add_test(test_observed_instrument_directory
         tests/test_observed_instrument_directory_v2.cpp L2Flow::market)
     l2flow_add_test(test_observed_instrument_router

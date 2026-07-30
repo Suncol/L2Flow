@@ -35,6 +35,7 @@ namespace runtime = l2flow::runtime;
 static_assert(
     market::kObservedInstrumentDirectoryDefaultCapacityV2 <=
     std::numeric_limits<std::uint32_t>::max());
+static_assert(market::kRealtimeHistorySourceCountV1 == 4U);
 
 volatile std::sig_atomic_t g_stop_requested = 0;
 
@@ -138,6 +139,7 @@ struct Options final {
     std::string server_address;
     std::string user_name;
     std::string sdk_log_prefix = "l2flow-realtime";
+    bool enable_mainland_a_share_filter = true;
 
     std::uint32_t instrument_store_workers = 4U;
     std::uint64_t intraday_store_maximum_records = 0U;
@@ -179,6 +181,8 @@ void PrintUsage(std::ostream& output) {
         << "Optional:\n"
         << "  --instrument-capacity N       1..4294967294, default 65536\n"
         << "  --sdk-log-prefix PATH         default l2flow-realtime\n"
+        << "  --enable-mainland-a-share-filter BOOL\n"
+        << "                                true|false, default true\n"
         << "  --instrument-store-workers N  1..256, default 4\n"
         << "  --intraday-store-segment-kib N\n"
         << "                                4..16384, default 64\n"
@@ -195,7 +199,9 @@ void PrintUsage(std::ostream& output) {
         << "  --help\n\n"
         << "The session exposes only the observed universe. Capacity and key "
            "arena exhaustion are fatal; this process does not roll over or "
-           "resume a session.\n";
+           "resume a session. The current production source catalog contains "
+           "Shanghai and Shenzhen tuples only; enabling the filter does not "
+           "add Beijing ingress.\n";
 }
 
 bool ParseU32(std::string_view text, std::uint32_t* output) noexcept {
@@ -226,6 +232,21 @@ bool ParseU64(std::string_view text, std::uint64_t* output) noexcept {
     }
     *output = value;
     return true;
+}
+
+bool ParseBool(std::string_view text, bool* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    if (text == "true") {
+        *output = true;
+        return true;
+    }
+    if (text == "false") {
+        *output = false;
+        return true;
+    }
+    return false;
 }
 
 bool ParsePositiveScaledBytes(
@@ -351,6 +372,7 @@ bool ParseOptions(
             option != "--server-address" &&
             option != "--user-name" &&
             option != "--sdk-log-prefix" &&
+            option != "--enable-mainland-a-share-filter" &&
             option != "--instrument-store-workers" &&
             option != "--intraday-store-max-records" &&
             option != "--intraday-store-memory-gib" &&
@@ -408,6 +430,16 @@ bool ParseOptions(
             parsed.user_name = value;
         } else if (option == "--sdk-log-prefix") {
             parsed.sdk_log_prefix = value;
+        } else if (option ==
+                   "--enable-mainland-a-share-filter") {
+            if (!ParseBool(
+                    value,
+                    &parsed.enable_mainland_a_share_filter)) {
+                *error =
+                    "--enable-mainland-a-share-filter must be "
+                    "true or false";
+                return false;
+            }
         } else if (option == "--instrument-store-workers") {
             if (!ParseU32(
                     value, &parsed.instrument_store_workers) ||
@@ -623,6 +655,7 @@ void ReportFatalSnapshot(
         << snapshot.processing_progress.applied_sequence
         << " processing_lag_records="
         << snapshot.processing_progress.processing_lag_records()
+        << " filtered_messages=" << snapshot.filtered_messages
         << " last_decode_error="
         << static_cast<unsigned int>(snapshot.last_decode_error)
         << '\n';
@@ -697,6 +730,8 @@ int Run(const Options& options) {
         options.intraday_store_from_open;
     pipeline_config.kline.windows = kline_windows;
     pipeline_config.enforce_receive_trade_date = true;
+    pipeline_config.enable_mainland_a_share_filter =
+        options.enable_mainland_a_share_filter;
     pipeline_config.sdk.enabled = true;
     pipeline_config.sdk.library_path = options.sdk_library;
     pipeline_config.sdk.server_address = options.server_address;
@@ -773,6 +808,10 @@ int Run(const Options& options) {
         << " coverage_complete=false"
         << " mapping_bytes=" << ipc_service->mapping_bytes()
         << " key_arena_bytes=" << options.ipc_key_arena_bytes
+        << " mainland_a_share_filter="
+        << (options.enable_mainland_a_share_filter
+                ? "true"
+                : "false")
         << '\n';
 
     pipeline_config.applied_record_sink = ipc_service;
@@ -963,7 +1002,18 @@ int Run(const Options& options) {
         << " applied_sequence="
         << final_snapshot.processing_progress.applied_sequence
         << " processing_lag_records="
-        << final_snapshot.processing_progress.processing_lag_records();
+        << final_snapshot.processing_progress.processing_lag_records()
+        << " mainland_a_share_filter="
+        << (final_snapshot.mainland_a_share_filter_enabled
+                ? "true"
+                : "false")
+        << " filtered_messages="
+        << final_snapshot.filtered_messages
+        << " filtered_by_source_sh_snapshot_sh_tick_sz_snapshot_sz_tick="
+        << final_snapshot.filtered_messages_by_source[0] << ','
+        << final_snapshot.filtered_messages_by_source[1] << ','
+        << final_snapshot.filtered_messages_by_source[2] << ','
+        << final_snapshot.filtered_messages_by_source[3];
     if (catalog_snapshot_error ==
             market::ObservedInstrumentDirectoryErrorV2::kNone &&
         final_catalog != nullptr) {

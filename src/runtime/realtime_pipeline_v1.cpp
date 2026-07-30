@@ -1,5 +1,6 @@
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
+#include "l2flow/market/mainland_a_share_filter_v1.h"
 #include "l2flow/runtime/detail/closeable_publication_gate.h"
 #include "l2flow/sdk/direct_sdk_runtime_v1.h"
 #include "l2flow/sdk/production_subscription_v1.h"
@@ -84,6 +85,19 @@ void SetDetailLiteral(std::string* detail, const char* message) noexcept {
            source_slot ==
                static_cast<std::uint8_t>(
                    realtime::OwnedIngressSourceV1::kShenzhenTick);
+}
+
+[[nodiscard]] constexpr market::MainlandExchangeV1
+MainlandExchangeForMarket(market::MarketV1 value) noexcept {
+    switch (value) {
+        case market::MarketV1::kShanghai:
+            return market::MainlandExchangeV1::kShanghai;
+        case market::MarketV1::kShenzhen:
+            return market::MainlandExchangeV1::kShenzhen;
+        case market::MarketV1::kUnknown:
+            break;
+    }
+    return market::MainlandExchangeV1::kUnknown;
 }
 
 [[nodiscard]] bool ReadClockNs(clockid_t clock,
@@ -772,6 +786,10 @@ std::string_view RealtimePipelineIngressErrorNameV1(
             return "stopped";
         case RealtimePipelineIngressErrorV1::kFatal:
             return "fatal";
+        case RealtimePipelineIngressErrorV1::kFilteredNonAShare:
+            return "filtered_non_a_share";
+        case RealtimePipelineIngressErrorV1::kInstrumentKeyRejected:
+            return "instrument_key_rejected";
     }
     return "unknown";
 }
@@ -1509,23 +1527,8 @@ public:
         result.source_slot = source_slot;
         result.vendor_local_time_raw =
             inspection.vendor_head().local_time_raw();
-        constexpr std::uint64_t exhaustion_sentinel =
-            std::numeric_limits<std::uint64_t>::max();
         const bool mixed_tick_source =
             IsMixedTickSourceSlot(source_slot);
-        // UINT64_MAX is a valid exclusive cut but is never assigned to a
-        // message.  Detect that boundary here instead of misclassifying the
-        // candidate as an OwnedIngress metadata failure.
-        if (global_ingress_sequence_ >= exhaustion_sentinel - 1U ||
-            source_sequences_[source_slot] >= exhaustion_sentinel - 1U ||
-            (mixed_tick_source &&
-             tick_stream_sequence_ >= exhaustion_sentinel - 1U)) {
-            result.error =
-                RealtimePipelineIngressErrorV1::kSequenceExhausted;
-            ++rejected_messages_;
-            TripFatalWithAdmissionLockHeld();
-            return result;
-        }
 
         std::uint64_t realtime_ns = 0U;
         std::uint64_t monotonic_ns = 0U;
@@ -1569,6 +1572,65 @@ public:
                 ++rejected_messages_;
                 return result;
             }
+        }
+
+        if (config_.enable_mainland_a_share_filter) {
+            market::MarketMessageViewV1 filter_view{};
+            filter_view.service_id = inspection.key().service_id;
+            filter_view.service_version =
+                inspection.key().service_version;
+            filter_view.message_id = inspection.key().message_id;
+            filter_view.body = inspection.body();
+
+            market::ObservedInstrumentKeyViewV2 extracted{};
+            const market::MarketDecodeErrorV1 extraction_error =
+                market::ExtractObservedInstrumentKeyV2(
+                    filter_view,
+                    config_.decoder_limits.maximum_text_bytes,
+                    &extracted);
+            if (extraction_error !=
+                market::MarketDecodeErrorV1::kNone) {
+                last_decode_error_.store(
+                    static_cast<std::uint8_t>(extraction_error),
+                    std::memory_order_release);
+                result.error =
+                    RealtimePipelineIngressErrorV1::
+                        kInstrumentKeyRejected;
+                ReportPipelineFailure(
+                    "admission_instrument_key_extract",
+                    source_slot,
+                    0U,
+                    static_cast<std::uint64_t>(extraction_error));
+                ++rejected_messages_;
+                TripFatalWithAdmissionLockHeld();
+                return result;
+            }
+            if (!market::IsMainlandAShareSecurityIdV1(
+                    MainlandExchangeForMarket(extracted.market),
+                    extracted.security_id)) {
+                result.error =
+                    RealtimePipelineIngressErrorV1::
+                        kFilteredNonAShare;
+                ++filtered_messages_;
+                ++filtered_messages_by_source_[source_slot];
+                return result;
+            }
+        }
+
+        constexpr std::uint64_t exhaustion_sentinel =
+            std::numeric_limits<std::uint64_t>::max();
+        // UINT64_MAX is a valid exclusive cut but is never assigned to a
+        // message. Filtered callbacks never consume a sequence, so this check
+        // intentionally follows the filter.
+        if (global_ingress_sequence_ >= exhaustion_sentinel - 1U ||
+            source_sequences_[source_slot] >= exhaustion_sentinel - 1U ||
+            (mixed_tick_source &&
+             tick_stream_sequence_ >= exhaustion_sentinel - 1U)) {
+            result.error =
+                RealtimePipelineIngressErrorV1::kSequenceExhausted;
+            ++rejected_messages_;
+            TripFatalWithAdmissionLockHeld();
+            return result;
         }
 
         realtime::OwnedIngressMetadataV1 metadata{};
@@ -2042,6 +2104,9 @@ public:
         {
             std::lock_guard<std::mutex> admission(admission_mutex_);
             result.accepted_messages = accepted_messages_;
+            result.filtered_messages = filtered_messages_;
+            result.filtered_messages_by_source =
+                filtered_messages_by_source_;
             result.ignored_messages = ignored_messages_;
             result.post_cut_messages = post_cut_messages_;
             result.rejected_messages = rejected_messages_;
@@ -2076,6 +2141,8 @@ public:
         result.stopped = stopped_.load(std::memory_order_acquire);
         result.trade_date_boundary_reached =
             trade_date_boundary_reached_.load(std::memory_order_acquire);
+        result.mainland_a_share_filter_enabled =
+            config_.enable_mainland_a_share_filter;
         return result;
     }
 
@@ -3058,6 +3125,10 @@ private:
                market::kRealtimeHistorySourceCountV1>
         source_sequences_{};
     std::uint64_t accepted_messages_ = 0U;
+    std::uint64_t filtered_messages_ = 0U;
+    std::array<std::uint64_t,
+               market::kRealtimeHistorySourceCountV1>
+        filtered_messages_by_source_{};
     std::uint64_t ignored_messages_ = 0U;
     std::uint64_t post_cut_messages_ = 0U;
     std::uint64_t rejected_messages_ = 0U;

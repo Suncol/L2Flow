@@ -3208,6 +3208,9 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
     pipeline_config.intraday_store.coverage_from_open = true;
+    // This synthetic capacity benchmark intentionally enumerates 000001
+    // through 060000, not an exchange-valid A-share universe.
+    pipeline_config.enable_mainland_a_share_filter = false;
     pipeline_config.applied_record_sink = timed_sink;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;
@@ -4173,6 +4176,9 @@ bool RunHistoryLatencyBenchmark() {
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
     pipeline_config.intraday_store.coverage_from_open = true;
+    // This synthetic capacity benchmark intentionally enumerates 000001
+    // through 060000, not an exchange-valid A-share universe.
+    pipeline_config.enable_mainland_a_share_filter = false;
     pipeline_config.applied_record_sink = timed_applied;
     pipeline_config.instrument_binding_sink = service;
     pipeline_config.processing_progress_sink = service;

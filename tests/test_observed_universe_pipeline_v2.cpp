@@ -96,7 +96,8 @@ private:
 };
 
 [[nodiscard]] std::vector<std::byte> ShenzhenSnapshotBody(
-    std::int64_t normalized_last_price_p6) {
+    std::int64_t normalized_last_price_p6,
+    std::string_view security_id = "000001") {
     WireWriter writer(224U);
     writer.StoreU32(0U, 93'000'123U);
     writer.StoreU32(4U, 12U);
@@ -107,14 +108,15 @@ private:
     writer.StoreU64(
         64U, static_cast<std::uint64_t>(normalized_last_price_p6));
     writer.StoreString(8U, "010");
-    writer.StoreString(14U, "000001");
+    writer.StoreString(14U, security_id);
     writer.StoreString(20U, "102 ");
     writer.StoreString(26U, "T");
     return std::move(writer).Take();
 }
 
 [[nodiscard]] std::vector<std::byte> ShenzhenOrderBody(
-    std::uint64_t sequence) {
+    std::uint64_t sequence,
+    std::string_view security_id = "000001") {
     WireWriter writer(58U);
     writer.StoreU32(0U, 12U);
     writer.StoreU64(4U, sequence);
@@ -124,13 +126,14 @@ private:
     writer.StoreU32(50U, 93'000'124U);
     writer.StoreU32(54U, 50U);
     writer.StoreString(12U, "010");
-    writer.StoreString(18U, "000001");
+    writer.StoreString(18U, security_id);
     writer.StoreString(24U, "102 ");
     return std::move(writer).Take();
 }
 
 [[nodiscard]] std::vector<std::byte> ShanghaiTradeBody(
-    std::uint64_t business_index) {
+    std::uint64_t business_index,
+    std::string_view security_id = "600007") {
     WireWriter writer(70U);
     writer.StoreU64(0U, business_index);
     writer.StoreU32(8U, 7U);
@@ -140,10 +143,58 @@ private:
     writer.StoreU32(44U, 12'345U);
     writer.StoreU64(48U, 41U);
     writer.StoreU64(56U, 506'145U);
-    writer.StoreString(12U, "600007");
+    writer.StoreString(12U, security_id);
     writer.StoreString(22U, "T");
     writer.StoreString(64U, "B");
     return std::move(writer).Take();
+}
+
+[[nodiscard]] std::vector<std::byte> ShanghaiSnapshotBody(
+    std::string_view security_id) {
+    WireWriter writer(248U);
+    writer.StoreU32(0U, 93'000'123U);
+    writer.StoreU32(30U, 12'345U);
+    writer.StoreString(4U, security_id);
+    writer.StoreString(38U, "TRADE");
+    return std::move(writer).Take();
+}
+
+[[nodiscard]] std::vector<std::byte> ShenzhenTransactionBody(
+    std::uint64_t sequence,
+    std::string_view security_id) {
+    WireWriter writer(70U);
+    writer.StoreU32(0U, 12U);
+    writer.StoreU64(4U, sequence);
+    writer.StoreU64(18U, sequence - 1U);
+    writer.StoreU64(26U, 0U);
+    writer.StoreU64(46U, 123'456U);
+    writer.StoreU64(54U, 33U);
+    writer.StoreU32(62U, 70U);
+    writer.StoreU32(66U, 93'000'124U);
+    writer.StoreString(12U, "010");
+    writer.StoreString(34U, security_id);
+    writer.StoreString(40U, "102 ");
+    return std::move(writer).Take();
+}
+
+[[nodiscard]] std::vector<std::byte> ProductionBody(
+    std::size_t catalog_index,
+    std::string_view security_id,
+    std::uint64_t sequence) {
+    switch (catalog_index) {
+        case 0U:
+            return ShanghaiSnapshotBody(security_id);
+        case 1U:
+            return ShanghaiTradeBody(sequence, security_id);
+        case 2U:
+            return ShenzhenSnapshotBody(12'345'600, security_id);
+        case 3U:
+            return ShenzhenOrderBody(sequence, security_id);
+        case 4U:
+            return ShenzhenTransactionBody(sequence, security_id);
+        default:
+            return {};
+    }
 }
 
 class FakeMessage final : public mdl::MDLMessage {
@@ -692,6 +743,377 @@ void CheckPopulatedGeneration(
         "external binding/data/progress projections expose processing progress");
 }
 
+void CheckMainlandAShareIngressFilter(TestContext* test) {
+    constexpr std::array<std::string_view,
+                         sdk::kProductionMessageCountV1>
+        kNonAShareSecurityIds{
+            "900901", "900901", "200001", "200001", "200001"};
+    constexpr std::array<std::uint64_t,
+                         market::kRealtimeHistorySourceCountV1>
+        kOneFilteredPerProductionTuple{1U, 1U, 1U, 2U};
+
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2>
+        filtered_directory;
+    test->Expect(
+        market::ObservedInstrumentDirectoryV2::Create(
+            market::ObservedInstrumentDirectoryConfigV2{8U, 21U},
+            &filtered_directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            filtered_directory != nullptr,
+        "create default A-share-filter directory");
+    if (filtered_directory == nullptr) {
+        return;
+    }
+
+    const auto filtered_projection =
+        std::make_shared<ProjectionProbe>();
+    runtime::RealtimePipelineConfigV1 filtered_config =
+        MakeConfig(
+            filtered_directory.get(), filtered_projection);
+    test->Expect(
+        filtered_config.enable_mainland_a_share_filter,
+        "Mainland A-share admission filter defaults to enabled");
+
+    std::unique_ptr<runtime::RealtimePipelineV1> filtered_pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            filtered_config, &filtered_pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            filtered_pipeline != nullptr,
+        "create default A-share-filter pipeline: " + detail);
+    if (filtered_pipeline == nullptr) {
+        return;
+    }
+
+    const realtime::OwnedIngressMessagePoolSnapshotV1
+        pool_before_filter = filtered_pipeline->Snapshot().ingress_pool;
+    bool all_production_tuples_filtered = true;
+    for (std::size_t index = 0U;
+         index < sdk::kProductionMessageCountV1;
+         ++index) {
+        FakeMessage message(
+            sdk::kProductionMessageKeysV1[index],
+            ProductionBody(
+                index,
+                kNonAShareSecurityIds[index],
+                100U + index));
+        const runtime::RealtimePipelineIngressResultV1 result =
+            filtered_pipeline->InjectSdkMessageForTest(&message);
+        message.DestroyCallbackBytes();
+        all_production_tuples_filtered =
+            all_production_tuples_filtered &&
+            result.error ==
+                runtime::RealtimePipelineIngressErrorV1::
+                    kFilteredNonAShare &&
+            runtime::RealtimePipelineIngressErrorNameV1(
+                result.error) == "filtered_non_a_share" &&
+            !result.accepted() &&
+            result.global_ingress_sequence == 0U &&
+            result.source_sequence == 0U &&
+            result.tick_stream_sequence == 0U;
+    }
+    const runtime::RealtimePipelineSnapshotV1 after_tuple_filter =
+        filtered_pipeline->Snapshot();
+    test->Expect(
+        all_production_tuples_filtered &&
+            after_tuple_filter.accepted_messages == 0U &&
+            after_tuple_filter.filtered_messages == 5U &&
+            after_tuple_filter.filtered_messages_by_source ==
+                kOneFilteredPerProductionTuple &&
+            after_tuple_filter.global_ingress_sequence == 0U &&
+            after_tuple_filter.tick_stream_sequence == 0U &&
+            after_tuple_filter.source_sequences ==
+                std::array<std::uint64_t,
+                           market::kRealtimeHistorySourceCountV1>{} &&
+            after_tuple_filter.ingress_pool.active_messages == 0U &&
+            after_tuple_filter.ingress_pool.allocated_blocks ==
+                pool_before_filter.allocated_blocks &&
+            after_tuple_filter.ingress_pool.cached_blocks ==
+                pool_before_filter.cached_blocks &&
+            after_tuple_filter.ingress_pool.allocated_bytes ==
+                pool_before_filter.allocated_bytes &&
+            after_tuple_filter.mainland_a_share_filter_enabled &&
+            !after_tuple_filter.fatal,
+        "all five production tuples filter non-A shares before ownership "
+        "or sequence allocation");
+
+    FakeMessage first_allowed(
+        sdk::kProductionMessageKeysV1[1U],
+        ShanghaiTradeBody(901U, "600007"));
+    FakeMessage between_filtered(
+        sdk::kProductionMessageKeysV1[1U],
+        ShanghaiTradeBody(902U, "900901"));
+    FakeMessage second_allowed(
+        sdk::kProductionMessageKeysV1[1U],
+        ShanghaiTradeBody(903U, "600007"));
+    const runtime::RealtimePipelineIngressResultV1 first_result =
+        filtered_pipeline->InjectSdkMessageForTest(&first_allowed);
+    first_allowed.DestroyCallbackBytes();
+    const runtime::RealtimePipelineIngressResultV1 middle_result =
+        filtered_pipeline->InjectSdkMessageForTest(&between_filtered);
+    between_filtered.DestroyCallbackBytes();
+    const runtime::RealtimePipelineIngressResultV1 second_result =
+        filtered_pipeline->InjectSdkMessageForTest(&second_allowed);
+    second_allowed.DestroyCallbackBytes();
+    test->Expect(
+        first_result.accepted() &&
+            first_result.global_ingress_sequence == 1U &&
+            first_result.source_sequence == 1U &&
+            first_result.tick_stream_sequence == 1U &&
+            middle_result.error ==
+                runtime::RealtimePipelineIngressErrorV1::
+                    kFilteredNonAShare &&
+            middle_result.global_ingress_sequence == 0U &&
+            middle_result.source_sequence == 0U &&
+            middle_result.tick_stream_sequence == 0U &&
+            second_result.accepted() &&
+            second_result.global_ingress_sequence == 2U &&
+            second_result.source_sequence == 2U &&
+            second_result.tick_stream_sequence == 2U,
+        "allowed-filtered-allowed callbacks retain dense global, source, "
+        "and mixed-tick sequences");
+
+    const bool filtered_applied_before_cut = WaitUntil([&] {
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            filtered_pipeline->Snapshot();
+        return snapshot.fatal ||
+               (snapshot.accepted_messages == 2U &&
+                snapshot.decoded_messages == 2U &&
+                snapshot.processing_progress.accepted_sequence == 2U &&
+                snapshot.processing_progress.applied_sequence == 2U &&
+                snapshot.store.appended_records == 2U);
+    });
+    test->Expect(
+        filtered_applied_before_cut &&
+            !filtered_pipeline->Snapshot().fatal,
+        "accepted records surrounding a filter decision fully apply");
+
+    const runtime::RealtimePipelineCutResultV1 filtered_cut =
+        filtered_pipeline->CutAndPublishGeneration(5s);
+    const runtime::RealtimePipelineSnapshotV1 filtered_snapshot =
+        filtered_pipeline->Snapshot();
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        filtered_catalog;
+    const bool filtered_catalog_ready =
+        filtered_directory->AcquireSnapshot(&filtered_catalog) ==
+            market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        filtered_catalog != nullptr;
+    test->Expect(
+        filtered_applied_before_cut && filtered_cut.published() &&
+            filtered_cut.store_generation != nullptr &&
+            filtered_cut.store_generation->watermark()
+                    .processing_progress.accepted_sequence == 2U &&
+            filtered_cut.store_generation->watermark()
+                    .processing_progress.applied_sequence == 2U &&
+            filtered_snapshot.accepted_messages == 2U &&
+            filtered_snapshot.filtered_messages == 6U &&
+            filtered_snapshot.filtered_messages_by_source ==
+                std::array<std::uint64_t,
+                           market::kRealtimeHistorySourceCountV1>{
+                    1U, 2U, 1U, 2U} &&
+            filtered_snapshot.decoded_messages == 2U &&
+            filtered_snapshot.global_ingress_sequence == 2U &&
+            filtered_snapshot.tick_stream_sequence == 2U &&
+            filtered_snapshot.source_sequences ==
+                std::array<std::uint64_t,
+                           market::kRealtimeHistorySourceCountV1>{
+                    0U, 2U, 0U, 0U} &&
+            filtered_snapshot.ignored_messages == 0U &&
+            filtered_snapshot.rejected_messages == 0U &&
+            filtered_snapshot.store.appended_records == 2U &&
+            filtered_catalog_ready &&
+            filtered_catalog->bound_count() == 1U &&
+            WaitUntil([&] {
+                return filtered_projection->binding_mask() == 0b1U &&
+                       filtered_projection->applied_mask() == 0b11U &&
+                       filtered_projection->accepted() == 2U &&
+                       filtered_projection->applied() == 2U;
+            }) &&
+            !filtered_snapshot.fatal,
+        "filtered callbacks stay outside the published prefix, Store, and "
+        "observed directory");
+    filtered_pipeline->StopAndDrain();
+
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2>
+        unfiltered_directory;
+    test->Expect(
+        market::ObservedInstrumentDirectoryV2::Create(
+            market::ObservedInstrumentDirectoryConfigV2{8U, 22U},
+            &unfiltered_directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            unfiltered_directory != nullptr,
+        "create explicitly unfiltered directory");
+    if (unfiltered_directory == nullptr) {
+        return;
+    }
+
+    const auto unfiltered_projection =
+        std::make_shared<ProjectionProbe>();
+    runtime::RealtimePipelineConfigV1 unfiltered_config =
+        MakeConfig(
+            unfiltered_directory.get(), unfiltered_projection);
+    unfiltered_config.enable_mainland_a_share_filter = false;
+    std::unique_ptr<runtime::RealtimePipelineV1> unfiltered_pipeline;
+    detail.clear();
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            unfiltered_config, &unfiltered_pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            unfiltered_pipeline != nullptr,
+        "create explicitly unfiltered pipeline: " + detail);
+    if (unfiltered_pipeline == nullptr) {
+        return;
+    }
+
+    constexpr std::array<std::uint64_t,
+                         sdk::kProductionMessageCountV1>
+        kExpectedSourceSequences{1U, 1U, 1U, 1U, 2U};
+    constexpr std::array<std::uint64_t,
+                         sdk::kProductionMessageCountV1>
+        kExpectedTickSequences{0U, 1U, 0U, 2U, 3U};
+    bool all_unfiltered = true;
+    for (std::size_t index = 0U;
+         index < sdk::kProductionMessageCountV1;
+         ++index) {
+        FakeMessage message(
+            sdk::kProductionMessageKeysV1[index],
+            ProductionBody(
+                index,
+                kNonAShareSecurityIds[index],
+                200U + index));
+        const runtime::RealtimePipelineIngressResultV1 result =
+            unfiltered_pipeline->InjectSdkMessageForTest(&message);
+        message.DestroyCallbackBytes();
+        all_unfiltered =
+            all_unfiltered && result.accepted() &&
+            result.global_ingress_sequence == index + 1U &&
+            result.source_sequence ==
+                kExpectedSourceSequences[index] &&
+            result.tick_stream_sequence ==
+                kExpectedTickSequences[index];
+    }
+
+    const bool unfiltered_applied_before_cut = WaitUntil([&] {
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            unfiltered_pipeline->Snapshot();
+        return snapshot.fatal ||
+               (snapshot.accepted_messages == 5U &&
+                snapshot.decoded_messages == 5U &&
+                snapshot.processing_progress.accepted_sequence == 5U &&
+                snapshot.processing_progress.applied_sequence == 5U &&
+                snapshot.store.appended_records == 5U);
+    });
+    test->Expect(
+        unfiltered_applied_before_cut &&
+            !unfiltered_pipeline->Snapshot().fatal,
+        "all explicitly unfiltered production tuples fully apply");
+
+    const runtime::RealtimePipelineCutResultV1 unfiltered_cut =
+        unfiltered_pipeline->CutAndPublishGeneration(5s);
+    const runtime::RealtimePipelineSnapshotV1 unfiltered_snapshot =
+        unfiltered_pipeline->Snapshot();
+    std::shared_ptr<
+        const market::ObservedInstrumentCatalogSnapshotV2>
+        unfiltered_catalog;
+    const bool unfiltered_catalog_ready =
+        unfiltered_directory->AcquireSnapshot(&unfiltered_catalog) ==
+            market::ObservedInstrumentDirectoryErrorV2::kNone &&
+        unfiltered_catalog != nullptr;
+    test->Expect(
+        all_unfiltered && unfiltered_applied_before_cut &&
+            unfiltered_cut.published() &&
+            unfiltered_cut.store_generation != nullptr &&
+            unfiltered_cut.store_generation->watermark()
+                    .processing_progress.accepted_sequence == 5U &&
+            unfiltered_cut.store_generation->watermark()
+                    .processing_progress.applied_sequence == 5U &&
+            unfiltered_snapshot.accepted_messages == 5U &&
+            unfiltered_snapshot.filtered_messages == 0U &&
+            unfiltered_snapshot.filtered_messages_by_source ==
+                std::array<std::uint64_t,
+                           market::kRealtimeHistorySourceCountV1>{} &&
+            unfiltered_snapshot.decoded_messages == 5U &&
+            unfiltered_snapshot.global_ingress_sequence == 5U &&
+            unfiltered_snapshot.tick_stream_sequence == 3U &&
+            unfiltered_snapshot.source_sequences ==
+                std::array<std::uint64_t,
+                           market::kRealtimeHistorySourceCountV1>{
+                    1U, 1U, 1U, 2U} &&
+            unfiltered_snapshot.ignored_messages == 0U &&
+            unfiltered_snapshot.rejected_messages == 0U &&
+            unfiltered_snapshot.store.appended_records == 5U &&
+            !unfiltered_snapshot.mainland_a_share_filter_enabled &&
+            unfiltered_catalog_ready &&
+            unfiltered_catalog->bound_count() == 2U &&
+            WaitUntil([&] {
+                return unfiltered_projection->binding_mask() == 0b11U &&
+                       unfiltered_projection->applied_mask() == 0b11111U &&
+                       unfiltered_projection->accepted() == 5U &&
+                       unfiltered_projection->applied() == 5U;
+            }) &&
+            !unfiltered_snapshot.fatal,
+        "explicitly disabling the filter restores admission for every "
+        "production tuple");
+    unfiltered_pipeline->StopAndDrain();
+
+    std::unique_ptr<market::ObservedInstrumentDirectoryV2>
+        malformed_directory;
+    test->Expect(
+        market::ObservedInstrumentDirectoryV2::Create(
+            market::ObservedInstrumentDirectoryConfigV2{2U, 23U},
+            &malformed_directory) ==
+                market::ObservedInstrumentDirectoryErrorV2::kNone &&
+            malformed_directory != nullptr,
+        "create malformed-key directory");
+    if (malformed_directory == nullptr) {
+        return;
+    }
+    const auto malformed_projection =
+        std::make_shared<ProjectionProbe>();
+    std::unique_ptr<runtime::RealtimePipelineV1> malformed_pipeline;
+    detail.clear();
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            MakeConfig(
+                malformed_directory.get(), malformed_projection),
+            &malformed_pipeline,
+            &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            malformed_pipeline != nullptr,
+        "create malformed-key pipeline: " + detail);
+    if (malformed_pipeline == nullptr) {
+        return;
+    }
+
+    FakeMessage malformed(
+        sdk::kProductionMessageKeysV1[0U],
+        std::vector<std::byte>(10U, std::byte{0U}));
+    const runtime::RealtimePipelineIngressResultV1 malformed_result =
+        malformed_pipeline->InjectSdkMessageForTest(&malformed);
+    const runtime::RealtimePipelineSnapshotV1 malformed_snapshot =
+        malformed_pipeline->Snapshot();
+    test->Expect(
+        malformed_result.error ==
+                runtime::RealtimePipelineIngressErrorV1::
+                    kInstrumentKeyRejected &&
+            !malformed_result.accepted() &&
+            malformed_result.global_ingress_sequence == 0U &&
+            malformed_result.source_sequence == 0U &&
+            malformed_result.tick_stream_sequence == 0U &&
+            malformed_snapshot.accepted_messages == 0U &&
+            malformed_snapshot.filtered_messages == 0U &&
+            malformed_snapshot.rejected_messages == 1U &&
+            malformed_snapshot.global_ingress_sequence == 0U &&
+            malformed_snapshot.last_decode_error ==
+                market::MarketDecodeErrorV1::kTruncated &&
+            malformed_snapshot.fatal,
+        "malformed required key data fails closed and is not counted as "
+        "a normal filter decision");
+    malformed_pipeline->StopAndDrain();
+}
+
 void CheckExplicitAppliedDispatchWindow(
     TestContext* test) {
     std::unique_ptr<market::ObservedInstrumentDirectoryV2> directory;
@@ -1107,6 +1529,7 @@ int main() {
     CheckEmptyGeneration(&test, pipeline.get());
     CheckPopulatedGeneration(
         &test, pipeline.get(), directory.get(), projection);
+    CheckMainlandAShareIngressFilter(&test);
 
     const runtime::RealtimePipelineSnapshotV1 before_stop =
         pipeline->Snapshot();
