@@ -1,5 +1,7 @@
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
+#include "l2flow/common/sha256.h"
+#include "l2flow/control/quality_flags_v1.h"
 #include "l2flow/market/mainland_a_share_filter_v1.h"
 #include "l2flow/runtime/detail/closeable_publication_gate.h"
 #include "l2flow/sdk/direct_sdk_runtime_v1.h"
@@ -9,15 +11,19 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <semaphore>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -25,14 +31,19 @@ namespace l2flow::runtime {
 namespace {
 
 namespace factor = l2flow::factor;
+namespace common = l2flow::common;
+namespace control = l2flow::control;
 namespace market = l2flow::market;
 namespace realtime = l2flow::realtime;
+namespace recovery = l2flow::recovery;
 namespace sdk = l2flow::sdk;
 namespace mdl = datayes::mdl;
 
 constexpr auto kMaximumCutTimeout = std::chrono::hours(24);
 constexpr auto kProgressPublishMaximumDelay =
     std::chrono::milliseconds(1);
+constexpr auto kStartupQueueRetryDelay =
+    std::chrono::microseconds(100);
 
 void ClearDetail(std::string* detail) noexcept {
     if (detail == nullptr) {
@@ -99,6 +110,367 @@ MainlandExchangeForMarket(market::MarketV1 value) noexcept {
     }
     return market::MainlandExchangeV1::kUnknown;
 }
+
+[[nodiscard]] std::optional<std::size_t> ProductionTupleIndex(
+    const sdk::MessageKey& key) noexcept {
+    for (std::size_t index = 0U;
+         index < sdk::kProductionMessageKeysV1.size();
+         ++index) {
+        if (sdk::kProductionMessageKeysV1[index] == key) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+// Hashes the decoder-observable payload rather than vendor body storage.
+// MDL string/list offsets are allocation-layout details, and the V4 Shanghai
+// order-queue CSV omits OrderQueOper/OrderQueID (which the decoder deliberately
+// does not publish). They must not manufacture a closed-handoff conflict.
+class StartupSemanticHasher final {
+public:
+    explicit StartupSemanticHasher(
+        bool normalize_shenzhen_snapshot_channel) noexcept
+        : normalize_shenzhen_snapshot_channel_(
+              normalize_shenzhen_snapshot_channel) {}
+
+    template <typename Integer>
+    void IntegerValue(Integer value) noexcept {
+        static_assert(
+            std::is_integral_v<Integer> &&
+            !std::is_same_v<Integer, bool>);
+        if (!ok_) {
+            return;
+        }
+        ok_ = hasher_.Update(
+            std::as_bytes(std::span(&value, 1U)));
+    }
+
+    template <typename Enum>
+    void EnumValue(Enum value) noexcept {
+        static_assert(std::is_enum_v<Enum>);
+        IntegerValue(
+            static_cast<std::underlying_type_t<Enum>>(value));
+    }
+
+    void BoolValue(bool value) noexcept {
+        IntegerValue<std::uint8_t>(value ? 1U : 0U);
+    }
+
+    void StringValue(std::string_view value) noexcept {
+        IntegerValue<std::uint64_t>(
+            static_cast<std::uint64_t>(value.size()));
+        if (ok_) {
+            ok_ = hasher_.Update(std::as_bytes(std::span(value)));
+        }
+    }
+
+    void Decimal(const market::DecimalValueV1& value) noexcept {
+        IntegerValue(value.raw);
+        IntegerValue(value.normalized_p6);
+        IntegerValue(value.scale);
+        BoolValue(value.valid);
+        BoolValue(value.is_null);
+    }
+
+    void Quantity(const market::QuantityValueV1& value) noexcept {
+        IntegerValue(value.raw);
+        IntegerValue(value.scale);
+        BoolValue(value.valid);
+        BoolValue(value.is_null);
+    }
+
+    void Unsigned(const market::UnsignedValueV1& value) noexcept {
+        IntegerValue(value.raw);
+        BoolValue(value.valid);
+    }
+
+    void Time(const market::TimeValueV1& value) noexcept {
+        IntegerValue(value.raw_hhmmssmmm);
+        IntegerValue(value.nanoseconds_since_midnight);
+        IntegerValue(value.unix_nanoseconds);
+        BoolValue(value.valid);
+        BoolValue(value.is_null);
+        BoolValue(value.unix_nanoseconds_valid);
+    }
+
+    void Common(const market::DecodedMarketCommonV1& value) noexcept {
+        EnumValue(value.kind);
+        EnumValue(value.market);
+        Time(value.exchange_time);
+        Time(value.vendor_local_time);
+        StringValue(value.security_id);
+        StringValue(value.security_id_source);
+        StringValue(value.md_stream_id);
+        BoolValue(value.security_id_valid);
+        BoolValue(value.security_id_source_valid);
+        BoolValue(value.md_stream_id_valid);
+        EnumValue(value.quantity_unit);
+        EnumValue(value.security_type);
+        EnumValue(value.asset_scope);
+        // A nonzero offset for an empty dynamic field is a wire-layout
+        // diagnostic, not a semantic difference. CSV reconstruction uses the
+        // canonical zero offset, while an equivalent live SDK body need not.
+        IntegerValue(
+            value.quality_flags &
+            ~control::QualityBit(
+                control::QualityFlagV1::
+                    kNoncanonicalEmptyOffset));
+        IntegerValue(value.market_notices);
+    }
+
+    void BookLevel(const market::BookLevelV1& value) noexcept {
+        Decimal(value.price);
+        Quantity(value.quantity);
+        IntegerValue(value.order_count);
+        BoolValue(value.order_count_valid);
+    }
+
+    void BestQueue(const market::BestQueueV1& value) noexcept {
+        IntegerValue(value.total_order_count);
+        IntegerValue(value.actual_revealed_count);
+        IntegerValue(value.retained_count);
+        for (const auto& quantity : value.quantities) {
+            Quantity(quantity);
+        }
+    }
+
+    void Book(const market::SnapshotBookV1& value) noexcept {
+        IntegerValue(value.actual_bid_depth);
+        IntegerValue(value.actual_ask_depth);
+        IntegerValue(value.retained_bid_depth);
+        IntegerValue(value.retained_ask_depth);
+        for (const auto& level : value.bids) {
+            BookLevel(level);
+        }
+        for (const auto& level : value.asks) {
+            BookLevel(level);
+        }
+        BestQueue(value.bid1_queue);
+        BestQueue(value.ask1_queue);
+    }
+
+    void Tick(
+        const market::TickFieldsV1& value,
+        bool include_phase = true) noexcept {
+        EnumValue(value.action);
+        EnumValue(value.side);
+        EnumValue(value.order_type);
+        EnumValue(value.aggressor);
+        if (include_phase) {
+            EnumValue(value.phase);
+        }
+        Decimal(value.price);
+        Quantity(value.quantity);
+        Decimal(value.trade_amount);
+        Quantity(value.matched_quantity);
+        IntegerValue(value.primary_order_id);
+        IntegerValue(value.buy_order_id);
+        IntegerValue(value.sell_order_id);
+        IntegerValue(
+            include_phase
+                ? value.validity_bitmap
+                : value.validity_bitmap &
+                      ~market::kTickPhaseValidV1);
+    }
+
+    void Event(const market::ShanghaiSnapshotV1& value) noexcept {
+        Common(value.common);
+        IntegerValue(value.image_status);
+        StringValue(value.instrument_status);
+        BoolValue(value.instrument_status_valid);
+        Decimal(value.pre_close_price);
+        Decimal(value.open_price);
+        Decimal(value.high_price);
+        Decimal(value.low_price);
+        Decimal(value.last_price);
+        Decimal(value.close_price);
+        IntegerValue(value.trade_count);
+        Quantity(value.trade_volume);
+        Decimal(value.turnover);
+        Quantity(value.total_bid_volume);
+        Decimal(value.weighted_average_bid_price);
+        Decimal(value.alternate_weighted_average_bid_price);
+        Quantity(value.total_ask_volume);
+        Decimal(value.weighted_average_ask_price);
+        Decimal(value.alternate_weighted_average_ask_price);
+        Unsigned(value.vendor_etf_buy_count);
+        Quantity(value.vendor_etf_buy_quantity);
+        Decimal(value.vendor_etf_buy_amount);
+        Unsigned(value.vendor_etf_sell_count);
+        Quantity(value.vendor_etf_sell_quantity);
+        Decimal(value.vendor_etf_sell_amount);
+        Decimal(value.yield_to_maturity);
+        Quantity(value.total_warrant_exercise_quantity);
+        Decimal(value.vendor_war_lower_value);
+        Decimal(value.vendor_war_upper_value);
+        IntegerValue(value.withdrawal_buy_count);
+        Quantity(value.withdrawal_buy_volume);
+        Decimal(value.withdrawal_buy_amount);
+        IntegerValue(value.withdrawal_sell_count);
+        Quantity(value.withdrawal_sell_volume);
+        Decimal(value.withdrawal_sell_amount);
+        IntegerValue(value.total_bid_order_count);
+        IntegerValue(value.total_ask_order_count);
+        Unsigned(value.maximum_bid_duration);
+        Unsigned(value.maximum_ask_duration);
+        Decimal(value.iopv);
+        Book(value.book);
+    }
+
+    void Event(const market::ShanghaiTickV1& value) noexcept {
+        Common(value.common);
+        IntegerValue(value.business_index);
+        IntegerValue(value.channel);
+        StringValue(value.raw_type);
+        StringValue(value.raw_tick_flag);
+        BoolValue(value.raw_type_valid);
+        BoolValue(value.raw_tick_flag_valid);
+        // phase and its validity bit are inherited from prior S records for
+        // A/D/T messages. raw_type/raw_tick_flag already bind the current
+        // body's status semantics, so history-derived phase is excluded.
+        Tick(value.fields, false);
+    }
+
+    void Event(const market::ShenzhenSnapshotV1& value) noexcept {
+        Common(value.common);
+        // V4 mdl_6_28_0 has no ChannelNo. Zero both sides only for this
+        // explicitly documented unavailable source field.
+        IntegerValue(
+            normalize_shenzhen_snapshot_channel_
+                ? std::uint32_t{0U}
+                : value.channel);
+        StringValue(value.trading_phase_code);
+        BoolValue(value.trading_phase_code_valid);
+        Decimal(value.pre_close_price);
+        IntegerValue(value.trade_count);
+        Quantity(value.volume);
+        Decimal(value.turnover);
+        Decimal(value.last_price);
+        Decimal(value.open_price);
+        Decimal(value.high_price);
+        Decimal(value.low_price);
+        Decimal(value.price_change_1);
+        Decimal(value.price_change_2);
+        Decimal(value.pe_ratio_1);
+        Decimal(value.pe_ratio_2);
+        Decimal(value.pre_close_iopv);
+        Decimal(value.iopv);
+        Quantity(value.total_ask_quantity);
+        Decimal(value.weighted_average_ask_price);
+        Quantity(value.total_bid_quantity);
+        Decimal(value.weighted_average_bid_price);
+        Decimal(value.high_limit_price);
+        Decimal(value.low_limit_price);
+        EnumValue(value.high_limit_semantics);
+        EnumValue(value.low_limit_semantics);
+        Quantity(value.open_interest);
+        Decimal(value.vendor_opt_premium_ratio);
+        Book(value.book);
+    }
+
+    void Event(const market::ShenzhenOrderV1& value) noexcept {
+        Common(value.common);
+        IntegerValue(value.channel);
+        IntegerValue(value.application_sequence);
+        IntegerValue(value.raw_side);
+        IntegerValue(value.raw_order_type);
+        Tick(value.fields);
+    }
+
+    void Event(const market::ShenzhenTransactionV1& value) noexcept {
+        Common(value.common);
+        IntegerValue(value.channel);
+        IntegerValue(value.application_sequence);
+        IntegerValue(value.raw_execution_type);
+        Tick(value.fields);
+    }
+
+    [[nodiscard]] bool Finalize(
+        common::Sha256Digest* output) noexcept {
+        return ok_ && hasher_.Finalize(output);
+    }
+
+private:
+    common::Sha256Hasher hasher_;
+    bool normalize_shenzhen_snapshot_channel_ = false;
+    bool ok_ = true;
+};
+
+[[nodiscard]] bool CanonicalDecodedDigest(
+    const market::DecodedMarketEventV1& event,
+    bool normalize_shenzhen_snapshot_channel,
+    common::Sha256Digest* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    StartupSemanticHasher hasher(
+        normalize_shenzhen_snapshot_channel);
+    std::visit(
+        [&hasher](const auto& value) noexcept {
+            hasher.Event(value);
+        },
+        event);
+    return hasher.Finalize(output);
+}
+
+class BufferedStartupMessage final : public mdl::MDLMessage {
+public:
+    BufferedStartupMessage(
+        const realtime::OwnedIngressMessageInspectionV1& inspection,
+        std::uint64_t recv_realtime_ns,
+        std::uint64_t recv_monotonic_ns,
+        std::uint64_t tuple_callback_serial)
+        : body_(inspection.body().begin(), inspection.body().end()),
+          recv_realtime_ns_(recv_realtime_ns),
+          recv_monotonic_ns_(recv_monotonic_ns),
+          tuple_callback_serial_(tuple_callback_serial) {
+        std::memcpy(
+            &head_,
+            inspection.vendor_head_bytes().data(),
+            sizeof(head_));
+    }
+
+    void AddRef() override {}
+    int ReleaseRef() override { return 1; }
+
+    [[nodiscard]] mdl::MDLMessageHead* GetHead() const override {
+        return const_cast<mdl::MDLMessageHead*>(&head_);
+    }
+
+    [[nodiscard]] char* GetBody() const override {
+        if (body_.empty()) {
+            return nullptr;
+        }
+        return reinterpret_cast<char*>(
+            const_cast<std::byte*>(body_.data()));
+    }
+
+    [[nodiscard]] mdl::MDLMessage* _Copy() const override {
+        return nullptr;
+    }
+
+    [[nodiscard]] std::uint64_t recv_realtime_ns() const noexcept {
+        return recv_realtime_ns_;
+    }
+    [[nodiscard]] std::uint64_t recv_monotonic_ns() const noexcept {
+        return recv_monotonic_ns_;
+    }
+    [[nodiscard]] std::size_t wire_size() const noexcept {
+        return sizeof(head_) + body_.size();
+    }
+    [[nodiscard]] std::uint64_t tuple_callback_serial()
+        const noexcept {
+        return tuple_callback_serial_;
+    }
+
+private:
+    mdl::MDLMessageHead head_{};
+    std::vector<std::byte> body_;
+    std::uint64_t recv_realtime_ns_ = 0U;
+    std::uint64_t recv_monotonic_ns_ = 0U;
+    std::uint64_t tuple_callback_serial_ = 0U;
+};
 
 [[nodiscard]] bool ReadClockNs(clockid_t clock,
                                std::uint64_t* output) noexcept {
@@ -1004,6 +1376,21 @@ std::string_view RealtimePipelineCreateErrorNameV1(
             return "resource_exhausted";
         case RealtimePipelineCreateErrorV1::kUnexpectedFailure:
             return "unexpected_failure";
+        case RealtimePipelineCreateErrorV1::kStartupReplayFailed:
+            return "startup_replay_failed";
+        case RealtimePipelineCreateErrorV1::kStartupBufferOverflow:
+            return "startup_buffer_overflow";
+        case RealtimePipelineCreateErrorV1::kStartupOverlapMissing:
+            return "startup_overlap_missing";
+        case RealtimePipelineCreateErrorV1::kStartupOverlapConflict:
+            return "startup_overlap_conflict";
+        case RealtimePipelineCreateErrorV1::
+            kStartupBackpressureTimeout:
+            return "startup_backpressure_timeout";
+        case RealtimePipelineCreateErrorV1::kStartupWarmupTimeout:
+            return "startup_warmup_timeout";
+        case RealtimePipelineCreateErrorV1::kStartupCancelled:
+            return "startup_cancelled";
     }
     return "unknown";
 }
@@ -1081,7 +1468,9 @@ std::string_view RealtimePipelineCutErrorNameV1(
     return "unknown";
 }
 
-class RealtimePipelineV1::Impl final : public mdl::MessageHandlerBase {
+class RealtimePipelineV1::Impl final
+    : public mdl::MessageHandlerBase,
+      public recovery::StartupReplaySinkV1 {
 public:
     struct CallbackClockObservation final {
         std::uint64_t realtime_ns = 0U;
@@ -1106,8 +1495,40 @@ public:
         realtime::OwnedIngressMessageHandleV1 message;
         market::DailyInstrumentIdentityViewV2 identity{};
         std::uint64_t generation = 0U;
+        std::uint64_t additional_market_notices = 0U;
         std::uint64_t callback_entry_monotonic_ns = 0U;
         std::uint64_t queue_publish_monotonic_ns = 0U;
+    };
+
+    enum class StartupState : std::uint8_t {
+        kInactive = 0U,
+        kBuffering,
+        kDirect,
+        kFailed,
+    };
+
+    enum class StartupFailure : std::uint8_t {
+        kNone = 0U,
+        kCallback,
+        kBufferOverflow,
+        kReplay,
+        kOverlapMissing,
+        kOverlapConflict,
+        kBackpressureTimeout,
+        kWarmupTimeout,
+        kCancelled,
+    };
+
+    enum class StartupTupleHandoffPhase : std::uint8_t {
+        kSeekingOverlap = 0U,
+        kOverlap,
+        kLiveSuffix,
+    };
+
+    struct StartupReplayFingerprint final {
+        std::uint64_t vendor_sequence_id = 0U;
+        bool normalize_shenzhen_snapshot_channel = false;
+        common::Sha256Digest body_digest{};
     };
 
     class DecoderQueue final {
@@ -1542,6 +1963,19 @@ public:
                     return RealtimePipelineCreateErrorV1::
                         kInvalidConfiguration;
                 }
+                if (config_.startup_replay_source != nullptr) {
+                    startup_fingerprint_decoders_[source] =
+                        std::make_unique<market::MarketDecoderV1>(
+                            decoder_config);
+                    if (!startup_fingerprint_decoders_[source]
+                             ->configuration_valid()) {
+                        SetDetailLiteral(
+                            detail,
+                            "startup fingerprint decoder configuration is invalid");
+                        return RealtimePipelineCreateErrorV1::
+                            kInvalidConfiguration;
+                    }
+                }
             }
 
             if (!StartDecoderThreads()) {
@@ -1549,6 +1983,9 @@ public:
                 return RealtimePipelineCreateErrorV1::
                     kDecoderThreadStartFailed;
             }
+            progress_publication_enabled_.store(
+                config_.startup_replay_source == nullptr,
+                std::memory_order_release);
             if (!StartProgressThread()) {
                 SetDetailLiteral(
                     detail,
@@ -1561,6 +1998,24 @@ public:
                 StartSdk(factory_is_test_override, detail);
             if (sdk_error != RealtimePipelineCreateErrorV1::kNone) {
                 return sdk_error;
+            }
+            if (config_.startup_replay_source != nullptr) {
+                // Recovery Create is also the external query-readiness
+                // boundary. Commit the fully applied handoff prefix to the
+                // mutable progress header synchronously before the owning
+                // application can activate its control socket.
+                if (!PublishProcessingProgressNow()) {
+                    SetDetailLiteral(
+                        detail,
+                        "startup recovered progress prefix could not be published");
+                    return RealtimePipelineCreateErrorV1::
+                        kStartupReplayFailed;
+                }
+                progress_publication_enabled_.store(
+                    true, std::memory_order_release);
+                // Cover any direct callback that raced the exact synchronous
+                // sample after the closed handoff.
+                RequestProgressPublication();
             }
             ClearDetail(detail);
             return RealtimePipelineCreateErrorV1::kNone;
@@ -1602,8 +2057,32 @@ public:
         RealtimePipelineIngressErrorV1 callback_error =
             RealtimePipelineIngressErrorV1::kStopped;
         if (!callback_gate_closed_.load(std::memory_order_acquire)) {
-            callback_error =
-                Ingest(message, callback_entry_pointer).error;
+            if (config_.startup_replay_source == nullptr) {
+                // Preserve the literal no-recovery callback hot path.
+                callback_error =
+                    Ingest(message, callback_entry_pointer).error;
+            } else if (startup_direct_.load(
+                           std::memory_order_acquire)) {
+                callback_error = HandleRecoveryDirectCallback(
+                    message, callback_entry_pointer);
+            } else {
+                startup_callback_pending_.fetch_add(
+                    1U, std::memory_order_acq_rel);
+                std::unique_lock<std::mutex> startup(startup_mutex_);
+                if (startup_state_ == StartupState::kBuffering) {
+                    callback_error = BufferStartupCallback(
+                        message, callback_entry_pointer);
+                } else if (startup_state_ == StartupState::kDirect) {
+                    // The same mutex linearizes the final buffered callback
+                    // with the first direct callback. With one SDK I/O thread,
+                    // this also preserves the vendor callback order exactly.
+                    callback_error = HandleRecoveryDirectCallback(
+                        message, callback_entry_pointer);
+                }
+                startup.unlock();
+                startup_callback_pending_.fetch_sub(
+                    1U, std::memory_order_acq_rel);
+            }
         }
         last_callback_error_.store(
             static_cast<std::uint8_t>(callback_error),
@@ -1614,9 +2093,894 @@ public:
         }
     }
 
+    [[nodiscard]] RealtimePipelineIngressErrorV1
+    BufferStartupCallback(
+        const mdl::MDLMessage* message,
+        const CallbackClockObservation* callback_entry) noexcept {
+        // startup_mutex_ is held. This path intentionally performs only the
+        // vendor inspection and one independent deep copy. It does not touch
+        // catalog/filter/sequence/decoder/History state.
+        realtime::OwnedIngressMessageInspectionV1 inspection{};
+        const realtime::OwnedIngressMessageErrorV1 inspection_error =
+            realtime::InspectOwnedIngressMessageV1(
+                message,
+                config_.maximum_sdk_message_bytes,
+                &inspection);
+        if (inspection_error ==
+            realtime::OwnedIngressMessageErrorV1::kUnsupportedMessage) {
+            ++startup_ignored_messages_;
+            return RealtimePipelineIngressErrorV1::kIgnoredUnsupported;
+        }
+        if (inspection_error !=
+                realtime::OwnedIngressMessageErrorV1::kNone ||
+            !inspection) {
+            startup_callback_owned_error_ = inspection_error;
+            startup_failure_ = StartupFailure::kCallback;
+            startup_state_ = StartupState::kFailed;
+            return inspection_error ==
+                           realtime::OwnedIngressMessageErrorV1::
+                               kForbiddenCombinedTick
+                       ? RealtimePipelineIngressErrorV1::
+                             kForbiddenCombinedTick
+                       : RealtimePipelineIngressErrorV1::
+                             kOwnedMessageRejected;
+        }
+
+        std::uint64_t realtime_ns = 0U;
+        std::uint64_t monotonic_ns = 0U;
+        bool clocks_valid = false;
+        if (callback_entry != nullptr) {
+            realtime_ns = callback_entry->realtime_ns;
+            monotonic_ns = callback_entry->monotonic_ns;
+            clocks_valid = callback_entry->valid;
+        } else {
+            clocks_valid =
+                ReadClockNs(CLOCK_REALTIME, &realtime_ns) &&
+                ReadClockNs(CLOCK_MONOTONIC, &monotonic_ns);
+        }
+        if (!clocks_valid) {
+            startup_failure_ = StartupFailure::kCallback;
+            startup_state_ = StartupState::kFailed;
+            return RealtimePipelineIngressErrorV1::kClockFailure;
+        }
+
+        const std::uint64_t wire_size =
+            static_cast<std::uint64_t>(inspection.wire_size());
+        if (startup_buffered_message_count_ >=
+                config_.startup_live_buffer_maximum_messages ||
+            wire_size >
+                config_.startup_live_buffer_maximum_bytes -
+                    startup_buffered_wire_bytes_) {
+            startup_failure_ = StartupFailure::kBufferOverflow;
+            startup_state_ = StartupState::kFailed;
+            return RealtimePipelineIngressErrorV1::
+                kOwnedMessageRejected;
+        }
+        const std::optional<std::size_t> tuple =
+            ProductionTupleIndex(inspection.key());
+        if (!tuple.has_value() ||
+            startup_tuple_callback_counts_[*tuple] ==
+                std::numeric_limits<std::uint64_t>::max()) {
+            startup_failure_ = StartupFailure::kCallback;
+            startup_state_ = StartupState::kFailed;
+            return RealtimePipelineIngressErrorV1::
+                kOwnedMessageRejected;
+        }
+        const std::uint64_t tuple_callback_serial =
+            startup_tuple_callback_counts_[*tuple] + 1U;
+        try {
+            startup_buffer_.push_back(
+                std::make_unique<BufferedStartupMessage>(
+                    inspection,
+                    realtime_ns,
+                    monotonic_ns,
+                    tuple_callback_serial));
+        } catch (...) {
+            startup_failure_ = StartupFailure::kBufferOverflow;
+            startup_state_ = StartupState::kFailed;
+            return RealtimePipelineIngressErrorV1::
+                kOwnedMessageRejected;
+        }
+        startup_tuple_callback_counts_[*tuple] =
+            tuple_callback_serial;
+        ++startup_buffered_message_count_;
+        startup_buffered_wire_bytes_ += wire_size;
+        return RealtimePipelineIngressErrorV1::kNone;
+    }
+
+    [[nodiscard]] bool CaptureTupleFence(
+        const sdk::MessageKey& key,
+        std::string* detail) noexcept override {
+        ClearDetail(detail);
+        try {
+            if (StartupCancellationRequested()) {
+                SetStartupFailure(StartupFailure::kCancelled);
+                SetDetailLiteral(
+                    detail,
+                    "startup recovery was cancelled before CSV cutoff capture");
+                return false;
+            }
+            const std::optional<std::size_t> tuple =
+                ProductionTupleIndex(key);
+            if (!tuple.has_value()) {
+                SetDetailLiteral(
+                    detail,
+                    "startup replay requested a fence for an unsupported tuple");
+                return false;
+            }
+            std::lock_guard<std::mutex> startup(startup_mutex_);
+            if (startup_state_ != StartupState::kBuffering ||
+                startup_failure_ != StartupFailure::kNone ||
+                startup_tuple_fence_captured_[*tuple]) {
+                SetDetailLiteral(
+                    detail,
+                    "startup replay tuple fence is duplicate or outside buffering state");
+                return false;
+            }
+            startup_tuple_fence_serials_[*tuple] =
+                startup_tuple_callback_counts_[*tuple];
+            startup_tuple_fence_captured_[*tuple] = true;
+            return true;
+        } catch (...) {
+            SetStartupFailure(StartupFailure::kReplay);
+            SetDetailLiteral(
+                detail,
+                "startup replay tuple fence failed unexpectedly");
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool Publish(
+        const recovery::StartupReplayPublicationV1& publication,
+        std::string* detail) noexcept override {
+        ClearDetail(detail);
+        try {
+            if (StartupCancellationRequested()) {
+                SetStartupFailure(StartupFailure::kCancelled);
+                SetDetailLiteral(
+                    detail,
+                    "startup recovery was cancelled during CSV replay");
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> startup(startup_mutex_);
+                if (startup_state_ != StartupState::kBuffering ||
+                    startup_failure_ != StartupFailure::kNone) {
+                    SetDetailLiteral(
+                        detail,
+                        "startup live buffer failed while CSV replay was running");
+                    return false;
+                }
+            }
+            if (publication.message == nullptr ||
+                (publication.provenance_flags &
+                 recovery::kStartupReplayProvenanceCsvV1) == 0U) {
+                SetStartupFailure(StartupFailure::kReplay);
+                SetDetailLiteral(
+                    detail,
+                    "startup replay publication has invalid provenance");
+                return false;
+            }
+            constexpr std::uint64_t kKnownReplayNotices =
+                recovery::
+                    kStartupReplayNoticeShenzhenSnapshotChannelUnavailableV1 |
+                recovery::
+                    kStartupReplayNoticeShanghaiOrderQueueMetadataUnavailableV1;
+            if ((publication.market_notice_flags &
+                 ~kKnownReplayNotices) != 0U) {
+                SetStartupFailure(StartupFailure::kReplay);
+                SetDetailLiteral(
+                    detail,
+                    "startup replay publication has an unknown market notice");
+                return false;
+            }
+            const std::optional<std::size_t> tuple =
+                ProductionTupleIndex(publication.key);
+            if (!tuple.has_value()) {
+                SetStartupFailure(StartupFailure::kReplay);
+                SetDetailLiteral(
+                    detail,
+                    "startup replay publication is outside the production message catalog");
+                return false;
+            }
+
+            realtime::OwnedIngressMessageInspectionV1 inspection{};
+            const realtime::OwnedIngressMessageErrorV1 inspection_error =
+                realtime::InspectOwnedIngressMessageV1(
+                    publication.message,
+                    config_.maximum_sdk_message_bytes,
+                    &inspection);
+            if (inspection_error !=
+                    realtime::OwnedIngressMessageErrorV1::kNone ||
+                !inspection ||
+                inspection.key() != publication.key) {
+                SetStartupFailure(StartupFailure::kReplay);
+                SetDetail(
+                    detail,
+                    "startup replay SDK message inspection failed: " +
+                        std::string(
+                            realtime::OwnedIngressMessageErrorNameV1(
+                                inspection_error)));
+                return false;
+            }
+
+            StartupReplayFingerprint fingerprint{};
+            fingerprint.vendor_sequence_id =
+                inspection.vendor_head().sequence_id();
+            if (publication.csv_sequence !=
+                    fingerprint.vendor_sequence_id ||
+                fingerprint.vendor_sequence_id == 0U) {
+                SetStartupFailure(StartupFailure::kReplay);
+                SetDetailLiteral(
+                    detail,
+                    "startup replay CSV SeqNo differs from the SDK SequenceID or is zero");
+                return false;
+            }
+            fingerprint.normalize_shenzhen_snapshot_channel =
+                (publication.market_notice_flags &
+                 recovery::
+                     kStartupReplayNoticeShenzhenSnapshotChannelUnavailableV1) !=
+                0U;
+            if (!CanonicalStartupMessageDigest(
+                    inspection,
+                    fingerprint
+                        .normalize_shenzhen_snapshot_channel,
+                    &fingerprint.body_digest)) {
+                SetStartupFailure(StartupFailure::kReplay);
+                SetDetailLiteral(
+                    detail,
+                    "startup replay payload digest failed");
+                return false;
+            }
+            const StartupReplayFingerprint* existing =
+                FindReplayFingerprint(
+                    *tuple, fingerprint.vendor_sequence_id);
+            if (existing != nullptr) {
+                const bool exact =
+                    existing->body_digest == fingerprint.body_digest;
+                SetStartupFailure(
+                    exact ? StartupFailure::kReplay
+                          : StartupFailure::kOverlapConflict);
+                SetDetailLiteral(
+                    detail,
+                    exact
+                        ? "startup replay contains a duplicate tuple/SequenceID"
+                        : "startup replay contains the same tuple/SequenceID with different payloads");
+                return false;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= startup_warmup_deadline_) {
+                SetStartupFailure(StartupFailure::kWarmupTimeout);
+                SetDetailLiteral(
+                    detail,
+                    "startup replay exceeded the warmup timeout");
+                return false;
+            }
+            const auto backpressure_deadline = std::min(
+                startup_warmup_deadline_,
+                now + config_.startup_replay_backpressure_timeout);
+            if (!WaitForStartupPipelineCapacity(
+                    backpressure_deadline)) {
+                SetStartupFailure(
+                    StartupCancellationRequested()
+                        ? StartupFailure::kCancelled
+                        : std::chrono::steady_clock::now() >=
+                            backpressure_deadline
+                        ? StartupFailure::
+                              kBackpressureTimeout
+                        : StartupFailure::kReplay);
+                SetDetailLiteral(
+                    detail,
+                    StartupCancellationRequested()
+                        ? "startup recovery was cancelled while waiting for downstream History capacity"
+                        : "startup replay could not obtain downstream History capacity");
+                return false;
+            }
+            std::uint64_t additional_notices =
+                market::MarketNoticeBitV1(
+                    market::MarketNoticeV1::kRecoveredFromCsv);
+            if ((publication.market_notice_flags &
+                 kKnownReplayNotices) !=
+                0U) {
+                additional_notices |= market::MarketNoticeBitV1(
+                    market::MarketNoticeV1::
+                        kCsvSourceFieldUnavailable);
+            }
+            const RealtimePipelineIngressResultV1 ingress = Ingest(
+                publication.message,
+                nullptr,
+                additional_notices,
+                true,
+                backpressure_deadline);
+            if (ingress.error !=
+                    RealtimePipelineIngressErrorV1::kNone &&
+                ingress.error !=
+                    RealtimePipelineIngressErrorV1::
+                        kFilteredNonAShare) {
+                const bool backpressure =
+                    startup_backpressure_timed_out_.load(
+                        std::memory_order_acquire);
+                SetStartupFailure(
+                    backpressure
+                        ? StartupFailure::kBackpressureTimeout
+                        : StartupFailure::kReplay);
+                SetDetail(
+                    detail,
+                    "startup replay admission failed: " +
+                        std::string(
+                            RealtimePipelineIngressErrorNameV1(
+                                ingress.error)));
+                return false;
+            }
+            RetainReplayFingerprint(*tuple, fingerprint);
+            startup_replay_cutoff_sequence_[*tuple] =
+                startup_replay_cutoff_seen_[*tuple]
+                    ? std::max(
+                          startup_replay_cutoff_sequence_[*tuple],
+                          fingerprint.vendor_sequence_id)
+                    : fingerprint.vendor_sequence_id;
+            startup_replay_cutoff_seen_[*tuple] = true;
+            return true;
+        } catch (const std::bad_alloc&) {
+            SetStartupFailure(StartupFailure::kReplay);
+            SetDetailLiteral(
+                detail,
+                "startup replay sink allocation failed");
+            return false;
+        } catch (...) {
+            SetStartupFailure(StartupFailure::kReplay);
+            SetDetailLiteral(
+                detail,
+                "startup replay sink failed unexpectedly");
+            return false;
+        }
+    }
+
+    void SetStartupFailure(StartupFailure failure) noexcept {
+        try {
+            std::lock_guard<std::mutex> startup(startup_mutex_);
+            if (startup_failure_ == StartupFailure::kNone) {
+                startup_failure_ = failure;
+            }
+            startup_state_ = StartupState::kFailed;
+        } catch (...) {
+            startup_failure_ = failure;
+            startup_state_ = StartupState::kFailed;
+        }
+    }
+
+    [[nodiscard]] const StartupReplayFingerprint*
+    FindReplayFingerprint(
+        std::size_t tuple,
+        std::uint64_t vendor_sequence_id) const noexcept {
+        if (tuple >=
+            startup_replay_retained_sequences_.size()) {
+            return nullptr;
+        }
+        const auto& index = startup_replay_tail_index_[tuple];
+        const auto found = index.find(vendor_sequence_id);
+        return found == index.end() ? nullptr : &found->second;
+    }
+
+    [[nodiscard]] bool CanonicalStartupMessageDigest(
+        const realtime::OwnedIngressMessageInspectionV1& inspection,
+        bool normalize_shenzhen_snapshot_channel,
+        common::Sha256Digest* output) noexcept {
+        if (!inspection || output == nullptr) {
+            return false;
+        }
+        try {
+            const std::uint8_t source = inspection.source_slot();
+            if (source >= market::kRealtimeHistorySourceCountV1) {
+                return false;
+            }
+            if (startup_fingerprint_decoders_[source] == nullptr ||
+                startup_fingerprint_source_sequences_[source] ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                return false;
+            }
+            const sdk::VendorHeadView head =
+                inspection.vendor_head();
+            market::MarketMessageViewV1 view{};
+            view.source_stream_id =
+                config_.source_stream_ids[source];
+            view.trade_date = config_.trade_date;
+            view.source_sequence =
+                ++startup_fingerprint_source_sequences_[source];
+            view.service_id = inspection.key().service_id;
+            view.service_version =
+                inspection.key().service_version;
+            view.message_id = inspection.key().message_id;
+            view.message_encoding = head.message_encoding();
+            view.vendor_local_time_raw =
+                head.local_time_raw();
+            view.vendor_sequence_id = head.sequence_id();
+            view.recv_realtime_ns = 1;
+            view.recv_monotonic_ns = 1;
+            view.body = inspection.body();
+            market::DecodedMarketEventV1 decoded;
+            return startup_fingerprint_decoders_[source]
+                           ->Decode(view, &decoded) ==
+                       market::MarketDecodeErrorV1::kNone &&
+                   CanonicalDecodedDigest(
+                       decoded,
+                       normalize_shenzhen_snapshot_channel,
+                       output);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] RealtimePipelineIngressErrorV1
+    HandleRecoveryDirectCallback(
+        const mdl::MDLMessage* message,
+        const CallbackClockObservation* callback_entry) noexcept {
+        // A CSV record can reach the vendor file before its matching callback
+        // enters this process. Consequently an empty startup buffer is not a
+        // proof that all CSV duplicates have already arrived. The per-tuple
+        // cutoffs and bounded semantic tails become immutable at the handoff
+        // and remain a recovery-mode guard for the pipeline lifetime.
+        realtime::OwnedIngressMessageInspectionV1 inspection{};
+        const realtime::OwnedIngressMessageErrorV1 inspection_error =
+            realtime::InspectOwnedIngressMessageV1(
+                message,
+                config_.maximum_sdk_message_bytes,
+                &inspection);
+        if (inspection_error !=
+                realtime::OwnedIngressMessageErrorV1::kNone ||
+            !inspection) {
+            return Ingest(message, callback_entry).error;
+        }
+        const std::optional<std::size_t> tuple =
+            ProductionTupleIndex(inspection.key());
+        if (!tuple.has_value() ||
+            !startup_replay_cutoff_seen_[*tuple]) {
+            return Ingest(message, callback_entry).error;
+        }
+
+        const std::uint64_t callback_sequence =
+            inspection.vendor_head().sequence_id();
+        if (callback_sequence >
+            startup_replay_cutoff_sequence_[*tuple]) {
+            startup_tuple_handoff_phases_[*tuple] =
+                StartupTupleHandoffPhase::kLiveSuffix;
+            return Ingest(message, callback_entry).error;
+        }
+
+        const StartupReplayFingerprint* replay =
+            FindReplayFingerprint(*tuple, callback_sequence);
+        common::Sha256Digest digest{};
+        const bool exact =
+            startup_tuple_handoff_phases_[*tuple] !=
+                StartupTupleHandoffPhase::kLiveSuffix &&
+            replay != nullptr &&
+            CanonicalStartupMessageDigest(
+                inspection,
+                replay->normalize_shenzhen_snapshot_channel,
+                &digest) &&
+            replay->body_digest == digest;
+        if (exact) {
+            // Suppress the delayed live copy before it acquires any process
+            // sequence or reaches decoder/History.
+            return RealtimePipelineIngressErrorV1::kNone;
+        }
+
+        ReportPipelineFailure(
+            startup_tuple_handoff_phases_[*tuple] ==
+                    StartupTupleHandoffPhase::kLiveSuffix
+                ? "startup_direct_returned_to_csv_prefix"
+                : replay == nullptr
+                ? "startup_direct_evicted_or_unknown_prefix"
+                : "startup_direct_overlap_conflict",
+            inspection.source_slot(),
+            0U,
+            callback_sequence);
+        TripFatal();
+        return RealtimePipelineIngressErrorV1::kFatal;
+    }
+
+    void RetainReplayFingerprint(
+        std::size_t tuple,
+        const StartupReplayFingerprint& fingerprint) {
+        std::set<std::uint64_t>& retained_sequences =
+            startup_replay_retained_sequences_[tuple];
+        auto& index = startup_replay_tail_index_[tuple];
+        const auto inserted = index.emplace(
+            fingerprint.vendor_sequence_id, fingerprint);
+        if (!inserted.second) {
+            return;
+        }
+        retained_sequences.insert(
+            fingerprint.vendor_sequence_id);
+        if (retained_sequences.size() >
+            config_.startup_overlap_retention_per_message) {
+            const auto smallest = retained_sequences.begin();
+            index.erase(*smallest);
+            retained_sequences.erase(smallest);
+        }
+    }
+
+    void RetireStartupBufferedMessage(
+        const BufferedStartupMessage& message) noexcept {
+        std::lock_guard<std::mutex> startup(startup_mutex_);
+        const std::uint64_t wire_size =
+            static_cast<std::uint64_t>(message.wire_size());
+        if (startup_buffered_message_count_ == 0U ||
+            wire_size > startup_buffered_wire_bytes_) {
+            startup_failure_ = StartupFailure::kCallback;
+            startup_state_ = StartupState::kFailed;
+            return;
+        }
+        --startup_buffered_message_count_;
+        startup_buffered_wire_bytes_ -= wire_size;
+    }
+
+    [[nodiscard]] bool WaitForStartupPipelineCapacity(
+        std::chrono::steady_clock::time_point deadline) noexcept {
+        // History submission itself is deliberately nonblocking. Bound the
+        // complete decoder+History outstanding prefix by the smallest
+        // per-source/worker History queue so a bulk single-instrument replay
+        // cannot fill History after it has already left the decoder FIFO.
+        const std::uint64_t capacity = static_cast<std::uint64_t>(
+            config_.store_queue_capacity_per_source_worker);
+        for (;;) {
+            const std::uint64_t accepted =
+                accepted_sequence_.load(std::memory_order_acquire);
+            const std::uint64_t applied =
+                applied_sequence_.load(std::memory_order_acquire);
+            if (applied > accepted) {
+                return false;
+            }
+            if (accepted - applied < capacity) {
+                return true;
+            }
+            const std::uint64_t required =
+                accepted - capacity + 1U;
+            if (!WaitAppliedThrough(required, deadline, true)) {
+                return false;
+            }
+        }
+    }
+
+    [[nodiscard]] bool ProcessStartupBuffer(
+        std::string* detail) noexcept {
+        try {
+            for (;;) {
+                if (StartupCancellationRequested()) {
+                    SetStartupFailure(
+                        StartupFailure::kCancelled);
+                    SetDetailLiteral(
+                        detail,
+                        "startup recovery was cancelled during live handoff");
+                    return false;
+                }
+                std::deque<std::unique_ptr<BufferedStartupMessage>>
+                    batch;
+                {
+                    std::lock_guard<std::mutex> startup(
+                        startup_mutex_);
+                    if (startup_state_ == StartupState::kFailed ||
+                        startup_failure_ != StartupFailure::kNone) {
+                        SetDetailLiteral(
+                            detail,
+                            "live SDK callback buffering failed during startup recovery");
+                        return false;
+                    }
+                    batch.swap(startup_buffer_);
+                }
+
+                if (batch.empty()) {
+                    if (std::chrono::steady_clock::now() >=
+                        startup_warmup_deadline_) {
+                        SetStartupFailure(
+                            StartupFailure::kWarmupTimeout);
+                        SetDetailLiteral(
+                            detail,
+                            "startup recovery exceeded the warmup timeout");
+                        return false;
+                    }
+                    std::uint64_t target = 0U;
+                    {
+                        std::lock_guard<std::mutex> admission(
+                            admission_mutex_);
+                        target = global_ingress_sequence_;
+                    }
+                    if (target != 0U &&
+                        !WaitAppliedThrough(
+                            target,
+                            startup_warmup_deadline_,
+                            true)) {
+                        SetStartupFailure(
+                            StartupCancellationRequested()
+                                ? StartupFailure::kCancelled
+                                : fatal_.load(std::memory_order_acquire) ||
+                                    history_->fatal()
+                                ? StartupFailure::kReplay
+                                : StartupFailure::
+                                      kWarmupTimeout);
+                        SetDetailLiteral(
+                            detail,
+                            StartupCancellationRequested()
+                                ? "startup recovery was cancelled while waiting for the applied prefix"
+                                : "startup recovered prefix could not be fully applied");
+                        return false;
+                    }
+
+                    std::unique_lock<std::mutex> startup(
+                        startup_mutex_);
+                    if (startup_state_ == StartupState::kFailed ||
+                        startup_failure_ != StartupFailure::kNone) {
+                        SetDetailLiteral(
+                            detail,
+                            "live SDK callback buffering failed during startup warmup");
+                        return false;
+                    }
+                    if (!startup_buffer_.empty()) {
+                        continue;
+                    }
+                    if (startup_callback_pending_.load(
+                            std::memory_order_acquire) != 0U) {
+                        startup.unlock();
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    for (std::size_t tuple = 0U;
+                         tuple < startup_buffered_tuple_seen_.size();
+                         ++tuple) {
+                        if (startup_buffered_tuple_seen_[tuple] &&
+                            !startup_overlap_seen_[tuple] &&
+                            !startup_tuple_fence_captured_[tuple]) {
+                            startup_failure_ =
+                                StartupFailure::kOverlapMissing;
+                            startup_state_ = StartupState::kFailed;
+                            SetDetail(
+                                detail,
+                                "no matching CSV/live SequenceID overlap for buffered tuple " +
+                                    std::to_string(tuple));
+                            return false;
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> admission(
+                            admission_mutex_);
+                        ignored_messages_ +=
+                            startup_ignored_messages_;
+                        startup_ignored_messages_ = 0U;
+                    }
+                    // This is the single closed-handoff linearization point.
+                    // A callback either completed its raw copy before it, or
+                    // observes kDirect while holding this same mutex and
+                    // enters normal admission after every prior copy.
+                    startup_state_ = StartupState::kDirect;
+                    startup_direct_.store(
+                        true, std::memory_order_release);
+                    startup.unlock();
+                    // The cutoffs and bounded tails are immutable from this
+                    // release onward. Keep them so a vendor callback delayed
+                    // outside this process cannot duplicate an already
+                    // replayed CSV record after Create returns.
+                    return true;
+                }
+
+                std::vector<bool> duplicate(batch.size(), false);
+                std::size_t batch_index = 0U;
+                for (const auto& owned : batch) {
+                    if (owned == nullptr) {
+                        SetStartupFailure(
+                            StartupFailure::kCallback);
+                        SetDetailLiteral(
+                            detail,
+                            "startup raw buffer contains a null message");
+                        return false;
+                    }
+                    realtime::OwnedIngressMessageInspectionV1
+                        inspection{};
+                    const auto inspection_error =
+                        realtime::InspectOwnedIngressMessageV1(
+                            owned.get(),
+                            config_.maximum_sdk_message_bytes,
+                            &inspection);
+                    const std::optional<std::size_t> tuple =
+                        inspection_error ==
+                                    realtime::
+                                        OwnedIngressMessageErrorV1::
+                                            kNone &&
+                                inspection
+                            ? ProductionTupleIndex(inspection.key())
+                            : std::nullopt;
+                    if (!tuple.has_value()) {
+                        SetStartupFailure(
+                            StartupFailure::kCallback);
+                        SetDetailLiteral(
+                            detail,
+                            "startup raw buffer reinspection failed");
+                        return false;
+                    }
+                    const std::uint64_t callback_sequence =
+                        inspection.vendor_head().sequence_id();
+                    startup_buffered_tuple_seen_[*tuple] = true;
+                    const StartupReplayFingerprint* replay =
+                        FindReplayFingerprint(
+                            *tuple,
+                            callback_sequence);
+                    StartupTupleHandoffPhase& handoff_phase =
+                        startup_tuple_handoff_phases_[*tuple];
+                    common::Sha256Digest digest{};
+                    if (!CanonicalStartupMessageDigest(
+                            inspection,
+                            replay != nullptr &&
+                                replay
+                                    ->normalize_shenzhen_snapshot_channel,
+                            &digest)) {
+                        SetStartupFailure(
+                            StartupFailure::kReplay);
+                        SetDetailLiteral(
+                            detail,
+                            "startup buffered payload digest failed");
+                        return false;
+                    }
+                    if (replay != nullptr) {
+                        if (handoff_phase ==
+                            StartupTupleHandoffPhase::
+                                kLiveSuffix) {
+                            SetStartupFailure(
+                                StartupFailure::
+                                    kOverlapConflict);
+                            SetDetailLiteral(
+                                detail,
+                                "CSV/live handoff returned to the CSV prefix after entering the fenced live suffix");
+                            return false;
+                        }
+                        if (replay->body_digest != digest) {
+                            SetStartupFailure(
+                                StartupFailure::
+                                    kOverlapConflict);
+                            SetDetailLiteral(
+                                detail,
+                                "CSV/live handoff has the same tuple/SequenceID with different payloads");
+                            return false;
+                        }
+                        duplicate[batch_index] = true;
+                        startup_overlap_seen_[*tuple] = true;
+                        handoff_phase =
+                            StartupTupleHandoffPhase::kOverlap;
+                    } else {
+                        const std::uint64_t callback_serial =
+                            owned->tuple_callback_serial();
+                        if (callback_sequence == 0U ||
+                            (startup_replay_cutoff_seen_[*tuple] &&
+                             callback_sequence <=
+                                 startup_replay_cutoff_sequence_
+                                     [*tuple])) {
+                            SetStartupFailure(
+                                StartupFailure::
+                                    kOverlapMissing);
+                            SetDetailLiteral(
+                                detail,
+                                "an unmatched live callback is not provably beyond the CSV tuple SequenceID maximum");
+                            return false;
+                        }
+                        if (startup_tuple_fence_captured_[*tuple] &&
+                            (callback_serial == 0U ||
+                             callback_serial <=
+                                 startup_tuple_fence_serials_
+                                     [*tuple])) {
+                            SetStartupFailure(
+                                StartupFailure::
+                                    kOverlapMissing);
+                            SetDetailLiteral(
+                                detail,
+                                "a callback copied no later than its tuple fence has no retained CSV identity match");
+                            return false;
+                        }
+                        handoff_phase =
+                            StartupTupleHandoffPhase::
+                                kLiveSuffix;
+                    }
+                    ++batch_index;
+                }
+
+                batch_index = 0U;
+                for (auto& owned : batch) {
+                    if (!duplicate[batch_index]) {
+                        CallbackClockObservation clocks{};
+                        clocks.realtime_ns =
+                            owned->recv_realtime_ns();
+                        clocks.monotonic_ns =
+                            owned->recv_monotonic_ns();
+                        clocks.valid = true;
+                        const auto now =
+                            std::chrono::steady_clock::now();
+                        if (now >= startup_warmup_deadline_) {
+                            SetStartupFailure(
+                                StartupFailure::
+                                    kWarmupTimeout);
+                            SetDetailLiteral(
+                                detail,
+                                "startup live-buffer drain exceeded the warmup timeout");
+                            return false;
+                        }
+                        const auto admission_deadline = std::min(
+                            startup_warmup_deadline_,
+                            now +
+                                config_
+                                    .startup_replay_backpressure_timeout);
+                        if (!WaitForStartupPipelineCapacity(
+                                admission_deadline)) {
+                            SetStartupFailure(
+                                StartupCancellationRequested()
+                                    ? StartupFailure::
+                                          kCancelled
+                                    : std::chrono::steady_clock::now() >=
+                                        admission_deadline
+                                    ? StartupFailure::
+                                          kBackpressureTimeout
+                                    : StartupFailure::kReplay);
+                            SetDetailLiteral(
+                                detail,
+                                StartupCancellationRequested()
+                                    ? "startup recovery was cancelled while draining the live buffer"
+                                    : "startup live-buffer drain timed out waiting for downstream History capacity");
+                            return false;
+                        }
+                        const RealtimePipelineIngressResultV1
+                            ingress = Ingest(
+                                owned.get(),
+                                &clocks,
+                                0U,
+                                true,
+                                admission_deadline);
+                        if (ingress.error !=
+                                RealtimePipelineIngressErrorV1::
+                                    kNone &&
+                            ingress.error !=
+                                RealtimePipelineIngressErrorV1::
+                                    kFilteredNonAShare) {
+                            const bool backpressure =
+                                startup_backpressure_timed_out_.load(
+                                    std::memory_order_acquire);
+                            SetStartupFailure(
+                                backpressure
+                                    ? StartupFailure::
+                                          kBackpressureTimeout
+                                    : StartupFailure::kReplay);
+                            SetDetail(
+                                detail,
+                                "startup live-buffer admission failed: " +
+                                    std::string(
+                                        RealtimePipelineIngressErrorNameV1(
+                                            ingress.error)));
+                            return false;
+                        }
+                    }
+                    RetireStartupBufferedMessage(*owned);
+                    owned.reset();
+                    ++batch_index;
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            SetStartupFailure(StartupFailure::kReplay);
+            SetDetailLiteral(
+                detail,
+                "startup handoff allocation failed");
+            return false;
+        } catch (...) {
+            SetStartupFailure(StartupFailure::kReplay);
+            SetDetailLiteral(
+                detail,
+                "startup handoff failed unexpectedly");
+            return false;
+        }
+    }
+
     [[nodiscard]] RealtimePipelineIngressResultV1 Ingest(
         const mdl::MDLMessage* message,
-        const CallbackClockObservation* callback_entry = nullptr) noexcept {
+        const CallbackClockObservation* callback_entry = nullptr,
+        std::uint64_t additional_market_notices = 0U,
+        bool wait_for_decoder_capacity = false,
+        std::chrono::steady_clock::time_point admission_deadline =
+            std::chrono::steady_clock::time_point::max()) noexcept {
         RealtimePipelineIngressResultV1 result{};
         std::unique_lock<std::mutex> admission(admission_mutex_);
         if (fatal_.load(std::memory_order_acquire) ||
@@ -1867,6 +3231,8 @@ public:
         command.kind = CommandKind::kMessage;
         command.message = std::move(owned);
         command.identity = identity;
+        command.additional_market_notices =
+            additional_market_notices;
         if (latency_collector_ != nullptr) {
             command.callback_entry_monotonic_ns = monotonic_ns;
         }
@@ -1875,19 +3241,17 @@ public:
         // after the slot is fully constructed and before release-publishing
         // the queue tail. A fast decoder can therefore never complete a
         // sequence whose accepted frontier is not yet visible.
-        if (lanes_[source_slot] == nullptr ||
-            !lanes_[source_slot]->queue.TryPushWithCommit(
-                std::move(command),
-                [this,
-                 &result,
-                 &metadata,
-                 source_slot,
-                 mixed_tick_source,
-                 native_sequence_tracked,
-                 native_descriptor,
-                 message_key = inspection.key()](
-                    std::uint64_t queue_publish_monotonic_ns)
-                    noexcept {
+        const auto commit =
+            [this,
+             &result,
+             &metadata,
+             source_slot,
+             mixed_tick_source,
+             native_sequence_tracked,
+             native_descriptor,
+             message_key = inspection.key()](
+                std::uint64_t queue_publish_monotonic_ns)
+                noexcept {
                     global_ingress_sequence_ =
                         metadata.global_ingress_sequence;
                     source_sequences_[source_slot] =
@@ -1926,7 +3290,30 @@ public:
                             metadata.recv_monotonic_ns,
                             queue_publish_monotonic_ns);
                     }
-                })) {
+                };
+        bool published = false;
+        while (lanes_[source_slot] != nullptr &&
+               !(published =
+                     lanes_[source_slot]->queue.TryPushWithCommit(
+                         std::move(command), commit)) &&
+               wait_for_decoder_capacity) {
+            if (fatal_.load(std::memory_order_acquire)) {
+                break;
+            }
+            if (std::chrono::steady_clock::now() >=
+                admission_deadline) {
+                startup_backpressure_timed_out_.store(
+                    true, std::memory_order_release);
+                break;
+            }
+            // Only the startup coordinator requests bounded waiting. SDK
+            // callbacks remain in the independent raw buffer, so releasing
+            // admission here cannot reorder or race a direct producer.
+            admission.unlock();
+            std::this_thread::sleep_for(kStartupQueueRetryDelay);
+            admission.lock();
+        }
+        if (!published) {
             result.error =
                 RealtimePipelineIngressErrorV1::
                     kDecoderAdmissionFailed;
@@ -2779,7 +4166,11 @@ private:
 
     [[nodiscard]] bool WaitAppliedThrough(
         std::uint64_t target_sequence,
-        std::chrono::steady_clock::time_point deadline) noexcept {
+        std::chrono::steady_clock::time_point deadline,
+        bool cancel_startup = false) noexcept {
+        if (cancel_startup && StartupCancellationRequested()) {
+            return false;
+        }
         if (applied_sequence_.load(std::memory_order_acquire) >=
             target_sequence) {
             return true;
@@ -2792,6 +4183,10 @@ private:
                     return true;
                 }
                 if (fatal_.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                if (cancel_startup &&
+                    StartupCancellationRequested()) {
                     return false;
                 }
                 const auto now = std::chrono::steady_clock::now();
@@ -2911,6 +4306,26 @@ private:
                 }
             }
         }
+        if (config_.startup_replay_source != nullptr &&
+            (!config_.sdk.enabled ||
+             !config_.intraday_store.coverage_from_open ||
+             config_.startup_live_buffer_maximum_messages == 0U ||
+             config_.startup_live_buffer_maximum_bytes == 0U ||
+             config_.startup_overlap_retention_per_message <
+                 config_.startup_live_buffer_maximum_messages ||
+             config_.startup_warmup_timeout <=
+                 std::chrono::nanoseconds::zero() ||
+             config_.startup_warmup_timeout > kMaximumCutTimeout ||
+             config_.startup_replay_backpressure_timeout <=
+                 std::chrono::nanoseconds::zero() ||
+             config_.startup_replay_backpressure_timeout >
+                 kMaximumCutTimeout)) {
+            return false;
+        }
+        if (config_.startup_replay_source == nullptr &&
+            config_.startup_cancel_requested) {
+            return false;
+        }
         if (!config_.sdk.enabled) {
             return !factory_is_test_override && sdk_factory_ == nullptr;
         }
@@ -3002,6 +4417,13 @@ private:
             const bool stopping =
                 progress_stop_requested_.load(
                     std::memory_order_acquire);
+            if (!progress_publication_enabled_.load(
+                    std::memory_order_acquire)) {
+                if (stopping) {
+                    return;
+                }
+                continue;
+            }
 
             realtime::ProcessingProgressV2 current{};
             current.applied_sequence =
@@ -3020,6 +4442,61 @@ private:
             if (stopping) {
                 return;
             }
+        }
+    }
+
+    [[nodiscard]] static RealtimePipelineCreateErrorV1
+    StartupFailureCreateError(StartupFailure failure) noexcept {
+        switch (failure) {
+            case StartupFailure::kNone:
+                return RealtimePipelineCreateErrorV1::kNone;
+            case StartupFailure::kCallback:
+                return RealtimePipelineCreateErrorV1::
+                    kSdkCallbackFailed;
+            case StartupFailure::kBufferOverflow:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupBufferOverflow;
+            case StartupFailure::kReplay:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupReplayFailed;
+            case StartupFailure::kOverlapMissing:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupOverlapMissing;
+            case StartupFailure::kOverlapConflict:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupOverlapConflict;
+            case StartupFailure::kBackpressureTimeout:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupBackpressureTimeout;
+            case StartupFailure::kWarmupTimeout:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupWarmupTimeout;
+            case StartupFailure::kCancelled:
+                return RealtimePipelineCreateErrorV1::
+                    kStartupCancelled;
+        }
+        return RealtimePipelineCreateErrorV1::kStartupReplayFailed;
+    }
+
+    [[nodiscard]] StartupFailure StartupFailureSnapshot() const noexcept {
+        try {
+            std::lock_guard<std::mutex> startup(startup_mutex_);
+            return startup_failure_;
+        } catch (...) {
+            return StartupFailure::kReplay;
+        }
+    }
+
+    [[nodiscard]] bool StartupCancellationRequested() const noexcept {
+        if (!config_.startup_cancel_requested) {
+            return false;
+        }
+        try {
+            return config_.startup_cancel_requested();
+        } catch (...) {
+            // A throwing cancellation provider is not safe to ignore during a
+            // completeness-sensitive startup.
+            return true;
         }
     }
 
@@ -3077,7 +4554,27 @@ private:
 
             // Connect may synchronously deliver API/SYS or market callbacks.
             // Every downstream component is already running at this point.
-            accepting_.store(true, std::memory_order_release);
+            const bool startup_recovery =
+                config_.startup_replay_source != nullptr;
+            if (startup_recovery) {
+                if (StartupCancellationRequested()) {
+                    SetStartupFailure(
+                        StartupFailure::kCancelled);
+                    SetDetailLiteral(
+                        detail,
+                        "startup recovery was cancelled before SDK Connect");
+                    return RealtimePipelineCreateErrorV1::
+                        kStartupCancelled;
+                }
+                std::lock_guard<std::mutex> startup(startup_mutex_);
+                startup_state_ = StartupState::kBuffering;
+                startup_failure_ = StartupFailure::kNone;
+                startup_warmup_deadline_ =
+                    std::chrono::steady_clock::now() +
+                    config_.startup_warmup_timeout;
+            } else {
+                accepting_.store(true, std::memory_order_release);
+            }
             const std::string connect_error = sdk_subscriber_->Connect();
             if (!connect_error.empty()) {
                 accepting_.store(false, std::memory_order_release);
@@ -3088,6 +4585,100 @@ private:
                 accepting_.store(false, std::memory_order_release);
                 SetDetailLiteral(detail, "a callback failed during SDK Connect");
                 return RealtimePipelineCreateErrorV1::kSdkCallbackFailed;
+            }
+            if (!startup_recovery) {
+                return RealtimePipelineCreateErrorV1::kNone;
+            }
+            if (StartupCancellationRequested()) {
+                SetStartupFailure(StartupFailure::kCancelled);
+                accepting_.store(
+                    false, std::memory_order_release);
+                SetDetailLiteral(
+                    detail,
+                    "startup recovery was cancelled after SDK Connect");
+                return RealtimePipelineCreateErrorV1::
+                    kStartupCancelled;
+            }
+
+            StartupFailure startup_failure =
+                StartupFailureSnapshot();
+            if (startup_failure != StartupFailure::kNone) {
+                accepting_.store(false, std::memory_order_release);
+                if (startup_failure == StartupFailure::kBufferOverflow) {
+                    SetDetailLiteral(
+                        detail,
+                        "live SDK startup buffer exceeded its message or byte bound during Connect");
+                } else {
+                    SetDetail(
+                        detail,
+                        "a supported SDK callback could not be copied during Connect: " +
+                            std::string(
+                                realtime::OwnedIngressMessageErrorNameV1(
+                                    startup_callback_owned_error_)));
+                }
+                return StartupFailureCreateError(startup_failure);
+            }
+
+            // The callback remains in raw-buffer mode. Only the startup
+            // coordinator enters normal admission until the final atomic
+            // switch, so CSV records necessarily precede non-overlap live
+            // records in the process-assigned sequence domain.
+            accepting_.store(true, std::memory_order_release);
+            const recovery::StartupReplayResultV1 replay =
+                config_.startup_replay_source->Replay(*this);
+            if (!replay.ok()) {
+                startup_failure = StartupFailureSnapshot();
+                if (startup_failure == StartupFailure::kNone) {
+                    SetStartupFailure(StartupFailure::kReplay);
+                    startup_failure = StartupFailure::kReplay;
+                }
+                accepting_.store(false, std::memory_order_release);
+                std::string replay_detail =
+                    "startup CSV replay failed: " +
+                    std::string(
+                        recovery::StartupReplayErrorNameV1(
+                            replay.error));
+                if (!replay.detail.empty()) {
+                    replay_detail += ": ";
+                    replay_detail += replay.detail;
+                }
+                if (!replay.error_file.empty()) {
+                    replay_detail += " in ";
+                    replay_detail += replay.error_file.string();
+                }
+                if (replay.error_line != 0U) {
+                    replay_detail += " at line ";
+                    replay_detail +=
+                        std::to_string(replay.error_line);
+                }
+                SetDetail(detail, std::move(replay_detail));
+                return StartupFailureCreateError(startup_failure);
+            }
+            if (StartupFailureSnapshot() !=
+                StartupFailure::kNone) {
+                startup_failure = StartupFailureSnapshot();
+                accepting_.store(false, std::memory_order_release);
+                SetDetailLiteral(
+                    detail,
+                    "live SDK startup buffer failed while CSV replay completed");
+                return StartupFailureCreateError(startup_failure);
+            }
+            if (!ProcessStartupBuffer(detail)) {
+                startup_failure = StartupFailureSnapshot();
+                accepting_.store(false, std::memory_order_release);
+                return StartupFailureCreateError(
+                    startup_failure == StartupFailure::kNone
+                        ? StartupFailure::kReplay
+                        : startup_failure);
+            }
+            if (fatal_.load(std::memory_order_acquire) ||
+                history_->fatal()) {
+                accepting_.store(false, std::memory_order_release);
+                SetDetailLiteral(
+                    detail,
+                    "startup recovered prefix failed in the downstream runtime");
+                return RealtimePipelineCreateErrorV1::
+                    kStartupReplayFailed;
             }
             return RealtimePipelineCreateErrorV1::kNone;
         } catch (const std::bad_alloc&) {
@@ -3155,6 +4746,7 @@ private:
                 source,
                 command.message,
                 command.identity,
+                command.additional_market_notices,
                 latency_collector_ != nullptr ? &timing : nullptr);
             if (latency_collector_ != nullptr) {
                 latency_collector_->RecordDecoderWork(
@@ -3185,6 +4777,7 @@ private:
         std::uint8_t source,
         const realtime::OwnedIngressMessageHandleV1& message,
         const market::DailyInstrumentIdentityViewV2& identity,
+        std::uint64_t additional_market_notices,
         DecoderTimingObservation* timing)
         noexcept {
         if (timing != nullptr) {
@@ -3246,6 +4839,12 @@ private:
                 identity.instrument_id);
             return false;
         }
+        std::visit(
+            [additional_market_notices](auto& value) noexcept {
+                value.common.market_notices |=
+                    additional_market_notices;
+            },
+            decoded);
         if (timing != nullptr) {
             timing->decode_complete_clock_valid = ReadClockNs(
                 CLOCK_MONOTONIC,
@@ -3447,9 +5046,16 @@ private:
     std::binary_semaphore progress_wake_{0};
     std::atomic<bool> progress_wake_pending_{false};
     std::atomic<bool> progress_stop_requested_{false};
+    std::atomic<bool> progress_publication_enabled_{true};
     std::array<std::unique_ptr<DecoderLane>,
                market::kRealtimeHistorySourceCountV1>
         lanes_{};
+    std::array<std::unique_ptr<market::MarketDecoderV1>,
+               market::kRealtimeHistorySourceCountV1>
+        startup_fingerprint_decoders_{};
+    std::array<std::uint64_t,
+               market::kRealtimeHistorySourceCountV1>
+        startup_fingerprint_source_sequences_{};
     bool decoder_threads_started_ = false;
 
     std::unique_ptr<market::RealtimeHistoryRuntimeV1> history_;
@@ -3482,6 +5088,47 @@ private:
     std::shared_ptr<sdk::SdkFactory> sdk_factory_;
     std::unique_ptr<sdk::SdkManager> sdk_manager_;
     std::unique_ptr<sdk::SdkSubscriber> sdk_subscriber_;
+
+    mutable std::mutex startup_mutex_;
+    StartupState startup_state_ = StartupState::kInactive;
+    StartupFailure startup_failure_ = StartupFailure::kNone;
+    realtime::OwnedIngressMessageErrorV1
+        startup_callback_owned_error_ =
+            realtime::OwnedIngressMessageErrorV1::kNone;
+    std::deque<std::unique_ptr<BufferedStartupMessage>>
+        startup_buffer_;
+    std::size_t startup_buffered_message_count_ = 0U;
+    std::uint64_t startup_buffered_wire_bytes_ = 0U;
+    std::uint64_t startup_ignored_messages_ = 0U;
+    std::array<std::set<std::uint64_t>,
+               sdk::kProductionMessageCountV1>
+        startup_replay_retained_sequences_{};
+    std::array<
+        std::unordered_map<std::uint64_t, StartupReplayFingerprint>,
+        sdk::kProductionMessageCountV1>
+        startup_replay_tail_index_{};
+    std::array<std::uint64_t, sdk::kProductionMessageCountV1>
+        startup_replay_cutoff_sequence_{};
+    std::array<bool, sdk::kProductionMessageCountV1>
+        startup_replay_cutoff_seen_{};
+    std::array<bool, sdk::kProductionMessageCountV1>
+        startup_buffered_tuple_seen_{};
+    std::array<bool, sdk::kProductionMessageCountV1>
+        startup_overlap_seen_{};
+    std::array<std::uint64_t, sdk::kProductionMessageCountV1>
+        startup_tuple_callback_counts_{};
+    std::array<std::uint64_t, sdk::kProductionMessageCountV1>
+        startup_tuple_fence_serials_{};
+    std::array<bool, sdk::kProductionMessageCountV1>
+        startup_tuple_fence_captured_{};
+    std::array<StartupTupleHandoffPhase,
+               sdk::kProductionMessageCountV1>
+        startup_tuple_handoff_phases_{};
+    std::chrono::steady_clock::time_point
+        startup_warmup_deadline_{};
+    std::atomic<bool> startup_backpressure_timed_out_{false};
+    std::atomic<bool> startup_direct_{false};
+    std::atomic<std::uint64_t> startup_callback_pending_{0U};
 
     mutable std::mutex admission_mutex_;
     std::uint64_t global_ingress_sequence_ = 0U;

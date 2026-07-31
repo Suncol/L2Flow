@@ -168,5 +168,6 @@ and accepted/applied distance. Queue publication timestamps are sampled
 immediately before the irreversible accepted commit; all operations after
 commit are non-throwing atomic publication/notification.
 
-This version intentionally does not add Parquet/Arrow output, WAL, ring
-catch-up, replay, or producer crash recovery.
+This version intentionally does not add Parquet/Arrow output or turn the
+same-day vendor-CSV startup catch-up into arbitrary-checkpoint replay, ring
+overrun catch-up, WAL restore, or producer crash recovery.

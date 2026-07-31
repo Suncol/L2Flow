@@ -4,13 +4,13 @@
 
 | 项目 | 当前基线 |
 | --- | --- |
-| 分支 | `perf/single-instrument-history-read` |
-| 提交 | `ee0a88a604a91320bfd8c0b161c0c4bd7ac700f8`（`feat(ipc): add generation-bound instrument tick delta V2`） |
+| 分支 | `feature/native-gap-recovery-fast-certified-v1` |
+| 提交 | `0d0fc709f47c629c246ea4598b5375d579a1ac99`（`docs: record flow architecture and leakage audit`；本文还覆盖当前未提交工作树） |
 | 对比分支 | `feature/live-latest-tick-snapshot-v1` |
 | merge-base | `7a1a4044b5a32435259abcc6099385f2b8ec2db3` |
 | 生产入口 | `apps/mdl_production_main.cpp` |
 | 核心编排 | `runtime::RealtimePipelineV1` |
-| 文档更新日期 | 2026-07-29 |
+| 文档更新日期 | 2026-07-31 |
 
 ---
 
@@ -162,8 +162,10 @@ flowchart TB
 
 ```text
 apps
+  ├── recovery/mdl_csv_startup_replay
+  │     └── sdk message layout
   ├── runtime/realtime_pipeline
-  │     ├── sdk
+  │     ├── sdk + recovery/startup_replay interface
   │     ├── realtime/owned_ingress + optional_wal
   │     ├── market/decoder + history + store + kline + latest
   │     └── factor
@@ -186,6 +188,12 @@ Store generation 则由生产应用在每次 Pipeline cut 成功后显式传给 
 
 生产入口位于 [`apps/mdl_production_main.cpp`](../apps/mdl_production_main.cpp)。启动顺序本身就是正确性约束：
 
+`--intraday-store-from-open` 与 `--intraday-recovery-csv-dir` 的控制面
+激活点不同：常规模式在创建 Pipeline 前已经启动 FAST 控制线程；CSV 恢复
+模式则让 FAST 保持 INITIALIZING，SDK 先进入有界 callback buffer，完成 CSV
+回放与闭合接管并发布首个 Store/KLine generation 后才进入 ACTIVE。详见
+[`csv-startup-recovery-v1.md`](csv-startup-recovery-v1.md)。
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -206,17 +214,28 @@ sequenceDiagram
         Main->>Ipc: Create/Initialize memfd、布局、UDS
         Ipc-->>Main: applied_record_sink
     end
+    alt 从开盘实时启动
+        Main->>Ipc: Start 控制线程，state = active
+        Note over Main,Ipc: history/delta 在首个成功 cut 前仍返回 unavailable
+    else CSV 盘中恢复
+        Note over Main,Ipc: FAST 保持 INITIALIZING，不对外返回半恢复 session
+    end
     Main->>Pipe: Create(config)
     Pipe->>Hist: 创建 Store、latest、KLine worker 与 4×W 队列
     Hist->>Hist: 启动 W 个 worker + 1 个 builder
     Pipe->>Dec: 创建四个 decoder 并启动四线程
     Pipe->>Sdk: 最后创建并 Connect
     Note over Pipe,Sdk: Connect 可能同步触发回调；此时全部下游已就绪
-    opt 启用 IPC
-        Main->>Ipc: Start 控制线程，state = active
+    alt CSV 盘中恢复
+        Note over Pipe,Sdk: callback 暂存；CSV 经同一 decoder/History 路径回放并闭合接管
+        Pipe-->>Main: 恢复前缀已全部 applied
+        Main->>Pipe: CutAndPublishGeneration
+        Main->>Ipc: 发布 KLine generation 并 Start FAST
+    else 从开盘实时启动
+        Pipe-->>Main: 实时路径已连接
     end
     Main->>Main: 进入周期 cut / 健康检查循环
-    Note over Main,Ipc: 第一次成功 cut 后，IPC 才拥有可供 history/delta 固定的 Store generation
+    Note over Main,Ipc: FAST history/delta 只固定已经发布的 immutable Store generation
 ```
 
 具体顺序：
@@ -226,21 +245,28 @@ sequenceDiagram
 3. 生成本次进程唯一的 `run_id`。
 4. 若启用 IPC，先建立共享内存布局、绑定监听 socket，并准备有界
    history-reader slot，再把服务作为 `applied_record_sink` 注入 Pipeline；
-   此时尚不接受客户端，也尚无 Store generation 可读。
-5. Pipeline 依次创建：
+   此时尚无 Store generation 可读。常规从开盘模式紧接着启动 FAST 控制
+   线程；CSV 恢复模式则明确保持 `INITIALIZING`。
+5. CSV 恢复且启用 CERTIFIED 时，只预先启动其投影 worker，不启动查询控制
+   线程；常规模式直接启动其 worker/control。
+6. Pipeline 依次创建：
    - 有界 `OwnedIngressMessagePoolV1`；
    - `RealtimeHistoryV1`，内部含 Store、latest、KLine、worker 与 builder；
    - 可选 WAL；
    - Factor engine；
    - 四个 decoder 和四个 decoder queue；
    - 最后才加载并连接 SDK。
-6. Pipeline 创建成功后才启动 IPC 控制线程并把服务切到 `active`，防止客户端连到一个尚未具备完整处理能力的 session。
-7. 每次周期或终局 cut 完成后，生产主线程先发布 exact Store generation，
+7. CSV 恢复模式必须再发布首个 Store/KLine generation；只有完整恢复前缀
+   可查询后才把 FAST 切到 `active`。可选 CERTIFIED 随后还必须通过其 worker
+   FIFO prefix barrier，不能提前开放控制线程。
+8. 每次周期或终局 cut 完成后，生产主线程先发布 exact Store generation，
    再发布可选 KLine generation。第一次 Store generation 发布前，
    `OPEN_HISTORY` 和 `OPEN_DELTA_SESSION` 会明确返回 unavailable，而不是读取
    mutable Store。
 
-SDK 连接前先设置 `accepting=true`，原因是厂商 `Connect()` 可能同步调用回调；此时 History、decoder 和所有有界内存池必须已经可以接收数据。
+常规模式在 SDK 连接前先设置 `accepting=true`；CSV 恢复模式则先设置
+`startup_state=buffering`。原因是厂商 `Connect()` 可能同步调用回调；无论
+哪种模式，此时 History、decoder 和所有有界内存池都必须已经就绪。
 
 ---
 
@@ -1045,7 +1071,7 @@ V2 一个 session 可以顺序打开多个 instrument cursor，但在 session �
 
 | 字段 | 它实际声明什么 | 它不声明什么 |
 | --- | --- | --- |
-| `coverage_from_open` | 一个由运维配置给出的事实断言：进程在首条市场消息前启动，并从那以后持续健康。生产入口通过 `--intraday-store-from-open` 或 `--partial-session` 二选一明确设置，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段 |
+| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 通过闭合 live handoff 恢复成功。生产入口通过 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 二选一明确设置，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
 | `record_coverage_complete` | generation 是本进程已接受记录的完整 cut 前缀；对 V1 是该 instrument 四路 Store 记录，对 V2 是该 instrument 在所选 source 1/3 与半开区间内的 tick | 进程覆盖了开盘；上游 feed 完整；payload 字段无损 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | 是否读到了所有 record |
 

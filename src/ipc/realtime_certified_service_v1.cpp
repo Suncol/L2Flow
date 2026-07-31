@@ -182,11 +182,13 @@ void CopyIdentity(
 enum class HandoffKind : std::uint8_t {
     kObservation = 1U,
     kApplied = 2U,
+    kBarrier = 3U,
 };
 
 struct HandoffEvent final {
     HandoffKind kind = HandoffKind::kObservation;
     std::array<std::uint8_t, 7U> reserved{};
+    std::uint64_t barrier_id = 0U;
     realtime::NativeSequenceObservationV1 observation{};
     std::size_t ordinal = 0U;
     const market::RealtimeHistoryRecordV1* record = nullptr;
@@ -868,7 +870,8 @@ public:
         return CreateListener(system_error_number);
     }
 
-    [[nodiscard]] bool Start(int* system_error_number) noexcept {
+    [[nodiscard]] bool StartWorker(
+        int* system_error_number) noexcept {
         SetSystemError(system_error_number, 0);
         bool expected = false;
         if (!started_.compare_exchange_strong(
@@ -877,13 +880,9 @@ public:
         }
         accepting_.store(true, std::memory_order_release);
         worker_running_.store(true, std::memory_order_release);
-        control_running_.store(true, std::memory_order_release);
         try {
             worker_thread_ = std::thread([this]() noexcept {
                 WorkerLoop();
-            });
-            control_thread_ = std::thread([this]() noexcept {
-                ControlLoop();
             });
             return true;
         } catch (...) {
@@ -891,19 +890,139 @@ public:
             worker_stop_requested_.store(
                 true, std::memory_order_release);
             worker_running_.store(false, std::memory_order_release);
-            control_running_.store(false, std::memory_order_release);
             wake_epoch_.fetch_add(1U, std::memory_order_release);
             wake_epoch_.notify_all();
-            SignalStopEvent();
             if (worker_thread_.joinable()) {
                 worker_thread_.join();
-            }
-            if (control_thread_.joinable()) {
-                control_thread_.join();
             }
             SetSystemError(system_error_number, EAGAIN);
             return false;
         }
+    }
+
+    [[nodiscard]] bool StartControl(
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (!started_.load(std::memory_order_acquire) ||
+            !worker_running_.load(std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        bool expected = false;
+        if (!control_started_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        return StartClaimedControl(system_error_number);
+    }
+
+    [[nodiscard]] bool ActivateControlAfterPrefix(
+        std::chrono::milliseconds timeout,
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (timeout <= std::chrono::milliseconds::zero() ||
+            timeout > std::chrono::hours(24) ||
+            !started_.load(std::memory_order_acquire) ||
+            !worker_running_.load(std::memory_order_acquire) ||
+            worker_stop_requested_.load(std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        bool expected = false;
+        if (!control_started_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        std::uint64_t previous =
+            next_barrier_id_.load(std::memory_order_acquire);
+        for (;;) {
+            if (previous ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                SetSystemError(system_error_number, EOVERFLOW);
+                return false;
+            }
+            if (next_barrier_id_.compare_exchange_weak(
+                    previous,
+                    previous + 1U,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
+        const std::uint64_t barrier_id = previous + 1U;
+        HandoffEvent barrier{};
+        barrier.kind = HandoffKind::kBarrier;
+        barrier.barrier_id = barrier_id;
+        const auto deadline =
+            std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (queue_ != nullptr && queue_->TryPush(barrier)) {
+                WakeWorker();
+                break;
+            }
+            if (!worker_running_.load(std::memory_order_acquire)) {
+                SetSystemError(system_error_number, EPIPE);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                SetSystemError(system_error_number, ETIMEDOUT);
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        for (;;) {
+            if (completed_barrier_id_.load(
+                    std::memory_order_acquire) >= barrier_id) {
+                break;
+            }
+            if (!worker_running_.load(std::memory_order_acquire)) {
+                SetSystemError(system_error_number, EPIPE);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                SetSystemError(system_error_number, ETIMEDOUT);
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        // completed_barrier_id_ is the release publication for the exact
+        // health result captured by the worker at that FIFO boundary.
+        // Reading a fresh mutable service Snapshot here would let later live
+        // handoffs spuriously change the activation decision.
+        if (!completed_barrier_healthy_.load(
+                std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EIO);
+            return false;
+        }
+        return StartClaimedControl(system_error_number);
+    }
+
+private:
+    [[nodiscard]] bool StartClaimedControl(
+        int* system_error_number) noexcept {
+        control_running_.store(true, std::memory_order_release);
+        try {
+            control_thread_ = std::thread([this]() noexcept {
+                ControlLoop();
+            });
+            return true;
+        } catch (...) {
+            control_running_.store(false, std::memory_order_release);
+            SetSystemError(system_error_number, EAGAIN);
+            return false;
+        }
+    }
+
+public:
+    [[nodiscard]] bool Start(int* system_error_number) noexcept {
+        if (!StartWorker(system_error_number)) {
+            return false;
+        }
+        if (StartControl(system_error_number)) {
+            return true;
+        }
+        StopControl();
+        return false;
     }
 
     [[nodiscard]] bool PublishApplied(
@@ -1174,7 +1293,7 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool WaitUntilIdleForTest(
+    [[nodiscard]] bool WaitUntilIdle(
         std::chrono::milliseconds timeout) const noexcept {
         if (timeout.count() < 0) {
             return false;
@@ -1271,8 +1390,17 @@ private:
         try {
             for (;;) {
                 std::size_t batch = 0U;
+                std::uint64_t completed_barrier = 0U;
                 HandoffEvent event{};
                 while (batch < 1024U && queue_->TryPop(&event)) {
+                    if (event.kind == HandoffKind::kBarrier) {
+                        completed_barrier = event.barrier_id;
+                        ++batch;
+                        // A barrier is an exact FIFO prefix boundary. Do not
+                        // pop any later live handoff into the same header
+                        // publication that acknowledges this barrier.
+                        break;
+                    }
                     if (!globally_frozen_resource_.load(
                             std::memory_order_acquire)) {
                         HandleHandoff(event);
@@ -1288,7 +1416,30 @@ private:
                         std::memory_order_acquire)) {
                     DrainCertified();
                 }
-                PublishHeader(DeriveAggregateState());
+                const RealtimeCertifiedStateV1 barrier_state =
+                    DeriveAggregateState();
+                const bool header_committed =
+                    PublishHeader(barrier_state);
+                if (completed_barrier != 0U) {
+                    const auto committed_state =
+                        static_cast<RealtimeCertifiedStateV1>(
+                            Atomic(header_->aggregate_state)
+                                .load(std::memory_order_acquire));
+                    completed_barrier_healthy_.store(
+                        header_committed &&
+                            !globally_frozen_resource_.load(
+                                std::memory_order_acquire) &&
+                            (committed_state ==
+                                 RealtimeCertifiedStateV1::kNoData ||
+                             committed_state ==
+                                 RealtimeCertifiedStateV1::
+                                     kContiguous),
+                        std::memory_order_release);
+                    completed_barrier_id_.store(
+                        completed_barrier,
+                        std::memory_order_release);
+                    completed_barrier_id_.notify_all();
+                }
                 if (worker_stop_requested_.load(
                         std::memory_order_acquire) &&
                     queue_->Empty()) {
@@ -1849,10 +2000,10 @@ private:
                    : RealtimeCertifiedStateV1::kContiguous;
     }
 
-    void PublishHeader(
+    bool PublishHeader(
         RealtimeCertifiedStateV1 requested_state) noexcept {
         if (header_ == nullptr) {
-            return;
+            return false;
         }
         std::uint64_t heartbeat = 0U;
         if (!ReadMonotonicNs(&heartbeat)) {
@@ -1911,7 +2062,7 @@ private:
         if ((stable & 1U) != 0U ||
             stable >
                 std::numeric_limits<std::uint64_t>::max() - 2U) {
-            return;
+            return false;
         }
         std::uint64_t expected = stable;
         if (!tag.compare_exchange_strong(
@@ -1919,7 +2070,7 @@ private:
                 stable + 1U,
                 std::memory_order_acq_rel,
                 std::memory_order_acquire)) {
-            return;
+            return false;
         }
         std::atomic_thread_fence(std::memory_order_release);
         const std::uint64_t aggregate_commit_tag = stable + 2U;
@@ -2043,6 +2194,7 @@ private:
         Atomic(header_->frozen_channel_count).store(
             frozen_count, std::memory_order_relaxed);
         tag.store(aggregate_commit_tag, std::memory_order_release);
+        return true;
     }
 
     [[nodiscard]] RealtimeCertifiedServiceCreateErrorV1
@@ -2375,12 +2527,16 @@ private:
     bool unrepresented_resource_failure_ = false;
 
     std::atomic<bool> started_{false};
+    std::atomic<bool> control_started_{false};
     std::atomic<bool> accepting_{false};
     std::atomic<bool> draining_{false};
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> worker_stop_requested_{false};
     std::atomic<bool> control_running_{false};
     std::atomic<bool> globally_frozen_resource_{false};
+    std::atomic<std::uint64_t> next_barrier_id_{0U};
+    std::atomic<std::uint64_t> completed_barrier_id_{0U};
+    std::atomic<bool> completed_barrier_healthy_{false};
     std::atomic<std::uint64_t> wake_epoch_{0U};
     std::atomic<std::uint64_t> enqueued_observations_{0U};
     std::atomic<std::uint64_t> enqueued_applied_records_{0U};
@@ -2432,6 +2588,27 @@ bool RealtimeCertifiedMarketServiceV1::Start(
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
            impl_->Start(system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::StartWorker(
+    int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->StartWorker(system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::StartControl(
+    int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->StartControl(system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::
+    ActivateControlAfterPrefix(
+        std::chrono::milliseconds timeout,
+        int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->ActivateControlAfterPrefix(
+               timeout, system_error_number);
 }
 
 bool RealtimeCertifiedMarketServiceV1::PublishApplied(
@@ -2520,7 +2697,7 @@ bool RealtimeCertifiedMarketServiceV1::
 bool RealtimeCertifiedMarketServiceV1::WaitUntilIdleForTest(
     std::chrono::milliseconds timeout) const noexcept {
     return impl_ != nullptr &&
-           impl_->WaitUntilIdleForTest(timeout);
+           impl_->WaitUntilIdle(timeout);
 }
 
 CertifiedOrderEventHistoryErrorV1

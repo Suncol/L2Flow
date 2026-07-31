@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,9 @@
 #include <type_traits>
 #include <vector>
 
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 namespace ipc = l2flow::ipc;
@@ -275,6 +279,48 @@ template <typename Predicate>
     return predicate();
 }
 
+[[nodiscard]] bool WorkerOnlyControlHasNoResponse(
+    const std::filesystem::path& socket_path) {
+    const std::string native = socket_path.string();
+    if (native.empty() ||
+        native.size() >= sizeof(sockaddr_un::sun_path)) {
+        return false;
+    }
+    const int client =
+        ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (client < 0) {
+        return false;
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(
+        address.sun_path, native.c_str(), native.size() + 1U);
+    const socklen_t address_bytes = static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) + native.size() + 1U);
+    ipc::RealtimeCertifiedControlRequestV1 request{};
+    request.magic = ipc::kRealtimeCertifiedControlRequestMagicV1;
+    request.abi_major = ipc::kRealtimeCertifiedWireMajorV1;
+    request.abi_minor = ipc::kRealtimeCertifiedWireMinorV1;
+    request.request_bytes = sizeof(request);
+    request.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeCertifiedControlOpcodeV1::kGetSession);
+    request.nonce = 0x1234U;
+    const bool sent =
+        ::connect(
+            client,
+            reinterpret_cast<const sockaddr*>(&address),
+            address_bytes) == 0 &&
+        ::send(
+            client, &request, sizeof(request), MSG_NOSIGNAL) ==
+            static_cast<ssize_t>(sizeof(request));
+    pollfd descriptor{};
+    descriptor.fd = client;
+    descriptor.events = POLLIN;
+    const int poll_result = sent ? ::poll(&descriptor, 1U, 50) : -1;
+    static_cast<void>(::close(client));
+    return sent && poll_result == 0;
+}
+
 [[nodiscard]] runtime::RealtimePipelineIngressResultV1 Inject(
     runtime::RealtimePipelineV1* pipeline,
     std::uint64_t sequence,
@@ -302,6 +348,277 @@ InjectSnapshot(runtime::RealtimePipelineV1* pipeline) {
         ShanghaiSnapshotBody(),
         sdk::MessageKey{4U, 101U, 4U});
     return pipeline->InjectSdkMessageForTest(&message);
+}
+
+struct WorkerBarrierFixture final {
+    Fixture instrument{};
+    std::shared_ptr<FastSink> fast;
+    ipc::RealtimeCertifiedServiceConfigV1 service_config{};
+    std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1> service;
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+
+    ~WorkerBarrierFixture() {
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+        if (service != nullptr) {
+            service->StopControl();
+        }
+    }
+};
+
+[[nodiscard]] bool BuildWorkerBarrierFixture(
+    TestContext* test,
+    std::string_view socket_tag,
+    std::byte run_marker,
+    WorkerBarrierFixture* output) {
+    if (test == nullptr || output == nullptr) {
+        return false;
+    }
+    const std::string label(socket_tag);
+    const bool instrument_ready =
+        BuildFixture(&output->instrument) &&
+        output->instrument.runtime_state != nullptr;
+    test->Expect(
+        instrument_ready,
+        "build " + label + " worker-barrier fixture");
+    if (!instrument_ready) {
+        return false;
+    }
+
+    output->fast = std::make_shared<FastSink>();
+    auto& service_config = output->service_config;
+    service_config.run_id[0] = run_marker;
+    service_config.run_id[15] = std::byte{0x7e};
+    service_config.session_epoch = 1U;
+    service_config.trade_date = 20260730U;
+    service_config.daily_catalog = output->instrument.catalog;
+    service_config.fast_sink = output->fast;
+    service_config.certified_tick_ring_capacity = 64U;
+    service_config.channel_capacity = 8U;
+    service_config.handoff_queue_capacity = 128U;
+    service_config.maximum_pending_entries = 64U;
+    service_config.maximum_pending_entries_per_channel = 64U;
+    service_config.certified_duplicate_retention_entries = 64U;
+    service_config.maximum_reorder_span = 1024U;
+    service_config.maximum_mapping_bytes = 8U * 1024U * 1024U;
+    service_config.maximum_order_states = 128U;
+    service_config.maximum_derived_events = 1024U;
+    service_config.control_socket_path =
+        std::filesystem::path("/tmp") /
+        ("l2flow-certified-barrier-" + label + "-" +
+         std::to_string(static_cast<long long>(::getpid())) +
+         ".sock");
+
+    int system_error = 0;
+    const auto service_error =
+        ipc::RealtimeCertifiedMarketServiceV1::Create(
+            service_config, &output->service, &system_error);
+    const bool service_ready =
+        service_error ==
+            ipc::RealtimeCertifiedServiceCreateErrorV1::kNone &&
+        output->service != nullptr;
+    test->Expect(
+        service_ready,
+        "create " + label + " worker-barrier service");
+    if (!service_ready) {
+        return false;
+    }
+    const bool worker_started =
+        output->service->StartWorker(&system_error);
+    test->Expect(
+        worker_started,
+        "start " + label + " worker-barrier worker");
+    if (!worker_started) {
+        return false;
+    }
+
+    runtime::RealtimePipelineConfigV1 pipeline_config{};
+    pipeline_config.run_id = service_config.run_id;
+    pipeline_config.trade_date = service_config.trade_date;
+    pipeline_config.daily_catalog = output->instrument.catalog;
+    pipeline_config.runtime_state =
+        output->instrument.runtime_state.get();
+    pipeline_config.source_stream_ids =
+        {1001U, 1002U, 2001U, 2002U};
+    pipeline_config.maximum_sdk_message_bytes = 4096U;
+    pipeline_config.decoder_queue_capacity_per_source = 32U;
+    pipeline_config.completion_tracker_capacity = 256U;
+    pipeline_config.tick_ring_capacity = 256U;
+    pipeline_config.store_worker_count = 1U;
+    pipeline_config.store_queue_capacity_per_source_worker = 32U;
+    pipeline_config.intraday_store.segment_target_bytes = 4096U;
+    pipeline_config.intraday_store.maximum_session_records = 64U;
+    pipeline_config.intraday_store.maximum_session_accounted_bytes =
+        8U * 1024U * 1024U;
+    pipeline_config.intraday_store.maximum_records_per_batch = 16U;
+    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.applied_record_sink = output->service;
+    pipeline_config.native_sequence_observation_sink =
+        output->service;
+    pipeline_config.sdk.enabled = false;
+
+    std::string detail;
+    const auto pipeline_error = runtime::RealtimePipelineV1::Create(
+        pipeline_config, &output->pipeline, &detail);
+    const bool pipeline_ready =
+        pipeline_error ==
+            runtime::RealtimePipelineCreateErrorV1::kNone &&
+        output->pipeline != nullptr;
+    test->Expect(
+        pipeline_ready,
+        "create " + label + " worker-barrier pipeline: " + detail);
+    return pipeline_ready;
+}
+
+void RunGapBeforeBarrierRejectsActivationScenario(
+    TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test, "gap-reject", std::byte{0x51}, &fixture)) {
+        return;
+    }
+    test->Expect(
+        WorkerOnlyControlHasNoResponse(
+            fixture.service_config.control_socket_path),
+        "GAP_OPEN worker-only phase exposes no control response");
+    test->Expect(
+        Inject(fixture.pipeline.get(), 3U, 41U).accepted(),
+        "inject leading gap before activation barrier");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.wire_snapshot_consistent &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kGapOpen &&
+                   snapshot.canonical_apply_frontier == 0U;
+        }) &&
+            fixture.service->WaitUntilIdleForTest(5s),
+        "GAP_OPEN is fully committed before activation barrier");
+
+    int system_error = 0;
+    test->Expect(
+        !fixture.service->ActivateControlAfterPrefix(
+            5s, &system_error) &&
+            system_error == EIO,
+        "pre-barrier GAP_OPEN rejects control activation with EIO");
+    test->Expect(
+        WorkerOnlyControlHasNoResponse(
+            fixture.service_config.control_socket_path),
+        "rejected GAP_OPEN activation leaves control unavailable");
+}
+
+void RunFrozenBeforeBarrierRejectsActivationScenario(
+    TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test, "frozen-reject", std::byte{0x52}, &fixture)) {
+        return;
+    }
+    test->Expect(
+        WorkerOnlyControlHasNoResponse(
+            fixture.service_config.control_socket_path),
+        "FROZEN worker-only phase exposes no control response");
+    fixture.service->MarkNativeSequenceObservationFailure(
+        l2flow::realtime::NativeSequenceObservationFailureV1::
+            kHandoff,
+        sdk::MessageKey{4U, 101U, 24U});
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.wire_snapshot_consistent &&
+                   snapshot.globally_frozen_resource &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::
+                           kFrozenResource;
+        }),
+        "FROZEN_RESOURCE is committed before activation barrier");
+
+    int system_error = 0;
+    test->Expect(
+        !fixture.service->ActivateControlAfterPrefix(
+            5s, &system_error) &&
+            system_error == EIO,
+        "pre-barrier FROZEN_RESOURCE rejects activation with EIO");
+    test->Expect(
+        WorkerOnlyControlHasNoResponse(
+            fixture.service_config.control_socket_path),
+        "rejected FROZEN activation leaves control unavailable");
+}
+
+void RunPostBarrierGapCannotRewriteActivationScenario(
+    TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test, "post-gap", std::byte{0x53}, &fixture)) {
+        return;
+    }
+    test->Expect(
+        Inject(fixture.pipeline.get(), 1U, 41U).accepted(),
+        "inject healthy prefix before exact activation barrier");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.wire_snapshot_consistent &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kContiguous &&
+                   snapshot.canonical_apply_frontier == 1U;
+        }) &&
+            fixture.service->WaitUntilIdleForTest(5s),
+        "healthy prefix is fully committed before exact barrier");
+
+    int system_error = 0;
+    const bool activated =
+        fixture.service->ActivateControlAfterPrefix(
+            5s, &system_error);
+    test->Expect(
+        activated && system_error == 0,
+        "healthy exact barrier activates control");
+
+    // This handoff is deliberately submitted immediately after the exact
+    // barrier result. It changes the live mutable state, but cannot rewrite
+    // the already-captured activation decision for that FIFO prefix.
+    test->Expect(
+        Inject(fixture.pipeline.get(), 3U, 43U).accepted(),
+        "inject state-changing live gap immediately after barrier");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.wire_snapshot_consistent &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kGapOpen &&
+                   snapshot.canonical_apply_frontier == 1U;
+        }),
+        "post-barrier live handoff advances mutable state to GAP_OPEN");
+
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    std::unique_ptr<ipc::RealtimeCertifiedReaderV1> reader;
+    const auto open_error = ipc::RealtimeCertifiedReaderV1::Open(
+        open, &reader, &system_error);
+    test->Expect(
+        open_error ==
+            ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            reader != nullptr,
+        "post-barrier GAP cannot revoke exact control activation");
+    ipc::RealtimeCertifiedStatusSnapshotV1 reader_status{};
+    test->Expect(
+        reader != nullptr &&
+            reader->ReadStatus(&reader_status) ==
+                ipc::RealtimeCertifiedReadResultV1::kOk &&
+            reader_status.state ==
+                ipc::RealtimeCertifiedStateV1::kGapOpen &&
+            reader_status.canonical_apply_frontier == 1U,
+        "activated control reports later GAP without polluting barrier result");
 }
 
 void RunRecoveryScenario(TestContext* test) {
@@ -345,7 +662,13 @@ void RunRecoveryScenario(TestContext* test) {
     if (service == nullptr) {
         return;
     }
-    test->Expect(service->Start(&system_error), "start certified service");
+    test->Expect(
+        service->StartWorker(&system_error),
+        "start recovery certified worker");
+    test->Expect(
+        WorkerOnlyControlHasNoResponse(
+            service_config.control_socket_path),
+        "worker-only recovery phase exposes no control response");
 
     runtime::RealtimePipelineConfigV1 pipeline_config{};
     pipeline_config.run_id = service_config.run_id;
@@ -455,6 +778,13 @@ void RunRecoveryScenario(TestContext* test) {
                         sequence - 1U)],
             "certified ring is native ordered after repair");
     }
+
+    test->Expect(
+        service->ActivateControlAfterPrefix(5s, &system_error),
+        "activate certified control after committed prefix barrier");
+    test->Expect(
+        !service->StartControl(&system_error),
+        "certified control activation is one-shot");
 
     const auto filtered =
         Inject(pipeline.get(), 4U, 44U, "900901");
@@ -835,6 +1165,9 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
 
 int main() {
     TestContext test;
+    RunGapBeforeBarrierRejectsActivationScenario(&test);
+    RunFrozenBeforeBarrierRejectsActivationScenario(&test);
+    RunPostBarrierGapCannotRewriteActivationScenario(&test);
     RunRecoveryScenario(&test);
     RunEventCapacityFailOpenScenario(&test);
     if (test.failures() != 0) {

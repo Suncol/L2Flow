@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -369,19 +370,46 @@ private:
     std::vector<std::byte> bytes_;
 };
 
-std::vector<std::byte> ShenzhenTransactionBody() {
+std::vector<std::byte> ShenzhenTransactionBody(
+    std::uint64_t application_sequence = 91U,
+    std::uint64_t price_raw = 123'456U,
+    std::uint64_t quantity_raw = 33U,
+    std::uint32_t channel = 12U) {
     WireWriter writer(70U);
-    writer.StoreU32(0U, 12U);
-    writer.StoreU64(4U, 91U);
-    writer.StoreU64(18U, 90U);
+    writer.StoreU32(0U, channel);
+    writer.StoreU64(4U, application_sequence);
+    writer.StoreU64(
+        18U,
+        application_sequence == 0U
+            ? 0U
+            : application_sequence - 1U);
     writer.StoreU64(26U, 0U);
-    writer.StoreU64(46U, 123'456U);
-    writer.StoreU64(54U, 33U);
+    writer.StoreU64(46U, price_raw);
+    writer.StoreU64(54U, quantity_raw);
     writer.StoreU32(62U, 70U);
     writer.StoreU32(66U, 93'000'124U);
     writer.StoreString(12U, "010");
     writer.StoreString(34U, "000001");
     writer.StoreString(40U, "102 ");
+    return std::move(writer).Take();
+}
+
+std::vector<std::byte> ShanghaiTickBody(
+    std::uint64_t business_index,
+    std::string_view type,
+    std::string_view flag) {
+    WireWriter writer(70U);
+    writer.StoreU64(0U, business_index);
+    writer.StoreU32(8U, 7U);
+    writer.StoreU32(18U, 93'000'125U);
+    writer.StoreU64(28U, 11'001U);
+    writer.StoreU64(36U, 22'002U);
+    writer.StoreU32(44U, 12'345U);
+    writer.StoreU64(48U, 41U);
+    writer.StoreU64(56U, 1'000U);
+    writer.StoreString(12U, "600001");
+    writer.StoreString(22U, type);
+    writer.StoreString(64U, flag);
     return std::move(writer).Take();
 }
 
@@ -424,6 +452,233 @@ private:
     std::vector<std::byte> body_;
 };
 
+class OwnedTestMessage final : public mdl::MDLMessage {
+public:
+    OwnedTestMessage(
+        std::uint64_t vendor_sequence,
+        std::uint64_t application_sequence,
+        std::uint64_t price_raw,
+        std::uint64_t quantity_raw = 1U,
+        std::uint32_t vendor_local_time = 93'000'000U)
+        : OwnedTestMessage(
+              sdk::MessageKey{6U, 101U, 36U},
+              vendor_sequence,
+              ShenzhenTransactionBody(
+                  application_sequence,
+                  price_raw,
+                  quantity_raw),
+              vendor_local_time) {}
+
+    OwnedTestMessage(
+        sdk::MessageKey key,
+        std::uint64_t vendor_sequence,
+        std::vector<std::byte> body,
+        std::uint32_t vendor_local_time = 93'000'000U)
+        : key_(key), body_(std::move(body)) {
+        std::memset(&head_, 0, sizeof(head_));
+        head_.HeadSize =
+            static_cast<std::uint8_t>(sdk::kVendorHeadBytes);
+        head_.MessageSize = static_cast<std::uint32_t>(
+            sdk::kVendorHeadBytes + body_.size());
+        head_.MessageEncoding =
+            static_cast<std::uint8_t>(mdl::MDLEID_BINARY);
+        head_.ServiceID = key.service_id;
+        head_.ServiceVersion = key.service_version;
+        head_.MessageID = key.message_id;
+        head_.LocalTime.m_Value = vendor_local_time;
+        head_.SequenceID = vendor_sequence;
+    }
+
+    void AddRef() override {}
+    int ReleaseRef() override { return 1; }
+
+    mdl::MDLMessageHead* GetHead() const override {
+        return const_cast<mdl::MDLMessageHead*>(&head_);
+    }
+
+    char* GetBody() const override {
+        return reinterpret_cast<char*>(
+            const_cast<std::byte*>(body_.data()));
+    }
+
+    mdl::MDLMessage* _Copy() const override { return nullptr; }
+
+    const sdk::MessageKey& key() const noexcept { return key_; }
+
+private:
+    sdk::MessageKey key_{};
+    mdl::MDLMessageHead head_{};
+    std::vector<std::byte> body_;
+};
+
+class TestReplaySource final
+    : public l2flow::recovery::StartupReplaySourceV1 {
+public:
+    explicit TestReplaySource(
+        std::vector<std::shared_ptr<OwnedTestMessage>> messages,
+        std::vector<sdk::MessageKey> fences = {},
+        std::function<void()> after_fences = {})
+        : messages_(std::move(messages)),
+          fences_(std::move(fences)),
+          after_fences_(std::move(after_fences)) {}
+
+    l2flow::recovery::StartupReplayResultV1 Replay(
+        l2flow::recovery::StartupReplaySinkV1& sink)
+        noexcept override {
+        l2flow::recovery::StartupReplayResultV1 result{};
+        for (const sdk::MessageKey& key : fences_) {
+            std::string detail;
+            if (!sink.CaptureTupleFence(key, &detail)) {
+                result.error =
+                    l2flow::recovery::StartupReplayErrorV1::
+                        kSinkRejected;
+                result.detail = std::move(detail);
+                return result;
+            }
+        }
+        if (after_fences_) {
+            after_fences_();
+        }
+        for (std::size_t index = 0U;
+             index < messages_.size();
+             ++index) {
+            l2flow::recovery::StartupReplayPublicationV1
+                publication{};
+            publication.message = messages_[index].get();
+            publication.key = messages_[index]->key();
+            publication.source_line =
+                static_cast<std::uint64_t>(index) + 2U;
+            publication.csv_sequence =
+                messages_[index]->GetHead()->SequenceID;
+            std::string detail;
+            if (!sink.Publish(publication, &detail)) {
+                result.error =
+                    l2flow::recovery::StartupReplayErrorV1::
+                        kSinkRejected;
+                result.error_line = publication.source_line;
+                result.detail = std::move(detail);
+                return result;
+            }
+            ++result.counts.shenzhen_transactions;
+        }
+        return result;
+    }
+
+private:
+    std::vector<std::shared_ptr<OwnedTestMessage>> messages_;
+    std::vector<sdk::MessageKey> fences_;
+    std::function<void()> after_fences_;
+};
+
+class CapturingProgressSink final
+    : public realtime::ProcessingProgressSinkV2 {
+public:
+    bool PublishProcessingProgress(
+        realtime::ProcessingProgressV2 progress) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        latest_ = progress;
+        ++publication_count_;
+        return true;
+    }
+
+    realtime::ProcessingProgressV2 latest() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return latest_;
+    }
+
+    std::uint64_t publication_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return publication_count_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    realtime::ProcessingProgressV2 latest_{};
+    std::uint64_t publication_count_ = 0U;
+};
+
+struct ReplaySdkState final {
+    mdl::MessageHandlerBase* handler = nullptr;
+    std::vector<std::shared_ptr<OwnedTestMessage>> connect_messages;
+    std::uint32_t shutdown_calls = 0U;
+};
+
+class ReplaySubscriber final : public sdk::SdkSubscriber {
+public:
+    explicit ReplaySubscriber(std::shared_ptr<ReplaySdkState> state)
+        : state_(std::move(state)) {}
+
+    void SetServerAddress(std::string_view) override {}
+    void SetUserName(std::string_view) override {}
+    void SetHeartbeatInterval(std::uint32_t) override {}
+    void SetHeartbeatTimeout(std::uint32_t) override {}
+    void SetMessageEncoding(mdl::MDLMessageEncoding) override {}
+    void EnableMergeMessage(bool) override {}
+    void SetSendMacAuth(bool) override {}
+    void EnableServerSelect(bool) override {}
+    void AddSubscription(const sdk::MessageKey&) override {}
+
+    std::string Connect() override {
+        for (const auto& message : state_->connect_messages) {
+            state_->handler->OnMessage(nullptr, message.get());
+        }
+        return {};
+    }
+
+    bool Release(std::string* error) noexcept override {
+        if (error != nullptr) {
+            error->clear();
+        }
+        return true;
+    }
+
+private:
+    std::shared_ptr<ReplaySdkState> state_;
+};
+
+class ReplayManager final : public sdk::SdkManager {
+public:
+    explicit ReplayManager(std::shared_ptr<ReplaySdkState> state)
+        : state_(std::move(state)) {}
+
+    void EnableLog(std::string_view, bool) override {}
+
+    std::unique_ptr<sdk::SdkSubscriber> CreateSubscriber(
+        mdl::MessageHandlerBase* handler,
+        bool multithread_callback) override {
+        if (multithread_callback) {
+            return nullptr;
+        }
+        state_->handler = handler;
+        return std::make_unique<ReplaySubscriber>(state_);
+    }
+
+    void Shutdown() override { ++state_->shutdown_calls; }
+
+    bool Release(std::string* error) noexcept override {
+        if (error != nullptr) {
+            error->clear();
+        }
+        return true;
+    }
+
+private:
+    std::shared_ptr<ReplaySdkState> state_;
+};
+
+class ReplayFactory final : public sdk::SdkFactory {
+public:
+    explicit ReplayFactory(std::shared_ptr<ReplaySdkState> state)
+        : state_(std::move(state)) {}
+
+    std::unique_ptr<sdk::SdkManager> Create(int, int) override {
+        return std::make_unique<ReplayManager>(state_);
+    }
+
+private:
+    std::shared_ptr<ReplaySdkState> state_;
+};
+
 struct PipelineCatalogFixture final {
     std::shared_ptr<const market::DailyInstrumentCatalogV2> catalog;
     std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
@@ -450,6 +705,43 @@ struct PipelineCatalogFixture final {
     config.trade_date = 20260724U;
     config.catalog_version = 1U;
     config.session_epoch = 171U;
+    config.market_scope = market::kDailyCatalogMainlandScopeV2;
+    config.coverage_complete = true;
+    std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
+    if (market::DailyInstrumentCatalogV2::Create(
+            config, std::span(&source, 1U), &catalog) !=
+            market::DailyInstrumentCatalogCreateErrorV2::kNone ||
+        catalog == nullptr) {
+        return false;
+    }
+    output->catalog =
+        std::shared_ptr<const market::DailyInstrumentCatalogV2>(
+            std::move(catalog));
+    return market::InstrumentRuntimeStateV2::Create(
+               *output->catalog, &output->runtime_state) ==
+               market::InstrumentRuntimeStateErrorV2::kNone &&
+           output->runtime_state != nullptr;
+}
+
+[[nodiscard]] bool MakeShanghaiCatalogFixture(
+    PipelineCatalogFixture* output) {
+    if (output == nullptr) {
+        return false;
+    }
+    *output = {};
+    market::DailyInstrumentSourceEntryV2 source{};
+    source.key.market = market::MarketV1::kShanghai;
+    source.key.security_id = {
+        std::byte{'6'}, std::byte{'0'}, std::byte{'0'},
+        std::byte{'0'}, std::byte{'0'}, std::byte{'1'}};
+    source.metadata = market::InstrumentMetadataV2{
+        market::QuantityUnitV1::kShare,
+        market::SecurityTypeV1::kEquity,
+        market::AssetScopeV1::kDocumentedCore};
+    market::DailyInstrumentCatalogConfigV2 config{};
+    config.trade_date = 20260724U;
+    config.catalog_version = 1U;
+    config.session_epoch = 172U;
     config.market_scope = market::kDailyCatalogMainlandScopeV2;
     config.coverage_complete = true;
     std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
@@ -507,6 +799,1005 @@ std::size_t EventIndex(
     return found == events.end()
                ? std::numeric_limits<std::size_t>::max()
                : static_cast<std::size_t>(found - events.begin());
+}
+
+void RunStartupRecoveryTests(TestContext* test) {
+    if (test == nullptr) {
+        return;
+    }
+    const auto message = [](
+                             std::uint64_t sequence,
+                             std::uint64_t price) {
+        return std::make_shared<OwnedTestMessage>(
+            sequence, sequence, price, 1U);
+    };
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup coverage assertion fixture");
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.intraday_store.coverage_from_open = false;
+        config.startup_replay_source = source;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kInvalidConfiguration &&
+                pipeline == nullptr,
+            "a replay source cannot manufacture coverage_from_open");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "post-handoff delayed callback fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        auto csv = message(450U, 100'000U);
+        auto delayed_duplicate = message(450U, 100'000U);
+        auto suffix_later = message(452U, 200'000U);
+        auto suffix_earlier = message(451U, 150'000U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv});
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        if (pipeline != nullptr) {
+            sdk_state->handler->OnMessage(
+                nullptr, delayed_duplicate.get());
+            sdk_state->handler->OnMessage(
+                nullptr, suffix_later.get());
+            sdk_state->handler->OnMessage(
+                nullptr, suffix_earlier.get());
+            pipeline->StopAndDrain();
+        }
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                !pipeline->fatal() &&
+                pipeline->Snapshot().store.appended_records == 3U,
+            "a CSV duplicate delayed until after Create is suppressed, while opaque live suffix identities remain in callback order: " +
+                detail);
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "out-of-order replay identity fixture");
+        const sdk::MessageKey key{6U, 101U, 36U};
+        auto first = std::make_shared<OwnedTestMessage>(
+            key,
+            10U,
+            ShenzhenTransactionBody(
+                1U, 100'010U, 1U, 12U));
+        auto high = std::make_shared<OwnedTestMessage>(
+            key,
+            30U,
+            ShenzhenTransactionBody(
+                1U, 100'030U, 1U, 13U));
+        auto later_released = std::make_shared<OwnedTestMessage>(
+            key,
+            20U,
+            ShenzhenTransactionBody(
+                2U, 100'020U, 1U, 12U));
+        auto delayed_prefix = std::make_shared<OwnedTestMessage>(
+            key,
+            25U,
+            ShenzhenTransactionBody(
+                2U, 100'025U, 1U, 13U));
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{
+                first, high, later_released});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        if (pipeline != nullptr) {
+            sdk_state->handler->OnMessage(
+                nullptr, delayed_prefix.get());
+        }
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr && pipeline->fatal() &&
+                pipeline->Snapshot().store.appended_records == 3U,
+            "replay may release SeqNo 30 before 20 across native channels, while the tuple cutoff remains the maximum 30: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "out-of-order retained-tail fixture");
+        const sdk::MessageKey key{6U, 101U, 36U};
+        auto delayed_low = std::make_shared<OwnedTestMessage>(
+            key,
+            1U,
+            ShenzhenTransactionBody(
+                2U, 100'001U, 1U, 7U));
+        auto physical_tail_first =
+            std::make_shared<OwnedTestMessage>(
+                key,
+                2U,
+                ShenzhenTransactionBody(
+                    1U, 100'002U, 1U, 8U));
+        auto physical_tail_second =
+            std::make_shared<OwnedTestMessage>(
+                key,
+                3U,
+                ShenzhenTransactionBody(
+                    1U, 100'003U, 1U, 7U));
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{
+                physical_tail_first,
+                physical_tail_second,
+                delayed_low});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {
+            physical_tail_first, physical_tail_second};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                pipeline->Snapshot().store.appended_records == 3U,
+            "fingerprint retention keeps the greatest SequenceIDs rather than the last Publish calls when native repair releases 2,3,1: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "post-handoff conflict fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        auto csv = message(460U, 100'000U);
+        auto conflict = message(460U, 100'001U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv});
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        if (pipeline != nullptr) {
+            sdk_state->handler->OnMessage(nullptr, conflict.get());
+        }
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr && pipeline->fatal() &&
+                pipeline->Snapshot().store.appended_records == 1U,
+            "a delayed post-Create callback with the CSV identity but a different semantic payload fails the session");
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "post-handoff evicted-prefix fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        std::vector<std::shared_ptr<OwnedTestMessage>> replay{
+            std::make_shared<OwnedTestMessage>(
+                470U, 1U, 100'470U),
+            std::make_shared<OwnedTestMessage>(
+                471U, 2U, 100'471U),
+            std::make_shared<OwnedTestMessage>(
+                472U, 3U, 100'472U)};
+        auto delayed_evicted = std::make_shared<OwnedTestMessage>(
+            470U, 1U, 100'470U);
+        auto source =
+            std::make_shared<TestReplaySource>(replay);
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        if (pipeline != nullptr) {
+            sdk_state->handler->OnMessage(
+                nullptr, delayed_evicted.get());
+        }
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr && pipeline->fatal() &&
+                pipeline->Snapshot().store.appended_records == 3U,
+            "a post-Create identity at or below the CSV cutoff fails closed when its bounded fingerprint was evicted");
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup cooperative-cancel fixture");
+        auto csv = message(90U, 90'000U);
+        auto cancel_requested = std::make_shared<bool>(false);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv},
+            std::vector<sdk::MessageKey>{csv->key()},
+            [cancel_requested]() {
+                *cancel_requested = true;
+            });
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_cancel_requested =
+            [cancel_requested]() noexcept {
+                return *cancel_requested;
+            };
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupCancelled &&
+                pipeline == nullptr &&
+                sdk_state->shutdown_calls == 1U,
+            "cooperative cancellation aborts recovery before ACTIVE and shuts down the SDK");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup opaque live SequenceID fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        auto csv = message(450U, 100'000U);
+        auto suffix_later =
+            std::make_shared<OwnedTestMessage>(
+                452U, 451U, 200'000U);
+        auto suffix_earlier =
+            std::make_shared<OwnedTestMessage>(
+                451U, 452U, 150'000U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv},
+            std::vector<sdk::MessageKey>{csv->key()},
+            [sdk_state, suffix_later, suffix_earlier]() {
+                sdk_state->handler->OnMessage(
+                    nullptr, suffix_later.get());
+                sdk_state->handler->OnMessage(
+                    nullptr, suffix_earlier.get());
+            });
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                pipeline->Snapshot().store.appended_records == 3U,
+            "live callback order is preserved without inventing an undocumented SequenceID monotonicity rule: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup recovery success fixture");
+        auto csv = message(100U, 100'000U);
+        auto overlap = message(100U, 100'000U);
+        auto live = message(101U, 200'000U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {overlap, live};
+        auto progress =
+            std::make_shared<CapturingProgressSink>();
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.processing_progress_sink = progress;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "CSV replay and overlapping synchronous callbacks recover: " +
+                detail);
+        const realtime::ProcessingProgressV2 ready_progress =
+            progress->latest();
+        test->Expect(
+            progress->publication_count() != 0U &&
+                ready_progress.accepted_sequence == 2U &&
+                ready_progress.applied_sequence == 2U,
+            "recovery Create synchronously publishes its fully applied query-ready prefix");
+        if (pipeline != nullptr) {
+            const runtime::RealtimePipelineSnapshotV1 snapshot =
+                pipeline->Snapshot();
+            test->Expect(
+                snapshot.accepted_messages == 2U &&
+                    snapshot.decoded_messages == 2U &&
+                    snapshot.store.appended_records == 2U,
+                "closed handoff drops the exact overlap before assigning a process sequence");
+            market::RealtimeLatestRecordViewV1 latest{};
+            const bool latest_query_ok =
+                pipeline->GetLatestTick(1U, &latest) ==
+                    market::RealtimeLatestQueryErrorV1::kNone &&
+                latest.available() && latest.record != nullptr &&
+                latest.record->ingress_sequence() == 2U;
+            const auto* latest_event =
+                latest_query_ok
+                    ? market::StoredMarketEventGetV1<
+                          market::ShenzhenTransactionV1>(
+                          latest.record->event())
+                    : nullptr;
+            test->Expect(
+                latest_event != nullptr &&
+                    latest_event->fields.price.raw == 200'000,
+                "Create returns only after latest query exposes the recovered CSV+live prefix");
+            const runtime::RealtimePipelineCutResultV1 terminal =
+                pipeline->StopAndPublishFinalGeneration(2s);
+            market::IntradayInstrumentSummaryV1 row{};
+            std::unique_ptr<market::IntradayInstrumentCursorV1>
+                cursor;
+            std::array<const market::RealtimeHistoryRecordV1*, 2U>
+                records{};
+            std::size_t written = 0U;
+            const std::uint64_t recovered_notice =
+                market::MarketNoticeBitV1(
+                    market::MarketNoticeV1::kRecoveredFromCsv);
+            bool records_ok = false;
+            bool recovered_first = false;
+            bool live_second = false;
+            bool latest_price_ok = false;
+            bool ingress_order_ok = false;
+            if (terminal.published() &&
+                terminal.store_generation->Find(1U, &row) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone &&
+                terminal.store_generation->OpenTailCursor(
+                    1U, row.record_count, &cursor) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone &&
+                cursor != nullptr &&
+                cursor->ReadBatch(records, &written) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::
+                        kNone &&
+                written == 2U) {
+                const auto* first =
+                    market::StoredMarketEventGetV1<
+                        market::ShenzhenTransactionV1>(
+                        records[1U]->event());
+                const auto* second =
+                    market::StoredMarketEventGetV1<
+                        market::ShenzhenTransactionV1>(
+                        records[0U]->event());
+                records_ok =
+                    first != nullptr && second != nullptr &&
+                    (ingress_order_ok =
+                         records[1U]->ingress_sequence() == 1U &&
+                         records[0U]->ingress_sequence() == 2U) &&
+                    (recovered_first =
+                         (first->common.market_notices &
+                          recovered_notice) != 0U) &&
+                    (live_second =
+                         (second->common.market_notices &
+                          recovered_notice) == 0U) &&
+                    (latest_price_ok =
+                         second->fields.price.raw == 200'000);
+            }
+            test->Expect(
+                terminal.published(),
+                "recovered pipeline publishes its final generation");
+            test->Expect(
+                terminal.published() && row.record_count == 2U,
+                "recovered final generation contains two records");
+            test->Expect(
+                terminal.published() &&
+                    terminal.store_generation->coverage_from_open(),
+                "explicit recovery coverage assertion reaches the Store only after successful startup");
+            test->Expect(
+                ingress_order_ok,
+                "CSV/live records retain process ingress order");
+            test->Expect(
+                recovered_first,
+                "CSV record carries recovered provenance");
+            test->Expect(
+                live_second,
+                "non-overlap live record does not carry CSV provenance");
+            test->Expect(
+                latest_price_ok,
+                "non-overlap live payload becomes latest");
+            test->Expect(
+                records_ok,
+                "CSV is applied before non-overlap live data with recovery provenance and correct latest payload");
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup fenced live-suffix fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        auto csv = message(150U, 100'000U);
+        auto suffix = message(151U, 200'000U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv},
+            std::vector<sdk::MessageKey>{suffix->key()},
+            [sdk_state, suffix]() {
+                sdk_state->handler->OnMessage(
+                    nullptr, suffix.get());
+            });
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                pipeline->Snapshot().store.appended_records == 2U,
+            "callback copied after its CSV cutoff is a valid pure live suffix without a manufactured overlap: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup fenced pre-cutoff-missing fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {
+            message(251U, 200'000U)};
+        auto csv = message(250U, 100'000U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv},
+            std::vector<sdk::MessageKey>{csv->key()});
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupOverlapMissing &&
+                pipeline == nullptr,
+            "callback copied no later than the CSV cutoff still requires an exact retained prefix match");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup fenced non-monotone handoff fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        auto csv = message(350U, 100'000U);
+        auto suffix = message(351U, 200'000U);
+        auto late_prefix = message(350U, 100'000U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv},
+            std::vector<sdk::MessageKey>{csv->key()},
+            [sdk_state, suffix, late_prefix]() {
+                sdk_state->handler->OnMessage(
+                    nullptr, suffix.get());
+                sdk_state->handler->OnMessage(
+                    nullptr, late_prefix.get());
+            });
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 4U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 4U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupOverlapConflict &&
+                pipeline == nullptr,
+            "handoff cannot return to the CSV prefix after entering the fenced live suffix");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup evicted-prefix identity fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        std::vector<std::shared_ptr<OwnedTestMessage>> replay{
+            message(400U, 100'400U),
+            message(401U, 100'401U),
+            message(402U, 100'402U),
+            message(403U, 100'403U)};
+        auto evicted_prefix = message(400U, 100'400U);
+        auto source = std::make_shared<TestReplaySource>(
+            replay,
+            std::vector<sdk::MessageKey>{
+                evicted_prefix->key()},
+            [sdk_state, evicted_prefix]() {
+                sdk_state->handler->OnMessage(
+                    nullptr, evicted_prefix.get());
+            });
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupOverlapMissing &&
+                pipeline == nullptr,
+            "a callback at or below the replay tuple cutoff cannot become a duplicate merely because its fingerprint was evicted");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup overlap-conflict fixture");
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{
+                message(200U, 100'000U)});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {
+            message(200U, 100'001U)};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupOverlapConflict &&
+                pipeline == nullptr && sdk_state->shutdown_calls == 1U &&
+                detail.find("different payloads") !=
+                    std::string::npos,
+            "same tuple/SequenceID with another semantic payload fails startup and shuts down SDK");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup local-time conflict fixture");
+        auto csv = std::make_shared<OwnedTestMessage>(
+            210U, 210U, 100'000U, 1U, 93'000'000U);
+        auto live = std::make_shared<OwnedTestMessage>(
+            210U, 210U, 100'000U, 1U, 93'000'001U);
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{csv});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {live};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupOverlapConflict &&
+                pipeline == nullptr,
+            "same tuple/SequenceID/body with a different vendor LocalTime is not an exact duplicate");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup missing-overlap fixture");
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{
+                message(300U, 100'000U)});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {
+            message(301U, 100'001U)};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupOverlapMissing &&
+                pipeline == nullptr && sdk_state->shutdown_calls == 1U,
+            "a buffered tuple without any proven CSV overlap fails startup");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup buffer-overflow fixture");
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{
+                message(400U, 100'000U)});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {
+            message(400U, 100'000U),
+            message(401U, 100'001U)};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 1U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 1U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kStartupBufferOverflow &&
+                pipeline == nullptr && sdk_state->shutdown_calls == 1U,
+            "startup raw buffer message bound fails explicitly and safely");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup tiny-queue fixture");
+        std::vector<std::shared_ptr<OwnedTestMessage>> replay;
+        replay.reserve(32U);
+        for (std::uint64_t sequence = 1U;
+             sequence <= 32U;
+             ++sequence) {
+            replay.push_back(message(
+                500U + sequence,
+                100'000U + sequence));
+        }
+        auto source =
+            std::make_shared<TestReplaySource>(replay);
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {replay.back()};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 32U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        config.decoder_queue_capacity_per_source = 1U;
+        config.store_queue_capacity_per_source_worker = 1U;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                pipeline->Snapshot().store.appended_records == 32U &&
+                !pipeline->fatal(),
+            "bulk replay waits through decoder and History backpressure instead of treating a tiny queue as fatal: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "startup retained-tail fixture");
+        constexpr std::size_t kReplayCount = 8193U;
+        constexpr std::size_t kBufferedCount = 4097U;
+        std::vector<std::shared_ptr<OwnedTestMessage>> replay;
+        replay.reserve(kReplayCount);
+        for (std::size_t index = 0U;
+             index < kReplayCount;
+             ++index) {
+            const std::uint64_t sequence =
+                10'000U + static_cast<std::uint64_t>(index);
+            replay.push_back(message(
+                sequence, 100'000U + sequence));
+        }
+        auto source =
+            std::make_shared<TestReplaySource>(replay);
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages.insert(
+            sdk_state->connect_messages.end(),
+            replay.end() -
+                static_cast<std::ptrdiff_t>(kBufferedCount),
+            replay.end());
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages =
+            kBufferedCount;
+        config.startup_live_buffer_maximum_bytes =
+            2U * 1024U * 1024U;
+        config.startup_overlap_retention_per_message =
+            kBufferedCount;
+        config.startup_warmup_timeout = 20s;
+        config.startup_replay_backpressure_timeout = 2s;
+        config.intraday_store.maximum_session_records =
+            kReplayCount;
+        config.intraday_store.maximum_session_accounted_bytes =
+            256U * 1024U * 1024U;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                pipeline->Snapshot().store.appended_records ==
+                    kReplayCount &&
+                pipeline->Snapshot().accepted_messages ==
+                    kReplayCount,
+            "a >4096-message buffered overlap remains in the bounded tail and creates no duplicate Store records: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeShanghaiCatalogFixture(&fixture),
+            "startup Shanghai stateful-fingerprint fixture");
+        const sdk::MessageKey sh_tick_key{4U, 101U, 24U};
+        auto early = std::make_shared<OwnedTestMessage>(
+            sh_tick_key,
+            30'000U,
+            ShanghaiTickBody(1U, "A", "B"));
+        auto status = std::make_shared<OwnedTestMessage>(
+            sh_tick_key,
+            30'001U,
+            ShanghaiTickBody(2U, "S", "TRADE"));
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{
+                early, status});
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages = {
+            std::make_shared<OwnedTestMessage>(
+                sh_tick_key,
+                30'000U,
+                ShanghaiTickBody(1U, "A", "B"))};
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.startup_live_buffer_maximum_messages = 2U;
+        config.startup_live_buffer_maximum_bytes = 64U * 1024U;
+        config.startup_overlap_retention_per_message = 2U;
+        config.startup_warmup_timeout = 5s;
+        config.startup_replay_backpressure_timeout = 2s;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr &&
+                pipeline->Snapshot().accepted_messages == 2U &&
+                pipeline->Snapshot().store.appended_records == 2U,
+            "Shanghai overlap fingerprint excludes decoder-state-derived phase after a later S transition: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
 }
 
 }  // namespace
@@ -760,6 +2051,8 @@ int main() {
             after_destruction.subscriber_release_calls == 1U &&
             after_destruction.manager_release_calls == 1U,
         "idempotent stop/destruction does not repeat SDK lifecycle operations");
+
+    RunStartupRecoveryTests(&test);
 
     return test.failures() == 0 ? 0 : 1;
 }

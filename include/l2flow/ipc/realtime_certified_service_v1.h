@@ -200,6 +200,22 @@ public:
     [[nodiscard]] bool Start(
         int* system_error_number = nullptr) noexcept;
 
+    // Two-phase startup is used by CSV intraday recovery: the worker must
+    // consume the recovered prefix while the query control socket remains
+    // unavailable. Start() is exactly StartWorker() followed by
+    // StartControl(), preserving the ordinary live-from-open API.
+    [[nodiscard]] bool StartWorker(
+        int* system_error_number = nullptr) noexcept;
+    [[nodiscard]] bool StartControl(
+        int* system_error_number = nullptr) noexcept;
+    // Enqueues a FIFO worker barrier, waits until all handoffs before it have
+    // been projected and their headers committed, and only then starts the
+    // query control thread. Later live handoffs do not extend this barrier.
+    // timeout must be positive and no greater than 24 hours.
+    [[nodiscard]] bool ActivateControlAfterPrefix(
+        std::chrono::milliseconds timeout,
+        int* system_error_number = nullptr) noexcept;
+
     // Required FAST publication happens first. A false return can therefore
     // mean only that FAST itself failed. Queue pressure, conflicts, gaps, and
     // every other certification failure return true after FAST succeeds.

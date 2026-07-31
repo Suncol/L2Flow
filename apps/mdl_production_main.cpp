@@ -9,6 +9,7 @@
 #include "l2flow/ipc/realtime_wire_v2.h"
 #include "l2flow/market/daily_instrument_catalog_loader_v2.h"
 #include "l2flow/market/instrument_runtime_state_v2.h"
+#include "l2flow/recovery/startup_replay_v1.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -35,6 +37,7 @@ namespace common = l2flow::common;
 namespace factor = l2flow::factor;
 namespace ipc = l2flow::ipc;
 namespace market = l2flow::market;
+namespace recovery = l2flow::recovery;
 namespace runtime = l2flow::runtime;
 
 static_assert(market::kRealtimeHistorySourceCountV1 == 4U);
@@ -147,8 +150,15 @@ struct Options final {
     std::uint32_t intraday_store_segment_kib = 64U;
     std::uint32_t intraday_store_batch_records = 64U * 1024U;
     bool intraday_store_from_open = false;
+    std::filesystem::path intraday_recovery_csv_dir;
+    std::uint64_t intraday_recovery_live_buffer_messages = 262'144U;
+    std::uint64_t intraday_recovery_live_buffer_bytes =
+        512ULL * 1024ULL * 1024ULL;
+    std::uint32_t intraday_recovery_warmup_seconds = 30U * 60U;
+    std::uint32_t intraday_recovery_backpressure_seconds = 30U;
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
+    bool intraday_recovery_tuning_set = false;
 
     // Each duration in milliseconds is also its stable public window_id.
     std::vector<std::uint32_t> kline_windows_ms;
@@ -187,9 +197,21 @@ void PrintUsage(std::ostream& output) {
         << "  --intraday-store-max-records N\n"
         << "                                positive u64 session record cap\n"
         << "  --intraday-store-memory-gib N positive u64 logical total GiB cap\n"
-        << "  --intraday-store-from-open    required assertion that capture "
-           "starts at market open\n"
+        << "  exactly one coverage source:\n"
+        << "    --intraday-store-from-open  assert this process captured "
+           "from market open\n"
+        << "    --intraday-recovery-csv-dir PATH\n"
+        << "                                absolute same-day vendor CSV "
+           "directory complete from open\n"
         << "Optional:\n"
+        << "  --intraday-recovery-live-buffer-messages N\n"
+        << "                                positive u64, default 262144\n"
+        << "  --intraday-recovery-live-buffer-mib N\n"
+        << "                                positive u64 MiB, default 512\n"
+        << "  --intraday-recovery-warmup-seconds N\n"
+        << "                                1..86400, default 1800\n"
+        << "  --intraday-recovery-backpressure-seconds N\n"
+        << "                                1..86400, default 30\n"
         << "  --sdk-log-prefix PATH         default l2flow-realtime\n"
         << "  --instrument-store-workers N  1..256, default 4\n"
         << "  --intraday-store-segment-kib N\n"
@@ -392,6 +414,11 @@ bool ParseOptions(
             option != "--intraday-store-memory-gib" &&
             option != "--intraday-store-segment-kib" &&
             option != "--intraday-store-batch-records" &&
+            option != "--intraday-recovery-csv-dir" &&
+            option != "--intraday-recovery-live-buffer-messages" &&
+            option != "--intraday-recovery-live-buffer-mib" &&
+            option != "--intraday-recovery-warmup-seconds" &&
+            option != "--intraday-recovery-backpressure-seconds" &&
             option != "--kline-windows-ms" &&
             option != "--generation-interval-ms" &&
             option != "--generation-timeout-ms" &&
@@ -503,6 +530,76 @@ bool ParseOptions(
                     "--intraday-store-batch-records must be 1..1048576";
                 return false;
             }
+        } else if (option == "--intraday-recovery-csv-dir") {
+            parsed.intraday_recovery_csv_dir =
+                std::string(value);
+        } else if (
+            option ==
+            "--intraday-recovery-live-buffer-messages") {
+            if (!ParseU64(
+                    value,
+                    &parsed
+                         .intraday_recovery_live_buffer_messages) ||
+                parsed.intraday_recovery_live_buffer_messages ==
+                    0U ||
+                parsed.intraday_recovery_live_buffer_messages >
+                    std::numeric_limits<std::size_t>::max()) {
+                *error =
+                    "--intraday-recovery-live-buffer-messages must "
+                    "be a positive value representable as size_t";
+                return false;
+            }
+            parsed.intraday_recovery_tuning_set = true;
+        } else if (
+            option == "--intraday-recovery-live-buffer-mib") {
+            constexpr std::uint64_t bytes_per_mib =
+                std::uint64_t{1024U} * 1024U;
+            if (!ParsePositiveScaledBytes(
+                    value,
+                    bytes_per_mib,
+                    &parsed
+                         .intraday_recovery_live_buffer_bytes)) {
+                *error =
+                    "--intraday-recovery-live-buffer-mib must be a "
+                    "positive u64 whose byte conversion does not "
+                    "overflow";
+                return false;
+            }
+            parsed.intraday_recovery_tuning_set = true;
+        } else if (
+            option == "--intraday-recovery-warmup-seconds") {
+            if (!ParseU32(
+                    value,
+                    &parsed
+                         .intraday_recovery_warmup_seconds) ||
+                parsed.intraday_recovery_warmup_seconds == 0U ||
+                parsed.intraday_recovery_warmup_seconds >
+                    86'400U) {
+                *error =
+                    "--intraday-recovery-warmup-seconds must be "
+                    "1..86400";
+                return false;
+            }
+            parsed.intraday_recovery_tuning_set = true;
+        } else if (
+            option ==
+            "--intraday-recovery-backpressure-seconds") {
+            if (!ParseU32(
+                    value,
+                    &parsed
+                         .intraday_recovery_backpressure_seconds) ||
+                parsed
+                        .intraday_recovery_backpressure_seconds ==
+                    0U ||
+                parsed
+                        .intraday_recovery_backpressure_seconds >
+                    86'400U) {
+                *error =
+                    "--intraday-recovery-backpressure-seconds must "
+                    "be 1..86400";
+                return false;
+            }
+            parsed.intraday_recovery_tuning_set = true;
         } else if (option == "--kline-windows-ms") {
             if (!ParseKLineWindows(
                     value, &parsed.kline_windows_ms, error)) {
@@ -600,6 +697,12 @@ bool ParseOptions(
         *error = "--daily-catalog must be an absolute path";
         return false;
     }
+    if (!parsed.intraday_recovery_csv_dir.empty() &&
+        !parsed.intraday_recovery_csv_dir.is_absolute()) {
+        *error =
+            "--intraday-recovery-csv-dir must be an absolute path";
+        return false;
+    }
     if (!parsed.event_aggregator_socket.empty() &&
         !parsed.event_aggregator_socket.is_absolute()) {
         *error =
@@ -646,10 +749,28 @@ bool ParseOptions(
             "--intraday-store-max-records and --intraday-store-memory-gib";
         return false;
     }
-    if (!parsed.intraday_store_from_open) {
+    const bool csv_recovery =
+        !parsed.intraday_recovery_csv_dir.empty();
+    if (parsed.intraday_store_from_open == csv_recovery) {
         *error =
-            "production requires --intraday-store-from-open; "
-            "partial-session startup is outside this runtime";
+            "production requires exactly one of "
+            "--intraday-store-from-open or "
+            "--intraday-recovery-csv-dir";
+        return false;
+    }
+    if (csv_recovery &&
+        !parsed.event_aggregator_socket.empty()) {
+        *error =
+            "--intraday-recovery-csv-dir cannot be combined with "
+            "--event-aggregator-socket: the external aggregator has "
+            "no pre-ACTIVE full-replay handoff";
+        return false;
+    }
+    if (!csv_recovery &&
+        parsed.intraday_recovery_tuning_set) {
+        *error =
+            "--intraday-recovery-* tuning options require "
+            "--intraday-recovery-csv-dir";
         return false;
     }
     if (parsed.ipc_key_arena_bytes >
@@ -961,8 +1082,15 @@ int Run(const Options& options) {
     pipeline_config.intraday_store.maximum_records_per_batch =
         static_cast<std::size_t>(
             options.intraday_store_batch_records);
+    const bool csv_startup_recovery =
+        !options.intraday_recovery_csv_dir.empty();
+    // Supplying the recovery directory is an explicit operator assertion
+    // that its bounded logical cuts cover this trade date from market open.
+    // Pipeline creation fails closed unless every required file parses and
+    // the buffered-live handoff can be proved without a conflict.
     pipeline_config.intraday_store.coverage_from_open =
-        options.intraday_store_from_open;
+        options.intraday_store_from_open ||
+        csv_startup_recovery;
     pipeline_config.kline.windows = kline_windows;
     pipeline_config.enforce_receive_trade_date = true;
     pipeline_config.tick_ring_capacity =
@@ -976,6 +1104,49 @@ int Run(const Options& options) {
     pipeline_config.sdk.message_encoding =
         datayes::mdl::MDLEID_BINARY;
     pipeline_config.sdk.merge_message = false;
+    if (csv_startup_recovery) {
+        pipeline_config.startup_live_buffer_maximum_messages =
+            static_cast<std::size_t>(
+                options
+                    .intraday_recovery_live_buffer_messages);
+        pipeline_config.startup_live_buffer_maximum_bytes =
+            options.intraday_recovery_live_buffer_bytes;
+        pipeline_config.startup_overlap_retention_per_message =
+            pipeline_config
+                .startup_live_buffer_maximum_messages;
+        pipeline_config.startup_warmup_timeout =
+            std::chrono::seconds(
+                options.intraday_recovery_warmup_seconds);
+        pipeline_config.startup_replay_backpressure_timeout =
+            std::chrono::seconds(
+                options
+                    .intraday_recovery_backpressure_seconds);
+        pipeline_config.startup_cancel_requested = []() noexcept {
+            return g_stop_requested != 0;
+        };
+        recovery::StartupReplayConfigV1 replay_config{};
+        replay_config.directory =
+            options.intraday_recovery_csv_dir;
+        replay_config.maximum_message_bytes =
+            pipeline_config.maximum_sdk_message_bytes;
+        try {
+            pipeline_config.startup_replay_source =
+                std::make_shared<
+                    recovery::MdlCsvStartupReplaySourceV1>(
+                    std::move(replay_config));
+        } catch (const std::exception& exception) {
+            std::cerr
+                << "mdl-production-router: CSV startup recovery "
+                   "source create failed: "
+                << exception.what() << '\n';
+            return 1;
+        } catch (...) {
+            std::cerr
+                << "mdl-production-router: CSV startup recovery "
+                   "source create failed unexpectedly\n";
+            return 1;
+        }
+    }
 
     std::uint64_t minimum_tick_ring_capacity = 0U;
     if (!MinimumTickRingCapacity(
@@ -1026,30 +1197,43 @@ int Run(const Options& options) {
         return 1;
     }
 
-    ipc_system_error = 0;
-    if (!ipc_service->Start(&ipc_system_error)) {
+    const auto start_fast_control = [&]() -> bool {
+        ipc_system_error = 0;
+        if (!ipc_service->Start(&ipc_system_error)) {
+            std::cerr
+                << "mdl-production-router: IPC V2 control start failed: "
+                   "errno="
+                << ipc_system_error << '\n';
+            return false;
+        }
         std::cerr
-            << "mdl-production-router: IPC V2 control start failed: "
-               "errno="
-            << ipc_system_error << '\n';
+            << "mdl-production-router: IPC V2 ACTIVE: socket="
+            << ipc_service->control_socket_path()
+            << " capacity=" << daily_catalog->instrument_count()
+            << " bound_count=" << daily_catalog->instrument_count()
+            << " catalog_scope=DECLARED_DAILY_A_SHARE"
+            << " coverage_complete=true"
+            << " coverage_from_open=true"
+            << " coverage_source="
+            << (csv_startup_recovery ? "CSV_RECOVERY" : "LIVE_FROM_OPEN")
+            << " catalog_version=" << daily_catalog->catalog_version()
+            << " catalog_digest="
+            << common::Sha256Hex(daily_catalog->catalog_digest())
+            << " mapping_bytes=" << ipc_service->mapping_bytes()
+            << " key_arena_bytes=" << options.ipc_key_arena_bytes
+            << " mainland_a_share_filter=true"
+            << '\n';
+        return true;
+    };
+
+    // In recovery mode the mapping remains INITIALIZING and accepts internal
+    // publications, but no query control thread is exposed until CSV replay,
+    // the closed live handoff, and the first immutable generation succeed.
+    if (!csv_startup_recovery && !start_fast_control()) {
         ipc_service->MarkFailed();
         ipc_service->StopControl();
         return 1;
     }
-    std::cerr
-        << "mdl-production-router: IPC V2 ACTIVE: socket="
-        << ipc_service->control_socket_path()
-        << " capacity=" << daily_catalog->instrument_count()
-        << " bound_count=" << daily_catalog->instrument_count()
-        << " catalog_scope=DECLARED_DAILY_A_SHARE"
-        << " coverage_complete=true"
-        << " catalog_version=" << daily_catalog->catalog_version()
-        << " catalog_digest="
-        << common::Sha256Hex(daily_catalog->catalog_digest())
-        << " mapping_bytes=" << ipc_service->mapping_bytes()
-        << " key_arena_bytes=" << options.ipc_key_arena_bytes
-        << " mainland_a_share_filter=true"
-        << '\n';
 
     if (!options.event_aggregator_socket.empty()) {
         ipc::OrderEventDeltaControlSnapshotV1 event_snapshot{};
@@ -1079,6 +1263,7 @@ int Run(const Options& options) {
 
     std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
         certified_service;
+    bool certified_control_active = false;
     // FAST is the required service. CERTIFIED is enabled by default, but it
     // remains an optional, fail-open sidecar: configuration, allocation,
     // socket, or thread-start failures must not make an otherwise healthy
@@ -1095,7 +1280,7 @@ int Run(const Options& options) {
             std::cerr
                 << "mdl-production-router: CERTIFIED V1 DEGRADED: "
                    "capacity cannot represent four derived events per "
-                   "stored record; FAST remains ACTIVE\n";
+                   "stored record; the required FAST path remains\n";
         } else {
             const std::size_t maximum_order_states =
                 static_cast<std::size_t>(
@@ -1135,30 +1320,49 @@ int Run(const Options& options) {
                     << ipc::RealtimeCertifiedServiceCreateErrorNameV1(
                            certified_error)
                     << " errno=" << certified_system_error
-                    << "; FAST remains ACTIVE\n";
+                    << "; the required FAST path remains\n";
                 certified_service.reset();
             } else {
                 certified_system_error = 0;
-                if (!certified_service->Start(
-                        &certified_system_error)) {
+                const bool certified_started =
+                    csv_startup_recovery
+                        ? certified_service->StartWorker(
+                              &certified_system_error)
+                        : certified_service->Start(
+                              &certified_system_error);
+                if (!certified_started) {
                     std::cerr
                         << "mdl-production-router: CERTIFIED V1 "
-                           "DEGRADED: control start failed: errno="
+                           "DEGRADED: "
+                        << (csv_startup_recovery
+                                ? "recovery worker"
+                                : "worker/control")
+                        << " start failed: errno="
                         << certified_system_error
-                        << "; FAST remains ACTIVE\n";
+                        << "; the required FAST path remains\n";
                     certified_service->StopControl();
                     certified_service.reset();
+                } else if (!csv_startup_recovery) {
+                    certified_control_active = true;
                 }
             }
         }
         if (certified_service != nullptr) {
-            std::cerr
-                << "mdl-production-router: CERTIFIED V1 ACTIVE: socket="
-                << certified_service->control_socket_path()
-                << " mapping_bytes="
-                << certified_service->mapping_bytes()
-                << " native_gap_recovery=true"
-                << " fast_wire_abi_unchanged=true\n";
+            if (certified_control_active) {
+                std::cerr
+                    << "mdl-production-router: CERTIFIED V1 ACTIVE: "
+                       "socket="
+                    << certified_service->control_socket_path()
+                    << " mapping_bytes="
+                    << certified_service->mapping_bytes()
+                    << " native_gap_recovery=true"
+                    << " fast_wire_abi_unchanged=true\n";
+            } else {
+                std::cerr
+                    << "mdl-production-router: CERTIFIED V1 WARMING: "
+                       "control unavailable until CSV recovery is "
+                       "complete\n";
+            }
             pipeline_config.applied_record_sink = certified_service;
             pipeline_config.native_sequence_observation_sink =
                 certified_service;
@@ -1179,17 +1383,41 @@ int Run(const Options& options) {
     if (create_error !=
             runtime::RealtimePipelineCreateErrorV1::kNone ||
         pipeline == nullptr) {
-        std::cerr
-            << "mdl-production-router: pipeline create failed: "
-            << runtime::RealtimePipelineCreateErrorNameV1(
-                   create_error)
-            << (detail.empty() ? "" : ": ") << detail << '\n';
+        const bool recovery_cancelled =
+            csv_startup_recovery &&
+            create_error ==
+                runtime::RealtimePipelineCreateErrorV1::
+                    kStartupCancelled &&
+            g_stop_requested != 0;
+        if (recovery_cancelled) {
+            std::cerr
+                << "mdl-production-router: CSV startup recovery "
+                   "cancelled before query activation\n";
+        } else {
+            std::cerr
+                << "mdl-production-router: pipeline create failed: "
+                << runtime::RealtimePipelineCreateErrorNameV1(
+                       create_error)
+                << (detail.empty() ? "" : ": ") << detail << '\n';
+        }
         if (certified_service != nullptr) {
             certified_service->StopControl();
         }
         ipc_service->MarkFailed();
         ipc_service->StopControl();
-        return 1;
+        return recovery_cancelled ? 0 : 1;
+    }
+    if (csv_startup_recovery && g_stop_requested != 0) {
+        std::cerr
+            << "mdl-production-router: CSV startup recovery cancelled "
+               "before query activation\n";
+        pipeline->StopAndDrain();
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        ipc_service->MarkFailed();
+        ipc_service->StopControl();
+        return 0;
     }
 
     const auto interval =
@@ -1198,6 +1426,97 @@ int Run(const Options& options) {
     const auto timeout =
         std::chrono::milliseconds(
             options.generation_timeout_ms);
+    if (csv_startup_recovery) {
+        const runtime::RealtimePipelineCutResultV1 recovered_cut =
+            pipeline->CutAndPublishGeneration(timeout);
+        if (!recovered_cut.published() ||
+            !PublishKLineGeneration(
+                recovered_cut, ipc_service, "CSV recovery initial")) {
+            std::cerr
+                << "mdl-production-router: CSV recovery initial "
+                   "generation failed: "
+                << runtime::RealtimePipelineCutErrorNameV1(
+                       recovered_cut.error)
+                << " generation="
+                << market::RealtimeHistoryGenerationErrorNameV1(
+                       recovered_cut.generation_error)
+                << " factor="
+                << factor::RealtimeFactorPublishErrorNameV1(
+                       recovered_cut.factor_result.error)
+                << '\n';
+            pipeline->StopAndDrain();
+            if (certified_service != nullptr) {
+                certified_service->StopControl();
+            }
+            ipc_service->MarkFailed();
+            ipc_service->StopControl();
+            return 1;
+        }
+        if (g_stop_requested != 0) {
+            std::cerr
+                << "mdl-production-router: CSV startup recovery "
+                   "cancelled before query activation\n";
+            pipeline->StopAndDrain();
+            if (certified_service != nullptr) {
+                certified_service->StopControl();
+            }
+            ipc_service->MarkFailed();
+            ipc_service->StopControl();
+            return 0;
+        }
+        if (!start_fast_control()) {
+            pipeline->StopAndDrain();
+            if (certified_service != nullptr) {
+                certified_service->StopControl();
+            }
+            ipc_service->MarkFailed();
+            ipc_service->StopControl();
+            return 1;
+        }
+        if (certified_service != nullptr &&
+            !certified_control_active) {
+            int certified_system_error = 0;
+            if (!certified_service->ActivateControlAfterPrefix(
+                    timeout, &certified_system_error)) {
+                std::cerr
+                    << "mdl-production-router: CERTIFIED V1 "
+                       "DEGRADED: post-recovery prefix barrier or "
+                       "control start failed: "
+                       "errno="
+                    << certified_system_error
+                    << "; the required FAST path remains ACTIVE\n";
+                certified_service->StopControl();
+            } else {
+                certified_control_active = true;
+                std::cerr
+                    << "mdl-production-router: CERTIFIED V1 ACTIVE: "
+                       "socket="
+                    << certified_service->control_socket_path()
+                    << " mapping_bytes="
+                    << certified_service->mapping_bytes()
+                    << " native_gap_recovery=true"
+                    << " startup_prefix_recovered=true"
+                    << " fast_wire_abi_unchanged=true\n";
+            }
+        }
+        const runtime::RealtimePipelineSnapshotV1 recovered_snapshot =
+            pipeline->Snapshot();
+        std::cerr
+            << "mdl-production-router: CSV startup recovery complete: "
+            << "records="
+            << recovered_snapshot.store.appended_records
+            << " accepted_sequence="
+            << recovered_snapshot.processing_progress.accepted_sequence
+            << " applied_sequence="
+            << recovered_snapshot.processing_progress.applied_sequence
+            << " generation="
+            << recovered_snapshot.last_published_generation
+            << " live_buffer_messages_limit="
+            << options.intraday_recovery_live_buffer_messages
+            << " live_buffer_bytes_limit="
+            << options.intraday_recovery_live_buffer_bytes
+            << '\n';
+    }
     int exit_code = 0;
     while (g_stop_requested == 0) {
         const IntervalWaitResult wait =

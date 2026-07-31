@@ -97,6 +97,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(l2flow_sdk PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
+# Strict reconstruction of the vendor client's from-open CSV files into the
+# same five MDL message tuples consumed by the realtime pipeline.
+add_library(l2flow_recovery STATIC
+    src/recovery/mdl_csv_startup_replay_v1.cpp)
+add_library(L2Flow::recovery ALIAS l2flow_recovery)
+l2flow_configure_target(l2flow_recovery)
+target_link_libraries(l2flow_recovery PUBLIC L2Flow::sdk)
+
 # Decoder, frozen daily runtime state, fixed-worker history, and
 # whole-generation market publication.
 add_library(l2flow_market STATIC
@@ -150,6 +158,7 @@ l2flow_configure_target(l2flow_realtime)
 target_link_libraries(l2flow_realtime
     PUBLIC
         L2Flow::sdk
+        L2Flow::recovery
         L2Flow::realtime_ingress
         L2Flow::market
         L2Flow::factor
@@ -357,6 +366,11 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_realtime_pipeline_lifecycle_concurrency
         tests/test_realtime_pipeline_lifecycle_concurrency_v1.cpp
         L2Flow::realtime)
+    l2flow_add_test(test_mdl_csv_startup_replay
+        tests/test_mdl_csv_replay_v1.cpp
+        L2Flow::recovery)
+    target_link_libraries(test_mdl_csv_startup_replay
+        PRIVATE L2Flow::market)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         l2flow_add_test(test_realtime_wire_v2
             tests/test_realtime_wire_v2.cpp L2Flow::common)

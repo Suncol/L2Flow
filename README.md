@@ -113,10 +113,15 @@ releases all lanes together. Post-cut records cannot enter History or mutate
 generation availability before the snapshot. Timeout, begin, or seal failure
 wakes every lane and fails closed.
 
-The runtime itself does not persist captured messages. It has no startup
-replay gate, Raw WAL, intraday replay, or crash-recovery path. Deployments that
-need recovery must retain an independent source capture and replay it in a
-separate recovery workflow.
+The runtime itself still does not persist captured messages and the optional
+Raw WAL is not a recovery source. It does, however, support one bounded
+mid-session startup path: replay the same-day, complete-from-open CSV files
+written by the vendor client, validate a closed CSV/live handoff with exact
+identity matches and tuple cutoffs under the explicit same-session,
+lossless-callback operating contract, and then switch to the live SDK stream.
+This is startup catch-up, not arbitrary checkpoint or process-crash recovery.
+The exact input, ordering, quality, and fail-closed contracts are documented in
+[`docs/csv-startup-recovery-v1.md`](docs/csv-startup-recovery-v1.md).
 
 ## Build and test
 
@@ -156,9 +161,50 @@ build/mdl-production-router \
   --intraday-store-from-open
 ```
 
-The control socket must not already exist. Operational code must assert
-`--intraday-store-from-open`; this replacement runtime does not offer a
-partial-session or recovery startup mode.
+The control socket must not already exist. Production requires exactly one
+coverage source:
+
+- `--intraday-store-from-open` asserts that this process started before the
+  first relevant market message and stayed healthy; or
+- `--intraday-recovery-csv-dir /absolute/path/to/same-day-csv` asserts that
+  the vendor directory contains the current trade day's complete saved prefix
+  from market open. The router connects the live feed into a bounded startup
+  buffer while it reconstructs the Store through the normal decode path.
+
+Recovery deployments can size that bounded handoff explicitly with
+`--intraday-recovery-live-buffer-messages`,
+`--intraday-recovery-live-buffer-mib`,
+`--intraday-recovery-warmup-seconds`, and
+`--intraday-recovery-backpressure-seconds`. The defaults are 262144 messages,
+512 MiB, 1800 seconds, and 30 seconds respectively; exceeding either live
+buffer bound fails startup instead of dropping data. The byte bound counts
+copied MDL head+body bytes, not allocator/deque/fingerprint overhead, and the
+message bound covers every supported subscribed callback before the A-share
+filter. Size both bounds from measured peak callback message/byte rates times
+the worst measured replay-and-drain duration, with operational headroom; the
+defaults are bounded fallbacks, not a throughput guarantee. Replay-tail
+fingerprints are retained separately per message tuple by the greatest
+SequenceIDs, not by potentially reordered replay publication order. The
+Shenzhen cross-file merge also has independent fixed defaults of 2,000,000 pending
+messages and 512 MiB of pending body bytes, so process RSS can exceed the live
+wire-byte bound.
+
+In recovery mode the FAST control socket is not made ACTIVE until replay,
+closed live handoff, the first immutable Store generation, and any configured
+KLine publication all succeed. A failed or partial recovery is therefore
+never exposed as a queryable complete session.
+
+The optional CERTIFIED sidecar starts only its projection worker during
+recovery. After FAST becomes active, a FIFO prefix barrier must commit a
+consistent `NO_DATA` or `CONTIGUOUS` certified state before its query control
+thread starts. A gap, conflict, resource freeze, or barrier failure degrades
+only that optional sidecar and leaves the required FAST service active.
+
+CSV recovery cannot be combined with `--event-aggregator-socket` in this
+version. The external aggregator has no pre-ACTIVE full-replay handoff and its
+bounded ring cannot be assumed to retain an entire intraday replay. See the
+[CSV startup recovery contract](docs/csv-startup-recovery-v1.md) before using
+the recovery option.
 
 The catalog is canonical ASCII with LF endings and lowercase exact-byte hex:
 

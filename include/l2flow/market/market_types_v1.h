@@ -197,6 +197,13 @@ enum class MarketNoticeV1 : std::uint8_t {
     kProductApplicabilityUnknown,
     kMaximumDurationUnavailable,
     kTradeAmountDomainInvalid,
+    // The event was reconstructed from the vendor client's startup CSV
+    // capture rather than received directly from the live SDK callback.
+    kRecoveredFromCsv,
+    // A CSV schema did not carry a source field present on the SDK message.
+    // The reconstructed wire field is left at its documented neutral value;
+    // consumers must not infer it from another stream.
+    kCsvSourceFieldUnavailable,
 };
 
 [[nodiscard]] constexpr std::uint64_t MarketNoticeBitV1(
