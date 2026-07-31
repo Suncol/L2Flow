@@ -257,6 +257,7 @@ public:
         CertifiedOrderEventHistorySnapshotV1* output) const noexcept;
 
     [[nodiscard]] std::uint64_t mapping_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t handoff_queue_capacity() const noexcept;
     [[nodiscard]] const std::filesystem::path&
     control_socket_path() const noexcept;
 

@@ -55,7 +55,7 @@ struct ShenzhenOrderKeyV1 final {
         const ShenzhenOrderKeyV1&,
         const ShenzhenOrderKeyV1&) noexcept = default;
 
-    [[nodiscard]] friend bool operator<(
+    friend bool operator<(
         const ShenzhenOrderKeyV1& lhs,
         const ShenzhenOrderKeyV1& rhs) noexcept;
 };

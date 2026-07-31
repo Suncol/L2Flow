@@ -663,6 +663,10 @@ void RunRecoveryScenario(TestContext* test) {
         return;
     }
     test->Expect(
+        service->handoff_queue_capacity() ==
+            service_config.handoff_queue_capacity,
+        "certified service applies the configured handoff queue capacity");
+    test->Expect(
         service->StartWorker(&system_error),
         "start recovery certified worker");
     test->Expect(

@@ -2534,25 +2534,29 @@ public:
         }
         const std::optional<std::size_t> tuple =
             ProductionTupleIndex(inspection.key());
-        if (!tuple.has_value() ||
-            !startup_replay_cutoff_seen_[*tuple]) {
+        if (!tuple.has_value()) {
+            return Ingest(message, callback_entry).error;
+        }
+        const std::size_t tuple_index = *tuple;
+        if (tuple_index >= startup_replay_cutoff_seen_.size() ||
+            !startup_replay_cutoff_seen_[tuple_index]) {
             return Ingest(message, callback_entry).error;
         }
 
         const std::uint64_t callback_sequence =
             inspection.vendor_head().sequence_id();
         if (callback_sequence >
-            startup_replay_cutoff_sequence_[*tuple]) {
-            startup_tuple_handoff_phases_[*tuple] =
+            startup_replay_cutoff_sequence_[tuple_index]) {
+            startup_tuple_handoff_phases_[tuple_index] =
                 StartupTupleHandoffPhase::kLiveSuffix;
             return Ingest(message, callback_entry).error;
         }
 
         const StartupReplayFingerprint* replay =
-            FindReplayFingerprint(*tuple, callback_sequence);
+            FindReplayFingerprint(tuple_index, callback_sequence);
         common::Sha256Digest digest{};
         const bool exact =
-            startup_tuple_handoff_phases_[*tuple] !=
+            startup_tuple_handoff_phases_[tuple_index] !=
                 StartupTupleHandoffPhase::kLiveSuffix &&
             replay != nullptr &&
             CanonicalStartupMessageDigest(
@@ -2567,7 +2571,7 @@ public:
         }
 
         ReportPipelineFailure(
-            startup_tuple_handoff_phases_[*tuple] ==
+            startup_tuple_handoff_phases_[tuple_index] ==
                     StartupTupleHandoffPhase::kLiveSuffix
                 ? "startup_direct_returned_to_csv_prefix"
                 : replay == nullptr

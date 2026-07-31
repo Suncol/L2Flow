@@ -77,13 +77,7 @@ public:
         const auto characters =
             std::span<const char>(value.data(), value.size());
         const auto encoded = std::as_bytes(characters);
-        bytes_.resize(start + encoded.size());
-        if (!encoded.empty()) {
-            std::memcpy(
-                bytes_.data() + start,
-                encoded.data(),
-                encoded.size());
-        }
+        bytes_.insert(bytes_.end(), encoded.begin(), encoded.end());
     }
 
     [[nodiscard]] std::vector<std::byte> Take() && {
@@ -348,6 +342,71 @@ private:
     std::atomic<std::uint64_t> applied_{0U};
     std::atomic<bool> coverage_lost_{false};
     bool block_first_applied_ = false;
+    mutable std::mutex gate_mutex_;
+    std::condition_variable gate_cv_;
+    bool first_applied_blocked_ = false;
+    bool release_first_applied_ = false;
+};
+
+class OpeningBurstAppliedBlocker final
+    : public market::RealtimeAppliedRecordSinkV1 {
+public:
+    [[nodiscard]] bool PublishApplied(
+        std::size_t ordinal,
+        const market::RealtimeHistoryRecordV1& record) noexcept override {
+        if (record.instrument_id() == 0U ||
+            ordinal !=
+                static_cast<std::size_t>(
+                    record.instrument_id() - 1U) ||
+            record.ingress_sequence() == 0U) {
+            return false;
+        }
+        if (record.ingress_sequence() == 1U) {
+            try {
+                std::unique_lock<std::mutex> lock(gate_mutex_);
+                first_applied_blocked_ = true;
+                gate_cv_.notify_all();
+                gate_cv_.wait(lock, [this] {
+                    return release_first_applied_ ||
+                           coverage_lost_.load(
+                               std::memory_order_acquire);
+                });
+            } catch (...) {
+                return false;
+            }
+        }
+        applied_calls_.fetch_add(1U, std::memory_order_release);
+        return true;
+    }
+
+    void MarkCoverageLost() noexcept override {
+        coverage_lost_.store(true, std::memory_order_release);
+        gate_cv_.notify_all();
+    }
+
+    [[nodiscard]] bool WaitUntilFirstAppliedBlocked(
+        std::chrono::nanoseconds timeout) {
+        std::unique_lock<std::mutex> lock(gate_mutex_);
+        return gate_cv_.wait_for(lock, timeout, [this] {
+            return first_applied_blocked_;
+        });
+    }
+
+    void ReleaseFirstApplied() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex_);
+            release_first_applied_ = true;
+        }
+        gate_cv_.notify_all();
+    }
+
+    [[nodiscard]] std::uint64_t applied_calls() const noexcept {
+        return applied_calls_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<std::uint64_t> applied_calls_{0U};
+    std::atomic<bool> coverage_lost_{false};
     mutable std::mutex gate_mutex_;
     std::condition_variable gate_cv_;
     bool first_applied_blocked_ = false;
@@ -1861,6 +1920,160 @@ void CheckSourceDecoderQueueFullKeepsAcceptedPrefix(
     pipeline->StopAndDrain();
 }
 
+void CheckOpeningBurstCapacityHeadroom(TestContext* test) {
+    constexpr std::size_t legacy_decoder_capacity = 4'096U;
+    constexpr std::size_t production_decoder_capacity = 65'536U;
+    constexpr std::size_t production_store_capacity = 32'768U;
+    constexpr std::size_t completion_capacity = 4'098U;
+    constexpr std::uint64_t burst_records = 9'000U;
+
+    const auto run_burst = [test](
+                               std::uint64_t session_epoch,
+                               std::size_t decoder_capacity,
+                               bool expect_admission_failure) {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(session_epoch, &fixture),
+            "create controlled opening-burst catalog");
+        if (fixture.runtime_state == nullptr) {
+            return;
+        }
+
+        const auto blocker =
+            std::make_shared<OpeningBurstAppliedBlocker>();
+        const std::shared_ptr<ProjectionProbe> no_projection;
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture, no_projection);
+        config.decoder_queue_capacity_per_source =
+            decoder_capacity;
+        config.completion_tracker_capacity = completion_capacity;
+        config.tick_ring_capacity = completion_capacity;
+        config.store_worker_count = 2U;
+        config.store_queue_capacity_per_source_worker =
+            production_store_capacity;
+        config.intraday_store.maximum_session_records =
+            burst_records + 64U;
+        config.intraday_store.maximum_session_accounted_bytes =
+            256U * 1024U * 1024U;
+        config.applied_record_sink = blocker;
+
+        std::size_t applied_window = 0U;
+        test->Expect(
+            runtime::RealtimePipelineAppliedWindowCapacityV1(
+                config, &applied_window) &&
+                applied_window == completion_capacity - 1U,
+            "controlled opening burst has a fixed decoder drain window");
+
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        test->Expect(
+            runtime::RealtimePipelineV1::Create(
+                config, &pipeline, &detail) ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "create controlled opening-burst pipeline: " + detail);
+        if (pipeline == nullptr) {
+            return;
+        }
+
+        FakeMessage first(
+            sdk::kProductionMessageKeysV1[2U],
+            ShenzhenSnapshotBody(12'345'600));
+        const runtime::RealtimePipelineIngressResultV1 first_result =
+            pipeline->InjectSdkMessageForTest(&first);
+        first.DestroyCallbackBytes();
+        const bool first_blocked =
+            first_result.accepted() &&
+            blocker->WaitUntilFirstAppliedBlocked(3s);
+        test->Expect(
+            first_blocked,
+            "controlled opening burst blocks the first applied record");
+        if (!first_blocked) {
+            blocker->ReleaseFirstApplied();
+            pipeline->StopAndDrain();
+            return;
+        }
+
+        bool all_accepted = true;
+        runtime::RealtimePipelineIngressResultV1 failure{};
+        for (std::uint64_t sequence = 2U;
+             sequence <= burst_records;
+             ++sequence) {
+            FakeMessage message(
+                sdk::kProductionMessageKeysV1[1U],
+                ShanghaiTradeBody(20'000U + sequence));
+            const runtime::RealtimePipelineIngressResultV1 result =
+                pipeline->InjectSdkMessageForTest(&message);
+            message.DestroyCallbackBytes();
+            if (!result.accepted()) {
+                all_accepted = false;
+                failure = result;
+                break;
+            }
+        }
+
+        const runtime::RealtimePipelineSnapshotV1 held =
+            pipeline->Snapshot();
+        constexpr std::size_t shanghai_tick_source = 1U;
+        if (expect_admission_failure) {
+            test->Expect(
+                !all_accepted &&
+                    failure.error ==
+                        runtime::RealtimePipelineIngressErrorV1::
+                            kDecoderAdmissionFailed &&
+                    held.accepted_messages < burst_records &&
+                    held.rejected_messages == 1U && held.fatal &&
+                    held.decoder_queues[shanghai_tick_source]
+                            .message_capacity ==
+                        legacy_decoder_capacity &&
+                    held.decoder_queues[shanghai_tick_source]
+                            .full_count == 1U,
+                "the legacy 4096-record decoder queue reproducibly "
+                "fails closed under the controlled 9000-record burst");
+        } else {
+            const auto& source_queue =
+                held.decoder_queues[shanghai_tick_source];
+            test->Expect(
+                all_accepted &&
+                    held.accepted_messages == burst_records &&
+                    held.processing_progress.accepted_sequence ==
+                        burst_records &&
+                    held.processing_progress.applied_sequence == 0U &&
+                    source_queue.message_capacity ==
+                        production_decoder_capacity &&
+                    source_queue.message_high_water >
+                        legacy_decoder_capacity &&
+                    source_queue.full_count == 0U && !held.fatal,
+                "the 65536-record production decoder queue admits the "
+                "same controlled burst with explicit headroom");
+        }
+
+        blocker->ReleaseFirstApplied();
+        if (!expect_admission_failure && all_accepted) {
+            test->Expect(
+                WaitUntil([&] {
+                    const runtime::RealtimePipelineSnapshotV1 snapshot =
+                        pipeline->Snapshot();
+                    return snapshot.fatal ||
+                           (snapshot.decoded_messages == burst_records &&
+                            snapshot.processing_progress
+                                    .applied_sequence ==
+                                burst_records &&
+                            snapshot.store.appended_records ==
+                                burst_records);
+                }) &&
+                    !pipeline->fatal() &&
+                    blocker->applied_calls() == burst_records,
+                "the enlarged decoder and 32768-record Store queues drain "
+                "the exact accepted burst after the consumer resumes");
+        }
+        pipeline->StopAndDrain();
+    };
+
+    run_burst(26U, legacy_decoder_capacity, true);
+    run_burst(27U, production_decoder_capacity, false);
+}
+
 void CheckFastDecoderAcceptedPublicationAndIdleBoundary(
     TestContext* test) {
     PipelineCatalogFixture fixture;
@@ -2051,6 +2264,7 @@ int main() {
     CheckReservedFenceWithEverySourceQueueFull(&test);
     CheckGenerationAndStopConcurrentExit(&test);
     CheckSourceDecoderQueueFullKeepsAcceptedPrefix(&test);
+    CheckOpeningBurstCapacityHeadroom(&test);
     CheckStoreGenerationSinkOrderingAndFailure(&test);
     CheckFastDecoderAcceptedPublicationAndIdleBoundary(&test);
 

@@ -1357,6 +1357,11 @@ public:
         return mapping_bytes_;
     }
 
+    [[nodiscard]] std::uint64_t handoff_queue_capacity()
+        const noexcept {
+        return config_.handoff_queue_capacity;
+    }
+
     [[nodiscard]] const std::filesystem::path& socket_path()
         const noexcept {
         return config_.control_socket_path;
@@ -2711,6 +2716,12 @@ RealtimeCertifiedMarketServiceV1::AcquireEventGeneration(
 std::uint64_t
 RealtimeCertifiedMarketServiceV1::mapping_bytes() const noexcept {
     return impl_ == nullptr ? 0U : impl_->mapping_bytes();
+}
+
+std::uint64_t
+RealtimeCertifiedMarketServiceV1::handoff_queue_capacity()
+    const noexcept {
+    return impl_ == nullptr ? 0U : impl_->handoff_queue_capacity();
 }
 
 const std::filesystem::path&

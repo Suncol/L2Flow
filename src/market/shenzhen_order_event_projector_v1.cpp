@@ -852,13 +852,10 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
                     &sell->second,
                     MutationOperation(&sell->second)};
             }
-            std::sort(
-                updates.begin(),
-                updates.begin() +
-                    static_cast<std::ptrdiff_t>(update_count),
-                [](const Updated& lhs, const Updated& rhs) {
-                    return lhs.key < rhs.key;
-                });
+            if (update_count == 2U &&
+                updates[1U].key < updates[0U].key) {
+                std::swap(updates[0U], updates[1U]);
+            }
 
             output->emplace_back(trade);
             for (std::size_t index = 0U;

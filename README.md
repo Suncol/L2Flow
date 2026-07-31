@@ -161,6 +161,18 @@ build/mdl-production-router \
   --intraday-store-from-open
 ```
 
+The production executable sizes each source decoder queue to 65,536 records,
+each source/Store-worker queue to 32,768 records, and the default-on
+CERTIFIED handoff queue to 4,194,304 records. These bounded defaults were
+selected from the observed 09:30 failure with explicit headroom; they must be
+re-certified in a subsequent from-open live session. Deployments may set
+`--decoder-queue-records-per-source`,
+`--store-queue-records-per-source-worker`, and
+`--certified-handoff-queue-records` explicitly from their own peak-rate and
+drain-time measurements; the certified handoff capacity must be a power of
+two. Queue exhaustion remains explicit and fail-closed for FAST source
+admission, while CERTIFIED exhaustion freezes only its last proven prefix.
+
 The control socket must not already exist. Production requires exactly one
 coverage source:
 

@@ -83,7 +83,7 @@ struct ShanghaiOrderKeyV1 final {
         const ShanghaiOrderKeyV1&,
         const ShanghaiOrderKeyV1&) noexcept = default;
 
-    [[nodiscard]] friend bool operator<(
+    friend bool operator<(
         const ShanghaiOrderKeyV1& lhs,
         const ShanghaiOrderKeyV1& rhs) noexcept;
 };

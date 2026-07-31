@@ -145,6 +145,9 @@ struct Options final {
     std::string user_name;
     std::string sdk_log_prefix = "l2flow-realtime";
     std::uint32_t instrument_store_workers = 4U;
+    std::uint64_t decoder_queue_records_per_source = 65'536U;
+    std::uint64_t store_queue_records_per_source_worker = 32'768U;
+    std::uint64_t certified_handoff_queue_records = 4'194'304U;
     std::uint64_t intraday_store_maximum_records = 0U;
     std::uint64_t intraday_store_memory_bytes = 0U;
     std::uint32_t intraday_store_segment_kib = 64U;
@@ -214,6 +217,12 @@ void PrintUsage(std::ostream& output) {
         << "                                1..86400, default 30\n"
         << "  --sdk-log-prefix PATH         default l2flow-realtime\n"
         << "  --instrument-store-workers N  1..256, default 4\n"
+        << "  --decoder-queue-records-per-source N\n"
+        << "                                positive u64, default 65536\n"
+        << "  --store-queue-records-per-source-worker N\n"
+        << "                                positive u64, default 32768\n"
+        << "  --certified-handoff-queue-records N\n"
+        << "                                power of two, default 4194304\n"
         << "  --intraday-store-segment-kib N\n"
         << "                                4..16384, default 64\n"
         << "  --intraday-store-batch-records N\n"
@@ -410,6 +419,9 @@ bool ParseOptions(
             option != "--user-name" &&
             option != "--sdk-log-prefix" &&
             option != "--instrument-store-workers" &&
+            option != "--decoder-queue-records-per-source" &&
+            option != "--store-queue-records-per-source-worker" &&
+            option != "--certified-handoff-queue-records" &&
             option != "--intraday-store-max-records" &&
             option != "--intraday-store-memory-gib" &&
             option != "--intraday-store-segment-kib" &&
@@ -478,6 +490,47 @@ bool ParseOptions(
                 parsed.instrument_store_workers > 256U) {
                 *error =
                     "--instrument-store-workers must be 1..256";
+                return false;
+            }
+        } else if (option ==
+                   "--decoder-queue-records-per-source") {
+            if (!ParseU64(
+                    value,
+                    &parsed.decoder_queue_records_per_source) ||
+                parsed.decoder_queue_records_per_source == 0U ||
+                parsed.decoder_queue_records_per_source >
+                    std::numeric_limits<std::size_t>::max()) {
+                *error =
+                    "--decoder-queue-records-per-source must fit a "
+                    "positive size_t";
+                return false;
+            }
+        } else if (option ==
+                   "--store-queue-records-per-source-worker") {
+            if (!ParseU64(
+                    value,
+                    &parsed.store_queue_records_per_source_worker) ||
+                parsed.store_queue_records_per_source_worker == 0U ||
+                parsed.store_queue_records_per_source_worker >
+                    std::numeric_limits<std::size_t>::max()) {
+                *error =
+                    "--store-queue-records-per-source-worker must fit "
+                    "a positive size_t";
+                return false;
+            }
+        } else if (option ==
+                   "--certified-handoff-queue-records") {
+            if (!ParseU64(
+                    value,
+                    &parsed.certified_handoff_queue_records) ||
+                parsed.certified_handoff_queue_records == 0U ||
+                (parsed.certified_handoff_queue_records &
+                 (parsed.certified_handoff_queue_records - 1U)) != 0U ||
+                parsed.certified_handoff_queue_records >
+                    std::numeric_limits<std::size_t>::max()) {
+                *error =
+                    "--certified-handoff-queue-records must be a "
+                    "power of two that fits size_t";
                 return false;
             }
         } else if (option == "--intraday-store-max-records") {
@@ -1071,6 +1124,12 @@ int Run(const Options& options) {
         {1001U, 1002U, 2001U, 2002U};
     pipeline_config.store_worker_count =
         options.instrument_store_workers;
+    pipeline_config.decoder_queue_capacity_per_source =
+        static_cast<std::size_t>(
+            options.decoder_queue_records_per_source);
+    pipeline_config.store_queue_capacity_per_source_worker =
+        static_cast<std::size_t>(
+            options.store_queue_records_per_source_worker);
     pipeline_config.intraday_store.segment_target_bytes =
         static_cast<std::size_t>(
             options.intraday_store_segment_kib) *
@@ -1221,6 +1280,10 @@ int Run(const Options& options) {
             << common::Sha256Hex(daily_catalog->catalog_digest())
             << " mapping_bytes=" << ipc_service->mapping_bytes()
             << " key_arena_bytes=" << options.ipc_key_arena_bytes
+            << " decoder_queue_records_per_source="
+            << options.decoder_queue_records_per_source
+            << " store_queue_records_per_source_worker="
+            << options.store_queue_records_per_source_worker
             << " mainland_a_share_filter=true"
             << '\n';
         return true;
@@ -1234,7 +1297,6 @@ int Run(const Options& options) {
         ipc_service->StopControl();
         return 1;
     }
-
     if (!options.event_aggregator_socket.empty()) {
         ipc::OrderEventDeltaControlSnapshotV1 event_snapshot{};
         std::string ready_detail;
@@ -1296,6 +1358,8 @@ int Run(const Options& options) {
             certified_config.fast_sink = ipc_service;
             certified_config.certified_tick_ring_capacity =
                 options.ipc_tick_ring_records;
+            certified_config.handoff_queue_capacity =
+                options.certified_handoff_queue_records;
             certified_config.maximum_mapping_bytes =
                 options.ipc_maximum_mapping_bytes;
             certified_config.maximum_order_states =
@@ -1355,12 +1419,20 @@ int Run(const Options& options) {
                     << certified_service->control_socket_path()
                     << " mapping_bytes="
                     << certified_service->mapping_bytes()
+                    << " handoff_queue_records="
+                    << certified_service->handoff_queue_capacity()
                     << " native_gap_recovery=true"
                     << " fast_wire_abi_unchanged=true\n";
             } else {
                 std::cerr
                     << "mdl-production-router: CERTIFIED V1 WARMING: "
-                       "control unavailable until CSV recovery is "
+                       "socket="
+                    << certified_service->control_socket_path()
+                    << " mapping_bytes="
+                    << certified_service->mapping_bytes()
+                    << " handoff_queue_records="
+                    << certified_service->handoff_queue_capacity()
+                    << " control unavailable until CSV recovery is "
                        "complete\n";
             }
             pipeline_config.applied_record_sink = certified_service;
@@ -1494,6 +1566,8 @@ int Run(const Options& options) {
                     << certified_service->control_socket_path()
                     << " mapping_bytes="
                     << certified_service->mapping_bytes()
+                    << " handoff_queue_records="
+                    << certified_service->handoff_queue_capacity()
                     << " native_gap_recovery=true"
                     << " startup_prefix_recovered=true"
                     << " fast_wire_abi_unchanged=true\n";
