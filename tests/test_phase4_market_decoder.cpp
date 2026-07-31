@@ -3,6 +3,8 @@
 #include "l2flow/market/market_types_v1.h"
 
 #include <algorithm>
+#include <array>
+#include <barrier>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -11,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -603,6 +606,109 @@ bool IsSentinel(const market::DecodedMarketEventV1& event) {
     return value != nullptr && value->channel == 0xdec0deU &&
            value->application_sequence == 0x12345678 &&
            value->common.security_id == "sentinel";
+}
+
+bool SameTime(
+    const market::TimeValueV1& left,
+    const market::TimeValueV1& right) {
+    return left.raw_hhmmssmmm == right.raw_hhmmssmmm &&
+           left.nanoseconds_since_midnight ==
+               right.nanoseconds_since_midnight &&
+           left.unix_nanoseconds == right.unix_nanoseconds &&
+           left.valid == right.valid && left.is_null == right.is_null &&
+           left.unix_nanoseconds_valid == right.unix_nanoseconds_valid;
+}
+
+bool SameDecimal(
+    const market::DecimalValueV1& left,
+    const market::DecimalValueV1& right) {
+    return left.raw == right.raw &&
+           left.normalized_p6 == right.normalized_p6 &&
+           left.scale == right.scale &&
+           left.valid == right.valid && left.is_null == right.is_null;
+}
+
+bool SameQuantity(
+    const market::QuantityValueV1& left,
+    const market::QuantityValueV1& right) {
+    return left.raw == right.raw && left.scale == right.scale &&
+           left.valid == right.valid && left.is_null == right.is_null;
+}
+
+bool SameOrigin(
+    const market::MarketMessageViewV1& left,
+    const market::MarketMessageViewV1& right) {
+    return left.source_stream_id == right.source_stream_id &&
+           left.trade_date == right.trade_date &&
+           left.source_sequence == right.source_sequence &&
+           left.service_id == right.service_id &&
+           left.service_version == right.service_version &&
+           left.message_id == right.message_id &&
+           left.message_encoding == right.message_encoding &&
+           left.vendor_local_time_raw == right.vendor_local_time_raw &&
+           left.vendor_sequence_id == right.vendor_sequence_id &&
+           left.recv_realtime_ns == right.recv_realtime_ns &&
+           left.recv_monotonic_ns == right.recv_monotonic_ns &&
+           left.body.empty() && right.body.empty();
+}
+
+bool SameCommon(
+    const market::DecodedMarketCommonV1& left,
+    const market::DecodedMarketCommonV1& right) {
+    return left.kind == right.kind && left.market == right.market &&
+           SameOrigin(left.origin, right.origin) &&
+           SameTime(left.exchange_time, right.exchange_time) &&
+           SameTime(left.vendor_local_time, right.vendor_local_time) &&
+           left.security_id == right.security_id &&
+           left.security_id_source == right.security_id_source &&
+           left.md_stream_id == right.md_stream_id &&
+           left.security_id_valid == right.security_id_valid &&
+           left.security_id_source_valid ==
+               right.security_id_source_valid &&
+           left.md_stream_id_valid == right.md_stream_id_valid &&
+           left.instrument_id == right.instrument_id &&
+           left.ordinal == right.ordinal &&
+           left.quantity_unit == right.quantity_unit &&
+           left.security_type == right.security_type &&
+           left.asset_scope == right.asset_scope &&
+           left.quality_flags == right.quality_flags &&
+           left.market_notices == right.market_notices;
+}
+
+bool SameTickFields(
+    const market::TickFieldsV1& left,
+    const market::TickFieldsV1& right) {
+    return left.action == right.action && left.side == right.side &&
+           left.order_type == right.order_type &&
+           left.aggressor == right.aggressor &&
+           left.phase == right.phase &&
+           SameDecimal(left.price, right.price) &&
+           SameQuantity(left.quantity, right.quantity) &&
+           SameDecimal(left.trade_amount, right.trade_amount) &&
+           SameQuantity(left.matched_quantity, right.matched_quantity) &&
+           left.primary_order_id == right.primary_order_id &&
+           left.buy_order_id == right.buy_order_id &&
+           left.sell_order_id == right.sell_order_id &&
+           left.validity_bitmap == right.validity_bitmap;
+}
+
+bool SameShanghaiTick(
+    const market::DecodedMarketEventV1& left,
+    const market::DecodedMarketEventV1& right) {
+    const auto* const left_tick =
+        std::get_if<market::ShanghaiTickV1>(&left);
+    const auto* const right_tick =
+        std::get_if<market::ShanghaiTickV1>(&right);
+    return left_tick != nullptr && right_tick != nullptr &&
+           SameCommon(left_tick->common, right_tick->common) &&
+           left_tick->business_index == right_tick->business_index &&
+           left_tick->channel == right_tick->channel &&
+           left_tick->raw_type == right_tick->raw_type &&
+           left_tick->raw_tick_flag == right_tick->raw_tick_flag &&
+           left_tick->raw_type_valid == right_tick->raw_type_valid &&
+           left_tick->raw_tick_flag_valid ==
+               right_tick->raw_tick_flag_valid &&
+           SameTickFields(left_tick->fields, right_tick->fields);
 }
 
 void TestFixedLowerBoundsAndSchemaGate(TestContext* context) {
@@ -2236,6 +2342,248 @@ void TestPhaseProductLimit(TestContext* context) {
     }
 }
 
+void TestStatelessOrderedFinalizeEquivalence(TestContext* context) {
+    market::MarketDecoderV1 legacy = MakeDecoder();
+    market::MarketDecoderV1 split = MakeDecoder();
+    struct Step final {
+        const char* type;
+        const char* tick_flag;
+    };
+    const std::array<Step, 9U> steps{{
+        {"S", "TRADE"},
+        {"A", "B"},
+        {"D", "S"},
+        {"T", "N"},
+        {"X", "?"},
+        {"S", "UNKNOWN"},
+        {"A", "B"},
+        {"S", "SUSP"},
+        {"A", "S"},
+    }};
+
+    std::uint64_t sequence = 3'000U;
+    for (const Step& step : steps) {
+        ShanghaiTickSpec spec;
+        spec.type = step.type;
+        spec.tick_flag = step.tick_flag;
+        const std::vector<std::byte> body = MakeShanghaiTickWire(spec);
+        const market::MarketMessageViewV1 input = Message(
+            kShanghaiService,
+            kShanghaiTickMessage,
+            body,
+            sequence++);
+
+        market::DecodedMarketEventV1 legacy_event = SentinelOutput();
+        market::DecodedMarketEventV1 split_event = SentinelOutput();
+        const market::MarketDecodeErrorV1 legacy_error =
+            legacy.Decode(input, &legacy_event);
+        const market::MarketDecodeErrorV1 parse_error =
+            split.DecodeStateless(input, &split_event);
+        context->Expect(
+            legacy_error == market::MarketDecodeErrorV1::kNone &&
+                parse_error == legacy_error,
+            "split SH tick stateless parse matches legacy success");
+        if (parse_error != market::MarketDecodeErrorV1::kNone) {
+            continue;
+        }
+
+        const auto* const parsed_tick =
+            std::get_if<market::ShanghaiTickV1>(&split_event);
+        if (parsed_tick != nullptr && parsed_tick->raw_type != "S") {
+            context->Expect(
+                parsed_tick->fields.phase ==
+                    market::TradingPhaseV1::kUnknown &&
+                    (parsed_tick->fields.validity_bitmap &
+                     market::kTickPhaseValidV1) == 0U,
+                "stateless non-status SH tick does not read phase history");
+        }
+
+        const market::MarketDecodeErrorV1 finalize_error =
+            split.FinalizeInSourceOrder(&split_event);
+        context->Expect(
+            finalize_error == legacy_error &&
+                SameShanghaiTick(legacy_event, split_event),
+            "stateless parse plus ordered finalize is field-exact legacy SH decode");
+    }
+
+    market::MarketDecoderConfigV1 limited_config;
+    limited_config.trade_date = kTradeDate;
+    limited_config.source_stream_id = kSourceStreamId;
+    limited_config.limits.maximum_phase_products = 1U;
+    market::MarketDecoderV1 limited(limited_config);
+
+    ShanghaiTickSpec status;
+    status.type = "S";
+    status.tick_flag = "TRADE";
+    status.security_id = "600000";
+    std::vector<std::byte> body = MakeShanghaiTickWire(status);
+    market::DecodedMarketEventV1 event = SentinelOutput();
+    context->Expect(
+        limited.DecodeStateless(
+            Message(
+                kShanghaiService,
+                kShanghaiTickMessage,
+                body,
+                4'000U),
+            &event) == market::MarketDecodeErrorV1::kNone &&
+            limited.FinalizeInSourceOrder(&event) ==
+                market::MarketDecodeErrorV1::kNone,
+        "split decoder seeds one ordered SH phase product");
+
+    status.security_id = "600001";
+    body = MakeShanghaiTickWire(status);
+    context->Expect(
+        limited.DecodeStateless(
+            Message(
+                kShanghaiService,
+                kShanghaiTickMessage,
+                body,
+                4'001U),
+            &event) == market::MarketDecodeErrorV1::kNone,
+        "stateless parse is independent of ordered phase capacity");
+    const market::DecodedMarketEventV1 before_finalize = event;
+    context->Expect(
+        limited.FinalizeInSourceOrder(&event) ==
+                market::MarketDecodeErrorV1::
+                    kPhaseProductLimitExceeded &&
+            SameShanghaiTick(before_finalize, event),
+        "ordered phase-capacity failure leaves split event unchanged");
+}
+
+void TestConcurrentStatelessDecode(TestContext* context) {
+    constexpr std::size_t kWorkerCount = 8U;
+    constexpr std::size_t kIterations = 200U;
+
+    market::MarketDecoderConfigV1 config;
+    config.trade_date = kTradeDate;
+    config.source_stream_id = kSourceStreamId;
+    config.limits.maximum_phase_products = 1U;
+    market::MarketDecoderV1 decoder(config);
+
+    ShanghaiTickSpec seed;
+    seed.type = "S";
+    seed.tick_flag = "TRADE";
+    seed.security_id = "600000";
+    std::vector<std::byte> seed_body = MakeShanghaiTickWire(seed);
+    market::DecodedMarketEventV1 seed_event = SentinelOutput();
+    context->Expect(
+        decoder.DecodeStateless(
+            Message(
+                kShanghaiService,
+                kShanghaiTickMessage,
+                seed_body,
+                1U),
+            &seed_event) == market::MarketDecodeErrorV1::kNone &&
+            decoder.FinalizeInSourceOrder(&seed_event) ==
+                market::MarketDecodeErrorV1::kNone,
+        "concurrent stateless test seeds ordered phase history");
+
+    std::array<std::vector<std::byte>, kWorkerCount> status_bodies;
+    std::array<std::vector<std::byte>, kWorkerCount> add_bodies;
+    for (std::size_t worker = 0U; worker < kWorkerCount; ++worker) {
+        ShanghaiTickSpec status;
+        status.type = "S";
+        status.tick_flag = "SUSP";
+        status.security_id =
+            std::to_string(610000U + static_cast<unsigned int>(worker));
+        status_bodies[worker] = MakeShanghaiTickWire(status);
+
+        ShanghaiTickSpec add;
+        add.type = "A";
+        add.tick_flag = "B";
+        add.security_id = "600000";
+        add_bodies[worker] = MakeShanghaiTickWire(add);
+    }
+
+    std::array<std::uint32_t, kWorkerCount> failures{};
+    std::array<market::DecodedMarketEventV1, kWorkerCount> retained;
+    std::barrier start(static_cast<std::ptrdiff_t>(kWorkerCount));
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkerCount);
+    for (std::size_t worker = 0U; worker < kWorkerCount; ++worker) {
+        workers.emplace_back([&, worker]() {
+            start.arrive_and_wait();
+            for (std::size_t iteration = 0U;
+                 iteration < kIterations;
+                 ++iteration) {
+                const bool parse_status = (iteration % 2U) == 0U;
+                const std::vector<std::byte>& body = parse_status
+                    ? status_bodies[worker]
+                    : add_bodies[worker];
+                const std::uint64_t source_sequence =
+                    10'000U +
+                    static_cast<std::uint64_t>(iteration) *
+                        static_cast<std::uint64_t>(kWorkerCount) +
+                    static_cast<std::uint64_t>(worker);
+                market::DecodedMarketEventV1 parsed{
+                    market::ShanghaiTickV1{}};
+                if (decoder.DecodeStateless(
+                        Message(
+                            kShanghaiService,
+                            kShanghaiTickMessage,
+                            body,
+                            source_sequence),
+                        &parsed) != market::MarketDecodeErrorV1::kNone) {
+                    ++failures[worker];
+                    continue;
+                }
+                const auto* const tick =
+                    std::get_if<market::ShanghaiTickV1>(&parsed);
+                if (tick == nullptr ||
+                    (parse_status &&
+                     (tick->fields.phase !=
+                          market::TradingPhaseV1::kSuspended ||
+                      (tick->fields.validity_bitmap &
+                       market::kTickPhaseValidV1) == 0U)) ||
+                    (!parse_status &&
+                     (tick->fields.phase !=
+                          market::TradingPhaseV1::kUnknown ||
+                      (tick->fields.validity_bitmap &
+                       market::kTickPhaseValidV1) != 0U))) {
+                    ++failures[worker];
+                }
+            }
+
+            market::DecodedMarketEventV1 parsed{
+                market::ShanghaiTickV1{}};
+            const market::MarketDecodeErrorV1 error =
+                decoder.DecodeStateless(
+                    Message(
+                        kShanghaiService,
+                        kShanghaiTickMessage,
+                        add_bodies[worker],
+                        2U + static_cast<std::uint64_t>(worker)),
+                    &parsed);
+            if (error != market::MarketDecodeErrorV1::kNone) {
+                ++failures[worker];
+            }
+            retained[worker] = std::move(parsed);
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+
+    for (std::size_t worker = 0U; worker < kWorkerCount; ++worker) {
+        context->Expect(
+            failures[worker] == 0U,
+            "same decoder instance supports concurrent stateless SH parses");
+        context->Expect(
+            decoder.FinalizeInSourceOrder(&retained[worker]) ==
+                market::MarketDecodeErrorV1::kNone,
+            "concurrently parsed SH tick finalizes in source order");
+        const auto* const tick =
+            std::get_if<market::ShanghaiTickV1>(&retained[worker]);
+        context->Expect(
+            tick != nullptr &&
+                tick->fields.phase ==
+                    market::TradingPhaseV1::kContinuous &&
+                (tick->fields.validity_bitmap &
+                 market::kTickPhaseValidV1) != 0U,
+            "ordered finalizer alone applies stored SH phase");
+    }
+}
+
 void TestTimeNullInvalidAndBoundaries(TestContext* context) {
     market::MarketDecoderV1 decoder = MakeDecoder();
     std::uint64_t sequence = 400U;
@@ -2938,6 +3286,8 @@ int main() {
     TestNegativeQuantityDomains(&context);
     TestOrderReferenceDomains(&context);
     TestPhaseProductLimit(&context);
+    TestStatelessOrderedFinalizeEquivalence(&context);
+    TestConcurrentStatelessDecode(&context);
     TestTimeNullInvalidAndBoundaries(&context);
     TestAbsolutePriceDomains(&context);
     TestMaximumDurationSentinel(&context);

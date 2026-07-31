@@ -75,9 +75,37 @@ struct RealtimePipelineConfigV1 final {
     std::uint32_t maximum_sdk_message_bytes =
         16U * 1024U * 1024U;
     std::size_t decoder_queue_capacity_per_source = 4096U;
-    // The decoder gate window D is min(sum(queue capacities)+source_count,
-    // completion_tracker_capacity-1, tick_ring_capacity-1). Both backing
-    // capacities must therefore be at least two and strictly exceed D.
+    // Zero preserves the original one-decoder-thread-per-source topology.
+    // A non-zero value enables the bounded parallel stateless-decode farm:
+    // the serialized callback still publishes to the same four source FIFOs,
+    // workers decode concurrently, and one ordered owner per source finalizes
+    // and submits results to History. Keep zero until the deployment's exact
+    // callback-to-reader workload has passed the latency non-regression gate.
+    std::uint32_t parallel_decoder_worker_count = 0U;
+    // Preserve the original single-hop path whenever a source is idle. Set
+    // false only for deterministic farm tests or a measured deployment that
+    // explicitly prefers uniform scheduling over low-load latency.
+    bool parallel_decoder_idle_inline_enabled = true;
+    // Configured source-local farm threshold. The effective threshold is
+    // min(configured, Q - max(1, Q/4)), where Q is that source FIFO capacity;
+    // zero requests immediate farm scheduling. Each source already has an
+    // independent decoder owner, so aggregate backlog across multiple sources
+    // does not force those naturally parallel owners through the higher-cost
+    // parse/reorder topology. The capacity clamp leaves headroom for a hot
+    // source even when Q is smaller than 8,192.
+    std::size_t parallel_decoder_farm_activation_queue_depth = 8'192U;
+    // Number of preallocated decoded-event leases owned by each
+    // (source, parallel worker) pair. The issue queues and completion rings
+    // carry pointers to these leases and never copy DecodedMarketEventV1.
+    // No worker waits to form a batch; a ready single record is processed
+    // immediately.
+    std::size_t parallel_decoder_slots_per_source_worker = 32U;
+    // The decoder gate window D is min(
+    //   source_count * (queue_capacity + 1 + W*S),
+    //   completion_tracker_capacity-1, tick_ring_capacity-1),
+    // where W*S is zero for the legacy topology and otherwise is parallel
+    // workers times leases per (source, worker). Both backing capacities must
+    // therefore be at least two and strictly exceed D.
     std::size_t completion_tracker_capacity = 262'144U;
     std::size_t tick_ring_capacity = 262'144U;
     l2flow::market::MarketDecoderLimitsV1 decoder_limits{};
@@ -281,6 +309,12 @@ struct RealtimePipelineStageLatencySnapshotV1 final {
     std::array<RealtimeLatencyDistributionV1,
                l2flow::market::kRealtimeHistorySourceCountV1>
         decoder_queue_dwell{};
+    // Wall-clock time from the beginning of decode work until the complete,
+    // source-ordered decoded event exists. In parallel mode it includes any
+    // completion-reorder wait between stateless parse and ordered finalization;
+    // it is not a CPU-service-time metric. queue_dwell covers the preceding
+    // source/issue-queue residence, and decode_to_history_submit starts only
+    // after ordered finalization and identity application are complete.
     std::array<RealtimeLatencyDistributionV1,
                l2flow::market::kRealtimeHistorySourceCountV1>
         decode_duration{};
@@ -446,6 +480,70 @@ struct RealtimeDecoderQueueSnapshotV1 final {
     std::uint64_t full_count = 0U;
 };
 
+inline constexpr std::size_t
+    kRealtimeParallelDecoderMaximumWorkersV1 = 64U;
+
+struct RealtimeParallelDecoderWorkerSnapshotV1 final {
+    // Farm tasks only. Source-owner idle-inline decodes are reported by
+    // RealtimeParallelDecoderSourceSnapshotV1::inline_messages.
+    std::uint64_t parsed_messages = 0U;
+    std::uint64_t parse_failures = 0U;
+    std::size_t issue_depth = 0U;
+    // Sum across this worker's four SPSC issue shards. Each producer-side
+    // shard sample is a conservative historical upper bound because a
+    // concurrent consumer can advance after its head is sampled; shard peaks
+    // can also occur at different times. This cannot certify exact headroom.
+    std::size_t issue_high_water = 0U;
+};
+
+struct RealtimeParallelDecoderSourceSnapshotV1 final {
+    // These counters are exact after the pipeline is quiescent. A concurrent
+    // Snapshot is an eventually consistent diagnostic view across the inline
+    // owner and ordered farm committer, not one atomic multi-field sample.
+    std::uint64_t dispatched_messages = 0U;
+    std::uint64_t inline_messages = 0U;
+    std::uint64_t farm_messages = 0U;
+    std::uint64_t completed_messages = 0U;
+    std::uint64_t committed_messages = 0U;
+    // Opportunistic History batches contain only completion records that were
+    // already contiguous when the committer checked; no timer or target batch
+    // size delays the first record. A one-record scalar submit is not counted.
+    std::uint64_t history_batch_calls = 0U;
+    std::uint64_t history_batched_messages = 0U;
+    std::size_t history_batch_max = 0U;
+    // Farm tasks released without ordered commit after a fatal transition.
+    std::uint64_t discarded_messages = 0U;
+    std::size_t farm_outstanding = 0U;
+    std::uint64_t committed_source_sequence = 0U;
+    std::size_t completion_capacity = 0U;
+    std::size_t completion_depth = 0U;
+    // Periodically sampled completion depth. This is a lower bound on the
+    // true historical high water and cannot certify unused capacity.
+    std::size_t completion_high_water = 0U;
+    std::uint64_t completion_publish_failures = 0U;
+    // Samples are recorded only when stage-latency measurement is enabled.
+    // The ordered owner measures from stateless-decode completion until it
+    // begins committing the next source sequence. Durations use
+    // CLOCK_MONOTONIC and include only completed-result reorder residence.
+    std::uint64_t reorder_wait_samples = 0U;
+    std::uint64_t reorder_wait_total_ns = 0U;
+    std::uint64_t reorder_wait_max_ns = 0U;
+    std::uint64_t lease_wait_count = 0U;
+};
+
+struct RealtimeParallelDecoderSnapshotV1 final {
+    bool enabled = false;
+    bool idle_inline_enabled = false;
+    std::uint32_t worker_count = 0U;
+    std::size_t slots_per_source_worker = 0U;
+    std::array<RealtimeParallelDecoderWorkerSnapshotV1,
+               kRealtimeParallelDecoderMaximumWorkersV1>
+        workers{};
+    std::array<RealtimeParallelDecoderSourceSnapshotV1,
+               l2flow::market::kRealtimeHistorySourceCountV1>
+        sources{};
+};
+
 struct RealtimePipelineSnapshotV1 final {
     // Exact count committed to one source decoder queue. It always
     // matches global_ingress_sequence.
@@ -484,6 +582,7 @@ struct RealtimePipelineSnapshotV1 final {
     std::array<RealtimeDecoderQueueSnapshotV1,
                l2flow::market::kRealtimeHistorySourceCountV1>
         decoder_queues{};
+    RealtimeParallelDecoderSnapshotV1 parallel_decoder{};
 };
 
 // Owns the single production data chain. The frozen catalog, runtime state and
@@ -520,7 +619,8 @@ public:
     // same admission, decoder, History, KLine and applied-sink path as live
     // traffic.  Receive clocks are supplied by the journal (or by the CSV
     // coordinator for recovered records); no current-time substitution is
-    // made.  A timeout never drops the record: it fails the shadow closed.
+    // made. Concurrent callers are serialized across bounded capacity waits.
+    // A timeout never drops the record: it fails the shadow closed.
     [[nodiscard]] RealtimePipelineIngressResultV1 IngestExternalMessage(
         const RealtimePipelineExternalIngressV1& input) noexcept;
 

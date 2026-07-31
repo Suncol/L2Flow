@@ -4,21 +4,32 @@
 
 | 项目 | 当前基线 |
 | --- | --- |
-| 分支 | `feature/native-gap-recovery-fast-certified-v1` |
-| 提交 | `0d0fc709f47c629c246ea4598b5375d579a1ac99`（`docs: record flow architecture and leakage audit`；本文还覆盖当前未提交工作树） |
-| 对比分支 | `feature/live-latest-tick-snapshot-v1` |
-| merge-base | `7a1a4044b5a32435259abcc6099385f2b8ec2db3` |
+| 分支 | `perf/parallel-decoder-500k-v1` |
+| 基线提交 | `3bc4f4108786e6df7e37f585fb294c258a02f367`（本文还覆盖当前未提交工作树） |
+| 本次对比 | 同一提交的原始生产源码与当前并行解码工作树 |
 | 生产入口 | `apps/mdl_production_main.cpp` |
 | 核心编排 | `runtime::RealtimePipelineV1` |
-| 文档更新日期 | 2026-07-31 |
+| 文档更新日期 | 2026-08-01 |
 
 ---
+
+> **并行解码覆盖说明：** 本文后续出现的“每 source 一个完整 decoder
+> thread”描述是 `parallel_decoder_worker_count=0` 的默认拓扑。正值会武装
+> adaptive topology。在 production-default `idle_inline=true` 且有效门槛
+> 大于零的 profile 中，四个 source owner 先沿原路径 inline 完整解码；达到
+> 有效 queue 门槛后，才 lazy-start `Wd` 个 stateless parse worker 和四个
+> source-ordered committer。`idle_inline=false`、配置门槛为零或容量钳制后
+> 的有效门槛为零时，第一笔记录直接选择 farm。`DecodeStateless` 可并行，但
+> `FinalizeInSourceOrder`、History `TrySubmit/SealSource` 仍按 source 严格
+> 非重叠。farm 排空并通过 release/acquire handoff 后可回到 inline；generation
+> fence 同时等待 committed frontier 与 `farm_outstanding==0`。下文 History
+> 的 `W` 表示 Store workers，与 decoder worker 数 `Wd` 无关。
 
 ## 1. 一句话结论
 
 当前实现不是一条单线程流水线，而是三个互相咬合、但一致性语义不同的执行平面：
 
-1. **逐条消息热路径**：串行 SDK 回调分配全局顺序并复制消息，四个 source decoder 并行解码，再按 `instrument_id % worker_count` 路由到唯一 worker；worker 严格按
+1. **逐条消息热路径**：串行 SDK 回调分配全局顺序并复制消息，四个 source owner 并行处理；启用 production-default adaptive topology 且某次 Pop 已读取的 source-local ring 剩余深度达到门槛时，stateless parse 再分发到 `Wd` 个 worker，随后按 source 顺序 finalize。该判断复用 Pop 本来就需要的 tail acquire，不增加第二次跨核 depth 读取；它是逐次 Pop 的瞬时观测，不是持续时间判定。完整 event 再按 `instrument_id % worker_count` 路由到唯一 Store worker；Store worker 严格按
    `Store → KLine → handoff 回收 → 进程内 latest → 外部 applied sink/IPC`
    的顺序提交一条“已应用记录”。
 2. **代际发布冷路径**：控制线程冻结一个排他 watermark，把 marker 注入四个 decoder；marker 在 `source × worker` 队列中变为 fence。所有 worker 到达同一屏障后，只复制 Store 端点和 KLine 快照，由 builder 构造不可变 generation，随后发布 Store、KLine 和 Factor。
@@ -62,19 +73,23 @@ flowchart TB
         COPY["OwnedIngress Pool<br/>复制 head + body"]
     end
 
-    subgraph DECODERS["四条 source decoder lane"]
+    subgraph DECODERS["四条 source owner lane + 可选 shared parse farm"]
         DQ0["SPSC decoder queue 0<br/>SH Snapshot"]
         DQ1["SPSC decoder queue 1<br/>SH Tick"]
         DQ2["SPSC decoder queue 2<br/>SZ Snapshot"]
         DQ3["SPSC decoder queue 3<br/>SZ Order + Transaction"]
-        DEC0["Decoder 0"]
-        DEC1["Decoder 1"]
-        DEC2["Decoder 2"]
-        DEC3["Decoder 3"]
+        DEC0["source owner 0<br/>inline Decode 或 dispatch"]
+        DEC1["source owner 1<br/>inline Decode 或 dispatch"]
+        DEC2["source owner 2<br/>inline Decode 或 dispatch"]
+        DEC3["source owner 3<br/>inline Decode 或 dispatch"]
+        ISSUE["每 worker × source SPSC issue shard<br/>预分配 task lease"]
+        PARSE["Wd 个 lazy stateless parse worker<br/>多核心 DecodeStateless"]
+        COMPLETE["每 source completion / failure ring"]
+        COMMIT["四个 lazy ordered committer<br/>FinalizeInSourceOrder"]
     end
 
     subgraph HISTORY["RealtimeHistory：4 × W 路由矩阵"]
-        ROUTE["Registry 解析<br/>worker = instrument_id % W"]
+        ROUTE["History route token 构造与校验<br/>worker = instrument_id % W"]
         HPOOL["HandoffPool<br/>decoder 获取，worker 回收"]
         QMAT["每个 source × worker 一条 SPSC<br/>record + 预留 fence 槽"]
         WORKERS["W 个唯一 writer worker<br/>每次轮询最多 microdrain 64"]
@@ -116,10 +131,15 @@ flowchart TB
     COPY --> DQ3 --> DEC3
     COPY -. "额外 intrusive ref" .-> WAL
 
-    DEC0 --> ROUTE
-    DEC1 --> ROUTE
-    DEC2 --> ROUTE
-    DEC3 --> ROUTE
+    DEC0 -->|inline| ROUTE
+    DEC1 -->|inline| ROUTE
+    DEC2 -->|inline| ROUTE
+    DEC3 -->|inline| ROUTE
+    DEC0 --> ISSUE
+    DEC1 --> ISSUE
+    DEC2 --> ISSUE
+    DEC3 --> ISSUE
+    ISSUE --> PARSE --> COMPLETE --> COMMIT --> ROUTE
     ROUTE --> HPOOL --> QMAT --> WORKERS
 
     WORKERS --> STORE --> KLINE --> RELEASE --> LATEST --> SINK
@@ -135,7 +155,7 @@ flowchart TB
     CUT -.-> DQ1
     CUT -.-> DQ2
     CUT -.-> DQ3
-    DEC0 -.-> FENCE
+    DEC0 -. "等待 committed frontier + outstanding=0" .-> FENCE
     DEC1 -.-> FENCE
     DEC2 -.-> FENCE
     DEC3 -.-> FENCE
@@ -259,7 +279,10 @@ sequenceDiagram
    - `RealtimeHistoryV1`，内部含 Store、latest、KLine、worker 与 builder；
    - 可选 WAL；
    - Factor engine；
-   - 四个 decoder 和四个 decoder queue；
+   - 四个 source owner 和四个 decoder queue；`Wd=0` 时它们执行完整
+     decode。`Wd>0` 只预分配有界 issue/completion/task-lease 状态，parse
+     workers 与四个 ordered committers 在首次 source-local farm activation
+     时才 lazy-start；
    - 最后才加载并连接 SDK。
 7. CSV 恢复模式必须再发布首个 Store/KLine generation；只有完整恢复前缀
    可查询后才把 FAST 切到 `active`。可选 CERTIFIED 随后还必须通过其 worker
@@ -323,9 +346,9 @@ tick_stream_sequence_exclusive - 1
 
 ## 5. 单条消息的完整执行时序
 
-入口实现见
-[`RealtimePipelineV1::Impl::Ingest`](../src/runtime/realtime_pipeline_v1.cpp#L1233)，worker 应用顺序见
-[`RealtimeHistoryV1::Impl::Append`](../src/market/realtime_history_v1.cpp#L1384)。
+入口实现在 `src/runtime/realtime_pipeline_v1.cpp`，worker 应用顺序实现在
+`src/market/realtime_history_v1.cpp`。这里不固定源码行号，避免正常演进使锚点
+失真。
 
 ```mermaid
 sequenceDiagram
@@ -335,7 +358,9 @@ sequenceDiagram
     participant Pool as OwnedIngress Pool
     participant DQ as source decoder SPSC
     participant WAL as 可选 WAL
-    participant Dec as source Decoder
+    participant Owner as source owner
+    participant Parse as Wd stateless parse workers
+    participant Commit as source ordered committer
     participant HP as Handoff Pool
     participant HQ as source×worker SPSC
     participant W as 唯一 instrument worker
@@ -367,10 +392,19 @@ sequenceDiagram
         end
         Adm-->>SDK: 释放 admission_mutex，回调完成
 
-        DQ->>Dec: Pop OwnedMessage
-        Dec->>Dec: 精确 schema 解码 + Registry 解析
-        Dec->>HP: 获取 handoff slot 并 move decoded event
-        Dec->>HQ: TrySubmit 到 instrument_id % W
+        DQ->>Owner: Pop OwnedMessage
+        alt Wd=0，或 adaptive inline 判定成立
+            Owner->>Owner: inline 完整 Decode + Registry 解析
+        else active farm interval
+            Owner->>Parse: source-sequence 映射到 issue shard
+            Parse->>Parse: DecodeStateless + Registry identity
+            Parse->>Commit: completion ring release-publish
+            Commit->>Commit: 按 source sequence FinalizeInSourceOrder
+            Note over Commit: 最多贪婪取 16 条 already-ready 连续结果；不等待组批
+        end
+        Owner->>HP: inline 路径获取 handoff slot
+        Commit->>HP: farm 路径获取 handoff slot
+        HP->>HQ: 立即 TrySubmit 到 instrument_id % W
         HQ->>W: Pop record
 
         W->>Store: Append exact typed record
@@ -411,13 +445,19 @@ source decoder queue TryPush 成功
 
 ### 5.3 解码与 Registry 解析
 
-每个 source 有一个专属 `MarketDecoderV1`：
+每个 source 有一个专属 `MarketDecoderV1`，其可变状态所有权在任一时刻始终
+唯一，但拥有线程会切换：没有 farm outstanding 时由 inline source owner
+持有；active farm interval 由 ordered committer 持有；排空后的
+release/acquire frontier 才允许交还 inline owner。
 
 - 只接收其固定 service/version/schema；
 - decoded event 自有字符串和数组，不引用 SDK body；
 - 按 `market + security source + security id` 查固定 Registry；
 - 解析出 `instrument_id`、`registry_ordinal`、数量单位、安全类型和 worker 路由信息；
-- 上海产品阶段状态只由对应 decoder 维护，不与其他 source 共享可变状态。
+- `DecodeStateless` 不读写跨消息状态，可由多个 parse worker 并行执行；
+- `FinalizeInSourceOrder` 只由当时拥有该 source 状态的 ordered committer
+  （或 inline owner）严格按 source sequence 调用；
+- 上海产品阶段状态只由上述唯一 ordered owner 维护，不与其他 source 共享可变状态。
 
 非白名单消息在 admission 层忽略；白名单消息一旦 schema 或 Registry 处理违反强约束，则进入 fatal，而不是静默跳过。
 
@@ -476,7 +516,8 @@ flowchart LR
 
 每条队列只有：
 
-- 一个 producer：固定 source decoder；
+- 一个 producer：固定 source 的当前 ordered producer（inline owner 或
+  farm committer，二者由排空 handoff 保证不重叠）；
 - 一个 consumer：固定 worker。
 
 因此 record 热路径不需要 MPSC 竞争，也不需要 append 全局锁。每个 worker 是其标的集合的唯一 writer，Store 和 KLine 都可依赖 thread ownership。
@@ -788,7 +829,14 @@ source_exclusive[s] = source_sequence[s] + 1
 
 ### 11.3 source seal 如何变成 worker barrier
 
-decoder 按其 SPSC queue 顺序消费，所以看见 marker 时，该 source 的 cut 前消息已经全部提交给 History。`SealSource` 校验 source sequence 和 global exclusive，再向该 source 的每个 worker queue 各插入一个 fence。
+source owner 按其 SPSC queue 顺序消费 marker。marker 前由 inline owner 处理的
+suffix 已经同步提交给 History；若该 source 曾向 farm dispatch，owner 只等待
+`last_dispatched_source_sequence`（最后一个实际 farm-dispatched sequence）的
+committed frontier，并确认所有已签发 lease 都已在 History submission gate
+结束后 retired。它不是笼统等待“最后一个 cut 前 sequence”；inline 部分无需
+再由 committer 覆盖。满足这些条件后才调用 `SealSource`。`SealSource` 校验
+完整 source sequence 和 global exclusive，再向该 source 的每个 History
+worker queue 各插入一个 fence。
 
 worker 看见某 source fence 后暂时不再消费该 source 的 post-cut record，但继续排空其他 source。只有四个 source 都停在同一 generation，才捕获本 worker 的 Store/KLine slice。
 
@@ -972,16 +1020,20 @@ index = (tick_stream_sequence - 1) % capacity
 - 每 ring slot 的小锁：避免两个乱序 worker 同时覆盖同一模位置；
 - 控制线程 eventfd：热路径只做有界推进，剩余连续前缀由控制线程补齐。
 
-生产入口在启动前计算最坏在途重排上界：
+生产入口在启动前计算有界 applied window。设每 source decoder queue 容量为
+`Q`、decode worker 数为 `Wd`、每 `(source, worker)` task lease 数为 `S`：
 
 ```text
-2 × decoder queue capacity
-+ 2 × worker_count × history queue capacity
-+ 2 个 tick decoder 的 in-flight
-+ worker_count 个 Store worker 的 in-flight
+D = min(4 × (Q + 1 + Wd × S),
+        completion_tracker_capacity - 1,
+        tick_ring_capacity - 1)
 ```
 
-配置的 ring capacity 小于该下界时拒绝启动。这个检查保护 producer 内部重排，但消费者仍可能因为自身太慢而被覆盖；此时 reader 返回明确 overrun，而不是悄悄跳号。
+`Wd=0` 时并行项为零。上式的 target 会被 tracker/ring 的 `capacity - 1`
+夹住；仅仅因为 target 大于 backing capacity 不会拒绝启动。无法安全计算、
+容量小于 2、结果为零、超过全局硬上限，或夹住后的值仍违反容量不变量时才
+拒绝。这个检查保护 producer 内部重排，但消费者仍可能因为自身太慢而被
+覆盖；此时 reader 返回明确 overrun，而不是悄悄跳号。
 
 ### 14.5 KLine 的 IPC generation 切换
 
@@ -1642,7 +1694,9 @@ Pipeline fatal = true
 | --- | ---: | --- | --- |
 | 生产主/控制线程 | 1 | 生命周期、周期 cut、最终停止、IPC Store/KLine generation | `cut_mutex`、`stop_mutex` |
 | SDK callback | SDK 串行配置 | admission 顺序号、OwnedIngress 入队 | `callback_gate`、`active_callbacks`、`admission_mutex` |
-| decoder thread | 4 | 单 source decoder 状态、source owner sequence | 每 source decoder SPSC；marker 顺序 |
+| source owner | 4 | source queue/dispatch；仅在无 farm outstanding 的 inline 区间持有 decoder 可变状态 | 每 source decoder SPSC；source-local activation；与 committer 的 release/acquire ownership handoff；marker 顺序 |
+| stateless parse worker | `Wd`，首次 farm activation 才启动 | issue shard 中 task 的 schema parse 与 immutable identity | 每 worker × source SPSC issue shard；completion release publication |
+| source ordered committer | 4，随 parse farm lazy-start | 按 source sequence finalize、History submission 与 task retirement | per-source completion/failure ring；committed/retired release frontier |
 | WAL writer | 0/1 | WAL fd 与写 offset | 独立有界 queue/semaphore |
 | History worker | W | `instrument_id % W` 的 Store/KLine 热写 | 4 条输入 SPSC；无需 append 全局锁 |
 | generation builder | 1 | pending generation 构建 | History generation mutex/condition variable |
@@ -1655,6 +1709,8 @@ Pipeline fatal = true
 ### 18.1 热路径避免的锁
 
 - decoder queue：真 SPSC ring，条件变量只用于睡眠/唤醒；
+- parallel issue/completion：预分配 task lease 与有界 ring；epoch 只负责唤醒，
+  正确性由 release/acquire publication 和 exact source sequence 决定；
 - History 路由：`source × worker` SPSC；
 - Store append：唯一 worker 写 ownership，不使用全局 append mutex；
 - KLine append：worker-local aggregator；
@@ -1754,14 +1810,53 @@ OnSdkMessage(message):
     unlock(admission_mutex)
     leave_active_callback()
 
-DecoderLoop(source):
+SourceOwnerLoop(source):
     for command in decoder_queue[source]:
         if command is marker:
+            wait_until(committed_frontier_covers_last_farm_dispatch &&
+                       farm_outstanding == 0)
             history.seal_source(source, generation)
-        else:
+        else if Wd == 0:
             event = decoder[source].decode(command.message)
             route = registry.resolve(event)
             history.try_submit(source, route, move(event))
+        else:
+            inline = false
+            if idle_inline_enabled && activation_depth != 0:
+                if !farm_interval_active:
+                    inline = pop_observed_remaining_ring_depth <
+                             effective_threshold
+                else if farm_outstanding == 0 &&
+                        pop_observed_remaining_ring_depth <
+                            effective_threshold:
+                    inline = true
+            if inline:
+                event = decoder[source].decode(command.message)
+                route = registry.resolve(event)
+                history.try_submit(source, route, move(event))
+            else:
+                worker = (source_sequence - 1 + source) % Wd
+                issue[worker][source].push(preallocated_lease(command))
+
+ParallelParseWorker(worker):
+    fairly_poll_four_source_issue_shards()
+    task.decoded = decoder[source].decode_stateless(task.message)
+    apply_daily_identity_and_merge_market_notices(task.decoded)
+    release_callback_owned_buffer(task)
+    completion[source].publish_exact(task.source_sequence, task)
+
+ParallelCommitLoop(source):
+    take_at_most_16_already_ready_contiguous_tasks_without_waiting()
+    if ready_count == 1:
+        decoder[source].finalize_in_source_order(task.decoded)
+        history.try_submit_scalar_immediately(task.decoded)
+    else:
+        batch = history.begin_submission_batch(source)
+        for task in source_sequence_order:
+            decoder[source].finalize_in_source_order(task.decoded)
+            batch.try_submit_immediately(task.decoded)
+        batch.finish_before_any_task_retirement()
+    publish_committed_then_release_and_retire_each_task()
 
 WorkerLoop(worker):
     fairly_poll_four_source_queues()
@@ -1915,7 +2010,8 @@ merge-base，新增两个提交：
 ```text
 SDK
 → owned ingress
-→ decoder
+→ source owner inline decoder
+  或 bounded issue → stateless parse farm → source-ordered finalize
 → instrument worker
 → Store
 → KLine

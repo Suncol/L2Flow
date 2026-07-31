@@ -1151,7 +1151,6 @@ TradingPhaseV1 ParseShPhase(std::string_view value) noexcept {
 MarketDecodeErrorV1 DecodeShanghaiTick(
     const MarketMessageViewV1& input,
     const MarketDecoderConfigV1& config,
-    std::map<std::string, TradingPhaseV1>* phases,
     ShanghaiTickV1* output) {
     CheckedBodyViewV1 view(input.body);
     CheckedBodyErrorV1 body_error =
@@ -1243,17 +1242,6 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         decoded.fields.validity_bitmap |= kTickExchangeTimeValidV1;
     }
 
-    const auto set_phase_from_history = [&]() {
-        if (!decoded.common.security_id_valid) {
-            return;
-        }
-        const auto found = phases->find(decoded.common.security_id);
-        if (found != phases->end() &&
-            found->second != TradingPhaseV1::kUnknown) {
-            decoded.fields.phase = found->second;
-            decoded.fields.validity_bitmap |= kTickPhaseValidV1;
-        }
-    };
     const auto set_order_side = [&]() {
         if (decoded.raw_tick_flag == "B") {
             decoded.fields.side = SideV1::kBuy;
@@ -1310,7 +1298,6 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         // For A, the vendor field named TradeMoney carries matched quantity;
         // it is not a valid trade-amount field.
         decoded.fields.trade_amount.valid = false;
-        set_phase_from_history();
     } else if (decoded.raw_type == "D") {
         decoded.fields.action = TickActionV1::kCancel;
         decoded.fields.price.valid = false;
@@ -1319,7 +1306,6 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
             decoded.fields.validity_bitmap |= kTickQuantityValidV1;
         }
         set_order_side();
-        set_phase_from_history();
     } else if (decoded.raw_type == "T") {
         decoded.fields.action = TickActionV1::kTrade;
         error = NormalizeStrictlyPositivePriceP6(
@@ -1372,7 +1358,6 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         if (decoded.fields.aggressor != AggressorV1::kUnknown) {
             decoded.fields.validity_bitmap |= kTickAggressorValidV1;
         }
-        set_phase_from_history();
     } else if (decoded.raw_type == "S") {
         decoded.fields.action = TickActionV1::kStatus;
         decoded.fields.price.valid = false;
@@ -1385,34 +1370,51 @@ MarketDecodeErrorV1 DecodeShanghaiTick(
         } else {
             decoded.fields.validity_bitmap |= kTickPhaseValidV1;
         }
-        if (decoded.fields.phase != TradingPhaseV1::kUnknown &&
-            decoded.common.security_id_valid &&
-            decoded.raw_tick_flag_valid) {
-            const auto existing = phases->find(decoded.common.security_id);
-            if (existing != phases->end()) {
-                existing->second = decoded.fields.phase;
-            } else {
-                if (phases->size() >=
-                    config.limits.maximum_phase_products) {
-                    return MarketDecodeErrorV1::
-                        kPhaseProductLimitExceeded;
-                }
-                phases->emplace(
-                    decoded.common.security_id, decoded.fields.phase);
-            }
-        }
     } else {
         decoded.fields.price.valid = false;
         decoded.fields.quantity.valid = false;
         decoded.fields.trade_amount.valid = false;
         decoded.common.quality_flags |=
             QualityBit(QualityFlagV1::kUnknownEnum);
-        set_phase_from_history();
     }
 
     ApplyBodyNotices(view, &decoded.common);
     MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
     *output = std::move(decoded);
+    return MarketDecodeErrorV1::kNone;
+}
+
+MarketDecodeErrorV1 FinalizeShanghaiTickInSourceOrder(
+    const MarketDecoderConfigV1& config,
+    std::map<std::string, TradingPhaseV1>* phases,
+    ShanghaiTickV1* decoded) {
+    if (decoded->fields.action != TickActionV1::kStatus) {
+        if (!decoded->common.security_id_valid) {
+            return MarketDecodeErrorV1::kNone;
+        }
+        const auto found = phases->find(decoded->common.security_id);
+        if (found != phases->end() &&
+            found->second != TradingPhaseV1::kUnknown) {
+            decoded->fields.phase = found->second;
+            decoded->fields.validity_bitmap |= kTickPhaseValidV1;
+        }
+        return MarketDecodeErrorV1::kNone;
+    }
+
+    if (decoded->fields.phase == TradingPhaseV1::kUnknown ||
+        !decoded->common.security_id_valid ||
+        !decoded->raw_tick_flag_valid) {
+        return MarketDecodeErrorV1::kNone;
+    }
+    const auto existing = phases->find(decoded->common.security_id);
+    if (existing != phases->end()) {
+        existing->second = decoded->fields.phase;
+        return MarketDecodeErrorV1::kNone;
+    }
+    if (phases->size() >= config.limits.maximum_phase_products) {
+        return MarketDecodeErrorV1::kPhaseProductLimitExceeded;
+    }
+    phases->emplace(decoded->common.security_id, decoded->fields.phase);
     return MarketDecodeErrorV1::kNone;
 }
 
@@ -1989,6 +1991,96 @@ bool RecognizedCoreMessage(
                reinterpret_cast<const char*>(bytes.data()));
 }
 
+MarketDecodeErrorV1 DecodeMessageV1(
+    const MarketMessageViewV1& input,
+    const MarketDecoderConfigV1& config,
+    bool configuration_valid,
+    std::map<std::string, TradingPhaseV1>* ordered_phases,
+    DecodedMarketEventV1* output) noexcept {
+    if (output == nullptr) {
+        return MarketDecodeErrorV1::kNullOutput;
+    }
+    if (!configuration_valid) {
+        return MarketDecodeErrorV1::kInvalidConfiguration;
+    }
+    if (input.trade_date != config.trade_date ||
+        input.source_stream_id != config.source_stream_id ||
+        input.source_sequence == 0U ||
+        input.message_encoding != static_cast<std::uint8_t>(
+            datayes::mdl::MDLEID_BINARY) ||
+        input.body.size() > config.limits.maximum_body_bytes) {
+        return MarketDecodeErrorV1::kInvalidInput;
+    }
+    if (!RecognizedCoreMessage(input.service_id, input.message_id)) {
+        return MarketDecodeErrorV1::kUnsupportedMessage;
+    }
+    if (input.service_version != kCoreServiceVersion) {
+        return MarketDecodeErrorV1::kUnsupportedServiceVersion;
+    }
+
+    try {
+        if (input.service_id == sh::SHL2MarketData::ServiceID &&
+            input.message_id == sh::SHL2MarketData::MessageID) {
+            ShanghaiSnapshotV1 decoded{};
+            const MarketDecodeErrorV1 error =
+                DecodeShanghaiSnapshot(input, config, &decoded);
+            if (error == MarketDecodeErrorV1::kNone) {
+                *output = DecodedMarketEventV1(std::move(decoded));
+            }
+            return error;
+        }
+        if (input.service_id == sh::NGTSTick::ServiceID &&
+            input.message_id == sh::NGTSTick::MessageID) {
+            ShanghaiTickV1 decoded{};
+            MarketDecodeErrorV1 error =
+                DecodeShanghaiTick(input, config, &decoded);
+            if (error == MarketDecodeErrorV1::kNone &&
+                ordered_phases != nullptr) {
+                error = FinalizeShanghaiTickInSourceOrder(
+                    config, ordered_phases, &decoded);
+            }
+            if (error == MarketDecodeErrorV1::kNone) {
+                *output = DecodedMarketEventV1(std::move(decoded));
+            }
+            return error;
+        }
+        if (input.service_id == sz::Snapshot300111_v2::ServiceID &&
+            input.message_id == sz::Snapshot300111_v2::MessageID) {
+            ShenzhenSnapshotV1 decoded{};
+            const MarketDecodeErrorV1 error =
+                DecodeShenzhenSnapshot(input, config, &decoded);
+            if (error == MarketDecodeErrorV1::kNone) {
+                *output = DecodedMarketEventV1(std::move(decoded));
+            }
+            return error;
+        }
+        if (input.service_id == sz::Order300192_v2::ServiceID &&
+            input.message_id == sz::Order300192_v2::MessageID) {
+            ShenzhenOrderV1 decoded{};
+            const MarketDecodeErrorV1 error =
+                DecodeShenzhenOrder(input, config, &decoded);
+            if (error == MarketDecodeErrorV1::kNone) {
+                *output = DecodedMarketEventV1(std::move(decoded));
+            }
+            return error;
+        }
+        ShenzhenTransactionV1 decoded{};
+        const MarketDecodeErrorV1 error =
+            DecodeShenzhenTransaction(input, config, &decoded);
+        if (error == MarketDecodeErrorV1::kNone) {
+            *output = DecodedMarketEventV1(std::move(decoded));
+        }
+        return error;
+    } catch (const std::bad_alloc&) {
+        return MarketDecodeErrorV1::kResourceExhausted;
+    } catch (...) {
+        // Do not misclassify an invariant/programming exception as memory
+        // pressure.  The API is noexcept, but the typed reason remains
+        // explicit so the owning source can fail-stop and diagnose it.
+        return MarketDecodeErrorV1::kUnexpectedFailure;
+    }
+}
+
 }  // namespace
 
 MarketDecodeErrorV1 ExtractExactInstrumentKeyV2(
@@ -2137,81 +2229,41 @@ MarketDecoderV1::MarketDecoderV1(
 MarketDecodeErrorV1 MarketDecoderV1::Decode(
     const MarketMessageViewV1& input,
     DecodedMarketEventV1* output) noexcept {
-    if (output == nullptr) {
+    return DecodeMessageV1(
+        input, config_, configuration_valid_, &sh_phases_, output);
+}
+
+MarketDecodeErrorV1 MarketDecoderV1::DecodeStateless(
+    const MarketMessageViewV1& input,
+    DecodedMarketEventV1* output) const noexcept {
+    return DecodeMessageV1(
+        input, config_, configuration_valid_, nullptr, output);
+}
+
+MarketDecodeErrorV1 MarketDecoderV1::FinalizeInSourceOrder(
+    DecodedMarketEventV1* event) noexcept {
+    if (event == nullptr) {
         return MarketDecodeErrorV1::kNullOutput;
     }
     if (!configuration_valid_) {
         return MarketDecodeErrorV1::kInvalidConfiguration;
     }
-    if (input.trade_date != config_.trade_date ||
-        input.source_stream_id != config_.source_stream_id ||
-        input.source_sequence == 0U ||
-        input.message_encoding != static_cast<std::uint8_t>(
-            datayes::mdl::MDLEID_BINARY) ||
-        input.body.size() > config_.limits.maximum_body_bytes) {
+    ShanghaiTickV1* const tick = std::get_if<ShanghaiTickV1>(event);
+    if (tick == nullptr) {
+        return MarketDecodeErrorV1::kNone;
+    }
+    const DecodedMarketCommonV1& common = tick->common;
+    if (common.origin.trade_date != config_.trade_date ||
+        common.origin.source_stream_id != config_.source_stream_id ||
+        common.origin.source_sequence == 0U) {
         return MarketDecodeErrorV1::kInvalidInput;
     }
-    if (!RecognizedCoreMessage(input.service_id, input.message_id)) {
-        return MarketDecodeErrorV1::kUnsupportedMessage;
-    }
-    if (input.service_version != kCoreServiceVersion) {
-        return MarketDecodeErrorV1::kUnsupportedServiceVersion;
-    }
-
     try {
-        if (input.service_id == sh::SHL2MarketData::ServiceID &&
-            input.message_id == sh::SHL2MarketData::MessageID) {
-            ShanghaiSnapshotV1 decoded{};
-            const MarketDecodeErrorV1 error =
-                DecodeShanghaiSnapshot(input, config_, &decoded);
-            if (error == MarketDecodeErrorV1::kNone) {
-                *output = DecodedMarketEventV1(std::move(decoded));
-            }
-            return error;
-        }
-        if (input.service_id == sh::NGTSTick::ServiceID &&
-            input.message_id == sh::NGTSTick::MessageID) {
-            ShanghaiTickV1 decoded{};
-            const MarketDecodeErrorV1 error = DecodeShanghaiTick(
-                input, config_, &sh_phases_, &decoded);
-            if (error == MarketDecodeErrorV1::kNone) {
-                *output = DecodedMarketEventV1(std::move(decoded));
-            }
-            return error;
-        }
-        if (input.service_id == sz::Snapshot300111_v2::ServiceID &&
-            input.message_id == sz::Snapshot300111_v2::MessageID) {
-            ShenzhenSnapshotV1 decoded{};
-            const MarketDecodeErrorV1 error =
-                DecodeShenzhenSnapshot(input, config_, &decoded);
-            if (error == MarketDecodeErrorV1::kNone) {
-                *output = DecodedMarketEventV1(std::move(decoded));
-            }
-            return error;
-        }
-        if (input.service_id == sz::Order300192_v2::ServiceID &&
-            input.message_id == sz::Order300192_v2::MessageID) {
-            ShenzhenOrderV1 decoded{};
-            const MarketDecodeErrorV1 error =
-                DecodeShenzhenOrder(input, config_, &decoded);
-            if (error == MarketDecodeErrorV1::kNone) {
-                *output = DecodedMarketEventV1(std::move(decoded));
-            }
-            return error;
-        }
-        ShenzhenTransactionV1 decoded{};
-        const MarketDecodeErrorV1 error =
-            DecodeShenzhenTransaction(input, config_, &decoded);
-        if (error == MarketDecodeErrorV1::kNone) {
-            *output = DecodedMarketEventV1(std::move(decoded));
-        }
-        return error;
+        return FinalizeShanghaiTickInSourceOrder(
+            config_, &sh_phases_, tick);
     } catch (const std::bad_alloc&) {
         return MarketDecodeErrorV1::kResourceExhausted;
     } catch (...) {
-        // Do not misclassify an invariant/programming exception as memory
-        // pressure.  The API is noexcept, but the typed reason remains
-        // explicit so the owning source can fail-stop and diagnose it.
         return MarketDecodeErrorV1::kUnexpectedFailure;
     }
 }

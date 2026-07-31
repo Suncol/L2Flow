@@ -375,6 +375,9 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_native_sequence_recovery
         tests/test_native_sequence_recovery_v1.cpp
         L2Flow::realtime_ingress)
+    l2flow_add_test(test_owned_ingress_message_pool
+        tests/test_owned_ingress_message_pool_v1.cpp
+        L2Flow::realtime_ingress)
     l2flow_add_test(test_closeable_publication_gate
         tests/test_closeable_publication_gate.cpp Threads::Threads)
     l2flow_add_test(test_realtime_history

@@ -72,9 +72,11 @@ struct MarketDecoderConfigV1 final {
 };
 
 // Stateful only for the documented SH 4.24 product-phase attribution.  One
-// decoder instance represents exactly one trade-date/source session and is a
-// single-writer object.  The caller must invoke Decode in authoritative,
-// strictly increasing owned-ingress source_sequence order; this object
+// decoder instance represents exactly one trade-date/source session.
+// DecodeStateless may be called concurrently on the same instance because it
+// neither reads nor writes the phase map.  FinalizeInSourceOrder and Decode
+// are single-writer operations: the caller must invoke them in authoritative,
+// strictly increasing owned-ingress source_sequence order.  This object
 // neither reorders nor validates sequence monotonicity on its own. Decoded
 // events own every published string/array and never retain
 // MarketMessageViewV1::body.
@@ -94,6 +96,23 @@ public:
     [[nodiscard]] MarketDecodeErrorV1 Decode(
         const MarketMessageViewV1& input,
         DecodedMarketEventV1* output) noexcept;
+
+    // Performs the complete allocation-owning wire parse without consulting
+    // or updating cross-message state.  Multiple workers may call this method
+    // concurrently on one decoder instance.  A non-status Shanghai tick is
+    // deliberately returned without phase-history attribution; callers must
+    // pass each successful result exactly once to FinalizeInSourceOrder before
+    // publication.  As with Decode, failures leave output unchanged.
+    [[nodiscard]] MarketDecodeErrorV1 DecodeStateless(
+        const MarketMessageViewV1& input,
+        DecodedMarketEventV1* output) const noexcept;
+
+    // Applies the documented Shanghai product-phase lookup/update.  Calls for
+    // one source session must be serialized in strictly increasing
+    // source_sequence order.  Other event kinds are passed through unchanged.
+    // Failures leave event and phase state unchanged.
+    [[nodiscard]] MarketDecodeErrorV1 FinalizeInSourceOrder(
+        DecodedMarketEventV1* event) noexcept;
 
     [[nodiscard]] const MarketDecoderConfigV1& config()
         const noexcept {

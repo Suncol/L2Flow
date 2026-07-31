@@ -307,6 +307,11 @@ struct OwnedIngressMessagePoolConfigV1 final {
     // messages use the bounded size-class fallback.
     std::uint32_t prewarm_message_bytes = 0U;
     std::size_t prewarm_message_count = 0U;
+    // Enables the callback-oriented free-cache path. Acquire calls must not
+    // overlap when this is true (they may migrate between threads when an
+    // external mutex provides that serialization). Recycle remains safe from
+    // any number of threads. Keep false for the general multi-acquirer pool.
+    bool serialized_acquire = false;
 };
 
 struct OwnedIngressMessagePoolSnapshotV1 final {
@@ -314,6 +319,7 @@ struct OwnedIngressMessagePoolSnapshotV1 final {
     std::size_t maximum_inflight_messages = 0U;
     std::uint32_t prewarm_message_bytes = 0U;
     std::size_t prewarm_message_count = 0U;
+    bool serialized_acquire = false;
     std::size_t active_messages = 0U;
     std::size_t allocated_blocks = 0U;
     std::size_t cached_blocks = 0U;
@@ -322,9 +328,13 @@ struct OwnedIngressMessagePoolSnapshotV1 final {
 };
 
 // Bounded, thread-safe size-class storage. Acquire is allocation-free after a
-// suitable block has been cached. Destroying the pool stops new acquisition
-// and frees idle blocks; blocks still referenced by handles remain valid and
-// are deleted safely by whichever thread performs their final release.
+// suitable block has been cached. The default configuration supports
+// concurrent acquirers. The explicit serialized-acquire mode instead requires
+// externally non-overlapping Acquire calls and uses an acquirer-private cache;
+// Recycle and Snapshot remain thread-safe. Destroying the pool stops new
+// acquisition and frees idle blocks; blocks still referenced by handles
+// remain valid and are deleted safely by whichever thread performs their
+// final release.
 class OwnedIngressMessagePoolV1 final {
 public:
     OwnedIngressMessagePoolV1(
@@ -344,6 +354,15 @@ public:
         const OwnedIngressMessageInspectionV1& inspection,
         const OwnedIngressMetadataV1& metadata,
         OwnedIngressMessageHandleV1* output) noexcept;
+
+    // Idempotently stops new block reservation and frees idle blocks. Existing
+    // handles remain valid and release their blocks safely. In the default
+    // multi-acquirer mode, an Acquire which reserved an active block before
+    // Retire may finish constructing and return its handle after Retire has
+    // returned; the retained lifetime reference keeps that operation safe.
+    // An Acquire that has not reserved a block observes retirement and returns
+    // kPoolExhausted. Serialized mode closes its acquire gate before returning.
+    void Retire() noexcept;
 
     [[nodiscard]] OwnedIngressMessagePoolSnapshotV1 Snapshot()
         const noexcept;

@@ -3,6 +3,7 @@
 #include "l2flow/ipc/instrument_derived_event_history_v1.h"
 #include "l2flow/ipc/realtime_history_wire_v2.h"
 #include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
+#include "l2flow/ipc/realtime_certified_service_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/ipc/realtime_shm_reader_c_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
@@ -16,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -182,9 +184,20 @@ std::vector<std::byte> PipelineShenzhenSnapshotBody(
     return std::move(writer).Take();
 }
 
+std::vector<std::byte> PipelineShanghaiSnapshotBody(
+    std::string_view security_id = "600001") {
+    PipelineWireWriter writer(248U);
+    writer.StoreU32(0U, 93'000'123U);
+    writer.StoreU32(30U, 12'345U);
+    writer.StoreString(4U, security_id);
+    writer.StoreString(38U, "TRADE");
+    return std::move(writer).Take();
+}
+
 std::vector<std::byte> PipelineShanghaiTickBody(
     std::string_view security_id = "600001",
-    std::uint64_t business_index = 1U) {
+    std::uint64_t business_index = 1U,
+    std::uint64_t quantity = 41U) {
     PipelineWireWriter writer(70U);
     writer.StoreU64(0U, business_index);
     writer.StoreU32(8U, 7U);
@@ -192,11 +205,45 @@ std::vector<std::byte> PipelineShanghaiTickBody(
     writer.StoreU64(28U, 11'001U);
     writer.StoreU64(36U, 22'002U);
     writer.StoreU32(44U, 12'345U);
-    writer.StoreU64(48U, 41U);
-    writer.StoreU64(56U, 506'145U);
+    writer.StoreU64(48U, quantity);
+    writer.StoreU64(56U, 12'345U * quantity);
     writer.StoreString(12U, security_id);
     writer.StoreString(22U, "T");
     writer.StoreString(64U, "B");
+    return std::move(writer).Take();
+}
+
+std::vector<std::byte> PipelineShanghaiAddBody(
+    std::string_view security_id,
+    std::uint64_t business_index,
+    std::uint64_t published_quantity,
+    std::uint64_t matched_quantity) {
+    PipelineWireWriter writer(70U);
+    writer.StoreU64(0U, business_index);
+    writer.StoreU32(8U, 7U);
+    writer.StoreU32(18U, 93'000'125U);
+    writer.StoreU64(28U, 11'001U);
+    writer.StoreU64(36U, 0U);
+    writer.StoreU32(44U, 12'345U);
+    writer.StoreU64(48U, published_quantity);
+    writer.StoreU64(56U, matched_quantity * 1'000U);
+    writer.StoreString(12U, security_id);
+    writer.StoreString(22U, "A");
+    writer.StoreString(64U, "B");
+    return std::move(writer).Take();
+}
+
+std::vector<std::byte> PipelineShanghaiStatusBody(
+    std::string_view security_id,
+    std::uint64_t business_index,
+    std::string_view phase) {
+    PipelineWireWriter writer(70U);
+    writer.StoreU64(0U, business_index);
+    writer.StoreU32(8U, 7U);
+    writer.StoreU32(18U, 93'000'125U);
+    writer.StoreString(12U, security_id);
+    writer.StoreString(22U, "S");
+    writer.StoreString(64U, phase);
     return std::move(writer).Take();
 }
 
@@ -214,6 +261,25 @@ std::vector<std::byte> PipelineShenzhenOrderBody(
     writer.StoreString(12U, "010");
     writer.StoreString(18U, security_id);
     writer.StoreString(24U, "102 ");
+    return std::move(writer).Take();
+}
+
+std::vector<std::byte> PipelineShenzhenTransactionBody(
+    std::string_view security_id = "000001",
+    std::uint64_t application_sequence = 2U,
+    std::uint64_t bid_application_sequence = 1U) {
+    PipelineWireWriter writer(70U);
+    writer.StoreU32(0U, 12U);
+    writer.StoreU64(4U, application_sequence);
+    writer.StoreU64(18U, bid_application_sequence);
+    writer.StoreU64(26U, 0U);
+    writer.StoreU64(46U, 123'456U);
+    writer.StoreU64(54U, 33U);
+    writer.StoreU32(62U, 70U);
+    writer.StoreU32(66U, 93'000'124U);
+    writer.StoreString(12U, "010");
+    writer.StoreString(34U, security_id);
+    writer.StoreString(40U, "102 ");
     return std::move(writer).Take();
 }
 
@@ -290,6 +356,24 @@ public:
                              body_.data()));
     }
     mdl::MDLMessage* _Copy() const override { return nullptr; }
+
+    [[nodiscard]] bool StoreBodyU64(
+        std::size_t offset,
+        std::uint64_t value) noexcept {
+        if (offset > body_.size() ||
+            body_.size() - offset < sizeof(value)) {
+            return false;
+        }
+        for (std::size_t index = 0U;
+             index < sizeof(value);
+             ++index) {
+            body_[offset + index] = static_cast<std::byte>(
+                (value >>
+                 static_cast<unsigned int>(index * 8U)) &
+                0xffU);
+        }
+        return true;
+    }
 
 private:
     mdl::MDLMessageHead head_{};
@@ -2066,6 +2150,61 @@ struct DailyRuntimeFixture final {
         return {};
     }
     return MakeDailyFixture(keys, epoch);
+}
+
+[[nodiscard]] DailyRuntimeFixture MakeHistoryBenchmarkDailyFixture(
+    std::size_t shenzhen_instrument_count,
+    std::size_t shanghai_instrument_count,
+    std::uint64_t epoch) {
+    if (shenzhen_instrument_count > 14'599U ||
+        shanghai_instrument_count == 0U ||
+        shanghai_instrument_count > 99'999U) {
+        return {};
+    }
+    std::vector<market::InstrumentKeyV1> keys;
+    try {
+        keys.reserve(
+            shenzhen_instrument_count + shanghai_instrument_count);
+        for (std::size_t index = 0U;
+             index < shanghai_instrument_count;
+             ++index) {
+            keys.push_back(Key(
+                "",
+                SixDigitSecurityId(
+                    static_cast<std::uint32_t>(600'001U + index))));
+        }
+        for (std::size_t index = 1U;
+             index <= shenzhen_instrument_count;
+             ++index) {
+            const std::string security_id =
+                ShenzhenAShareSecurityId(
+                    static_cast<std::uint32_t>(index));
+            if (security_id.empty()) {
+                return {};
+            }
+            market::InstrumentKeyV1 key{};
+            key.market = market::MarketV1::kShenzhen;
+            key.security_id_source = Bytes("102 ");
+            key.security_id = Bytes(security_id);
+            keys.push_back(std::move(key));
+        }
+    } catch (...) {
+        return {};
+    }
+    return MakeDailyFixture(keys, epoch);
+}
+
+[[nodiscard]] DailyRuntimeFixture MakeThroughputBenchmarkDailyFixture(
+    std::size_t instruments_per_market,
+    std::uint64_t epoch) {
+    if (instruments_per_market == 0U ||
+        instruments_per_market > 14'599U) {
+        return {};
+    }
+    return MakeHistoryBenchmarkDailyFixture(
+        instruments_per_market,
+        instruments_per_market,
+        epoch);
 }
 
 void FillCommon(
@@ -5559,20 +5698,1173 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     return ok;
 }
 
-bool RunHistoryLatencyBenchmark() {
-    constexpr std::size_t kCapacity = 12'000U;
+enum class ThroughputWorkloadV1 : std::uint8_t {
+    kSingleInstrument = 0U,
+    kFiveTupleUniform,
+    kFourSourceBalanced,
+    kHotShenzhenTickSource,
+};
+
+enum class ThroughputSinkV1 : std::uint8_t {
+    kFast = 0U,
+    kFastAndCertified,
+};
+
+struct ThroughputBenchmarkConfigV1 final {
+    std::uint64_t target_rate = 0U;
+    std::chrono::milliseconds duration{0};
+    std::size_t instruments_per_market = 0U;
+    std::uint32_t store_worker_count = 0U;
+    std::uint32_t parallel_decoder_worker_count = 0U;
+    bool parallel_decoder_idle_inline_enabled = true;
+    std::size_t decoder_queue_capacity_per_source = 0U;
+    std::size_t store_queue_capacity_per_source_worker = 0U;
+    std::uint32_t segment_kib = 0U;
+    ThroughputWorkloadV1 workload =
+        ThroughputWorkloadV1::kSingleInstrument;
+    ThroughputSinkV1 sink = ThroughputSinkV1::kFast;
+};
+
+[[nodiscard]] std::string_view ThroughputWorkloadNameV1(
+    ThroughputWorkloadV1 workload) noexcept {
+    switch (workload) {
+        case ThroughputWorkloadV1::kSingleInstrument:
+            return "single_instrument";
+        case ThroughputWorkloadV1::kFiveTupleUniform:
+            return "five_tuple_uniform";
+        case ThroughputWorkloadV1::kFourSourceBalanced:
+            return "four_source_balanced";
+        case ThroughputWorkloadV1::kHotShenzhenTickSource:
+            return "hot_shenzhen_tick_source";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] std::string_view ThroughputSinkNameV1(
+    ThroughputSinkV1 sink) noexcept {
+    switch (sink) {
+        case ThroughputSinkV1::kFast:
+            return "fast";
+        case ThroughputSinkV1::kFastAndCertified:
+            return "fast_certified";
+    }
+    return "unknown";
+}
+
+template <typename Config>
+[[nodiscard]] bool SetParallelDecoderWorkerCountV1(
+    Config* config,
+    std::uint32_t worker_count) noexcept {
+    if (config == nullptr) {
+        return false;
+    }
+    if constexpr (requires(Config& value) {
+                      value.parallel_decoder_worker_count = worker_count;
+                  }) {
+        config->parallel_decoder_worker_count = worker_count;
+        return true;
+    }
+    return worker_count == 0U;
+}
+
+[[nodiscard]] std::size_t
+EffectiveParallelDecoderFarmActivationDepthV1(
+    std::size_t configured,
+    std::size_t queue_capacity) noexcept {
+    if (configured == 0U || queue_capacity == 0U) {
+        return configured;
+    }
+    const std::size_t capacity_limited =
+        queue_capacity -
+        std::max<std::size_t>(1U, queue_capacity / 4U);
+    return std::min(configured, capacity_limited);
+}
+
+struct ThroughputInstrumentMessagesV1 final {
+    std::unique_ptr<FakeSdkMessage> shanghai_snapshot;
+    std::unique_ptr<FakeSdkMessage> shanghai_tick;
+    std::unique_ptr<FakeSdkMessage> shenzhen_snapshot;
+    std::unique_ptr<FakeSdkMessage> shenzhen_order;
+    std::unique_ptr<FakeSdkMessage> shenzhen_transaction;
+    std::uint64_t last_shenzhen_order_sequence = 0U;
+};
+
+[[nodiscard]] bool MakeThroughputMessagesV1(
+    std::size_t instruments_per_market,
+    std::vector<ThroughputInstrumentMessagesV1>* output) {
+    if (output == nullptr || instruments_per_market == 0U) {
+        return false;
+    }
+    output->clear();
+    try {
+        output->reserve(instruments_per_market);
+        for (std::size_t index = 0U;
+             index < instruments_per_market;
+             ++index) {
+            const std::string shanghai_id = SixDigitSecurityId(
+                static_cast<std::uint32_t>(600'001U + index));
+            const std::string shenzhen_id = ShenzhenAShareSecurityId(
+                static_cast<std::uint32_t>(index + 1U));
+            if (shanghai_id.empty() || shenzhen_id.empty()) {
+                output->clear();
+                return false;
+            }
+            ThroughputInstrumentMessagesV1 messages{};
+            messages.shanghai_snapshot =
+                std::make_unique<FakeSdkMessage>(
+                    sdk::kProductionMessageKeysV1[0U],
+                    PipelineShanghaiSnapshotBody(shanghai_id));
+            messages.shanghai_tick =
+                std::make_unique<FakeSdkMessage>(
+                    sdk::kProductionMessageKeysV1[1U],
+                    PipelineShanghaiTickBody(shanghai_id));
+            messages.shenzhen_snapshot =
+                std::make_unique<FakeSdkMessage>(
+                    sdk::kProductionMessageKeysV1[2U],
+                    PipelineShenzhenSnapshotBody(shenzhen_id));
+            messages.shenzhen_order =
+                std::make_unique<FakeSdkMessage>(
+                    sdk::kProductionMessageKeysV1[3U],
+                    PipelineShenzhenOrderBody(shenzhen_id));
+            messages.shenzhen_transaction =
+                std::make_unique<FakeSdkMessage>(
+                    sdk::kProductionMessageKeysV1[4U],
+                    PipelineShenzhenTransactionBody(shenzhen_id));
+            output->push_back(std::move(messages));
+        }
+    } catch (...) {
+        output->clear();
+        return false;
+    }
+    return output->size() == instruments_per_market;
+}
+
+[[nodiscard]] std::size_t ThroughputTupleIndexV1(
+    ThroughputWorkloadV1 workload,
+    std::uint64_t callback_index) noexcept {
+    switch (workload) {
+        case ThroughputWorkloadV1::kSingleInstrument:
+            return 2U;
+        case ThroughputWorkloadV1::kFiveTupleUniform:
+            return static_cast<std::size_t>(callback_index % 5U);
+        case ThroughputWorkloadV1::kFourSourceBalanced: {
+            constexpr std::array<std::size_t, 8U> kCycle{
+                0U, 1U, 2U, 3U, 0U, 1U, 2U, 4U};
+            return kCycle[static_cast<std::size_t>(
+                callback_index % kCycle.size())];
+        }
+        case ThroughputWorkloadV1::kHotShenzhenTickSource:
+            return callback_index % 2U == 0U ? 3U : 4U;
+    }
+    return sdk::kProductionMessageCountV1;
+}
+
+[[nodiscard]] std::size_t ThroughputCycleSizeV1(
+    ThroughputWorkloadV1 workload) noexcept {
+    switch (workload) {
+        case ThroughputWorkloadV1::kSingleInstrument:
+            return 1U;
+        case ThroughputWorkloadV1::kFiveTupleUniform:
+            return 5U;
+        case ThroughputWorkloadV1::kFourSourceBalanced:
+            return 8U;
+        case ThroughputWorkloadV1::kHotShenzhenTickSource:
+            return 2U;
+    }
+    return 1U;
+}
+
+bool RunThroughputProfileBenchmark(
+    const ThroughputBenchmarkConfigV1& benchmark) {
+    constexpr std::uint64_t kTickRingCapacity = 262'144U;
+    constexpr std::uint64_t kCertifiedQueueCapacity = 4'194'304U;
+    constexpr std::uint64_t kMaximumTargetRate = 1'000'000U;
+    constexpr std::uint64_t kMaximumDurationMs = 10'000U;
+    constexpr std::uint64_t kMaximumPlannedCallbacks = 5'000'000U;
+    constexpr std::uint64_t kMaximumAccountedBytes =
+        32ULL * 1024ULL * 1024ULL * 1024ULL;
+    const std::uint64_t duration_ms =
+        static_cast<std::uint64_t>(benchmark.duration.count());
+    if (benchmark.target_rate == 0U ||
+        benchmark.target_rate > kMaximumTargetRate ||
+        duration_ms == 0U || duration_ms > kMaximumDurationMs ||
+        benchmark.instruments_per_market == 0U ||
+        benchmark.instruments_per_market > 14'599U ||
+        benchmark.store_worker_count == 0U ||
+        benchmark.decoder_queue_capacity_per_source < 2U ||
+        benchmark.store_queue_capacity_per_source_worker < 2U ||
+        benchmark.segment_kib < 64U) {
+        std::cerr << "invalid throughput profile arguments\n";
+        return false;
+    }
+    if (benchmark.target_rate >
+        std::numeric_limits<std::uint64_t>::max() / duration_ms) {
+        std::cerr << "throughput callback count overflow\n";
+        return false;
+    }
+    const std::uint64_t planned =
+        benchmark.target_rate * duration_ms / 1'000U;
+    if (planned == 0U || planned > kMaximumPlannedCallbacks) {
+        std::cerr << "throughput profile callback count out of range\n";
+        return false;
+    }
+    if (benchmark.decoder_queue_capacity_per_source >
+        std::numeric_limits<std::uint64_t>::max() - planned) {
+        std::cerr << "throughput retained-record bound overflow\n";
+        return false;
+    }
+    const std::uint64_t segment_bytes =
+        static_cast<std::uint64_t>(benchmark.segment_kib) * 1'024U;
+    if (segment_bytes >
+        std::numeric_limits<std::uint32_t>::max()) {
+        std::cerr << "throughput segment size is not representable\n";
+        return false;
+    }
+
+    std::cout
+        << "THROUGHPUT_ENV target_rps=" << benchmark.target_rate
+        << " duration_ms=" << duration_ms
+        << " planned_callbacks=" << planned
+        << " callback_contract=serialized"
+        << " workload=" << ThroughputWorkloadNameV1(benchmark.workload)
+        << " instruments_per_market="
+        << benchmark.instruments_per_market
+        << " production_tuple_count="
+        << sdk::kProductionMessageCountV1
+        << " parallel_decoder_workers="
+        << benchmark.parallel_decoder_worker_count
+        << " parallel_idle_inline="
+        << (benchmark.parallel_decoder_idle_inline_enabled ? 1 : 0)
+        << " parallel_farm_activation_configured="
+        << runtime::RealtimePipelineConfigV1{}
+               .parallel_decoder_farm_activation_queue_depth
+        << " parallel_farm_activation_effective="
+        << EffectiveParallelDecoderFarmActivationDepthV1(
+               runtime::RealtimePipelineConfigV1{}
+                   .parallel_decoder_farm_activation_queue_depth,
+               benchmark.decoder_queue_capacity_per_source)
+        << " decoder_queue_capacity_per_source="
+        << benchmark.decoder_queue_capacity_per_source
+        << " store_queue_capacity_per_source_worker="
+        << benchmark.store_queue_capacity_per_source_worker
+        << " store_worker_count=" << benchmark.store_worker_count
+        << " store_segment_kib=" << benchmark.segment_kib
+        << " tick_ring_capacity=" << kTickRingCapacity
+        << " sink=" << ThroughputSinkNameV1(benchmark.sink)
+        << " pacing=absolute_deadline_no_batch_wait"
+        << " clock=CLOCK_MONOTONIC"
+        << " affinity=" << CpuAffinityText() << '\n';
+
+    ScopedTempDirectory temporary;
+    DailyRuntimeFixture fixture = MakeThroughputBenchmarkDailyFixture(
+        benchmark.instruments_per_market, 82U);
+    std::vector<ThroughputInstrumentMessagesV1> messages;
+    if (!Expect(
+            temporary.valid() && static_cast<bool>(fixture) &&
+                MakeThroughputMessagesV1(
+                    benchmark.instruments_per_market, &messages),
+            "create throughput profile fixture")) {
+        return false;
+    }
+    const common::Identity128 run_id = RunId(0x82U);
+    const std::filesystem::path socket_path =
+        temporary.path() / "throughput-profile-fast.sock";
+
+    ipc::RealtimeSharedServiceConfigV2 service_config{};
+    service_config.run_id = run_id;
+    service_config.session_epoch = 82U;
+    service_config.trade_date = kTradeDate;
+    service_config.daily_catalog = fixture.catalog;
+    service_config.coverage_from_open = true;
+    service_config.tick_ring_capacity = kTickRingCapacity;
+    service_config.maximum_history_readers = 4U;
+    service_config.maximum_history_page_records = 65'536U;
+    service_config.control_socket_path = socket_path;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    const auto service_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            service_config, &service, &system_error);
+    if (service_error !=
+            ipc::RealtimeSharedServiceCreateErrorV2::kNone ||
+        service == nullptr || system_error != 0) {
+        std::cerr
+            << "throughput profile FAST create error="
+            << static_cast<unsigned int>(service_error)
+            << " system_error=" << system_error << '\n';
+    }
+    if (!Expect(
+            service_error ==
+                    ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+                service != nullptr && system_error == 0,
+            "create throughput profile FAST service") ||
+        !Expect(
+            service->Start(&system_error) && system_error == 0,
+            "start throughput profile FAST service")) {
+        if (service != nullptr) {
+            service->StopControl();
+        }
+        return false;
+    }
+
+    std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
+        certified_service;
+    if (benchmark.sink == ThroughputSinkV1::kFastAndCertified) {
+        ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
+        certified_config.run_id = run_id;
+        certified_config.session_epoch = 82U;
+        certified_config.trade_date = kTradeDate;
+        certified_config.daily_catalog = fixture.catalog;
+        certified_config.fast_sink = service;
+        certified_config.certified_tick_ring_capacity =
+            kTickRingCapacity;
+        certified_config.handoff_queue_capacity =
+            kCertifiedQueueCapacity;
+        certified_config.maximum_mapping_bytes =
+            2ULL * 1024ULL * 1024ULL * 1024ULL;
+        if (planned >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max() / 4U)) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        certified_config.maximum_order_states =
+            static_cast<std::size_t>(planned);
+        certified_config.maximum_derived_events =
+            static_cast<std::size_t>(planned * 4U);
+        certified_config.control_socket_path =
+            temporary.path() / "throughput-profile-certified.sock";
+        const auto certified_error =
+            ipc::RealtimeCertifiedMarketServiceV1::Create(
+                std::move(certified_config),
+                &certified_service,
+                &system_error);
+        if (!Expect(
+                certified_error ==
+                        ipc::RealtimeCertifiedServiceCreateErrorV1::
+                            kNone &&
+                    certified_service != nullptr &&
+                    certified_service->Start(&system_error),
+                "create/start throughput CERTIFIED service")) {
+            if (certified_service != nullptr) {
+                certified_service->StopControl();
+            }
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
+
+    auto sdk_state = std::make_shared<LatencySdkState>();
+    auto sdk_factory =
+        std::make_shared<LatencySdkFactory>(sdk_state);
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    PipelineCleanup pipeline_cleanup(&pipeline);
+    runtime::RealtimePipelineConfigV1 pipeline_config{};
+    pipeline_config.run_id = run_id;
+    pipeline_config.trade_date = kTradeDate;
+    pipeline_config.daily_catalog = fixture.catalog;
+    pipeline_config.runtime_state = fixture.runtime_state.get();
+    pipeline_config.source_stream_ids = kSourceStreamIds;
+    pipeline_config.maximum_sdk_message_bytes = 4'096U;
+    pipeline_config.decoder_queue_capacity_per_source =
+        benchmark.decoder_queue_capacity_per_source;
+    pipeline_config.tick_ring_capacity = kTickRingCapacity;
+    pipeline_config.store_worker_count =
+        benchmark.store_worker_count;
+    pipeline_config.store_queue_capacity_per_source_worker =
+        benchmark.store_queue_capacity_per_source_worker;
+    pipeline_config.intraday_store.segment_target_bytes =
+        static_cast<std::uint32_t>(segment_bytes);
+    pipeline_config.intraday_store.maximum_session_records =
+        planned + benchmark.decoder_queue_capacity_per_source;
+    pipeline_config.intraday_store.maximum_session_accounted_bytes =
+        kMaximumAccountedBytes;
+    pipeline_config.intraday_store.maximum_records_per_batch =
+        65'536U;
+    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.applied_record_sink =
+        certified_service != nullptr
+            ? std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  certified_service)
+            : std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(service);
+    if (certified_service != nullptr) {
+        pipeline_config.native_sequence_observation_sink =
+            certified_service;
+    }
+    pipeline_config.processing_progress_sink = service;
+    pipeline_config.store_generation_sink = service;
+    pipeline_config.sdk.enabled = true;
+    pipeline_config.sdk.server_address = "throughput.invalid";
+    pipeline_config.sdk.user_name = "throughput";
+    pipeline_config.parallel_decoder_idle_inline_enabled =
+        benchmark.parallel_decoder_idle_inline_enabled;
+    if (!SetParallelDecoderWorkerCountV1(
+            &pipeline_config,
+            benchmark.parallel_decoder_worker_count)) {
+        std::cerr
+            << "parallel decoder worker configuration is unavailable\n";
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    std::string pipeline_detail;
+    const auto pipeline_error =
+        runtime::RealtimePipelineV1::CreateForTest(
+            pipeline_config,
+            sdk_factory,
+            &pipeline,
+            &pipeline_detail);
+    if (!Expect(
+            pipeline_error ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "create throughput profile Pipeline: " + pipeline_detail)) {
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    mdl::MessageHandlerBase* const handler = sdk_state->handler();
+    if (!Expect(
+            handler != nullptr,
+            "throughput profile SDK callback installed")) {
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    std::array<std::uint64_t, 5U> offered_by_tuple{};
+    std::array<std::uint64_t, 4U> backlog_at_quarter{};
+    std::uint64_t shanghai_business_sequence = 0U;
+    std::uint64_t shenzhen_native_sequence = 0U;
+    const std::size_t cycle_size =
+        ThroughputCycleSizeV1(benchmark.workload);
+    const std::uint64_t start_ns = MonotonicNowNs();
+    if (!Expect(start_ns != 0U, "start throughput profile clock")) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    std::uint64_t invoked = 0U;
+    bool message_patch_failed = false;
+    bool fatal_during_offer = false;
+    std::vector<bool> covered_store_workers(
+        benchmark.store_worker_count, false);
+    for (std::size_t instrument = 0U;
+         instrument < benchmark.instruments_per_market;
+         ++instrument) {
+        if (benchmark.workload !=
+            ThroughputWorkloadV1::kHotShenzhenTickSource) {
+            covered_store_workers[
+                instrument % benchmark.store_worker_count] = true;
+        }
+        if (benchmark.workload !=
+            ThroughputWorkloadV1::kSingleInstrument) {
+            covered_store_workers[
+                (benchmark.instruments_per_market + instrument) %
+                benchmark.store_worker_count] = true;
+        }
+    }
+    if (benchmark.workload ==
+        ThroughputWorkloadV1::kSingleInstrument) {
+        covered_store_workers[
+            benchmark.instruments_per_market %
+            benchmark.store_worker_count] = true;
+    }
+    const std::size_t covered_store_worker_count =
+        static_cast<std::size_t>(std::count(
+            covered_store_workers.begin(),
+            covered_store_workers.end(),
+            true));
+    std::size_t next_quarter = 0U;
+    for (std::uint64_t index = 0U; index < planned; ++index) {
+        const std::size_t tuple =
+            ThroughputTupleIndexV1(benchmark.workload, index);
+        const std::size_t instrument_index =
+            benchmark.workload ==
+                    ThroughputWorkloadV1::kSingleInstrument
+                ? 0U
+                : static_cast<std::size_t>(
+                      (index / cycle_size) % messages.size());
+        ThroughputInstrumentMessagesV1& instrument =
+            messages[instrument_index];
+        FakeSdkMessage* message = nullptr;
+        if (tuple == 0U) {
+            message = instrument.shanghai_snapshot.get();
+        } else if (tuple == 1U) {
+            ++shanghai_business_sequence;
+            message = instrument.shanghai_tick.get();
+            message_patch_failed =
+                !message->StoreBodyU64(
+                    0U, shanghai_business_sequence) ||
+                !message->StoreBodyU64(
+                    28U,
+                    shanghai_business_sequence * 2U) ||
+                !message->StoreBodyU64(
+                    36U,
+                    shanghai_business_sequence * 2U + 1U);
+        } else if (tuple == 2U) {
+            message = instrument.shenzhen_snapshot.get();
+        } else if (tuple == 3U) {
+            ++shenzhen_native_sequence;
+            message = instrument.shenzhen_order.get();
+            instrument.last_shenzhen_order_sequence =
+                shenzhen_native_sequence;
+            message_patch_failed = !message->StoreBodyU64(
+                4U, shenzhen_native_sequence);
+        } else if (tuple == 4U) {
+            ++shenzhen_native_sequence;
+            message = instrument.shenzhen_transaction.get();
+            const std::uint64_t bid_sequence =
+                instrument.last_shenzhen_order_sequence == 0U
+                    ? shenzhen_native_sequence - 1U
+                    : instrument.last_shenzhen_order_sequence;
+            message_patch_failed =
+                !message->StoreBodyU64(
+                    4U, shenzhen_native_sequence) ||
+                !message->StoreBodyU64(18U, bid_sequence);
+        } else {
+            message_patch_failed = true;
+        }
+        if (message == nullptr || message_patch_failed) {
+            break;
+        }
+
+        const std::uint64_t deadline_ns =
+            start_ns + index * 1'000'000'000ULL /
+                           benchmark.target_rate;
+        for (;;) {
+            const std::uint64_t now_ns = MonotonicNowNs();
+            if (now_ns == 0U || now_ns >= deadline_ns) {
+                break;
+            }
+            const std::uint64_t remaining_ns = deadline_ns - now_ns;
+            if (remaining_ns > 100'000U) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(
+                    remaining_ns - 50'000U));
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        handler->OnMessage(nullptr, message);
+        ++invoked;
+        ++offered_by_tuple[tuple];
+        while (next_quarter < backlog_at_quarter.size() &&
+               invoked * 4U >=
+                   planned *
+                       static_cast<std::uint64_t>(next_quarter + 1U)) {
+            const auto sample = pipeline->Snapshot();
+            backlog_at_quarter[next_quarter] =
+                sample.accepted_messages >=
+                        sample.processing_progress.applied_sequence
+                    ? sample.accepted_messages -
+                          sample.processing_progress.applied_sequence
+                    : 0U;
+            ++next_quarter;
+        }
+        if ((invoked & 255U) == 0U && pipeline->fatal()) {
+            fatal_during_offer = true;
+            break;
+        }
+    }
+    fatal_during_offer = fatal_during_offer || pipeline->fatal();
+    const std::uint64_t offer_complete_ns = MonotonicNowNs();
+    const runtime::RealtimePipelineSnapshotV1 before_drain =
+        pipeline->Snapshot();
+    const std::uint64_t applied_before_drain =
+        before_drain.processing_progress.applied_sequence;
+    const std::uint64_t backlog_before_drain =
+        before_drain.accepted_messages >= applied_before_drain
+            ? before_drain.accepted_messages - applied_before_drain
+            : 0U;
+    if (certified_service != nullptr) {
+        certified_service->MarkDraining();
+    }
+    const std::uint64_t drain_start_ns = MonotonicNowNs();
+    pipeline->StopAndDrain();
+    const std::uint64_t drain_complete_ns = MonotonicNowNs();
+    const runtime::RealtimePipelineSnapshotV1 final =
+        pipeline->Snapshot();
+
+    bool certified_idle = true;
+    ipc::RealtimeCertifiedServiceSnapshotV1 certified_snapshot{};
+    if (certified_service != nullptr) {
+        certified_idle = certified_service->WaitUntilIdleForTest(
+            std::chrono::seconds(60));
+        certified_service->MarkStoppedClean();
+        certified_snapshot = certified_service->Snapshot();
+    }
+
+    std::size_t decoder_depth_before_drain = 0U;
+    std::size_t decoder_high_water_max = 0U;
+    std::uint64_t decoder_full_count = 0U;
+    for (const auto& queue : final.decoder_queues) {
+        decoder_high_water_max = std::max(
+            decoder_high_water_max, queue.message_high_water);
+        decoder_full_count += queue.full_count;
+    }
+    for (const auto& queue : before_drain.decoder_queues) {
+        decoder_depth_before_drain += queue.message_depth;
+    }
+    std::uint64_t parallel_parsed = 0U;
+    std::uint64_t parallel_parse_failures = 0U;
+    std::size_t parallel_issue_high_water_max = 0U;
+    std::size_t parallel_active_worker_count = 0U;
+    std::ostringstream parallel_worker_parsed_csv;
+    for (std::size_t index = 0U;
+         index < final.parallel_decoder.worker_count;
+         ++index) {
+        const auto& worker = final.parallel_decoder.workers[index];
+        if (index != 0U) {
+            parallel_worker_parsed_csv << ',';
+        }
+        parallel_worker_parsed_csv << worker.parsed_messages;
+        if (worker.parsed_messages != 0U) {
+            ++parallel_active_worker_count;
+        }
+        parallel_parsed += worker.parsed_messages;
+        parallel_parse_failures += worker.parse_failures;
+        parallel_issue_high_water_max = std::max(
+            parallel_issue_high_water_max,
+            worker.issue_high_water);
+    }
+    std::uint64_t parallel_dispatched = 0U;
+    std::uint64_t parallel_inline = 0U;
+    std::uint64_t parallel_farm = 0U;
+    std::uint64_t parallel_completed = 0U;
+    std::uint64_t parallel_committed = 0U;
+    std::uint64_t parallel_history_batch_calls = 0U;
+    std::uint64_t parallel_history_batched_messages = 0U;
+    std::size_t parallel_history_batch_max = 0U;
+    std::uint64_t parallel_discarded = 0U;
+    std::size_t parallel_farm_outstanding = 0U;
+    std::uint64_t parallel_committed_before_drain = 0U;
+    std::uint64_t parallel_publish_failures = 0U;
+    std::uint64_t parallel_lease_waits = 0U;
+    std::uint64_t parallel_reorder_wait_max_ns = 0U;
+    std::size_t parallel_completion_high_water_max = 0U;
+    for (const auto& source : final.parallel_decoder.sources) {
+        parallel_dispatched += source.dispatched_messages;
+        parallel_inline += source.inline_messages;
+        parallel_farm += source.farm_messages;
+        parallel_completed += source.completed_messages;
+        parallel_committed += source.committed_messages;
+        parallel_history_batch_calls += source.history_batch_calls;
+        parallel_history_batched_messages +=
+            source.history_batched_messages;
+        parallel_history_batch_max = std::max(
+            parallel_history_batch_max,
+            source.history_batch_max);
+        parallel_discarded += source.discarded_messages;
+        parallel_farm_outstanding += source.farm_outstanding;
+        parallel_publish_failures +=
+            source.completion_publish_failures;
+        parallel_lease_waits += source.lease_wait_count;
+        parallel_reorder_wait_max_ns = std::max(
+            parallel_reorder_wait_max_ns,
+            source.reorder_wait_max_ns);
+        parallel_completion_high_water_max = std::max(
+            parallel_completion_high_water_max,
+            source.completion_high_water);
+    }
+    for (const auto& source :
+         before_drain.parallel_decoder.sources) {
+        parallel_committed_before_drain +=
+            source.committed_messages;
+    }
+
+    const std::uint64_t producer_elapsed_ns =
+        offer_complete_ns >= start_ns
+            ? offer_complete_ns - start_ns
+            : 0U;
+    const std::uint64_t drain_elapsed_ns =
+        drain_complete_ns >= drain_start_ns
+            ? drain_complete_ns - drain_start_ns
+            : 0U;
+    const double achieved_offered_rps =
+        producer_elapsed_ns == 0U
+            ? 0.0
+            : static_cast<double>(invoked) * 1'000'000'000.0 /
+                  static_cast<double>(producer_elapsed_ns);
+    const bool certified_healthy =
+        certified_service == nullptr ||
+        (certified_idle &&
+         !certified_snapshot.globally_frozen_resource &&
+         certified_snapshot.frozen_channel_count == 0U &&
+         certified_snapshot.dropped_handoffs == 0U &&
+         certified_snapshot.processed_handoffs ==
+             certified_snapshot.enqueued_observations +
+                 certified_snapshot.enqueued_applied_records);
+    const bool complete_prefix =
+        !final.fatal && final.accepted_messages == planned &&
+        final.decoded_messages == planned &&
+        final.processing_progress.applied_sequence == planned &&
+        final.store.appended_records == planned &&
+        final.store.failed_appends == 0U && !service->failed() &&
+        certified_healthy &&
+        ((benchmark.parallel_decoder_worker_count == 0U &&
+          !final.parallel_decoder.enabled) ||
+         (final.parallel_decoder.enabled &&
+          final.parallel_decoder.worker_count ==
+              benchmark.parallel_decoder_worker_count &&
+          parallel_dispatched == planned &&
+          parallel_inline + parallel_farm ==
+              parallel_dispatched &&
+          parallel_parsed == parallel_farm &&
+          parallel_completed == planned &&
+          parallel_committed == planned &&
+          parallel_discarded == 0U &&
+          parallel_farm_outstanding == 0U &&
+          parallel_parse_failures == 0U &&
+          parallel_publish_failures == 0U));
+    const std::uint64_t steady_state_backlog_budget = std::max(
+        std::uint64_t{1'024U},
+        (benchmark.target_rate + 999U) / 1'000U);
+    const bool steady_state_met =
+        backlog_before_drain <= steady_state_backlog_budget &&
+        backlog_at_quarter[3U] <=
+            backlog_at_quarter[1U] + steady_state_backlog_budget;
+    const bool target_met =
+        invoked == planned && complete_prefix &&
+        achieved_offered_rps >=
+            static_cast<double>(benchmark.target_rate) * 0.98 &&
+        decoder_full_count == 0U && !message_patch_failed &&
+        steady_state_met;
+    bool stopped_clean = false;
+    service->MarkDraining();
+    if (complete_prefix) {
+        stopped_clean = service->MarkStoppedClean(
+            final.tick_stream_sequence);
+    } else {
+        service->MarkFailed();
+    }
+    if (certified_service != nullptr) {
+        certified_service->StopControl();
+    }
+    service->StopControl();
+
+    std::ostringstream achieved_text;
+    achieved_text << std::fixed << std::setprecision(3)
+                  << achieved_offered_rps;
+    std::cout
+        << "THROUGHPUT_RESULT target_rps=" << benchmark.target_rate
+        << " duration_ms=" << duration_ms
+        << " workload=" << ThroughputWorkloadNameV1(benchmark.workload)
+        << " sink=" << ThroughputSinkNameV1(benchmark.sink)
+        << " instruments_per_market="
+        << benchmark.instruments_per_market
+        << " parallel_decoder_workers="
+        << benchmark.parallel_decoder_worker_count
+        << " parallel_idle_inline="
+        << (final.parallel_decoder.idle_inline_enabled ? 1 : 0)
+        << " store_worker_count=" << benchmark.store_worker_count
+        << " covered_store_worker_count="
+        << covered_store_worker_count
+        << " planned_callbacks=" << planned
+        << " invoked_callbacks=" << invoked
+        << " producer_elapsed_ns=" << producer_elapsed_ns
+        << " achieved_offered_rps=" << achieved_text.str()
+        << " target_met=" << (target_met ? 1 : 0)
+        << " process_survived=1"
+        << " fatal_during_offer=" << (fatal_during_offer ? 1 : 0)
+        << " fatal_final=" << (final.fatal ? 1 : 0)
+        << " message_patch_failed="
+        << (message_patch_failed ? 1 : 0)
+        << " accepting_before_drain="
+        << (before_drain.accepting ? 1 : 0)
+        << " accepted=" << final.accepted_messages
+        << " rejected=" << final.rejected_messages
+        << " post_cut=" << final.post_cut_messages
+        << " decoded=" << final.decoded_messages
+        << " decoded_before_drain="
+        << before_drain.decoded_messages
+        << " applied_before_drain=" << applied_before_drain
+        << " backlog_before_drain=" << backlog_before_drain
+        << " steady_state_backlog_budget="
+        << steady_state_backlog_budget
+        << " steady_state_met=" << (steady_state_met ? 1 : 0)
+        << " applied="
+        << final.processing_progress.applied_sequence
+        << " store_appended=" << final.store.appended_records
+        << " store_appended_before_drain="
+        << before_drain.store.appended_records
+        << " store_failed_appends=" << final.store.failed_appends
+        << " decoder_depth_before_drain="
+        << decoder_depth_before_drain
+        << " decoder_high_water_max="
+        << decoder_high_water_max
+        << " decoder_full_count=" << decoder_full_count
+        << " parallel_enabled="
+        << (final.parallel_decoder.enabled ? 1 : 0)
+        << " parallel_parsed=" << parallel_parsed
+        << " parallel_worker_parsed_csv="
+        << parallel_worker_parsed_csv.str()
+        << " parallel_active_worker_count="
+        << parallel_active_worker_count
+        << " parallel_slots_per_source_worker="
+        << final.parallel_decoder.slots_per_source_worker
+        << " parallel_issue_capacity_per_worker="
+        << market::kRealtimeHistorySourceCountV1 *
+               final.parallel_decoder.slots_per_source_worker
+        << " parallel_completion_capacity_per_source="
+        << static_cast<std::size_t>(
+               final.parallel_decoder.worker_count) *
+               final.parallel_decoder.slots_per_source_worker
+        << " parallel_parse_failures="
+        << parallel_parse_failures
+        << " parallel_dispatched=" << parallel_dispatched
+        << " parallel_inline=" << parallel_inline
+        << " parallel_farm=" << parallel_farm
+        << " parallel_completed=" << parallel_completed
+        << " parallel_committed=" << parallel_committed
+        << " parallel_history_batch_calls="
+        << parallel_history_batch_calls
+        << " parallel_history_batched_messages="
+        << parallel_history_batched_messages
+        << " parallel_history_batch_max="
+        << parallel_history_batch_max
+        << " parallel_committed_before_drain="
+        << parallel_committed_before_drain
+        << " parallel_discarded=" << parallel_discarded
+        << " parallel_farm_outstanding="
+        << parallel_farm_outstanding
+        << " parallel_completion_publish_failures="
+        << parallel_publish_failures
+        << " parallel_issue_high_water_max="
+        << parallel_issue_high_water_max
+        << " parallel_completion_high_water_max="
+        << parallel_completion_high_water_max
+        << " parallel_lease_waits=" << parallel_lease_waits
+        << " parallel_reorder_wait_max_ns="
+        << parallel_reorder_wait_max_ns
+        << " backlog_q25=" << backlog_at_quarter[0U]
+        << " backlog_q50=" << backlog_at_quarter[1U]
+        << " backlog_q75=" << backlog_at_quarter[2U]
+        << " backlog_q100=" << backlog_at_quarter[3U]
+        << " tuple0_offered=" << offered_by_tuple[0U]
+        << " tuple1_offered=" << offered_by_tuple[1U]
+        << " tuple2_offered=" << offered_by_tuple[2U]
+        << " tuple3_offered=" << offered_by_tuple[3U]
+        << " tuple4_offered=" << offered_by_tuple[4U]
+        << " last_decode_error="
+        << static_cast<unsigned int>(final.last_decode_error)
+        << " service_failed=" << (service->failed() ? 1 : 0)
+        << " complete_prefix=" << (complete_prefix ? 1 : 0)
+        << " stopped_clean=" << (stopped_clean ? 1 : 0)
+        << " drain_elapsed_ns=" << drain_elapsed_ns
+        << " certified_idle=" << (certified_idle ? 1 : 0)
+        << " certified_healthy=" << (certified_healthy ? 1 : 0)
+        << " certified_enqueued_observations="
+        << certified_snapshot.enqueued_observations
+        << " certified_enqueued_applied="
+        << certified_snapshot.enqueued_applied_records
+        << " certified_processed="
+        << certified_snapshot.processed_handoffs
+        << " certified_dropped="
+        << certified_snapshot.dropped_handoffs
+        << " certified_frozen_channels="
+        << certified_snapshot.frozen_channel_count
+        << " certified_global_frozen="
+        << (certified_snapshot.globally_frozen_resource ? 1 : 0)
+        << '\n';
+    return true;
+}
+
+bool RunThroughputStabilityBenchmark(
+    std::uint64_t target_rate,
+    std::chrono::milliseconds duration) {
+    constexpr std::size_t kQueueCapacity = 4'096U;
+    constexpr std::uint64_t kTickRingCapacity = 262'144U;
+    constexpr std::uint32_t kStoreWorkerCount = 4U;
+    constexpr std::uint64_t kMaximumTargetRate = 1'000'000U;
+    constexpr std::uint64_t kMaximumDurationMs = 10'000U;
+    const std::uint64_t duration_ms =
+        static_cast<std::uint64_t>(duration.count());
+    if (target_rate == 0U || target_rate > kMaximumTargetRate ||
+        duration_ms == 0U || duration_ms > kMaximumDurationMs) {
+        std::cerr << "invalid throughput benchmark arguments\n";
+        return false;
+    }
+    const std::uint64_t planned =
+        target_rate * duration_ms / 1'000U;
+    if (planned == 0U) {
+        std::cerr << "throughput benchmark plans no callbacks\n";
+        return false;
+    }
+
+    std::cout
+        << "THROUGHPUT_ENV target_rps=" << target_rate
+        << " duration_ms=" << duration_ms
+        << " planned_callbacks=" << planned
+        << " callback_contract=serialized"
+        << " decoder_queue_capacity_per_source=" << kQueueCapacity
+        << " store_queue_capacity_per_source_worker=" << kQueueCapacity
+        << " store_worker_count=" << kStoreWorkerCount
+        << " tick_ring_capacity=" << kTickRingCapacity
+        << " clock=CLOCK_MONOTONIC"
+        << " affinity=" << CpuAffinityText() << '\n';
+
+    ScopedTempDirectory temporary;
+    DailyRuntimeFixture fixture = MakePipelineDailyFixture(81U);
+    if (!Expect(
+            temporary.valid() && static_cast<bool>(fixture),
+            "create throughput fixture")) {
+        return false;
+    }
+    const common::Identity128 run_id = RunId(0x81U);
+    const std::filesystem::path socket_path =
+        temporary.path() / "throughput-stability.sock";
+
+    ipc::RealtimeSharedServiceConfigV2 service_config{};
+    service_config.run_id = run_id;
+    service_config.session_epoch = 81U;
+    service_config.trade_date = kTradeDate;
+    service_config.daily_catalog = fixture.catalog;
+    service_config.coverage_from_open = true;
+    service_config.tick_ring_capacity = kTickRingCapacity;
+    service_config.maximum_history_readers = 4U;
+    service_config.maximum_history_page_records = kQueueCapacity;
+    service_config.control_socket_path = socket_path;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    const auto service_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            service_config, &service, &system_error);
+    if (!Expect(
+            service_error ==
+                    ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+                service != nullptr && system_error == 0,
+            "create throughput Wire V2 service") ||
+        !Expect(
+            service->Start(&system_error) && system_error == 0,
+            "start throughput Wire V2 service")) {
+        if (service != nullptr) {
+            service->StopControl();
+        }
+        return false;
+    }
+
+    auto sdk_state = std::make_shared<LatencySdkState>();
+    auto sdk_factory =
+        std::make_shared<LatencySdkFactory>(sdk_state);
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    PipelineCleanup pipeline_cleanup(&pipeline);
+    runtime::RealtimePipelineConfigV1 pipeline_config{};
+    pipeline_config.run_id = run_id;
+    pipeline_config.trade_date = kTradeDate;
+    pipeline_config.daily_catalog = fixture.catalog;
+    pipeline_config.runtime_state = fixture.runtime_state.get();
+    pipeline_config.source_stream_ids = kSourceStreamIds;
+    pipeline_config.maximum_sdk_message_bytes = 4'096U;
+    pipeline_config.decoder_queue_capacity_per_source =
+        kQueueCapacity;
+    pipeline_config.tick_ring_capacity = kTickRingCapacity;
+    pipeline_config.store_worker_count = kStoreWorkerCount;
+    pipeline_config.store_queue_capacity_per_source_worker =
+        kQueueCapacity;
+    pipeline_config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    pipeline_config.intraday_store.maximum_session_records =
+        planned + kQueueCapacity;
+    pipeline_config.intraday_store.maximum_session_accounted_bytes =
+        4ULL * 1024ULL * 1024ULL * 1024ULL;
+    pipeline_config.intraday_store.maximum_records_per_batch =
+        kQueueCapacity;
+    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.applied_record_sink = service;
+    pipeline_config.processing_progress_sink = service;
+    pipeline_config.store_generation_sink = service;
+    pipeline_config.sdk.enabled = true;
+    pipeline_config.sdk.server_address = "throughput.invalid";
+    pipeline_config.sdk.user_name = "throughput";
+
+    std::string pipeline_detail;
+    const auto pipeline_error =
+        runtime::RealtimePipelineV1::CreateForTest(
+            pipeline_config,
+            sdk_factory,
+            &pipeline,
+            &pipeline_detail);
+    if (!Expect(
+            pipeline_error ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "create throughput Pipeline: " + pipeline_detail)) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    mdl::MessageHandlerBase* const handler = sdk_state->handler();
+    if (!Expect(
+            handler != nullptr,
+            "throughput SDK callback installed")) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    FakeSdkMessage message(
+        sdk::kProductionMessageKeysV1[2U],
+        PipelineShenzhenSnapshotBody());
+    const std::uint64_t start_ns = MonotonicNowNs();
+    if (!Expect(start_ns != 0U, "start throughput clock")) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    std::uint64_t invoked = 0U;
+    bool fatal_during_offer = false;
+    for (std::uint64_t index = 0U; index < planned; ++index) {
+        const std::uint64_t deadline_ns =
+            start_ns + index * 1'000'000'000ULL / target_rate;
+        for (;;) {
+            const std::uint64_t now_ns = MonotonicNowNs();
+            if (now_ns == 0U || now_ns >= deadline_ns) {
+                break;
+            }
+            const std::uint64_t remaining_ns = deadline_ns - now_ns;
+            if (remaining_ns > 100'000U) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(
+                    remaining_ns - 50'000U));
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        handler->OnMessage(nullptr, &message);
+        ++invoked;
+        if ((invoked & 255U) == 0U && pipeline->fatal()) {
+            fatal_during_offer = true;
+            break;
+        }
+    }
+    fatal_during_offer = fatal_during_offer || pipeline->fatal();
+    const std::uint64_t offer_complete_ns = MonotonicNowNs();
+    const runtime::RealtimePipelineSnapshotV1 before_drain =
+        pipeline->Snapshot();
+    const std::uint64_t drain_start_ns = MonotonicNowNs();
+    pipeline->StopAndDrain();
+    const std::uint64_t drain_complete_ns = MonotonicNowNs();
+    const runtime::RealtimePipelineSnapshotV1 final =
+        pipeline->Snapshot();
+
+    std::size_t decoder_depth_before_drain = 0U;
+    std::size_t decoder_high_water_max = 0U;
+    std::uint64_t decoder_full_count = 0U;
+    for (const auto& queue : final.decoder_queues) {
+        decoder_high_water_max = std::max(
+            decoder_high_water_max, queue.message_high_water);
+        decoder_full_count += queue.full_count;
+    }
+    for (const auto& queue : before_drain.decoder_queues) {
+        decoder_depth_before_drain += queue.message_depth;
+    }
+
+    const std::uint64_t producer_elapsed_ns =
+        offer_complete_ns >= start_ns
+            ? offer_complete_ns - start_ns
+            : 0U;
+    const std::uint64_t drain_elapsed_ns =
+        drain_complete_ns >= drain_start_ns
+            ? drain_complete_ns - drain_start_ns
+            : 0U;
+    const double achieved_offered_rps =
+        producer_elapsed_ns == 0U
+            ? 0.0
+            : static_cast<double>(invoked) * 1'000'000'000.0 /
+                  static_cast<double>(producer_elapsed_ns);
+    const bool complete_prefix =
+        !final.fatal && final.accepted_messages == planned &&
+        final.decoded_messages == planned &&
+        final.processing_progress.applied_sequence == planned &&
+        final.store.appended_records == planned &&
+        final.store.failed_appends == 0U && !service->failed();
+    const bool target_met =
+        invoked == planned && complete_prefix &&
+        achieved_offered_rps >=
+            static_cast<double>(target_rate) * 0.98;
+    bool stopped_clean = false;
+    service->MarkDraining();
+    if (complete_prefix) {
+        stopped_clean = service->MarkStoppedClean(
+            final.tick_stream_sequence);
+    } else {
+        service->MarkFailed();
+    }
+    service->StopControl();
+
+    std::ostringstream achieved_text;
+    achieved_text << std::fixed << std::setprecision(3)
+                  << achieved_offered_rps;
+    std::cout
+        << "THROUGHPUT_RESULT target_rps=" << target_rate
+        << " duration_ms=" << duration_ms
+        << " planned_callbacks=" << planned
+        << " invoked_callbacks=" << invoked
+        << " producer_elapsed_ns=" << producer_elapsed_ns
+        << " achieved_offered_rps=" << achieved_text.str()
+        << " target_met=" << (target_met ? 1 : 0)
+        << " process_survived=1"
+        << " fatal_during_offer="
+        << (fatal_during_offer ? 1 : 0)
+        << " fatal_final=" << (final.fatal ? 1 : 0)
+        << " accepting_before_drain="
+        << (before_drain.accepting ? 1 : 0)
+        << " accepted=" << final.accepted_messages
+        << " rejected=" << final.rejected_messages
+        << " post_cut=" << final.post_cut_messages
+        << " decoded=" << final.decoded_messages
+        << " applied="
+        << final.processing_progress.applied_sequence
+        << " store_appended=" << final.store.appended_records
+        << " store_failed_appends=" << final.store.failed_appends
+        << " decoder_depth_before_drain="
+        << decoder_depth_before_drain
+        << " decoder_high_water_max="
+        << decoder_high_water_max
+        << " decoder_full_count=" << decoder_full_count
+        << " last_decode_error="
+        << static_cast<unsigned int>(final.last_decode_error)
+        << " service_failed=" << (service->failed() ? 1 : 0)
+        << " complete_prefix=" << (complete_prefix ? 1 : 0)
+        << " stopped_clean=" << (stopped_clean ? 1 : 0)
+        << " drain_elapsed_ns=" << drain_elapsed_ns << '\n';
+    return true;
+}
+
+bool RunHistoryLatencyBenchmark(
+    std::uint32_t parallel_decoder_worker_count,
+    bool callback_polars_only = false) {
+    constexpr std::size_t kShanghaiInstrumentCount = 3U;
+    constexpr std::size_t kSnapshotFillCount = 11'997U;
+    constexpr std::size_t kCapacity =
+        kSnapshotFillCount + kShanghaiInstrumentCount;
     constexpr std::size_t kBoundInstrumentCount = kCapacity;
-    constexpr std::size_t kSnapshotFillCount =
-        kBoundInstrumentCount - 1U;
     constexpr std::size_t kQueueCapacity = 8'192U;
     constexpr std::size_t kFillBatch = 512U;
     constexpr std::size_t kMaximumSequence = 250'000U;
     constexpr std::uint64_t kTickRingCapacity = 262'144U;
     constexpr std::uint32_t kStoreWorkerCount = 4U;
     // Exact-key sorting assigns the sole Shanghai entry ID 1, followed by
-    // the Shenzhen range. 000001 is therefore the mixed instrument ID 2.
+    // the other Shanghai entries and the Shenzhen range.
     constexpr std::uint32_t kPureTickInstrument = 1U;
-    constexpr std::uint32_t kMixedInstrument = 2U;
+    constexpr std::uint32_t kDerivedInstrument = 2U;
+    constexpr std::uint32_t kRawBatchInstrument = 3U;
+    constexpr std::uint32_t kMixedInstrument = 4U;
+    constexpr std::size_t kRawPolarsRecords = 4'096U;
+    constexpr std::size_t kRawPolarsRepeats = 20U;
     constexpr std::size_t kPriceRepeats = 20U;
     constexpr std::size_t kAllColumnRepeats = 10U;
 
@@ -5585,12 +6877,24 @@ bool RunHistoryLatencyBenchmark() {
         << " requested_page_records=4096"
         << " price_repeats=" << kPriceRepeats
         << " all_column_repeats=" << kAllColumnRepeats
+        << " raw_polars_records=" << kRawPolarsRecords
+        << " raw_polars_repeats=" << kRawPolarsRepeats
+        << " parallel_decoder_workers="
+        << parallel_decoder_worker_count
+        << " parallel_decoder_farm_activation_queue_depth="
+        << runtime::RealtimePipelineConfigV1{}
+               .parallel_decoder_farm_activation_queue_depth
+        << " parallel_decoder_farm_activation_effective_depth="
+        << EffectiveParallelDecoderFarmActivationDepthV1(
+               runtime::RealtimePipelineConfigV1{}
+                   .parallel_decoder_farm_activation_queue_depth,
+               kQueueCapacity)
         << " clock=CLOCK_MONOTONIC"
         << " affinity=" << CpuAffinityText() << '\n';
 
     ScopedTempDirectory temporary;
-    DailyRuntimeFixture fixture = MakeBenchmarkDailyFixture(
-        kSnapshotFillCount, 67U, true);
+    DailyRuntimeFixture fixture = MakeHistoryBenchmarkDailyFixture(
+        kSnapshotFillCount, kShanghaiInstrumentCount, 67U);
     if (!Expect(
             temporary.valid() && static_cast<bool>(fixture),
             "create history latency fixture")) {
@@ -5617,6 +6921,14 @@ bool RunHistoryLatencyBenchmark() {
     const auto service_error =
         ipc::RealtimeSharedMarketServiceV2::Create(
             service_config, &service, &system_error);
+    if (service_error !=
+            ipc::RealtimeSharedServiceCreateErrorV2::kNone ||
+        service == nullptr || system_error != 0) {
+        std::cerr
+            << "history service create error="
+            << static_cast<unsigned int>(service_error)
+            << " system_error=" << system_error << '\n';
+    }
     if (!Expect(
             service_error ==
                     ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
@@ -5666,6 +6978,16 @@ bool RunHistoryLatencyBenchmark() {
     pipeline_config.sdk.enabled = true;
     pipeline_config.sdk.server_address = "history-latency.invalid";
     pipeline_config.sdk.user_name = "history-latency";
+    pipeline_config.parallel_decoder_idle_inline_enabled = true;
+    if (!SetParallelDecoderWorkerCountV1(
+            &pipeline_config,
+            parallel_decoder_worker_count)) {
+        std::cerr
+            << "parallel decoder worker configuration is unavailable\n";
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
 
     std::string pipeline_detail;
     const auto pipeline_error =
@@ -5958,6 +7280,386 @@ bool RunHistoryLatencyBenchmark() {
                 << std::setprecision(3) << records_per_second
                 << std::defaultfloat << '\n';
         };
+
+    auto run_python_lines =
+        [&](const std::string& command,
+            std::string_view sample_prefix,
+            std::size_t sample_count,
+            std::vector<std::string>* samples) {
+            if (samples == nullptr ||
+                !protocol->SendLine(command)) {
+                return false;
+            }
+            samples->clear();
+            samples->reserve(sample_count);
+            std::string response;
+            for (std::size_t index = 0U;
+                 index < sample_count;
+                 ++index) {
+                if (!protocol->ReadLine(
+                        std::chrono::seconds(120), &response) ||
+                    !response.starts_with(sample_prefix)) {
+                    std::cerr << "Python Polars sample: "
+                              << response << '\n';
+                    return false;
+                }
+                std::cout << "PYTHON_" << response << '\n';
+                samples->push_back(response);
+            }
+            if (!protocol->ReadLine(
+                    std::chrono::seconds(120), &response) ||
+                !response.starts_with("DONE ")) {
+                std::cerr << "Python Polars DONE: "
+                          << response << '\n';
+                return false;
+            }
+            std::cout << "PYTHON_" << response << '\n';
+            return true;
+        };
+
+    std::vector<std::string> polars_lines;
+    if (!run_python_lines(
+            "PREPARE_DERIVED_POLARS " +
+                std::to_string(kDerivedInstrument),
+            "DERIVED_POLARS_PREPARED ",
+            1U,
+            &polars_lines)) {
+        return false;
+    }
+    const runtime::RealtimePipelineCutResultV1 polars_baseline_cut =
+        pipeline->CutAndPublishGeneration(std::chrono::seconds(60));
+    if (!Expect(
+            polars_baseline_cut.published() &&
+                polars_baseline_cut.store_generation != nullptr,
+            "publish empty raw-Polars baseline generation")) {
+        return false;
+    }
+    const std::uint64_t polars_baseline_generation =
+        polars_baseline_cut.store_generation->watermark().generation;
+    if (!run_python_lines(
+            "RAW_POLARS_BASELINE " +
+                std::to_string(kRawBatchInstrument) + " " +
+                std::to_string(polars_baseline_generation),
+            "RAW_POLARS_BASELINE ",
+            1U,
+            &polars_lines)) {
+        return false;
+    }
+
+    struct PolarsIngressBoundary final {
+        std::uint64_t first_sequence = 0U;
+        std::uint64_t first_call_start_ns = 0U;
+        std::uint64_t first_call_return_ns = 0U;
+        std::uint64_t last_sequence = 0U;
+        std::uint64_t last_call_start_ns = 0U;
+        std::uint64_t last_call_return_ns = 0U;
+        std::uint64_t first_callback_entry_ns = 0U;
+        std::uint64_t last_callback_entry_ns = 0U;
+    };
+    auto fill_applied_callback_entries =
+        [&](PolarsIngressBoundary* boundary) {
+            if (boundary == nullptr) {
+                return false;
+            }
+            std::uint64_t ignored_begin = 0U;
+            std::uint64_t ignored_return = 0U;
+            return timed_applied->Read(
+                       boundary->first_sequence,
+                       &boundary->first_callback_entry_ns,
+                       &ignored_begin,
+                       &ignored_return) &&
+                   timed_applied->Read(
+                       boundary->last_sequence,
+                       &boundary->last_callback_entry_ns,
+                       &ignored_begin,
+                       &ignored_return);
+        };
+
+    PolarsIngressBoundary raw_polars_boundary{};
+    for (std::size_t index = 0U;
+         index < kRawPolarsRecords;
+         ++index) {
+        FakeSdkMessage message(
+            sdk::kProductionMessageKeysV1[1U],
+            PipelineShanghaiTickBody(
+                "600003",
+                static_cast<std::uint64_t>(index + 1U),
+                1U));
+        const std::uint64_t sequence = next_sequence;
+        const std::uint64_t call_start = MonotonicNowNs();
+        handler->OnMessage(nullptr, &message);
+        const std::uint64_t call_return = MonotonicNowNs();
+        ++next_sequence;
+        if (index == 0U) {
+            raw_polars_boundary.first_sequence = sequence;
+            raw_polars_boundary.first_call_start_ns = call_start;
+            raw_polars_boundary.first_call_return_ns = call_return;
+        }
+        if (index + 1U == kRawPolarsRecords) {
+            raw_polars_boundary.last_sequence = sequence;
+            raw_polars_boundary.last_call_start_ns = call_start;
+            raw_polars_boundary.last_call_return_ns = call_return;
+        }
+    }
+    if (!Expect(
+            wait_prefix(next_sequence - 1U) &&
+                fill_applied_callback_entries(&raw_polars_boundary),
+            "raw Polars batch reaches the applied prefix")) {
+        return false;
+    }
+    const runtime::RealtimePipelineCutResultV1 raw_polars_cut =
+        pipeline->CutAndPublishGeneration(std::chrono::seconds(60));
+    if (!Expect(
+            raw_polars_cut.published() &&
+                raw_polars_cut.store_generation != nullptr,
+            "publish raw Polars batch generation")) {
+        return false;
+    }
+    const std::uint64_t raw_polars_generation =
+        raw_polars_cut.store_generation->watermark().generation;
+    if (!run_python_lines(
+            "RAW_POLARS_UPDATE " +
+                std::to_string(kRawBatchInstrument) + " " +
+                std::to_string(raw_polars_generation) + " " +
+                std::to_string(kRawPolarsRepeats) + " " +
+                std::to_string(kRawPolarsRecords),
+            "RAW_POLARS_SAMPLE ",
+            kRawPolarsRepeats,
+            &polars_lines)) {
+        return false;
+    }
+    std::uint64_t raw_first_entry_ns = 0U;
+    std::uint64_t raw_last_entry_ns = 0U;
+    std::uint64_t raw_polars_ready_ns = 0U;
+    if (!Expect(
+            !polars_lines.empty() &&
+                ParseLineUnsignedField(
+                    polars_lines.front(),
+                    "first_callback_entry_ns",
+                    &raw_first_entry_ns) &&
+                ParseLineUnsignedField(
+                    polars_lines.front(),
+                    "last_callback_entry_ns",
+                    &raw_last_entry_ns) &&
+                ParseLineUnsignedField(
+                    polars_lines.front(),
+                    "polars_ready_ns",
+                    &raw_polars_ready_ns) &&
+                raw_first_entry_ns ==
+                    raw_polars_boundary.first_callback_entry_ns &&
+                raw_last_entry_ns ==
+                    raw_polars_boundary.last_callback_entry_ns &&
+                raw_polars_boundary.first_call_start_ns <=
+                    raw_first_entry_ns &&
+                raw_first_entry_ns <=
+                    raw_polars_boundary.first_call_return_ns &&
+                raw_polars_boundary.last_call_start_ns <=
+                    raw_last_entry_ns &&
+                raw_last_entry_ns <=
+                    raw_polars_boundary.last_call_return_ns &&
+                raw_polars_ready_ns >= raw_last_entry_ns,
+            "raw Polars callback boundaries reconcile")) {
+        return false;
+    }
+    std::cout
+        << "POLARS_BOUNDARY workload=raw_batch_4096_all_columns"
+        << " generation=" << raw_polars_generation
+        << " records=" << kRawPolarsRecords
+        << " columns=55"
+        << " first_caller_before_callback_ns="
+        << raw_polars_boundary.first_call_start_ns
+        << " last_caller_before_callback_ns="
+        << raw_polars_boundary.last_call_start_ns
+        << " first_callback_entry_ns=" << raw_first_entry_ns
+        << " last_callback_entry_ns=" << raw_last_entry_ns
+        << " polars_ready_ns=" << raw_polars_ready_ns
+        << " strict_first_callback_to_polars_ns="
+        << (raw_polars_ready_ns -
+            raw_polars_boundary.first_call_start_ns)
+        << " strict_last_callback_to_polars_ns="
+        << (raw_polars_ready_ns -
+            raw_polars_boundary.last_call_start_ns)
+        << '\n';
+
+    PolarsIngressBoundary derived_boundary{};
+    const std::array<std::vector<std::byte>, 4U> derived_bodies{{
+        PipelineShanghaiStatusBody("600002", 4'096U, "TRADE"),
+        PipelineShanghaiTickBody("600002", 4'097U, 101U),
+        PipelineShanghaiAddBody("600002", 4'098U, 50U, 101U),
+        PipelineShanghaiTickBody("600002", 4'099U, 50U),
+    }};
+    for (std::size_t index = 0U;
+         index < derived_bodies.size();
+         ++index) {
+        FakeSdkMessage message(
+            sdk::kProductionMessageKeysV1[1U],
+            derived_bodies[index]);
+        const std::uint64_t sequence = next_sequence;
+        const std::uint64_t call_start = MonotonicNowNs();
+        handler->OnMessage(nullptr, &message);
+        const std::uint64_t call_return = MonotonicNowNs();
+        ++next_sequence;
+        if (index == 1U) {
+            derived_boundary.first_sequence = sequence;
+            derived_boundary.first_call_start_ns = call_start;
+            derived_boundary.first_call_return_ns = call_return;
+        }
+        if (index + 1U == derived_bodies.size()) {
+            derived_boundary.last_sequence = sequence;
+            derived_boundary.last_call_start_ns = call_start;
+            derived_boundary.last_call_return_ns = call_return;
+        }
+    }
+    if (!Expect(
+            wait_prefix(next_sequence - 1U) &&
+                fill_applied_callback_entries(&derived_boundary),
+            "derived lifecycle reaches the applied prefix")) {
+        return false;
+    }
+    const runtime::RealtimePipelineCutResultV1 derived_polars_cut =
+        pipeline->CutAndPublishGeneration(std::chrono::seconds(60));
+    if (!Expect(
+            derived_polars_cut.published() &&
+                derived_polars_cut.store_generation != nullptr,
+            "publish derived Polars lifecycle generation")) {
+        return false;
+    }
+    const std::uint64_t derived_polars_generation =
+        derived_polars_cut.store_generation->watermark().generation;
+    if (!run_python_lines(
+            "DERIVED_POLARS " +
+                std::to_string(kDerivedInstrument) + " " +
+                std::to_string(derived_polars_generation) +
+                " 5 11001",
+            "DERIVED_POLARS_SAMPLE ",
+            1U,
+            &polars_lines)) {
+        return false;
+    }
+    std::uint64_t derived_first_entry_ns = 0U;
+    std::uint64_t derived_last_entry_ns = 0U;
+    std::uint64_t derived_polars_ready_ns = 0U;
+    if (!Expect(
+            polars_lines.size() == 1U &&
+                ParseLineUnsignedField(
+                    polars_lines.front(),
+                    "first_callback_entry_ns",
+                    &derived_first_entry_ns) &&
+                ParseLineUnsignedField(
+                    polars_lines.front(),
+                    "last_callback_entry_ns",
+                    &derived_last_entry_ns) &&
+                ParseLineUnsignedField(
+                    polars_lines.front(),
+                    "polars_ready_ns",
+                    &derived_polars_ready_ns) &&
+                derived_first_entry_ns ==
+                    derived_boundary.first_callback_entry_ns &&
+                derived_last_entry_ns ==
+                    derived_boundary.last_callback_entry_ns &&
+                derived_boundary.first_call_start_ns <=
+                    derived_first_entry_ns &&
+                derived_first_entry_ns <=
+                    derived_boundary.first_call_return_ns &&
+                derived_boundary.last_call_start_ns <=
+                    derived_last_entry_ns &&
+                derived_last_entry_ns <=
+                    derived_boundary.last_call_return_ns &&
+                derived_polars_ready_ns >=
+                    derived_last_entry_ns,
+            "derived Polars callback boundaries reconcile")) {
+        return false;
+    }
+    std::cout
+        << "POLARS_BOUNDARY workload=derived_complete_order_lifecycle"
+        << " generation=" << derived_polars_generation
+        << " raw_records=4 derived_events=6"
+        << " order_sequence_events=5 order_id=11001"
+        << " final_revision=3 final_remaining_quantity=0"
+        << " first_caller_before_callback_ns="
+        << derived_boundary.first_call_start_ns
+        << " last_caller_before_callback_ns="
+        << derived_boundary.last_call_start_ns
+        << " first_callback_entry_ns=" << derived_first_entry_ns
+        << " last_callback_entry_ns=" << derived_last_entry_ns
+        << " polars_ready_ns=" << derived_polars_ready_ns
+        << " strict_first_callback_to_polars_ns="
+        << (derived_polars_ready_ns -
+            derived_boundary.first_call_start_ns)
+        << " strict_last_callback_to_polars_ns="
+        << (derived_polars_ready_ns -
+            derived_boundary.last_call_start_ns)
+        << '\n';
+
+    if (callback_polars_only) {
+        std::string response;
+        if (!protocol->SendLine("QUIT") ||
+            !protocol->ReadLine(
+                std::chrono::seconds(30), &response) ||
+            !response.starts_with("BYE ") ||
+            !python.Wait(std::chrono::seconds(30))) {
+            std::cerr
+                << "callback-to-Polars probe shutdown: "
+                << response << '\n';
+            return false;
+        }
+        std::cout << "PYTHON_" << response << '\n';
+
+        pipeline->StopAndDrain();
+        const auto final = pipeline->Snapshot();
+        std::uint64_t parallel_inline_messages = 0U;
+        std::uint64_t parallel_farm_messages = 0U;
+        std::size_t parallel_active_workers = 0U;
+        for (const auto& source : final.parallel_decoder.sources) {
+            parallel_inline_messages += source.inline_messages;
+            parallel_farm_messages += source.farm_messages;
+        }
+        for (std::size_t worker = 0U;
+             worker < final.parallel_decoder.worker_count;
+             ++worker) {
+            if (final.parallel_decoder.workers[worker].parsed_messages !=
+                0U) {
+                ++parallel_active_workers;
+            }
+        }
+        std::cout
+            << "CALLBACK_POLARS_TOPOLOGY enabled="
+            << (final.parallel_decoder.enabled ? 1 : 0)
+            << " configured_workers="
+            << parallel_decoder_worker_count
+            << " reported_workers="
+            << final.parallel_decoder.worker_count
+            << " inline_messages=" << parallel_inline_messages
+            << " farm_messages=" << parallel_farm_messages
+            << " active_parse_workers=" << parallel_active_workers
+            << " activation_configured_depth="
+            << pipeline_config
+                   .parallel_decoder_farm_activation_queue_depth
+            << " activation_effective_depth="
+            << EffectiveParallelDecoderFarmActivationDepthV1(
+                   pipeline_config
+                       .parallel_decoder_farm_activation_queue_depth,
+                   pipeline_config.decoder_queue_capacity_per_source)
+            << '\n';
+        const bool complete =
+            !pipeline->fatal() && !final.fatal &&
+            final.accepted_messages == next_sequence - 1U &&
+            final.processing_progress.applied_sequence ==
+                next_sequence - 1U &&
+            !service->failed() && !history_stages.failed();
+        service->MarkDraining();
+        const bool stopped =
+            service->MarkStoppedClean(final.tick_stream_sequence);
+        service->StopControl();
+        return Expect(
+                   complete,
+                   "callback-to-Polars benchmark retains its complete "
+                   "accepted/applied prefix") &&
+               Expect(
+                   stopped,
+                   "callback-to-Polars benchmark stops cleanly");
+    }
+    history_stages.Clear();
 
     auto cut_and_run_history =
         [&](std::string_view workload,
@@ -7010,7 +8712,7 @@ bool RunHistoryLatencyBenchmark() {
         "history benchmark retains its complete accepted/applied prefix");
     service->MarkDraining();
     const bool stopped =
-        service->MarkStoppedClean(pure_tick_count + mixed_tick_count);
+        service->MarkStoppedClean(final.tick_stream_sequence);
     service->StopControl();
     return ok &&
            Expect(stopped, "history benchmark stops cleanly");
@@ -7019,6 +8721,174 @@ bool RunHistoryLatencyBenchmark() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    auto parse_unsigned = [](
+                              std::string_view text,
+                              std::uint64_t* output) {
+        if (output == nullptr || text.empty()) {
+            return false;
+        }
+        std::uint64_t value = 0U;
+        const auto result = std::from_chars(
+            text.data(), text.data() + text.size(), value);
+        if (result.ec != std::errc{} ||
+            result.ptr != text.data() + text.size()) {
+            return false;
+        }
+        *output = value;
+        return true;
+    };
+    if (argc == 13 &&
+        std::string_view(argv[1]) ==
+            "--throughput-profile-benchmark") {
+        std::array<std::uint64_t, 8U> numeric{};
+        for (std::size_t index = 0U;
+             index < numeric.size();
+             ++index) {
+            if (!parse_unsigned(argv[index + 2U], &numeric[index])) {
+                std::cerr
+                    << "invalid throughput profile numeric argument\n";
+                return 2;
+            }
+        }
+        if (numeric[1U] > static_cast<std::uint64_t>(
+                std::numeric_limits<
+                    std::chrono::milliseconds::rep>::max()) ||
+            numeric[2U] >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            numeric[3U] >
+                std::numeric_limits<std::uint32_t>::max() ||
+            numeric[4U] >
+                std::numeric_limits<std::uint32_t>::max() ||
+            numeric[5U] > 1U ||
+            numeric[6U] >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max()) ||
+            numeric[7U] >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max())) {
+            std::cerr << "throughput profile argument out of range\n";
+            return 2;
+        }
+        std::uint64_t segment_kib = 0U;
+        if (!parse_unsigned(argv[10], &segment_kib) ||
+            segment_kib >
+                std::numeric_limits<std::uint32_t>::max()) {
+            std::cerr << "invalid throughput segment argument\n";
+            return 2;
+        }
+        ThroughputWorkloadV1 workload{};
+        const std::string_view workload_text(argv[11]);
+        if (workload_text == "single_instrument") {
+            workload = ThroughputWorkloadV1::kSingleInstrument;
+        } else if (workload_text == "five_tuple_uniform") {
+            workload = ThroughputWorkloadV1::kFiveTupleUniform;
+        } else if (workload_text == "four_source_balanced") {
+            workload = ThroughputWorkloadV1::kFourSourceBalanced;
+        } else if (workload_text == "hot_shenzhen_tick_source") {
+            workload =
+                ThroughputWorkloadV1::kHotShenzhenTickSource;
+        } else {
+            std::cerr << "invalid throughput workload\n";
+            return 2;
+        }
+        ThroughputSinkV1 sink{};
+        const std::string_view sink_text(argv[12]);
+        if (sink_text == "fast") {
+            sink = ThroughputSinkV1::kFast;
+        } else if (sink_text == "fast_certified") {
+            sink = ThroughputSinkV1::kFastAndCertified;
+        } else {
+            std::cerr << "invalid throughput sink\n";
+            return 2;
+        }
+        ThroughputBenchmarkConfigV1 config{};
+        config.target_rate = numeric[0U];
+        config.duration = std::chrono::milliseconds(
+            static_cast<std::chrono::milliseconds::rep>(numeric[1U]));
+        config.instruments_per_market =
+            static_cast<std::size_t>(numeric[2U]);
+        config.store_worker_count =
+            static_cast<std::uint32_t>(numeric[3U]);
+        config.parallel_decoder_worker_count =
+            static_cast<std::uint32_t>(numeric[4U]);
+        config.parallel_decoder_idle_inline_enabled =
+            numeric[5U] == 1U;
+        config.decoder_queue_capacity_per_source =
+            static_cast<std::size_t>(numeric[6U]);
+        config.store_queue_capacity_per_source_worker =
+            static_cast<std::size_t>(numeric[7U]);
+        config.segment_kib =
+            static_cast<std::uint32_t>(segment_kib);
+        config.workload = workload;
+        config.sink = sink;
+        return RunThroughputProfileBenchmark(config) ? 0 : 1;
+    }
+    if (argc == 3 &&
+        std::string_view(argv[1]) ==
+            "--history-latency-benchmark-workers") {
+        std::uint64_t worker_count = 0U;
+        if (!parse_unsigned(argv[2], &worker_count) ||
+            worker_count >
+                std::numeric_limits<std::uint32_t>::max()) {
+            std::cerr << "invalid parallel decoder worker count\n";
+            return 2;
+        }
+        return RunHistoryLatencyBenchmark(
+                   static_cast<std::uint32_t>(worker_count))
+                   ? 0
+                   : 1;
+    }
+    if (argc == 3 &&
+        std::string_view(argv[1]) ==
+            "--callback-polars-latency-benchmark-workers") {
+        std::uint64_t worker_count = 0U;
+        if (!parse_unsigned(argv[2], &worker_count) ||
+            worker_count >
+                std::numeric_limits<std::uint32_t>::max()) {
+            std::cerr << "invalid parallel decoder worker count\n";
+            return 2;
+        }
+        return RunHistoryLatencyBenchmark(
+                   static_cast<std::uint32_t>(worker_count), true)
+                   ? 0
+                   : 1;
+    }
+    if (argc == 4 &&
+        std::string_view(argv[1]) ==
+            "--throughput-stability-benchmark") {
+        std::uint64_t target_rate = 0U;
+        std::uint64_t duration_ms = 0U;
+        const std::string_view rate_text(argv[2]);
+        const std::string_view duration_text(argv[3]);
+        const auto rate_result = std::from_chars(
+            rate_text.data(),
+            rate_text.data() + rate_text.size(),
+            target_rate);
+        const auto duration_result = std::from_chars(
+            duration_text.data(),
+            duration_text.data() + duration_text.size(),
+            duration_ms);
+        if (rate_result.ec != std::errc{} ||
+            rate_result.ptr != rate_text.data() + rate_text.size() ||
+            duration_result.ec != std::errc{} ||
+            duration_result.ptr !=
+                duration_text.data() + duration_text.size() ||
+            duration_ms > static_cast<std::uint64_t>(
+                              std::numeric_limits<
+                                  std::chrono::milliseconds::rep>::max())) {
+            std::cerr << "invalid throughput benchmark arguments\n";
+            return 2;
+        }
+        return RunThroughputStabilityBenchmark(
+                   target_rate,
+                   std::chrono::milliseconds(
+                       static_cast<
+                           std::chrono::milliseconds::rep>(
+                           duration_ms)))
+                   ? 0
+                   : 1;
+    }
     if (argc == 2) {
         const std::string_view mode(argv[1]);
         if (mode == "--latency-benchmark") {
@@ -7028,7 +8898,7 @@ int main(int argc, char** argv) {
             return RunLatencyBenchmark(true) ? 0 : 1;
         }
         if (mode == "--history-latency-benchmark") {
-            return RunHistoryLatencyBenchmark() ? 0 : 1;
+            return RunHistoryLatencyBenchmark(0U) ? 0 : 1;
         }
     }
     if (argc != 1) {
@@ -7036,7 +8906,15 @@ int main(int argc, char** argv) {
             << "usage: " << argv[0]
             << " [--latency-benchmark"
                "|--latency-benchmark-stages"
-               "|--history-latency-benchmark]\n";
+               "|--history-latency-benchmark"
+               "|--history-latency-benchmark-workers WORKERS"
+               "|--callback-polars-latency-benchmark-workers WORKERS"
+               "|--throughput-stability-benchmark RATE DURATION_MS"
+               "|--throughput-profile-benchmark RATE DURATION_MS "
+               "INSTRUMENTS_PER_MARKET STORE_WORKERS "
+               "PARALLEL_DECODER_WORKERS IDLE_INLINE "
+               "DECODER_QUEUE STORE_QUEUE "
+               "SEGMENT_KIB WORKLOAD SINK]\n";
         return 2;
     }
     if (!TestMalformedHistoryResponseClosesReceivedDescriptor() ||

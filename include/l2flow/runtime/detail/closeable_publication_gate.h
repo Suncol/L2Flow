@@ -113,7 +113,12 @@ private:
     void Release() noexcept {
         const std::uint64_t previous =
             state_.fetch_sub(1U, std::memory_order_acq_rel);
-        if ((previous & kActiveMask) == 1U) {
+        // CloseAndWait is the only waiter.  If the last lease finishes before
+        // close sets its bit, close observes a zero active count directly and
+        // never waits.  Notify only when close has already linearized, which
+        // removes an otherwise-useless notify from every normal publication.
+        if ((previous & kClosedBit) != 0U &&
+            (previous & kActiveMask) == 1U) {
             state_.notify_all();
         }
     }

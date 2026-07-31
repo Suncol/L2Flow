@@ -3,7 +3,6 @@
 #include "l2flow/common/sha256.h"
 #include "l2flow/control/quality_flags_v1.h"
 #include "l2flow/market/mainland_a_share_filter_v1.h"
-#include "l2flow/runtime/detail/closeable_publication_gate.h"
 #include "l2flow/sdk/direct_sdk_runtime_v1.h"
 #include "l2flow/sdk/production_subscription_v1.h"
 
@@ -30,6 +29,51 @@
 namespace l2flow::runtime {
 namespace {
 
+[[noreturn]] void TerminateInvariant(const char* reason) noexcept {
+    std::fprintf(
+        stderr,
+        "l2flow-pipeline: invariant failure=%s\n",
+        reason != nullptr ? reason : "unknown");
+    std::fflush(stderr);
+    std::terminate();
+}
+
+void IncrementSingleWriterCounter(
+    std::atomic<std::uint64_t>* counter) noexcept {
+    counter->store(
+        counter->load(std::memory_order_relaxed) + 1U,
+        std::memory_order_relaxed);
+}
+
+void AddSingleWriterCounter(
+    std::atomic<std::uint64_t>* counter,
+    std::uint64_t amount) noexcept {
+    const std::uint64_t current =
+        counter->load(std::memory_order_relaxed);
+    if (amount >
+        std::numeric_limits<std::uint64_t>::max() - current) {
+        TerminateInvariant("single_writer_counter_overflow");
+    }
+    counter->store(current + amount, std::memory_order_relaxed);
+}
+
+void IncrementSingleWriterCounterRelease(
+    std::atomic<std::uint64_t>* counter) noexcept {
+    counter->store(
+        counter->load(std::memory_order_relaxed) + 1U,
+        std::memory_order_release);
+}
+
+void DecrementSingleWriterCounter(
+    std::atomic<std::uint64_t>* counter) noexcept {
+    const std::uint64_t current =
+        counter->load(std::memory_order_relaxed);
+    if (current == 0U) {
+        TerminateInvariant("single_writer_counter_underflow");
+    }
+    counter->store(current - 1U, std::memory_order_relaxed);
+}
+
 namespace factor = l2flow::factor;
 namespace common = l2flow::common;
 namespace control = l2flow::control;
@@ -44,6 +88,7 @@ constexpr auto kProgressPublishMaximumDelay =
     std::chrono::milliseconds(1);
 constexpr auto kStartupQueueRetryDelay =
     std::chrono::microseconds(100);
+inline constexpr std::size_t kMaximumParallelDecoderSlotsPerShard = 1024U;
 
 void ClearDetail(std::string* detail) noexcept {
     if (detail == nullptr) {
@@ -1264,9 +1309,33 @@ private:
         config.tick_ring_capacity < 2U) {
         return false;
     }
+    std::size_t parallel_inflight = 0U;
+    if (config.parallel_decoder_worker_count != 0U) {
+        if (config.parallel_decoder_worker_count >
+                kRealtimeParallelDecoderMaximumWorkersV1 ||
+            config.parallel_decoder_slots_per_source_worker == 0U ||
+            config.parallel_decoder_slots_per_source_worker >
+                std::numeric_limits<std::size_t>::max() /
+                    config.parallel_decoder_worker_count) {
+            return false;
+        }
+        parallel_inflight =
+            static_cast<std::size_t>(
+                config.parallel_decoder_worker_count) *
+            config.parallel_decoder_slots_per_source_worker;
+    }
+    const std::size_t base =
+        config.decoder_queue_capacity_per_source * source_count;
+    if (parallel_inflight >
+        (std::numeric_limits<std::size_t>::max() - base -
+         source_count) /
+            source_count) {
+        return false;
+    }
+    // In parallel mode each source FIFO can remain full while its dispatcher
+    // owns one command and W*S additional commands occupy decode leases.
     const std::size_t target =
-        config.decoder_queue_capacity_per_source * source_count +
-        source_count;
+        base + source_count + parallel_inflight * source_count;
     const std::size_t maximum = std::min(
         {target,
          config.completion_tracker_capacity - 1U,
@@ -1296,11 +1365,30 @@ private:
     }
     std::size_t maximum =
         config.decoder_queue_capacity_per_source * source_count;
-    // One message can be held by each decoder after it has left its queue.
-    // One is being constructed by the serialized callback. A source-count
-    // safety margin covers bounded lifecycle handoff without relying on
-    // History queue capacity (History never owns the raw SDK message).
-    constexpr std::size_t decoder_owners = source_count;
+    // One message can be held by each source owner after it has left its
+    // queue. In parallel mode W*S additional messages can reside in the
+    // preallocated decode leases for each source.
+    std::size_t decoder_owners = source_count;
+    if (config.parallel_decoder_worker_count != 0U) {
+        if (config.parallel_decoder_worker_count >
+                kRealtimeParallelDecoderMaximumWorkersV1 ||
+            config.parallel_decoder_slots_per_source_worker == 0U ||
+            config.parallel_decoder_slots_per_source_worker >
+                std::numeric_limits<std::size_t>::max() /
+                    config.parallel_decoder_worker_count) {
+            return false;
+        }
+        const std::size_t per_source =
+            static_cast<std::size_t>(
+                config.parallel_decoder_worker_count) *
+            config.parallel_decoder_slots_per_source_worker;
+        if (per_source >
+            (std::numeric_limits<std::size_t>::max() - decoder_owners) /
+                source_count) {
+            return false;
+        }
+        decoder_owners += per_source * source_count;
+    }
     constexpr std::size_t callback_owner = 1U;
     constexpr std::size_t safety_margin = source_count;
     const std::array<std::size_t, 3U> additions{
@@ -1565,25 +1653,44 @@ public:
                 !command.message) {
                 return false;
             }
-            detail::CloseablePublicationGate::Lease publication =
-                publication_gate_.TryAcquire();
-            if (!publication) {
+            // The enclosing Pipeline serializes every producer with
+            // admission_mutex_ and closes admission before RequestStop. The
+            // queue therefore needs only this read-mostly terminal flag; a
+            // per-message publication lease would add two needless RMWs.
+            if (stop_requested_.load(std::memory_order_acquire)) {
                 return false;
             }
             if (!WakeEpochAvailable()) {
                 return false;
             }
-            if (message_depth_.load(std::memory_order_acquire) >=
+            // All message/fence producers are serialized by admission_mutex_.
+            // Keep producer and consumer progress on separate cache lines and
+            // refresh the consumer count only near capacity. This avoids four
+            // cross-core depth RMWs on every successful SPSC handoff.
+            if (producer_message_count_ - cached_consumed_message_count_ >=
                 message_capacity_) {
-                full_count_.fetch_add(1U, std::memory_order_relaxed);
-                return false;
+                cached_consumed_message_count_ =
+                    consumed_message_count_.load(
+                        std::memory_order_acquire);
+                if (producer_message_count_ -
+                        cached_consumed_message_count_ >=
+                    message_capacity_) {
+                    full_count_.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    return false;
+                }
             }
             const std::size_t tail =
                 tail_.load(std::memory_order_relaxed);
             const std::size_t next = Increment(tail);
-            if (next == head_.load(std::memory_order_acquire)) {
-                full_count_.fetch_add(1U, std::memory_order_relaxed);
-                return false;
+            if (next == cached_producer_head_) {
+                cached_producer_head_ =
+                    head_.load(std::memory_order_acquire);
+                if (next == cached_producer_head_) {
+                    full_count_.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    return false;
+                }
             }
             slots_[tail].emplace(std::move(command));
             std::uint64_t queue_publish_monotonic_ns = 0U;
@@ -1594,11 +1701,16 @@ public:
             }
             slots_[tail]->queue_publish_monotonic_ns =
                 queue_publish_monotonic_ns;
-            const std::size_t message_depth =
-                message_depth_.fetch_add(
-                    1U, std::memory_order_relaxed) +
-                1U;
-            total_depth_.fetch_add(1U, std::memory_order_relaxed);
+            ++producer_message_count_;
+            const std::uint64_t observed_consumed =
+                consumed_message_count_.load(
+                    std::memory_order_acquire);
+            if (observed_consumed > cached_consumed_message_count_) {
+                cached_consumed_message_count_ = observed_consumed;
+            }
+            const std::uint64_t message_depth =
+                producer_message_count_ -
+                observed_consumed;
             UpdateHighWater(message_depth);
 
             // Irreversible admission linearization point. Slot construction
@@ -1608,6 +1720,8 @@ public:
             std::forward<Commit>(commit)(
                 queue_publish_monotonic_ns);
             tail_.store(next, std::memory_order_release);
+            published_message_count_.store(
+                producer_message_count_, std::memory_order_release);
             WakeConsumer();
             return true;
         }
@@ -1620,9 +1734,7 @@ public:
                 command.message || command.generation == 0U) {
                 return false;
             }
-            detail::CloseablePublicationGate::Lease publication =
-                publication_gate_.TryAcquire();
-            if (!publication ||
+            if (stop_requested_.load(std::memory_order_acquire) ||
                 !WakeEpochAvailable() ||
                 control_inflight_.load(std::memory_order_acquire)) {
                 return false;
@@ -1630,15 +1742,19 @@ public:
             const std::size_t tail =
                 tail_.load(std::memory_order_relaxed);
             const std::size_t next = Increment(tail);
-            if (next == head_.load(std::memory_order_acquire) ||
-                total_depth_.load(std::memory_order_acquire) >
-                    message_capacity_) {
-                return false;
+            if (next == cached_producer_head_) {
+                cached_producer_head_ =
+                    head_.load(std::memory_order_acquire);
+                if (next == cached_producer_head_) {
+                    return false;
+                }
             }
             slots_[tail].emplace(std::move(command));
             control_inflight_.store(true, std::memory_order_relaxed);
-            total_depth_.fetch_add(1U, std::memory_order_relaxed);
             tail_.store(next, std::memory_order_release);
+            ++producer_control_count_;
+            published_control_count_.store(
+                producer_control_count_, std::memory_order_release);
             WakeConsumer();
             return true;
         }
@@ -1647,27 +1763,33 @@ public:
             control_inflight_.store(false, std::memory_order_release);
         }
 
-        [[nodiscard]] bool Pop(DecoderCommand* output) noexcept {
+        [[nodiscard]] bool Pop(
+            DecoderCommand* output,
+            std::size_t* remaining_ring_depth = nullptr) noexcept {
             if (output == nullptr) {
                 return false;
             }
             while (true) {
-                if (TryPop(output)) {
+                if (TryPop(output, remaining_ring_depth)) {
                     return true;
                 }
-                if (publication_gate_.closed_and_quiesced()) {
-                    return false;
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    // RequestStop runs only after the serialized producer is
+                    // quiescent. Re-sample the ring after observing that
+                    // terminal publication: the preceding empty observation
+                    // may have raced the last accepted tail store.
+                    return TryPop(output, remaining_ring_depth);
                 }
                 const std::uint64_t observed_epoch =
                     wake_epoch_.load(std::memory_order_acquire);
                 // Close the window between observing an empty tail and
                 // arming the atomic wait. If publication wins either side,
                 // this pop sees the tail or wait observes a changed epoch.
-                if (TryPop(output)) {
+                if (TryPop(output, remaining_ring_depth)) {
                     return true;
                 }
-                if (publication_gate_.closed_and_quiesced()) {
-                    return false;
+                if (stop_requested_.load(std::memory_order_acquire)) {
+                    return TryPop(output, remaining_ring_depth);
                 }
                 wake_epoch_.wait(
                     observed_epoch, std::memory_order_acquire);
@@ -1675,10 +1797,9 @@ public:
         }
 
         void RequestStop() noexcept {
-            // Fence/message producers that already passed admission publish
-            // before consumers are allowed to interpret closed+empty.
-            publication_gate_.CloseAndWait();
-            if (!stop_wake_published_.exchange(
+            // Pipeline admission serialization guarantees that no producer is
+            // inside publication when this terminal transition is requested.
+            if (!stop_requested_.exchange(
                     true, std::memory_order_acq_rel)) {
                 // Pushes reserve UINT64_MAX for this terminal wake.
                 wake_epoch_.fetch_add(1U, std::memory_order_release);
@@ -1690,10 +1811,29 @@ public:
             const noexcept {
             RealtimeDecoderQueueSnapshotV1 result{};
             result.message_capacity = message_capacity_;
-            result.message_depth =
-                message_depth_.load(std::memory_order_acquire);
-            result.total_depth =
-                total_depth_.load(std::memory_order_acquire);
+            for (;;) {
+                const std::uint64_t published_messages =
+                    published_message_count_.load(
+                        std::memory_order_acquire);
+                const std::uint64_t published_controls =
+                    published_control_count_.load(
+                        std::memory_order_acquire);
+                const std::uint64_t consumed_messages =
+                    consumed_message_count_.load(
+                        std::memory_order_acquire);
+                const std::uint64_t consumed_controls =
+                    consumed_control_count_.load(
+                        std::memory_order_acquire);
+                if (consumed_messages <= published_messages &&
+                    consumed_controls <= published_controls) {
+                    result.message_depth = static_cast<std::size_t>(
+                        published_messages - consumed_messages);
+                    result.total_depth = result.message_depth +
+                        static_cast<std::size_t>(
+                            published_controls - consumed_controls);
+                    break;
+                }
+            }
             result.message_high_water =
                 message_high_water_.load(std::memory_order_acquire);
             result.full_count =
@@ -1701,8 +1841,30 @@ public:
             return result;
         }
 
+        [[nodiscard]] bool Empty() const noexcept {
+            return head_.load(std::memory_order_acquire) ==
+                   tail_.load(std::memory_order_acquire);
+        }
+
+        [[nodiscard]] std::size_t MessageDepthSnapshot() const noexcept {
+            for (;;) {
+                const std::uint64_t published =
+                    published_message_count_.load(
+                        std::memory_order_acquire);
+                const std::uint64_t consumed =
+                    consumed_message_count_.load(
+                        std::memory_order_acquire);
+                if (consumed <= published) {
+                    return static_cast<std::size_t>(
+                        published - consumed);
+                }
+            }
+        }
+
     private:
-        [[nodiscard]] bool TryPop(DecoderCommand* output) noexcept {
+        [[nodiscard]] bool TryPop(
+            DecoderCommand* output,
+            std::size_t* remaining_ring_depth) noexcept {
             const std::size_t head =
                 head_.load(std::memory_order_relaxed);
             const std::size_t tail =
@@ -1712,11 +1874,33 @@ public:
             }
             *output = std::move(*slots_[head]);
             slots_[head].reset();
-            head_.store(Increment(head), std::memory_order_release);
-            total_depth_.fetch_sub(1U, std::memory_order_relaxed);
+            // Release the physical ring cell before publishing logical
+            // consumption. A producer that observes capacity through the
+            // consumed frontier must also be able to observe the new head;
+            // otherwise a transient in-progress pop could be misreported as
+            // terminal queue-full and fail closed.
+            const std::size_t next_head = Increment(head);
+            head_.store(next_head, std::memory_order_release);
+            if (remaining_ring_depth != nullptr) {
+                // Reuse the tail acquire already required by Pop. This is the
+                // number of ring cells remaining in the observed SPSC prefix,
+                // so adaptive decode can inspect every pop without adding a
+                // second cross-core atomic depth sample. At most one cell is a
+                // generation fence; counting it can only activate the farm
+                // one record early.
+                *remaining_ring_depth =
+                    tail >= next_head
+                        ? tail - next_head
+                        : slots_.size() - next_head + tail;
+            }
             if (output->kind == CommandKind::kMessage) {
-                message_depth_.fetch_sub(
-                    1U, std::memory_order_release);
+                ++consumer_message_count_;
+                consumed_message_count_.store(
+                    consumer_message_count_, std::memory_order_release);
+            } else {
+                ++consumer_control_count_;
+                consumed_control_count_.store(
+                    consumer_control_count_, std::memory_order_release);
             }
             return true;
         }
@@ -1735,15 +1919,12 @@ public:
                    std::numeric_limits<std::uint64_t>::max() - 1U;
         }
 
-        void UpdateHighWater(std::size_t candidate) noexcept {
-            std::size_t current =
-                message_high_water_.load(std::memory_order_relaxed);
-            while (current < candidate &&
-                   !message_high_water_.compare_exchange_weak(
-                       current,
-                       candidate,
-                       std::memory_order_relaxed,
-                       std::memory_order_relaxed)) {
+        void UpdateHighWater(std::uint64_t candidate) noexcept {
+            if (candidate > producer_message_high_water_) {
+                producer_message_high_water_ = candidate;
+                message_high_water_.store(
+                    static_cast<std::size_t>(candidate),
+                    std::memory_order_relaxed);
             }
         }
 
@@ -1755,25 +1936,473 @@ public:
         const std::size_t message_capacity_;
         std::vector<std::optional<DecoderCommand>> slots_;
         alignas(64) std::atomic<std::size_t> head_{0U};
+        std::uint64_t consumer_message_count_ = 0U;
+        std::atomic<std::uint64_t> consumed_message_count_{0U};
+        std::uint64_t consumer_control_count_ = 0U;
+        std::atomic<std::uint64_t> consumed_control_count_{0U};
         alignas(64) std::atomic<std::size_t> tail_{0U};
-        std::atomic<std::size_t> message_depth_{0U};
-        std::atomic<std::size_t> total_depth_{0U};
+        std::size_t cached_producer_head_ = 0U;
+        std::uint64_t producer_message_count_ = 0U;
+        std::uint64_t producer_control_count_ = 0U;
+        std::uint64_t cached_consumed_message_count_ = 0U;
+        std::uint64_t producer_message_high_water_ = 0U;
+        std::atomic<std::uint64_t> published_message_count_{0U};
+        std::atomic<std::uint64_t> published_control_count_{0U};
         std::atomic<std::size_t> message_high_water_{0U};
         std::atomic<std::uint64_t> full_count_{0U};
         std::atomic<bool> control_inflight_{false};
-        detail::CloseablePublicationGate publication_gate_;
         std::atomic<std::uint64_t> wake_epoch_{0U};
-        std::atomic<bool> stop_wake_published_{false};
+        std::atomic<bool> stop_requested_{false};
+    };
+
+    struct ParallelDecodeTask final {
+        std::atomic<bool> available{true};
+        DecoderCommand command{};
+        market::DecodedMarketEventV1 decoded{};
+        market::MarketDecodeErrorV1 decode_error =
+            market::MarketDecodeErrorV1::kNone;
+        std::uint8_t source_slot =
+            static_cast<std::uint8_t>(
+                market::kRealtimeHistorySourceCountV1);
+        std::uint64_t global_ingress_sequence = 0U;
+        std::uint64_t source_sequence = 0U;
+        std::uint64_t tick_stream_sequence = 0U;
+        bool identity_applied = false;
+        std::uint64_t worker_dequeue_monotonic_ns = 0U;
+        std::uint64_t decode_start_monotonic_ns = 0U;
+        std::uint64_t decode_complete_monotonic_ns = 0U;
+        bool worker_dequeue_clock_valid = false;
+        bool decode_start_clock_valid = false;
+        bool decode_complete_clock_valid = false;
+
+        ParallelDecodeTask() = default;
+        ParallelDecodeTask(const ParallelDecodeTask&) = delete;
+        ParallelDecodeTask& operator=(const ParallelDecodeTask&) = delete;
+
+        void ResetAndRelease(
+            std::atomic<std::uint64_t>* epoch,
+            std::atomic<bool>* waiter_armed) noexcept {
+            command = DecoderCommand{};
+            // DecodeStateless fully replaces this value on success, and a
+            // failed decode is never allowed to inspect it. Do not assign a
+            // default DecodedMarketEventV1 here: its first snapshot
+            // alternative is deliberately large and zeroing it on every
+            // recycle measurably extends callback-to-reader latency.
+            decode_error = market::MarketDecodeErrorV1::kNone;
+            source_slot = static_cast<std::uint8_t>(
+                market::kRealtimeHistorySourceCountV1);
+            global_ingress_sequence = 0U;
+            source_sequence = 0U;
+            tick_stream_sequence = 0U;
+            identity_applied = false;
+            worker_dequeue_monotonic_ns = 0U;
+            decode_start_monotonic_ns = 0U;
+            decode_complete_monotonic_ns = 0U;
+            worker_dequeue_clock_valid = false;
+            decode_start_clock_valid = false;
+            decode_complete_clock_valid = false;
+            available.store(true, std::memory_order_release);
+            // Acquire rechecks available after arming. A release that sees no
+            // waiter therefore needs neither an epoch RMW nor a futex wake on
+            // the common streaming path.
+            if (epoch != nullptr && waiter_armed != nullptr &&
+                waiter_armed->exchange(
+                    false, std::memory_order_acq_rel)) {
+                epoch->fetch_add(1U, std::memory_order_release);
+                epoch->notify_one();
+            }
+        }
+    };
+
+    class ParallelIssueQueue final {
+    public:
+        explicit ParallelIssueQueue(std::size_t capacity)
+            : slots_(capacity + 1U, nullptr) {}
+
+        ParallelIssueQueue(const ParallelIssueQueue&) = delete;
+        ParallelIssueQueue& operator=(const ParallelIssueQueue&) = delete;
+
+        [[nodiscard]] bool TryPush(ParallelDecodeTask* task) noexcept {
+            if (task == nullptr) {
+                return false;
+            }
+            const std::size_t tail =
+                tail_.load(std::memory_order_relaxed);
+            const std::size_t next = Increment(tail);
+            const std::size_t head =
+                head_.load(std::memory_order_acquire);
+            if (next == head) {
+                return false;
+            }
+            slots_[tail] = task;
+            tail_.store(next, std::memory_order_release);
+            const std::size_t depth = Distance(next, head);
+            if (depth > producer_high_water_) {
+                producer_high_water_ = depth;
+                high_water_.store(depth, std::memory_order_relaxed);
+            }
+            return true;
+        }
+
+        [[nodiscard]] bool TryPop(ParallelDecodeTask** output) noexcept {
+            if (output == nullptr) {
+                return false;
+            }
+            const std::size_t head =
+                head_.load(std::memory_order_relaxed);
+            if (head == tail_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            *output = slots_[head];
+            slots_[head] = nullptr;
+            head_.store(Increment(head), std::memory_order_release);
+            return *output != nullptr;
+        }
+
+        [[nodiscard]] std::size_t DepthSnapshot() const noexcept {
+            const std::size_t head =
+                head_.load(std::memory_order_acquire);
+            const std::size_t tail =
+                tail_.load(std::memory_order_acquire);
+            return Distance(tail, head);
+        }
+
+        [[nodiscard]] std::size_t HighWater() const noexcept {
+            return high_water_.load(std::memory_order_acquire);
+        }
+
+    private:
+        [[nodiscard]] std::size_t Increment(std::size_t value) const
+            noexcept {
+            ++value;
+            return value == slots_.size() ? 0U : value;
+        }
+
+        [[nodiscard]] std::size_t Distance(
+            std::size_t tail,
+            std::size_t head) const noexcept {
+            return tail >= head
+                       ? tail - head
+                       : slots_.size() - head + tail;
+        }
+
+        std::vector<ParallelDecodeTask*> slots_;
+        alignas(64) std::atomic<std::size_t> head_{0U};
+        alignas(64) std::atomic<std::size_t> tail_{0U};
+        std::size_t producer_high_water_ = 0U;
+        std::atomic<std::size_t> high_water_{0U};
+    };
+
+    struct ParallelDecodeShard final {
+        explicit ParallelDecodeShard(std::size_t requested_slot_count)
+            : slots(std::make_unique<ParallelDecodeTask[]>(
+                  requested_slot_count)),
+              issue(requested_slot_count),
+              slot_count(requested_slot_count) {}
+
+        [[nodiscard]] ParallelDecodeTask* Acquire(
+            std::size_t slot,
+            const std::atomic<bool>& fatal,
+            std::atomic<std::uint64_t>* wait_count) noexcept {
+            if (slot >= slot_count) {
+                return nullptr;
+            }
+            if (fatal.load(std::memory_order_acquire)) {
+                return nullptr;
+            }
+            ParallelDecodeTask* const task = &slots[slot];
+            bool counted = false;
+            while (!task->available.load(std::memory_order_acquire)) {
+                if (fatal.load(std::memory_order_acquire)) {
+                    return nullptr;
+                }
+                if (!counted && wait_count != nullptr) {
+                    wait_count->fetch_add(1U, std::memory_order_relaxed);
+                    counted = true;
+                }
+                const std::uint64_t observed =
+                    release_epoch.load(std::memory_order_acquire);
+                const bool already_armed =
+                    release_waiter_armed.exchange(
+                        true, std::memory_order_acq_rel);
+                if (already_armed) {
+                    TerminateInvariant("parallel_lease_waiter_rearmed");
+                }
+                if (!task->available.load(std::memory_order_acquire) &&
+                    !fatal.load(std::memory_order_acquire)) {
+                    release_epoch.wait(observed, std::memory_order_acquire);
+                    // A terminal Wake can advance the epoch just before this
+                    // dispatcher arms. In that case wait returns immediately
+                    // and no releaser owns the armed bit.
+                    static_cast<void>(
+                        release_waiter_armed.exchange(
+                            false, std::memory_order_acq_rel));
+                } else {
+                    static_cast<void>(
+                        release_waiter_armed.exchange(
+                            false, std::memory_order_acq_rel));
+                }
+            }
+            if (fatal.load(std::memory_order_acquire)) {
+                return nullptr;
+            }
+            task->available.store(false, std::memory_order_relaxed);
+            return task;
+        }
+
+        void Wake() noexcept {
+            static_cast<void>(release_waiter_armed.exchange(
+                false, std::memory_order_acq_rel));
+            release_epoch.fetch_add(1U, std::memory_order_release);
+            release_epoch.notify_all();
+        }
+
+        std::unique_ptr<ParallelDecodeTask[]> slots;
+        ParallelIssueQueue issue;
+        const std::size_t slot_count;
+        std::atomic<std::uint64_t> release_epoch{0U};
+        alignas(64) std::atomic<bool> release_waiter_armed{false};
+    };
+
+    class ParallelCompletionRing final {
+    public:
+        explicit ParallelCompletionRing(std::size_t capacity)
+            : capacity_(capacity),
+              slots_(std::make_unique<
+                     std::atomic<ParallelDecodeTask*>[]>(capacity)),
+              failed_slots_(std::make_unique<
+                     std::atomic<ParallelDecodeTask*>[]>(capacity)) {
+            for (std::size_t index = 0U; index < capacity_; ++index) {
+                slots_[index].store(nullptr, std::memory_order_relaxed);
+                failed_slots_[index].store(
+                    nullptr, std::memory_order_relaxed);
+            }
+        }
+
+        ParallelCompletionRing(const ParallelCompletionRing&) = delete;
+        ParallelCompletionRing& operator=(const ParallelCompletionRing&) =
+            delete;
+
+        [[nodiscard]] bool Publish(ParallelDecodeTask* task) noexcept {
+            if (task == nullptr ||
+                task->source_slot >=
+                    market::kRealtimeHistorySourceCountV1 ||
+                task->source_sequence == 0U ||
+                task->global_ingress_sequence == 0U) {
+                publish_failures_.fetch_add(1U, std::memory_order_relaxed);
+                return false;
+            }
+            std::atomic<ParallelDecodeTask*>& cell =
+                slots_[Index(task->source_sequence)];
+            ParallelDecodeTask* expected = nullptr;
+            if (!cell.compare_exchange_strong(
+                    expected,
+                    task,
+                    std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                publish_failures_.fetch_add(1U, std::memory_order_relaxed);
+                return false;
+            }
+            SignalWaiter();
+            return true;
+        }
+
+        // A normal completion publication failure is fatal, but the ordered
+        // committer still needs an exact-sequence tombstone so it can release
+        // the task lease and drain every later completion without hanging.
+        [[nodiscard]] bool PublishFailure(
+            ParallelDecodeTask* task) noexcept {
+            if (task == nullptr ||
+                task->source_slot >=
+                    market::kRealtimeHistorySourceCountV1 ||
+                task->source_sequence == 0U ||
+                task->global_ingress_sequence == 0U) {
+                return false;
+            }
+            std::atomic<ParallelDecodeTask*>& cell =
+                failed_slots_[Index(task->source_sequence)];
+            ParallelDecodeTask* expected = nullptr;
+            if (!cell.compare_exchange_strong(
+                    expected,
+                    task,
+                    std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                return false;
+            }
+            SignalWaiter();
+            return true;
+        }
+
+        [[nodiscard]] ParallelDecodeTask* TryTake(
+            std::uint64_t source_sequence) noexcept {
+            if (source_sequence == 0U) {
+                return nullptr;
+            }
+            return slots_[Index(source_sequence)].exchange(
+                nullptr, std::memory_order_acq_rel);
+        }
+
+        [[nodiscard]] ParallelDecodeTask* TryTakeFailure(
+            std::uint64_t source_sequence) noexcept {
+            if (source_sequence == 0U) {
+                return nullptr;
+            }
+            return failed_slots_[Index(source_sequence)].exchange(
+                nullptr, std::memory_order_acq_rel);
+        }
+
+        [[nodiscard]] std::uint64_t epoch() const noexcept {
+            return completion_epoch_.load(std::memory_order_acquire);
+        }
+
+        void Wait(std::uint64_t observed,
+                  std::uint64_t source_sequence) const noexcept {
+            const bool already_armed = waiter_armed_.exchange(
+                true, std::memory_order_acq_rel);
+            if (already_armed) {
+                TerminateInvariant("parallel_completion_waiter_rearmed");
+            }
+            const std::size_t index = Index(source_sequence);
+            if (slots_[index].load(std::memory_order_acquire) == nullptr &&
+                failed_slots_[index].load(
+                    std::memory_order_acquire) == nullptr) {
+                completion_epoch_.wait(
+                    observed, std::memory_order_acquire);
+                // WakeAll may advance the epoch after the caller sampled it
+                // but before this waiter arms. In that case atomic::wait
+                // returns immediately and no publisher owns the armed bit.
+                // Always disarm on return; a publisher that observed the bit
+                // already cleared it before changing the epoch, and a later
+                // publisher may rely on the next target-cell recheck instead.
+                static_cast<void>(waiter_armed_.exchange(
+                    false, std::memory_order_acq_rel));
+            } else {
+                static_cast<void>(waiter_armed_.exchange(
+                    false, std::memory_order_acq_rel));
+            }
+        }
+
+        void WakeAll() noexcept {
+            static_cast<void>(waiter_armed_.exchange(
+                false, std::memory_order_acq_rel));
+            completion_epoch_.fetch_add(1U, std::memory_order_release);
+            completion_epoch_.notify_all();
+        }
+
+        [[nodiscard]] std::size_t capacity() const noexcept {
+            return capacity_;
+        }
+        [[nodiscard]] std::uint64_t publish_failures() const noexcept {
+            return publish_failures_.load(std::memory_order_acquire);
+        }
+
+    private:
+        void SignalWaiter() noexcept {
+            // The ordered committer rechecks its exact sequence cells after
+            // arming. Avoid one epoch RMW and notify syscall per completion
+            // while it is already running.
+            if (waiter_armed_.exchange(
+                    false, std::memory_order_acq_rel)) {
+                completion_epoch_.fetch_add(
+                    1U, std::memory_order_release);
+                completion_epoch_.notify_one();
+            }
+        }
+
+        [[nodiscard]] std::size_t Index(
+            std::uint64_t source_sequence) const noexcept {
+            return static_cast<std::size_t>(
+                (source_sequence - 1U) % capacity_);
+        }
+
+        const std::size_t capacity_;
+        std::unique_ptr<std::atomic<ParallelDecodeTask*>[]> slots_;
+        std::unique_ptr<std::atomic<ParallelDecodeTask*>[]> failed_slots_;
+        std::atomic<std::uint64_t> publish_failures_{0U};
+        mutable std::atomic<std::uint64_t> completion_epoch_{0U};
+        mutable std::atomic<bool> waiter_armed_{false};
     };
 
     struct DecoderLane final {
         DecoderLane(std::size_t capacity,
-                    market::MarketDecoderConfigV1 decoder_config)
-            : queue(capacity), decoder(decoder_config) {}
+                    market::MarketDecoderConfigV1 decoder_config,
+                    std::uint32_t parallel_worker_count,
+                    std::size_t parallel_slots_per_worker)
+            : queue(capacity),
+              decoder(decoder_config),
+              completion(
+                  parallel_worker_count == 0U
+                      ? nullptr
+                      : std::make_unique<ParallelCompletionRing>(
+                            static_cast<std::size_t>(
+                                parallel_worker_count) *
+                            parallel_slots_per_worker)) {
+            parallel_shards.reserve(parallel_worker_count);
+            for (std::uint32_t worker = 0U;
+                 worker < parallel_worker_count;
+                 ++worker) {
+                parallel_shards.push_back(
+                    std::make_unique<ParallelDecodeShard>(
+                        parallel_slots_per_worker));
+            }
+        }
 
         DecoderQueue queue;
         market::MarketDecoderV1 decoder;
+        std::vector<std::unique_ptr<ParallelDecodeShard>> parallel_shards;
+        std::unique_ptr<ParallelCompletionRing> completion;
         std::thread thread;
+        std::thread commit_thread;
+        std::atomic<bool> dispatch_done{false};
+        std::atomic<std::uint64_t> last_dispatched_source_sequence{0U};
+        std::atomic<std::uint64_t> committed_source_sequence{0U};
+        // completion->epoch() has exactly one waiter: commit_thread. The
+        // source dispatcher uses this independent event only while a rare
+        // generation fence waits for ordered commit progress. Keeping the
+        // wait domains separate prevents notify_one from waking the wrong
+        // waiter and removes a completion-ring WakeAll from every record.
+        alignas(64) std::atomic<std::uint64_t> commit_progress_epoch{0U};
+        alignas(64) std::atomic<bool> commit_progress_waiter_armed{false};
+        // The dispatcher is the sole issuer and the ordered committer is the
+        // sole normal-path retiree. Keeping monotonic counters on separate
+        // cache lines avoids one cross-core fetch_add/fetch_sub round trip for
+        // every farm record; outstanding is their bounded difference.
+        alignas(64) std::atomic<std::uint64_t> farm_messages{0U};
+        alignas(64) std::atomic<std::uint64_t> retired_messages{0U};
+        // Completion depth is sampled from the workers' single-writer publish
+        // counters and this committer-owned take counter. It is diagnostic,
+        // not a correctness gate, so telemetry cannot serialize all parsers
+        // on one shared depth RMW.
+        alignas(64) std::atomic<std::uint64_t>
+            completion_taken_messages{0U};
+        std::atomic<std::size_t> completion_high_water{0U};
+        // Farm-only committed count. Snapshot derives inline and total
+        // committed counts from the source's authoritative decoded counter.
+        std::atomic<std::uint64_t> committed_messages{0U};
+        std::atomic<std::uint64_t> history_batch_calls{0U};
+        std::atomic<std::uint64_t> history_batched_messages{0U};
+        std::atomic<std::size_t> history_batch_max{0U};
+        std::atomic<std::uint64_t> discarded_messages{0U};
+        std::atomic<std::uint64_t> reorder_wait_samples{0U};
+        std::atomic<std::uint64_t> reorder_wait_total_ns{0U};
+        std::atomic<std::uint64_t> reorder_wait_max_ns{0U};
+        std::atomic<std::uint64_t> lease_wait_count{0U};
+    };
+
+    struct ParallelDecoderWorker final {
+        std::thread thread;
+        std::atomic<std::uint64_t> work_epoch{0U};
+        alignas(64) std::atomic<bool> work_waiter_armed{false};
+        std::atomic<bool> stop_requested{false};
+        alignas(64) std::atomic<std::uint64_t> parsed_messages{0U};
+        std::atomic<std::uint64_t> parse_failures{0U};
+        std::array<std::atomic<std::uint64_t>,
+                   market::kRealtimeHistorySourceCountV1>
+            completed_messages_by_source{};
+    };
+
+    struct alignas(64) SourceMessageCounter final {
+        std::atomic<std::uint64_t> value{0U};
     };
 
     Impl(RealtimePipelineConfigV1 config,
@@ -1847,6 +2476,10 @@ public:
             pool_config.prewarm_message_count = std::min(
                 maximum_inflight_messages,
                 kIngressPrewarmMaximumBlocks);
+            // Every ingress path holds admission_mutex_ across Acquire. This
+            // permits the pool's single-acquirer private cache while decoder
+            // and History owners continue to recycle from many threads.
+            pool_config.serialized_acquire = true;
             const realtime::OwnedIngressMessageErrorV1 pool_error =
                 realtime::OwnedIngressMessagePoolV1::Create(
                     pool_config, &ingress_pool_);
@@ -1967,7 +2600,9 @@ public:
                 decoder_config.limits = config_.decoder_limits;
                 lanes_[source] = std::make_unique<DecoderLane>(
                     config_.decoder_queue_capacity_per_source,
-                    decoder_config);
+                    decoder_config,
+                    config_.parallel_decoder_worker_count,
+                    config_.parallel_decoder_slots_per_source_worker);
                 if (!lanes_[source]->decoder.configuration_valid()) {
                     SetDetailLiteral(detail, "market decoder configuration is invalid");
                     return RealtimePipelineCreateErrorV1::
@@ -1988,8 +2623,18 @@ public:
                 }
             }
 
+            parallel_decoder_workers_.reserve(
+                config_.parallel_decoder_worker_count);
+            for (std::uint32_t worker = 0U;
+                 worker < config_.parallel_decoder_worker_count;
+                 ++worker) {
+                parallel_decoder_workers_.push_back(
+                    std::make_unique<ParallelDecoderWorker>());
+            }
+
             if (!StartDecoderThreads()) {
-                SetDetailLiteral(detail, "cannot start all four decoder threads");
+                SetDetailLiteral(
+                    detail, "cannot start decoder runtime threads");
                 return RealtimePipelineCreateErrorV1::
                     kDecoderThreadStartFailed;
             }
@@ -2064,46 +2709,42 @@ public:
                     CLOCK_MONOTONIC, &callback_entry.monotonic_ns);
             callback_entry_pointer = &callback_entry;
         }
-        RealtimePipelineIngressErrorV1 callback_error =
-            RealtimePipelineIngressErrorV1::kStopped;
         if (!callback_gate_closed_.load(std::memory_order_acquire)) {
             if (config_.startup_replay_source == nullptr) {
                 if (config_.live_ingress_capture_sink == nullptr) {
                     // Preserve the literal no-recovery callback hot path.
-                    callback_error =
-                        Ingest(message, callback_entry_pointer).error;
+                    static_cast<void>(
+                        Ingest(message, callback_entry_pointer));
                 } else {
-                    callback_error = CaptureAndIngestLive(
-                        message, callback_entry_pointer);
+                    static_cast<void>(CaptureAndIngestLive(
+                        message, callback_entry_pointer));
                 }
             } else if (startup_direct_.load(
                            std::memory_order_acquire)) {
-                callback_error = HandleRecoveryDirectCallback(
-                    message, callback_entry_pointer);
+                static_cast<void>(HandleRecoveryDirectCallback(
+                    message, callback_entry_pointer));
             } else {
                 startup_callback_pending_.fetch_add(
                     1U, std::memory_order_acq_rel);
                 std::unique_lock<std::mutex> startup(startup_mutex_);
                 if (startup_state_ == StartupState::kBuffering) {
-                    callback_error = BufferStartupCallback(
-                        message, callback_entry_pointer);
+                    static_cast<void>(BufferStartupCallback(
+                        message, callback_entry_pointer));
                 } else if (startup_state_ == StartupState::kDirect) {
                     // The same mutex linearizes the final buffered callback
                     // with the first direct callback. With one SDK I/O thread,
                     // this also preserves the vendor callback order exactly.
-                    callback_error = HandleRecoveryDirectCallback(
-                        message, callback_entry_pointer);
+                    static_cast<void>(HandleRecoveryDirectCallback(
+                        message, callback_entry_pointer));
                 }
                 startup.unlock();
                 startup_callback_pending_.fetch_sub(
                     1U, std::memory_order_acq_rel);
             }
         }
-        last_callback_error_.store(
-            static_cast<std::uint8_t>(callback_error),
-            std::memory_order_release);
         if (active_callbacks_.fetch_sub(
-                1U, std::memory_order_acq_rel) == 1U) {
+                1U, std::memory_order_acq_rel) == 1U &&
+            callback_waiter_armed_.load(std::memory_order_acquire)) {
             active_callbacks_.notify_all();
         }
     }
@@ -3366,11 +4007,12 @@ public:
                     }
                 };
         bool published = false;
-        while (lanes_[source_slot] != nullptr &&
-               !(published =
-                     lanes_[source_slot]->queue.TryPushWithCommit(
-                         std::move(command), commit)) &&
-               wait_for_decoder_capacity) {
+        while (lanes_[source_slot] != nullptr) {
+            published = lanes_[source_slot]->queue.TryPushWithCommit(
+                std::move(command), commit);
+            if (published || !wait_for_decoder_capacity) {
+                break;
+            }
             if (fatal_.load(std::memory_order_acquire)) {
                 break;
             }
@@ -3386,6 +4028,25 @@ public:
             admission.unlock();
             std::this_thread::sleep_for(kStartupQueueRetryDelay);
             admission.lock();
+
+            // Stop, a terminal cut, or an asynchronous History failure can
+            // linearize while this bounded external/replay producer sleeps.
+            // Revalidate under the same mutex that protects every producer
+            // before retrying queue publication. This keeps the ordinary SDK
+            // callback free of a per-message publication-gate RMW.
+            const bool history_fatal =
+                history_ != nullptr && history_->fatal();
+            if (fatal_.load(std::memory_order_acquire) || history_fatal) {
+                result.error = RealtimePipelineIngressErrorV1::kFatal;
+                ++rejected_messages_;
+                TripFatalWithAdmissionLockHeld();
+                return result;
+            }
+            if (!accepting_.load(std::memory_order_acquire)) {
+                result.error = RealtimePipelineIngressErrorV1::kStopped;
+                ++post_cut_messages_;
+                return result;
+            }
         }
         if (!published) {
             result.error =
@@ -3456,6 +4117,12 @@ public:
             }
             return rejected;
         }
+        // A bounded retry releases admission_mutex_ so decoders and terminal
+        // control can make progress. Retain one logical external producer
+        // across that gap: otherwise two callers could precompute the same
+        // next global/source sequence and later publish both stale commands.
+        const std::lock_guard<std::mutex> external_owner(
+            external_ingress_mutex_);
         CallbackClockObservation clocks{};
         clocks.realtime_ns = input.recv_realtime_ns;
         clocks.monotonic_ns = input.recv_monotonic_ns;
@@ -3884,8 +4551,11 @@ public:
             result.source_sequences = source_sequences_;
             result.last_started_generation = last_started_generation_;
         }
-        result.decoded_messages =
-            decoded_messages_.load(std::memory_order_acquire);
+        for (const SourceMessageCounter& counter :
+             decoded_messages_by_source_) {
+            result.decoded_messages +=
+                counter.value.load(std::memory_order_acquire);
+        }
         result.last_published_generation =
             last_published_generation_.load(std::memory_order_acquire);
         result.last_decode_error =
@@ -3910,6 +4580,108 @@ public:
             if (lanes_[source] != nullptr) {
                 result.decoder_queues[source] =
                     lanes_[source]->queue.Snapshot();
+                if (lanes_[source]->completion != nullptr) {
+                    RealtimeParallelDecoderSourceSnapshotV1& target =
+                        result.parallel_decoder.sources[source];
+                    const std::uint64_t farm_committed =
+                        lanes_[source]->committed_messages.load(
+                            std::memory_order_acquire);
+                    const std::uint64_t committed_total =
+                        decoded_messages_by_source_[source].value.load(
+                            std::memory_order_acquire);
+                    target.inline_messages =
+                        committed_total >= farm_committed
+                            ? committed_total - farm_committed
+                            : 0U;
+                    target.farm_messages =
+                        lanes_[source]->farm_messages.load(
+                            std::memory_order_acquire);
+                    target.dispatched_messages =
+                        target.inline_messages + target.farm_messages;
+                    target.completed_messages =
+                        target.inline_messages;
+                    for (const std::unique_ptr<ParallelDecoderWorker>&
+                             worker : parallel_decoder_workers_) {
+                        target.completed_messages +=
+                            worker->completed_messages_by_source[source]
+                                .load(std::memory_order_acquire);
+                    }
+                    target.committed_messages = committed_total;
+                    target.history_batch_calls =
+                        lanes_[source]->history_batch_calls.load(
+                            std::memory_order_acquire);
+                    target.history_batched_messages =
+                        lanes_[source]->history_batched_messages.load(
+                            std::memory_order_acquire);
+                    target.history_batch_max =
+                        lanes_[source]->history_batch_max.load(
+                            std::memory_order_acquire);
+                    target.discarded_messages =
+                        lanes_[source]->discarded_messages.load(
+                            std::memory_order_acquire);
+                    target.farm_outstanding =
+                        ParallelFarmOutstanding(*lanes_[source]);
+                    target.committed_source_sequence = committed_total;
+                    target.completion_capacity =
+                        lanes_[source]->completion->capacity();
+                    target.completion_depth =
+                        ParallelCompletionDepth(
+                            static_cast<std::uint8_t>(source),
+                            *lanes_[source]);
+                    target.completion_high_water =
+                        lanes_[source]->completion_high_water.load(
+                            std::memory_order_acquire);
+                    target.completion_publish_failures =
+                        lanes_[source]
+                            ->completion->publish_failures();
+                    target.reorder_wait_samples =
+                        lanes_[source]->reorder_wait_samples.load(
+                            std::memory_order_acquire);
+                    target.reorder_wait_total_ns =
+                        lanes_[source]->reorder_wait_total_ns.load(
+                            std::memory_order_acquire);
+                    target.reorder_wait_max_ns =
+                        lanes_[source]->reorder_wait_max_ns.load(
+                            std::memory_order_acquire);
+                    target.lease_wait_count =
+                        lanes_[source]->lease_wait_count.load(
+                            std::memory_order_acquire);
+                }
+            }
+        }
+        result.parallel_decoder.enabled =
+            config_.parallel_decoder_worker_count != 0U;
+        result.parallel_decoder.idle_inline_enabled =
+            config_.parallel_decoder_worker_count != 0U &&
+            config_.parallel_decoder_idle_inline_enabled;
+        result.parallel_decoder.worker_count =
+            config_.parallel_decoder_worker_count;
+        result.parallel_decoder.slots_per_source_worker =
+            config_.parallel_decoder_slots_per_source_worker;
+        for (std::size_t worker = 0U;
+             worker < parallel_decoder_workers_.size();
+             ++worker) {
+            RealtimeParallelDecoderWorkerSnapshotV1& target =
+                result.parallel_decoder.workers[worker];
+            target.parsed_messages =
+                parallel_decoder_workers_[worker]
+                    ->parsed_messages.load(std::memory_order_acquire);
+            target.parse_failures =
+                parallel_decoder_workers_[worker]
+                    ->parse_failures.load(std::memory_order_acquire);
+            for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
+                if (lane != nullptr &&
+                    worker < lane->parallel_shards.size()) {
+                    const ParallelIssueQueue& issue =
+                        lane->parallel_shards[worker]->issue;
+                    target.issue_depth += issue.DepthSnapshot();
+                    // TryPush samples the consumer head before publishing its
+                    // tail, so a concurrent pop can make each shard HWM a
+                    // conservative upper bound rather than an exact peak.
+                    // Summing four independently timed shard upper bounds is
+                    // also only a conservative simultaneous-depth bound.
+                    target.issue_high_water += issue.HighWater();
+                }
             }
         }
         result.accepting = accepting_.load(std::memory_order_acquire);
@@ -4017,7 +4789,10 @@ private:
                    std::memory_order_release,
                    std::memory_order_acquire)) {
         }
-        applied_progress_cv_.notify_all();
+        if (applied_progress_waiters_.load(
+                std::memory_order_relaxed) != 0U) {
+            applied_progress_cv_.notify_all();
+        }
         RequestProgressPublication();
         if (fatal_.load(std::memory_order_acquire)) {
             ReportAppliedSequenceFailure(
@@ -4291,6 +5066,14 @@ private:
                     applied_window_capacity_)) {
             return true;
         }
+        applied_progress_waiters_.fetch_add(
+            1U, std::memory_order_acq_rel);
+        struct AppliedWaiterGuard final {
+            std::atomic<std::size_t>* count = nullptr;
+            ~AppliedWaiterGuard() {
+                count->fetch_sub(1U, std::memory_order_acq_rel);
+            }
+        } waiter_guard{&applied_progress_waiters_};
         try {
             std::unique_lock<std::mutex> lock(applied_progress_mutex_);
             for (;;) {
@@ -4327,6 +5110,7 @@ private:
 
     void RequestProgressPublication() noexcept {
         if (config_.processing_progress_sink != nullptr &&
+            !progress_wake_pending_.load(std::memory_order_relaxed) &&
             !progress_wake_pending_.exchange(
                 true, std::memory_order_acq_rel)) {
             progress_wake_.release();
@@ -4378,6 +5162,14 @@ private:
             target_sequence) {
             return true;
         }
+        applied_progress_waiters_.fetch_add(
+            1U, std::memory_order_acq_rel);
+        struct AppliedWaiterGuard final {
+            std::atomic<std::size_t>* count = nullptr;
+            ~AppliedWaiterGuard() {
+                count->fetch_sub(1U, std::memory_order_acq_rel);
+            }
+        } waiter_guard{&applied_progress_waiters_};
         try {
             std::unique_lock<std::mutex> lock(applied_progress_mutex_);
             for (;;) {
@@ -4439,6 +5231,12 @@ private:
             config_.decoder_queue_capacity_per_source == 0U ||
             config_.decoder_queue_capacity_per_source >
                 std::numeric_limits<std::size_t>::max() - 2U ||
+            config_.parallel_decoder_worker_count >
+                kRealtimeParallelDecoderMaximumWorkersV1 ||
+            (config_.parallel_decoder_worker_count != 0U &&
+             (config_.parallel_decoder_slots_per_source_worker == 0U ||
+              config_.parallel_decoder_slots_per_source_worker >
+                  kMaximumParallelDecoderSlotsPerShard)) ||
             config_.completion_tracker_capacity < 2U ||
             config_.tick_ring_capacity < 2U ||
             config_.store_worker_count == 0U ||
@@ -4567,6 +5365,22 @@ private:
 
     [[nodiscard]] bool StartDecoderThreads() noexcept {
         try {
+            if (config_.parallel_decoder_worker_count != 0U) {
+                // Start only the four source owners. Parse workers and
+                // ordered committers are created when a source Pop first
+                // observes remaining ring occupancy at its local threshold,
+                // so the idle path has the same runnable decoder-thread count
+                // as the legacy topology.
+                for (std::uint8_t source = 0U;
+                     source < market::kRealtimeHistorySourceCountV1;
+                     ++source) {
+                    lanes_[source]->thread = std::thread([this, source] {
+                        ParallelDispatchLoop(source);
+                    });
+                }
+                decoder_threads_started_ = true;
+                return true;
+            }
             for (std::uint8_t source = 0U;
                  source < market::kRealtimeHistorySourceCountV1;
                  ++source) {
@@ -4578,8 +5392,943 @@ private:
             return true;
         } catch (...) {
             RequestDecoderStop();
+            for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
+                if (lane != nullptr && !lane->thread.joinable()) {
+                    lane->dispatch_done.store(
+                        true, std::memory_order_release);
+                    if (lane->completion != nullptr) {
+                        lane->completion->WakeAll();
+                    }
+                }
+            }
             JoinDecoderThreads();
             return false;
+        }
+    }
+
+    [[nodiscard]] bool EnsureParallelFarmStarted() noexcept {
+        if (parallel_farm_started_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        try {
+            std::call_once(parallel_farm_start_once_, [this]() noexcept {
+                try {
+                    for (std::uint32_t worker = 0U;
+                         worker < config_.parallel_decoder_worker_count;
+                         ++worker) {
+                        parallel_decoder_workers_[worker]->thread =
+                            std::thread([this, worker] {
+                                ParallelDecoderWorkerLoop(worker);
+                            });
+                    }
+                    for (std::uint8_t source = 0U;
+                         source < market::kRealtimeHistorySourceCountV1;
+                         ++source) {
+                        lanes_[source]->commit_thread =
+                            std::thread([this, source] {
+                                ParallelCommitLoop(source);
+                            });
+                    }
+                    parallel_farm_started_.store(
+                        true, std::memory_order_release);
+                } catch (...) {
+                    parallel_farm_start_failed_.store(
+                        true, std::memory_order_release);
+                }
+            });
+        } catch (...) {
+            parallel_farm_start_failed_.store(
+                true, std::memory_order_release);
+        }
+        return parallel_farm_started_.load(
+                   std::memory_order_acquire) &&
+               !parallel_farm_start_failed_.load(
+                   std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::size_t ParallelFarmActivationDepth() const noexcept {
+        if (config_.parallel_decoder_farm_activation_queue_depth == 0U) {
+            return 0U;
+        }
+        const std::size_t queue_capacity =
+            config_.decoder_queue_capacity_per_source;
+        const std::size_t capacity_limited_threshold =
+            queue_capacity -
+            std::max<std::size_t>(1U, queue_capacity / 4U);
+        return std::min(
+            config_.parallel_decoder_farm_activation_queue_depth,
+            capacity_limited_threshold);
+    }
+
+    [[nodiscard]] bool ParallelFarmPressure(
+        std::size_t remaining_ring_depth) const noexcept {
+        const std::size_t single_source_threshold =
+            ParallelFarmActivationDepth();
+        if (single_source_threshold == 0U) {
+            return true;
+        }
+        // The four source owners already decode independently on four cores.
+        // Arming the farm from aggregate multi-source pressure replaces that
+        // useful parallelism with two extra handoffs per record and can make a
+        // balanced stream slower. Reserve the farm for a source that cannot
+        // keep up with its own FIFO.
+        return remaining_ring_depth >= single_source_threshold;
+    }
+
+    [[nodiscard]] static std::size_t ParallelFarmOutstanding(
+        const DecoderLane& lane) noexcept {
+        const std::uint64_t retired = lane.retired_messages.load(
+            std::memory_order_acquire);
+        // The committer can only retire a task after its issue-queue and
+        // completion publication. Sample the single-writer issued frontier
+        // last so an observed retirement cannot be compared with an older
+        // issued value.
+        const std::uint64_t issued = lane.farm_messages.load(
+            std::memory_order_acquire);
+        if (retired > issued) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        if (retired == issued) {
+            return 0U;
+        }
+        const std::uint64_t difference = issued - retired;
+        return difference >
+                       static_cast<std::uint64_t>(
+                           std::numeric_limits<std::size_t>::max())
+                   ? std::numeric_limits<std::size_t>::max()
+                   : static_cast<std::size_t>(difference);
+    }
+
+    [[nodiscard]] static std::size_t ParallelWorkerForSourceSequence(
+        std::uint8_t source,
+        std::uint64_t source_sequence,
+        std::uint32_t worker_count) noexcept {
+        if (source_sequence == 0U || worker_count == 0U) {
+            return 0U;
+        }
+        return static_cast<std::size_t>(
+            (source_sequence - 1U + source) % worker_count);
+    }
+
+    [[nodiscard]] std::size_t ParallelCompletionDepth(
+        std::uint8_t source,
+        const DecoderLane& lane) const noexcept {
+        std::uint64_t published = 0U;
+        for (const std::unique_ptr<ParallelDecoderWorker>& worker :
+             parallel_decoder_workers_) {
+            published += worker->completed_messages_by_source[source].load(
+                std::memory_order_acquire);
+        }
+        const std::uint64_t taken =
+            lane.completion_taken_messages.load(
+                std::memory_order_acquire);
+        if (taken >= published) {
+            return 0U;
+        }
+        const std::uint64_t difference = published - taken;
+        const std::size_t capacity = lane.completion->capacity();
+        return difference >= static_cast<std::uint64_t>(capacity)
+                   ? capacity
+                   : static_cast<std::size_t>(difference);
+    }
+
+    void SampleParallelCompletionDepth(
+        std::uint8_t source,
+        DecoderLane* lane) noexcept {
+        if (lane == nullptr || lane->completion == nullptr) {
+            return;
+        }
+        const std::size_t depth =
+            ParallelCompletionDepth(source, *lane);
+        const std::size_t high_water =
+            lane->completion_high_water.load(
+                std::memory_order_relaxed);
+        if (depth > high_water) {
+            lane->completion_high_water.store(
+                depth, std::memory_order_relaxed);
+        }
+    }
+
+    void ParallelDispatchLoop(std::uint8_t source) noexcept {
+        DecoderLane& lane = *lanes_[source];
+        DecoderCommand command{};
+        std::size_t remaining_ring_depth = 0U;
+        bool farm_interval_active = false;
+        while (lane.queue.Pop(&command, &remaining_ring_depth)) {
+            if (command.kind == CommandKind::kGenerationFence) {
+                const std::uint64_t through =
+                    lane.last_dispatched_source_sequence.load(
+                        std::memory_order_acquire);
+                const bool farm_committed =
+                    lane.farm_messages.load(
+                        std::memory_order_acquire) == 0U ||
+                    WaitForParallelCommit(source, through);
+                if ((!farm_committed ||
+                     !ParkAtGenerationFence(
+                         source, command.generation)) &&
+                    !fatal_.load(std::memory_order_acquire)) {
+                    TripFatal();
+                }
+                farm_interval_active = false;
+                command = DecoderCommand{};
+                continue;
+            }
+            if (fatal_.load(std::memory_order_acquire)) {
+                command = DecoderCommand{};
+                continue;
+            }
+            if (!command.message ||
+                command.message->source_slot() != source ||
+                !WaitForAppliedDispatchWindow(
+                    command.message->global_ingress_sequence())) {
+                ReportPipelineFailure(
+                    "parallel_dispatch_window",
+                    source,
+                    command.message
+                        ? command.message->global_ingress_sequence()
+                        : 0U,
+                    applied_window_capacity_);
+                TripFatal();
+                command = DecoderCommand{};
+                continue;
+            }
+
+            const std::uint64_t source_sequence =
+                command.message->source_sequence();
+            // Preserve the legacy low-latency path for bounded bursts. The
+            // authoritative source owner performs the existing DecodeOne
+            // path until observed pressure crosses the configured threshold.
+            // It returns inline after the farm drains and pressure subsides.
+            bool decode_inline = false;
+            if (config_.parallel_decoder_idle_inline_enabled &&
+                config_.parallel_decoder_farm_activation_queue_depth !=
+                    0U) {
+                if (!farm_interval_active) {
+                    decode_inline =
+                        !ParallelFarmPressure(remaining_ring_depth);
+                    farm_interval_active = !decode_inline;
+                } else if (ParallelFarmOutstanding(lane) == 0U &&
+                           !ParallelFarmPressure(
+                               remaining_ring_depth)) {
+                    farm_interval_active = false;
+                    decode_inline = true;
+                }
+            }
+            if (decode_inline &&
+                !fatal_.load(std::memory_order_acquire)) {
+                std::uint64_t dequeue_monotonic_ns = 0U;
+                if (latency_collector_ != nullptr) {
+                    static_cast<void>(ReadClockNs(
+                        CLOCK_MONOTONIC, &dequeue_monotonic_ns));
+                }
+                std::uint64_t decode_start_monotonic_ns = 0U;
+                if (latency_collector_ != nullptr) {
+                    static_cast<void>(ReadClockNs(
+                        CLOCK_MONOTONIC,
+                        &decode_start_monotonic_ns));
+                }
+                DecoderTimingObservation timing{};
+                const bool decoded = DecodeOne(
+                    source,
+                    command.message,
+                    command.identity,
+                    command.additional_market_notices,
+                    latency_collector_ != nullptr ? &timing : nullptr);
+                if (latency_collector_ != nullptr) {
+                    latency_collector_->RecordDecoderWork(
+                        source,
+                        command.queue_publish_monotonic_ns,
+                        dequeue_monotonic_ns,
+                        decode_start_monotonic_ns,
+                        timing.decode_complete_monotonic_ns,
+                        timing.history_submit_complete_monotonic_ns,
+                        command.queue_publish_monotonic_ns != 0U &&
+                            dequeue_monotonic_ns != 0U &&
+                            dequeue_monotonic_ns >=
+                                command.queue_publish_monotonic_ns,
+                        decoded &&
+                            decode_start_monotonic_ns != 0U &&
+                            timing.decode_complete_clock_valid,
+                        decoded &&
+                            timing.decode_complete_clock_valid &&
+                            timing.history_submit_complete_clock_valid);
+                }
+                if (!decoded) {
+                    TripFatal();
+                    command = DecoderCommand{};
+                    continue;
+                }
+                command = DecoderCommand{};
+                continue;
+            }
+            if (!EnsureParallelFarmStarted()) {
+                ReportPipelineFailure(
+                    "parallel_farm_start",
+                    source,
+                    command.message
+                        ? command.message->global_ingress_sequence()
+                        : 0U,
+                    config_.parallel_decoder_worker_count);
+                TripFatal();
+                command = DecoderCommand{};
+                continue;
+            }
+            if (ParallelFarmOutstanding(lane) == 0U) {
+                // Every prior item on this source completed through the
+                // inline owner. Initialize/advance the farm-only ordering
+                // frontiers once when crossing into a new farm interval.
+                lane.last_dispatched_source_sequence.store(
+                    source_sequence - 1U, std::memory_order_release);
+                lane.committed_source_sequence.store(
+                    source_sequence - 1U, std::memory_order_release);
+            }
+            farm_interval_active = true;
+            const std::size_t worker =
+                ParallelWorkerForSourceSequence(
+                    source,
+                    source_sequence,
+                    config_.parallel_decoder_worker_count);
+            const std::size_t slot = static_cast<std::size_t>(
+                ((source_sequence - 1U) /
+                 config_.parallel_decoder_worker_count) %
+                config_.parallel_decoder_slots_per_source_worker);
+            ParallelDecodeShard& shard =
+                *lane.parallel_shards[worker];
+            ParallelDecodeTask* const task = shard.Acquire(
+                slot, fatal_, &lane.lease_wait_count);
+            if (task == nullptr) {
+                if (!fatal_.load(std::memory_order_acquire)) {
+                    ReportPipelineFailure(
+                        "parallel_decode_lease",
+                        source,
+                        command.message->global_ingress_sequence(),
+                        worker);
+                    TripFatal();
+                }
+                command = DecoderCommand{};
+                continue;
+            }
+            if (fatal_.load(std::memory_order_acquire)) {
+                task->ResetAndRelease(
+                    &shard.release_epoch,
+                    &shard.release_waiter_armed);
+                command = DecoderCommand{};
+                continue;
+            }
+            task->source_slot = source;
+            task->global_ingress_sequence =
+                command.message->global_ingress_sequence();
+            task->source_sequence = source_sequence;
+            task->tick_stream_sequence =
+                command.message->tick_stream_sequence();
+            task->command = std::move(command);
+            ParallelDecoderWorker& owner =
+                *parallel_decoder_workers_[worker];
+            IncrementSingleWriterCounter(&lane.farm_messages);
+            if (!shard.issue.TryPush(task)) {
+                DecrementSingleWriterCounter(&lane.farm_messages);
+                const std::uint64_t ingress_sequence =
+                    task->command.message
+                        ? task->command.message->global_ingress_sequence()
+                        : 0U;
+                task->ResetAndRelease(
+                    &shard.release_epoch,
+                    &shard.release_waiter_armed);
+                ReportPipelineFailure(
+                    "parallel_issue_queue",
+                    source,
+                    ingress_sequence,
+                    worker);
+                TripFatal();
+                command = DecoderCommand{};
+                continue;
+            }
+            lane.last_dispatched_source_sequence.store(
+                source_sequence, std::memory_order_release);
+            if (owner.work_waiter_armed.exchange(
+                    false, std::memory_order_acq_rel)) {
+                owner.work_epoch.fetch_add(
+                    1U, std::memory_order_release);
+                owner.work_epoch.notify_one();
+            }
+            command = DecoderCommand{};
+        }
+        lane.dispatch_done.store(true, std::memory_order_release);
+        if (lane.completion != nullptr) {
+            lane.completion->WakeAll();
+        }
+    }
+
+    [[nodiscard]] bool WaitForParallelCommit(
+        std::uint8_t source,
+        std::uint64_t sequence) noexcept {
+        if (source >= market::kRealtimeHistorySourceCountV1 ||
+            lanes_[source] == nullptr ||
+            lanes_[source]->completion == nullptr) {
+            return false;
+        }
+        DecoderLane& lane = *lanes_[source];
+        const auto commit_and_leases_ready = [&]() noexcept {
+            return lane.committed_source_sequence.load(
+                       std::memory_order_acquire) >= sequence &&
+                   ParallelFarmOutstanding(lane) == 0U;
+        };
+        while (!fatal_.load(std::memory_order_acquire) &&
+               !commit_and_leases_ready()) {
+            const std::uint64_t observed =
+                lane.commit_progress_epoch.load(
+                    std::memory_order_acquire);
+            const bool already_armed =
+                lane.commit_progress_waiter_armed.exchange(
+                    true, std::memory_order_acq_rel);
+            if (already_armed) {
+                TerminateInvariant("parallel_commit_waiter_rearmed");
+            }
+            const bool wait_required =
+                !commit_and_leases_ready() &&
+                !fatal_.load(std::memory_order_acquire);
+            if (wait_required) {
+                lane.commit_progress_epoch.wait(
+                    observed, std::memory_order_acquire);
+                // Terminal progress may precede arming and make wait return
+                // immediately. Always leave the single-waiter flag clear.
+                static_cast<void>(
+                    lane.commit_progress_waiter_armed.exchange(
+                        false, std::memory_order_acq_rel));
+            } else {
+                // A signal that precedes arming is observed through the
+                // exchange above. In that case no signal owns this armed bit,
+                // so the waiter must explicitly disarm before returning.
+                static_cast<void>(
+                    lane.commit_progress_waiter_armed.exchange(
+                        false, std::memory_order_acq_rel));
+            }
+        }
+        return !fatal_.load(std::memory_order_acquire) &&
+               commit_and_leases_ready();
+    }
+
+    static void SignalParallelCommitProgress(
+        DecoderLane* lane,
+        bool terminal) noexcept {
+        if (lane == nullptr) {
+            return;
+        }
+        const bool waiter =
+            lane->commit_progress_waiter_armed.exchange(
+                false, std::memory_order_acq_rel);
+        if (!waiter && !terminal) {
+            return;
+        }
+        lane->commit_progress_epoch.fetch_add(
+            1U, std::memory_order_release);
+        if (terminal) {
+            lane->commit_progress_epoch.notify_all();
+        } else {
+            lane->commit_progress_epoch.notify_one();
+        }
+    }
+
+    [[nodiscard]] bool TryPopParallelWorkerTask(
+        std::uint32_t worker,
+        std::uint8_t* next_source,
+        std::uint8_t* output_source,
+        ParallelDecodeTask** output) noexcept {
+        if (next_source == nullptr || output_source == nullptr ||
+            output == nullptr ||
+            worker >= parallel_decoder_workers_.size()) {
+            return false;
+        }
+        for (std::size_t offset = 0U;
+             offset < market::kRealtimeHistorySourceCountV1;
+             ++offset) {
+            const std::uint8_t source = static_cast<std::uint8_t>(
+                (static_cast<std::size_t>(*next_source) + offset) %
+                market::kRealtimeHistorySourceCountV1);
+            if (lanes_[source]->parallel_shards[worker]
+                    ->issue.TryPop(output)) {
+                *output_source = source;
+                *next_source = static_cast<std::uint8_t>(
+                    (static_cast<std::size_t>(source) + 1U) %
+                    market::kRealtimeHistorySourceCountV1);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void ParallelDecoderWorkerLoop(std::uint32_t worker) noexcept {
+        ParallelDecoderWorker& owner =
+            *parallel_decoder_workers_[worker];
+        std::uint8_t next_source = 0U;
+        for (;;) {
+            ParallelDecodeTask* task = nullptr;
+            std::uint8_t popped_source =
+                static_cast<std::uint8_t>(
+                    market::kRealtimeHistorySourceCountV1);
+            if (!TryPopParallelWorkerTask(
+                    worker, &next_source, &popped_source, &task)) {
+                if (owner.stop_requested.load(
+                        std::memory_order_acquire)) {
+                    // Dispatchers are joined before stop is published. Rescan
+                    // after the acquire so their final issue publication
+                    // cannot be stranded by an earlier empty observation.
+                    if (!TryPopParallelWorkerTask(
+                            worker,
+                            &next_source,
+                            &popped_source,
+                            &task)) {
+                        return;
+                    }
+                }
+                if (task == nullptr) {
+                    const std::uint64_t observed =
+                        owner.work_epoch.load(std::memory_order_acquire);
+                    const bool already_armed =
+                        owner.work_waiter_armed.exchange(
+                            true, std::memory_order_acq_rel);
+                    if (already_armed) {
+                        TerminateInvariant(
+                            "parallel_worker_waiter_rearmed");
+                    }
+                    const bool found_after_arm =
+                        TryPopParallelWorkerTask(
+                            worker,
+                            &next_source,
+                            &popped_source,
+                            &task);
+                    if (!found_after_arm &&
+                        !owner.stop_requested.load(
+                            std::memory_order_acquire)) {
+                        owner.work_epoch.wait(
+                            observed, std::memory_order_acquire);
+                        // A fatal drain can advance the epoch before this
+                        // worker arms, so wait may return immediately without
+                        // a producer having observed and cleared the bit.
+                        static_cast<void>(
+                            owner.work_waiter_armed.exchange(
+                                false, std::memory_order_acq_rel));
+                        continue;
+                    }
+                    static_cast<void>(
+                        owner.work_waiter_armed.exchange(
+                            false, std::memory_order_acq_rel));
+                    if (!found_after_arm) {
+                        if (owner.stop_requested.load(
+                                std::memory_order_acquire)) {
+                            // As above, the acquire must precede the final
+                            // empty scan that authorizes worker exit.
+                            if (!TryPopParallelWorkerTask(
+                                    worker,
+                                    &next_source,
+                                    &popped_source,
+                                    &task)) {
+                                return;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if (task == nullptr ||
+                popped_source >=
+                    market::kRealtimeHistorySourceCountV1 ||
+                task->source_sequence == 0U ||
+                task->global_ingress_sequence == 0U) {
+                TerminateInvariant("parallel_issue_task_identity_corrupt");
+            }
+            const std::uint8_t source = popped_source;
+            if (task->source_slot != source ||
+                !task->command.message ||
+                task->command.message->source_slot() != source ||
+                task->command.message->source_sequence() !=
+                    task->source_sequence ||
+                task->command.message->global_ingress_sequence() !=
+                    task->global_ingress_sequence) {
+                ReportPipelineFailure(
+                    "parallel_issue_corrupt",
+                    source,
+                    task->global_ingress_sequence,
+                    worker);
+                task->source_slot = source;
+                task->command.message.reset();
+                task->decode_error =
+                    market::MarketDecodeErrorV1::kInvalidInput;
+                task->identity_applied = false;
+                TripFatal();
+                if (!lanes_[source]->completion->PublishFailure(task)) {
+                    TerminateInvariant(
+                        "parallel_issue_failure_tombstone_publish");
+                }
+                continue;
+            }
+            if (latency_collector_ != nullptr) {
+                task->worker_dequeue_clock_valid = ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &task->worker_dequeue_monotonic_ns);
+                task->decode_start_clock_valid = ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &task->decode_start_monotonic_ns);
+            }
+            const bool decode_attempted =
+                !fatal_.load(std::memory_order_acquire);
+            if (decode_attempted) {
+                task->decode_error = DecodeStatelessOne(
+                    source, task->command.message, &task->decoded);
+                if (task->decode_error ==
+                    market::MarketDecodeErrorV1::kNone) {
+                    task->identity_applied =
+                        market::ApplyDailyInstrumentIdentityV2(
+                            task->command.identity,
+                            &task->decoded);
+                    if (task->identity_applied) {
+                        std::visit(
+                            [additional_market_notices =
+                                 task->command
+                                     .additional_market_notices](
+                                auto& value) noexcept {
+                                value.common.market_notices |=
+                                    additional_market_notices;
+                            },
+                            task->decoded);
+                    }
+                }
+            }
+            if (latency_collector_ != nullptr) {
+                task->decode_complete_clock_valid = ReadClockNs(
+                    CLOCK_MONOTONIC,
+                    &task->decode_complete_monotonic_ns);
+            }
+            // DecodeStateless owns every published field and clears
+            // origin.body. The large callback copy is no longer needed by
+            // ordered finalization, so return it to the ingress pool on the
+            // parse core instead of carrying it through the reorder window.
+            task->command.message.reset();
+            if (decode_attempted) {
+                IncrementSingleWriterCounter(
+                    &owner.parsed_messages);
+                if (task->decode_error !=
+                    market::MarketDecodeErrorV1::kNone) {
+                    IncrementSingleWriterCounter(
+                        &owner.parse_failures);
+                }
+            }
+            if (source >= market::kRealtimeHistorySourceCountV1 ||
+                lanes_[source]->completion == nullptr ||
+                !lanes_[source]->completion->Publish(task)) {
+                const std::uint64_t ingress_sequence =
+                    task->global_ingress_sequence;
+                ReportPipelineFailure(
+                    "parallel_completion_publish",
+                    source,
+                    ingress_sequence,
+                    worker);
+                TripFatal();
+                if (!lanes_[source]->completion->PublishFailure(task)) {
+                    TerminateInvariant(
+                        "parallel_completion_failure_tombstone_publish");
+                }
+                continue;
+            }
+            if (decode_attempted) {
+                // Count only successfully published decode completions. This
+                // keeps normal-path completed telemetry exact and makes the
+                // sampled published-minus-taken depth a lower-bound estimate
+                // instead of counting a cell before it exists.
+                std::atomic<std::uint64_t>& completed =
+                    owner.completed_messages_by_source[source];
+                IncrementSingleWriterCounter(&completed);
+            }
+        }
+    }
+
+    void ParallelCommitLoop(std::uint8_t source) noexcept {
+        DecoderLane& lane = *lanes_[source];
+        std::uint64_t next_sequence = 1U;
+        constexpr std::size_t kCompletionDepthSampleInterval = 64U;
+        std::size_t completion_depth_sample_countdown = 1U;
+        for (;;) {
+            // Observe the wake epoch before checking the target cell. A
+            // publication between the empty check and wait then changes this
+            // epoch and cannot become a lost final wake.
+            const std::uint64_t observed = lane.completion->epoch();
+            const std::uint64_t externally_committed =
+                lane.committed_source_sequence.load(
+                    std::memory_order_acquire);
+            if (next_sequence <= externally_committed) {
+                next_sequence = externally_committed + 1U;
+            }
+            --completion_depth_sample_countdown;
+            if (completion_depth_sample_countdown == 0U) {
+                SampleParallelCompletionDepth(source, &lane);
+                completion_depth_sample_countdown =
+                    kCompletionDepthSampleInterval;
+            }
+            ParallelDecodeTask* task =
+                lane.completion->TryTake(next_sequence);
+            bool completion_publish_failed = false;
+            if (task == nullptr) {
+                task = lane.completion->TryTakeFailure(next_sequence);
+                completion_publish_failed = task != nullptr;
+            }
+            if (task != nullptr) {
+                constexpr std::size_t kMaximumCommitBatch =
+                    market::kRealtimeHistoryMaximumSubmitBatchV1;
+                std::array<ParallelDecodeTask*, kMaximumCommitBatch>
+                    ready_tasks{};
+                std::array<bool, kMaximumCommitBatch>
+                    completion_failures{};
+                std::array<bool, kMaximumCommitBatch>
+                    commit_results{};
+                ready_tasks[0U] = task;
+                completion_failures[0U] =
+                    completion_publish_failed;
+                std::size_t ready_count = 1U;
+                // Greedily take only results that are already contiguous.
+                // The first missing cell ends the batch immediately; no
+                // latency is added by waiting for a preferred batch size.
+                while (ready_count < kMaximumCommitBatch &&
+                       next_sequence <=
+                           std::numeric_limits<std::uint64_t>::max() -
+                               ready_count) {
+                    const std::uint64_t candidate_sequence =
+                        next_sequence + ready_count;
+                    ParallelDecodeTask* candidate =
+                        lane.completion->TryTake(candidate_sequence);
+                    bool candidate_failed = false;
+                    if (candidate == nullptr) {
+                        candidate = lane.completion->TryTakeFailure(
+                            candidate_sequence);
+                        candidate_failed = candidate != nullptr;
+                    }
+                    if (candidate == nullptr) {
+                        break;
+                    }
+                    ready_tasks[ready_count] = candidate;
+                    completion_failures[ready_count] =
+                        candidate_failed;
+                    ++ready_count;
+                }
+
+                market::RealtimeHistorySubmissionBatchV1
+                    submission_batch;
+                market::RealtimeHistorySubmissionBatchV1*
+                    submission_batch_pointer = nullptr;
+                if (ready_count > 1U &&
+                    !completion_failures[0U] &&
+                    !fatal_.load(std::memory_order_acquire)) {
+                    const market::RealtimeHistorySubmitErrorV1 begin_error =
+                        history_->BeginSubmissionBatch(
+                            source, &submission_batch);
+                    if (begin_error ==
+                        market::RealtimeHistorySubmitErrorV1::kNone) {
+                        submission_batch_pointer = &submission_batch;
+                    } else {
+                        ReportPipelineFailure(
+                            "history_submit_batch_begin",
+                            source,
+                            ready_tasks[0U]
+                                ->global_ingress_sequence,
+                            static_cast<std::uint64_t>(begin_error));
+                        TripFatal();
+                    }
+                }
+
+                std::size_t batch_committed = 0U;
+                for (std::size_t index = 0U;
+                     index < ready_count;
+                     ++index) {
+                    task = ready_tasks[index];
+                    completion_publish_failed =
+                        completion_failures[index];
+                    const std::uint64_t expected_sequence =
+                        next_sequence + index;
+                    if (!completion_publish_failed) {
+                        IncrementSingleWriterCounter(
+                            &lane.completion_taken_messages);
+                    }
+                    const bool task_valid =
+                        task != nullptr &&
+                        !task->command.message &&
+                        task->source_sequence == expected_sequence &&
+                        task->source_slot == source &&
+                        task->global_ingress_sequence != 0U;
+                    if (!task_valid) {
+                        ReportPipelineFailure(
+                            "parallel_completion_sequence",
+                            source,
+                            task != nullptr
+                                ? task->global_ingress_sequence
+                                : 0U,
+                            expected_sequence);
+                        TripFatal();
+                    }
+                    std::uint64_t commit_start_ns = 0U;
+                    const bool commit_clock_valid =
+                        task_valid && latency_collector_ != nullptr &&
+                        ReadClockNs(
+                            CLOCK_MONOTONIC, &commit_start_ns);
+                    if (commit_clock_valid &&
+                        task->decode_complete_clock_valid &&
+                        commit_start_ns >=
+                            task->decode_complete_monotonic_ns) {
+                        const std::uint64_t wait_ns =
+                            commit_start_ns -
+                            task->decode_complete_monotonic_ns;
+                        IncrementSingleWriterCounter(
+                            &lane.reorder_wait_samples);
+                        lane.reorder_wait_total_ns.store(
+                            lane.reorder_wait_total_ns.load(
+                                std::memory_order_relaxed) + wait_ns,
+                            std::memory_order_relaxed);
+                        std::uint64_t maximum =
+                            lane.reorder_wait_max_ns.load(
+                                std::memory_order_relaxed);
+                        while (maximum < wait_ns &&
+                               !lane.reorder_wait_max_ns
+                                    .compare_exchange_weak(
+                                        maximum,
+                                        wait_ns,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+                        }
+                    }
+
+                    const bool committed =
+                        task_valid &&
+                        !completion_publish_failed &&
+                        !fatal_.load(std::memory_order_acquire) &&
+                        CommitParallelTask(
+                            source,
+                            task,
+                            submission_batch_pointer);
+                    if (!committed &&
+                        !fatal_.load(std::memory_order_acquire)) {
+                        TripFatal();
+                    }
+                    if (committed) {
+                        ++batch_committed;
+                    }
+                    commit_results[index] = committed;
+                }
+                if (submission_batch_pointer != nullptr) {
+                    const market::RealtimeHistoryBatchSubmitResultV1
+                        batch_result = submission_batch.Finish();
+                    if (batch_result.submitted_count !=
+                        batch_committed) {
+                        TerminateInvariant(
+                            "parallel_history_batch_prefix_mismatch");
+                    }
+                    if (batch_result.submitted_count > 1U) {
+                        IncrementSingleWriterCounter(
+                            &lane.history_batch_calls);
+                        AddSingleWriterCounter(
+                            &lane.history_batched_messages,
+                            static_cast<std::uint64_t>(
+                                batch_result.submitted_count));
+                        const std::size_t maximum =
+                            lane.history_batch_max.load(
+                                std::memory_order_relaxed);
+                        if (batch_result.submitted_count > maximum) {
+                            lane.history_batch_max.store(
+                                batch_result.submitted_count,
+                                std::memory_order_relaxed);
+                        }
+                    }
+                }
+                // End the History submission gate before publishing any
+                // retirement from this batch.  The final retirement permits
+                // the source owner to switch back to inline submission and
+                // permits a generation fence to call SealSource; neither may
+                // overlap this batch's non-atomic source-owner state updates.
+                for (std::size_t index = 0U;
+                     index < ready_count;
+                     ++index) {
+                    task = ready_tasks[index];
+                    const bool committed = commit_results[index];
+                    const std::uint64_t expected_sequence =
+                        next_sequence;
+                    ParallelDecodeShard& shard =
+                        *lane.parallel_shards[
+                            ParallelWorkerForSourceSequence(
+                                source,
+                                expected_sequence,
+                                config_
+                                    .parallel_decoder_worker_count)];
+                    if (committed) {
+                        const std::uint64_t committed_messages =
+                            lane.committed_messages.load(
+                                std::memory_order_relaxed);
+                        if (committed_messages ==
+                            std::numeric_limits<
+                                std::uint64_t>::max()) {
+                            TerminateInvariant(
+                                "parallel_committed_messages_overflow");
+                        }
+                        lane.committed_messages.store(
+                            committed_messages + 1U,
+                            std::memory_order_relaxed);
+                        lane.committed_source_sequence.store(
+                            expected_sequence,
+                            std::memory_order_release);
+                    } else {
+                        lane.discarded_messages.fetch_add(
+                            1U, std::memory_order_relaxed);
+                    }
+                    ++next_sequence;
+                    task->ResetAndRelease(
+                        &shard.release_epoch,
+                        &shard.release_waiter_armed);
+                    // Publish every ordered decoder/History effect, including
+                    // batch Finish, before a source owner can observe the farm
+                    // as fully drained.
+                    IncrementSingleWriterCounterRelease(
+                        &lane.retired_messages);
+                    const std::uint64_t issued =
+                        lane.farm_messages.load(
+                            std::memory_order_acquire);
+                    if (lane.retired_messages.load(
+                            std::memory_order_relaxed) > issued) {
+                        TerminateInvariant(
+                            committed
+                                ? "parallel_commit_retired_exceeds_issued"
+                                : "parallel_discard_retired_exceeds_issued");
+                    }
+                }
+                const std::uint64_t issued =
+                    lane.farm_messages.load(
+                        std::memory_order_acquire);
+                if (lane.retired_messages.load(
+                        std::memory_order_relaxed) == issued) {
+                    SignalParallelCommitProgress(&lane, false);
+                }
+                continue;
+            }
+
+            const bool dispatch_done =
+                lane.dispatch_done.load(std::memory_order_acquire);
+            const bool fatal =
+                fatal_.load(std::memory_order_acquire);
+            if (dispatch_done) {
+                if (fatal &&
+                    ParallelFarmOutstanding(lane) == 0U) {
+                    return;
+                }
+                if (!fatal &&
+                    next_sequence >
+                        lane.last_dispatched_source_sequence.load(
+                            std::memory_order_acquire)) {
+                    return;
+                }
+            }
+            // On fatal, workers still publish every lease that the source
+            // dispatcher had already issued. Keep consuming those completions
+            // without applying them until dispatch is closed and the bounded
+            // outstanding count reaches zero.
+            SampleParallelCompletionDepth(source, &lane);
+            lane.completion->Wait(observed, next_sequence);
         }
     }
 
@@ -4917,6 +6666,155 @@ private:
         }
     }
 
+    [[nodiscard]] market::MarketDecodeErrorV1 DecodeStatelessOne(
+        std::uint8_t source,
+        const realtime::OwnedIngressMessageHandleV1& message,
+        market::DecodedMarketEventV1* output) const noexcept {
+        if (output == nullptr || !message ||
+            source >= market::kRealtimeHistorySourceCountV1 ||
+            message->source_slot() != source ||
+            IsMixedTickSourceSlot(source) !=
+                (message->tick_stream_sequence() != 0U) ||
+            message->recv_realtime_ns() >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max()) ||
+            message->recv_monotonic_ns() >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max())) {
+            return market::MarketDecodeErrorV1::kInvalidInput;
+        }
+        const sdk::VendorHeadView head = message->vendor_head();
+        if (head.message_encoding() !=
+            static_cast<std::uint8_t>(mdl::MDLEID_BINARY)) {
+            return market::MarketDecodeErrorV1::kInvalidInput;
+        }
+        market::MarketMessageViewV1 view{};
+        view.source_stream_id = config_.source_stream_ids[source];
+        view.trade_date = config_.trade_date;
+        view.source_sequence = message->source_sequence();
+        view.service_id = message->key().service_id;
+        view.service_version = message->key().service_version;
+        view.message_id = message->key().message_id;
+        view.message_encoding = head.message_encoding();
+        view.vendor_local_time_raw = head.local_time_raw();
+        view.vendor_sequence_id = head.sequence_id();
+        view.recv_realtime_ns =
+            static_cast<std::int64_t>(message->recv_realtime_ns());
+        view.recv_monotonic_ns =
+            static_cast<std::int64_t>(message->recv_monotonic_ns());
+        view.body = message->body();
+        return lanes_[source]->decoder.DecodeStateless(view, output);
+    }
+
+    [[nodiscard]] bool CommitParallelTask(
+        std::uint8_t source,
+        ParallelDecodeTask* task,
+        market::RealtimeHistorySubmissionBatchV1* submission_batch)
+        noexcept {
+        if (task == nullptr || task->command.message ||
+            task->source_slot != source ||
+            task->source_sequence == 0U ||
+            task->global_ingress_sequence == 0U) {
+            return false;
+        }
+        market::MarketDecodeErrorV1 decode_error = task->decode_error;
+        if (decode_error == market::MarketDecodeErrorV1::kNone) {
+            decode_error = lanes_[source]->decoder.FinalizeInSourceOrder(
+                &task->decoded);
+        }
+        if (decode_error != market::MarketDecodeErrorV1::kNone) {
+            last_decode_error_.store(
+                static_cast<std::uint8_t>(decode_error),
+                std::memory_order_release);
+            ReportPipelineFailure(
+                "market_decode",
+                source,
+                task->global_ingress_sequence,
+                static_cast<std::uint64_t>(decode_error));
+            return false;
+        }
+        if (!task->identity_applied) {
+            ReportPipelineFailure(
+                "instrument_identity_apply",
+                source,
+                task->global_ingress_sequence,
+                task->command.identity.instrument_id);
+            return false;
+        }
+
+        std::uint64_t ordered_decode_complete_ns = 0U;
+        const bool ordered_decode_complete_clock_valid =
+            latency_collector_ != nullptr &&
+            ReadClockNs(
+                CLOCK_MONOTONIC, &ordered_decode_complete_ns);
+        if (latency_collector_ != nullptr) {
+            latency_collector_->RecordDecodeAppliedOrigin(
+                source,
+                task->global_ingress_sequence,
+                ordered_decode_complete_ns,
+                ordered_decode_complete_clock_valid);
+        }
+
+        std::optional<market::RealtimeHistoryEventInputV1> input =
+            market::RealtimeHistoryEventInputV1::Create(
+                source,
+                task->global_ingress_sequence,
+                std::move(task->decoded),
+                task->tick_stream_sequence);
+        if (!input.has_value()) {
+            ReportHistoryInputFailure(
+                source,
+                task->global_ingress_sequence,
+                task->tick_stream_sequence,
+                task->decoded);
+            return false;
+        }
+        const market::RealtimeHistorySubmitErrorV1 submit_error =
+            submission_batch == nullptr
+                ? history_->TrySubmit(std::move(*input))
+                : submission_batch->TrySubmit(std::move(*input));
+        std::uint64_t history_submit_complete_ns = 0U;
+        const bool history_submit_clock_valid =
+            latency_collector_ != nullptr &&
+            ReadClockNs(
+                CLOCK_MONOTONIC, &history_submit_complete_ns);
+        const bool submitted =
+            submit_error == market::RealtimeHistorySubmitErrorV1::kNone;
+        if (latency_collector_ != nullptr) {
+            latency_collector_->RecordDecoderWork(
+                source,
+                task->command.queue_publish_monotonic_ns,
+                task->worker_dequeue_monotonic_ns,
+                task->decode_start_monotonic_ns,
+                ordered_decode_complete_ns,
+                history_submit_complete_ns,
+                task->command.queue_publish_monotonic_ns != 0U &&
+                    task->worker_dequeue_clock_valid &&
+                    task->worker_dequeue_monotonic_ns >=
+                        task->command.queue_publish_monotonic_ns,
+                task->decode_start_clock_valid &&
+                    ordered_decode_complete_clock_valid &&
+                    ordered_decode_complete_ns >=
+                        task->decode_start_monotonic_ns,
+                submitted && ordered_decode_complete_clock_valid &&
+                    history_submit_clock_valid &&
+                    history_submit_complete_ns >=
+                        ordered_decode_complete_ns);
+        }
+        if (!submitted) {
+            ReportPipelineFailure(
+                "history_submit",
+                source,
+                task->global_ingress_sequence,
+                static_cast<std::uint64_t>(submit_error));
+            return false;
+        }
+        std::atomic<std::uint64_t>& decoded_counter =
+            decoded_messages_by_source_[source].value;
+        IncrementSingleWriterCounter(&decoded_counter);
+        return true;
+    }
+
     void DecoderLoop(std::uint8_t source) noexcept {
         DecoderCommand command{};
         while (lanes_[source]->queue.Pop(&command)) {
@@ -5034,10 +6932,10 @@ private:
         market::DecodedMarketEventV1 decoded;
         const market::MarketDecodeErrorV1 decode_error =
             lanes_[source]->decoder.Decode(view, &decoded);
-        last_decode_error_.store(
-            static_cast<std::uint8_t>(decode_error),
-            std::memory_order_release);
         if (decode_error != market::MarketDecodeErrorV1::kNone) {
+            last_decode_error_.store(
+                static_cast<std::uint8_t>(decode_error),
+                std::memory_order_release);
             ReportPipelineFailure(
                 "market_decode",
                 source,
@@ -5105,7 +7003,9 @@ private:
                 static_cast<std::uint64_t>(submit_error));
             return false;
         }
-        decoded_messages_.fetch_add(1U, std::memory_order_relaxed);
+        std::atomic<std::uint64_t>& decoded_counter =
+            decoded_messages_by_source_[source].value;
+        IncrementSingleWriterCounter(&decoded_counter);
         return true;
     }
 
@@ -5186,7 +7086,21 @@ private:
         for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
             if (lane != nullptr) {
                 lane->queue.RequestStop();
+                for (const auto& shard : lane->parallel_shards) {
+                    shard->Wake();
+                }
+                if (lane->completion != nullptr) {
+                    lane->completion->WakeAll();
+                }
+                SignalParallelCommitProgress(lane.get(), true);
             }
+        }
+        for (const auto& worker : parallel_decoder_workers_) {
+            static_cast<void>(worker->work_waiter_armed.exchange(
+                false, std::memory_order_acq_rel));
+            worker->work_epoch.fetch_add(
+                1U, std::memory_order_release);
+            worker->work_epoch.notify_all();
         }
     }
 
@@ -5206,6 +7120,43 @@ private:
     }
 
     void JoinDecoderThreads() noexcept {
+        if (config_.parallel_decoder_worker_count != 0U) {
+            // Source dispatchers are the sole producers for their worker
+            // issue queues. Drain/join them before publishing worker stop so
+            // every accepted message has either completed inline or owns a
+            // consumable decode lease.
+            for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
+                if (lane != nullptr && lane->thread.joinable()) {
+                    lane->thread.join();
+                }
+            }
+            for (const auto& worker : parallel_decoder_workers_) {
+                worker->stop_requested.store(
+                    true, std::memory_order_release);
+                static_cast<void>(worker->work_waiter_armed.exchange(
+                    false, std::memory_order_acq_rel));
+                worker->work_epoch.fetch_add(
+                    1U, std::memory_order_release);
+                worker->work_epoch.notify_all();
+            }
+            for (const auto& worker : parallel_decoder_workers_) {
+                if (worker->thread.joinable()) {
+                    worker->thread.join();
+                }
+            }
+            for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
+                if (lane != nullptr && lane->completion != nullptr) {
+                    lane->completion->WakeAll();
+                }
+            }
+            for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
+                if (lane != nullptr && lane->commit_thread.joinable()) {
+                    lane->commit_thread.join();
+                }
+            }
+            decoder_threads_started_ = false;
+            return;
+        }
         for (const std::unique_ptr<DecoderLane>& lane : lanes_) {
             if (lane != nullptr && lane->thread.joinable()) {
                 lane->thread.join();
@@ -5223,9 +7174,13 @@ private:
                 // The narrow adapters cannot be safely destroyed while the
                 // vendor may still call the handler. Continuing would create
                 // a dangling callback target.
-                std::terminate();
+                TerminateInvariant("sdk_shutdown_exception");
             }
         }
+        // Arm before sampling the count. A callback that completed earlier
+        // leaves zero for this load; one that completes later observes the
+        // armed flag after its decrement and performs the only needed notify.
+        callback_waiter_armed_.store(true, std::memory_order_release);
         std::uint64_t active =
             active_callbacks_.load(std::memory_order_acquire);
         while (active != 0U) {
@@ -5265,6 +7220,11 @@ private:
     std::array<std::unique_ptr<DecoderLane>,
                market::kRealtimeHistorySourceCountV1>
         lanes_{};
+    std::vector<std::unique_ptr<ParallelDecoderWorker>>
+        parallel_decoder_workers_;
+    std::once_flag parallel_farm_start_once_;
+    std::atomic<bool> parallel_farm_started_{false};
+    std::atomic<bool> parallel_farm_start_failed_{false};
     std::array<std::unique_ptr<market::MarketDecoderV1>,
                market::kRealtimeHistorySourceCountV1>
         startup_fingerprint_decoders_{};
@@ -5278,10 +7238,11 @@ private:
     std::unique_ptr<realtime::ContiguousSequenceTrackerV2>
         applied_tracker_;
     std::size_t applied_window_capacity_ = 0U;
-    std::atomic<std::uint64_t> accepted_sequence_{0U};
-    std::atomic<std::uint64_t> applied_sequence_{0U};
+    alignas(64) std::atomic<std::uint64_t> accepted_sequence_{0U};
+    alignas(64) std::atomic<std::uint64_t> applied_sequence_{0U};
     std::mutex applied_progress_mutex_;
     std::condition_variable applied_progress_cv_;
+    std::atomic<std::size_t> applied_progress_waiters_{0U};
     std::mutex generation_fence_mutex_;
     std::condition_variable generation_fence_cv_;
     std::uint64_t active_fence_generation_ = 0U;
@@ -5345,6 +7306,10 @@ private:
     std::atomic<bool> startup_direct_{false};
     std::atomic<std::uint64_t> startup_callback_pending_{0U};
 
+    // Serializes the SDK-less shadow/replay producer across bounded waits
+    // that deliberately release admission_mutex_. It is never touched by the
+    // ordinary SDK callback path.
+    std::mutex external_ingress_mutex_;
     mutable std::mutex admission_mutex_;
     std::uint64_t global_ingress_sequence_ = 0U;
     std::uint64_t tick_stream_sequence_ = 0U;
@@ -5362,13 +7327,12 @@ private:
     std::uint64_t last_started_generation_ = 0U;
     std::optional<std::uint64_t> clean_admission_cut_ns_;
 
-    std::atomic<std::uint64_t> decoded_messages_{0U};
+    std::array<SourceMessageCounter,
+               market::kRealtimeHistorySourceCountV1>
+        decoded_messages_by_source_{};
     std::atomic<std::uint64_t> last_published_generation_{0U};
     std::atomic<std::uint8_t> last_decode_error_{
         static_cast<std::uint8_t>(market::MarketDecodeErrorV1::kNone)};
-    std::atomic<std::uint8_t> last_callback_error_{
-        static_cast<std::uint8_t>(
-            RealtimePipelineIngressErrorV1::kNone)};
     std::atomic_flag applied_sequence_failure_reported_ =
         ATOMIC_FLAG_INIT;
     std::atomic_flag pipeline_failure_reported_ = ATOMIC_FLAG_INIT;
@@ -5379,6 +7343,7 @@ private:
 
     std::atomic<bool> callback_gate_closed_{false};
     std::atomic<std::uint64_t> active_callbacks_{0U};
+    std::atomic<bool> callback_waiter_armed_{false};
 
     std::mutex cut_mutex_;
     std::mutex stop_mutex_;

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -64,6 +65,21 @@ public:
     }
     void StoreU64(std::size_t offset, std::uint64_t value) {
         StoreUnsigned(offset, value);
+    }
+
+    std::size_t BeginList(
+        std::size_t descriptor,
+        std::uint32_t count,
+        std::size_t item_bytes) {
+        const std::size_t start = bytes_.size();
+        bytes_.resize(
+            start + static_cast<std::size_t>(count) * item_bytes,
+            std::byte{0U});
+        StoreU32(descriptor, count);
+        StoreU32(
+            descriptor + sizeof(std::uint32_t),
+            static_cast<std::uint32_t>(start - descriptor));
+        return start;
     }
 
     void StoreString(std::size_t descriptor, std::string_view value) {
@@ -152,6 +168,20 @@ private:
     return std::move(writer).Take();
 }
 
+[[nodiscard]] std::vector<std::byte> ShanghaiStatusBody(
+    std::uint64_t business_index,
+    std::string_view phase,
+    std::string_view security_id = "600007") {
+    WireWriter writer(70U);
+    writer.StoreU64(0U, business_index);
+    writer.StoreU32(8U, 7U);
+    writer.StoreU32(18U, 93'000'125U);
+    writer.StoreString(12U, security_id);
+    writer.StoreString(22U, "S");
+    writer.StoreString(64U, phase);
+    return std::move(writer).Take();
+}
+
 [[nodiscard]] std::vector<std::byte> ShanghaiSnapshotBody(
     std::string_view security_id) {
     WireWriter writer(248U);
@@ -159,6 +189,45 @@ private:
     writer.StoreU32(30U, 12'345U);
     writer.StoreString(4U, security_id);
     writer.StoreString(38U, "TRADE");
+    return std::move(writer).Take();
+}
+
+[[nodiscard]] std::vector<std::byte> ShanghaiNestedQueueSnapshotBody(
+    bool malformed_at_last_level) {
+    // A queue target is registered for every depth level. CheckedBodyView's
+    // non-overlap validation therefore performs substantial deterministic work
+    // while the wire stays small enough for callback admission to outrun it.
+    constexpr std::uint32_t bid_depth = 4096U;
+    constexpr std::size_t bid_levels_descriptor = 228U;
+    constexpr std::size_t level_bytes = 28U;
+    constexpr std::size_t level_price = 4U;
+    constexpr std::size_t level_order_count = 16U;
+    constexpr std::size_t level_queue = 20U;
+    constexpr std::size_t queue_item_bytes = 16U;
+
+    WireWriter writer(248U);
+    writer.StoreU32(0U, 93'000'123U);
+    writer.StoreU32(30U, 12'345U);
+    writer.StoreString(4U, "600007");
+    writer.StoreString(38U, "TRADE");
+
+    const std::size_t bids = writer.BeginList(
+        bid_levels_descriptor, bid_depth, level_bytes);
+    for (std::uint32_t index = 0U; index < bid_depth; ++index) {
+        const std::size_t level =
+            bids + static_cast<std::size_t>(index) * level_bytes;
+        writer.StoreU32(level + level_price, 12'345U - index);
+        writer.StoreU32(level + level_order_count, 1U);
+        if (malformed_at_last_level && index + 1U == bid_depth) {
+            writer.StoreU32(level + level_queue, 1U);
+            writer.StoreU32(
+                level + level_queue + sizeof(std::uint32_t),
+                std::numeric_limits<std::uint32_t>::max());
+        } else {
+            static_cast<void>(writer.BeginList(
+                level + level_queue, 1U, queue_item_bytes));
+        }
+    }
     return std::move(writer).Take();
 }
 
@@ -2074,6 +2143,234 @@ void CheckOpeningBurstCapacityHeadroom(TestContext* test) {
     run_burst(27U, production_decoder_capacity, false);
 }
 
+void CheckExternalIngressCapacityRetryOwnershipAndStop(
+    TestContext* test) {
+    const auto run_case = [test](
+                              std::uint64_t session_epoch,
+                              bool stop_while_waiting) {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(session_epoch, &fixture),
+            "create external-ingress retry catalog");
+        if (fixture.runtime_state == nullptr) {
+            return;
+        }
+
+        const auto blocker =
+            std::make_shared<OpeningBurstAppliedBlocker>();
+        const std::shared_ptr<ProjectionProbe> no_projection;
+        runtime::RealtimePipelineConfigV1 config =
+            MakeConfig(fixture, no_projection);
+        config.external_ingress_enabled = true;
+        config.decoder_queue_capacity_per_source = 4U;
+        config.completion_tracker_capacity = 2U;
+        config.tick_ring_capacity = 2U;
+        config.store_queue_capacity_per_source_worker = 16U;
+        config.intraday_store.maximum_session_records = 32U;
+        config.applied_record_sink = blocker;
+
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        test->Expect(
+            runtime::RealtimePipelineV1::Create(
+                config, &pipeline, &detail) ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr,
+            "create external-ingress retry pipeline: " + detail);
+        if (pipeline == nullptr) {
+            return;
+        }
+
+        const auto ingest = [&](
+                                FakeMessage* message,
+                                std::uint64_t clock_value) {
+            runtime::RealtimePipelineExternalIngressV1 input{};
+            input.message = message;
+            input.recv_realtime_ns = 1'000U + clock_value;
+            input.recv_monotonic_ns = 2'000U + clock_value;
+            input.admission_timeout = 5s;
+            return pipeline->IngestExternalMessage(input);
+        };
+
+        FakeMessage first(
+            sdk::kProductionMessageKeysV1[2U],
+            ShenzhenSnapshotBody(12'345'600));
+        const runtime::RealtimePipelineIngressResultV1 first_result =
+            ingest(&first, 1U);
+        first.DestroyCallbackBytes();
+        const bool first_blocked =
+            first_result.accepted() &&
+            blocker->WaitUntilFirstAppliedBlocked(3s);
+        test->Expect(
+            first_blocked,
+            "external-ingress retry fixture blocks its first applied record");
+        if (!first_blocked) {
+            blocker->ReleaseFirstApplied();
+            pipeline->StopAndDrain();
+            return;
+        }
+
+        bool prefix_accepted = true;
+        for (std::uint64_t sequence = 2U;
+             sequence <= 6U;
+             ++sequence) {
+            FakeMessage message(
+                sdk::kProductionMessageKeysV1[2U],
+                ShenzhenSnapshotBody(12'345'600 + sequence));
+            const runtime::RealtimePipelineIngressResultV1 result =
+                ingest(&message, sequence);
+            message.DestroyCallbackBytes();
+            prefix_accepted = prefix_accepted && result.accepted() &&
+                              result.global_ingress_sequence == sequence &&
+                              result.source_sequence == sequence;
+        }
+        constexpr std::size_t kShenzhenSnapshotSource = 2U;
+        const bool queue_full = prefix_accepted && WaitUntil([&] {
+            const runtime::RealtimePipelineSnapshotV1 snapshot =
+                pipeline->Snapshot();
+            return snapshot.processing_progress.applied_sequence == 0U &&
+                   snapshot.decoder_queues[kShenzhenSnapshotSource]
+                           .message_depth == 4U;
+        });
+        test->Expect(
+            queue_full,
+            "external-ingress retry fixture fills the source queue while "
+            "the applied window is blocked");
+        if (!queue_full) {
+            blocker->ReleaseFirstApplied();
+            pipeline->StopAndDrain();
+            return;
+        }
+        const std::uint64_t full_count_before_seventh =
+            pipeline->Snapshot()
+                .decoder_queues[kShenzhenSnapshotSource]
+                .full_count;
+
+        FakeMessage seventh(
+            sdk::kProductionMessageKeysV1[2U],
+            ShenzhenSnapshotBody(12'345'607));
+        runtime::RealtimePipelineIngressResultV1 seventh_result{};
+        std::atomic<bool> seventh_finished{false};
+        std::thread seventh_thread([&] {
+            seventh_result = ingest(&seventh, 7U);
+            seventh_finished.store(true, std::memory_order_release);
+        });
+        const bool seventh_waiting = WaitUntil([&] {
+            const runtime::RealtimePipelineSnapshotV1 snapshot =
+                pipeline->Snapshot();
+            return !seventh_finished.load(std::memory_order_acquire) &&
+                   snapshot.decoder_queues[kShenzhenSnapshotSource]
+                           .full_count > full_count_before_seventh;
+        });
+        test->Expect(
+            seventh_waiting,
+            "external ingress waits outside admission on a full decoder "
+            "queue");
+
+        if (stop_while_waiting) {
+            std::thread stop_thread([&] { pipeline->StopAndDrain(); });
+            const bool stop_linearized = WaitUntil([&] {
+                return !pipeline->Snapshot().accepting;
+            });
+            const bool waiter_rejected_before_release =
+                stop_linearized && WaitUntil([&] {
+                    return seventh_finished.load(
+                        std::memory_order_acquire);
+                });
+            blocker->ReleaseFirstApplied();
+            seventh_thread.join();
+            stop_thread.join();
+            seventh.DestroyCallbackBytes();
+            const runtime::RealtimePipelineSnapshotV1 stopped =
+                pipeline->Snapshot();
+            test->Expect(
+                seventh_waiting && waiter_rejected_before_release &&
+                    seventh_result.error ==
+                        runtime::RealtimePipelineIngressErrorV1::kStopped &&
+                    !seventh_result.accepted() && stopped.stopped &&
+                    !stopped.fatal && stopped.accepted_messages == 6U &&
+                    stopped.decoded_messages == 6U &&
+                    stopped.processing_progress.applied_sequence == 6U &&
+                    stopped.store.appended_records == 6U &&
+                    stopped.post_cut_messages == 1U &&
+                    stopped.decoder_queues[kShenzhenSnapshotSource]
+                            .message_depth == 0U &&
+                    stopped.ingress_pool.active_messages == 0U,
+                "StopAndDrain rejects a capacity waiter before decoder "
+                "close and drains the exact accepted prefix");
+            return;
+        }
+
+        FakeMessage eighth(
+            sdk::kProductionMessageKeysV1[2U],
+            ShenzhenSnapshotBody(12'345'608));
+        runtime::RealtimePipelineIngressResultV1 eighth_result{};
+        std::thread eighth_thread([&] {
+            eighth_result = ingest(&eighth, 8U);
+        });
+        blocker->ReleaseFirstApplied();
+        seventh_thread.join();
+        eighth_thread.join();
+        seventh.DestroyCallbackBytes();
+        eighth.DestroyCallbackBytes();
+        // CompleteAppliedSequence() runs from History before the source owner
+        // increments decoded_messages. Waiting only for applied_sequence can
+        // therefore observe the valid, short-lived applied=8/decoded=7
+        // boundary. Wait for the whole externally asserted snapshot instead
+        // of treating that publication order as an ownership failure.
+        const bool exact_suffix_drained = WaitUntil([&] {
+            const runtime::RealtimePipelineSnapshotV1 snapshot =
+                pipeline->Snapshot();
+            return snapshot.fatal ||
+                   (snapshot.accepted_messages == 8U &&
+                    snapshot.decoded_messages == 8U &&
+                    snapshot.processing_progress.applied_sequence == 8U &&
+                    snapshot.store.appended_records == 8U);
+        });
+        const runtime::RealtimePipelineSnapshotV1 drained =
+            pipeline->Snapshot();
+        const bool exact_retry_result =
+            seventh_waiting && seventh_result.accepted() &&
+                eighth_result.accepted() &&
+                seventh_result.global_ingress_sequence == 7U &&
+                eighth_result.global_ingress_sequence == 8U &&
+                exact_suffix_drained && !drained.fatal &&
+                drained.accepted_messages == 8U &&
+                drained.decoded_messages == 8U &&
+                drained.processing_progress.applied_sequence == 8U &&
+                drained.store.appended_records == 8U;
+        if (!exact_retry_result) {
+            std::cerr
+                << "external retry diagnostic: seventh_waiting="
+                << seventh_waiting
+                << " seventh_error="
+                << static_cast<unsigned>(seventh_result.error)
+                << " seventh_sequence="
+                << seventh_result.global_ingress_sequence
+                << " eighth_error="
+                << static_cast<unsigned>(eighth_result.error)
+                << " eighth_sequence="
+                << eighth_result.global_ingress_sequence
+                << " suffix_drained=" << exact_suffix_drained
+                << " fatal=" << drained.fatal
+                << " accepted=" << drained.accepted_messages
+                << " decoded=" << drained.decoded_messages
+                << " applied="
+                << drained.processing_progress.applied_sequence
+                << " store=" << drained.store.appended_records
+                << '\n';
+        }
+        test->Expect(
+            exact_retry_result,
+            "concurrent external callers retain one sequence owner across "
+            "a bounded capacity retry");
+        pipeline->StopAndDrain();
+    };
+
+    run_case(31U, false);
+    run_case(32U, true);
+}
+
 void CheckFastDecoderAcceptedPublicationAndIdleBoundary(
     TestContext* test) {
     PipelineCatalogFixture fixture;
@@ -2208,6 +2505,792 @@ void CheckFastDecoderAcceptedPublicationAndIdleBoundary(
     pipeline->StopAndDrain();
 }
 
+void CheckParallelDecodeFarmOrderedFenceAndDrain(TestContext* test) {
+    PipelineCatalogFixture fixture;
+    test->Expect(
+        MakeCatalogFixture(28U, &fixture),
+        "create parallel-decode-farm catalog");
+    if (fixture.runtime_state == nullptr) {
+        return;
+    }
+
+    const std::shared_ptr<ProjectionProbe> no_projection;
+    runtime::RealtimePipelineConfigV1 base =
+        MakeConfig(fixture, no_projection);
+    test->Expect(
+        runtime::RealtimePipelineConfigV1{}
+                .parallel_decoder_worker_count == 0U,
+        "public pipeline config keeps the legacy decoder topology by default");
+    base.decoder_queue_capacity_per_source = 512U;
+    base.store_queue_capacity_per_source_worker = 1024U;
+    base.intraday_store.maximum_session_records = 2048U;
+    base.intraday_store.maximum_session_accounted_bytes =
+        128U * 1024U * 1024U;
+
+    auto expect_invalid = [&](runtime::RealtimePipelineConfigV1 config,
+                              std::string_view description) {
+        std::unique_ptr<runtime::RealtimePipelineV1> invalid;
+        std::string detail;
+        test->Expect(
+            runtime::RealtimePipelineV1::Create(
+                std::move(config), &invalid, &detail) ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kInvalidConfiguration &&
+                invalid == nullptr,
+            description);
+    };
+
+    runtime::RealtimePipelineConfigV1 too_many_workers = base;
+    too_many_workers.parallel_decoder_worker_count =
+        static_cast<std::uint32_t>(
+            runtime::kRealtimeParallelDecoderMaximumWorkersV1 + 1U);
+    expect_invalid(
+        std::move(too_many_workers),
+        "parallel decoder rejects worker count above its fixed snapshot bound");
+
+    runtime::RealtimePipelineConfigV1 zero_slots = base;
+    zero_slots.parallel_decoder_worker_count = 2U;
+    zero_slots.parallel_decoder_slots_per_source_worker = 0U;
+    expect_invalid(
+        std::move(zero_slots),
+        "parallel decoder rejects a zero lease count");
+
+    runtime::RealtimePipelineConfigV1 too_many_slots = base;
+    too_many_slots.parallel_decoder_worker_count = 2U;
+    too_many_slots.parallel_decoder_slots_per_source_worker = 1025U;
+    expect_invalid(
+        std::move(too_many_slots),
+        "parallel decoder rejects an unbounded lease count");
+
+    runtime::RealtimePipelineConfigV1 config = base;
+    config.parallel_decoder_worker_count = 4U;
+    config.parallel_decoder_slots_per_source_worker = 4U;
+    // The production default keeps the idle-inline latency path. Disable it
+    // here so every accepted message deterministically exercises issue,
+    // concurrent stateless decode, completion reorder, and ordered commit.
+    config.parallel_decoder_idle_inline_enabled = false;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create deterministic parallel decode farm: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    constexpr std::uint64_t pre_cut_records = 1024U;
+    constexpr std::uint64_t chunk_records = 128U;
+    bool all_admitted = true;
+    for (std::uint64_t sequence = 1U;
+         sequence <= pre_cut_records;
+         ++sequence) {
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            InjectSourceMessage(pipeline.get(), 0U, sequence);
+        all_admitted = all_admitted && admitted.accepted() &&
+                       admitted.global_ingress_sequence == sequence &&
+                       admitted.source_sequence == sequence;
+        if (!all_admitted) {
+            break;
+        }
+        // Leave the final chunk in flight so Cut must cover decode leases and
+        // the ordered completion prefix, rather than observing an idle farm.
+        if (sequence % chunk_records == 0U &&
+            sequence != pre_cut_records) {
+            all_admitted = WaitUntil([&] {
+                const runtime::RealtimePipelineSnapshotV1 snapshot =
+                    pipeline->Snapshot();
+                return snapshot.fatal ||
+                       snapshot.decoded_messages == sequence;
+            }) &&
+                           !pipeline->fatal();
+        }
+    }
+    test->Expect(
+        all_admitted,
+        "parallel farm accepts the complete pre-cut source prefix");
+
+    const runtime::RealtimePipelineCutResultV1 cut =
+        pipeline->CutAndPublishGeneration(5s);
+    const runtime::RealtimePipelineSnapshotV1 after_cut =
+        pipeline->Snapshot();
+    std::uint64_t parsed_by_workers = 0U;
+    for (std::uint32_t worker = 0U;
+         worker < config.parallel_decoder_worker_count;
+         ++worker) {
+        parsed_by_workers +=
+            after_cut.parallel_decoder.workers[worker].parsed_messages;
+    }
+    const runtime::RealtimeParallelDecoderSourceSnapshotV1& source_zero =
+        after_cut.parallel_decoder.sources[0U];
+    test->Expect(
+        cut.published() &&
+            cut.store_generation->watermark()
+                    .processing_progress.accepted_sequence ==
+                pre_cut_records &&
+            cut.store_generation->watermark()
+                    .processing_progress.applied_sequence ==
+                pre_cut_records &&
+            after_cut.accepted_messages == pre_cut_records &&
+            after_cut.decoded_messages == pre_cut_records &&
+            after_cut.processing_progress.applied_sequence ==
+                pre_cut_records &&
+            after_cut.store.appended_records == pre_cut_records &&
+            after_cut.parallel_decoder.enabled &&
+            !after_cut.parallel_decoder.idle_inline_enabled &&
+            source_zero.dispatched_messages == pre_cut_records &&
+            source_zero.inline_messages == 0U &&
+            source_zero.farm_messages == pre_cut_records &&
+            source_zero.completed_messages == pre_cut_records &&
+            source_zero.committed_messages == pre_cut_records &&
+            source_zero.committed_source_sequence == pre_cut_records &&
+            source_zero.farm_outstanding == 0U &&
+            source_zero.completion_depth == 0U &&
+            source_zero.completion_capacity != 0U &&
+            source_zero.completion_high_water <=
+                source_zero.completion_capacity &&
+            source_zero.completion_publish_failures == 0U &&
+            parsed_by_workers == pre_cut_records &&
+            !after_cut.fatal,
+        "generation fence waits for every parallel lease and publishes the "
+        "exact ordered pre-cut prefix");
+
+    constexpr std::uint64_t post_cut_records = 64U;
+    bool suffix_admitted = cut.published();
+    if (suffix_admitted) {
+        FakeMessage status(
+            sdk::kProductionMessageKeysV1[1U],
+            ShanghaiStatusBody(50'001U, "TRADE"));
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            pipeline->InjectSdkMessageForTest(&status);
+        status.DestroyCallbackBytes();
+        suffix_admitted = admitted.accepted() &&
+                          admitted.global_ingress_sequence ==
+                              pre_cut_records + 1U &&
+                          admitted.source_sequence == 1U;
+    }
+    for (std::uint64_t sequence = 2U;
+         sequence <= post_cut_records && suffix_admitted;
+         ++sequence) {
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            InjectSourceMessage(
+                pipeline.get(), 1U, 50'000U + sequence);
+        suffix_admitted = admitted.accepted() &&
+                          admitted.global_ingress_sequence ==
+                              pre_cut_records + sequence &&
+                          admitted.source_sequence == sequence;
+    }
+    const runtime::RealtimePipelineCutResultV1 terminal =
+        pipeline->StopAndPublishFinalGeneration(5s);
+    const runtime::RealtimePipelineSnapshotV1 stopped =
+        pipeline->Snapshot();
+    market::RealtimeLatestRecordViewV1 latest_tick{};
+    const bool latest_phase_ordered =
+        pipeline->GetLatestTick(1U, &latest_tick) ==
+            market::RealtimeLatestQueryErrorV1::kNone &&
+        latest_tick.record != nullptr &&
+        [&] {
+            const market::StoredMarketEventViewV1 event =
+                latest_tick.record->event();
+            const market::ShanghaiTickV1* const tick =
+                market::StoredMarketEventGetV1<market::ShanghaiTickV1>(
+                    event);
+            return tick != nullptr &&
+                   tick->fields.action == market::TickActionV1::kTrade &&
+                   tick->fields.phase ==
+                       market::TradingPhaseV1::kContinuous &&
+                   (tick->fields.validity_bitmap &
+                    market::kTickPhaseValidV1) != 0U;
+        }();
+    const std::uint64_t total_records =
+        pre_cut_records + post_cut_records;
+    test->Expect(
+        suffix_admitted && terminal.published() && stopped.stopped &&
+            !stopped.fatal && latest_phase_ordered &&
+            stopped.accepted_messages == total_records &&
+            stopped.decoded_messages == total_records &&
+            stopped.processing_progress.accepted_sequence ==
+                total_records &&
+            stopped.processing_progress.applied_sequence ==
+                total_records &&
+            stopped.store.appended_records == total_records &&
+            stopped.parallel_decoder.sources[1U]
+                    .committed_source_sequence == post_cut_records &&
+            stopped.parallel_decoder.sources[1U]
+                    .completion_depth == 0U,
+        "terminal stop drains the post-cut parallel suffix and preserves "
+        "ordered Shanghai phase attribution");
+}
+
+void CheckParallelDecodeFarmFourSourceWorkerOffsetMapping(
+    TestContext* test) {
+    static_assert(market::kRealtimeHistorySourceCountV1 == 4U);
+
+    PipelineCatalogFixture fixture;
+    test->Expect(
+        MakeCatalogFixture(31U, &fixture),
+        "create four-source parallel worker-mapping catalog");
+    if (fixture.runtime_state == nullptr) {
+        return;
+    }
+
+    const std::shared_ptr<ProjectionProbe> no_projection;
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(fixture, no_projection);
+    constexpr std::uint32_t worker_count = 4U;
+    constexpr std::uint64_t records_per_source = 5U;
+    constexpr std::uint64_t total_records =
+        records_per_source *
+        market::kRealtimeHistorySourceCountV1;
+    config.parallel_decoder_worker_count = worker_count;
+    config.parallel_decoder_slots_per_source_worker = 1U;
+    // Force every record through the farm. A fence after each source makes
+    // the worker-counter delta an exact observation of that source's mapping.
+    config.parallel_decoder_idle_inline_enabled = false;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create four-source parallel worker-mapping pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    std::array<std::uint64_t, worker_count> previous_parsed{};
+    std::uint64_t admitted_records = 0U;
+    bool all_admitted = true;
+    bool every_source_offset_exact = true;
+    for (std::size_t source_index = 0U;
+         source_index < market::kRealtimeHistorySourceCountV1 &&
+         all_admitted;
+         ++source_index) {
+        const std::uint8_t source =
+            static_cast<std::uint8_t>(source_index);
+        for (std::uint64_t source_sequence = 1U;
+             source_sequence <= records_per_source;
+             ++source_sequence) {
+            const std::uint64_t expected_global_sequence =
+                admitted_records + 1U;
+            const runtime::RealtimePipelineIngressResultV1 admitted =
+                InjectSourceMessage(
+                    pipeline.get(), source, source_sequence);
+            all_admitted = admitted.accepted() &&
+                           admitted.global_ingress_sequence ==
+                               expected_global_sequence &&
+                           admitted.source_sequence == source_sequence &&
+                           admitted.source_slot == source;
+            if (!all_admitted) {
+                break;
+            }
+            admitted_records = expected_global_sequence;
+        }
+
+        if (!all_admitted) {
+            break;
+        }
+
+        const runtime::RealtimePipelineCutResultV1 cut =
+            pipeline->CutAndPublishGeneration(5s);
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            pipeline->Snapshot();
+        bool source_offset_exact =
+            cut.published() && !snapshot.fatal &&
+            snapshot.accepted_messages == admitted_records &&
+            snapshot.decoded_messages == admitted_records &&
+            snapshot.processing_progress.applied_sequence ==
+                admitted_records &&
+            snapshot.store.appended_records == admitted_records;
+        for (std::size_t worker = 0U;
+             worker < worker_count;
+             ++worker) {
+            const std::uint64_t parsed =
+                snapshot.parallel_decoder.workers[worker]
+                    .parsed_messages;
+            const std::uint64_t expected_delta =
+                worker == source_index ? 2U : 1U;
+            source_offset_exact =
+                source_offset_exact &&
+                parsed >= previous_parsed[worker] &&
+                parsed - previous_parsed[worker] == expected_delta;
+            previous_parsed[worker] = parsed;
+        }
+        const runtime::RealtimeParallelDecoderSourceSnapshotV1&
+            source_snapshot =
+                snapshot.parallel_decoder.sources[source_index];
+        source_offset_exact =
+            source_offset_exact &&
+            source_snapshot.dispatched_messages == records_per_source &&
+            source_snapshot.inline_messages == 0U &&
+            source_snapshot.farm_messages == records_per_source &&
+            source_snapshot.completed_messages == records_per_source &&
+            source_snapshot.committed_messages == records_per_source &&
+            source_snapshot.committed_source_sequence ==
+                records_per_source &&
+            source_snapshot.farm_outstanding == 0U &&
+            source_snapshot.completion_depth == 0U &&
+            source_snapshot.completion_publish_failures == 0U;
+        every_source_offset_exact =
+            every_source_offset_exact && source_offset_exact;
+    }
+
+    const runtime::RealtimePipelineSnapshotV1 final =
+        pipeline->Snapshot();
+    bool workers_uniform = true;
+    for (std::size_t worker = 0U;
+         worker < worker_count;
+         ++worker) {
+        const runtime::RealtimeParallelDecoderWorkerSnapshotV1&
+            worker_snapshot =
+                final.parallel_decoder.workers[worker];
+        workers_uniform =
+            workers_uniform &&
+            worker_snapshot.parsed_messages == records_per_source &&
+            worker_snapshot.parse_failures == 0U &&
+            worker_snapshot.issue_depth == 0U;
+    }
+    test->Expect(
+        all_admitted && every_source_offset_exact && workers_uniform &&
+            admitted_records == total_records &&
+            final.parallel_decoder.enabled &&
+            !final.parallel_decoder.idle_inline_enabled &&
+            final.parallel_decoder.worker_count == worker_count &&
+            final.accepted_messages == total_records &&
+            final.decoded_messages == total_records &&
+            final.processing_progress.applied_sequence == total_records &&
+            final.store.appended_records == total_records &&
+            !final.fatal,
+        "four-source offset mapping assigns each source's extra task to its "
+        "matching worker and distributes 20 tasks evenly across W4");
+    pipeline->StopAndDrain();
+}
+
+void CheckAdaptiveParallelDecodeOwnershipHandoff(TestContext* test) {
+    PipelineCatalogFixture fixture;
+    test->Expect(
+        MakeCatalogFixture(30U, &fixture),
+        "create adaptive parallel-decode catalog");
+    if (fixture.runtime_state == nullptr) {
+        return;
+    }
+
+    const std::shared_ptr<ProjectionProbe> no_projection;
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(fixture, no_projection);
+    config.decoder_queue_capacity_per_source = 512U;
+    config.store_queue_capacity_per_source_worker = 1024U;
+    config.parallel_decoder_worker_count = 4U;
+    config.parallel_decoder_slots_per_source_worker = 8U;
+    config.parallel_decoder_idle_inline_enabled = true;
+    config.parallel_decoder_farm_activation_queue_depth = 1U;
+    config.maximum_sdk_message_bytes = 256U * 1024U;
+    config.intraday_store.maximum_session_records = 2048U;
+    config.intraday_store.maximum_session_accounted_bytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create adaptive parallel-decode pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    // First prove the idle path inline before creating pressure. Parsing one
+    // maximum nested-queue descriptor set is then deliberately much more
+    // expensive than the following compact callback copies, allowing the
+    // suffix to cross the source-local threshold. Only one large decoded
+    // event per attempt reaches Store, keeping retained memory bounded under
+    // sanitizers.
+    const runtime::RealtimePipelineIngressResultV1 idle_prefix =
+        InjectSourceMessage(pipeline.get(), 0U, 89'999U);
+    const bool idle_prefix_applied = idle_prefix.accepted() && WaitUntil([&] {
+        return pipeline->Snapshot().processing_progress.applied_sequence ==
+               1U;
+    });
+    FakeMessage heavy(
+        sdk::kProductionMessageKeysV1[0U],
+        ShanghaiNestedQueueSnapshotBody(false));
+    constexpr std::uint64_t kPressureBurstPerAttempt = 320U;
+    constexpr std::size_t kMaximumPressureAttempts = 3U;
+    bool admitted_all = idle_prefix_applied;
+    bool burst_drained = false;
+    bool crossed_to_farm = false;
+    std::uint64_t pressure_records = idle_prefix_applied ? 1U : 0U;
+    runtime::RealtimePipelineSnapshotV1 after_burst{};
+    // Thread scheduling can let the owner finish a deliberately heavy record
+    // before this producer gets another timeslice. Retry a bounded burst in
+    // the same ordered session so the handoff assertion remains deterministic.
+    for (std::size_t attempt = 0U;
+         attempt < kMaximumPressureAttempts && admitted_all &&
+         !crossed_to_farm;
+         ++attempt) {
+        for (std::uint64_t offset = 0U;
+             offset < kPressureBurstPerAttempt && admitted_all;
+             ++offset) {
+            const std::uint64_t sequence = pressure_records + 1U;
+            const runtime::RealtimePipelineIngressResultV1 admitted =
+                offset == 0U
+                    ? pipeline->InjectSdkMessageForTest(&heavy)
+                    : InjectSourceMessage(
+                          pipeline.get(), 0U, 90'000U + sequence);
+            admitted_all = admitted.accepted() &&
+                           admitted.global_ingress_sequence == sequence &&
+                           admitted.source_sequence == sequence;
+            if (admitted_all) {
+                pressure_records = sequence;
+            }
+        }
+        burst_drained = admitted_all && WaitUntil([&] {
+            const runtime::RealtimePipelineSnapshotV1 snapshot =
+                pipeline->Snapshot();
+            return snapshot.fatal ||
+                   snapshot.processing_progress.applied_sequence ==
+                       pressure_records;
+        });
+        after_burst = pipeline->Snapshot();
+        const auto& candidate_source =
+            after_burst.parallel_decoder.sources[0U];
+        std::size_t active_workers = 0U;
+        for (std::uint32_t worker = 0U;
+             worker < config.parallel_decoder_worker_count;
+             ++worker) {
+            active_workers +=
+                after_burst.parallel_decoder.workers[worker]
+                            .parsed_messages != 0U
+                    ? 1U
+                    : 0U;
+        }
+        crossed_to_farm =
+            burst_drained && !after_burst.fatal &&
+            candidate_source.inline_messages != 0U &&
+            candidate_source.farm_messages != 0U &&
+            active_workers >= 2U &&
+            candidate_source.farm_outstanding == 0U;
+    }
+    const auto& burst_source =
+        after_burst.parallel_decoder.sources[0U];
+
+    const std::uint64_t inline_before_suffix =
+        burst_source.inline_messages;
+    const std::uint64_t farm_before_suffix = burst_source.farm_messages;
+    const runtime::RealtimePipelineIngressResultV1 suffix =
+        InjectSourceMessage(pipeline.get(), 0U, 90'000U);
+    const bool suffix_applied = suffix.accepted() && WaitUntil([&] {
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            pipeline->Snapshot();
+        return snapshot.fatal ||
+               snapshot.processing_progress.applied_sequence ==
+                   pressure_records + 1U;
+    });
+    const runtime::RealtimePipelineCutResultV1 cut =
+        pipeline->CutAndPublishGeneration(5s);
+    const runtime::RealtimePipelineSnapshotV1 after_cut =
+        pipeline->Snapshot();
+    const auto& final_source =
+        after_cut.parallel_decoder.sources[0U];
+    test->Expect(
+        crossed_to_farm && suffix_applied && cut.published() &&
+            !after_cut.fatal &&
+            after_cut.accepted_messages == pressure_records + 1U &&
+            after_cut.decoded_messages == pressure_records + 1U &&
+            after_cut.processing_progress.applied_sequence ==
+                pressure_records + 1U &&
+            after_cut.store.appended_records == pressure_records + 1U &&
+            final_source.inline_messages ==
+                inline_before_suffix + 1U &&
+            final_source.farm_messages == farm_before_suffix &&
+            final_source.dispatched_messages == pressure_records + 1U &&
+            final_source.completed_messages == pressure_records + 1U &&
+            final_source.committed_messages == pressure_records + 1U &&
+            final_source.farm_outstanding == 0U &&
+            final_source.completion_depth == 0U &&
+            final_source.completion_publish_failures == 0U,
+        "adaptive owner moves inline-to-farm-to-inline and fences an exact "
+        "non-overlapping source prefix");
+    pipeline->StopAndDrain();
+}
+
+void CheckCapacityClampedAdaptiveActivation(TestContext* test) {
+    PipelineCatalogFixture fixture;
+    test->Expect(
+        MakeCatalogFixture(33U, &fixture),
+        "create capacity-clamped adaptive catalog");
+    if (fixture.runtime_state == nullptr) {
+        return;
+    }
+
+    const auto blocker =
+        std::make_shared<OpeningBurstAppliedBlocker>();
+    const std::shared_ptr<ProjectionProbe> no_projection;
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(fixture, no_projection);
+    constexpr std::size_t kQueueCapacity = 512U;
+    constexpr std::uint64_t kQueuedSuffix = kQueueCapacity;
+    constexpr std::uint64_t kTotalRecords = kQueuedSuffix + 2U;
+    config.decoder_queue_capacity_per_source = kQueueCapacity;
+    config.store_queue_capacity_per_source_worker = 1024U;
+    config.parallel_decoder_worker_count = 4U;
+    config.parallel_decoder_slots_per_source_worker = 8U;
+    config.parallel_decoder_idle_inline_enabled = true;
+    // Keep the configured default 8,192. Capacity clamping makes the
+    // effective threshold 512 - 128 = 384.
+    config.completion_tracker_capacity = 2U;
+    config.tick_ring_capacity = 2U;
+    config.intraday_store.maximum_session_records = 1024U;
+    config.applied_record_sink = blocker;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create capacity-clamped adaptive pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    const runtime::RealtimePipelineIngressResultV1 first =
+        InjectSourceMessage(pipeline.get(), 0U, 1U);
+    const bool first_blocked =
+        first.accepted() && blocker->WaitUntilFirstAppliedBlocked(3s);
+    const runtime::RealtimePipelineIngressResultV1 second =
+        first_blocked
+            ? InjectSourceMessage(pipeline.get(), 0U, 2U)
+            : runtime::RealtimePipelineIngressResultV1{};
+    const bool second_parked =
+        first_blocked && second.accepted() && WaitUntil([&] {
+            const runtime::RealtimePipelineSnapshotV1 snapshot =
+                pipeline->Snapshot();
+            return snapshot.fatal ||
+                   (snapshot.decoded_messages == 1U &&
+                    snapshot.decoder_queues[0U].message_depth == 0U);
+        });
+
+    bool suffix_admitted = second_parked;
+    for (std::uint64_t sequence = 3U;
+         sequence <= kTotalRecords && suffix_admitted;
+         ++sequence) {
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            InjectSourceMessage(pipeline.get(), 0U, sequence);
+        suffix_admitted =
+            admitted.accepted() &&
+            admitted.global_ingress_sequence == sequence &&
+            admitted.source_sequence == sequence;
+    }
+    const runtime::RealtimePipelineSnapshotV1 full =
+        pipeline->Snapshot();
+    const bool exact_full_prefix =
+        suffix_admitted && !full.fatal &&
+        full.decoder_queues[0U].message_depth == kQueueCapacity &&
+        full.decoder_queues[0U].full_count == 0U;
+
+    blocker->ReleaseFirstApplied();
+    const bool drained = exact_full_prefix && WaitUntil([&] {
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            pipeline->Snapshot();
+        const auto& source = snapshot.parallel_decoder.sources[0U];
+        return snapshot.fatal ||
+               (snapshot.decoded_messages == kTotalRecords &&
+                snapshot.processing_progress.applied_sequence ==
+                    kTotalRecords &&
+                snapshot.store.appended_records == kTotalRecords &&
+                source.dispatched_messages == kTotalRecords &&
+                source.completed_messages == kTotalRecords &&
+                source.committed_messages == kTotalRecords &&
+                source.farm_outstanding == 0U);
+    });
+    const runtime::RealtimePipelineSnapshotV1 final =
+        pipeline->Snapshot();
+    const auto& source = final.parallel_decoder.sources[0U];
+    test->Expect(
+        first_blocked && second_parked && exact_full_prefix && drained &&
+            !final.fatal && final.accepted_messages == kTotalRecords &&
+            source.farm_messages != 0U &&
+            source.inline_messages != 0U &&
+            source.dispatched_messages == kTotalRecords &&
+            source.completed_messages == kTotalRecords &&
+            source.committed_messages == kTotalRecords &&
+            source.farm_outstanding == 0U &&
+            final.decoder_queues[0U].full_count == 0U,
+        "capacity-clamped adaptive routing observes the already-loaded Pop "
+        "depth, activates before the 512-record suffix drains, and preserves "
+        "the exact prefix");
+    pipeline->StopAndDrain();
+}
+
+void CheckParallelDecodeFarmFatalDrain(TestContext* test) {
+    PipelineCatalogFixture fixture;
+    test->Expect(
+        MakeCatalogFixture(29U, &fixture),
+        "create parallel-decode fatal-drain catalog");
+    if (fixture.runtime_state == nullptr) {
+        return;
+    }
+
+    const std::shared_ptr<ProjectionProbe> no_projection;
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(fixture, no_projection);
+    config.parallel_decoder_worker_count = 2U;
+    config.parallel_decoder_slots_per_source_worker = 4U;
+    config.parallel_decoder_idle_inline_enabled = false;
+    config.maximum_sdk_message_bytes = 256U * 1024U;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create parallel-decode fatal-drain pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    // Construct both large callback bodies before publishing source sequence
+    // one. Its SecurityID is valid, so admission succeeds; stateless decode
+    // then validates 4,095 nested queue ranges before reaching the deliberately
+    // invalid final descriptor. Sequence three repeats the expensive valid
+    // path, keeping worker zero occupied while the ordered owner trips fatal
+    // and the remaining already-issued leases take the cancellation path.
+    FakeMessage malformed(
+        sdk::kProductionMessageKeysV1[0U],
+        ShanghaiNestedQueueSnapshotBody(true));
+    FakeMessage long_suffix(
+        sdk::kProductionMessageKeysV1[0U],
+        ShanghaiNestedQueueSnapshotBody(false));
+
+    constexpr std::uint64_t burst_messages = 8U;
+    const runtime::RealtimePipelineIngressResultV1 malformed_admitted =
+        pipeline->InjectSdkMessageForTest(&malformed);
+    bool burst_admitted = malformed_admitted.accepted() &&
+                          malformed_admitted.global_ingress_sequence == 1U &&
+                          malformed_admitted.source_sequence == 1U;
+    if (burst_admitted) {
+        FakeMessage second(
+            sdk::kProductionMessageKeysV1[0U],
+            ShanghaiSnapshotBody("600007"));
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            pipeline->InjectSdkMessageForTest(&second);
+        second.DestroyCallbackBytes();
+        burst_admitted = admitted.accepted() &&
+                          admitted.global_ingress_sequence == 2U &&
+                          admitted.source_sequence == 2U;
+    }
+    if (burst_admitted) {
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            pipeline->InjectSdkMessageForTest(&long_suffix);
+        burst_admitted = admitted.accepted() &&
+                          admitted.global_ingress_sequence == 3U &&
+                          admitted.source_sequence == 3U;
+    }
+    for (std::uint64_t sequence = 4U;
+         sequence <= burst_messages && burst_admitted;
+         ++sequence) {
+        FakeMessage suffix(
+            sdk::kProductionMessageKeysV1[0U],
+            ShanghaiSnapshotBody("600007"));
+        const runtime::RealtimePipelineIngressResultV1 admitted =
+            pipeline->InjectSdkMessageForTest(&suffix);
+        suffix.DestroyCallbackBytes();
+        burst_admitted = admitted.accepted() &&
+                          admitted.global_ingress_sequence == sequence &&
+                          admitted.source_sequence == sequence;
+    }
+    malformed.DestroyCallbackBytes();
+    long_suffix.DestroyCallbackBytes();
+
+    const bool dispatch_settled = burst_admitted && WaitUntil([&] {
+        const runtime::RealtimePipelineSnapshotV1 snapshot =
+            pipeline->Snapshot();
+        return snapshot.fatal ||
+               snapshot.parallel_decoder.sources[0U].farm_messages ==
+                   burst_messages;
+    });
+    const runtime::RealtimePipelineSnapshotV1 dispatched =
+        pipeline->Snapshot();
+    const bool full_farm_burst = dispatch_settled &&
+        dispatched.parallel_decoder.sources[0U].farm_messages ==
+            burst_messages;
+    const bool fatal_observed = full_farm_burst && WaitUntil([&] {
+        return pipeline->Snapshot().fatal;
+    });
+    const runtime::RealtimePipelineSnapshotV1 failed =
+        pipeline->Snapshot();
+
+    pipeline->StopAndDrain();
+    const runtime::RealtimePipelineSnapshotV1 stopped =
+        pipeline->Snapshot();
+    std::uint64_t parsed = 0U;
+    std::uint64_t parse_failures = 0U;
+    std::size_t issue_depth = 0U;
+    std::size_t issue_high_water = 0U;
+    for (std::uint32_t worker = 0U;
+         worker < config.parallel_decoder_worker_count;
+         ++worker) {
+        parsed += stopped.parallel_decoder.workers[worker]
+                      .parsed_messages;
+        parse_failures += stopped.parallel_decoder.workers[worker]
+                              .parse_failures;
+        issue_depth += stopped.parallel_decoder.workers[worker]
+                           .issue_depth;
+        issue_high_water = std::max(
+            issue_high_water,
+            stopped.parallel_decoder.workers[worker]
+                .issue_high_water);
+    }
+    const runtime::RealtimeParallelDecoderSourceSnapshotV1& source =
+        stopped.parallel_decoder.sources[0U];
+    test->Expect(
+        burst_admitted && full_farm_burst && fatal_observed &&
+            malformed_admitted.error ==
+                runtime::RealtimePipelineIngressErrorV1::kNone &&
+            failed.accepted_messages == burst_messages &&
+            failed.decoded_messages == 0U &&
+            failed.processing_progress.accepted_sequence ==
+                burst_messages &&
+            failed.processing_progress.applied_sequence == 0U &&
+            failed.store.appended_records == 0U &&
+            failed.last_decode_error !=
+                market::MarketDecodeErrorV1::kNone &&
+            stopped.stopped && stopped.fatal &&
+            stopped.accepted_messages == burst_messages &&
+            stopped.decoded_messages == 0U &&
+            stopped.rejected_messages == 0U &&
+            stopped.decoder_queues[0U].message_depth == 0U &&
+            stopped.ingress_pool.active_messages == 0U &&
+            source.dispatched_messages == burst_messages &&
+            source.inline_messages == 0U &&
+            source.farm_messages == burst_messages &&
+            source.completed_messages == parsed &&
+            source.committed_messages == 0U &&
+            source.committed_source_sequence == 0U &&
+            source.farm_outstanding == 0U &&
+            source.discarded_messages == burst_messages &&
+            source.completion_depth == 0U &&
+            source.completion_high_water > 1U &&
+            source.completion_publish_failures == 0U &&
+            parsed >= 1U &&
+            parse_failures == 1U &&
+            source.discarded_messages > parse_failures &&
+            issue_depth == 0U && issue_high_water > 1U,
+        "fatal burst drains every issued lease and queued completion without "
+        "leaving ingress ownership behind");
+}
+
 }  // namespace
 
 int main() {
@@ -2265,8 +3348,14 @@ int main() {
     CheckGenerationAndStopConcurrentExit(&test);
     CheckSourceDecoderQueueFullKeepsAcceptedPrefix(&test);
     CheckOpeningBurstCapacityHeadroom(&test);
+    CheckExternalIngressCapacityRetryOwnershipAndStop(&test);
     CheckStoreGenerationSinkOrderingAndFailure(&test);
     CheckFastDecoderAcceptedPublicationAndIdleBoundary(&test);
+    CheckParallelDecodeFarmOrderedFenceAndDrain(&test);
+    CheckParallelDecodeFarmFourSourceWorkerOffsetMapping(&test);
+    CheckAdaptiveParallelDecodeOwnershipHandoff(&test);
+    CheckCapacityClampedAdaptiveActivation(&test);
+    CheckParallelDecodeFarmFatalDrain(&test);
 
     return test.failures() == 0 ? 0 : 1;
 }

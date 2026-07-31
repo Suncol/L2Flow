@@ -16,18 +16,30 @@ single-threaded vendor SDK callback
   -> one bounded owned-message copy
   -> direct nonblocking source-decoder admission
 
-four serial source decoder lanes
-  -> bounded cross-lane applied gate
-  -> full decode and exact-key revalidation
+four source decoder lanes
+  -> adaptive inline full decode (legacy latency path), or
+  -> Wd stateless parse workers + four source-ordered finalizers
+  -> bounded cross-lane applied gate and exact-key revalidation
   -> intraday Store, latest IPC, and KLine
   -> contiguous applied watermark
   -> parked all-lane generation fence
 ```
 
-The four lanes are fixed: Shanghai snapshot, Shanghai NGTSTick, Shenzhen
+The four source lanes are fixed: Shanghai snapshot, Shanghai NGTSTick, Shenzhen
 snapshot, and one shared Shenzhen 6.33/6.36 tick lane. This preserves the
 Shanghai phase state machine and Shenzhen order/trade/cancel source order.
-The SDK remains configured for one callback thread.
+The SDK remains configured for one callback thread. Parallel decode is
+disabled by default. With a positive worker count and the production-default
+idle-inline/activation settings, stateless parsing may run on multiple cores
+only after a source Pop observes remaining ring occupancy at its bounded local
+threshold. The observation reuses the tail acquire already required by Pop;
+it does not add a second cross-core depth read. Aggregate pressure across
+several sources does not lower that threshold.
+This preserves the existing four-core source-owner parallelism for balanced
+traffic while no individual source crosses its threshold. Diagnostic
+idle-inline-off or zero-threshold configurations enter the farm immediately.
+One ordered finalizer per source retains stateful decoder and History
+ownership during an active farm interval.
 
 ## Daily-catalog contract
 
@@ -89,14 +101,27 @@ closed; SDK messages are never silently dropped.
 After pop and before full decode, each lane enforces:
 
 ```text
-D = min(4*Q + 4, completion_tracker_capacity - 1,
+D = min(4 * (Q + 1 + Wd*S), completion_tracker_capacity - 1,
         tick_ring_capacity - 1)
 0 < global_sequence - applied_sequence <= D
 ```
 
+`Wd` is the parallel decode-worker count and `S` is the preallocated lease
+count per source/worker; `Wd*S` is zero in the default legacy topology.
 Cross-source completion may be out of order, but only the contiguous
-completion prefix is published as `applied_sequence`. Backlog remains
-source-local until that lane exhausts its own capacity.
+completion prefix is published as `applied_sequence`. In parallel mode,
+source backlog can also occupy bounded per-worker issue queues, per-source
+completion rings, and task leases; exhaustion remains explicit and
+fail-closed.
+
+During an active farm interval, an ordered committer may opportunistically
+take at most 16 completion records that are already contiguous. It stops at
+the first missing source sequence and never waits to fill a batch. Each event
+is finalized and submitted to History immediately in source order; the first
+record routed to each History worker is signaled immediately, while only
+redundant later wake signals are coalesced until the bounded submission ends.
+This internal microbatch is unrelated to the user-visible Batch-history
+result.
 
 The accepted/applied status tuple is coalesced by a background
 publisher on a 1 ms cadence. Per-record progress notifications therefore do
@@ -174,6 +199,20 @@ build/mdl-production-router \
   --intraday-store-memory-gib 64 \
   --intraday-store-from-open
 ```
+
+`--parallel-decoder-workers` accepts `0..64` and defaults to `0`. Zero keeps
+the original one-full-decoder-owner-per-source behavior and creates no parse
+worker or ordered-committer threads. `--parallel-decoder-workers 4` is an
+explicit opt-in candidate profile, not a universal default: enable it only
+after the target CPU placement, traffic distribution, callback-to-Polars
+latency gate, and explicit backlog/pressure guardrails have passed the
+validation procedure in
+`benchmarks/PARALLEL_DECODER_VALIDATION.md`.
+
+Current parallel issue/completion high-water telemetry cannot prove exact
+unused capacity: one field is a conservative upper bound assembled from shard
+maxima and the other is a periodically sampled lower bound on the true high
+water. Absence of queue-full is therefore not a proof of queue headroom.
 
 The production executable sizes each source decoder queue to 65,536 records,
 each source/Store-worker queue to 32,768 records, and the default-on

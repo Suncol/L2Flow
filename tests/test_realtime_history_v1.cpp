@@ -3,6 +3,7 @@
 #include "l2flow/market/instrument_runtime_state_v2.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -703,6 +704,310 @@ int main() {
                  "only latest complete generation is current");
 
     runtime->StopAndDrain();
+
+    // The parallel decoder uses a bounded session only when at least two
+    // source-ordered completions are already ready. Verify that the batch
+    // admits its exact prefix across both History workers and that a later
+    // sequence error neither over-counts nor rolls back the accepted prefix.
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> batch_runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            config, &batch_runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            batch_runtime != nullptr,
+        "batch history runtime creation");
+    if (batch_runtime != nullptr) {
+        market::RealtimeHistorySubmissionBatchV1 batch;
+        auto first_batch_record =
+            MakeRecord(instrument1, 1U, 1U, 3'000'001);
+        auto second_batch_record =
+            MakeRecord(instrument2, 2U, 2U, 3'000'002);
+        auto third_batch_record =
+            MakeRecord(instrument1, 3U, 3U, 3'000'003);
+        auto fourth_batch_record =
+            MakeRecord(instrument2, 4U, 4U, 3'000'004);
+        const bool batch_records_ready =
+            first_batch_record.has_value() &&
+            second_batch_record.has_value() &&
+            third_batch_record.has_value() &&
+            fourth_batch_record.has_value();
+        const market::RealtimeHistorySubmitErrorV1 batch_begin_error =
+            batch_records_ready
+                ? batch_runtime->BeginSubmissionBatch(0U, &batch)
+                : market::RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        ok &= Expect(
+            batch_records_ready &&
+                batch_begin_error ==
+                    market::RealtimeHistorySubmitErrorV1::kNone,
+            "begin bounded History submission batch");
+        if (batch_records_ready &&
+            batch_begin_error ==
+                market::RealtimeHistorySubmitErrorV1::kNone) {
+            ok &= Expect(
+                batch.TrySubmit(std::move(*first_batch_record)) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone,
+                "batch immediately submits its first record");
+
+            // The first record for a History worker must be observable while
+            // the batch gate is still active. StopAndDrain is deliberately not
+            // used as the waiter here because its WakeAll would mask a missing
+            // first-record signal.
+            market::RealtimeLatestRecordViewV1 first_batch_live{};
+            const auto first_batch_deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::seconds(2);
+            do {
+                const bool first_applied =
+                    batch_runtime->GetLatestSnapshot(
+                        instrument1.instrument_id,
+                        &first_batch_live) ==
+                        market::RealtimeLatestQueryErrorV1::kNone &&
+                    first_batch_live.available() &&
+                    first_batch_live.record->ingress_sequence() == 1U;
+                if (first_applied) {
+                    break;
+                }
+                std::this_thread::yield();
+            } while (std::chrono::steady_clock::now() <
+                     first_batch_deadline);
+            ok &= Expect(
+                first_batch_live.available() &&
+                    first_batch_live.record->ingress_sequence() == 1U,
+                "first batch record is applied before Finish");
+
+            ok &= Expect(
+                batch.TrySubmit(std::move(*second_batch_record)) ==
+                        market::RealtimeHistorySubmitErrorV1::kNone &&
+                    batch.TrySubmit(std::move(*third_batch_record)) ==
+                        market::RealtimeHistorySubmitErrorV1::kNone &&
+                    batch.TrySubmit(std::move(*fourth_batch_record)) ==
+                        market::RealtimeHistorySubmitErrorV1::kNone,
+                "batch immediately routes the remaining ordered prefix");
+        }
+        const market::RealtimeHistoryBatchSubmitResultV1 batch_result =
+            batch.Finish();
+        batch_runtime->StopAndDrain();
+        ok &= Expect(
+            batch_result.error ==
+                    market::RealtimeHistorySubmitErrorV1::kNone &&
+                batch_result.submitted_count == 4U &&
+                batch_runtime->StoreSnapshot().appended_records == 4U &&
+                batch_runtime->BeginSubmissionBatch(0U, &batch) ==
+                    market::RealtimeHistorySubmitErrorV1::kStopped,
+            "batch result and post-stop gate expose the exact admitted prefix");
+    }
+
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1>
+        failing_batch_runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            config, &failing_batch_runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            failing_batch_runtime != nullptr,
+        "failing batch history runtime creation");
+    if (failing_batch_runtime != nullptr) {
+        market::RealtimeHistorySubmissionBatchV1 batch;
+        auto valid = MakeRecord(instrument1, 1U, 1U, 4'000'001);
+        auto sequence_gap =
+            MakeRecord(instrument2, 3U, 2U, 4'000'002);
+        ok &= Expect(
+            valid.has_value() && sequence_gap.has_value() &&
+                failing_batch_runtime->BeginSubmissionBatch(
+                    0U, &batch) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone,
+            "begin batch used for prefix-failure validation");
+        if (valid.has_value() && sequence_gap.has_value()) {
+            ok &= Expect(
+                batch.TrySubmit(std::move(*valid)) ==
+                        market::RealtimeHistorySubmitErrorV1::kNone &&
+                    batch.TrySubmit(std::move(*sequence_gap)) ==
+                        market::RealtimeHistorySubmitErrorV1::
+                            kSequenceNotIncreasing,
+                "batch reports the first source-sequence failure");
+        }
+        const market::RealtimeHistoryBatchSubmitResultV1 batch_result =
+            batch.Finish();
+        failing_batch_runtime->StopAndDrain();
+        ok &= Expect(
+            batch_result.submitted_count == 1U &&
+                batch_result.error ==
+                    market::RealtimeHistorySubmitErrorV1::
+                        kSequenceNotIncreasing &&
+                failing_batch_runtime->fatal() &&
+                failing_batch_runtime->StoreSnapshot().coverage_lost,
+            "batch failure reports its exact admitted prefix and fails closed");
+    }
+
+    // StopAndDrain closes admission and then waits for every active batch
+    // gate. Observe the closed gate through a second source before releasing
+    // the first source, so this test does not depend on a scheduling delay.
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> gate_runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            config, &gate_runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            gate_runtime != nullptr,
+        "batch gate history runtime creation");
+    if (gate_runtime != nullptr) {
+        market::RealtimeHistorySubmissionBatchV1 held_batch;
+        const market::RealtimeHistorySubmitErrorV1 held_begin_error =
+            gate_runtime->BeginSubmissionBatch(0U, &held_batch);
+        ok &= Expect(
+            held_begin_error ==
+                market::RealtimeHistorySubmitErrorV1::kNone,
+            "begin batch held across StopAndDrain");
+
+        std::atomic<bool> stop_entered{false};
+        std::atomic<bool> stop_returned{false};
+        std::thread stopper([&] {
+            stop_entered.store(true, std::memory_order_release);
+            gate_runtime->StopAndDrain();
+            stop_returned.store(true, std::memory_order_release);
+        });
+
+        bool admission_closed = false;
+        const auto gate_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < gate_deadline) {
+            if (!stop_entered.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+                continue;
+            }
+            market::RealtimeHistorySubmissionBatchV1 probe_batch;
+            const market::RealtimeHistorySubmitErrorV1 probe_error =
+                gate_runtime->BeginSubmissionBatch(1U, &probe_batch);
+            if (probe_error ==
+                market::RealtimeHistorySubmitErrorV1::kStopped) {
+                admission_closed = true;
+                break;
+            }
+            if (probe_error ==
+                market::RealtimeHistorySubmitErrorV1::kNone) {
+                static_cast<void>(probe_batch.Finish());
+            } else {
+                break;
+            }
+            std::this_thread::yield();
+        }
+        const bool stop_blocked_on_batch =
+            admission_closed &&
+            !stop_returned.load(std::memory_order_acquire);
+        const market::RealtimeHistoryBatchSubmitResultV1 held_result =
+            held_batch.Finish();
+        stopper.join();
+        ok &= Expect(
+            stop_blocked_on_batch &&
+                held_result.error ==
+                    market::RealtimeHistorySubmitErrorV1::kNone &&
+                held_result.submitted_count == 0U &&
+                stop_returned.load(std::memory_order_acquire),
+            "StopAndDrain waits for an active batch gate");
+    }
+
+    // Exactly the documented maximum is a successful batch. This also
+    // exercises all fixed-size tracking arrays at their highest valid index.
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> maximum_batch_runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            config, &maximum_batch_runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            maximum_batch_runtime != nullptr,
+        "maximum batch history runtime creation");
+    if (maximum_batch_runtime != nullptr) {
+        market::RealtimeHistorySubmissionBatchV1 batch;
+        bool maximum_submitted =
+            maximum_batch_runtime->BeginSubmissionBatch(0U, &batch) ==
+            market::RealtimeHistorySubmitErrorV1::kNone;
+        for (std::size_t index = 0U;
+             maximum_submitted &&
+             index < market::kRealtimeHistoryMaximumSubmitBatchV1;
+             ++index) {
+            const std::uint64_t sequence =
+                static_cast<std::uint64_t>(index) + 1U;
+            auto record = MakeRecord(
+                fixture->entries[index % fixture->entries.size()],
+                sequence,
+                sequence,
+                5'000'000 + static_cast<std::int64_t>(sequence));
+            maximum_submitted =
+                record.has_value() &&
+                batch.TrySubmit(std::move(*record)) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone;
+        }
+        const market::RealtimeHistoryBatchSubmitResultV1 result =
+            batch.Finish();
+        maximum_batch_runtime->StopAndDrain();
+        ok &= Expect(
+            maximum_submitted &&
+                result.error ==
+                    market::RealtimeHistorySubmitErrorV1::kNone &&
+                result.submitted_count ==
+                    market::kRealtimeHistoryMaximumSubmitBatchV1 &&
+                maximum_batch_runtime->StoreSnapshot().appended_records ==
+                    market::kRealtimeHistoryMaximumSubmitBatchV1,
+            "maximum-size batch succeeds without truncation");
+    }
+
+    // The first record beyond the fixed bound is rejected without admission;
+    // Finish must still expose the exact sixteen-record accepted prefix.
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> overflow_batch_runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            config, &overflow_batch_runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            overflow_batch_runtime != nullptr,
+        "overflow batch history runtime creation");
+    if (overflow_batch_runtime != nullptr) {
+        market::RealtimeHistorySubmissionBatchV1 batch;
+        bool prefix_submitted =
+            overflow_batch_runtime->BeginSubmissionBatch(0U, &batch) ==
+            market::RealtimeHistorySubmitErrorV1::kNone;
+        for (std::size_t index = 0U;
+             prefix_submitted &&
+             index < market::kRealtimeHistoryMaximumSubmitBatchV1;
+             ++index) {
+            const std::uint64_t sequence =
+                static_cast<std::uint64_t>(index) + 1U;
+            auto record = MakeRecord(
+                fixture->entries[index % fixture->entries.size()],
+                sequence,
+                sequence,
+                6'000'000 + static_cast<std::int64_t>(sequence));
+            prefix_submitted =
+                record.has_value() &&
+                batch.TrySubmit(std::move(*record)) ==
+                    market::RealtimeHistorySubmitErrorV1::kNone;
+        }
+        const std::uint64_t overflow_sequence =
+            static_cast<std::uint64_t>(
+                market::kRealtimeHistoryMaximumSubmitBatchV1) +
+            1U;
+        auto overflow_record = MakeRecord(
+            instrument1,
+            overflow_sequence,
+            overflow_sequence,
+            6'000'000 +
+                static_cast<std::int64_t>(overflow_sequence));
+        const market::RealtimeHistorySubmitErrorV1 overflow_error =
+            prefix_submitted && overflow_record.has_value()
+                ? batch.TrySubmit(std::move(*overflow_record))
+                : market::RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        const market::RealtimeHistoryBatchSubmitResultV1 result =
+            batch.Finish();
+        overflow_batch_runtime->StopAndDrain();
+        ok &= Expect(
+            prefix_submitted &&
+                overflow_error ==
+                    market::RealtimeHistorySubmitErrorV1::kInvalidRecord &&
+                result.error ==
+                    market::RealtimeHistorySubmitErrorV1::kInvalidRecord &&
+                result.submitted_count ==
+                    market::kRealtimeHistoryMaximumSubmitBatchV1 &&
+                overflow_batch_runtime->fatal() &&
+                overflow_batch_runtime->StoreSnapshot().coverage_lost,
+            "batch overflow reports the exact maximum-size admitted prefix");
+    }
 
     // A separate runtime exercises event-time KLine aggregation without
     // changing any of the store-only generation assertions above.

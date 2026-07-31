@@ -43,11 +43,7 @@ class ContiguousSequenceTrackerV2::Impl final {
 public:
     explicit Impl(std::size_t capacity)
         : capacity_(capacity),
-          slots_(std::make_unique<std::atomic<std::uint64_t>[]>(capacity)) {
-        for (std::size_t index = 0U; index < capacity_; ++index) {
-            slots_[index].store(0U, std::memory_order_relaxed);
-        }
-    }
+          slots_(std::make_unique<std::uint64_t[]>(capacity)) {}
 
     [[nodiscard]] ContiguousSequenceMarkErrorV2 Mark(
         std::uint64_t sequence) noexcept {
@@ -88,30 +84,23 @@ public:
                 kReorderWindowExceeded;
         }
 
-        std::atomic<std::uint64_t>& slot =
-            slots_[Index(sequence)];
-        std::uint64_t empty = 0U;
-        if (!slot.compare_exchange_strong(
-                empty,
-                sequence,
-                std::memory_order_release,
-                std::memory_order_acquire)) {
+        std::uint64_t& slot = slots_[Index(sequence)];
+        if (slot != 0U) {
             failed_marks_.fetch_add(1U, std::memory_order_relaxed);
-            return empty == sequence
+            return slot == sequence
                        ? ContiguousSequenceMarkErrorV2::
                              kDuplicateSequence
                        : ContiguousSequenceMarkErrorV2::kSlotConflict;
         }
-        pending_sequences_.fetch_add(1U, std::memory_order_relaxed);
+        slot = sequence;
+        pending_sequences_.store(
+            pending_sequences_.load(std::memory_order_relaxed) + 1U,
+            std::memory_order_relaxed);
 
-        std::uint64_t highest =
-            highest_observed_sequence_.load(std::memory_order_relaxed);
-        while (highest < sequence &&
-               !highest_observed_sequence_.compare_exchange_weak(
-                   highest,
-                   sequence,
-                   std::memory_order_relaxed,
-                   std::memory_order_relaxed)) {
+        if (highest_observed_sequence_.load(
+                std::memory_order_relaxed) < sequence) {
+            highest_observed_sequence_.store(
+                sequence, std::memory_order_relaxed);
         }
 
         Advance();
@@ -147,31 +136,24 @@ private:
     void Advance() noexcept {
         std::uint64_t next =
             next_sequence_.load(std::memory_order_relaxed);
-        while (true) {
-            std::atomic<std::uint64_t>& slot = slots_[Index(next)];
-            if (slot.load(std::memory_order_acquire) != next) {
-                break;
+        std::uint64_t pending =
+            pending_sequences_.load(std::memory_order_relaxed);
+        while (slots_[Index(next)] == next) {
+            slots_[Index(next)] = 0U;
+            if (pending == 0U) {
+                std::terminate();
             }
-            const std::uint64_t removed =
-                slot.exchange(0U, std::memory_order_acq_rel);
-            if (removed != next) {
-                // The advance lock gives this function the only consumer.
-                // A mismatch can therefore arise only from memory
-                // corruption; leave the prefix conservative.
-                if (removed != 0U) {
-                    slot.store(removed, std::memory_order_release);
-                }
-                break;
-            }
-            pending_sequences_.fetch_sub(
-                1U, std::memory_order_relaxed);
+            --pending;
             ++next;
-            next_sequence_.store(next, std::memory_order_release);
         }
+        pending_sequences_.store(pending, std::memory_order_relaxed);
+        next_sequence_.store(next, std::memory_order_release);
     }
 
     std::size_t capacity_ = 0U;
-    std::unique_ptr<std::atomic<std::uint64_t>[]> slots_;
+    // Mark and Advance hold advance_lock_, so ring cells do not need their
+    // own atomics. Snapshot never reads the cells directly.
+    std::unique_ptr<std::uint64_t[]> slots_;
     std::atomic<std::uint64_t> next_sequence_{1U};
     std::atomic<std::uint64_t> highest_observed_sequence_{0U};
     std::atomic<std::uint64_t> pending_sequences_{0U};

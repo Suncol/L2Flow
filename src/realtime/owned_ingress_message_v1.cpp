@@ -8,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <utility>
 
 namespace l2flow::realtime {
@@ -17,6 +18,15 @@ inline constexpr std::size_t kMinimumSizeClassBytes = 128U;
 inline constexpr std::size_t kMaximumSizeClassBytes =
     32U * 1024U * 1024U;
 inline constexpr std::size_t kSizeClassCount = 19U;
+inline constexpr std::uint64_t kSerializedRetiredBit =
+    std::uint64_t{1U} << 63U;
+inline constexpr std::uint64_t kSerializedAnchorCheckBit =
+    std::uint64_t{1U} << 62U;
+inline constexpr std::uint64_t kSerializedRecyclerCountMask =
+    kSerializedAnchorCheckBit - 1U;
+inline constexpr std::uint64_t kSerializedAcquireSequenceMask =
+    kSerializedRetiredBit - 1U;
+inline constexpr std::uint64_t kSerializedAcquireBusyBit = 1U;
 static_assert(
     kMinimumSizeClassBytes << (kSizeClassCount - 1U) ==
     kMaximumSizeClassBytes);
@@ -158,7 +168,9 @@ public:
         std::size_t maximum_pool_bytes) noexcept
         : config_(config),
           maximum_size_class_(maximum_size_class),
-          maximum_pool_bytes_(maximum_pool_bytes) {}
+          maximum_pool_bytes_(maximum_pool_bytes),
+          lifetime_references_(
+              config.serialized_acquire ? 2U : 1U) {}
 
     OwnedIngressMessagePoolStateV1(
         const OwnedIngressMessagePoolStateV1&) = delete;
@@ -168,6 +180,10 @@ public:
     [[nodiscard]] bool Prewarm() noexcept {
         if (config_.prewarm_message_count == 0U) {
             return true;
+        }
+
+        if (config_.serialized_acquire) {
+            return PrewarmSerialized();
         }
 
         const std::size_t prewarm_body_bytes =
@@ -213,6 +229,12 @@ public:
             return OwnedIngressMessageErrorV1::kNullOutput;
         }
         output->reset();
+        SerializedAcquireScope serialized_scope(
+            this, config_.serialized_acquire);
+        if (serialized_scope.error() !=
+            OwnedIngressMessageErrorV1::kNone) {
+            return serialized_scope.error();
+        }
         if (!IsValidMetadata(metadata)) {
             return OwnedIngressMessageErrorV1::kInvalidMetadata;
         }
@@ -233,6 +255,14 @@ public:
         if (!FindSizeClass(required_bytes, &requested_size_class) ||
             requested_size_class > maximum_size_class_) {
             return OwnedIngressMessageErrorV1::kMessageTooLarge;
+        }
+
+        if (config_.serialized_acquire) {
+            return AcquireSerializedValidated(
+                inspection,
+                metadata,
+                requested_size_class,
+                output);
         }
 
         void* block = nullptr;
@@ -314,6 +344,10 @@ public:
     }
 
     void Recycle(OwnedIngressMessageV1* message) noexcept {
+        if (config_.serialized_acquire) {
+            RecycleSerialized(message);
+            return;
+        }
         const std::size_t size_class = message->size_class_index_;
         void* const block = message;
         message->~OwnedIngressMessageV1();
@@ -347,6 +381,10 @@ public:
     }
 
     void Retire() noexcept {
+        if (config_.serialized_acquire) {
+            RetireSerialized();
+            return;
+        }
         std::array<void*, kSizeClassCount> detached{};
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -385,6 +423,9 @@ public:
 
     [[nodiscard]] OwnedIngressMessagePoolSnapshotV1 Snapshot()
         const noexcept {
+        if (config_.serialized_acquire) {
+            return SnapshotSerialized();
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         OwnedIngressMessagePoolSnapshotV1 result{};
         result.maximum_message_bytes =
@@ -395,6 +436,7 @@ public:
             config_.prewarm_message_bytes;
         result.prewarm_message_count =
             config_.prewarm_message_count;
+        result.serialized_acquire = false;
         result.active_messages = active_messages_;
         result.allocated_blocks = allocated_blocks_;
         result.cached_blocks = cached_blocks_;
@@ -431,10 +473,630 @@ private:
         std::size_t count = 0U;
     };
 
+    struct SerializedFreeList final {
+        void* head = nullptr;
+    };
+
+    class SerializedAcquireScope final {
+    public:
+        SerializedAcquireScope(
+            OwnedIngressMessagePoolStateV1* owner,
+            bool enabled) noexcept {
+            if (!enabled) {
+                return;
+            }
+            error_ = owner->EnterSerializedAcquire();
+            if (error_ == OwnedIngressMessageErrorV1::kNone) {
+                owner_ = owner;
+            }
+        }
+
+        SerializedAcquireScope(const SerializedAcquireScope&) = delete;
+        SerializedAcquireScope& operator=(
+            const SerializedAcquireScope&) = delete;
+
+        ~SerializedAcquireScope() {
+            if (owner_ != nullptr) {
+                owner_->ExitSerializedAcquire();
+            }
+        }
+
+        [[nodiscard]] OwnedIngressMessageErrorV1 error()
+            const noexcept {
+            return error_;
+        }
+
+    private:
+        OwnedIngressMessagePoolStateV1* owner_ = nullptr;
+        OwnedIngressMessageErrorV1 error_ =
+            OwnedIngressMessageErrorV1::kNone;
+    };
+
+    [[nodiscard]] OwnedIngressMessageErrorV1
+    EnterSerializedAcquire() noexcept {
+        const std::uint64_t gate_before =
+            serialized_acquire_gate_.fetch_add(
+                1U, std::memory_order_acq_rel);
+        if ((gate_before & kSerializedAcquireSequenceMask) >=
+            kSerializedAcquireSequenceMask - 1U) {
+            std::terminate();
+        }
+        if ((gate_before & kSerializedRetiredBit) != 0U) {
+            const std::uint64_t gate_after =
+                serialized_acquire_gate_.fetch_add(
+                    1U, std::memory_order_release);
+            if ((gate_after & kSerializedAcquireBusyBit) == 0U) {
+                std::terminate();
+            }
+            return OwnedIngressMessageErrorV1::kPoolExhausted;
+        }
+        if ((gate_before & kSerializedAcquireBusyBit) != 0U) {
+            // The explicit serialized-acquire contract was violated. There
+            // is no safe recovery after two callers can mutate private lists.
+            std::terminate();
+        }
+        return OwnedIngressMessageErrorV1::kNone;
+    }
+
+    void ExitSerializedAcquire() noexcept {
+        const std::uint64_t gate_before =
+            serialized_acquire_gate_.fetch_add(
+                1U, std::memory_order_release);
+        if ((gate_before & kSerializedAcquireBusyBit) == 0U) {
+            std::terminate();
+        }
+    }
+
+    [[nodiscard]] bool PrewarmSerialized() noexcept {
+        const std::size_t prewarm_body_bytes =
+            static_cast<std::size_t>(config_.prewarm_message_bytes) -
+            l2flow::sdk::kVendorHeadBytes;
+        std::uint8_t size_class = 0U;
+        if (!FindSizeClass(
+                sizeof(OwnedIngressMessageV1) + prewarm_body_bytes,
+                &size_class) ||
+            size_class > maximum_size_class_) {
+            return false;
+        }
+
+        const std::size_t block_bytes = SizeClassBytes(size_class);
+        for (std::size_t index = 0U;
+             index < config_.prewarm_message_count;
+             ++index) {
+            void* const block =
+                ::operator new(block_bytes, std::nothrow);
+            if (block == nullptr) {
+                return false;
+            }
+            std::memset(block, 0, block_bytes);
+            PushSerializedLocal(size_class, block);
+            serialized_allocated_blocks_.store(
+                serialized_allocated_blocks_.load(
+                    std::memory_order_relaxed) + 1U,
+                std::memory_order_relaxed);
+            serialized_allocated_bytes_.store(
+                serialized_allocated_bytes_.load(
+                    std::memory_order_relaxed) + block_bytes,
+                std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    [[nodiscard]] OwnedIngressMessageErrorV1
+    AcquireSerializedValidated(
+        const OwnedIngressMessageInspectionV1& inspection,
+        const OwnedIngressMetadataV1& metadata,
+        std::uint8_t requested_size_class,
+        OwnedIngressMessageHandleV1* output) noexcept {
+        void* block = TakeSerializedFreeBlock(
+            requested_size_class, &requested_size_class);
+        OwnedIngressMessageErrorV1 error =
+            OwnedIngressMessageErrorV1::kNone;
+        if (block == nullptr) {
+            const std::size_t allocation_bytes =
+                SizeClassBytes(requested_size_class);
+            while (serialized_allocated_blocks_.load(
+                       std::memory_order_relaxed) >=
+                   config_.maximum_inflight_messages) {
+                if (!EvictOneSerializedFreeBlock()) {
+                    error = OwnedIngressMessageErrorV1::kPoolExhausted;
+                    break;
+                }
+            }
+            while (error == OwnedIngressMessageErrorV1::kNone &&
+                   serialized_allocated_bytes_.load(
+                       std::memory_order_relaxed) >
+                       maximum_pool_bytes_ - allocation_bytes) {
+                if (!EvictOneSerializedFreeBlock()) {
+                    error = OwnedIngressMessageErrorV1::kPoolExhausted;
+                    break;
+                }
+            }
+            if (error == OwnedIngressMessageErrorV1::kNone) {
+                block = ::operator new(
+                    allocation_bytes, std::nothrow);
+                if (block == nullptr) {
+                    error =
+                        OwnedIngressMessageErrorV1::kResourceExhausted;
+                } else {
+                    serialized_allocated_blocks_.store(
+                        serialized_allocated_blocks_.load(
+                            std::memory_order_relaxed) + 1U,
+                        std::memory_order_relaxed);
+                    serialized_allocated_bytes_.store(
+                        serialized_allocated_bytes_.load(
+                            std::memory_order_relaxed) + allocation_bytes,
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+
+        if (error == OwnedIngressMessageErrorV1::kNone) {
+            const std::uint64_t acquired =
+                serialized_acquired_messages_.load(
+                    std::memory_order_relaxed);
+            if (acquired ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                std::terminate();
+            }
+            serialized_acquired_messages_.store(
+                acquired + 1U, std::memory_order_release);
+        }
+        if (error != OwnedIngressMessageErrorV1::kNone) {
+            return error;
+        }
+
+        auto* const allocation_bytes = static_cast<std::byte*>(block);
+        std::byte* const body_data =
+            allocation_bytes + sizeof(OwnedIngressMessageV1);
+        auto* const message = new (block) OwnedIngressMessageV1(
+            metadata,
+            inspection,
+            this,
+            body_data,
+            requested_size_class);
+        if (!inspection.body_.empty()) {
+            std::memcpy(
+                message->mutable_body_data(),
+                inspection.body_.data(),
+                inspection.body_.size());
+        }
+        *output = OwnedIngressMessageHandleV1(
+            message,
+            OwnedIngressMessageHandleV1::AdoptReference{});
+        return OwnedIngressMessageErrorV1::kNone;
+    }
+
+    void RecycleSerialized(OwnedIngressMessageV1* message) noexcept {
+        const std::size_t size_class = message->size_class_index_;
+        if (size_class > maximum_size_class_) {
+            std::terminate();
+        }
+        const std::uint64_t gate_before = EnterSerializedRecycle();
+        const bool retired =
+            (gate_before & kSerializedRetiredBit) != 0U;
+        void* const block = message;
+        message->~OwnedIngressMessageV1();
+
+        // Publish the logical recycle before making this block reusable. An
+        // acquirer that takes the returned block can then publish a new
+        // acquisition without a concurrent Snapshot ever observing two active
+        // messages backed by one allocated block. The returned-stack release
+        // publication carries this counter update to the acquirer.
+        const std::uint64_t previous_recycled =
+            serialized_recycled_messages_.fetch_add(
+                1U, std::memory_order_acq_rel);
+        if (previous_recycled ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            std::terminate();
+        }
+
+        if (retired) {
+            const std::size_t block_bytes =
+                SizeClassBytes(size_class);
+            const std::size_t previous_blocks =
+                serialized_allocated_blocks_.fetch_sub(
+                    1U, std::memory_order_acq_rel);
+            const std::size_t previous_bytes =
+                serialized_allocated_bytes_.fetch_sub(
+                    block_bytes, std::memory_order_acq_rel);
+            if (previous_blocks == 0U ||
+                previous_bytes < block_bytes) {
+                std::terminate();
+            }
+            ::operator delete(block);
+        } else {
+            PushSerializedReturned(size_class, block);
+        }
+        const std::uint64_t gate_after =
+            serialized_recycle_gate_.fetch_sub(
+                1U, std::memory_order_release);
+        if ((gate_after & kSerializedRecyclerCountMask) == 0U) {
+            std::terminate();
+        }
+        if (retired &&
+            (gate_after & kSerializedRecyclerCountMask) == 1U) {
+            TryReleaseSerializedAnchor();
+        }
+    }
+
+    [[nodiscard]] std::uint64_t EnterSerializedRecycle() noexcept {
+        std::uint64_t observed = serialized_recycle_gate_.load(
+            std::memory_order_acquire);
+        for (;;) {
+            if ((observed & kSerializedAnchorCheckBit) != 0U) {
+                std::this_thread::yield();
+                observed = serialized_recycle_gate_.load(
+                    std::memory_order_acquire);
+                continue;
+            }
+            if ((observed & kSerializedRecyclerCountMask) ==
+                kSerializedRecyclerCountMask) {
+                std::terminate();
+            }
+            if (serialized_recycle_gate_.compare_exchange_weak(
+                    observed,
+                    observed + 1U,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return observed;
+            }
+        }
+    }
+
+    void TryReleaseSerializedAnchor() noexcept {
+        std::uint64_t observed = serialized_recycle_gate_.load(
+            std::memory_order_acquire);
+        for (;;) {
+            if ((observed & kSerializedRetiredBit) == 0U ||
+                (observed & (kSerializedAnchorCheckBit |
+                             kSerializedRecyclerCountMask)) != 0U) {
+                return;
+            }
+            if (serialized_recycle_gate_.compare_exchange_weak(
+                    observed,
+                    observed | kSerializedAnchorCheckBit,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
+
+        if (serialized_acquired_messages_.load(
+                std::memory_order_acquire) !=
+            serialized_recycled_messages_.load(
+                std::memory_order_acquire)) {
+            serialized_recycle_gate_.fetch_and(
+                ~kSerializedAnchorCheckBit,
+                std::memory_order_release);
+            return;
+        }
+        bool expected = false;
+        if (!serialized_anchor_released_.compare_exchange_strong(
+                expected,
+                true,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return;
+        }
+        // The anchor is the only per-pool state reference held on behalf of
+        // all serialized-mode messages. Keep the exclusive gate set and make
+        // this the final state access: after pool destruction this release
+        // can delete the state.
+        ReleaseLifetimeReference();
+    }
+
+    void RetireSerialized() noexcept {
+        serialized_retired_.store(true, std::memory_order_release);
+        const std::uint64_t acquire_gate_before =
+            serialized_acquire_gate_.fetch_or(
+                kSerializedRetiredBit, std::memory_order_acq_rel);
+        if ((acquire_gate_before & kSerializedRetiredBit) != 0U) {
+            while (!serialized_retire_complete_.load(
+                std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            return;
+        }
+        while ((serialized_acquire_gate_.load(
+                    std::memory_order_acquire) &
+                kSerializedAcquireBusyBit) != 0U) {
+            std::this_thread::yield();
+        }
+        const std::uint64_t gate_before =
+            serialized_recycle_gate_.fetch_or(
+                kSerializedRetiredBit, std::memory_order_acq_rel);
+        if ((gate_before & kSerializedRetiredBit) != 0U) {
+            std::terminate();
+        }
+        while ((serialized_recycle_gate_.load(
+                    std::memory_order_acquire) &
+                kSerializedRecyclerCountMask) != 0U) {
+            std::this_thread::yield();
+        }
+
+        std::size_t detached_blocks = 0U;
+        std::size_t detached_bytes = 0U;
+        for (std::size_t index = 0U;
+             index <= maximum_size_class_;
+             ++index) {
+            DeleteSerializedFreeList(
+                serialized_local_free_lists_[index].head,
+                index,
+                &detached_blocks,
+                &detached_bytes);
+            serialized_local_free_lists_[index].head = nullptr;
+            void* const returned =
+                serialized_returned_heads_[index].exchange(
+                    nullptr, std::memory_order_acquire);
+            DeleteSerializedFreeList(
+                returned,
+                index,
+                &detached_blocks,
+                &detached_bytes);
+        }
+        if (detached_blocks != 0U) {
+            const std::size_t previous_blocks =
+                serialized_allocated_blocks_.fetch_sub(
+                    detached_blocks, std::memory_order_acq_rel);
+            const std::size_t previous_bytes =
+                serialized_allocated_bytes_.fetch_sub(
+                    detached_bytes, std::memory_order_acq_rel);
+            if (previous_blocks < detached_blocks ||
+                previous_bytes < detached_bytes) {
+                std::terminate();
+            }
+        }
+        serialized_retire_complete_.store(
+            true, std::memory_order_release);
+        TryReleaseSerializedAnchor();
+    }
+
+    [[nodiscard]] OwnedIngressMessagePoolSnapshotV1
+    SnapshotSerialized() const noexcept {
+        for (;;) {
+            const bool retired_before =
+                serialized_retired_.load(std::memory_order_acquire);
+            if (retired_before &&
+                !serialized_retire_complete_.load(
+                    std::memory_order_acquire)) {
+                std::this_thread::yield();
+                continue;
+            }
+            const std::uint64_t acquire_gate_before =
+                serialized_acquire_gate_.load(
+                    std::memory_order_acquire);
+            if ((acquire_gate_before &
+                 kSerializedAcquireBusyBit) != 0U) {
+                std::this_thread::yield();
+                continue;
+            }
+
+            const std::uint64_t acquired =
+                serialized_acquired_messages_.load(
+                    std::memory_order_acquire);
+            const std::uint64_t recycled =
+                serialized_recycled_messages_.load(
+                    std::memory_order_acquire);
+            const std::uint64_t recycle_gate_before = retired_before
+                ? serialized_recycle_gate_.load(
+                      std::memory_order_acquire)
+                : 0U;
+            if (retired_before &&
+                (recycle_gate_before &
+                 kSerializedRecyclerCountMask) != 0U) {
+                std::this_thread::yield();
+                continue;
+            }
+            const std::size_t allocated_blocks =
+                serialized_allocated_blocks_.load(
+                    std::memory_order_acquire);
+            const std::size_t allocated_bytes =
+                serialized_allocated_bytes_.load(
+                    std::memory_order_acquire);
+
+            const std::uint64_t acquire_gate_after =
+                serialized_acquire_gate_.load(
+                    std::memory_order_acquire);
+            const std::uint64_t recycle_gate_after = retired_before
+                ? serialized_recycle_gate_.load(
+                      std::memory_order_acquire)
+                : 0U;
+            const std::uint64_t recycled_after = retired_before
+                ? serialized_recycled_messages_.load(
+                      std::memory_order_acquire)
+                : recycled;
+            const bool retired_after =
+                serialized_retired_.load(std::memory_order_acquire);
+            if (acquire_gate_before != acquire_gate_after ||
+                (acquire_gate_after &
+                 kSerializedAcquireBusyBit) != 0U ||
+                retired_before != retired_after ||
+                (retired_before &&
+                 (recycle_gate_before != recycle_gate_after ||
+                  recycled != recycled_after ||
+                  (recycle_gate_after &
+                   kSerializedRecyclerCountMask) != 0U))) {
+                continue;
+            }
+            if (recycled > acquired ||
+                acquired - recycled >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::size_t>::max())) {
+                std::terminate();
+            }
+            const std::size_t active_messages =
+                static_cast<std::size_t>(acquired - recycled);
+            if (active_messages > allocated_blocks) {
+                std::terminate();
+            }
+
+            OwnedIngressMessagePoolSnapshotV1 result{};
+            result.maximum_message_bytes =
+                config_.maximum_message_bytes;
+            result.maximum_inflight_messages =
+                config_.maximum_inflight_messages;
+            result.prewarm_message_bytes =
+                config_.prewarm_message_bytes;
+            result.prewarm_message_count =
+                config_.prewarm_message_count;
+            result.serialized_acquire = true;
+            result.active_messages = active_messages;
+            result.allocated_blocks = allocated_blocks;
+            result.cached_blocks =
+                allocated_blocks - active_messages;
+            result.allocated_bytes = allocated_bytes;
+            result.retired = retired_after;
+            return result;
+        }
+    }
+
+    void PushSerializedLocal(
+        std::size_t size_class,
+        void* block) noexcept {
+        SerializedFreeList& list =
+            serialized_local_free_lists_[size_class];
+        std::memcpy(block, &list.head, sizeof(list.head));
+        list.head = block;
+    }
+
+    [[nodiscard]] void* PopSerializedLocal(
+        std::size_t size_class) noexcept {
+        SerializedFreeList& list =
+            serialized_local_free_lists_[size_class];
+        void* const block = list.head;
+        if (block == nullptr) {
+            return nullptr;
+        }
+        std::memcpy(&list.head, block, sizeof(list.head));
+        return block;
+    }
+
+    void PushSerializedReturned(
+        std::size_t size_class,
+        void* block) noexcept {
+        std::atomic<void*>& head =
+            serialized_returned_heads_[size_class];
+        void* observed = head.load(std::memory_order_relaxed);
+        do {
+            std::memcpy(block, &observed, sizeof(observed));
+        } while (!head.compare_exchange_weak(
+            observed,
+            block,
+            std::memory_order_release,
+            std::memory_order_relaxed));
+    }
+
+    [[nodiscard]] void* TakeSerializedFreeBlock(
+        std::size_t requested_size_class,
+        std::uint8_t* actual_size_class) noexcept {
+        for (std::size_t index = requested_size_class;
+             index <= maximum_size_class_;
+             ++index) {
+            if (serialized_local_free_lists_[index].head == nullptr) {
+                serialized_local_free_lists_[index].head =
+                    serialized_returned_heads_[index].exchange(
+                        nullptr, std::memory_order_acquire);
+            }
+            void* const block = PopSerializedLocal(index);
+            if (block != nullptr) {
+                *actual_size_class =
+                    static_cast<std::uint8_t>(index);
+                return block;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool EvictOneSerializedFreeBlock() noexcept {
+        for (std::size_t reverse = maximum_size_class_ + 1U;
+             reverse != 0U;
+             --reverse) {
+            const std::size_t index = reverse - 1U;
+            if (serialized_local_free_lists_[index].head == nullptr) {
+                serialized_local_free_lists_[index].head =
+                    serialized_returned_heads_[index].exchange(
+                        nullptr, std::memory_order_acquire);
+            }
+            void* const block = PopSerializedLocal(index);
+            if (block == nullptr) {
+                continue;
+            }
+            const std::size_t block_bytes = SizeClassBytes(index);
+            const std::size_t allocated_blocks =
+                serialized_allocated_blocks_.load(
+                    std::memory_order_relaxed);
+            const std::size_t allocated_bytes =
+                serialized_allocated_bytes_.load(
+                    std::memory_order_relaxed);
+            if (allocated_blocks == 0U ||
+                allocated_bytes < block_bytes) {
+                std::terminate();
+            }
+            serialized_allocated_blocks_.store(
+                allocated_blocks - 1U, std::memory_order_relaxed);
+            serialized_allocated_bytes_.store(
+                allocated_bytes - block_bytes,
+                std::memory_order_relaxed);
+            ::operator delete(block);
+            return true;
+        }
+        return false;
+    }
+
+    static void DeleteSerializedFreeList(
+        void* block,
+        std::size_t size_class,
+        std::size_t* deleted_blocks,
+        std::size_t* deleted_bytes) noexcept {
+        const std::size_t block_bytes = SizeClassBytes(size_class);
+        while (block != nullptr) {
+            void* next = nullptr;
+            std::memcpy(&next, block, sizeof(next));
+            ::operator delete(block);
+            block = next;
+            if (*deleted_blocks ==
+                    std::numeric_limits<std::size_t>::max() ||
+                *deleted_bytes >
+                    std::numeric_limits<std::size_t>::max() -
+                        block_bytes) {
+                std::terminate();
+            }
+            ++*deleted_blocks;
+            *deleted_bytes += block_bytes;
+        }
+    }
+
     ~OwnedIngressMessagePoolStateV1() {
-        if (!retired_ || active_messages_ != 0U ||
-            allocated_blocks_ != 0U || cached_blocks_ != 0U ||
-            allocated_bytes_ != 0U) {
+        if (config_.serialized_acquire) {
+            if (!serialized_retired_.load(
+                    std::memory_order_relaxed) ||
+                !serialized_retire_complete_.load(
+                    std::memory_order_relaxed) ||
+                !serialized_anchor_released_.load(
+                    std::memory_order_relaxed) ||
+                serialized_acquired_messages_.load(
+                    std::memory_order_relaxed) !=
+                    serialized_recycled_messages_.load(
+                        std::memory_order_relaxed) ||
+                serialized_allocated_blocks_.load(
+                    std::memory_order_relaxed) != 0U ||
+                serialized_allocated_bytes_.load(
+                    std::memory_order_relaxed) != 0U) {
+                std::terminate();
+            }
+            for (std::size_t index = 0U;
+                 index <= maximum_size_class_;
+                 ++index) {
+                if (serialized_local_free_lists_[index].head != nullptr ||
+                    serialized_returned_heads_[index].load(
+                        std::memory_order_relaxed) != nullptr) {
+                    std::terminate();
+                }
+            }
+        } else if (!retired_ || active_messages_ != 0U ||
+                   allocated_blocks_ != 0U || cached_blocks_ != 0U ||
+                   allocated_bytes_ != 0U) {
             std::terminate();
         }
     }
@@ -522,6 +1184,30 @@ private:
     std::size_t cached_blocks_ = 0U;
     std::size_t allocated_bytes_ = 0U;
     bool retired_ = false;
+
+    // The acquisition and recycle counters occupy separate cache lines so a
+    // serialized callback does not write the cache line shared by decoder
+    // recyclers. Returned blocks cross that boundary only when the callback
+    // atomically detaches a whole size-class chain after its private list is
+    // empty.
+    alignas(64) std::atomic<std::uint64_t>
+        serialized_acquire_gate_{0U};
+    std::atomic<std::uint64_t> serialized_acquired_messages_{0U};
+    std::array<SerializedFreeList, kSizeClassCount>
+        serialized_local_free_lists_{};
+    std::atomic<bool> serialized_retired_{false};
+    std::atomic<bool> serialized_retire_complete_{false};
+    std::atomic<bool> serialized_anchor_released_{false};
+
+    alignas(64) std::atomic<std::uint64_t>
+        serialized_recycle_gate_{0U};
+    std::atomic<std::uint64_t> serialized_recycled_messages_{0U};
+    std::array<std::atomic<void*>, kSizeClassCount>
+        serialized_returned_heads_{};
+
+    alignas(64) std::atomic<std::size_t>
+        serialized_allocated_blocks_{0U};
+    std::atomic<std::size_t> serialized_allocated_bytes_{0U};
 };
 
 std::string_view OwnedIngressKeyErrorNameV1(
@@ -872,6 +1558,10 @@ OwnedIngressMessageErrorV1 OwnedIngressMessagePoolV1::Acquire(
     const OwnedIngressMetadataV1& metadata,
     OwnedIngressMessageHandleV1* output) noexcept {
     return state_->Acquire(inspection, metadata, output);
+}
+
+void OwnedIngressMessagePoolV1::Retire() noexcept {
+    state_->Retire();
 }
 
 OwnedIngressMessagePoolSnapshotV1

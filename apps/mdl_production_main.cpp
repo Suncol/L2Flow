@@ -153,6 +153,10 @@ struct Options final {
     std::string user_name;
     std::string sdk_log_prefix = "l2flow-realtime";
     std::uint32_t instrument_store_workers = 4U;
+    // Zero keeps the existing one-decoder-owner-per-source path.
+    // Operators may enable the bounded stateless parse farm after validating
+    // the exact deployment's callback-to-reader latency and CPU placement.
+    std::uint32_t parallel_decoder_workers = 0U;
     std::uint64_t decoder_queue_records_per_source = 65'536U;
     std::uint64_t store_queue_records_per_source_worker = 32'768U;
     std::uint64_t certified_handoff_queue_records = 4'194'304U;
@@ -263,6 +267,8 @@ void PrintUsage(std::ostream& output) {
         << "                                1..86400, default 30\n"
         << "  --sdk-log-prefix PATH         default l2flow-realtime\n"
         << "  --instrument-store-workers N  1..256, default 4\n"
+        << "  --parallel-decoder-workers N  0..64, default 0; 0 keeps "
+           "the ordered legacy path\n"
         << "  --decoder-queue-records-per-source N\n"
         << "                                positive u64, default 65536\n"
         << "  --store-queue-records-per-source-worker N\n"
@@ -473,6 +479,7 @@ bool ParseOptions(
             option != "--user-name" &&
             option != "--sdk-log-prefix" &&
             option != "--instrument-store-workers" &&
+            option != "--parallel-decoder-workers" &&
             option != "--decoder-queue-records-per-source" &&
             option != "--store-queue-records-per-source-worker" &&
             option != "--certified-handoff-queue-records" &&
@@ -552,6 +559,15 @@ bool ParseOptions(
                 parsed.instrument_store_workers > 256U) {
                 *error =
                     "--instrument-store-workers must be 1..256";
+                return false;
+            }
+        } else if (option == "--parallel-decoder-workers") {
+            if (!ParseU32(
+                    value, &parsed.parallel_decoder_workers) ||
+                parsed.parallel_decoder_workers >
+                    runtime::kRealtimeParallelDecoderMaximumWorkersV1) {
+                *error =
+                    "--parallel-decoder-workers must be 0..64";
                 return false;
             }
         } else if (option ==
@@ -1345,6 +1361,8 @@ runtime::RealtimePipelineConfigV1 BuildOnlinePipelineBase(
     config.runtime_state = runtime_state;
     config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
     config.store_worker_count = options.instrument_store_workers;
+    config.parallel_decoder_worker_count =
+        options.parallel_decoder_workers;
     config.decoder_queue_capacity_per_source =
         static_cast<std::size_t>(
             options.decoder_queue_records_per_source);
@@ -2548,6 +2566,8 @@ int Run(const Options& options) {
         {1001U, 1002U, 2001U, 2002U};
     pipeline_config.store_worker_count =
         options.instrument_store_workers;
+    pipeline_config.parallel_decoder_worker_count =
+        options.parallel_decoder_workers;
     pipeline_config.decoder_queue_capacity_per_source =
         static_cast<std::size_t>(
             options.decoder_queue_records_per_source);
@@ -2711,6 +2731,8 @@ int Run(const Options& options) {
             << " key_arena_bytes=" << options.ipc_key_arena_bytes
             << " decoder_queue_records_per_source="
             << options.decoder_queue_records_per_source
+            << " parallel_decoder_workers="
+            << options.parallel_decoder_workers
             << " store_queue_records_per_source_worker="
             << options.store_queue_records_per_source_worker
             << " mainland_a_share_filter=true"

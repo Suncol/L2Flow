@@ -1175,6 +1175,118 @@ public:
         return RealtimeHistorySubmitErrorV1::kNone;
     }
 
+    [[nodiscard]] RealtimeHistorySubmitErrorV1 BeginBatch(
+        std::uint8_t source) noexcept {
+        if (source >= kRealtimeHistorySourceCountV1) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        }
+        if (!admission_open_.load(std::memory_order_acquire)) {
+            return RealtimeHistorySubmitErrorV1::kStopped;
+        }
+        if (fatal_.load(std::memory_order_acquire)) {
+            return RealtimeHistorySubmitErrorV1::kFatal;
+        }
+        return BeginSubmission(source)
+                   ? RealtimeHistorySubmitErrorV1::kNone
+                   : RealtimeHistorySubmitErrorV1::kStopped;
+    }
+
+    void EndBatch(std::uint8_t source) noexcept {
+        EndSubmission(source);
+    }
+
+    void SignalBatchWorker(std::uint32_t worker) noexcept {
+        SignalWorkIfNeeded(worker);
+    }
+
+    RealtimeHistorySubmitErrorV1 SubmitBatchItem(
+        std::uint8_t source,
+        RealtimeHistoryEventInputV1&& input,
+        std::uint32_t* worker_output) noexcept {
+        if (worker_output == nullptr ||
+            source >= kRealtimeHistorySourceCountV1) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        }
+        if (!admission_open_.load(std::memory_order_acquire)) {
+            return RealtimeHistorySubmitErrorV1::kStopped;
+        }
+        if (fatal_.load(std::memory_order_acquire)) {
+            return RealtimeHistorySubmitErrorV1::kFatal;
+        }
+        if (!input.valid() || input.instrument_id() == 0U ||
+            input.source_slot() != source ||
+            input.source_sequence() == 0U ||
+            input.ingress_sequence() == 0U ||
+            !KindBelongsToSource(input.kind(), source) ||
+            !TickStreamSequenceConsistent(
+                input.kind(),
+                input.ingress_sequence(),
+                input.tick_stream_sequence())) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        }
+        if (input.source_stream_id() !=
+            config_.source_stream_ids[source]) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kSourceMismatch;
+        }
+
+        SourceOwnerState& source_owner = source_owner_states_[source];
+        if (source_owner.last_sequence ==
+                std::numeric_limits<std::uint64_t>::max() ||
+            input.source_sequence() != source_owner.last_sequence + 1U ||
+            input.ingress_sequence() <=
+                source_owner.last_ingress_sequence ||
+            (input.tick_stream_sequence() != 0U &&
+             input.tick_stream_sequence() <=
+                 source_owner.last_tick_stream_sequence)) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kSequenceNotIncreasing;
+        }
+
+        InstrumentRouteTokenV1 route{};
+        if (store_->ResolveRouteToken(
+                input.ordinal(),
+                input.instrument_id(),
+                &route) != IntradayInstrumentStoreQueryErrorV1::kNone ||
+            route.worker != WorkerFor(input.instrument_id())) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        }
+        const std::uint32_t worker = route.worker;
+        const std::uint64_t accepted_source_sequence =
+            input.source_sequence();
+        const std::uint64_t accepted_ingress_sequence =
+            input.ingress_sequence();
+        const std::uint64_t accepted_tick_stream_sequence =
+            input.tick_stream_sequence();
+        HistoryHandoffPool::Slot* slot = nullptr;
+        HistoryHandoffPool& pool = HandoffPool(source, worker);
+        if (!pool.Acquire(std::move(input), &slot) || slot == nullptr) {
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kQueueFull;
+        }
+        Command command{};
+        command.kind = CommandKind::kRecord;
+        command.slot = slot;
+        command.route = route;
+        if (!Queue(source, worker).TryPush(std::move(command))) {
+            pool.ReleaseFromProducer(slot);
+            MarkFatal();
+            return RealtimeHistorySubmitErrorV1::kQueueFull;
+        }
+        source_owner.last_sequence = accepted_source_sequence;
+        source_owner.last_ingress_sequence = accepted_ingress_sequence;
+        if (accepted_tick_stream_sequence != 0U) {
+            source_owner.last_tick_stream_sequence =
+                accepted_tick_stream_sequence;
+        }
+        *worker_output = worker;
+        return RealtimeHistorySubmitErrorV1::kNone;
+    }
+
     RealtimeHistoryGenerationErrorV1 Begin(
         const RealtimeHistoryWatermarkV1& watermark) noexcept {
         if (!admission_open_.load(std::memory_order_acquire)) {
@@ -2469,6 +2581,160 @@ RealtimeHistoryCreateErrorV1 RealtimeHistoryRuntimeV1::Create(
 RealtimeHistorySubmitErrorV1 RealtimeHistoryRuntimeV1::TrySubmit(
     RealtimeHistoryEventInputV1&& input) noexcept {
     return impl_->Submit(std::move(input));
+}
+
+RealtimeHistorySubmissionBatchV1::RealtimeHistorySubmissionBatchV1(
+    RealtimeHistorySubmissionBatchV1&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      source_(other.source_),
+      submitted_count_(other.submitted_count_),
+      error_(other.error_),
+      signaled_workers_(other.signaled_workers_),
+      records_per_signaled_worker_(
+          other.records_per_signaled_worker_),
+      signaled_worker_count_(other.signaled_worker_count_) {
+    other.source_ = 0U;
+    other.submitted_count_ = 0U;
+    other.error_ = RealtimeHistorySubmitErrorV1::kNone;
+    other.signaled_worker_count_ = 0U;
+}
+
+RealtimeHistorySubmissionBatchV1&
+RealtimeHistorySubmissionBatchV1::operator=(
+    RealtimeHistorySubmissionBatchV1&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (owner_ != nullptr) {
+        static_cast<void>(Finish());
+    }
+    owner_ = std::exchange(other.owner_, nullptr);
+    source_ = other.source_;
+    submitted_count_ = other.submitted_count_;
+    error_ = other.error_;
+    signaled_workers_ = other.signaled_workers_;
+    records_per_signaled_worker_ =
+        other.records_per_signaled_worker_;
+    signaled_worker_count_ = other.signaled_worker_count_;
+    other.source_ = 0U;
+    other.submitted_count_ = 0U;
+    other.error_ = RealtimeHistorySubmitErrorV1::kNone;
+    other.signaled_worker_count_ = 0U;
+    return *this;
+}
+
+RealtimeHistorySubmissionBatchV1::~RealtimeHistorySubmissionBatchV1() {
+    if (owner_ != nullptr) {
+        static_cast<void>(Finish());
+    }
+}
+
+RealtimeHistorySubmitErrorV1
+RealtimeHistorySubmissionBatchV1::TrySubmit(
+    RealtimeHistoryEventInputV1&& input) noexcept {
+    if (owner_ == nullptr) {
+        return error_ == RealtimeHistorySubmitErrorV1::kNone
+                   ? RealtimeHistorySubmitErrorV1::kStopped
+                   : error_;
+    }
+    return owner_->TrySubmitBatchItem(this, std::move(input));
+}
+
+RealtimeHistoryBatchSubmitResultV1
+RealtimeHistorySubmissionBatchV1::Finish() noexcept {
+    if (owner_ == nullptr) {
+        return {submitted_count_, error_};
+    }
+    return owner_->FinishSubmissionBatch(this);
+}
+
+RealtimeHistorySubmitErrorV1
+RealtimeHistoryRuntimeV1::BeginSubmissionBatch(
+    std::uint8_t source_slot,
+    RealtimeHistorySubmissionBatchV1* output) noexcept {
+    if (output == nullptr || output->owner_ != nullptr) {
+        impl_->MarkFatal();
+        return RealtimeHistorySubmitErrorV1::kInvalidRecord;
+    }
+    const RealtimeHistorySubmitErrorV1 error =
+        impl_->BeginBatch(source_slot);
+    if (error != RealtimeHistorySubmitErrorV1::kNone) {
+        return error;
+    }
+    output->owner_ = this;
+    output->source_ = source_slot;
+    output->submitted_count_ = 0U;
+    output->error_ = RealtimeHistorySubmitErrorV1::kNone;
+    output->signaled_worker_count_ = 0U;
+    return RealtimeHistorySubmitErrorV1::kNone;
+}
+
+RealtimeHistorySubmitErrorV1
+RealtimeHistoryRuntimeV1::TrySubmitBatchItem(
+    RealtimeHistorySubmissionBatchV1* batch,
+    RealtimeHistoryEventInputV1&& input) noexcept {
+    if (batch == nullptr || batch->owner_ != this ||
+        batch->error_ != RealtimeHistorySubmitErrorV1::kNone) {
+        return batch != nullptr &&
+                       batch->error_ !=
+                           RealtimeHistorySubmitErrorV1::kNone
+                   ? batch->error_
+                   : RealtimeHistorySubmitErrorV1::kInvalidRecord;
+    }
+    if (batch->submitted_count_ >=
+        kRealtimeHistoryMaximumSubmitBatchV1) {
+        impl_->MarkFatal();
+        batch->error_ = RealtimeHistorySubmitErrorV1::kInvalidRecord;
+        return batch->error_;
+    }
+    std::uint32_t worker = 0U;
+    const RealtimeHistorySubmitErrorV1 error =
+        impl_->SubmitBatchItem(
+            batch->source_, std::move(input), &worker);
+    if (error != RealtimeHistorySubmitErrorV1::kNone) {
+        batch->error_ = error;
+        return error;
+    }
+    ++batch->submitted_count_;
+    std::size_t worker_index = 0U;
+    while (worker_index < batch->signaled_worker_count_ &&
+           batch->signaled_workers_[worker_index] != worker) {
+        ++worker_index;
+    }
+    if (worker_index == batch->signaled_worker_count_) {
+        batch->signaled_workers_[worker_index] = worker;
+        batch->records_per_signaled_worker_[worker_index] = 1U;
+        ++batch->signaled_worker_count_;
+        // Preserve the first record's wake latency.
+        impl_->SignalBatchWorker(worker);
+    } else {
+        ++batch->records_per_signaled_worker_[worker_index];
+    }
+    return RealtimeHistorySubmitErrorV1::kNone;
+}
+
+RealtimeHistoryBatchSubmitResultV1
+RealtimeHistoryRuntimeV1::FinishSubmissionBatch(
+    RealtimeHistorySubmissionBatchV1* batch) noexcept {
+    if (batch == nullptr || batch->owner_ != this) {
+        return {0U, RealtimeHistorySubmitErrorV1::kInvalidRecord};
+    }
+    for (std::size_t index = 0U;
+         index < batch->signaled_worker_count_;
+         ++index) {
+        if (batch->records_per_signaled_worker_[index] > 1U) {
+            impl_->SignalBatchWorker(batch->signaled_workers_[index]);
+        }
+    }
+    impl_->EndBatch(batch->source_);
+    const RealtimeHistoryBatchSubmitResultV1 result{
+        batch->submitted_count_, batch->error_};
+    batch->owner_ = nullptr;
+    batch->source_ = 0U;
+    batch->submitted_count_ = 0U;
+    batch->error_ = RealtimeHistorySubmitErrorV1::kNone;
+    batch->signaled_worker_count_ = 0U;
+    return result;
 }
 
 RealtimeHistoryGenerationErrorV1

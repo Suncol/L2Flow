@@ -385,6 +385,57 @@ enum class RealtimeHistorySubmitErrorV1 : std::uint8_t {
     kFatal,
 };
 
+inline constexpr std::size_t kRealtimeHistoryMaximumSubmitBatchV1 = 16U;
+
+struct RealtimeHistoryBatchSubmitResultV1 final {
+    // Exact contiguous prefix moved into the source×worker queues. If error is
+    // non-none, inputs at and after submitted_count were not admitted.
+    std::size_t submitted_count = 0U;
+    RealtimeHistorySubmitErrorV1 error =
+        RealtimeHistorySubmitErrorV1::kNone;
+};
+
+class RealtimeHistoryRuntimeV1;
+
+// A bounded, allocation-free submission gate held only while the caller
+// greedily drains records that are already ready. The first record for each
+// History worker is signaled immediately; Finish adds the terminal signal
+// needed when that worker received multiple records. Destruction finishes an
+// active batch, so StopAndDrain cannot be stranded behind a leaked gate.
+class RealtimeHistorySubmissionBatchV1 final {
+public:
+    RealtimeHistorySubmissionBatchV1() noexcept = default;
+    RealtimeHistorySubmissionBatchV1(
+        const RealtimeHistorySubmissionBatchV1&) = delete;
+    RealtimeHistorySubmissionBatchV1& operator=(
+        const RealtimeHistorySubmissionBatchV1&) = delete;
+    RealtimeHistorySubmissionBatchV1(
+        RealtimeHistorySubmissionBatchV1&& other) noexcept;
+    RealtimeHistorySubmissionBatchV1& operator=(
+        RealtimeHistorySubmissionBatchV1&& other) noexcept;
+    ~RealtimeHistorySubmissionBatchV1();
+
+    [[nodiscard]] RealtimeHistorySubmitErrorV1 TrySubmit(
+        RealtimeHistoryEventInputV1&& input) noexcept;
+    [[nodiscard]] RealtimeHistoryBatchSubmitResultV1 Finish() noexcept;
+
+private:
+    friend class RealtimeHistoryRuntimeV1;
+
+    RealtimeHistoryRuntimeV1* owner_ = nullptr;
+    std::uint8_t source_ = 0U;
+    std::size_t submitted_count_ = 0U;
+    RealtimeHistorySubmitErrorV1 error_ =
+        RealtimeHistorySubmitErrorV1::kNone;
+    std::array<std::uint32_t,
+               kRealtimeHistoryMaximumSubmitBatchV1>
+        signaled_workers_{};
+    std::array<std::size_t,
+               kRealtimeHistoryMaximumSubmitBatchV1>
+        records_per_signaled_worker_{};
+    std::size_t signaled_worker_count_ = 0U;
+};
+
 enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
@@ -409,7 +460,10 @@ enum class RealtimeHistoryGenerationErrorV1 : std::uint8_t {
     RealtimeHistoryGenerationErrorV1 error) noexcept;
 
 // Four source owners submit concurrently. For a given source, TrySubmit and
-// SealSource must be called by the same serial decoder owner. The upstream
+// SealSource must never overlap and belong to one logical serial owner. That
+// responsibility may migrate between threads only through a synchronized
+// handoff after every earlier call has returned; thread identity itself is not
+// part of the contract. The upstream
 // ingress authority must assign every accepted record one globally unique,
 // dense ingress_sequence and one dense per-source source_sequence. This
 // runtime validates per-source order and generation cuts; it does not invent
@@ -433,6 +487,13 @@ public:
 
     [[nodiscard]] RealtimeHistorySubmitErrorV1 TrySubmit(
         RealtimeHistoryEventInputV1&& input) noexcept;
+
+    // Opens a bounded batch for one logical source owner. The caller must not
+    // wait for more data while it is active, and SealSource must not overlap.
+    // The scalar API above retains its dedicated latency path.
+    [[nodiscard]] RealtimeHistorySubmitErrorV1 BeginSubmissionBatch(
+        std::uint8_t source_slot,
+        RealtimeHistorySubmissionBatchV1* output) noexcept;
 
     // BeginGeneration is called before the four decoder markers are admitted.
     // Each decoder calls SealSource after it has routed every event preceding
@@ -505,7 +566,14 @@ public:
         const noexcept;
 
 private:
+    friend class RealtimeHistorySubmissionBatchV1;
     class Impl;
+    [[nodiscard]] RealtimeHistorySubmitErrorV1 TrySubmitBatchItem(
+        RealtimeHistorySubmissionBatchV1* batch,
+        RealtimeHistoryEventInputV1&& input) noexcept;
+    [[nodiscard]] RealtimeHistoryBatchSubmitResultV1
+    FinishSubmissionBatch(
+        RealtimeHistorySubmissionBatchV1* batch) noexcept;
     explicit RealtimeHistoryRuntimeV1(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
 };

@@ -47,11 +47,14 @@ before reading those already materialized price columns for the checksum.
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
+import platform
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from enum import IntEnum
 from typing import Iterable, Optional
 
 
@@ -62,6 +65,48 @@ _CHECKSUM_MASK = _UINT64_MAX
 _CHECKSUM_OFFSET = 0xCBF29CE484222325
 _CHECKSUM_PRIME = 0x100000001B3
 _LATEST_SERIES_TIMEOUT_NS = 30_000_000_000
+_EXPECTED_DERIVED_POLARS_TOTAL_RECORDS = 6
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cpu_affinity_text() -> str:
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return "unavailable"
+    return ",".join(str(cpu) for cpu in cpus) + f";count={len(cpus)}"
+
+
+def _polars_scalar(value: object) -> object:
+    if isinstance(value, IntEnum):
+        return int(value)
+    return value
+
+
+def _derived_polars_frame(polars, rows: tuple[object, ...]):
+    _require(bool(rows), "derived Polars input is empty")
+    columns = {
+        field.name: [
+            _polars_scalar(getattr(row, field.name)) for row in rows
+        ]
+        for field in fields(rows[0])
+        if not field.name.startswith("_")
+    }
+    return polars.DataFrame(columns, strict=True)
+
+
+def _raw_polars_frame(polars, frames: list[object]):
+    _require(bool(frames), "raw Polars scan returned no data frames")
+    if len(frames) == 1:
+        return frames[0].rechunk()
+    return polars.concat(frames, how="vertical", rechunk=True)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -1853,6 +1898,305 @@ def _run_latest_series(
     )
 
 
+def _run_raw_polars_baseline(
+    raw_history,
+    checkpoints: dict[int, object],
+    *,
+    command_index: int,
+    instrument_id: int,
+    expected_generation: int,
+) -> None:
+    start_ns = _now_ns()
+    with raw_history.read_all(
+        instrument_id,
+        batch_records=_PAGE_RECORDS,
+        expected_generation=expected_generation,
+    ) as cursor:
+        batches = 0
+        records = 0
+        for batch in cursor.batches():
+            batches += 1
+            records += len(batch)
+        checkpoint = cursor.verified_checkpoint
+    ready_ns = _now_ns()
+    _require(records == 0, "raw Polars baseline is not empty")
+    _require(batches == 0, "empty raw baseline returned a data batch")
+    checkpoints[instrument_id] = checkpoint
+    _emit(
+        "RAW_POLARS_BASELINE",
+        command=command_index,
+        instrument_id=instrument_id,
+        generation=checkpoint.generation,
+        history_published_monotonic_ns=(
+            checkpoint.history_published_monotonic_ns
+        ),
+        ready_ns=ready_ns,
+        elapsed_ns=ready_ns - start_ns,
+        records=records,
+    )
+    _emit(
+        "DONE",
+        command=command_index,
+        operation="RAW_POLARS_BASELINE",
+        samples=1,
+    )
+
+
+def _run_raw_polars_update(
+    polars,
+    raw_history,
+    checkpoints: dict[int, object],
+    *,
+    command_index: int,
+    instrument_id: int,
+    expected_generation: int,
+    repeats: int,
+    expected_records: int,
+) -> None:
+    _require(
+        instrument_id in checkpoints,
+        "raw Polars update has no verified baseline",
+    )
+    base = checkpoints[instrument_id]
+    target_checkpoint = None
+    target_checksum = None
+    for repeat in range(repeats):
+        start_ns = _now_ns()
+        frames: list[object] = []
+        batch_count = 0
+        with raw_history.read_updates(
+            instrument_id,
+            base,
+            batch_records=_PAGE_RECORDS,
+            expected_generation=expected_generation,
+        ) as cursor:
+            open_return_ns = _now_ns()
+            for batch in cursor.batches():
+                batch_count += 1
+                columns = batch.materialize_all()
+                frames.append(polars.DataFrame(columns, strict=True))
+            checkpoint = cursor.verified_checkpoint
+        frame = _raw_polars_frame(polars, frames)
+        row_count = frame.height
+        column_count = frame.width
+        ingress_sum = frame.select(
+            polars.col("ingress_sequence").sum()
+        ).item()
+        first_recv_ns, last_recv_ns = frame.select(
+            polars.col("recv_monotonic_ns").min().alias("first_recv"),
+            polars.col("recv_monotonic_ns").max().alias("last_recv"),
+        ).row(0)
+        first_ingress, last_ingress = frame.select(
+            polars.col("ingress_sequence").min().alias("first_ingress"),
+            polars.col("ingress_sequence").max().alias("last_ingress"),
+        ).row(0)
+        ready_ns = _now_ns()
+        _require(
+            row_count == expected_records,
+            "raw Polars row count differs from expected",
+        )
+        _require(
+            column_count == len(raw_history.raw_event_columns),
+            "raw Polars column count differs from selected schema",
+        )
+        _require(
+            isinstance(ingress_sum, int)
+            and isinstance(first_recv_ns, int)
+            and isinstance(last_recv_ns, int)
+            and isinstance(first_ingress, int)
+            and isinstance(last_ingress, int),
+            "raw Polars aggregate returned a non-integer",
+        )
+        _require(
+            isinstance(checkpoint.history_published_monotonic_ns, int)
+            and 0 < first_recv_ns <= last_recv_ns
+            <= checkpoint.history_published_monotonic_ns
+            <= ready_ns,
+            "raw callback/publication/Polars timestamps are non-monotonic",
+        )
+        if target_checkpoint is None:
+            target_checkpoint = checkpoint
+            target_checksum = ingress_sum
+        else:
+            _require(
+                checkpoint == target_checkpoint
+                and ingress_sum == target_checksum,
+                "repeated raw Polars reads disagree",
+            )
+        _emit(
+            "RAW_POLARS_SAMPLE",
+            command=command_index,
+            sample=repeat,
+            instrument_id=instrument_id,
+            generation=checkpoint.generation,
+            records=row_count,
+            columns=column_count,
+            batches=batch_count,
+            first_ingress=first_ingress,
+            last_ingress=last_ingress,
+            ingress_sum=ingress_sum,
+            first_callback_entry_ns=first_recv_ns,
+            last_callback_entry_ns=last_recv_ns,
+            history_published_monotonic_ns=(
+                checkpoint.history_published_monotonic_ns
+            ),
+            open_return_ns=open_return_ns,
+            polars_ready_ns=ready_ns,
+            open_to_polars_ns=ready_ns - open_return_ns,
+            publication_to_polars_ns=(
+                ready_ns
+                - checkpoint.history_published_monotonic_ns
+            ),
+            first_callback_to_polars_ns=ready_ns - first_recv_ns,
+            last_callback_to_polars_ns=ready_ns - last_recv_ns,
+            elapsed_ns=ready_ns - start_ns,
+            dataframe_estimated_bytes=frame.estimated_size(),
+        )
+    _require(target_checkpoint is not None, "raw Polars produced no sample")
+    checkpoints[instrument_id] = target_checkpoint
+    _emit(
+        "DONE",
+        command=command_index,
+        operation="RAW_POLARS_UPDATE",
+        samples=repeats,
+    )
+
+
+def _run_derived_polars(
+    polars,
+    reader,
+    derived_event_kind,
+    revision_operation,
+    order_finality,
+    *,
+    command_index: int,
+    expected_generation: int,
+    expected_events: int,
+    expected_order_id: int,
+) -> None:
+    start_ns = _now_ns()
+    rows: list[object] = []
+    batch_count = 0
+    with reader.read_all(
+        expected_generation=expected_generation
+    ) as cursor:
+        for batch in cursor.batches():
+            batch_count += 1
+            rows.extend(batch.materialize())
+        checkpoint = cursor.verified_checkpoint
+    materialized = tuple(rows)
+    frame = _derived_polars_frame(polars, materialized)
+    relevant = frame.filter(
+        (
+            (
+                polars.col("event_kind")
+                == int(derived_event_kind.ORDER_REVISION)
+            )
+            & (polars.col("order_id") == expected_order_id)
+        )
+        | (
+            (polars.col("event_kind") == int(derived_event_kind.TRADE))
+            & (polars.col("buy_order_id") == expected_order_id)
+        )
+    ).sort("derived_event_sequence")
+    sequence_values = relevant.get_column(
+        "derived_event_sequence"
+    ).to_list()
+    revisions = [
+        row
+        for row in materialized
+        if row.event_kind is derived_event_kind.ORDER_REVISION
+        and row.order_id == expected_order_id
+    ]
+    ready_ns = _now_ns()
+    _require(
+        frame.height == _EXPECTED_DERIVED_POLARS_TOTAL_RECORDS
+        and relevant.height == expected_events,
+        "derived Polars event count differs from expected: "
+        f"frame={frame.height} relevant={relevant.height} "
+        f"kinds={','.join(str(int(row.event_kind)) for row in materialized)} "
+        "revisions="
+        + ",".join(
+            f"{row.revision}:{row.operation}:{row.finality}:"
+            f"{row.remaining_quantity}:{row.native_event_sequence}"
+            for row in revisions
+        ),
+    )
+    _require(bool(sequence_values), "derived Polars sequence is empty")
+    _require(
+        sequence_values
+        == list(
+            range(
+                sequence_values[0],
+                sequence_values[0] + expected_events,
+            )
+        ),
+        "derived Polars sequence is not dense",
+    )
+    _require(
+        [row.revision for row in revisions] == [1, 2, 3],
+        "derived order revision sequence is not 1,2,3",
+    )
+    _require(
+        revisions[-1].operation == int(revision_operation.FINALIZE)
+        and revisions[-1].finality == int(order_finality.FINAL)
+        and revisions[-1].remaining_quantity_valid
+        and revisions[-1].remaining_quantity == 0,
+        "derived order sequence does not end in a clean zero-balance "
+        "finalization: "
+        f"operation={revisions[-1].operation} "
+        f"finality={revisions[-1].finality} "
+        f"remaining={revisions[-1].remaining_quantity} "
+        f"quality={revisions[-1].quality_flags} "
+        f"source_quality={revisions[-1].source_quality_flags} "
+        f"matched={revisions[-1].source_matched_quantity} "
+        f"observed_pre_add="
+        f"{revisions[-1].observed_pre_add_trade_quantity}",
+    )
+    first_recv_ns, last_recv_ns = relevant.select(
+        polars.col("recv_monotonic_ns").min().alias("first_recv"),
+        polars.col("recv_monotonic_ns").max().alias("last_recv"),
+    ).row(0)
+    published_ns = checkpoint.raw_checkpoint.history_published_monotonic_ns
+    _require(
+        isinstance(first_recv_ns, int)
+        and isinstance(last_recv_ns, int)
+        and 0 < first_recv_ns <= last_recv_ns <= published_ns <= ready_ns,
+        "derived callback/publication/Polars timestamps are non-monotonic",
+    )
+    _emit(
+        "DERIVED_POLARS_SAMPLE",
+        command=command_index,
+        instrument_id=reader.instrument_id,
+        generation=checkpoint.raw_checkpoint.generation,
+        records=frame.height,
+        order_sequence_records=relevant.height,
+        columns=frame.width,
+        batches=batch_count,
+        order_id=expected_order_id,
+        order_revision_count=len(revisions),
+        first_derived_sequence=sequence_values[0],
+        last_derived_sequence=sequence_values[-1],
+        first_callback_entry_ns=first_recv_ns,
+        last_callback_entry_ns=last_recv_ns,
+        history_published_monotonic_ns=published_ns,
+        polars_ready_ns=ready_ns,
+        publication_to_polars_ns=ready_ns - published_ns,
+        first_callback_to_polars_ns=ready_ns - first_recv_ns,
+        last_callback_to_polars_ns=ready_ns - last_recv_ns,
+        elapsed_ns=ready_ns - start_ns,
+        dataframe_estimated_bytes=frame.estimated_size(),
+        final_revision=revisions[-1].revision,
+        final_remaining_quantity=revisions[-1].remaining_quantity,
+    )
+    _emit(
+        "DONE",
+        command=command_index,
+        operation="DERIVED_POLARS",
+        samples=1,
+    )
+
+
 def _validate_paths(
     control_socket: str,
     native_library: str,
@@ -1890,8 +2234,14 @@ def main(argv: list[str]) -> int:
     _validate_paths(control_socket, native_library, source_python)
     sys.path.insert(0, source_python)
 
+    import polars as pl  # pylint: disable=import-outside-toplevel
+
     from l2flow_realtime import (  # pylint: disable=import-outside-toplevel
         InconsistentReadError,
+        INSTRUMENT_RAW_EVENT_COLUMNS,
+        InstrumentDerivedEventKind,
+        InstrumentOrderFinality,
+        InstrumentOrderRevisionOperation,
         InstrumentTickRollingStore,
         L2FlowClient,
         LatestStatus,
@@ -1899,6 +2249,8 @@ def main(argv: list[str]) -> int:
 
     checkpoints: dict[int, object] = {}
     worker_checkpoints: dict[int, object] = {}
+    raw_polars_checkpoints: dict[int, object] = {}
+    derived_readers: dict[int, object] = {}
     rolling_lanes: dict[
         tuple[int, str, int], list[_RollingLane]
     ] = {}
@@ -1912,6 +2264,11 @@ def main(argv: list[str]) -> int:
             result_columns=("price_p6",),
             ring_slots=4,
             result_batch_records=_PAGE_RECORDS,
+        )
+        raw_history = client.open_instrument_raw_event_history(
+            raw_event_columns=INSTRUMENT_RAW_EVENT_COLUMNS,
+            ring_slots=4,
+            batch_capacity=_PAGE_RECORDS,
         )
         session = client.session_info()
         clock = time.get_clock_info("monotonic")
@@ -1936,6 +2293,15 @@ def main(argv: list[str]) -> int:
             worker_result_batch_records=(
                 delta_worker.result_batch_records
             ),
+            raw_polars_worker_pid=raw_history.worker_pid,
+            raw_polars_columns=len(raw_history.raw_event_columns),
+            python_version=platform.python_version(),
+            python_implementation=platform.python_implementation(),
+            python_affinity=_cpu_affinity_text(),
+            python_executable_sha256=_sha256_file(sys.executable),
+            native_library_sha256=_sha256_file(native_library),
+            probe_sha256=_sha256_file(__file__),
+            polars_version=pl.__version__,
         )
 
         command_index = 0
@@ -2055,6 +2421,154 @@ def main(argv: list[str]) -> int:
                         count=count,
                     )
                     continue
+                if operation == "PREPARE_DERIVED_POLARS":
+                    _require(
+                        len(words) == 2,
+                        "PREPARE_DERIVED_POLARS requires one argument",
+                    )
+                    instrument_id = _decimal(
+                        words[1],
+                        "instrument_id",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    _require(
+                        instrument_id not in derived_readers,
+                        "derived Polars reader is already prepared",
+                    )
+                    command_index += 1
+                    reader = client.open_instrument_derived_event_history(
+                        instrument_id,
+                        maximum_order_states=100,
+                        page_records=_PAGE_RECORDS,
+                    )
+                    derived_readers[instrument_id] = reader
+                    _emit(
+                        "DERIVED_POLARS_PREPARED",
+                        command=command_index,
+                        instrument_id=instrument_id,
+                        main_pid=os.getpid(),
+                    )
+                    _emit(
+                        "DONE",
+                        command=command_index,
+                        operation="PREPARE_DERIVED_POLARS",
+                        samples=1,
+                    )
+                    continue
+                if operation == "RAW_POLARS_BASELINE":
+                    _require(
+                        len(words) == 3,
+                        "RAW_POLARS_BASELINE requires two arguments",
+                    )
+                    instrument_id = _decimal(
+                        words[1],
+                        "instrument_id",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    generation = _decimal(
+                        words[2],
+                        "generation",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    command_index += 1
+                    _run_raw_polars_baseline(
+                        raw_history,
+                        raw_polars_checkpoints,
+                        command_index=command_index,
+                        instrument_id=instrument_id,
+                        expected_generation=generation,
+                    )
+                    continue
+                if operation == "RAW_POLARS_UPDATE":
+                    _require(
+                        len(words) == 5,
+                        "RAW_POLARS_UPDATE requires four arguments",
+                    )
+                    instrument_id = _decimal(
+                        words[1],
+                        "instrument_id",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    generation = _decimal(
+                        words[2],
+                        "generation",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    repeats = _decimal(
+                        words[3],
+                        "repeats",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    expected_records = _decimal(
+                        words[4],
+                        "expected_records",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    command_index += 1
+                    _run_raw_polars_update(
+                        pl,
+                        raw_history,
+                        raw_polars_checkpoints,
+                        command_index=command_index,
+                        instrument_id=instrument_id,
+                        expected_generation=generation,
+                        repeats=repeats,
+                        expected_records=expected_records,
+                    )
+                    continue
+                if operation == "DERIVED_POLARS":
+                    _require(
+                        len(words) == 5,
+                        "DERIVED_POLARS requires four arguments",
+                    )
+                    instrument_id = _decimal(
+                        words[1],
+                        "instrument_id",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    generation = _decimal(
+                        words[2],
+                        "generation",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_events = _decimal(
+                        words[3],
+                        "expected_events",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_order_id = _decimal(
+                        words[4],
+                        "expected_order_id",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    _require(
+                        instrument_id in derived_readers,
+                        "derived Polars reader was not prepared",
+                    )
+                    command_index += 1
+                    _run_derived_polars(
+                        pl,
+                        derived_readers[instrument_id],
+                        InstrumentDerivedEventKind,
+                        InstrumentOrderRevisionOperation,
+                        InstrumentOrderFinality,
+                        command_index=command_index,
+                        expected_generation=generation,
+                        expected_events=expected_events,
+                        expected_order_id=expected_order_id,
+                    )
+                    continue
                 _require(
                     operation
                     in (
@@ -2154,6 +2668,12 @@ def main(argv: list[str]) -> int:
                     worker_loop.stop_and_join()
                 except BaseException:
                     pass
+            for reader in derived_readers.values():
+                try:
+                    reader.close()
+                except BaseException:
+                    pass
+            raw_history.close()
             delta_worker.close()
     raise RuntimeError("stdin reached EOF before QUIT")
 

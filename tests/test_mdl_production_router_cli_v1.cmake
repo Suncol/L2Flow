@@ -27,6 +27,12 @@ run_case(
     "--intraday-live-partial"
     --help)
 
+run_case(
+    help_lists_parallel_decoder_default
+    0
+    "--parallel-decoder-workers N  0..64, default 0"
+    --help)
+
 set(base
     --sdk-library /nonexistent/libmdl_api.so
     --session-epoch 1
@@ -55,6 +61,30 @@ run_case(
     "--trade-date must equal the current"
     ${base}
     --intraday-live-partial)
+
+run_case(
+    parallel_decoder_zero_reaches_runtime
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --parallel-decoder-workers 0)
+
+run_case(
+    parallel_decoder_four_reaches_runtime
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --parallel-decoder-workers 4)
+
+run_case(
+    parallel_decoder_above_bound_is_rejected
+    2
+    "--parallel-decoder-workers must be 0..64"
+    ${base}
+    --intraday-live-partial
+    --parallel-decoder-workers 65)
 
 run_case(
     partial_and_from_open_conflict
