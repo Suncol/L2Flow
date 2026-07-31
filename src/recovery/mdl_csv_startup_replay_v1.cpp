@@ -704,6 +704,15 @@ public:
         if (!*available) {
             return true;
         }
+        // The production MDL snapshot/queue backup writer terminates data
+        // rows with a delimiter even though its header does not declare an
+        // additional column.  Treat exactly one trailing empty field as the
+        // writer's row terminator.  Any non-empty or additional field remains
+        // a hard schema failure below.
+        if (output->fields.size() == header_.size() + 1U &&
+            output->fields.back().empty()) {
+            output->fields.pop_back();
+        }
         if (output->fields == header_) {
             return state_->Fail(
                 StartupReplayErrorV1::kDuplicateHeader,
@@ -1085,6 +1094,29 @@ public:
         return true;
     }
 
+    bool RightSpacePaddedAscii(
+        std::string_view column,
+        std::string* output) {
+        std::string_view value = table_.Get(record_, column);
+        if (value.empty() || !IsAscii(value)) {
+            return Invalid(
+                StartupReplayErrorV1::kValueInvalid,
+                column,
+                "must be a non-empty ASCII string");
+        }
+        while (!value.empty() && value.back() == ' ') {
+            value.remove_suffix(1U);
+        }
+        if (value.empty()) {
+            return Invalid(
+                StartupReplayErrorV1::kValueInvalid,
+                column,
+                "must contain a non-space ASCII value");
+        }
+        output->assign(value);
+        return true;
+    }
+
     bool U32(std::string_view column, std::uint32_t* output) {
         std::uint64_t value = 0U;
         bool overflow = false;
@@ -1112,6 +1144,16 @@ public:
                     StartupReplayErrorV1::kValueInvalid,
                     column,
                     "must be greater than zero"));
+    }
+
+    bool OptionalU32(
+        std::string_view column,
+        std::uint32_t* output) {
+        if (table_.Get(record_, column).empty()) {
+            *output = 0U;
+            return true;
+        }
+        return U32(column, output);
     }
 
     bool NonnegativeI64(
@@ -1144,6 +1186,16 @@ public:
                     StartupReplayErrorV1::kValueInvalid,
                     column,
                     "must be greater than zero"));
+    }
+
+    bool OptionalNonnegativeI64(
+        std::string_view column,
+        std::int64_t* output) {
+        if (table_.Get(record_, column).empty()) {
+            *output = 0;
+            return true;
+        }
+        return NonnegativeI64(column, output);
     }
 
     bool PositiveU64(
@@ -1224,7 +1276,18 @@ public:
         return true;
     }
 
-    bool OptionalTailFixed64(
+    bool OptionalFixed32(
+        std::string_view column,
+        std::uint8_t scale,
+        std::int32_t* output) {
+        if (table_.Get(record_, column).empty()) {
+            *output = 0;
+            return true;
+        }
+        return Fixed32(column, scale, output);
+    }
+
+    bool OptionalFixed64(
         std::string_view column,
         std::uint8_t scale,
         std::int64_t* output) {
@@ -1233,6 +1296,13 @@ public:
             return true;
         }
         return Fixed64(column, scale, output);
+    }
+
+    bool OptionalTailFixed64(
+        std::string_view column,
+        std::uint8_t scale,
+        std::int64_t* output) {
+        return OptionalFixed64(column, scale, output);
     }
 
     bool EncodedAsciiI32(
@@ -1589,28 +1659,32 @@ bool ParseQueueRow(
         !parse.U32("ImageStatus", &decoded.image_status) ||
         !parse.Ascii("Side", &side) ||
         !parse.U32("NoPriceLevel", &decoded.price_level) ||
-        !parse.U32("PrcLvlOperator", &decoded.level_operator) ||
-        !parse.U32("NumOrders", &decoded.total_order_count) ||
-        !parse.U32("NoOrders", &decoded.revealed_count) ||
+        !parse.OptionalU32(
+            "PrcLvlOperator", &decoded.level_operator) ||
+        !parse.OptionalU32(
+            "NumOrders", &decoded.total_order_count) ||
+        !parse.OptionalU32("NoOrders", &decoded.revealed_count) ||
         !parse.Time("LocalTime", &decoded.local_time) ||
         !parse.PositiveU64("SeqNo", &decoded.sequence)) {
         return false;
     }
     if (price_scale == 3U) {
         std::int32_t price = 0;
-        if (!parse.Fixed32("Price", price_scale, &price)) {
+        if (!parse.OptionalFixed32(
+                "Price", price_scale, &price)) {
             return false;
         }
         decoded.price = price;
-    } else if (!parse.Fixed64(
+    } else if (!parse.OptionalFixed64(
                    "Price", price_scale, &decoded.price)) {
         return false;
     }
     if (quantity_scale == 0U) {
-        if (!parse.NonnegativeI64("Volume", &decoded.volume)) {
+        if (!parse.OptionalNonnegativeI64(
+                "Volume", &decoded.volume)) {
             return false;
         }
-    } else if (!parse.Fixed64(
+    } else if (!parse.OptionalFixed64(
                    "Volume", quantity_scale, &decoded.volume)) {
         return false;
     }
@@ -2116,8 +2190,8 @@ bool BuildShanghaiSnapshot(
     std::string security_id;
     std::string instrument_status;
     std::uint32_t image_u32 = 0U;
-    std::uint32_t bid_level_count = 0U;
-    std::uint32_t ask_level_count = 0U;
+    std::uint32_t bid_feed_count = 0U;
+    std::uint32_t ask_feed_count = 0U;
     if (!parse.Time("UpdateTime", &update_time) ||
         !parse.Ascii("SecurityID", &security_id) ||
         !parse.U32("ImageStatus", &image_u32) ||
@@ -2222,10 +2296,10 @@ bool BuildShanghaiSnapshot(
         u32("TotSellNum", 208U) &&
         u32("MaxBidDur", 212U) &&
         u32("MaxSellDur", 216U) &&
-        parse.U32("BidNum", &bid_level_count) &&
-        writer.StoreU32(220U, bid_level_count) &&
-        parse.U32("SellNum", &ask_level_count) &&
-        writer.StoreU32(224U, ask_level_count) &&
+        parse.U32("BidNum", &bid_feed_count) &&
+        writer.StoreU32(220U, bid_feed_count) &&
+        parse.U32("SellNum", &ask_feed_count) &&
+        writer.StoreU32(224U, ask_feed_count) &&
         fixed32("IOPV", 244U, 3U);
     if (!wire_ok ||
         !writer.AddString(4U, security_id) ||
@@ -2237,24 +2311,58 @@ bool BuildShanghaiSnapshot(
 
     std::array<DepthLevel, kPublishedDepth> bids{};
     std::array<DepthLevel, kPublishedDepth> asks{};
+    std::array<bool, kPublishedDepth> bid_present{};
+    std::array<bool, kPublishedDepth> ask_present{};
     for (std::size_t index = 0U; index < kPublishedDepth; ++index) {
         const std::string ordinal = std::to_string(index + 1U);
+        const bool bid_price_present =
+            !table.Get(record, "BidPrice" + ordinal).empty();
+        const bool bid_volume_present =
+            !table.Get(record, "BidVolume" + ordinal).empty();
+        const bool bid_orders_present =
+            !table.Get(record, "NumOrdersB" + ordinal).empty();
+        const bool ask_price_present =
+            !table.Get(record, "AskPrice" + ordinal).empty();
+        const bool ask_volume_present =
+            !table.Get(record, "AskVolume" + ordinal).empty();
+        const bool ask_orders_present =
+            !table.Get(record, "NumOrdersS" + ordinal).empty();
+        const bool any_bid =
+            bid_price_present || bid_volume_present ||
+            bid_orders_present;
+        const bool any_ask =
+            ask_price_present || ask_volume_present ||
+            ask_orders_present;
+        if ((any_bid &&
+             !(bid_price_present && bid_volume_present &&
+               bid_orders_present)) ||
+            (any_ask &&
+             !(ask_price_present && ask_volume_present &&
+               ask_orders_present))) {
+            return state->Fail(
+                StartupReplayErrorV1::kValueInvalid,
+                table.input().path,
+                record.line,
+                "flattened Shanghai depth item is only partially present");
+        }
+        bid_present[index] = any_bid;
+        ask_present[index] = any_ask;
         std::int32_t bid_price = 0;
         std::int32_t ask_price = 0;
-        if (!parse.Fixed32(
+        if (!parse.OptionalFixed32(
                 "BidPrice" + ordinal, 3U, &bid_price) ||
-            !parse.Fixed64(
+            !parse.OptionalFixed64(
                 "BidVolume" + ordinal, 3U,
                 &bids[index].volume) ||
-            !parse.U32(
+            !parse.OptionalU32(
                 "NumOrdersB" + ordinal,
                 &bids[index].order_count) ||
-            !parse.Fixed32(
+            !parse.OptionalFixed32(
                 "AskPrice" + ordinal, 3U, &ask_price) ||
-            !parse.Fixed64(
+            !parse.OptionalFixed64(
                 "AskVolume" + ordinal, 3U,
                 &asks[index].volume) ||
-            !parse.U32(
+            !parse.OptionalU32(
                 "NumOrdersS" + ordinal,
                 &asks[index].order_count)) {
             return false;
@@ -2293,41 +2401,41 @@ bool BuildShanghaiSnapshot(
         return false;
     }
 
+    const auto infer_flattened_depth =
+        [&](std::span<const bool> present,
+            std::string_view side,
+            std::size_t* depth) {
+            bool empty_seen = false;
+            *depth = 0U;
+            for (std::size_t index = 0U;
+                 index < present.size();
+                 ++index) {
+                if (!present[index]) {
+                    empty_seen = true;
+                    continue;
+                }
+                if (empty_seen) {
+                    return state->Fail(
+                        StartupReplayErrorV1::kValueInvalid,
+                        table.input().path,
+                        record.line,
+                        std::string(side) +
+                            " flattened depth contains an item after an empty slot");
+                }
+                *depth = index + 1U;
+            }
+            return true;
+        };
+    std::size_t bid_depth = 0U;
+    std::size_t ask_depth = 0U;
+    if (!infer_flattened_depth(
+            bid_present, "bid", &bid_depth) ||
+        !infer_flattened_depth(
+            ask_present, "ask", &ask_depth)) {
+        return false;
+    }
     std::size_t bid_start = 0U;
     std::size_t ask_start = 0U;
-    const std::size_t bid_depth = std::min(
-        static_cast<std::size_t>(bid_level_count),
-        kPublishedDepth);
-    const std::size_t ask_depth = std::min(
-        static_cast<std::size_t>(ask_level_count),
-        kPublishedDepth);
-    const auto has_observed_level =
-        [](const DepthLevel& level) noexcept {
-            return level.price > 0 || level.volume > 0 ||
-                   level.order_count > 0U;
-        };
-    for (std::size_t index = bid_depth;
-         index < kPublishedDepth;
-         ++index) {
-        if (has_observed_level(bids[index])) {
-            return state->Fail(
-                StartupReplayErrorV1::kValueInvalid,
-                table.input().path,
-                record.line,
-                "BidNum is smaller than populated BidPrice levels");
-        }
-    }
-    for (std::size_t index = ask_depth;
-         index < kPublishedDepth;
-         ++index) {
-        if (has_observed_level(asks[index])) {
-            return state->Fail(
-                StartupReplayErrorV1::kValueInvalid,
-                table.input().path,
-                record.line,
-                "SellNum is smaller than populated AskPrice levels");
-        }
-    }
     if (!writer.AddList(
             228U,
             static_cast<std::uint32_t>(bid_depth),
@@ -2437,11 +2545,13 @@ bool BuildShenzhenSnapshot(
     std::string security_id_source;
     std::string trading_phase;
     if (!parse.Time("UpdateTime", &update_time) ||
-        !parse.Ascii("MDStreamID", &md_stream_id) ||
+        !parse.RightSpacePaddedAscii(
+            "MDStreamID", &md_stream_id) ||
         !parse.Ascii("SecurityID", &security_id) ||
-        !parse.Ascii(
+        !parse.RightSpacePaddedAscii(
             "SecurityIDSource", &security_id_source) ||
-        !parse.Ascii("TradingPhaseCode", &trading_phase) ||
+        !parse.RightSpacePaddedAscii(
+            "TradingPhaseCode", &trading_phase) ||
         !parse.Time("LocalTime", &local_time) ||
         !parse.PositiveU64("SeqNo", &sequence)) {
         return false;
@@ -2531,24 +2641,58 @@ bool BuildShenzhenSnapshot(
 
     std::array<DepthLevel, kPublishedDepth> bids{};
     std::array<DepthLevel, kPublishedDepth> asks{};
+    std::array<bool, kPublishedDepth> bid_present{};
+    std::array<bool, kPublishedDepth> ask_present{};
     for (std::size_t index = 0U; index < kPublishedDepth; ++index) {
         const std::string ordinal = std::to_string(index + 1U);
-        if (!parse.Fixed64(
+        const bool bid_price_present =
+            !table.Get(record, "BidPrice" + ordinal).empty();
+        const bool bid_volume_present =
+            !table.Get(record, "BidVolume" + ordinal).empty();
+        const bool bid_orders_present =
+            !table.Get(record, "NumOrdersB" + ordinal).empty();
+        const bool ask_price_present =
+            !table.Get(record, "AskPrice" + ordinal).empty();
+        const bool ask_volume_present =
+            !table.Get(record, "AskVolume" + ordinal).empty();
+        const bool ask_orders_present =
+            !table.Get(record, "NumOrdersS" + ordinal).empty();
+        const bool any_bid =
+            bid_price_present || bid_volume_present ||
+            bid_orders_present;
+        const bool any_ask =
+            ask_price_present || ask_volume_present ||
+            ask_orders_present;
+        if ((any_bid &&
+             !(bid_price_present && bid_volume_present &&
+               bid_orders_present)) ||
+            (any_ask &&
+             !(ask_price_present && ask_volume_present &&
+               ask_orders_present))) {
+            return state->Fail(
+                StartupReplayErrorV1::kValueInvalid,
+                table.input().path,
+                record.line,
+                "flattened Shenzhen depth item is only partially present");
+        }
+        bid_present[index] = any_bid;
+        ask_present[index] = any_ask;
+        if (!parse.OptionalFixed64(
                 "BidPrice" + ordinal, 6U,
                 &bids[index].price) ||
-            !parse.NonnegativeI64(
+            !parse.OptionalNonnegativeI64(
                 "BidVolume" + ordinal,
                 &bids[index].volume) ||
-            !parse.U32(
+            !parse.OptionalU32(
                 "NumOrdersB" + ordinal,
                 &bids[index].order_count) ||
-            !parse.Fixed64(
+            !parse.OptionalFixed64(
                 "AskPrice" + ordinal, 6U,
                 &asks[index].price) ||
-            !parse.NonnegativeI64(
+            !parse.OptionalNonnegativeI64(
                 "AskVolume" + ordinal,
                 &asks[index].volume) ||
-            !parse.U32(
+            !parse.OptionalU32(
                 "NumOrdersS" + ordinal,
                 &asks[index].order_count)) {
             return false;
@@ -2588,19 +2732,15 @@ bool BuildShenzhenSnapshot(
     std::size_t bid_start = 0U;
     std::size_t ask_start = 0U;
     const auto infer_depth =
-        [&](std::span<const DepthLevel> levels,
+        [&](std::span<const bool> present,
             std::string_view side_name,
             std::size_t* depth) {
             bool inactive_seen = false;
             *depth = 0U;
             for (std::size_t index = 0U;
-                 index < levels.size();
+                 index < present.size();
                  ++index) {
-                const bool active =
-                    levels[index].price > 0 ||
-                    levels[index].volume > 0 ||
-                    levels[index].order_count > 0U;
-                if (!active) {
+                if (!present[index]) {
                     inactive_seen = true;
                     continue;
                 }
@@ -2619,8 +2759,8 @@ bool BuildShenzhenSnapshot(
         };
     std::size_t bid_depth = 0U;
     std::size_t ask_depth = 0U;
-    if (!infer_depth(bids, "bid", &bid_depth) ||
-        !infer_depth(asks, "ask", &ask_depth)) {
+    if (!infer_depth(bid_present, "bid", &bid_depth) ||
+        !infer_depth(ask_present, "ask", &ask_depth)) {
         return false;
     }
     if (!writer.AddList(
@@ -2835,9 +2975,10 @@ bool BuildShenzhenOrder(
     if (!parse.U32("ChannelNo", &channel) ||
         !parse.PositiveI64(
             "ApplSeqNum", &application_sequence) ||
-        !parse.Ascii("MDStreamID", &md_stream_id) ||
+        !parse.RightSpacePaddedAscii(
+            "MDStreamID", &md_stream_id) ||
         !parse.Ascii("SecurityID", &security_id) ||
-        !parse.Ascii(
+        !parse.RightSpacePaddedAscii(
             "SecurityIDSource", &security_id_source) ||
         !parse.Fixed64("Price", 4U, &price) ||
         !parse.NonnegativeI64("OrderQty", &quantity) ||
@@ -2917,13 +3058,14 @@ bool BuildShenzhenTransaction(
     if (!parse.U32("ChannelNo", &channel) ||
         !parse.PositiveI64(
             "ApplSeqNum", &application_sequence) ||
-        !parse.Ascii("MDStreamID", &md_stream_id) ||
+        !parse.RightSpacePaddedAscii(
+            "MDStreamID", &md_stream_id) ||
         !parse.NonnegativeI64(
             "BidApplSeqNum", &bid_application_sequence) ||
         !parse.NonnegativeI64(
             "OfferApplSeqNum", &offer_application_sequence) ||
         !parse.Ascii("SecurityID", &security_id) ||
-        !parse.Ascii(
+        !parse.RightSpacePaddedAscii(
             "SecurityIDSource", &security_id_source) ||
         !parse.Fixed64("LastPx", 4U, &last_price) ||
         !parse.NonnegativeI64("LastQty", &last_quantity) ||
@@ -3038,8 +3180,8 @@ bool ReplayShanghaiSnapshots(
         }
         std::uint32_t bid_orders = 0U;
         std::uint32_t ask_orders = 0U;
-        if (!parse.U32("NumOrdersB1", &bid_orders) ||
-            !parse.U32("NumOrdersS1", &ask_orders)) {
+        if (!parse.OptionalU32("NumOrdersB1", &bid_orders) ||
+            !parse.OptionalU32("NumOrdersS1", &ask_orders)) {
             return false;
         }
         const bool missing_required_queue =
@@ -3173,8 +3315,8 @@ bool ReplayShenzhenSnapshots(
         }
         std::uint32_t ask_orders = 0U;
         std::uint32_t bid_orders = 0U;
-        if (!parse.U32("NumOrdersS1", &ask_orders) ||
-            !parse.U32("NumOrdersB1", &bid_orders)) {
+        if (!parse.OptionalU32("NumOrdersS1", &ask_orders) ||
+            !parse.OptionalU32("NumOrdersB1", &bid_orders)) {
             return false;
         }
         if (ask_orders != 0U &&

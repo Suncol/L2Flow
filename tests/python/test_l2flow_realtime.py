@@ -72,7 +72,7 @@ def session_info(**overrides) -> SessionInfo:
         "published_records": 50,
         "trade_date": 20260729,
         "server_state": ServerState.ACTIVE,
-        "flags": 2,
+        "flags": 6,
         "capacity": CAPACITY,
         "window_count": 2,
         "catalog_scope": CatalogScope.DECLARED_DAILY_A_SHARE,
@@ -293,7 +293,7 @@ class FakeV2Library:
         result.published_records = 50
         result.trade_date = 20260729
         result.server_state = int(ServerState.ACTIVE)
-        result.flags = 2
+        result.flags = 6
         result.capacity = CAPACITY
         result.window_count = 2
         result.catalog_scope = int(
@@ -317,7 +317,7 @@ class FakeV2Library:
         result.session_epoch = SESSION_EPOCH
         result.heartbeat_monotonic_ns = time.monotonic_ns()
         result.server_state = int(ServerState.ACTIVE)
-        result.flags = 2
+        result.flags = 6
         return native.OK
 
     def _instrument(
@@ -608,7 +608,39 @@ class AbiContractTests(unittest.TestCase):
         magic, major, minor = struct.unpack_from("<8sHH", request)
         self.assertEqual(magic, CONTROL_MAGIC)
         self.assertEqual((major, minor), (WIRE_MAJOR, WIRE_MINOR))
-        self.assertEqual((major, minor), (2, 2))
+        self.assertEqual((major, minor), (2, 3))
+
+    def test_v23_live_partial_and_prefix_flags(self):
+        self.assertEqual(int(ServerState.LIVE_PARTIAL), 6)
+        partial = session_info(
+            server_state=ServerState.LIVE_PARTIAL,
+            flags=0,
+        )
+        self.assertFalse(partial.coverage_lost)
+        self.assertFalse(partial.coverage_from_open)
+        self.assertFalse(partial.startup_prefix_recovered)
+        self.assertFalse(partial.full_day_kline_valid)
+        self.assertFalse(partial.full_day_factor_valid)
+        self.assertFalse(partial.certified_prefix_valid)
+
+        recovered = session_info(flags=0x7E)
+        self.assertFalse(recovered.coverage_lost)
+        self.assertTrue(recovered.kline_enabled)
+        self.assertTrue(recovered.coverage_from_open)
+        self.assertTrue(recovered.startup_prefix_recovered)
+        self.assertTrue(recovered.full_day_kline_valid)
+        self.assertTrue(recovered.full_day_factor_valid)
+        self.assertTrue(recovered.certified_prefix_valid)
+
+        with self.assertRaises(ValueError):
+            session_info(flags=2)
+        with self.assertRaises(ValueError):
+            session_info(
+                server_state=ServerState.LIVE_PARTIAL,
+                flags=4,
+            )
+        with self.assertRaises(ValueError):
+            session_info(flags=0x80)
 
     def test_v2_history_modules_replace_removed_v1_surface(self):
         self.assertTrue(hasattr(l2flow_realtime, "HistoryCursor"))
@@ -677,7 +709,12 @@ class NativeReaderTests(unittest.TestCase):
         health = self.reader.health()
         self.assertEqual(health.session_epoch, SESSION_EPOCH)
         self.assertIs(health.server_state, ServerState.ACTIVE)
-        self.assertEqual(health.flags, 2)
+        self.assertEqual(health.flags, 6)
+        self.assertTrue(health.coverage_from_open)
+        self.assertFalse(health.startup_prefix_recovered)
+        self.assertFalse(health.full_day_kline_valid)
+        self.assertFalse(health.full_day_factor_valid)
+        self.assertFalse(health.certified_prefix_valid)
         self.assertGreater(health.heartbeat_monotonic_ns, 0)
         self.assertEqual(
             len(self.library.l2flow_shm_reader_session_v2.calls),
@@ -787,6 +824,30 @@ class NativeReaderTests(unittest.TestCase):
 
 
 class ClientHotPathTests(unittest.TestCase):
+    def test_live_partial_is_readable_but_heartbeat_is_still_enforced(self):
+        library = FakeV2Library()
+        reader = native.NativeReader.open_fd(9, library=library)
+        try:
+            client = L2FlowClient(reader, stale_after_ns=1_000_000)
+            current = native.NativeSessionHealth(
+                SESSION_EPOCH,
+                time.monotonic_ns(),
+                ServerState.LIVE_PARTIAL,
+                0,
+            )
+            client._validate_health(current)
+            stale = native.NativeSessionHealth(
+                SESSION_EPOCH,
+                time.monotonic_ns() - 2_000_000,
+                ServerState.LIVE_PARTIAL,
+                0,
+            )
+            with self.assertRaises(l2flow_realtime.StaleSessionError):
+                client._validate_health(stale)
+            client.close()
+        finally:
+            reader.close()
+
     def test_known_id_latest_never_resolves_or_fetches_instrument(self):
         library = FakeV2Library()
         reader = native.NativeReader.open_fd(9, library=library)

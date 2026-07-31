@@ -34,6 +34,28 @@ enum l2flow_shm_reader_error_v2 {
     L2FLOW_SHM_READER_INCONSISTENT_READ_V2 = 8,
 };
 
+// Wire V2.3 server states. LIVE_PARTIAL permits point-in-time latest reads,
+// but it is not a from-open prefix and therefore cannot be interpreted as
+// ACTIVE by History, Factor, KLine, or CERTIFIED consumers.
+enum l2flow_shm_server_state_v2 {
+    L2FLOW_SHM_SERVER_INITIALIZING_V2 = 1,
+    L2FLOW_SHM_SERVER_ACTIVE_V2 = 2,
+    L2FLOW_SHM_SERVER_DRAINING_V2 = 3,
+    L2FLOW_SHM_SERVER_STOPPED_CLEAN_V2 = 4,
+    L2FLOW_SHM_SERVER_FAILED_V2 = 5,
+    L2FLOW_SHM_SERVER_LIVE_PARTIAL_V2 = 6,
+};
+
+enum l2flow_shm_header_flag_v2 {
+    L2FLOW_SHM_HEADER_COVERAGE_LOST_V2 = 1U << 0U,
+    L2FLOW_SHM_HEADER_KLINE_ENABLED_V2 = 1U << 1U,
+    L2FLOW_SHM_HEADER_COVERAGE_FROM_OPEN_V2 = 1U << 2U,
+    L2FLOW_SHM_HEADER_STARTUP_PREFIX_RECOVERED_V2 = 1U << 3U,
+    L2FLOW_SHM_HEADER_FULL_DAY_KLINE_VALID_V2 = 1U << 4U,
+    L2FLOW_SHM_HEADER_FULL_DAY_FACTOR_VALID_V2 = 1U << 5U,
+    L2FLOW_SHM_HEADER_CERTIFIED_PREFIX_VALID_V2 = 1U << 6U,
+};
+
 enum l2flow_instrument_status_v2 {
     L2FLOW_INSTRUMENT_AVAILABLE_V2 = 0,
     L2FLOW_INSTRUMENT_BOUND_NO_DATA_V2 = 1,
@@ -282,7 +304,7 @@ typedef struct l2flow_selection_envelope_v2 {
     uint32_t reserved[2];
 } l2flow_selection_envelope_v2;
 
-// Maps fd read-only and accepts only the sealed Wire V2.2 layout. The caller
+// Maps fd read-only and accepts only the sealed Wire V2.3 layout. The caller
 // retains ownership of fd and may close it immediately after this function
 // returns.
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_open_fd_v2(

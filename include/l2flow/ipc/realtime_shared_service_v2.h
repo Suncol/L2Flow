@@ -61,6 +61,16 @@ struct RealtimeSharedServiceConfigV2 final {
         const l2flow::market::DailyInstrumentCatalogV2>
         daily_catalog;
     std::vector<l2flow::market::KLineWindowSpecV1> kline_windows;
+    // Explicit service semantics.  A preview leaves every value false and is
+    // started with StartLivePartial().  A recovered service sets the first
+    // four strong claims before Start(); CERTIFIED remains false until its
+    // independent prefix barrier succeeds and MarkCertifiedPrefixValid() is
+    // called.
+    bool coverage_from_open = false;
+    bool startup_prefix_recovered = false;
+    bool full_day_kline_valid = false;
+    bool full_day_factor_valid = false;
+    bool certified_prefix_valid = false;
     std::uint64_t tick_ring_capacity = 262'144U;
     // Fixed for the session. Exhaustion is fatal; V2 deliberately has no
     // rollover or variable-size compatibility path.
@@ -104,7 +114,7 @@ enum class RealtimeSharedServiceCreateErrorV2 : std::uint8_t {
 RealtimeSharedServiceCreateErrorNameV2(
     RealtimeSharedServiceCreateErrorV2 error) noexcept;
 
-// Wire V2.2 service. History and delta readers bind to one immutable daily
+// Wire V2.3 service. History and delta readers bind to one immutable daily
 // catalog generation and never enter the live callback/decoder path.
 class RealtimeSharedMarketServiceV2 final
     : public l2flow::market::RealtimeAppliedRecordSinkV1,
@@ -129,6 +139,8 @@ public:
     // Starts only the control plane. All catalog rows are already published,
     // so ACTIVE always begins with bound_count == capacity.
     [[nodiscard]] bool Start(int* system_error_number = nullptr) noexcept;
+    [[nodiscard]] bool StartLivePartial(
+        int* system_error_number = nullptr) noexcept;
 
     [[nodiscard]] bool PublishApplied(
         std::size_t ordinal,
@@ -148,6 +160,7 @@ public:
             generation) noexcept override;
 
     void MarkDraining() noexcept;
+    [[nodiscard]] bool MarkCertifiedPrefixValid() noexcept;
     // Call only after MarkDraining and after every producer has joined.
     [[nodiscard]] bool MarkStoppedClean(
         std::uint64_t final_admitted_tick_sequence) noexcept;

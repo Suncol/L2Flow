@@ -611,6 +611,227 @@ void TestFiveMessagesAndQueues(TestContext* test) {
         "missing Shenzhen ChannelNo carries mandatory notice");
 }
 
+void TestVendorBlankPreOpenBooksAndPaddedText(TestContext* test) {
+    {
+        TempDirectory directory;
+        const std::vector<std::string> snapshot_columns =
+            ShanghaiSnapshotColumns();
+        Row snapshot = ZeroRow(snapshot_columns);
+        snapshot["UpdateTime"] = "08:45:00.000";
+        snapshot["SecurityID"] = "600648";
+        snapshot["ImageStatus"] = "1";
+        snapshot["InstruStatus"] = "START";
+        snapshot["LocalTime"] = "08:45:00.456";
+        snapshot["SeqNo"] = "1";
+        for (std::size_t index = 1U; index <= 10U; ++index) {
+            const std::string ordinal = std::to_string(index);
+            snapshot.erase("AskPrice" + ordinal);
+            snapshot.erase("AskVolume" + ordinal);
+            snapshot.erase("BidPrice" + ordinal);
+            snapshot.erase("BidVolume" + ordinal);
+            snapshot.erase("NumOrdersB" + ordinal);
+            snapshot.erase("NumOrdersS" + ordinal);
+        }
+        WriteTable(
+            directory.path() / "MarketData.csv",
+            snapshot_columns,
+            {snapshot});
+
+        const std::vector<std::string> queue_columns =
+            QueueColumns("UpdateTime");
+        Row bid = ZeroRow(queue_columns);
+        bid["UpdateTime"] = "08:45:00.000";
+        bid["SecurityID"] = "600648";
+        bid["ImageStatus"] = "1";
+        bid["Side"] = "B";
+        bid["NoPriceLevel"] = "1";
+        bid["LocalTime"] = "08:45:00.456";
+        bid["SeqNo"] = "1";
+        bid.erase("PrcLvlOperator");
+        bid.erase("Price");
+        bid.erase("Volume");
+        bid.erase("NumOrders");
+        bid.erase("NoOrders");
+        for (std::size_t index = 1U; index <= 50U; ++index) {
+            bid.erase("OrderQty" + std::to_string(index));
+        }
+        Row ask = bid;
+        ask["Side"] = "S";
+        WriteTable(
+            directory.path() / "OrderQueue.csv",
+            queue_columns,
+            {bid, ask});
+
+        DecodeSink sink;
+        const auto result = Replay(
+            directory.path(),
+            recovery::StartupReplayMessageSetV1::
+                kShanghaiSnapshot,
+            &sink);
+        const auto* decoded =
+            sink.events.empty()
+                ? nullptr
+                : std::get_if<market::ShanghaiSnapshotV1>(
+                      &sink.events.front());
+        if (!result.ok()) {
+            std::cerr << "Shanghai blank-book replay detail: "
+                      << result.detail << '\n';
+        }
+        test->Expect(
+            result.ok() &&
+                result.counts.shanghai_snapshots == 1U &&
+                decoded != nullptr &&
+                decoded->book.actual_bid_depth == 0U &&
+                decoded->book.actual_ask_depth == 0U &&
+                decoded->book.retained_bid_depth == 0U &&
+                decoded->book.retained_ask_depth == 0U,
+            "vendor blank Shanghai pre-open depth and queue values map to an empty book");
+    }
+    {
+        TempDirectory directory;
+        const std::vector<std::string> snapshot_columns =
+            ShanghaiSnapshotColumns();
+        Row snapshot = ZeroRow(snapshot_columns);
+        snapshot["UpdateTime"] = "09:15:00.000";
+        snapshot["SecurityID"] = "603813";
+        snapshot["ImageStatus"] = "1";
+        snapshot["InstruStatus"] = "OCALL";
+        snapshot["BidNum"] = "1";
+        snapshot["SellNum"] = "1";
+        snapshot["BidPrice1"] = "34.270";
+        snapshot["BidVolume1"] = "100.000";
+        snapshot["NumOrdersB1"] = "0";
+        snapshot["BidPrice2"] = "0.000";
+        snapshot["BidVolume2"] = "700.000";
+        snapshot["NumOrdersB2"] = "0";
+        snapshot["AskPrice1"] = "34.270";
+        snapshot["AskVolume1"] = "100.000";
+        snapshot["NumOrdersS1"] = "0";
+        snapshot["AskPrice2"] = "0.000";
+        snapshot["AskVolume2"] = "0.000";
+        snapshot["NumOrdersS2"] = "0";
+        snapshot["LocalTime"] = "09:15:00.001";
+        snapshot["SeqNo"] = "1";
+        for (std::size_t index = 3U; index <= 10U; ++index) {
+            const std::string ordinal = std::to_string(index);
+            snapshot.erase("AskPrice" + ordinal);
+            snapshot.erase("AskVolume" + ordinal);
+            snapshot.erase("BidPrice" + ordinal);
+            snapshot.erase("BidVolume" + ordinal);
+            snapshot.erase("NumOrdersB" + ordinal);
+            snapshot.erase("NumOrdersS" + ordinal);
+        }
+        WriteTable(
+            directory.path() / "MarketData.csv",
+            snapshot_columns,
+            {snapshot});
+        WriteTable(
+            directory.path() / "OrderQueue.csv",
+            QueueColumns("UpdateTime"),
+            {});
+
+        DecodeSink sink;
+        const auto result = Replay(
+            directory.path(),
+            recovery::StartupReplayMessageSetV1::
+                kShanghaiSnapshot,
+            &sink);
+        const auto* decoded =
+            sink.events.empty()
+                ? nullptr
+                : std::get_if<market::ShanghaiSnapshotV1>(
+                      &sink.events.front());
+        test->Expect(
+            result.ok() && decoded != nullptr &&
+                decoded->book.actual_bid_depth == 2U &&
+                decoded->book.actual_ask_depth == 2U &&
+                decoded->book.bids[1U].price.raw == 0 &&
+                decoded->book.bids[1U].quantity.raw == 700000,
+            "Shanghai flattened level presence, not BidNum/SellNum counters, restores dynamic depth");
+    }
+    {
+        TempDirectory directory;
+        const std::vector<std::string> snapshot_columns =
+            ShenzhenSnapshotColumns();
+        Row snapshot = ZeroRow(snapshot_columns);
+        snapshot["UpdateTime"] = "08:15:00.000";
+        snapshot["MDStreamID"] = "010";
+        snapshot["SecurityID"] = "002853";
+        snapshot["SecurityIDSource"] = "102 ";
+        snapshot["TradingPhaseCode"] = "S0      ";
+        snapshot["LocalTime"] = "08:15:00.690";
+        snapshot["SeqNo"] = "1";
+        for (std::size_t index = 1U; index <= 10U; ++index) {
+            const std::string ordinal = std::to_string(index);
+            snapshot.erase("AskPrice" + ordinal);
+            snapshot.erase("AskVolume" + ordinal);
+            snapshot.erase("BidPrice" + ordinal);
+            snapshot.erase("BidVolume" + ordinal);
+            snapshot.erase("NumOrdersB" + ordinal);
+            snapshot.erase("NumOrdersS" + ordinal);
+        }
+        WriteTable(
+            directory.path() / "mdl_6_28_0.csv",
+            snapshot_columns,
+            {snapshot});
+
+        const std::vector<std::string> queue_columns =
+            QueueColumns("DataTimeStamp");
+        Row ask = ZeroRow(queue_columns);
+        ask["DataTimeStamp"] = "08:15:00.000";
+        ask["SecurityID"] = "002853";
+        ask["ImageStatus"] = "1";
+        ask["Side"] = "S";
+        ask["NoPriceLevel"] = "1";
+        ask["LocalTime"] = "08:15:00.690";
+        ask["SeqNo"] = "1";
+        ask.erase("PrcLvlOperator");
+        ask.erase("Price");
+        ask.erase("Volume");
+        ask.erase("NumOrders");
+        ask.erase("NoOrders");
+        for (std::size_t index = 1U; index <= 50U; ++index) {
+            ask.erase("OrderQty" + std::to_string(index));
+        }
+        Row bid = ask;
+        bid["Side"] = "B";
+        WriteTable(
+            directory.path() / "mdl_6_28_1.csv",
+            queue_columns,
+            {ask});
+        WriteTable(
+            directory.path() / "mdl_6_28_2.csv",
+            queue_columns,
+            {bid});
+
+        DecodeSink sink;
+        const auto result = Replay(
+            directory.path(),
+            recovery::StartupReplayMessageSetV1::
+                kShenzhenSnapshot,
+            &sink);
+        const auto* decoded =
+            sink.events.empty()
+                ? nullptr
+                : std::get_if<market::ShenzhenSnapshotV1>(
+                      &sink.events.front());
+        if (!result.ok()) {
+            std::cerr << "Shenzhen blank-book replay detail: "
+                      << result.detail << '\n';
+        }
+        test->Expect(
+            result.ok() &&
+                result.counts.shenzhen_snapshots == 1U &&
+                decoded != nullptr &&
+                decoded->book.actual_bid_depth == 0U &&
+                decoded->book.actual_ask_depth == 0U &&
+                decoded->book.retained_bid_depth == 0U &&
+                decoded->book.retained_ask_depth == 0U &&
+                decoded->common.security_id_source == "102 ",
+            "vendor blank Shenzhen pre-open book and right-padded fixed text are normalized");
+    }
+}
+
 void TestPartialSuffixAndFailures(TestContext* test) {
     {
         TempDirectory directory;
@@ -789,6 +1010,74 @@ void TestPartialSuffixAndFailures(TestContext* test) {
                 recovery::StartupReplayErrorV1::
                     kColumnCountMismatch,
             "wrong data column count fails closed");
+    }
+    {
+        TempDirectory directory;
+        Row tick = ZeroRow(kShanghaiTickColumns);
+        tick["BizIndex"] = "1";
+        tick["Channel"] = "1";
+        tick["SecurityID"] = "600000";
+        tick["TickTime"] = "09:30:00.001";
+        tick["Type"] = "A";
+        tick["TickBSFlag"] = "B";
+        tick["LocalTime"] = "09:30:00.002";
+        tick["SeqNo"] = "1";
+        Row header;
+        for (const std::string& column : kShanghaiTickColumns) {
+            header[column] = column;
+        }
+        std::string vendor_row = CsvLine(kShanghaiTickColumns, tick);
+        vendor_row.insert(vendor_row.size() - 1U, ",");
+        std::ofstream output(
+            directory.path() / "mdl_4_24_0.csv",
+            std::ios::binary);
+        output << CsvLine(kShanghaiTickColumns, header)
+               << vendor_row;
+        output.close();
+        DecodeSink sink;
+        const auto result = Replay(
+            directory.path(),
+            recovery::StartupReplayMessageSetV1::kShanghaiTick,
+            &sink);
+        test->Expect(
+            result.ok() && result.counts.shanghai_ticks == 1U,
+            "one vendor trailing empty data column is accepted");
+    }
+    {
+        TempDirectory directory;
+        Row tick = ZeroRow(kShanghaiTickColumns);
+        tick["BizIndex"] = "1";
+        tick["Channel"] = "1";
+        tick["SecurityID"] = "600000";
+        tick["TickTime"] = "09:30:00.001";
+        tick["Type"] = "A";
+        tick["TickBSFlag"] = "B";
+        tick["LocalTime"] = "09:30:00.002";
+        tick["SeqNo"] = "1";
+        Row header;
+        for (const std::string& column : kShanghaiTickColumns) {
+            header[column] = column;
+        }
+        std::string invalid_row = CsvLine(kShanghaiTickColumns, tick);
+        invalid_row.insert(
+            invalid_row.size() - 1U,
+            ",unexpected");
+        std::ofstream output(
+            directory.path() / "mdl_4_24_0.csv",
+            std::ios::binary);
+        output << CsvLine(kShanghaiTickColumns, header)
+               << invalid_row;
+        output.close();
+        DecodeSink sink;
+        const auto result = Replay(
+            directory.path(),
+            recovery::StartupReplayMessageSetV1::kShanghaiTick,
+            &sink);
+        test->Expect(
+            result.error ==
+                recovery::StartupReplayErrorV1::
+                    kColumnCountMismatch,
+            "a trailing non-empty undeclared data column fails closed");
     }
     {
         TempDirectory directory;
@@ -1718,6 +2007,7 @@ void TestRecoverySequenceIntegrity(TestContext* test) {
 int main() {
     TestContext test;
     TestFiveMessagesAndQueues(&test);
+    TestVendorBlankPreOpenBooksAndPaddedText(&test);
     TestPartialSuffixAndFailures(&test);
     TestTupleFencesAndReservedValues(&test);
     TestFenceOrderingAndSnapshotTailJoin(&test);

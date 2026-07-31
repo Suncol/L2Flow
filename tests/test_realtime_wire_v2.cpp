@@ -14,7 +14,7 @@ namespace {
 namespace ipc = l2flow::ipc;
 
 static_assert(ipc::kRealtimeWireMajorV2 == 2U);
-static_assert(ipc::kRealtimeWireMinorV2 == 2U);
+static_assert(ipc::kRealtimeWireMinorV2 == 3U);
 static_assert(
     ipc::kRealtimeShmMagicV2 ==
     std::array<std::uint8_t, 8U>{

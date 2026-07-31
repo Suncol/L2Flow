@@ -570,6 +570,70 @@ private:
     std::function<void()> after_fences_;
 };
 
+class CaptureProbe final
+    : public realtime::RealtimeIngressCaptureSinkV1 {
+public:
+    explicit CaptureProbe(bool accept) : accept_(accept) {}
+
+    [[nodiscard]] bool Capture(
+        const realtime::RealtimeIngressCaptureInputV1& input)
+        noexcept override {
+        try {
+            ++calls_;
+            if (input.inspection == nullptr || !*input.inspection) {
+                valid_ = false;
+                return false;
+            }
+            key_ = input.inspection->key();
+            source_slot_ = input.inspection->source_slot();
+            vendor_sequence_ =
+                input.inspection->vendor_head().sequence_id();
+            realtime_ns_ = input.recv_realtime_ns;
+            monotonic_ns_ = input.recv_monotonic_ns;
+            body_.assign(
+                input.inspection->body().begin(),
+                input.inspection->body().end());
+            valid_ = realtime_ns_ != 0U && monotonic_ns_ != 0U;
+            return accept_ && valid_;
+        } catch (...) {
+            valid_ = false;
+            return false;
+        }
+    }
+
+    [[nodiscard]] std::uint64_t calls() const noexcept { return calls_; }
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
+    [[nodiscard]] const sdk::MessageKey& key() const noexcept {
+        return key_;
+    }
+    [[nodiscard]] std::uint8_t source_slot() const noexcept {
+        return source_slot_;
+    }
+    [[nodiscard]] std::uint64_t vendor_sequence() const noexcept {
+        return vendor_sequence_;
+    }
+    [[nodiscard]] std::uint64_t realtime_ns() const noexcept {
+        return realtime_ns_;
+    }
+    [[nodiscard]] std::uint64_t monotonic_ns() const noexcept {
+        return monotonic_ns_;
+    }
+    [[nodiscard]] std::span<const std::byte> body() const noexcept {
+        return body_;
+    }
+
+private:
+    bool accept_ = false;
+    bool valid_ = false;
+    std::uint64_t calls_ = 0U;
+    sdk::MessageKey key_{};
+    std::uint8_t source_slot_ = 0U;
+    std::uint64_t vendor_sequence_ = 0U;
+    std::uint64_t realtime_ns_ = 0U;
+    std::uint64_t monotonic_ns_ = 0U;
+    std::vector<std::byte> body_;
+};
+
 class CapturingProgressSink final
     : public realtime::ProcessingProgressSinkV2 {
 public:
@@ -1800,6 +1864,229 @@ void RunStartupRecoveryTests(TestContext* test) {
     }
 }
 
+void RunOnlineIngressSeamTests(TestContext* test) {
+    if (test == nullptr) {
+        return;
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "process-start partial SDK fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages.push_back(
+            std::make_shared<OwnedTestMessage>(
+                650U, 650U, 165'000U, 2U));
+        runtime::RealtimePipelineConfigV1 config = MakeConfig(fixture);
+        config.intraday_store.coverage_from_open = false;
+        config.kline.windows.clear();
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto create_error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        runtime::RealtimePipelineCutResultV1 generation{};
+        if (pipeline != nullptr) {
+            generation = pipeline->CutAndPublishGeneration(3s);
+        }
+        market::IntradayInstrumentSummaryV1 row{};
+        test->Expect(
+            create_error ==
+                    runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr && generation.published() &&
+                generation.store_generation != nullptr &&
+                !generation.store_generation->coverage_from_open() &&
+                generation.store_generation->Find(1U, &row) ==
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                row.record_count == 1U &&
+                pipeline->Snapshot().accepted_messages == 1U,
+            "SDK live data advances a process-start partial Store without "
+            "a replay source, WAL capture, or from-open claim: " + detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "external shadow ingress fixture");
+        if (fixture.runtime_state != nullptr) {
+            runtime::RealtimePipelineConfigV1 config = MakeConfig(fixture);
+            config.sdk.enabled = false;
+            config.external_ingress_enabled = true;
+            std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+            std::string detail;
+            const auto create_error = runtime::RealtimePipelineV1::Create(
+                std::move(config), &pipeline, &detail);
+            auto message = std::make_shared<OwnedTestMessage>(
+                700U, 700U, 170'000U, 3U);
+            runtime::RealtimePipelineExternalIngressV1 input{};
+            input.message = message.get();
+            input.recv_realtime_ns = 1'000U;
+            input.recv_monotonic_ns = 2'000U;
+            input.admission_timeout = 2s;
+            runtime::RealtimePipelineIngressResultV1 ingress{};
+            if (pipeline != nullptr) {
+                ingress = pipeline->IngestExternalMessage(input);
+            }
+            runtime::RealtimePipelineCutResultV1 generation{};
+            if (pipeline != nullptr && ingress.accepted()) {
+                generation = pipeline->CutAndPublishGeneration(3s);
+            }
+            market::IntradayInstrumentSummaryV1 row{};
+            test->Expect(
+                create_error ==
+                        runtime::RealtimePipelineCreateErrorV1::kNone &&
+                    pipeline != nullptr && ingress.accepted() &&
+                    ingress.global_ingress_sequence == 1U &&
+                    ingress.source_sequence == 1U &&
+                    generation.published() &&
+                    generation.store_generation->Find(1U, &row) ==
+                        market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+                    row.record_count == 1U,
+                "SDK-less external ingress advances the complete shadow pipeline: " +
+                    detail);
+            if (pipeline != nullptr) {
+                pipeline->StopAndDrain();
+            }
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "SDK/external mutual exclusion fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        runtime::RealtimePipelineConfigV1 config = MakeConfig(fixture);
+        config.external_ingress_enabled = true;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        test->Expect(
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail) ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kInvalidConfiguration &&
+                pipeline == nullptr,
+            "one pipeline cannot own both physical SDK and external shadow ingress");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "blocking/capture mutual exclusion fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        auto source = std::make_shared<TestReplaySource>(
+            std::vector<std::shared_ptr<OwnedTestMessage>>{});
+        auto capture = std::make_shared<CaptureProbe>(true);
+        runtime::RealtimePipelineConfigV1 config = MakeConfig(fixture);
+        config.startup_replay_source = source;
+        config.live_ingress_capture_sink = capture;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        test->Expect(
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail) ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kInvalidConfiguration &&
+                pipeline == nullptr && capture->calls() == 0U,
+            "online capture and synchronous startup replay cannot share one owner");
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "successful SDK capture fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        const std::vector<std::byte> expected_body =
+            ShenzhenTransactionBody(801U, 180'000U, 4U);
+        auto message = std::make_shared<OwnedTestMessage>(
+            sdk::MessageKey{6U, 101U, 36U},
+            800U,
+            expected_body);
+        sdk_state->connect_messages.push_back(message);
+        auto capture = std::make_shared<CaptureProbe>(true);
+        runtime::RealtimePipelineConfigV1 config = MakeConfig(fixture);
+        config.live_ingress_capture_sink = capture;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto create_error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        runtime::RealtimePipelineCutResultV1 generation{};
+        if (pipeline != nullptr) {
+            generation = pipeline->CutAndPublishGeneration(3s);
+        }
+        test->Expect(
+            create_error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr && capture->calls() == 1U &&
+                capture->valid() &&
+                capture->key() == sdk::MessageKey{6U, 101U, 36U} &&
+                capture->source_slot() == 3U &&
+                capture->vendor_sequence() == 800U &&
+                capture->realtime_ns() != 0U &&
+                capture->monotonic_ns() != 0U &&
+                std::equal(
+                    expected_body.begin(),
+                    expected_body.end(),
+                    capture->body().begin(),
+                    capture->body().end()) &&
+                generation.published() &&
+                pipeline->Snapshot().accepted_messages == 1U,
+            "Connect callback is independently deep-copied before the same message advances preview: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "failed SDK capture fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        sdk_state->connect_messages.push_back(
+            std::make_shared<OwnedTestMessage>(
+                900U, 900U, 190'000U, 5U));
+        auto capture = std::make_shared<CaptureProbe>(false);
+        runtime::RealtimePipelineConfigV1 config = MakeConfig(fixture);
+        config.live_ingress_capture_sink = capture;
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto create_error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                std::move(config),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        test->Expect(
+            create_error ==
+                    runtime::RealtimePipelineCreateErrorV1::
+                        kSdkCallbackFailed &&
+                pipeline == nullptr && capture->calls() == 1U &&
+                capture->valid() && sdk_state->shutdown_calls == 1U,
+            "capture refusal prevents preview admission and fails the sole SDK owner closed");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2053,6 +2340,7 @@ int main() {
         "idempotent stop/destruction does not repeat SDK lifecycle operations");
 
     RunStartupRecoveryTests(&test);
+    RunOnlineIngressSeamTests(&test);
 
     return test.failures() == 0 ? 0 : 1;
 }

@@ -2933,6 +2933,168 @@ bool TestMalformedHistoryResponseClosesReceivedDescriptor() {
         "short history response is protocol-fatal and closes every received SCM_RIGHTS fd");
 }
 
+bool TestLivePartialSemantics() {
+    ScopedTempDirectory temporary;
+    constexpr std::uint64_t partial_epoch = kSessionEpoch + 100U;
+    DailyRuntimeFixture fixture =
+        MakeManualDailyFixture(1U, partial_epoch);
+    if (!Expect(temporary.valid(), "create partial temp directory") ||
+        !Expect(static_cast<bool>(fixture), "create partial daily catalog")) {
+        return false;
+    }
+
+    const std::filesystem::path socket_path =
+        temporary.path() / "live-partial.sock";
+    ipc::RealtimeSharedServiceConfigV2 config{};
+    config.run_id = RunId(0x61U);
+    config.session_epoch = partial_epoch;
+    config.trade_date = kTradeDate;
+    config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = false;
+    config.startup_prefix_recovered = false;
+    config.full_day_kline_valid = false;
+    config.full_day_factor_valid = false;
+    config.certified_prefix_valid = false;
+    config.tick_ring_capacity = 4U;
+    config.key_arena_bytes = 128U;
+    config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.control_socket_path = socket_path;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    bool ok = Expect(
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            config, &service, &system_error) ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            service != nullptr && system_error == 0,
+        "create LIVE_PARTIAL service");
+    if (service == nullptr) {
+        return false;
+    }
+
+    ok &= Expect(
+        !service->Start(&system_error) && system_error == EINVAL,
+        "ACTIVE start rejects a service without from-open coverage");
+    system_error = 0;
+    ok &= Expect(
+        service->StartLivePartial(&system_error) && system_error == 0,
+        "LIVE_PARTIAL starts from the unchanged INITIALIZING state");
+
+    SessionTransfer transfer = RequestSession(socket_path);
+    ok &= Expect(
+        transfer.response.status == static_cast<std::uint16_t>(
+            ipc::RealtimeControlStatusV2::kOk) &&
+            transfer.fd.get() >= 0,
+        "LIVE_PARTIAL exposes GET_SESSION and its latest-value mapping");
+    ReaderHandle reader;
+    if (transfer.fd.get() >= 0) {
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                transfer.fd.get(), reader.output()) ==
+                    L2FLOW_SHM_READER_OK_V2 &&
+                reader.get() != nullptr,
+            "native reader accepts the V2.3 LIVE_PARTIAL state");
+    }
+    transfer.fd.Reset();
+    if (reader.get() == nullptr) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    l2flow_shm_session_info_v2 session{};
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.server_state == static_cast<std::uint32_t>(
+                ipc::RealtimeServerStateV2::kLivePartial) &&
+            session.flags == 0U &&
+            session.coverage_complete == 1U &&
+            session.bound_count == session.capacity &&
+            session.available_count == 0U,
+        "preview has complete catalog identity but no from-open or strong prefix claim");
+
+    constexpr std::uint32_t instrument_id = 1U;
+    ipc::RealtimeWireSnapshotPayloadV2 snapshot{};
+    std::uint8_t latest_status = 0xffU;
+    ok &= Expect(
+        l2flow_shm_reader_latest_snapshots_v2(
+            reader.get(),
+            &instrument_id,
+            1U,
+            &snapshot,
+            sizeof(snapshot),
+            &latest_status) == L2FLOW_SHM_READER_OK_V2 &&
+            latest_status == L2FLOW_LATEST_BOUND_NO_DATA_V2,
+        "latest API remains queryable during recovery and reports explicit no-data status");
+    ok &= Expect(
+        !service->MarkCertifiedPrefixValid(),
+        "LIVE_PARTIAL cannot manufacture a certified from-open prefix");
+
+    const auto history_unavailable = [&socket_path] {
+        UniqueFd channel = ConnectControlSocket(socket_path);
+        ipc::RealtimeHistoryOpenRequestV2 request{};
+        request.magic = ipc::kRealtimeControlMagicV2;
+        request.protocol_major = ipc::kRealtimeWireMajorV2;
+        request.protocol_minor = ipc::kRealtimeWireMinorV2;
+        request.opcode = static_cast<std::uint16_t>(
+            ipc::RealtimeHistoryControlOpcodeV2::kOpenHistory);
+        request.message_bytes = sizeof(request);
+        request.request_id = 0x5041525448495354ULL;
+        request.instrument_id = 1U;
+        request.requested_page_records = 1U;
+        ipc::RealtimeHistoryOpenResponseV2 response{};
+        return channel.get() >= 0 && SendObject(channel.get(), request) &&
+               ReceiveObjectWithoutDescriptor(channel.get(), &response) &&
+               response.status == static_cast<std::uint16_t>(
+                   ipc::RealtimeHistoryControlStatusV2::kUnavailable) &&
+               response.initial_read_token == 0U;
+    };
+    const auto delta_unavailable = [&socket_path] {
+        UniqueFd channel = ConnectControlSocket(socket_path);
+        ipc::RealtimeInstrumentTickDeltaOpenSessionRequestV2 request{};
+        request.magic = ipc::kRealtimeControlMagicV2;
+        request.protocol_major = ipc::kRealtimeWireMajorV2;
+        request.protocol_minor = ipc::kRealtimeWireMinorV2;
+        request.opcode = static_cast<std::uint16_t>(
+            ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+                kOpenDeltaSession);
+        request.message_bytes = sizeof(request);
+        request.request_id = 0x5041525444454c54ULL;
+        ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2 response{};
+        return channel.get() >= 0 && SendObject(channel.get(), request) &&
+               ReceiveObjectWithoutDescriptor(channel.get(), &response) &&
+               response.status == static_cast<std::uint16_t>(
+                   ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                       kUnavailable) &&
+               response.delta_session_token == 0U;
+    };
+    ok &= Expect(
+        history_unavailable(),
+        "History OPEN is unavailable before from-open promotion");
+    ok &= Expect(
+        delta_unavailable(),
+        "tick-delta OPEN is unavailable before from-open promotion");
+
+    service->MarkDraining();
+    ok &= Expect(
+        service->MarkStoppedClean(0U),
+        "zero-tick LIVE_PARTIAL session can stop cleanly without claiming coverage loss");
+    session = {};
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.server_state == static_cast<std::uint32_t>(
+                ipc::RealtimeServerStateV2::kStoppedClean) &&
+            session.flags == 0U,
+        "partial origin remains explicit after DRAINING and STOPPED_CLEAN");
+    ok &= Expect(
+        history_unavailable() && delta_unavailable(),
+        "stopped partial session still refuses complete History and delta semantics");
+    service->StopControl();
+    return ok && Expect(!service->failed(), "LIVE_PARTIAL lifecycle is nonfatal");
+}
+
 bool TestServiceEndToEnd() {
     ScopedTempDirectory temporary;
     DailyRuntimeFixture fixture =
@@ -2950,6 +3112,7 @@ bool TestServiceEndToEnd() {
     service_config.session_epoch = kSessionEpoch;
     service_config.trade_date = kTradeDate;
     service_config.daily_catalog = fixture.catalog;
+    service_config.coverage_from_open = true;
     service_config.kline_windows = {{
         kWindowId,
         kWindowDurationNs,
@@ -3958,6 +4121,7 @@ bool TestProcessingAdmissionPublishesWireLatest() {
     service_config.session_epoch = 33U;
     service_config.trade_date = kTradeDate;
     service_config.daily_catalog = fixture.catalog;
+    service_config.coverage_from_open = true;
     service_config.tick_ring_capacity = 16U;
     service_config.key_arena_bytes = 128U;
     service_config.maximum_mapping_bytes =
@@ -4167,6 +4331,7 @@ bool TestKeyArenaExhaustionIsFatal() {
     config.session_epoch = 30U;
     config.trade_date = kTradeDate;
     config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = true;
     config.tick_ring_capacity = 2U;
     config.key_arena_bytes = 2U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -4196,6 +4361,7 @@ bool TestStoppedCleanRejectsMismatchedWatermark() {
     config.session_epoch = 31U;
     config.trade_date = kTradeDate;
     config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = true;
     config.tick_ring_capacity = 2U;
     config.key_arena_bytes = 16U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -4232,6 +4398,7 @@ bool TestTickRingRejectsUnclosedGapOverwrite() {
     config.session_epoch = 32U;
     config.trade_date = kTradeDate;
     config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = true;
     config.tick_ring_capacity = 2U;
     config.key_arena_bytes = 32U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -4357,6 +4524,7 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     service_config.session_epoch = 47U;
     service_config.trade_date = kTradeDate;
     service_config.daily_catalog = fixture.catalog;
+    service_config.coverage_from_open = true;
     service_config.tick_ring_capacity = kTickRingCapacity;
     service_config.control_socket_path = socket_path;
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
@@ -5438,6 +5606,7 @@ bool RunHistoryLatencyBenchmark() {
     service_config.session_epoch = 67U;
     service_config.trade_date = kTradeDate;
     service_config.daily_catalog = fixture.catalog;
+    service_config.coverage_from_open = true;
     service_config.tick_ring_capacity = kTickRingCapacity;
     service_config.maximum_history_readers = 8U;
     service_config.maximum_history_page_records = 4'096U;
@@ -6871,6 +7040,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!TestMalformedHistoryResponseClosesReceivedDescriptor() ||
+        !TestLivePartialSemantics() ||
         !TestServiceEndToEnd() ||
         !TestProcessingAdmissionPublishesWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||

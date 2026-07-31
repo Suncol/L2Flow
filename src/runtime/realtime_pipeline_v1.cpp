@@ -1337,6 +1337,14 @@ bool RealtimePipelineAppliedWindowCapacityV1(
     return BoundedAppliedWindowCapacity(config, output);
 }
 
+bool RealtimePipelineStartupSemanticDigestV1(
+    const market::DecodedMarketEventV1& event,
+    bool normalize_shenzhen_snapshot_channel,
+    common::Sha256Digest* output) noexcept {
+    return CanonicalDecodedDigest(
+        event, normalize_shenzhen_snapshot_channel, output);
+}
+
 std::string_view RealtimePipelineCreateErrorNameV1(
     RealtimePipelineCreateErrorV1 error) noexcept {
     switch (error) {
@@ -1426,6 +1434,8 @@ std::string_view RealtimePipelineIngressErrorNameV1(
             return "instrument_key_rejected";
         case RealtimePipelineIngressErrorV1::kCatalogMiss:
             return "catalog_miss";
+        case RealtimePipelineIngressErrorV1::kCaptureFailed:
+            return "capture_failed";
     }
     return "unknown";
 }
@@ -2058,9 +2068,14 @@ public:
             RealtimePipelineIngressErrorV1::kStopped;
         if (!callback_gate_closed_.load(std::memory_order_acquire)) {
             if (config_.startup_replay_source == nullptr) {
-                // Preserve the literal no-recovery callback hot path.
-                callback_error =
-                    Ingest(message, callback_entry_pointer).error;
+                if (config_.live_ingress_capture_sink == nullptr) {
+                    // Preserve the literal no-recovery callback hot path.
+                    callback_error =
+                        Ingest(message, callback_entry_pointer).error;
+                } else {
+                    callback_error = CaptureAndIngestLive(
+                        message, callback_entry_pointer);
+                }
             } else if (startup_direct_.load(
                            std::memory_order_acquire)) {
                 callback_error = HandleRecoveryDirectCallback(
@@ -2091,6 +2106,61 @@ public:
                 1U, std::memory_order_acq_rel) == 1U) {
             active_callbacks_.notify_all();
         }
+    }
+
+    [[nodiscard]] RealtimePipelineIngressErrorV1 CaptureAndIngestLive(
+        const mdl::MDLMessage* message,
+        const CallbackClockObservation* callback_entry) noexcept {
+        realtime::OwnedIngressMessageInspectionV1 inspection{};
+        const realtime::OwnedIngressMessageErrorV1 inspection_error =
+            realtime::InspectOwnedIngressMessageV1(
+                message,
+                config_.maximum_sdk_message_bytes,
+                &inspection);
+        if (inspection_error ==
+                realtime::OwnedIngressMessageErrorV1::
+                    kUnsupportedMessage ||
+            inspection_error !=
+                realtime::OwnedIngressMessageErrorV1::kNone ||
+            !inspection) {
+            // Unsupported API/SYS callbacks are intentionally outside the
+            // five-tuple recovery identity.  Every malformed/forbidden
+            // callback still follows the ordinary fail-closed admission path.
+            return Ingest(message, callback_entry).error;
+        }
+
+        CallbackClockObservation capture_clock{};
+        if (callback_entry != nullptr) {
+            capture_clock = *callback_entry;
+        } else {
+            capture_clock.valid =
+                ReadClockNs(
+                    CLOCK_REALTIME, &capture_clock.realtime_ns) &&
+                ReadClockNs(
+                    CLOCK_MONOTONIC, &capture_clock.monotonic_ns);
+        }
+        if (!capture_clock.valid) {
+            return Ingest(message, &capture_clock).error;
+        }
+
+        realtime::RealtimeIngressCaptureInputV1 capture{};
+        capture.inspection = &inspection;
+        capture.recv_realtime_ns = capture_clock.realtime_ns;
+        capture.recv_monotonic_ns = capture_clock.monotonic_ns;
+        if (!config_.live_ingress_capture_sink->Capture(capture)) {
+            {
+                std::lock_guard<std::mutex> admission(admission_mutex_);
+                ++rejected_messages_;
+                ReportPipelineFailure(
+                    "live_ingress_capture",
+                    inspection.source_slot(),
+                    0U,
+                    inspection.vendor_head().sequence_id());
+                TripFatalWithAdmissionLockHeld();
+            }
+            return RealtimePipelineIngressErrorV1::kCaptureFailed;
+        }
+        return Ingest(message, &capture_clock).error;
     }
 
     [[nodiscard]] RealtimePipelineIngressErrorV1
@@ -3354,6 +3424,54 @@ public:
         return result;
     }
 
+    [[nodiscard]] RealtimePipelineIngressResultV1 IngestExternal(
+        const RealtimePipelineExternalIngressV1& input) noexcept {
+        RealtimePipelineIngressResultV1 rejected{};
+        if (!config_.external_ingress_enabled) {
+            rejected.error = RealtimePipelineIngressErrorV1::kStopped;
+            return rejected;
+        }
+        if (input.message == nullptr ||
+            input.recv_realtime_ns == 0U ||
+            input.recv_monotonic_ns == 0U ||
+            input.admission_timeout <=
+                std::chrono::nanoseconds::zero() ||
+            input.admission_timeout > kMaximumCutTimeout) {
+            rejected.error =
+                input.message == nullptr
+                    ? RealtimePipelineIngressErrorV1::kNullMessage
+                    : RealtimePipelineIngressErrorV1::
+                          kOwnedMessageRejected;
+            rejected.owned_error =
+                input.message == nullptr
+                    ? realtime::OwnedIngressMessageErrorV1::kNullMessage
+                    : realtime::OwnedIngressMessageErrorV1::
+                          kInvalidMetadata;
+            {
+                std::lock_guard<std::mutex> admission(admission_mutex_);
+                ++rejected_messages_;
+                ReportPipelineFailure(
+                    "external_ingress_input", 0U, 0U, 0U);
+                TripFatalWithAdmissionLockHeld();
+            }
+            return rejected;
+        }
+        CallbackClockObservation clocks{};
+        clocks.realtime_ns = input.recv_realtime_ns;
+        clocks.monotonic_ns = input.recv_monotonic_ns;
+        clocks.valid = true;
+        const auto now = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(
+            input.admission_timeout);
+        return Ingest(
+            input.message,
+            &clocks,
+            input.additional_market_notices,
+            true,
+            now + timeout);
+    }
+
     [[nodiscard]] RealtimePipelineCutResultV1 Cut(
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
@@ -3815,6 +3933,13 @@ public:
                (history_ != nullptr && history_->fatal());
     }
 
+    [[nodiscard]] market::RealtimeHistoryGenerationErrorV1
+    history_failure_error() const noexcept {
+        return history_ == nullptr
+                   ? market::RealtimeHistoryGenerationErrorV1::kNone
+                   : history_->FailureError();
+    }
+
     void StopAndDrain() noexcept {
         const std::lock_guard<std::mutex> stop_guard(stop_mutex_);
         if (stopped_.load(std::memory_order_acquire)) {
@@ -3847,15 +3972,39 @@ private:
         const std::uint64_t accepted =
             accepted_sequence_.load(std::memory_order_acquire);
         if (ingress_sequence == 0U || ingress_sequence > accepted ||
-            applied_tracker_ == nullptr ||
-            applied_tracker_->MarkCompleted(ingress_sequence) !=
-                realtime::ContiguousSequenceMarkErrorV2::kNone) {
+            applied_tracker_ == nullptr) {
+            ReportAppliedSequenceFailure(
+                "precondition", ingress_sequence, accepted, 0U);
+            MarkAsyncFatal();
+            return false;
+        }
+        const realtime::ContiguousSequenceMarkErrorV2 mark_error =
+            applied_tracker_->MarkCompleted(ingress_sequence);
+        if (mark_error !=
+            realtime::ContiguousSequenceMarkErrorV2::kNone) {
+            ReportAppliedSequenceFailure(
+                "tracker_mark",
+                ingress_sequence,
+                accepted,
+                static_cast<std::uint64_t>(mark_error));
             MarkAsyncFatal();
             return false;
         }
         const std::uint64_t completed =
             applied_tracker_->contiguous_sequence();
-        if (completed > accepted) {
+        // MarkCompleted serializes concurrent completions. While this caller
+        // waits for that tracker lock, a later admitted sequence can complete
+        // and become part of the same newly contiguous prefix. Re-read the
+        // monotonic accepted frontier after the tracker operation; comparing
+        // against the pre-lock sample would falsely fail a valid prefix.
+        const std::uint64_t accepted_after_mark =
+            accepted_sequence_.load(std::memory_order_acquire);
+        if (completed > accepted_after_mark) {
+            ReportAppliedSequenceFailure(
+                "completed_past_accepted",
+                ingress_sequence,
+                accepted_after_mark,
+                completed);
             MarkAsyncFatal();
             return false;
         }
@@ -3870,7 +4019,52 @@ private:
         }
         applied_progress_cv_.notify_all();
         RequestProgressPublication();
-        return !fatal_.load(std::memory_order_acquire);
+        if (fatal_.load(std::memory_order_acquire)) {
+            ReportAppliedSequenceFailure(
+                "post_completion_fatal",
+                ingress_sequence,
+                accepted,
+                completed);
+            return false;
+        }
+        return true;
+    }
+
+    void ReportAppliedSequenceFailure(
+        const char* reason,
+        std::uint64_t ingress_sequence,
+        std::uint64_t accepted_sequence,
+        std::uint64_t detail) noexcept {
+        if (applied_sequence_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        realtime::ContiguousSequenceTrackerSnapshotV2 tracker{};
+        if (applied_tracker_ != nullptr) {
+            tracker = applied_tracker_->Snapshot();
+        }
+        std::fprintf(
+            stderr,
+            "l2flow-pipeline: first applied-sequence failure reason=%s "
+            "ingress_sequence=%llu accepted_sequence=%llu "
+            "published_applied=%llu tracker_capacity=%zu "
+            "tracker_contiguous=%llu tracker_highest=%llu "
+            "tracker_pending=%llu tracker_failed_marks=%llu "
+            "detail=%llu\n",
+            reason == nullptr ? "unknown" : reason,
+            static_cast<unsigned long long>(ingress_sequence),
+            static_cast<unsigned long long>(accepted_sequence),
+            static_cast<unsigned long long>(
+                applied_sequence_.load(std::memory_order_acquire)),
+            tracker.capacity,
+            static_cast<unsigned long long>(
+                tracker.contiguous_sequence),
+            static_cast<unsigned long long>(
+                tracker.highest_observed_sequence),
+            static_cast<unsigned long long>(
+                tracker.pending_sequences),
+            static_cast<unsigned long long>(tracker.failed_marks),
+            static_cast<unsigned long long>(detail));
     }
 
     [[nodiscard]] bool PrepareGenerationFence(
@@ -4154,6 +4348,11 @@ private:
         if (!progress.valid() ||
             !config_.processing_progress_sink
                  ->PublishProcessingProgress(progress)) {
+            ReportPipelineFailure(
+                "processing_progress_sink",
+                0U,
+                progress.accepted_sequence,
+                progress.applied_sequence);
             MarkAsyncFatal();
             return false;
         }
@@ -4328,6 +4527,18 @@ private:
         }
         if (config_.startup_replay_source == nullptr &&
             config_.startup_cancel_requested) {
+            return false;
+        }
+        if (config_.live_ingress_capture_sink != nullptr &&
+            (!config_.sdk.enabled ||
+             config_.startup_replay_source != nullptr ||
+             config_.external_ingress_enabled)) {
+            return false;
+        }
+        if (config_.external_ingress_enabled &&
+            (config_.sdk.enabled ||
+             config_.startup_replay_source != nullptr ||
+             config_.live_ingress_capture_sink != nullptr)) {
             return false;
         }
         if (!config_.sdk.enabled) {
@@ -5158,6 +5369,8 @@ private:
     std::atomic<std::uint8_t> last_callback_error_{
         static_cast<std::uint8_t>(
             RealtimePipelineIngressErrorV1::kNone)};
+    std::atomic_flag applied_sequence_failure_reported_ =
+        ATOMIC_FLAG_INIT;
     std::atomic_flag pipeline_failure_reported_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> accepting_{false};
     std::atomic<bool> fatal_{false};
@@ -5189,6 +5402,39 @@ RealtimePipelineCreateErrorV1 RealtimePipelineV1::CreateImpl(
         const RealtimePipelineCreateErrorV1 error =
             impl->Initialize(factory_is_test_override, detail);
         if (error != RealtimePipelineCreateErrorV1::kNone) {
+            const RealtimePipelineSnapshotV1 snapshot =
+                impl->Snapshot();
+            if (detail != nullptr && snapshot.fatal) {
+                *detail +=
+                    "; startup_diagnostics accepted=" +
+                    std::to_string(
+                        snapshot.processing_progress
+                            .accepted_sequence) +
+                    " applied=" +
+                    std::to_string(
+                        snapshot.processing_progress
+                            .applied_sequence) +
+                    " decoded=" +
+                    std::to_string(snapshot.decoded_messages) +
+                    " rejected=" +
+                    std::to_string(snapshot.rejected_messages) +
+                    " store_records=" +
+                    std::to_string(
+                        snapshot.store.appended_records) +
+                    " coverage_lost=" +
+                    std::string(
+                        snapshot.store.coverage_lost
+                            ? "true"
+                            : "false") +
+                    " last_decode_error=" +
+                    std::to_string(
+                        static_cast<unsigned>(
+                            snapshot.last_decode_error)) +
+                    " history_failure=" +
+                    std::string(
+                        market::RealtimeHistoryGenerationErrorNameV1(
+                            impl->history_failure_error()));
+            }
             return error;
         }
         output->reset(new RealtimePipelineV1(std::move(impl)));
@@ -5233,6 +5479,12 @@ RealtimePipelineIngressResultV1
 RealtimePipelineV1::InjectSdkMessageForTest(
     const mdl::MDLMessage* message) noexcept {
     return impl_->Ingest(message);
+}
+
+RealtimePipelineIngressResultV1
+RealtimePipelineV1::IngestExternalMessage(
+    const RealtimePipelineExternalIngressV1& input) noexcept {
+    return impl_->IngestExternal(input);
 }
 
 RealtimePipelineCutResultV1

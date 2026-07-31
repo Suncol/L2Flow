@@ -123,6 +123,7 @@ class ServerState(IntEnum):
     DRAINING = 3
     STOPPED_CLEAN = 4
     FAILED = 5
+    LIVE_PARTIAL = 6
 
 
 class Market(IntEnum):
@@ -331,8 +332,29 @@ class SessionInfo:
             raise ValueError("capacity must be nonzero")
         if self.tick_ring_capacity == 0:
             raise ValueError("tick_ring_capacity must be nonzero")
-        if self.flags & ~0x3:
+        if self.flags & ~0x7F:
             raise ValueError("flags contain an unknown Wire V2 bit")
+        if self.flags & 0x78 and not self.flags & 0x4:
+            raise ValueError(
+                "strong recovered-prefix flags require coverage_from_open"
+            )
+        if self.flags & 0x10 and not self.flags & 0x2:
+            raise ValueError(
+                "full_day_kline_valid requires KLine to be enabled"
+            )
+        server_state = ServerState(self.server_state)
+        if (
+            server_state is ServerState.ACTIVE
+            and not self.flags & (1 << 2)
+        ):
+            raise ValueError("ACTIVE requires coverage_from_open")
+        if (
+            server_state is ServerState.LIVE_PARTIAL
+            and self.flags & 0x7C
+        ):
+            raise ValueError(
+                "LIVE_PARTIAL cannot carry from-open or strong prefix flags"
+            )
         if (
             CatalogScope(self.catalog_scope)
             is not CatalogScope.DECLARED_DAILY_A_SHARE
@@ -374,7 +396,7 @@ class SessionInfo:
             self.tick_available_count,
             self.factor_eligible_count,
         )
-        object.__setattr__(self, "server_state", ServerState(self.server_state))
+        object.__setattr__(self, "server_state", server_state)
         object.__setattr__(
             self, "catalog_scope", CatalogScope(self.catalog_scope)
         )
@@ -390,6 +412,26 @@ class SessionInfo:
     @property
     def kline_enabled(self) -> bool:
         return (self.flags & 2) != 0
+
+    @property
+    def coverage_from_open(self) -> bool:
+        return (self.flags & (1 << 2)) != 0
+
+    @property
+    def startup_prefix_recovered(self) -> bool:
+        return (self.flags & (1 << 3)) != 0
+
+    @property
+    def full_day_kline_valid(self) -> bool:
+        return (self.flags & (1 << 4)) != 0
+
+    @property
+    def full_day_factor_valid(self) -> bool:
+        return (self.flags & (1 << 5)) != 0
+
+    @property
+    def certified_prefix_valid(self) -> bool:
+        return (self.flags & (1 << 6)) != 0
 
 
 @dataclass(frozen=True, slots=True)

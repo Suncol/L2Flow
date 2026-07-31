@@ -1,3 +1,0 @@
-ServiceKey,CaptureRows,BackupFile,BackupMatches,MissingRows,FieldsComparedPerMatch,DifferingRows,FieldDifferences,Result
-4.101.4,6864,/home/sunc/L2Flow/MDL/msg_backup/20260721/mdl_4_4_0.csv,6864,0,16,0,0,IDENTICAL_FOR_COMPARED_FIELDS
-6.101.28,4104,/home/sunc/L2Flow/MDL/msg_backup/20260721/mdl_6_28_0.csv,4104,0,18,0,0,IDENTICAL_FOR_COMPARED_FIELDS

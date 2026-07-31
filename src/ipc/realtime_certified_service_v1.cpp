@@ -916,7 +916,7 @@ public:
         return StartClaimedControl(system_error_number);
     }
 
-    [[nodiscard]] bool ActivateControlAfterPrefix(
+    [[nodiscard]] bool WaitForPrefixBarrier(
         std::chrono::milliseconds timeout,
         int* system_error_number) noexcept {
         SetSystemError(system_error_number, 0);
@@ -929,8 +929,9 @@ public:
             return false;
         }
         bool expected = false;
-        if (!control_started_.compare_exchange_strong(
+        if (!prefix_barrier_started_.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
+            SetSystemError(system_error_number, EALREADY);
             return false;
         }
         std::uint64_t previous =
@@ -994,7 +995,15 @@ public:
             SetSystemError(system_error_number, EIO);
             return false;
         }
-        return StartClaimedControl(system_error_number);
+        prefix_barrier_completed_.store(true, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] bool ActivateControlAfterPrefix(
+        std::chrono::milliseconds timeout,
+        int* system_error_number) noexcept {
+        return WaitForPrefixBarrier(timeout, system_error_number) &&
+               StartControl(system_error_number);
     }
 
 private:
@@ -2533,6 +2542,8 @@ private:
 
     std::atomic<bool> started_{false};
     std::atomic<bool> control_started_{false};
+    std::atomic<bool> prefix_barrier_started_{false};
+    std::atomic<bool> prefix_barrier_completed_{false};
     std::atomic<bool> accepting_{false};
     std::atomic<bool> draining_{false};
     std::atomic<bool> worker_running_{false};
@@ -2605,6 +2616,13 @@ bool RealtimeCertifiedMarketServiceV1::StartControl(
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
            impl_->StartControl(system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::WaitForPrefixBarrier(
+    std::chrono::milliseconds timeout,
+    int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->WaitForPrefixBarrier(timeout, system_error_number);
 }
 
 bool RealtimeCertifiedMarketServiceV1::

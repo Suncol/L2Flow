@@ -1,6 +1,7 @@
 #pragma once
 
 #include "l2flow/common/identity128.h"
+#include "l2flow/common/sha256.h"
 #include "l2flow/factor/realtime_factor_engine_v1.h"
 #include "l2flow/ipc/realtime_store_generation_sink_v2.h"
 #include "l2flow/market/daily_instrument_catalog_v2.h"
@@ -8,6 +9,7 @@
 #include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/realtime/contiguous_sequence_tracker_v2.h"
+#include "l2flow/realtime/ingress_capture_v1.h"
 #include "l2flow/realtime/native_sequence_observer_v1.h"
 #include "l2flow/realtime/owned_ingress_message_v1.h"
 #include "l2flow/realtime/processing_progress_v2.h"
@@ -112,6 +114,18 @@ struct RealtimePipelineConfigV1 final {
         native_sequence_observation_sink;
     std::shared_ptr<l2flow::realtime::ProcessingProgressSinkV2>
         processing_progress_sink;
+    // Optional online-recovery capture.  It is valid only for the real SDK
+    // owner and cannot be combined with the synchronous startup replay mode.
+    // The callback first copies the supported raw message into this sink and
+    // only then admits the same callback to this pipeline's partial preview.
+    // Capture failure is completeness loss and fails this pipeline closed.
+    // Null preserves the literal ordinary callback hot path.
+    std::shared_ptr<l2flow::realtime::RealtimeIngressCaptureSinkV1>
+        live_ingress_capture_sink;
+    // Enables the bounded production injection API for an SDK-less shadow
+    // owner.  It is mutually exclusive with sdk.enabled and with synchronous
+    // startup replay.  Tests should continue to use InjectSdkMessageForTest.
+    bool external_ingress_enabled = false;
     // Optional mid-session recovery source. It is valid only with the real
     // SDK path enabled and with intraday_store.coverage_from_open explicitly
     // asserted by the operator. The mere presence or successful return of an
@@ -186,6 +200,16 @@ struct RealtimePipelineConfigV1 final {
 [[nodiscard]] bool RealtimePipelineAppliedWindowCapacityV1(
     const RealtimePipelineConfigV1& config,
     std::size_t* output) noexcept;
+
+// Exact semantic fingerprint used by both the legacy buffered handoff and the
+// online journal handoff.  It excludes vendor dynamic-layout offsets and the
+// documented CSV-unavailable fields; callers must first decode through a
+// correctly configured MarketDecoderV1.  Keeping one implementation prevents
+// the two recovery modes from disagreeing about overlap equality.
+[[nodiscard]] bool RealtimePipelineStartupSemanticDigestV1(
+    const l2flow::market::DecodedMarketEventV1& event,
+    bool normalize_shenzhen_snapshot_channel,
+    l2flow::common::Sha256Digest* output) noexcept;
 
 struct RealtimeLatencyQuantileV1 final {
     // The estimate is the midpoint of the containing linear histogram bucket.
@@ -327,6 +351,10 @@ enum class RealtimePipelineIngressErrorV1 : std::uint8_t {
     // Structurally valid A-share identity missing from the declared complete
     // daily catalog. No sequence or pool slot has been committed.
     kCatalogMiss,
+    // The optional online-recovery capture could not retain a supported SDK
+    // callback.  The live preview may not advance past an unjournaled record;
+    // the complete session is failed closed.
+    kCaptureFailed,
 };
 
 [[nodiscard]] std::string_view RealtimePipelineIngressErrorNameV1(
@@ -349,6 +377,19 @@ struct RealtimePipelineIngressResultV1 final {
         return error == RealtimePipelineIngressErrorV1::kNone &&
                global_ingress_sequence != 0U && source_sequence != 0U;
     }
+};
+
+// Production injection boundary for an SDK-less shadow pipeline.  It keeps
+// the original callback receive timestamps, carries only explicitly declared
+// market notices, and may wait for bounded decoder capacity.  This API is
+// rejected unless external_ingress_enabled was set before Create().
+struct RealtimePipelineExternalIngressV1 final {
+    const datayes::mdl::MDLMessage* message = nullptr;
+    std::uint64_t recv_realtime_ns = 0U;
+    std::uint64_t recv_monotonic_ns = 0U;
+    std::uint64_t additional_market_notices = 0U;
+    std::chrono::nanoseconds admission_timeout =
+        std::chrono::seconds(30);
 };
 
 enum class RealtimePipelineCutErrorV1 : std::uint8_t {
@@ -474,6 +515,14 @@ public:
     // vendor message may be destroyed immediately after this method returns.
     [[nodiscard]] RealtimePipelineIngressResultV1 InjectSdkMessageForTest(
         const datayes::mdl::MDLMessage* message) noexcept;
+
+    // Feeds one journal/CSV record to an SDK-less shadow pipeline through the
+    // same admission, decoder, History, KLine and applied-sink path as live
+    // traffic.  Receive clocks are supplied by the journal (or by the CSV
+    // coordinator for recovered records); no current-time substitution is
+    // made.  A timeout never drops the record: it fails the shadow closed.
+    [[nodiscard]] RealtimePipelineIngressResultV1 IngestExternalMessage(
+        const RealtimePipelineExternalIngressV1& input) noexcept;
 
     // Establishes an exclusive ingress prefix, inserts one reserved-slot
     // parked fence into each decoder FIFO, snapshots availability only after

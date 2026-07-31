@@ -15,7 +15,7 @@ inline constexpr std::array<std::uint8_t, 8U> kRealtimeShmMagicV2{
 inline constexpr std::array<std::uint8_t, 8U> kRealtimeControlMagicV2{
     'L', '2', 'F', 'C', 'T', 'L', '2', '\0'};
 inline constexpr std::uint16_t kRealtimeWireMajorV2 = 2U;
-inline constexpr std::uint16_t kRealtimeWireMinorV2 = 2U;
+inline constexpr std::uint16_t kRealtimeWireMinorV2 = 3U;
 inline constexpr std::uint32_t kRealtimeLittleEndianMarkerV2 =
     0x01020304U;
 inline constexpr std::uint32_t kRealtimeDefaultInstrumentCapacityV2 =
@@ -32,24 +32,33 @@ enum class RealtimeServerStateV2 : std::uint32_t {
     kDraining = 3U,
     kStoppedClean = 4U,
     kFailed = 5U,
+    // Queryable latest-value preview whose retained prefix begins at process
+    // startup rather than market open.  History/KLine/Factor/CERTIFIED must
+    // consult the coverage flags and cannot treat this as complete ACTIVE.
+    kLivePartial = 6U,
 };
 
 enum RealtimeHeaderFlagV2 : std::uint32_t {
     kRealtimeHeaderCoverageLostV2 = 1U << 0U,
     kRealtimeHeaderKLineEnabledV2 = 1U << 1U,
+    kRealtimeHeaderCoverageFromOpenV2 = 1U << 2U,
+    kRealtimeHeaderStartupPrefixRecoveredV2 = 1U << 3U,
+    kRealtimeHeaderFullDayKLineValidV2 = 1U << 4U,
+    kRealtimeHeaderFullDayFactorValidV2 = 1U << 5U,
+    kRealtimeHeaderCertifiedPrefixValidV2 = 1U << 6U,
 };
 
-// V2.2 exposes the immutable, declared daily Shanghai+Shenzhen A-share
-// catalog. It does not claim that every exchange security is subscribed or
-// that every catalog instrument has produced data.
+// V2.3 retains the immutable, declared daily Shanghai+Shenzhen A-share
+// catalog introduced by V2.2. It does not claim that every exchange security
+// is subscribed or that every catalog instrument has produced data.
 enum class RealtimeCatalogScopeV2 : std::uint32_t {
     kDeclaredDailyAShare = 2U,
 };
 
 enum class RealtimeInstrumentBindingStateV2 : std::uint32_t {
     // Zero remains the value-initialized prepublication representation.
-    // A V2.2 ACTIVE mapping has no UNBOUND tail: every capacity row is
-    // prepublished as kBoundNoData or kAvailable.
+    // A V2.2+ ACTIVE or LIVE_PARTIAL mapping has no UNBOUND tail: every
+    // capacity row is prepublished as kBoundNoData or kAvailable.
     kUnbound = 0U,
     kBinding = 1U,
     kBoundNoData = 2U,
@@ -69,7 +78,7 @@ enum class RealtimeSelectionScopeV2 : std::uint32_t {
     kSnapshotAvailable = 3U,
     kTickAvailable = 4U,
     kFactorEligible = 5U,
-    // Source-compatibility aliases. Wire V2.2 documentation and new code use
+    // Source-compatibility aliases. Wire V2.2+ documentation and new code use
     // the catalog/availability names.
     kBound = kCatalogAll,
     kObservedAny = kAvailableAny,
@@ -134,8 +143,8 @@ struct RealtimeWireRegionDescriptorV2 final {
 static_assert(sizeof(RealtimeWireRegionDescriptorV2) == 64U);
 static_assert(std::is_standard_layout_v<RealtimeWireRegionDescriptorV2>);
 
-// In V2.2 catalog_generation is the immutable value 1 because the complete
-// capacity-sized identity table is published before ACTIVE.
+// In V2.2+ catalog_generation is the immutable value 1 because the complete
+// capacity-sized identity table is published before ACTIVE or LIVE_PARTIAL.
 // data_state_generation changes when availability or factor eligibility
 // changes. Writers serialize updates covered by status_publish_tag:
 //

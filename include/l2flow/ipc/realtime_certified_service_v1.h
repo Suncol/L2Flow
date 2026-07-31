@@ -208,9 +208,17 @@ public:
         int* system_error_number = nullptr) noexcept;
     [[nodiscard]] bool StartControl(
         int* system_error_number = nullptr) noexcept;
-    // Enqueues a FIFO worker barrier, waits until all handoffs before it have
-    // been projected and their headers committed, and only then starts the
-    // query control thread. Later live handoffs do not extend this barrier.
+    // Enqueues a FIFO worker barrier and waits until all handoffs before it
+    // have been projected and their headers committed.  It deliberately does
+    // not expose the query socket; online recovery uses this split phase so
+    // neither recovered FAST nor CERTIFIED is queryable before the barrier.
+    // Later live handoffs do not extend this fixed prefix.
+    // This is a one-shot operation.  A failed barrier cannot be retried.
+    [[nodiscard]] bool WaitForPrefixBarrier(
+        std::chrono::milliseconds timeout,
+        int* system_error_number = nullptr) noexcept;
+    // Compatibility composition: WaitForPrefixBarrier() followed by
+    // StartControl().
     // timeout must be positive and no greater than 24 hours.
     [[nodiscard]] bool ActivateControlAfterPrefix(
         std::chrono::milliseconds timeout,

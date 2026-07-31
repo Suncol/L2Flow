@@ -5,6 +5,7 @@
 /python/dist/
 /python/*.egg-info/
 /.cache/
+/.venv/
 __pycache__/
 *.py[cod]
 compile_commands.json

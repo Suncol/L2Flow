@@ -2,6 +2,34 @@ cmake_minimum_required(VERSION 3.16)
 
 project(L2Flow VERSION 1.0.0 LANGUAGES CXX)
 
+# Keep GNU builds on the production compiler major version while allowing any
+# GCC 13 minor or patch release.
+set(L2FLOW_REQUIRED_GCC_MAJOR_VERSION "13")
+message(STATUS
+    "L2Flow C++ compiler: ${CMAKE_CXX_COMPILER_ID} "
+    "${CMAKE_CXX_COMPILER_VERSION} (${CMAKE_CXX_COMPILER})")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    string(REGEX MATCH "^[0-9]+" L2FLOW_DETECTED_GCC_MAJOR_VERSION
+        "${CMAKE_CXX_COMPILER_VERSION}")
+    if(NOT L2FLOW_DETECTED_GCC_MAJOR_VERSION STREQUAL
+            L2FLOW_REQUIRED_GCC_MAJOR_VERSION)
+        message(FATAL_ERROR
+            "L2Flow GNU builds require GCC "
+            "${L2FLOW_REQUIRED_GCC_MAJOR_VERSION}.x; detected GCC "
+            "${CMAKE_CXX_COMPILER_VERSION} at ${CMAKE_CXX_COMPILER}. "
+            "Select GCC ${L2FLOW_REQUIRED_GCC_MAJOR_VERSION} with "
+            "-DCMAKE_CXX_COMPILER=/path/to/g++-13.")
+    endif()
+    message(STATUS
+        "L2Flow required GCC major version: "
+        "${L2FLOW_REQUIRED_GCC_MAJOR_VERSION}")
+else()
+    message(STATUS
+        "L2Flow GCC major-version baseline: "
+        "${L2FLOW_REQUIRED_GCC_MAJOR_VERSION} "
+        "(not enforced for ${CMAKE_CXX_COMPILER_ID})")
+endif()
+
 option(L2FLOW_BUILD_TESTS "Build the realtime production-chain tests" ON)
 option(L2MOCK_BUILD_TESTS "Build the isolated vendor mock tests" OFF)
 option(L2FLOW_BUILD_FEEDER_PROBE
@@ -152,6 +180,8 @@ target_link_libraries(l2flow_factor PUBLIC L2Flow::market)
 # Decoders drive fixed-worker History; parked all-lane fences establish exact
 # generation watermarks before whole-generation Factor publication.
 add_library(l2flow_realtime STATIC
+    src/recovery/live_journal_v1.cpp
+    src/recovery/online_recovery_v1.cpp
     src/runtime/realtime_pipeline_v1.cpp)
 add_library(L2Flow::realtime ALIAS l2flow_realtime)
 l2flow_configure_target(l2flow_realtime)
@@ -366,6 +396,10 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_realtime_pipeline_lifecycle_concurrency
         tests/test_realtime_pipeline_lifecycle_concurrency_v1.cpp
         L2Flow::realtime)
+    l2flow_add_test(test_live_journal_v1
+        tests/test_live_journal_v1.cpp L2Flow::realtime)
+    l2flow_add_test(test_online_recovery_v1
+        tests/test_online_recovery_v1.cpp L2Flow::realtime)
     l2flow_add_test(test_mdl_csv_startup_replay
         tests/test_mdl_csv_replay_v1.cpp
         L2Flow::recovery)
@@ -434,6 +468,13 @@ if(L2FLOW_BUILD_TESTS)
             COMMAND
                 test_mdl_order_event_aggregator_process_v1
                 $<TARGET_FILE:mdl_order_event_aggregator>)
+        add_test(
+            NAME test_mdl_production_router_cli_v1
+            COMMAND
+                ${CMAKE_COMMAND}
+                -DROUTER=$<TARGET_FILE:mdl_production_router>
+                -P
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mdl_production_router_cli_v1.cmake)
         l2flow_add_test(test_realtime_shm_reader_v2
             tests/test_realtime_shm_reader_v2.cpp
             l2flow_shm_reader)

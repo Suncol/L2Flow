@@ -126,7 +126,22 @@ bool StateAcceptsPublication(std::uint32_t state) noexcept {
                    RealtimeServerStateV2::kActive) ||
            state ==
                static_cast<std::uint32_t>(
-                   RealtimeServerStateV2::kDraining);
+                   RealtimeServerStateV2::kDraining) ||
+           state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV2::kLivePartial);
+}
+
+bool StateHasFullPrefix(std::uint32_t state) noexcept {
+    return state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV2::kActive) ||
+           state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV2::kDraining) ||
+           state ==
+               static_cast<std::uint32_t>(
+                   RealtimeServerStateV2::kStoppedClean);
 }
 
 template <typename Slot, typename Payload>
@@ -1815,7 +1830,16 @@ public:
                 std::chrono::milliseconds::zero() ||
             !ValidSocketPath(config_.control_socket_path) ||
             config_.kline_windows.size() >
-                market::kKLineMaximumWindowsV1) {
+                market::kKLineMaximumWindowsV1 ||
+            ((!config_.coverage_from_open) &&
+             (config_.startup_prefix_recovered ||
+              config_.full_day_kline_valid ||
+              config_.full_day_factor_valid ||
+              config_.certified_prefix_valid)) ||
+            (config_.full_day_kline_valid &&
+             config_.kline_windows.empty()) ||
+            (config_.startup_prefix_recovered &&
+             !config_.coverage_from_open)) {
             return RealtimeSharedServiceCreateErrorV2::
                 kInvalidConfiguration;
         }
@@ -2039,14 +2063,32 @@ public:
         return BindSocket(system_error_number);
     }
 
-    [[nodiscard]] bool Start(int* system_error_number) noexcept {
+    [[nodiscard]] bool Start(
+        RealtimeServerStateV2 target_state,
+        int* system_error_number) noexcept {
         SetSystemError(system_error_number, 0);
+        const bool live_partial =
+            target_state == RealtimeServerStateV2::kLivePartial;
+        const std::uint32_t strong_flags =
+            kRealtimeHeaderCoverageFromOpenV2 |
+            kRealtimeHeaderStartupPrefixRecoveredV2 |
+            kRealtimeHeaderFullDayKLineValidV2 |
+            kRealtimeHeaderFullDayFactorValidV2 |
+            kRealtimeHeaderCertifiedPrefixValidV2;
         if (header_ == nullptr || listener_fd_ < 0 ||
             stop_event_fd_ < 0 || prefix_event_fd_ < 0 ||
             control_thread_.joinable() ||
             control_stop_requested_.load(std::memory_order_acquire) ||
+            (target_state != RealtimeServerStateV2::kActive &&
+             !live_partial) ||
             (Atomic(header_->flags).load(std::memory_order_acquire) &
-             kRealtimeHeaderCoverageLostV2) != 0U) {
+             kRealtimeHeaderCoverageLostV2) != 0U ||
+            (!live_partial &&
+             (Atomic(header_->flags).load(std::memory_order_acquire) &
+              kRealtimeHeaderCoverageFromOpenV2) == 0U) ||
+            (live_partial &&
+             (Atomic(header_->flags).load(std::memory_order_acquire) &
+              strong_flags) != 0U)) {
             SetSystemError(system_error_number, EINVAL);
             return false;
         }
@@ -2056,8 +2098,7 @@ public:
         if (!Atomic(header_->server_state)
                  .compare_exchange_strong(
                      expected,
-                     static_cast<std::uint32_t>(
-                         RealtimeServerStateV2::kActive),
+                     static_cast<std::uint32_t>(target_state),
                      std::memory_order_release,
                      std::memory_order_acquire)) {
             SetSystemError(system_error_number, EINVAL);
@@ -2178,12 +2219,22 @@ public:
             !StateAcceptsPublication(
                 Atomic(header_->server_state)
                     .load(std::memory_order_acquire))) {
+            ReportFailure(
+                "processing_progress_precondition",
+                0U,
+                0U,
+                progress.accepted_sequence);
             MarkCoverageLost();
             return false;
         }
         std::uint64_t stable = 0U;
         if (!AcquireSeqcount(
                 &header_->status_publish_tag, &stable, false)) {
+            ReportFailure(
+                "processing_progress_seqcount",
+                0U,
+                0U,
+                progress.accepted_sequence);
             MarkCoverageLost();
             return false;
         }
@@ -2207,6 +2258,11 @@ public:
         }
         ReleaseSeqcount(&header_->status_publish_tag, stable);
         if (!coherent) {
+            ReportFailure(
+                "processing_progress_incoherent",
+                0U,
+                0U,
+                progress.accepted_sequence);
             MarkCoverageLost();
         }
         return coherent;
@@ -2603,17 +2659,50 @@ public:
         if (header_ == nullptr) {
             return;
         }
-        std::uint32_t expected =
-            static_cast<std::uint32_t>(
-                RealtimeServerStateV2::kActive);
-        static_cast<void>(
+        std::uint32_t current =
             Atomic(header_->server_state)
-                .compare_exchange_strong(
-                    expected,
+                .load(std::memory_order_acquire);
+        while ((current ==
                     static_cast<std::uint32_t>(
-                        RealtimeServerStateV2::kDraining),
-                    std::memory_order_release,
-                    std::memory_order_acquire));
+                        RealtimeServerStateV2::kActive) ||
+                current ==
+                    static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kLivePartial)) &&
+               !Atomic(header_->server_state)
+                    .compare_exchange_weak(
+                        current,
+                        static_cast<std::uint32_t>(
+                            RealtimeServerStateV2::kDraining),
+                        std::memory_order_release,
+                        std::memory_order_acquire)) {
+        }
+    }
+
+    [[nodiscard]] bool MarkCertifiedPrefixValid() noexcept {
+        if (header_ == nullptr ||
+            Atomic(header_->server_state)
+                    .load(std::memory_order_acquire) !=
+                static_cast<std::uint32_t>(
+                    RealtimeServerStateV2::kActive)) {
+            return false;
+        }
+        // A normal process that genuinely captured from market open has no
+        // startup-recovery prefix flag, yet its CERTIFIED prefix can still be
+        // complete.  coverage_from_open is the common prerequisite for both
+        // live-from-open and recovered sessions.
+        const std::uint32_t required =
+            kRealtimeHeaderCoverageFromOpenV2;
+        const std::uint32_t flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        if ((flags & kRealtimeHeaderCoverageLostV2) != 0U ||
+            (flags & required) != required) {
+            return false;
+        }
+        Atomic(header_->flags)
+            .fetch_or(
+                kRealtimeHeaderCertifiedPrefixValidV2,
+                std::memory_order_release);
+        return !failed();
     }
 
     [[nodiscard]] bool MarkStoppedClean(
@@ -2673,6 +2762,9 @@ public:
                 state ==
                     static_cast<std::uint32_t>(
                         RealtimeServerStateV2::kActive) ||
+                state ==
+                    static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kLivePartial) ||
                 state ==
                     static_cast<std::uint32_t>(
                         RealtimeServerStateV2::kDraining)) {
@@ -3307,10 +3399,27 @@ private:
         }
         header_->session_epoch = config_.session_epoch;
         header_->trade_date = config_.trade_date;
-        header_->flags =
-            config_.kline_windows.empty()
-                ? 0U
-                : kRealtimeHeaderKLineEnabledV2;
+        header_->flags = 0U;
+        if (!config_.kline_windows.empty()) {
+            header_->flags |= kRealtimeHeaderKLineEnabledV2;
+        }
+        if (config_.coverage_from_open) {
+            header_->flags |= kRealtimeHeaderCoverageFromOpenV2;
+        }
+        if (config_.startup_prefix_recovered) {
+            header_->flags |=
+                kRealtimeHeaderStartupPrefixRecoveredV2;
+        }
+        if (config_.full_day_kline_valid) {
+            header_->flags |= kRealtimeHeaderFullDayKLineValidV2;
+        }
+        if (config_.full_day_factor_valid) {
+            header_->flags |= kRealtimeHeaderFullDayFactorValidV2;
+        }
+        if (config_.certified_prefix_valid) {
+            header_->flags |=
+                kRealtimeHeaderCertifiedPrefixValidV2;
+        }
         header_->capacity =
             static_cast<std::uint32_t>(
                 config_.daily_catalog->instrument_count());
@@ -3947,7 +4056,13 @@ private:
                 config_.maximum_history_page_records) {
             status = RealtimeHistoryControlStatusV2::
                 kResourceExhausted;
-        } else if (failed()) {
+        } else if (
+            !StateHasFullPrefix(
+                Atomic(header_->server_state)
+                    .load(std::memory_order_acquire)) ||
+            (Atomic(header_->flags).load(std::memory_order_acquire) &
+             kRealtimeHeaderCoverageFromOpenV2) == 0U ||
+            failed()) {
             status =
                 RealtimeHistoryControlStatusV2::kUnavailable;
         }
@@ -4513,7 +4628,13 @@ private:
             status =
                 RealtimeInstrumentTickDeltaControlStatusV2::
                     kUnsupportedVersion;
-        } else if (failed()) {
+        } else if (
+            !StateHasFullPrefix(
+                Atomic(header_->server_state)
+                    .load(std::memory_order_acquire)) ||
+            (Atomic(header_->flags).load(std::memory_order_acquire) &
+             kRealtimeHeaderCoverageFromOpenV2) == 0U ||
+            failed()) {
             status =
                 RealtimeInstrumentTickDeltaControlStatusV2::
                     kUnavailable;
@@ -5203,7 +5324,17 @@ RealtimeSharedMarketServiceV2::Create(
 bool RealtimeSharedMarketServiceV2::Start(
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
-           impl_->Start(system_error_number);
+           impl_->Start(
+               RealtimeServerStateV2::kActive,
+               system_error_number);
+}
+
+bool RealtimeSharedMarketServiceV2::StartLivePartial(
+    int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->Start(
+               RealtimeServerStateV2::kLivePartial,
+               system_error_number);
 }
 
 bool RealtimeSharedMarketServiceV2::PublishApplied(
@@ -5243,6 +5374,10 @@ void RealtimeSharedMarketServiceV2::MarkDraining() noexcept {
     if (impl_ != nullptr) {
         impl_->MarkDraining();
     }
+}
+
+bool RealtimeSharedMarketServiceV2::MarkCertifiedPrefixValid() noexcept {
+    return impl_ != nullptr && impl_->MarkCertifiedPrefixValid();
 }
 
 bool RealtimeSharedMarketServiceV2::MarkStoppedClean(

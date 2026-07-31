@@ -29,7 +29,7 @@ enum class OrderEventDeltaControlStatusV1 : std::uint16_t {
 };
 
 // Protocol V1.1 carries the complete immutable daily-catalog identity of the
-// upstream Wire V2.2 source. This prevents a retained event-control socket
+// upstream Wire V2.2+ source. This prevents a retained event-control socket
 // path from silently rebinding to another catalog within the same nominal
 // run, epoch, or trading day.
 struct OrderEventDeltaSourceSessionWireV1 final {

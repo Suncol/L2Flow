@@ -1459,9 +1459,18 @@ public:
         HistoryHandoffPool::Slot* slot,
         const InstrumentRouteTokenV1& route) noexcept {
         if (slot == nullptr || !slot->engaged) {
+            ReportAppendFailure(
+                "handoff_slot",
+                worker,
+                source,
+                route,
+                0U,
+                slot == nullptr ? 0U : 1U);
             return false;
         }
         RealtimeHistoryEventInputV1* const input = slot->Input();
+        const std::uint64_t ingress_sequence =
+            input->ingress_sequence();
         KLineTradeV1 kline_trade{};
         KLineTradeProjectionV1 kline_projection =
             KLineTradeProjectionV1::kNotTrade;
@@ -1546,11 +1555,25 @@ public:
         const bool released =
             HandoffPool(source, worker).ReleaseFromConsumer(slot);
         if (!released) {
+            ReportAppendFailure(
+                "handoff_release",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                0U);
             MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
             return false;
         }
         if (error != IntradayInstrumentStoreAppendErrorV1::kNone) {
+            ReportAppendFailure(
+                "store_append",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                static_cast<std::uint64_t>(error));
             MarkStoreCoverageLost();
             store_failed_.store(true, std::memory_order_release);
             return false;
@@ -1559,6 +1582,13 @@ public:
             return false;
         }
         if (appended_record == nullptr || latest_read_model_ == nullptr) {
+            ReportAppendFailure(
+                "latest_precondition",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                appended_record == nullptr ? 0U : 1U);
             MarkLatestCoverageLost();
             return false;
         }
@@ -1566,6 +1596,13 @@ public:
             latest_read_model_->PublishApplied(
                 route.ordinal, appended_record);
         if (latest_error != RealtimeLatestPublishErrorV1::kNone) {
+            ReportAppendFailure(
+                "latest_publish",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                static_cast<std::uint64_t>(latest_error));
             // A publish failure violates the required live-read projection.
             // Fail the projection closed before returning; WorkerLoop then
             // transitions the complete History/Store chain to fatal.
@@ -1602,6 +1639,13 @@ public:
             config_.append_observer(
                 config_.append_observer_context, observation);
             if (!exact_record_read) {
+                ReportAppendFailure(
+                    "latest_readback",
+                    worker,
+                    source,
+                    route,
+                    ingress_sequence,
+                    static_cast<std::uint64_t>(read_error));
                 MarkLatestCoverageLost();
                 return false;
             }
@@ -1618,6 +1662,13 @@ public:
         if (config_.applied_record_sink != nullptr) {
             if (!config_.applied_record_sink->PublishApplied(
                     route.ordinal, *appended_record)) {
+                ReportAppendFailure(
+                    "applied_record_sink",
+                    worker,
+                    source,
+                    route,
+                    ingress_sequence,
+                    0U);
                 MarkLatestCoverageLost();
                 return false;
             }
@@ -1631,6 +1682,13 @@ public:
             }
         }
         if (config_.runtime_state == nullptr) {
+            ReportAppendFailure(
+                "runtime_state_null",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                0U);
             MarkLatestCoverageLost();
             return false;
         }
@@ -1638,21 +1696,40 @@ public:
             IsSnapshotEventKindV1(appended_record->kind())
                 ? InstrumentRuntimeDataKindV2::kSnapshot
                 : InstrumentRuntimeDataKindV2::kTick;
-        if (config_.runtime_state->MarkApplied(
+        const InstrumentRuntimeStateErrorV2 mark_applied_error =
+            config_.runtime_state->MarkApplied(
                 route.ordinal,
                 appended_record->instrument_id(),
                 data_kind,
-                appended_record->ingress_sequence()) !=
+                appended_record->ingress_sequence());
+        if (mark_applied_error !=
             InstrumentRuntimeStateErrorV2::kNone) {
+            ReportAppendFailure(
+                "runtime_mark_applied",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                static_cast<std::uint64_t>(mark_applied_error));
             MarkLatestCoverageLost();
             return false;
         }
-        if (data_kind == InstrumentRuntimeDataKindV2::kSnapshot &&
-            config_.runtime_state->SetFactorEligible(
+        const InstrumentRuntimeStateErrorV2 factor_eligible_error =
+            data_kind == InstrumentRuntimeDataKindV2::kSnapshot
+                ? config_.runtime_state->SetFactorEligible(
                 route.ordinal,
                 appended_record->instrument_id(),
-                SnapshotFactorEligible(*appended_record)) !=
-                InstrumentRuntimeStateErrorV2::kNone) {
+                SnapshotFactorEligible(*appended_record))
+                : InstrumentRuntimeStateErrorV2::kNone;
+        if (factor_eligible_error !=
+            InstrumentRuntimeStateErrorV2::kNone) {
+            ReportAppendFailure(
+                "runtime_factor_eligible",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                static_cast<std::uint64_t>(factor_eligible_error));
             MarkLatestCoverageLost();
             return false;
         }
@@ -1667,10 +1744,42 @@ public:
             !config_.applied_observer(
                 config_.applied_observer_context,
                 applied_observation)) {
+            ReportAppendFailure(
+                "applied_observer",
+                worker,
+                source,
+                route,
+                ingress_sequence,
+                0U);
             MarkLatestCoverageLost();
             return false;
         }
         return true;
+    }
+
+    void ReportAppendFailure(
+        const char* reason,
+        std::uint32_t worker,
+        std::uint8_t source,
+        const InstrumentRouteTokenV1& route,
+        std::uint64_t ingress_sequence,
+        std::uint64_t detail) noexcept {
+        if (append_failure_reported_.test_and_set(
+                std::memory_order_relaxed)) {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "l2flow-history: first append failure reason=%s "
+            "worker=%u source_slot=%u ordinal=%zu instrument_id=%u "
+            "ingress_sequence=%llu detail=%llu\n",
+            reason == nullptr ? "unknown" : reason,
+            worker,
+            static_cast<unsigned>(source),
+            route.ordinal,
+            route.instrument_id,
+            static_cast<unsigned long long>(ingress_sequence),
+            static_cast<unsigned long long>(detail));
     }
 
     void ReportInvalidKLineProjection(
@@ -2201,6 +2310,7 @@ public:
     std::atomic<bool> fatal_{false};
     std::atomic<bool> store_failed_{false};
     std::atomic<bool> kline_failed_{false};
+    std::atomic_flag append_failure_reported_ = ATOMIC_FLAG_INIT;
     std::atomic_flag kline_failure_reported_ = ATOMIC_FLAG_INIT;
     std::array<SourceOwnerState, kRealtimeHistorySourceCountV1>
         source_owner_states_{};

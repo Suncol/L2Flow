@@ -45,12 +45,18 @@ message 6.101.33 与 6.101.36 共享同一个 sequence domain
 没有使用 `MDLMessageHead::SequenceID`、接收时间或本地时间来证明交易所
 连续性。参考文档也没有给出可安全推断的“重连后 replay 已完成”、序号自动
 重置或 correction window 协议，因此实现不会根据超时或序号回退猜测新
-epoch。生产运行要求从 `--intraday-store-from-open` 与
-`--intraday-recovery-csv-dir` 中恰选一个 coverage source。两者都会重建一个
+epoch。需要完整 FAST/CERTIFIED 前缀的生产运行要求从
+`--intraday-store-from-open` 与 `--intraday-recovery-csv-dir` 中选择一个
+coverage source。两者都会重建一个
 fresh session，所以原生 domain 的期望原点仍固定为 1：前者直接观察从开盘
 开始的实时消息，后者把同日从开盘保存的 CSV 先送入同一投影 worker，再以
 闭合的 live handoff 接管。任意晚于开盘的可信 checkpoint、上次进程状态或
 ring overrun catch-up 仍不在本协议范围内。
+
+`--intraday-live-partial` 是第三种 startup mode，但不是 coverage source：它
+只服务进程启动后的 latest 数据，自动禁用 CERTIFIED sidecar，并始终保持
+`certified_prefix_valid=false`。它不能用启动后的 native sequence 片段伪造
+从开盘完整的 CERTIFIED 前缀。
 
 不同 channel 之间没有文档定义的交易所总序。本实现的
 `canonical_apply_sequence` 只是本进程对多个已就绪 channel 的确定性发布

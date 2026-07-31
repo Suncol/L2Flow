@@ -188,11 +188,16 @@ Store generation 则由生产应用在每次 Pipeline cut 成功后显式传给 
 
 生产入口位于 [`apps/mdl_production_main.cpp`](../apps/mdl_production_main.cpp)。启动顺序本身就是正确性约束：
 
-`--intraday-store-from-open` 与 `--intraday-recovery-csv-dir` 的控制面
-激活点不同：常规模式在创建 Pipeline 前已经启动 FAST 控制线程；CSV 恢复
+`--intraday-store-from-open`、`--intraday-recovery-csv-dir` 与
+`--intraday-live-partial` 的控制面激活点不同：常规 from-open 模式在创建
+Pipeline 前已经启动 FAST 控制线程；CSV 恢复
 模式则让 FAST 保持 INITIALIZING，SDK 先进入有界 callback buffer，完成 CSV
 回放与闭合接管并发布首个 Store/KLine generation 后才进入 ACTIVE。详见
 [`csv-startup-recovery-v1.md`](csv-startup-recovery-v1.md)。
+
+盘中明确不恢复时，partial 模式在连接 SDK 前以 `LIVE_PARTIAL` 启动控制面，
+只允许 latest 查询。它不创建 startup buffer/journal/shadow，也不宣称
+`coverage_from_open`，History/delta/KLine/CERTIFIED 均不可用。
 
 ```mermaid
 sequenceDiagram
@@ -1071,7 +1076,7 @@ V2 一个 session 可以顺序打开多个 instrument cursor，但在 session �
 
 | 字段 | 它实际声明什么 | 它不声明什么 |
 | --- | --- | --- |
-| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 通过闭合 live handoff 恢复成功。生产入口通过 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 二选一明确设置，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
+| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 通过闭合 live handoff 恢复成功。生产入口只有在 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 模式设置它；`--intraday-live-partial` 明确保持 false，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
 | `record_coverage_complete` | generation 是本进程已接受记录的完整 cut 前缀；对 V1 是该 instrument 四路 Store 记录，对 V2 是该 instrument 在所选 source 1/3 与半开区间内的 tick | 进程覆盖了开盘；上游 feed 完整；payload 字段无损 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | 是否读到了所有 record |
 

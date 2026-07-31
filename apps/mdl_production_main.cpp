@@ -10,9 +10,12 @@
 #include "l2flow/market/daily_instrument_catalog_loader_v2.h"
 #include "l2flow/market/instrument_runtime_state_v2.h"
 #include "l2flow/recovery/startup_replay_v1.h"
+#include "l2flow/recovery/live_journal_v1.h"
+#include "l2flow/recovery/online_recovery_v1.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -24,6 +27,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
@@ -136,6 +140,10 @@ IntervalWaitResult WaitForInterval(
 }
 
 struct Options final {
+    enum class IntradayRecoveryMode : std::uint8_t {
+        kBlocking = 0U,
+        kOnline,
+    };
     std::filesystem::path sdk_library;
     std::uint64_t session_epoch = 0U;
     std::uint32_t trade_date = 0U;
@@ -153,7 +161,23 @@ struct Options final {
     std::uint32_t intraday_store_segment_kib = 64U;
     std::uint32_t intraday_store_batch_records = 64U * 1024U;
     bool intraday_store_from_open = false;
+    // Explicit process-start-only service for a mid-session launch that does
+    // not reconstruct the market-open prefix.  This is intentionally not a
+    // coverage source and may expose only LIVE_PARTIAL latest-value reads.
+    bool intraday_live_partial = false;
     std::filesystem::path intraday_recovery_csv_dir;
+    IntradayRecoveryMode intraday_recovery_mode =
+        IntradayRecoveryMode::kBlocking;
+    bool intraday_recovery_mode_set = false;
+    std::filesystem::path intraday_recovery_journal_dir;
+    std::filesystem::path live_preview_ipc_socket;
+    std::uint64_t intraday_recovery_journal_maximum_bytes =
+        512ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::uint64_t intraday_recovery_journal_segment_bytes =
+        256ULL * 1024ULL * 1024ULL;
+    std::uint64_t intraday_recovery_journal_queue_records = 65'536U;
+    std::uint32_t
+        intraday_recovery_certified_high_watermark_percent = 75U;
     std::uint64_t intraday_recovery_live_buffer_messages = 262'144U;
     std::uint64_t intraday_recovery_live_buffer_bytes =
         512ULL * 1024ULL * 1024ULL;
@@ -162,6 +186,8 @@ struct Options final {
     bool intraday_store_maximum_records_set = false;
     bool intraday_store_memory_set = false;
     bool intraday_recovery_tuning_set = false;
+    bool intraday_recovery_buffer_tuning_set = false;
+    bool intraday_recovery_online_tuning_set = false;
 
     // Each duration in milliseconds is also its stable public window_id.
     std::vector<std::uint32_t> kline_windows_ms;
@@ -196,16 +222,36 @@ void PrintUsage(std::ostream& output) {
         << "  --catalog-version N           positive u64 source version\n"
         << "  --server-address HOST:PORT    vendor endpoint\n"
         << "  --user-name VALUE             nonempty vendor user/token field\n"
-        << "  --ipc-socket PATH             absolute GET_SESSION UDS path\n"
+        << "  --ipc-socket PATH             absolute GET_SESSION UDS path; "
+           "recovered FAST online or standalone partial endpoint\n"
         << "  --intraday-store-max-records N\n"
         << "                                positive u64 session record cap\n"
         << "  --intraday-store-memory-gib N positive u64 logical total GiB cap\n"
-        << "  exactly one coverage source:\n"
+        << "  exactly one startup mode:\n"
         << "    --intraday-store-from-open  assert this process captured "
            "from market open\n"
         << "    --intraday-recovery-csv-dir PATH\n"
         << "                                absolute same-day vendor CSV "
            "directory complete from open\n"
+        << "    --intraday-live-partial    mid-session latest-only service; "
+           "no recovery or from-open claim\n"
+        << "  optional CSV recovery mode:\n"
+        << "    --intraday-recovery-mode MODE\n"
+        << "                                blocking (default) or online\n"
+        << "  online recovery additionally requires:\n"
+        << "    --live-preview-ipc-socket PATH\n"
+        << "                                LIVE_PARTIAL latest-value socket\n"
+        << "    --intraday-recovery-journal-dir PATH\n"
+        << "                                empty local append-only WAL directory\n"
+        << "  optional online recovery tuning:\n"
+        << "    --intraday-recovery-journal-max-gib N\n"
+        << "                                positive u64, default 512\n"
+        << "    --intraday-recovery-journal-segment-mib N\n"
+        << "                                1..4096, default 256\n"
+        << "    --intraday-recovery-journal-queue-records N\n"
+        << "                                1..4194304, default 65536\n"
+        << "    --intraday-recovery-certified-high-watermark-percent N\n"
+        << "                                51..89, default 75 (pause is 90)\n"
         << "Optional:\n"
         << "  --intraday-recovery-live-buffer-messages N\n"
         << "                                positive u64, default 262144\n"
@@ -401,6 +447,14 @@ bool ParseOptions(
             parsed.intraday_store_from_open = true;
             continue;
         }
+        if (option == "--intraday-live-partial") {
+            if (!seen.insert(option).second) {
+                *error = "duplicate option: " + std::string(option);
+                return false;
+            }
+            parsed.intraday_live_partial = true;
+            continue;
+        }
         if (option == "--disable-native-gap-recovery") {
             if (!seen.insert(option).second) {
                 *error = "duplicate option: " + std::string(option);
@@ -427,6 +481,13 @@ bool ParseOptions(
             option != "--intraday-store-segment-kib" &&
             option != "--intraday-store-batch-records" &&
             option != "--intraday-recovery-csv-dir" &&
+            option != "--intraday-recovery-mode" &&
+            option != "--intraday-recovery-journal-dir" &&
+            option != "--intraday-recovery-journal-max-gib" &&
+            option != "--intraday-recovery-journal-segment-mib" &&
+            option != "--intraday-recovery-journal-queue-records" &&
+            option !=
+                "--intraday-recovery-certified-high-watermark-percent" &&
             option != "--intraday-recovery-live-buffer-messages" &&
             option != "--intraday-recovery-live-buffer-mib" &&
             option != "--intraday-recovery-warmup-seconds" &&
@@ -435,6 +496,7 @@ bool ParseOptions(
             option != "--generation-interval-ms" &&
             option != "--generation-timeout-ms" &&
             option != "--ipc-socket" &&
+            option != "--live-preview-ipc-socket" &&
             option != "--event-aggregator-socket" &&
             option != "--event-aggregator-ready-timeout-ms" &&
             option != "--ipc-tick-ring-records" &&
@@ -586,6 +648,91 @@ bool ParseOptions(
         } else if (option == "--intraday-recovery-csv-dir") {
             parsed.intraday_recovery_csv_dir =
                 std::string(value);
+        } else if (option == "--intraday-recovery-mode") {
+            if (value == "blocking") {
+                parsed.intraday_recovery_mode =
+                    Options::IntradayRecoveryMode::kBlocking;
+            } else if (value == "online") {
+                parsed.intraday_recovery_mode =
+                    Options::IntradayRecoveryMode::kOnline;
+            } else {
+                *error =
+                    "--intraday-recovery-mode must be blocking or online";
+                return false;
+            }
+            parsed.intraday_recovery_mode_set = true;
+        } else if (option == "--intraday-recovery-journal-dir") {
+            parsed.intraday_recovery_journal_dir =
+                std::string(value);
+            parsed.intraday_recovery_online_tuning_set = true;
+        } else if (
+            option == "--intraday-recovery-journal-max-gib") {
+            constexpr std::uint64_t bytes_per_gib =
+                std::uint64_t{1024U} * 1024U * 1024U;
+            if (!ParsePositiveScaledBytes(
+                    value,
+                    bytes_per_gib,
+                    &parsed
+                         .intraday_recovery_journal_maximum_bytes)) {
+                *error =
+                    "--intraday-recovery-journal-max-gib must be a "
+                    "positive u64 whose byte conversion does not overflow";
+                return false;
+            }
+            parsed.intraday_recovery_online_tuning_set = true;
+        } else if (
+            option == "--intraday-recovery-journal-segment-mib") {
+            constexpr std::uint64_t bytes_per_mib =
+                std::uint64_t{1024U} * 1024U;
+            if (!ParsePositiveScaledBytes(
+                    value,
+                    bytes_per_mib,
+                    &parsed
+                         .intraday_recovery_journal_segment_bytes) ||
+                parsed.intraday_recovery_journal_segment_bytes <
+                    recovery::kLiveJournalMinimumSegmentBytesV1 ||
+                parsed.intraday_recovery_journal_segment_bytes >
+                    recovery::kLiveJournalMaximumSegmentBytesV1) {
+                *error =
+                    "--intraday-recovery-journal-segment-mib must be "
+                    "1..4096";
+                return false;
+            }
+            parsed.intraday_recovery_online_tuning_set = true;
+        } else if (
+            option == "--intraday-recovery-journal-queue-records") {
+            if (!ParseU64(
+                    value,
+                    &parsed
+                         .intraday_recovery_journal_queue_records) ||
+                parsed.intraday_recovery_journal_queue_records == 0U ||
+                parsed.intraday_recovery_journal_queue_records >
+                    recovery::kLiveJournalMaximumQueueRecordsV1) {
+                *error =
+                    "--intraday-recovery-journal-queue-records must be "
+                    "1..4194304";
+                return false;
+            }
+            parsed.intraday_recovery_online_tuning_set = true;
+        } else if (
+            option ==
+            "--intraday-recovery-certified-high-watermark-percent") {
+            if (!ParseU32(
+                    value,
+                    &parsed
+                         .intraday_recovery_certified_high_watermark_percent) ||
+                parsed
+                        .intraday_recovery_certified_high_watermark_percent <
+                    51U ||
+                parsed
+                        .intraday_recovery_certified_high_watermark_percent >
+                    89U) {
+                *error =
+                    "--intraday-recovery-certified-high-watermark-percent "
+                    "must be 51..89";
+                return false;
+            }
+            parsed.intraday_recovery_online_tuning_set = true;
         } else if (
             option ==
             "--intraday-recovery-live-buffer-messages") {
@@ -603,6 +750,7 @@ bool ParseOptions(
                 return false;
             }
             parsed.intraday_recovery_tuning_set = true;
+            parsed.intraday_recovery_buffer_tuning_set = true;
         } else if (
             option == "--intraday-recovery-live-buffer-mib") {
             constexpr std::uint64_t bytes_per_mib =
@@ -619,6 +767,7 @@ bool ParseOptions(
                 return false;
             }
             parsed.intraday_recovery_tuning_set = true;
+            parsed.intraday_recovery_buffer_tuning_set = true;
         } else if (
             option == "--intraday-recovery-warmup-seconds") {
             if (!ParseU32(
@@ -678,6 +827,8 @@ bool ParseOptions(
             }
         } else if (option == "--ipc-socket") {
             parsed.ipc_socket = std::string(value);
+        } else if (option == "--live-preview-ipc-socket") {
+            parsed.live_preview_ipc_socket = std::string(value);
         } else if (option == "--event-aggregator-socket") {
             parsed.event_aggregator_socket = std::string(value);
         } else if (
@@ -756,11 +907,66 @@ bool ParseOptions(
             "--intraday-recovery-csv-dir must be an absolute path";
         return false;
     }
+    if (!parsed.intraday_recovery_journal_dir.empty() &&
+        !parsed.intraday_recovery_journal_dir.is_absolute()) {
+        *error =
+            "--intraday-recovery-journal-dir must be an absolute path";
+        return false;
+    }
+    if (!parsed.live_preview_ipc_socket.empty() &&
+        !parsed.live_preview_ipc_socket.is_absolute()) {
+        *error = "--live-preview-ipc-socket must be an absolute path";
+        return false;
+    }
     if (!parsed.event_aggregator_socket.empty() &&
         !parsed.event_aggregator_socket.is_absolute()) {
         *error =
             "--event-aggregator-socket must be an absolute path";
         return false;
+    }
+    const bool csv_recovery =
+        !parsed.intraday_recovery_csv_dir.empty();
+    const bool online_recovery =
+        csv_recovery &&
+        parsed.intraday_recovery_mode ==
+            Options::IntradayRecoveryMode::kOnline;
+    const unsigned int startup_mode_count =
+        static_cast<unsigned int>(parsed.intraday_store_from_open) +
+        static_cast<unsigned int>(csv_recovery) +
+        static_cast<unsigned int>(parsed.intraday_live_partial);
+    if (startup_mode_count != 1U) {
+        *error =
+            "production requires exactly one of "
+            "--intraday-store-from-open, "
+            "--intraday-recovery-csv-dir, or "
+            "--intraday-live-partial";
+        return false;
+    }
+    if (parsed.intraday_live_partial) {
+        if (!parsed.event_aggregator_socket.empty()) {
+            *error =
+                "--intraday-live-partial cannot use "
+                "--event-aggregator-socket because that service has no "
+                "process-start partial-coverage contract";
+            return false;
+        }
+        if (!parsed.kline_windows_ms.empty()) {
+            *error =
+                "--intraday-live-partial cannot publish full-day KLine; "
+                "omit --kline-windows-ms";
+            return false;
+        }
+        if (parsed.certified_ipc_socket_set) {
+            *error =
+                "--intraday-live-partial does not expose CERTIFIED; "
+                "omit --certified-ipc-socket";
+            return false;
+        }
+        // A process-start fragment cannot establish the native sequence
+        // prefix from market open.  Keep the public contract unambiguous by
+        // disabling the default sidecar for this explicit partial mode.
+        parsed.native_gap_recovery_enabled = false;
+        parsed.certified_ipc_socket.clear();
     }
     if (parsed.certified_ipc_socket_set &&
         !parsed.native_gap_recovery_enabled) {
@@ -802,21 +1008,62 @@ bool ParseOptions(
             "--intraday-store-max-records and --intraday-store-memory-gib";
         return false;
     }
-    const bool csv_recovery =
-        !parsed.intraday_recovery_csv_dir.empty();
-    if (parsed.intraday_store_from_open == csv_recovery) {
-        *error =
-            "production requires exactly one of "
-            "--intraday-store-from-open or "
-            "--intraday-recovery-csv-dir";
-        return false;
-    }
     if (csv_recovery &&
         !parsed.event_aggregator_socket.empty()) {
         *error =
             "--intraday-recovery-csv-dir cannot be combined with "
             "--event-aggregator-socket: the external aggregator has "
             "no pre-ACTIVE full-replay handoff";
+        return false;
+    }
+    if (!csv_recovery && parsed.intraday_recovery_mode_set) {
+        *error =
+            "--intraday-recovery-mode requires "
+            "--intraday-recovery-csv-dir";
+        return false;
+    }
+    if (online_recovery) {
+        if (parsed.intraday_recovery_journal_dir.empty() ||
+            parsed.live_preview_ipc_socket.empty()) {
+            *error =
+                "online recovery requires "
+                "--intraday-recovery-journal-dir and "
+                "--live-preview-ipc-socket";
+            return false;
+        }
+        if (parsed.intraday_recovery_buffer_tuning_set) {
+            *error =
+                "online recovery does not use --intraday-recovery-live-"
+                "buffer-*; configure the bounded journal queue instead";
+            return false;
+        }
+        if (parsed.intraday_recovery_journal_segment_bytes >
+            parsed.intraday_recovery_journal_maximum_bytes) {
+            *error =
+                "journal segment size must not exceed journal capacity";
+            return false;
+        }
+        if (parsed.intraday_recovery_journal_dir.lexically_normal() ==
+            parsed.intraday_recovery_csv_dir.lexically_normal()) {
+            *error =
+                "--intraday-recovery-journal-dir must be distinct from "
+                "the immutable CSV directory";
+            return false;
+        }
+        if (parsed.live_preview_ipc_socket == parsed.ipc_socket ||
+            (parsed.native_gap_recovery_enabled &&
+             parsed.live_preview_ipc_socket ==
+                 parsed.certified_ipc_socket)) {
+            *error =
+                "--live-preview-ipc-socket must be distinct from recovered "
+                "and CERTIFIED sockets";
+            return false;
+        }
+    } else if (parsed.intraday_recovery_online_tuning_set ||
+               !parsed.live_preview_ipc_socket.empty()) {
+        *error =
+            "journal/live-preview options require "
+            "--intraday-recovery-mode online";
         return false;
     }
     if (!csv_recovery &&
@@ -1041,6 +1288,1168 @@ bool WaitForEventAggregatorReady(
     }
 }
 
+struct OnlineRunState final {
+    void Fail(std::string value) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (detail.empty()) {
+                detail = std::move(value);
+            }
+        } catch (...) {
+        }
+        failed.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] std::string Detail() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return detail;
+    }
+
+    std::atomic<bool> promoted{false};
+    std::atomic<bool> failed{false};
+    std::atomic<bool> abort_requested{false};
+    std::atomic<bool> recovery_thread_finished{false};
+    // Serializes the final control-plane exposure with shutdown's decision to
+    // cancel an unpromoted rebuild.  CSV replay and journal catch-up never
+    // take this mutex.
+    std::mutex promotion_mutex;
+    mutable std::mutex mutex;
+    std::string detail;
+};
+
+bool CurrentRealtimeNs(std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    const auto count =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    if (count <= 0) {
+        return false;
+    }
+    *output = static_cast<std::uint64_t>(count);
+    return true;
+}
+
+runtime::RealtimePipelineConfigV1 BuildOnlinePipelineBase(
+    const Options& options,
+    const common::Identity128& run_id,
+    const std::shared_ptr<const market::DailyInstrumentCatalogV2>&
+        daily_catalog,
+    market::InstrumentRuntimeStateV2* runtime_state) {
+    runtime::RealtimePipelineConfigV1 config{};
+    config.run_id = run_id;
+    config.trade_date = options.trade_date;
+    config.daily_catalog = daily_catalog;
+    config.runtime_state = runtime_state;
+    config.source_stream_ids = {1001U, 1002U, 2001U, 2002U};
+    config.store_worker_count = options.instrument_store_workers;
+    config.decoder_queue_capacity_per_source =
+        static_cast<std::size_t>(
+            options.decoder_queue_records_per_source);
+    config.store_queue_capacity_per_source_worker =
+        static_cast<std::size_t>(
+            options.store_queue_records_per_source_worker);
+    config.intraday_store.segment_target_bytes =
+        static_cast<std::size_t>(
+            options.intraday_store_segment_kib) *
+        1024U;
+    config.intraday_store.maximum_session_records =
+        options.intraday_store_maximum_records;
+    config.intraday_store.maximum_session_accounted_bytes =
+        options.intraday_store_memory_bytes;
+    config.intraday_store.maximum_records_per_batch =
+        static_cast<std::size_t>(
+            options.intraday_store_batch_records);
+    config.enforce_receive_trade_date = true;
+    config.tick_ring_capacity =
+        static_cast<std::size_t>(options.ipc_tick_ring_records);
+    return config;
+}
+
+ipc::RealtimeSharedServiceConfigV2 BuildOnlineIpcConfig(
+    const Options& options,
+    const common::Identity128& run_id,
+    const std::shared_ptr<const market::DailyInstrumentCatalogV2>&
+        daily_catalog,
+    std::vector<market::KLineWindowSpecV1> kline_windows,
+    std::filesystem::path socket) {
+    ipc::RealtimeSharedServiceConfigV2 config{};
+    config.run_id = run_id;
+    config.session_epoch = options.session_epoch;
+    config.trade_date = options.trade_date;
+    config.daily_catalog = daily_catalog;
+    config.kline_windows = std::move(kline_windows);
+    config.tick_ring_capacity = options.ipc_tick_ring_records;
+    config.key_arena_bytes = options.ipc_key_arena_bytes;
+    config.maximum_mapping_bytes = options.ipc_maximum_mapping_bytes;
+    config.control_socket_path = std::move(socket);
+    return config;
+}
+
+int RunLivePartial(
+    const Options& options,
+    const common::Identity128& run_id,
+    const std::shared_ptr<const market::DailyInstrumentCatalogV2>&
+        daily_catalog,
+    market::InstrumentRuntimeStateV2* runtime_state) {
+    ipc::RealtimeSharedServiceConfigV2 ipc_config =
+        BuildOnlineIpcConfig(
+            options,
+            run_id,
+            daily_catalog,
+            {},
+            options.ipc_socket);
+    ipc_config.coverage_from_open = false;
+    ipc_config.startup_prefix_recovered = false;
+    ipc_config.full_day_kline_valid = false;
+    ipc_config.full_day_factor_valid = false;
+    ipc_config.certified_prefix_valid = false;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> ipc_service;
+    int ipc_system_error = 0;
+    const ipc::RealtimeSharedServiceCreateErrorV2 ipc_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            std::move(ipc_config),
+            &ipc_service,
+            &ipc_system_error);
+    if (ipc_error !=
+            ipc::RealtimeSharedServiceCreateErrorV2::kNone ||
+        ipc_service == nullptr ||
+        !ipc_service->StartLivePartial(&ipc_system_error)) {
+        std::cerr
+            << "mdl-production-router: standalone LIVE_PARTIAL IPC "
+               "start failed: "
+            << ipc::RealtimeSharedServiceCreateErrorNameV2(ipc_error)
+            << " errno=" << ipc_system_error << '\n';
+        return 1;
+    }
+
+    runtime::RealtimePipelineConfigV1 pipeline_config =
+        BuildOnlinePipelineBase(
+            options, run_id, daily_catalog, runtime_state);
+    pipeline_config.intraday_store.coverage_from_open = false;
+    pipeline_config.kline.windows.clear();
+    pipeline_config.sdk.enabled = true;
+    pipeline_config.sdk.library_path = options.sdk_library;
+    pipeline_config.sdk.server_address = options.server_address;
+    pipeline_config.sdk.user_name = options.user_name;
+    pipeline_config.sdk.log_prefix = options.sdk_log_prefix + "-partial";
+    pipeline_config.sdk.message_encoding =
+        datayes::mdl::MDLEID_BINARY;
+    pipeline_config.sdk.merge_message = false;
+    pipeline_config.applied_record_sink = ipc_service;
+    pipeline_config.processing_progress_sink = ipc_service;
+    pipeline_config.store_generation_sink = ipc_service;
+
+    std::uint64_t minimum_tick_ring = 0U;
+    if (!MinimumTickRingCapacity(
+            pipeline_config, &minimum_tick_ring) ||
+        options.ipc_tick_ring_records < minimum_tick_ring) {
+        std::cerr
+            << "mdl-production-router: LIVE_PARTIAL tick ring is "
+               "smaller than the applied dispatch window\n";
+        ipc_service->MarkFailed();
+        ipc_service->StopControl();
+        return 1;
+    }
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    const runtime::RealtimePipelineCreateErrorV1 create_error =
+        runtime::RealtimePipelineV1::Create(
+            std::move(pipeline_config), &pipeline, &detail);
+    if (create_error !=
+            runtime::RealtimePipelineCreateErrorV1::kNone ||
+        pipeline == nullptr) {
+        std::cerr
+            << "mdl-production-router: standalone LIVE_PARTIAL pipeline "
+               "create/connect failed: "
+            << runtime::RealtimePipelineCreateErrorNameV1(create_error)
+            << (detail.empty() ? "" : ": ") << detail << '\n';
+        ipc_service->MarkFailed();
+        ipc_service->StopControl();
+        return 1;
+    }
+
+    std::cerr
+        << "mdl-production-router: standalone LIVE_PARTIAL available: "
+        << "socket=" << ipc_service->control_socket_path()
+        << " run_id=" << common::Identity128Hex(run_id)
+        << " coverage_from_open=false"
+        << " startup_prefix_recovered=false"
+        << " full_day_kline_valid=false"
+        << " full_day_factor_valid=false"
+        << " certified_prefix_valid=false"
+        << " history_control=unavailable"
+        << " recovery=disabled\n";
+
+    const auto interval =
+        std::chrono::milliseconds(options.generation_interval_ms);
+    const auto timeout =
+        std::chrono::milliseconds(options.generation_timeout_ms);
+    int exit_code = 0;
+    while (g_stop_requested == 0) {
+        const IntervalWaitResult wait =
+            WaitForInterval(interval, options.trade_date);
+        if (wait == IntervalWaitResult::kSignal) {
+            break;
+        }
+        if (wait != IntervalWaitResult::kElapsed) {
+            std::cerr
+                << "mdl-production-router: LIVE_PARTIAL trade-date/clock "
+                   "boundary failed\n";
+            exit_code = 1;
+            break;
+        }
+        if (pipeline->fatal() || ipc_service->failed()) {
+            ReportFatalSnapshot(pipeline->Snapshot());
+            exit_code = 1;
+            break;
+        }
+    }
+
+    if (!ipc_service->failed()) {
+        ipc_service->MarkDraining();
+    }
+    runtime::RealtimePipelineCutResultV1 final{};
+    if (exit_code == 0 && !pipeline->fatal()) {
+        final = pipeline->StopAndPublishFinalGeneration(timeout);
+        if (!final.published()) {
+            std::cerr
+                << "mdl-production-router: LIVE_PARTIAL final generation "
+                   "failed: "
+                << runtime::RealtimePipelineCutErrorNameV1(final.error)
+                << '\n';
+            exit_code = 1;
+        }
+    } else {
+        pipeline->StopAndDrain();
+    }
+
+    const runtime::RealtimePipelineSnapshotV1 snapshot =
+        pipeline->Snapshot();
+    if (snapshot.fatal) {
+        exit_code = 1;
+    }
+    if (exit_code == 0) {
+        if (!ipc_service->MarkStoppedClean(
+                snapshot.tick_stream_sequence)) {
+            exit_code = 1;
+        }
+    }
+    if (exit_code != 0) {
+        ipc_service->MarkFailed();
+    }
+    std::cerr
+        << "mdl-production-router: LIVE_PARTIAL final: exit_code="
+        << exit_code
+        << " accepted=" << snapshot.accepted_messages
+        << " applied="
+        << snapshot.processing_progress.applied_sequence
+        << " filtered=" << snapshot.filtered_messages
+        << " records=" << snapshot.store.appended_records
+        << " tick_stream_sequence=" << snapshot.tick_stream_sequence
+        << " coverage_from_open=false"
+        << " recovery=disabled\n";
+    return exit_code;
+}
+
+int RunOnlineRecovery(
+    const Options& options,
+    const common::Identity128& recovered_run_id,
+    const std::shared_ptr<const market::DailyInstrumentCatalogV2>&
+        daily_catalog,
+    const std::vector<market::KLineWindowSpecV1>& kline_windows) {
+    common::Identity128 preview_run_id{};
+    int entropy_error = 0;
+    if (!common::GenerateIdentity128(
+            &preview_run_id, &entropy_error) ||
+        preview_run_id == recovered_run_id) {
+        std::cerr
+            << "mdl-production-router: preview run-id entropy failed: "
+            << "errno=" << entropy_error << '\n';
+        return 1;
+    }
+
+    std::unique_ptr<market::InstrumentRuntimeStateV2>
+        preview_runtime_state;
+    std::unique_ptr<market::InstrumentRuntimeStateV2>
+        shadow_runtime_state;
+    const market::InstrumentRuntimeStateErrorV2 preview_state_error =
+        market::InstrumentRuntimeStateV2::Create(
+            *daily_catalog, &preview_runtime_state);
+    const market::InstrumentRuntimeStateErrorV2 shadow_state_error =
+        market::InstrumentRuntimeStateV2::Create(
+            *daily_catalog, &shadow_runtime_state);
+    if (preview_state_error !=
+            market::InstrumentRuntimeStateErrorV2::kNone ||
+        shadow_state_error !=
+            market::InstrumentRuntimeStateErrorV2::kNone ||
+        preview_runtime_state == nullptr ||
+        shadow_runtime_state == nullptr) {
+        std::cerr
+            << "mdl-production-router: online recovery runtime state "
+               "create failed: preview="
+            << market::InstrumentRuntimeStateErrorNameV2(
+                   preview_state_error)
+            << " shadow="
+            << market::InstrumentRuntimeStateErrorNameV2(
+                   shadow_state_error)
+            << '\n';
+        return 1;
+    }
+
+    recovery::LiveJournalConfigV1 journal_config{};
+    journal_config.directory =
+        options.intraday_recovery_journal_dir;
+    journal_config.run_id = preview_run_id;
+    journal_config.trade_date = options.trade_date;
+    journal_config.segment_maximum_bytes =
+        options.intraday_recovery_journal_segment_bytes;
+    journal_config.maximum_total_bytes =
+        options.intraday_recovery_journal_maximum_bytes;
+    journal_config.queue_capacity_records =
+        static_cast<std::size_t>(
+            options.intraday_recovery_journal_queue_records);
+    journal_config.sync_batch_records = std::min<std::size_t>(
+        256U, journal_config.queue_capacity_records);
+    std::shared_ptr<recovery::MdlLiveJournalV1> live_journal;
+    int journal_system_error = 0;
+    const recovery::LiveJournalErrorV1 journal_error =
+        recovery::MdlLiveJournalV1::Create(
+            std::move(journal_config),
+            &live_journal,
+            &journal_system_error);
+    if (journal_error != recovery::LiveJournalErrorV1::kNone ||
+        live_journal == nullptr) {
+        std::cerr
+            << "mdl-production-router: live journal create failed: "
+            << recovery::LiveJournalErrorNameV1(journal_error)
+            << " errno=" << journal_system_error << '\n';
+        return 1;
+    }
+
+    ipc::RealtimeSharedServiceConfigV2 preview_ipc_config =
+        BuildOnlineIpcConfig(
+            options,
+            preview_run_id,
+            daily_catalog,
+            {},
+            options.live_preview_ipc_socket);
+    preview_ipc_config.coverage_from_open = false;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2>
+        preview_ipc_service;
+    int ipc_system_error = 0;
+    const ipc::RealtimeSharedServiceCreateErrorV2
+        preview_ipc_error =
+            ipc::RealtimeSharedMarketServiceV2::Create(
+                std::move(preview_ipc_config),
+                &preview_ipc_service,
+                &ipc_system_error);
+    if (preview_ipc_error !=
+            ipc::RealtimeSharedServiceCreateErrorV2::kNone ||
+        preview_ipc_service == nullptr ||
+        !preview_ipc_service->StartLivePartial(&ipc_system_error)) {
+        std::cerr
+            << "mdl-production-router: LIVE_PARTIAL IPC start failed: "
+            << ipc::RealtimeSharedServiceCreateErrorNameV2(
+                   preview_ipc_error)
+            << " errno=" << ipc_system_error << '\n';
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+
+    runtime::RealtimePipelineConfigV1 preview_config =
+        BuildOnlinePipelineBase(
+            options,
+            preview_run_id,
+            daily_catalog,
+            preview_runtime_state.get());
+    preview_config.intraday_store.coverage_from_open = false;
+    // Preview deliberately publishes no KLine generation.  Its internal
+    // partial Store supplies lifetime-safe latest records, while the control
+    // service rejects History/delta until clients switch to recovered IPC.
+    preview_config.kline.windows.clear();
+    preview_config.sdk.enabled = true;
+    preview_config.sdk.library_path = options.sdk_library;
+    preview_config.sdk.server_address = options.server_address;
+    preview_config.sdk.user_name = options.user_name;
+    preview_config.sdk.log_prefix =
+        options.sdk_log_prefix + "-preview";
+    preview_config.sdk.message_encoding =
+        datayes::mdl::MDLEID_BINARY;
+    preview_config.sdk.merge_message = false;
+    preview_config.live_ingress_capture_sink = live_journal;
+    preview_config.applied_record_sink = preview_ipc_service;
+    preview_config.processing_progress_sink = preview_ipc_service;
+    preview_config.store_generation_sink = preview_ipc_service;
+
+    std::uint64_t preview_minimum_tick_ring = 0U;
+    if (!MinimumTickRingCapacity(
+            preview_config, &preview_minimum_tick_ring) ||
+        options.ipc_tick_ring_records < preview_minimum_tick_ring) {
+        std::cerr
+            << "mdl-production-router: preview tick ring is smaller than "
+               "the applied window\n";
+        preview_ipc_service->MarkFailed();
+        preview_ipc_service->StopControl();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+
+    std::unique_ptr<runtime::RealtimePipelineV1> preview_pipeline;
+    std::string detail;
+    const runtime::RealtimePipelineCreateErrorV1 preview_create_error =
+        runtime::RealtimePipelineV1::Create(
+            std::move(preview_config),
+            &preview_pipeline,
+            &detail);
+    if (preview_create_error !=
+            runtime::RealtimePipelineCreateErrorV1::kNone ||
+        preview_pipeline == nullptr) {
+        std::cerr
+            << "mdl-production-router: preview pipeline create failed: "
+            << runtime::RealtimePipelineCreateErrorNameV1(
+                   preview_create_error)
+            << (detail.empty() ? "" : ": ") << detail << '\n';
+        preview_ipc_service->MarkFailed();
+        preview_ipc_service->StopControl();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+    std::cerr
+        << "mdl-production-router: LIVE_PARTIAL available: socket="
+        << preview_ipc_service->control_socket_path()
+        << " run_id=" << common::Identity128Hex(preview_run_id)
+        << " server_state=LIVE_PARTIAL"
+        << " coverage_from_open=false"
+        << " startup_prefix_recovered=false"
+        << " full_day_kline_valid=false"
+        << " full_day_factor_valid=false"
+        << " certified_prefix_valid=false"
+        << " history_control=unavailable"
+        << " journal_dir="
+        << options.intraday_recovery_journal_dir
+        << '\n';
+
+    ipc::RealtimeSharedServiceConfigV2 recovered_ipc_config =
+        BuildOnlineIpcConfig(
+            options,
+            recovered_run_id,
+            daily_catalog,
+            kline_windows,
+            options.ipc_socket);
+    recovered_ipc_config.coverage_from_open = true;
+    recovered_ipc_config.startup_prefix_recovered = true;
+    recovered_ipc_config.full_day_kline_valid =
+        !kline_windows.empty();
+    recovered_ipc_config.full_day_factor_valid = true;
+    recovered_ipc_config.certified_prefix_valid = false;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2>
+        recovered_ipc_service;
+    ipc_system_error = 0;
+    const ipc::RealtimeSharedServiceCreateErrorV2
+        recovered_ipc_error =
+            ipc::RealtimeSharedMarketServiceV2::Create(
+                std::move(recovered_ipc_config),
+                &recovered_ipc_service,
+                &ipc_system_error);
+    if (recovered_ipc_error !=
+            ipc::RealtimeSharedServiceCreateErrorV2::kNone ||
+        recovered_ipc_service == nullptr) {
+        std::cerr
+            << "mdl-production-router: recovered IPC create failed: "
+            << ipc::RealtimeSharedServiceCreateErrorNameV2(
+                   recovered_ipc_error)
+            << " errno=" << ipc_system_error << '\n';
+        preview_pipeline->StopAndDrain();
+        preview_ipc_service->MarkFailed();
+        preview_ipc_service->StopControl();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+
+    std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
+        certified_service;
+    if (options.native_gap_recovery_enabled) {
+        constexpr std::size_t maximum_size =
+            std::numeric_limits<std::size_t>::max();
+        if (options.intraday_store_maximum_records > maximum_size ||
+            options.intraday_store_maximum_records >
+                maximum_size / 4U) {
+            std::cerr
+                << "mdl-production-router: online CERTIFIED capacity "
+                   "is not representable\n";
+            preview_pipeline->StopAndDrain();
+            recovered_ipc_service->MarkFailed();
+            preview_ipc_service->MarkFailed();
+            static_cast<void>(live_journal->StopAndFlush());
+            return 1;
+        }
+        const std::size_t maximum_order_states =
+            static_cast<std::size_t>(
+                options.intraday_store_maximum_records);
+        ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
+        certified_config.run_id = recovered_run_id;
+        certified_config.session_epoch = options.session_epoch;
+        certified_config.trade_date = options.trade_date;
+        certified_config.daily_catalog = daily_catalog;
+        certified_config.fast_sink = recovered_ipc_service;
+        certified_config.certified_tick_ring_capacity =
+            options.ipc_tick_ring_records;
+        certified_config.handoff_queue_capacity =
+            options.certified_handoff_queue_records;
+        certified_config.maximum_mapping_bytes =
+            options.ipc_maximum_mapping_bytes;
+        certified_config.maximum_order_states = maximum_order_states;
+        certified_config.maximum_derived_events =
+            maximum_order_states * 4U;
+        certified_config.control_socket_path =
+            options.certified_ipc_socket;
+        int certified_system_error = 0;
+        const ipc::RealtimeCertifiedServiceCreateErrorV1
+            certified_error =
+                ipc::RealtimeCertifiedMarketServiceV1::Create(
+                    std::move(certified_config),
+                    &certified_service,
+                    &certified_system_error);
+        if (certified_error !=
+                ipc::RealtimeCertifiedServiceCreateErrorV1::kNone ||
+            certified_service == nullptr ||
+            !certified_service->StartWorker(
+                &certified_system_error)) {
+            std::cerr
+                << "mdl-production-router: online CERTIFIED worker "
+                   "start failed: "
+                << ipc::RealtimeCertifiedServiceCreateErrorNameV1(
+                       certified_error)
+                << " errno=" << certified_system_error << '\n';
+            if (certified_service != nullptr) {
+                certified_service->StopControl();
+            }
+            preview_pipeline->StopAndDrain();
+            recovered_ipc_service->MarkFailed();
+            preview_ipc_service->MarkFailed();
+            static_cast<void>(live_journal->StopAndFlush());
+            return 1;
+        }
+    }
+
+    runtime::RealtimePipelineConfigV1 shadow_config =
+        BuildOnlinePipelineBase(
+            options,
+            recovered_run_id,
+            daily_catalog,
+            shadow_runtime_state.get());
+    shadow_config.intraday_store.coverage_from_open = true;
+    shadow_config.kline.windows = kline_windows;
+    shadow_config.sdk.enabled = false;
+    shadow_config.external_ingress_enabled = true;
+    shadow_config.applied_record_sink =
+        certified_service != nullptr
+            ? std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  certified_service)
+            : std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  recovered_ipc_service);
+    if (certified_service != nullptr) {
+        shadow_config.native_sequence_observation_sink =
+            certified_service;
+    }
+    shadow_config.processing_progress_sink = recovered_ipc_service;
+    shadow_config.store_generation_sink = recovered_ipc_service;
+    std::uint64_t shadow_minimum_tick_ring = 0U;
+    if (!MinimumTickRingCapacity(
+            shadow_config, &shadow_minimum_tick_ring) ||
+        options.ipc_tick_ring_records < shadow_minimum_tick_ring) {
+        std::cerr
+            << "mdl-production-router: shadow tick ring is smaller than "
+               "the applied window\n";
+        preview_pipeline->StopAndDrain();
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        recovered_ipc_service->MarkFailed();
+        preview_ipc_service->MarkFailed();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+    std::unique_ptr<runtime::RealtimePipelineV1> shadow_pipeline;
+    detail.clear();
+    const runtime::RealtimePipelineCreateErrorV1 shadow_create_error =
+        runtime::RealtimePipelineV1::Create(
+            std::move(shadow_config),
+            &shadow_pipeline,
+            &detail);
+    if (shadow_create_error !=
+            runtime::RealtimePipelineCreateErrorV1::kNone ||
+        shadow_pipeline == nullptr) {
+        std::cerr
+            << "mdl-production-router: shadow pipeline create failed: "
+            << runtime::RealtimePipelineCreateErrorNameV1(
+                   shadow_create_error)
+            << (detail.empty() ? "" : ": ") << detail << '\n';
+        preview_pipeline->StopAndDrain();
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        recovered_ipc_service->MarkFailed();
+        preview_ipc_service->MarkFailed();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+
+    recovery::StartupReplayConfigV1 replay_config{};
+    replay_config.directory = options.intraday_recovery_csv_dir;
+    replay_config.maximum_message_bytes =
+        16U * 1024U * 1024U;
+    std::shared_ptr<recovery::StartupReplaySourceV1> replay_source;
+    try {
+        replay_source = std::make_shared<
+            recovery::MdlCsvStartupReplaySourceV1>(
+            std::move(replay_config));
+    } catch (...) {
+        std::cerr
+            << "mdl-production-router: online CSV replay source create "
+               "failed\n";
+        preview_pipeline->StopAndDrain();
+        shadow_pipeline->StopAndDrain();
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        recovered_ipc_service->MarkFailed();
+        preview_ipc_service->MarkFailed();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+
+    OnlineRunState online_state;
+    recovery::OnlineRecoveryConfigV1 online_config{};
+    online_config.live_journal = live_journal;
+    online_config.csv_replay_source = replay_source;
+    online_config.shadow_pipeline = shadow_pipeline.get();
+    online_config.trade_date = options.trade_date;
+    online_config.source_stream_ids =
+        {1001U, 1002U, 2001U, 2002U};
+    online_config.overlap_retention_per_tuple =
+        static_cast<std::size_t>(
+            options.intraday_recovery_live_buffer_messages);
+    online_config.warmup_timeout = std::chrono::seconds(
+        options.intraday_recovery_warmup_seconds);
+    online_config.per_record_admission_timeout =
+        std::chrono::seconds(
+            options.intraday_recovery_backpressure_seconds);
+    online_config.cancel_requested = [&online_state]() noexcept {
+        return (g_stop_requested != 0 ||
+                online_state.abort_requested.load(
+                    std::memory_order_acquire)) &&
+               !online_state.promoted.load(std::memory_order_acquire);
+    };
+    online_config.certified_high_watermark_percent =
+        options
+            .intraday_recovery_certified_high_watermark_percent;
+    if (certified_service != nullptr) {
+        online_config.certified_handoff_healthy =
+            [certified_service]() noexcept -> bool {
+                const ipc::RealtimeCertifiedServiceSnapshotV1 snapshot =
+                    certified_service->Snapshot();
+                return snapshot.worker_running &&
+                       !snapshot.globally_frozen_resource &&
+                       snapshot.resource_exhaustion_count == 0U &&
+                       snapshot.dropped_handoffs == 0U &&
+                       snapshot.conflicting_duplicate_count == 0U;
+            };
+        online_config.certified_queue_utilization_percent =
+            [certified_service]() noexcept -> std::uint32_t {
+                const ipc::RealtimeCertifiedServiceSnapshotV1 snapshot =
+                    certified_service->Snapshot();
+                const std::uint64_t maximum =
+                    std::numeric_limits<std::uint64_t>::max();
+                const std::uint64_t enqueued =
+                    snapshot.enqueued_observations >
+                            maximum -
+                                snapshot.enqueued_applied_records
+                        ? maximum
+                        : snapshot.enqueued_observations +
+                              snapshot.enqueued_applied_records;
+                const std::uint64_t pending =
+                    enqueued > snapshot.processed_handoffs
+                        ? enqueued - snapshot.processed_handoffs
+                        : 0U;
+                const std::uint64_t capacity =
+                    certified_service->handoff_queue_capacity();
+                if (capacity == 0U || pending >= capacity) {
+                    return 100U;
+                }
+                return static_cast<std::uint32_t>(
+                    (pending * 100U) / capacity);
+            };
+    }
+    std::unique_ptr<recovery::OnlineRecoveryHandoffV1> handoff;
+    detail.clear();
+    const recovery::OnlineRecoveryErrorV1 handoff_error =
+        recovery::OnlineRecoveryHandoffV1::Create(
+            std::move(online_config), &handoff, &detail);
+    if (handoff_error != recovery::OnlineRecoveryErrorV1::kNone ||
+        handoff == nullptr) {
+        std::cerr
+            << "mdl-production-router: online recovery handoff create "
+               "failed: "
+            << recovery::OnlineRecoveryErrorNameV1(handoff_error)
+            << (detail.empty() ? "" : ": ") << detail << '\n';
+        preview_pipeline->StopAndDrain();
+        shadow_pipeline->StopAndDrain();
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
+        recovered_ipc_service->MarkFailed();
+        preview_ipc_service->MarkFailed();
+        static_cast<void>(live_journal->StopAndFlush());
+        return 1;
+    }
+
+    const auto interval =
+        std::chrono::milliseconds(options.generation_interval_ms);
+    const auto timeout =
+        std::chrono::milliseconds(options.generation_timeout_ms);
+    std::thread recovery_thread(
+        [&online_state,
+         &handoff,
+         &live_journal,
+         &preview_pipeline,
+         &preview_ipc_service,
+         &shadow_pipeline,
+         &recovered_run_id,
+         &recovered_ipc_service,
+         &certified_service,
+         timeout]() noexcept {
+            const auto finish = [&online_state]() noexcept {
+                online_state.recovery_thread_finished.store(
+                    true, std::memory_order_release);
+            };
+            const recovery::OnlineRecoveryBoundaryV1 boundary =
+                handoff->RecoverToPromotionBoundary();
+            if (!boundary.ready()) {
+                if (!(boundary.error ==
+                          recovery::OnlineRecoveryErrorV1::kCancelled &&
+                      (g_stop_requested != 0 ||
+                       online_state.abort_requested.load(
+                           std::memory_order_acquire)))) {
+                    online_state.Fail(
+                        "background recovery failed before promotion: " +
+                        std::string(
+                            recovery::OnlineRecoveryErrorNameV1(
+                                boundary.error)) +
+                        (boundary.detail.empty()
+                             ? std::string()
+                             : ": " + boundary.detail));
+                    recovered_ipc_service->MarkFailed();
+                }
+                finish();
+                return;
+            }
+            const auto preview_owner_healthy =
+                [&preview_pipeline,
+                 &preview_ipc_service]() noexcept -> bool {
+                    const runtime::RealtimePipelineSnapshotV1 preview =
+                        preview_pipeline->Snapshot();
+                    return preview.accepting && !preview.fatal &&
+                           !preview.stopped &&
+                           !preview.trade_date_boundary_reached &&
+                           !preview_ipc_service->failed();
+                };
+            const auto promotion_inputs_healthy =
+                [&live_journal,
+                 &preview_owner_healthy,
+                 &boundary]() noexcept -> bool {
+                    const recovery::LiveJournalSnapshotV1 journal =
+                        live_journal->Snapshot();
+                    return journal.healthy() &&
+                           journal.state ==
+                               recovery::LiveJournalStateV1::kWriting &&
+                           journal.accepted_serial >=
+                               boundary.journal_frontier &&
+                           journal.committed_serial >=
+                               boundary.journal_frontier &&
+                           preview_owner_healthy();
+                };
+            const runtime::RealtimePipelineCutResultV1 cut =
+                shadow_pipeline->CutAndPublishGeneration(timeout);
+            if (!cut.published() ||
+                !PublishKLineGeneration(
+                    cut,
+                    recovered_ipc_service,
+                    "online recovery promotion")) {
+                online_state.Fail(
+                    "shadow promotion generation failed: " +
+                    std::string(
+                        runtime::RealtimePipelineCutErrorNameV1(
+                            cut.error)));
+                recovered_ipc_service->MarkFailed();
+                finish();
+                return;
+            }
+            if (certified_service != nullptr) {
+                int certified_error = 0;
+                if (!certified_service->WaitForPrefixBarrier(
+                        timeout, &certified_error)) {
+                    online_state.Fail(
+                        "CERTIFIED promotion prefix barrier failed: errno=" +
+                        std::to_string(certified_error));
+                    recovered_ipc_service->MarkFailed();
+                    certified_service->StopControl();
+                    finish();
+                    return;
+                }
+            }
+            std::uint64_t promotion_ns = 0U;
+            {
+                std::lock_guard<std::mutex> promotion(
+                    online_state.promotion_mutex);
+                if (g_stop_requested != 0 ||
+                    online_state.abort_requested.load(
+                        std::memory_order_acquire)) {
+                    finish();
+                    return;
+                }
+                if (!promotion_inputs_healthy()) {
+                    online_state.Fail(
+                        "online journal/preview owner failed before "
+                        "promotion exposure");
+                    preview_ipc_service->MarkFailed();
+                    recovered_ipc_service->MarkFailed();
+                    if (certified_service != nullptr) {
+                        certified_service->StopControl();
+                    }
+                    finish();
+                    return;
+                }
+                int start_error = 0;
+                // The CERTIFIED prefix is already sealed.  Start its control
+                // first, then expose recovered FAST last, so the authoritative
+                // socket cannot become queryable before the barrier.
+                if (certified_service != nullptr &&
+                    !certified_service->StartControl(&start_error)) {
+                    online_state.Fail(
+                        "CERTIFIED control activation failed: errno=" +
+                        std::to_string(start_error));
+                    recovered_ipc_service->MarkFailed();
+                    certified_service->StopControl();
+                    finish();
+                    return;
+                }
+                start_error = 0;
+                if (!recovered_ipc_service->Start(&start_error)) {
+                    online_state.Fail(
+                        "recovered FAST activation failed: errno=" +
+                        std::to_string(start_error));
+                    recovered_ipc_service->MarkFailed();
+                    if (certified_service != nullptr) {
+                        certified_service->StopControl();
+                    }
+                    finish();
+                    return;
+                }
+                if (certified_service != nullptr &&
+                    !recovered_ipc_service
+                         ->MarkCertifiedPrefixValid()) {
+                    online_state.Fail(
+                        "recovered FAST certified-prefix publication failed");
+                    recovered_ipc_service->MarkFailed();
+                    certified_service->StopControl();
+                    finish();
+                    return;
+                }
+                if (!promotion_inputs_healthy()) {
+                    online_state.Fail(
+                        "online journal/preview owner failed during "
+                        "promotion exposure");
+                    preview_ipc_service->MarkFailed();
+                    recovered_ipc_service->MarkFailed();
+                    if (certified_service != nullptr) {
+                        certified_service->StopControl();
+                    }
+                    finish();
+                    return;
+                }
+                if (!CurrentRealtimeNs(&promotion_ns) ||
+                    !handoff->MarkPromoted(promotion_ns)) {
+                    online_state.Fail(
+                        "promotion completion timestamp publication failed");
+                    recovered_ipc_service->MarkFailed();
+                    if (certified_service != nullptr) {
+                        certified_service->StopControl();
+                    }
+                    finish();
+                    return;
+                }
+                online_state.promoted.store(
+                    true, std::memory_order_release);
+            }
+            std::cerr
+                << "mdl-production-router: online recovery promoted: "
+                << "socket="
+                << recovered_ipc_service->control_socket_path()
+                << " run_id="
+                << common::Identity128Hex(recovered_run_id)
+                << " journal_frontier=" << boundary.journal_frontier
+                << " shadow_ingress_frontier="
+                << boundary.shadow_ingress_frontier
+                << " promotion_realtime_ns=" << promotion_ns
+                << " coverage_from_open=true"
+                << " startup_prefix_recovered=true"
+                << " full_day_kline_valid="
+                << (cut.kline_enabled ? "true" : "false")
+                << " full_day_factor_valid=true"
+                << " certified_prefix_valid="
+                << (certified_service != nullptr ? "true" : "false")
+                << '\n';
+
+            for (;;) {
+                if (g_stop_requested == 0 &&
+                    !preview_owner_healthy()) {
+                    online_state.Fail(
+                        "post-promotion LIVE_PARTIAL/SDK owner failed");
+                    preview_ipc_service->MarkFailed();
+                    recovered_ipc_service->MarkFailed();
+                    if (certified_service != nullptr) {
+                        certified_service->StopControl();
+                    }
+                    finish();
+                    return;
+                }
+                const recovery::OnlineRecoveryPumpResultV1 pumped =
+                    handoff->PumpNext(
+                        std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(100));
+                if (pumped.disposition ==
+                        recovery::OnlineRecoveryPumpDispositionV1::
+                            kRecord ||
+                    pumped.disposition ==
+                        recovery::OnlineRecoveryPumpDispositionV1::kIdle) {
+                    continue;
+                }
+                if (pumped.disposition ==
+                    recovery::OnlineRecoveryPumpDispositionV1::kEnd) {
+                    finish();
+                    return;
+                }
+                online_state.Fail(
+                    "post-promotion journal tail failed: " +
+                    std::string(
+                        recovery::OnlineRecoveryErrorNameV1(
+                            pumped.error)) +
+                    (pumped.detail.empty()
+                         ? std::string()
+                         : ": " + pumped.detail));
+                preview_ipc_service->MarkFailed();
+                recovered_ipc_service->MarkFailed();
+                if (certified_service != nullptr) {
+                    certified_service->StopControl();
+                }
+                finish();
+                return;
+            }
+        });
+
+    int exit_code = 0;
+    while (g_stop_requested == 0) {
+        const IntervalWaitResult wait =
+            WaitForInterval(interval, options.trade_date);
+        if (wait == IntervalWaitResult::kSignal) {
+            break;
+        }
+        if (wait != IntervalWaitResult::kElapsed) {
+            std::cerr
+                << "mdl-production-router: online runtime date/clock "
+                   "boundary failed\n";
+            exit_code = 1;
+            break;
+        }
+        const recovery::LiveJournalSnapshotV1 journal_snapshot =
+            live_journal->Snapshot();
+        if (preview_pipeline->fatal() ||
+            preview_ipc_service->failed() ||
+            !journal_snapshot.healthy()) {
+            std::cerr
+                << "mdl-production-router: LIVE_PARTIAL/journal failed: "
+                << recovery::LiveJournalErrorNameV1(
+                       journal_snapshot.error)
+                << " accepted=" << journal_snapshot.accepted_serial
+                << " committed=" << journal_snapshot.committed_serial
+                << '\n';
+            exit_code = 1;
+            break;
+        }
+        if (online_state.failed.load(std::memory_order_acquire)) {
+            std::cerr
+                << "mdl-production-router: " << online_state.Detail()
+                << '\n';
+            exit_code = 1;
+            break;
+        }
+        if (!online_state.promoted.load(std::memory_order_acquire)) {
+            continue;
+        }
+        const runtime::RealtimePipelineCutResultV1 cut =
+            shadow_pipeline->CutAndPublishGeneration(timeout);
+        if (!cut.published() ||
+            !PublishKLineGeneration(
+                cut, recovered_ipc_service, "online periodic")) {
+            std::cerr
+                << "mdl-production-router: online recovered generation "
+                   "failed: "
+                << runtime::RealtimePipelineCutErrorNameV1(cut.error)
+                << '\n';
+            exit_code = 1;
+            break;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> promotion(
+            online_state.promotion_mutex);
+        if (!online_state.promoted.load(std::memory_order_acquire)) {
+            online_state.abort_requested.store(
+                true, std::memory_order_release);
+        }
+    }
+
+    if (!preview_ipc_service->failed()) {
+        preview_ipc_service->MarkDraining();
+    }
+    if (online_state.promoted.load(std::memory_order_acquire) &&
+        !recovered_ipc_service->failed()) {
+        recovered_ipc_service->MarkDraining();
+    }
+    if (certified_service != nullptr &&
+        online_state.promoted.load(std::memory_order_acquire)) {
+        certified_service->MarkDraining();
+    }
+
+    runtime::RealtimePipelineCutResultV1 preview_final{};
+    if (exit_code == 0 && !preview_pipeline->fatal()) {
+        preview_final =
+            preview_pipeline->StopAndPublishFinalGeneration(timeout);
+        if (!preview_final.published()) {
+            std::cerr
+                << "mdl-production-router: preview final generation failed\n";
+            exit_code = 1;
+        }
+    } else {
+        preview_pipeline->StopAndDrain();
+    }
+    if (!live_journal->StopAndFlush()) {
+        const recovery::LiveJournalSnapshotV1 snapshot =
+            live_journal->Snapshot();
+        std::cerr
+            << "mdl-production-router: journal final flush failed: "
+            << recovery::LiveJournalErrorNameV1(snapshot.error)
+            << " accepted=" << snapshot.accepted_serial
+            << " committed=" << snapshot.committed_serial << '\n';
+        exit_code = 1;
+    }
+    if (recovery_thread.joinable()) {
+        recovery_thread.join();
+    }
+    if (online_state.failed.load(std::memory_order_acquire)) {
+        std::cerr
+            << "mdl-production-router: " << online_state.Detail() << '\n';
+        exit_code = 1;
+    }
+
+    runtime::RealtimePipelineCutResultV1 recovered_final{};
+    const bool promoted =
+        online_state.promoted.load(std::memory_order_acquire);
+    if (promoted && exit_code == 0 && !shadow_pipeline->fatal()) {
+        recovered_final =
+            shadow_pipeline->StopAndPublishFinalGeneration(timeout);
+        if (!recovered_final.published() ||
+            !PublishKLineGeneration(
+                recovered_final,
+                recovered_ipc_service,
+                "online final")) {
+            std::cerr
+                << "mdl-production-router: recovered final generation "
+                   "failed\n";
+            exit_code = 1;
+        }
+    } else {
+        shadow_pipeline->StopAndDrain();
+    }
+
+    const runtime::RealtimePipelineSnapshotV1 preview_snapshot =
+        preview_pipeline->Snapshot();
+    const runtime::RealtimePipelineSnapshotV1 shadow_snapshot =
+        shadow_pipeline->Snapshot();
+    if (preview_snapshot.fatal || shadow_snapshot.fatal) {
+        exit_code = 1;
+    }
+    if (certified_service != nullptr) {
+        if (promoted && exit_code == 0) {
+            certified_service->MarkStoppedClean();
+        } else {
+            certified_service->StopControl();
+        }
+    }
+    if (exit_code == 0 &&
+        !preview_ipc_service->MarkStoppedClean(
+            preview_snapshot.tick_stream_sequence)) {
+        exit_code = 1;
+    }
+    if (promoted && exit_code == 0) {
+        if (!recovered_ipc_service->MarkStoppedClean(
+                shadow_snapshot.tick_stream_sequence)) {
+            exit_code = 1;
+        }
+    } else {
+        recovered_ipc_service->MarkFailed();
+    }
+    if (exit_code != 0) {
+        preview_ipc_service->MarkFailed();
+        recovered_ipc_service->MarkFailed();
+    }
+
+    const recovery::LiveJournalSnapshotV1 final_journal =
+        live_journal->Snapshot();
+    const recovery::OnlineRecoverySnapshotV1 final_recovery =
+        handoff->Snapshot();
+    std::cerr
+        << "mdl-production-router: online final: exit_code="
+        << exit_code
+        << " preview_records="
+        << preview_snapshot.store.appended_records
+        << " recovered_records="
+        << shadow_snapshot.store.appended_records
+        << " journal_accepted=" << final_journal.accepted_serial
+        << " journal_committed=" << final_journal.committed_serial
+        << " journal_bytes=" << final_journal.committed_bytes
+        << " journal_duplicates_suppressed="
+        << final_recovery.journal_duplicates_suppressed
+        << " journal_last_read="
+        << final_recovery.last_journal_serial
+        << " promotion_journal_frontier="
+        << final_recovery.promotion_journal_frontier
+        << " promotion_shadow_ingress_frontier="
+        << final_recovery.promotion_shadow_ingress_frontier
+        << " csv_publications="
+        << final_recovery.csv_publications
+        << " journal_suffix_publications="
+        << final_recovery.journal_suffix_publications
+        << " replay_throttle_events="
+        << final_recovery.replay_throttle_events
+        << " replay_pause_events="
+        << final_recovery.replay_pause_events
+        << " promotion_realtime_ns="
+        << final_recovery.promotion_realtime_ns
+        << " recovered=" << (promoted ? "true" : "false")
+        << '\n';
+    return exit_code;
+}
+
 int Run(const Options& options) {
     std::uint32_t current_trade_date = 0U;
     if (!CurrentFixedUtc8TradeDate(&current_trade_date)) {
@@ -1096,6 +2505,14 @@ int Run(const Options& options) {
                "complete Shanghai+Shenzhen A-share coverage\n";
         return 1;
     }
+    if (options.intraday_recovery_mode ==
+        Options::IntradayRecoveryMode::kOnline) {
+        return RunOnlineRecovery(
+            options,
+            run_id,
+            daily_catalog,
+            BuildKLineWindows(options));
+    }
     std::unique_ptr<market::InstrumentRuntimeStateV2> runtime_state;
     const market::InstrumentRuntimeStateErrorV2 runtime_error =
         market::InstrumentRuntimeStateV2::Create(
@@ -1110,6 +2527,13 @@ int Run(const Options& options) {
                    runtime_error)
             << '\n';
         return 1;
+    }
+    if (options.intraday_live_partial) {
+        return RunLivePartial(
+            options,
+            run_id,
+            daily_catalog,
+            runtime_state.get());
     }
 
     const std::vector<market::KLineWindowSpecV1> kline_windows =
@@ -1231,6 +2655,11 @@ int Run(const Options& options) {
     ipc_config.trade_date = options.trade_date;
     ipc_config.daily_catalog = daily_catalog;
     ipc_config.kline_windows = kline_windows;
+    ipc_config.coverage_from_open = true;
+    ipc_config.startup_prefix_recovered = csv_startup_recovery;
+    ipc_config.full_day_kline_valid = !kline_windows.empty();
+    ipc_config.full_day_factor_valid = true;
+    ipc_config.certified_prefix_valid = false;
     ipc_config.tick_ring_capacity =
         options.ipc_tick_ring_records;
     ipc_config.key_arena_bytes = options.ipc_key_arena_bytes;
@@ -1407,7 +2836,16 @@ int Run(const Options& options) {
                     certified_service->StopControl();
                     certified_service.reset();
                 } else if (!csv_startup_recovery) {
-                    certified_control_active = true;
+                    if (!ipc_service->MarkCertifiedPrefixValid()) {
+                        std::cerr
+                            << "mdl-production-router: CERTIFIED V1 "
+                               "DEGRADED: FAST certified-prefix flag "
+                               "publication failed\n";
+                        certified_service->StopControl();
+                        certified_service.reset();
+                    } else {
+                        certified_control_active = true;
+                    }
                 }
             }
         }
@@ -1473,6 +2911,54 @@ int Run(const Options& options) {
                 << (detail.empty() ? "" : ": ") << detail << '\n';
         }
         if (certified_service != nullptr) {
+            const ipc::RealtimeCertifiedServiceSnapshotV1
+                startup_certified_snapshot =
+                    certified_service->Snapshot();
+            std::cerr
+                << "mdl-production-router: CERTIFIED startup failure: "
+                << "state="
+                << static_cast<std::uint32_t>(
+                       startup_certified_snapshot.state)
+                << " canonical_apply_frontier="
+                << startup_certified_snapshot.canonical_apply_frontier
+                << " observed_native_messages="
+                << startup_certified_snapshot
+                       .observed_native_message_count
+                << " enqueued_observations="
+                << startup_certified_snapshot.enqueued_observations
+                << " enqueued_applied_records="
+                << startup_certified_snapshot.enqueued_applied_records
+                << " processed_handoffs="
+                << startup_certified_snapshot.processed_handoffs
+                << " pending_token_count="
+                << startup_certified_snapshot.pending_token_count
+                << " conflicts="
+                << startup_certified_snapshot
+                       .conflicting_duplicate_count
+                << " resource_exhaustions="
+                << startup_certified_snapshot
+                       .resource_exhaustion_count
+                << " dropped_handoffs="
+                << startup_certified_snapshot.dropped_handoffs
+                << " worker_running="
+                << (startup_certified_snapshot.worker_running
+                        ? "true"
+                        : "false")
+                << " globally_frozen_resource="
+                << (startup_certified_snapshot
+                            .globally_frozen_resource
+                        ? "true"
+                        : "false")
+                << " frozen_channel_count="
+                << startup_certified_snapshot.frozen_channel_count
+                << " wire_snapshot_consistent="
+                << (startup_certified_snapshot
+                            .wire_snapshot_consistent
+                        ? "true"
+                        : "false")
+                << " fast_failed="
+                << (ipc_service->failed() ? "true" : "false")
+                << '\n';
             certified_service->StopControl();
         }
         ipc_service->MarkFailed();
@@ -1557,6 +3043,12 @@ int Run(const Options& options) {
                        "errno="
                     << certified_system_error
                     << "; the required FAST path remains ACTIVE\n";
+                certified_service->StopControl();
+            } else if (!ipc_service->MarkCertifiedPrefixValid()) {
+                std::cerr
+                    << "mdl-production-router: CERTIFIED V1 DEGRADED: "
+                       "FAST certified-prefix flag publication failed; "
+                       "the required FAST path remains ACTIVE\n";
                 certified_service->StopControl();
             } else {
                 certified_control_active = true;

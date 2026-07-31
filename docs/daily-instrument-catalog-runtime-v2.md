@@ -1,4 +1,4 @@
-# Daily Instrument Catalog Runtime V2.2
+# Daily Instrument Catalog Runtime V2.3
 
 ## Session contract
 
@@ -24,13 +24,19 @@ coverage declaration, ordered identities, metadata, and external IDs.
 Shanghai+Shenzhen A-share scope. It says nothing about other products,
 complete-from-open history, or data availability for each identity.
 
+Wire V2.3 adds `LIVE_PARTIAL` and explicit coverage/recovery/full-day/
+CERTIFIED-prefix header flags while retaining the V2.2 dense-catalog layout
+contract. Readers validate the exact supported minor and invalid state/flag
+combinations, so producer, C reader, and Python client must be upgraded
+together rather than treating V2.3 as an ignorable V2.2 extension.
+
 ## Startup order
 
 ```text
 load and validate strict premarket file
   -> classify A shares, sort, deduplicate, assign dense IDs, hash, freeze
   -> allocate dense runtime availability state and Store
-  -> create Wire V2.2 mapping
+  -> create Wire V2.3 mapping
   -> prepublish every BOUND_NO_DATA identity and exact key
   -> IPC ACTIVE
   -> order-event aggregator READY (when configured)
@@ -145,7 +151,10 @@ Reader selections are:
 - `FACTOR_ELIGIBLE`.
 
 The historical `BOUND` and `OBSERVED_ANY` names remain source aliases only;
-Wire V2.2 readers validate the daily scope and reject legacy/partial catalogs.
+Wire V2.2+ readers validate the daily scope and reject legacy/incomplete
+catalogs. Wire V2.3 `LIVE_PARTIAL` changes coverage/query semantics, not this
+immutable catalog rule: preview mappings also prepublish the complete daily
+identity table before their latest-value control plane starts.
 
 C++, C ABI, and Python full/rolling raw and derived event readers retain their
 existing finite-EOF and verified-checkpoint contracts. Catalog members with
@@ -168,6 +177,9 @@ and accepted/applied distance. Queue publication timestamps are sampled
 immediately before the irreversible accepted commit; all operations after
 commit are non-throwing atomic publication/notification.
 
-This version intentionally does not add Parquet/Arrow output or turn the
-same-day vendor-CSV startup catch-up into arbitrary-checkpoint replay, ring
-overrun catch-up, WAL restore, or producer crash recovery.
+This version intentionally does not add Parquet/Arrow output or turn same-day
+vendor-CSV bootstrap into arbitrary-checkpoint replay, ring-overrun catch-up,
+or previous-process recovery. Online recovery has a session-local live WAL,
+but a new process requires an empty journal directory and does not resume old
+segments. See `csv-startup-recovery-v1.md` for the distinction between the
+normal, blocking-recovery, preview, and shadow callback paths.

@@ -369,6 +369,7 @@ int main(int argc, char** argv) {
     config.session_epoch = kEpoch;
     config.trade_date = kTradeDate;
     config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = true;
     config.tick_ring_capacity = 8U;
     config.key_arena_bytes = 64U;
     config.maximum_mapping_bytes = 8U * 1024U * 1024U;

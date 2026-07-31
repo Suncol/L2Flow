@@ -149,6 +149,26 @@ class NativeSessionHealth:
     def coverage_lost(self) -> bool:
         return bool(self.flags & 0x1)
 
+    @property
+    def coverage_from_open(self) -> bool:
+        return bool(self.flags & (1 << 2))
+
+    @property
+    def startup_prefix_recovered(self) -> bool:
+        return bool(self.flags & (1 << 3))
+
+    @property
+    def full_day_kline_valid(self) -> bool:
+        return bool(self.flags & (1 << 4))
+
+    @property
+    def full_day_factor_valid(self) -> bool:
+        return bool(self.flags & (1 << 5))
+
+    @property
+    def certified_prefix_valid(self) -> bool:
+        return bool(self.flags & (1 << 6))
+
 
 def _candidate_library_paths() -> Iterable[str]:
     configured = os.environ.get("L2FLOW_SHM_READER_LIBRARY")
@@ -326,7 +346,7 @@ def _session_from_c(value: _SessionInfoC) -> SessionInfo:
         )
     if value.coverage_complete != 1:
         raise WireFormatError("Wire V2 coverage_complete must be one")
-    if value.flags & ~0x3:
+    if value.flags & ~0x7F:
         raise WireFormatError("session C result has unknown flags")
     try:
         return SessionInfo(
@@ -510,7 +530,7 @@ class NativeReader:
             _raise_native("health_v2", code)
             if (
                 any(output.reserved)
-                or output.flags & ~0x3
+                or output.flags & ~0x7F
                 or output.session_epoch == 0
             ):
                 raise WireFormatError(

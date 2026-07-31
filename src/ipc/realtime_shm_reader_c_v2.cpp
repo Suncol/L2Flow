@@ -235,18 +235,68 @@ bool CheckedEnd(
 }
 
 bool KnownServerState(std::uint32_t state) noexcept {
-    return state >= static_cast<std::uint32_t>(
-                        RealtimeServerStateV2::kInitializing) &&
-           state <=
-               static_cast<std::uint32_t>(
-                   RealtimeServerStateV2::kFailed);
+    return state == static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kInitializing) ||
+           state == static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kActive) ||
+           state == static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kDraining) ||
+           state == static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kStoppedClean) ||
+           state == static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kFailed) ||
+           state == static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kLivePartial);
 }
 
 bool HeaderFlagsValid(std::uint32_t flags) noexcept {
     constexpr std::uint32_t known =
         l2flow::ipc::kRealtimeHeaderCoverageLostV2 |
-        l2flow::ipc::kRealtimeHeaderKLineEnabledV2;
-    return (flags & ~known) == 0U;
+        l2flow::ipc::kRealtimeHeaderKLineEnabledV2 |
+        l2flow::ipc::kRealtimeHeaderCoverageFromOpenV2 |
+        l2flow::ipc::kRealtimeHeaderStartupPrefixRecoveredV2 |
+        l2flow::ipc::kRealtimeHeaderFullDayKLineValidV2 |
+        l2flow::ipc::kRealtimeHeaderFullDayFactorValidV2 |
+        l2flow::ipc::kRealtimeHeaderCertifiedPrefixValidV2;
+    const std::uint32_t strong =
+        l2flow::ipc::kRealtimeHeaderStartupPrefixRecoveredV2 |
+        l2flow::ipc::kRealtimeHeaderFullDayKLineValidV2 |
+        l2flow::ipc::kRealtimeHeaderFullDayFactorValidV2 |
+        l2flow::ipc::kRealtimeHeaderCertifiedPrefixValidV2;
+    return (flags & ~known) == 0U &&
+           ((flags & strong) == 0U ||
+            (flags &
+             l2flow::ipc::kRealtimeHeaderCoverageFromOpenV2) != 0U) &&
+           ((flags &
+             l2flow::ipc::kRealtimeHeaderFullDayKLineValidV2) == 0U ||
+            (flags & l2flow::ipc::kRealtimeHeaderKLineEnabledV2) != 0U);
+}
+
+bool StateFlagsValid(
+    std::uint32_t state,
+    std::uint32_t flags) noexcept {
+    if (!KnownServerState(state) || !HeaderFlagsValid(flags)) {
+        return false;
+    }
+    if (state == static_cast<std::uint32_t>(
+                     RealtimeServerStateV2::kActive)) {
+        return (flags &
+                l2flow::ipc::kRealtimeHeaderCoverageFromOpenV2) != 0U;
+    }
+    if (state == static_cast<std::uint32_t>(
+                     RealtimeServerStateV2::kLivePartial)) {
+        const std::uint32_t forbidden =
+            l2flow::ipc::kRealtimeHeaderCoverageFromOpenV2 |
+            l2flow::ipc::kRealtimeHeaderStartupPrefixRecoveredV2 |
+            l2flow::ipc::kRealtimeHeaderFullDayKLineValidV2 |
+            l2flow::ipc::kRealtimeHeaderFullDayFactorValidV2 |
+            l2flow::ipc::kRealtimeHeaderCertifiedPrefixValidV2;
+        return (flags & forbidden) == 0U;
+    }
+    // DRAINING and STOPPED_CLEAN can originate from either ACTIVE or
+    // LIVE_PARTIAL, while INITIALIZING/FAILED can retain a configured flag
+    // set that was never exposed as ACTIVE.
+    return true;
 }
 
 bool HealthyForRead(const RealtimeWireHeaderV2& header) noexcept {
@@ -260,11 +310,14 @@ bool HealthyForRead(const RealtimeWireHeaderV2& header) noexcept {
                 RealtimeServerStateV2::kActive) ||
         state ==
             static_cast<std::uint32_t>(
+                RealtimeServerStateV2::kLivePartial) ||
+        state ==
+            static_cast<std::uint32_t>(
                 RealtimeServerStateV2::kDraining) ||
         state ==
             static_cast<std::uint32_t>(
                 RealtimeServerStateV2::kStoppedClean);
-    return HeaderFlagsValid(flags) &&
+    return StateFlagsValid(state, flags) &&
            (flags &
             l2flow::ipc::kRealtimeHeaderCoverageLostV2) == 0U &&
            readable_state;
@@ -404,8 +457,9 @@ StableCopyResult CopyCatalogCut(
         if (begin != end) {
             continue;
         }
-        // Wire V2.2 publishes the complete dense daily catalog before
-        // ACTIVE. Identity never grows or renumbers during the session.
+        // Wire V2.2+ publishes the complete dense daily catalog before
+        // ACTIVE/LIVE_PARTIAL. Identity never grows or renumbers during the
+        // session.
         if (begin != header.capacity ||
             snapshot.catalog_generation != 1U ||
             !AnyNonzero(snapshot.catalog_digest)) {
@@ -1049,7 +1103,8 @@ PointRowResult ResolvePointOrdinal(
     }
     const std::size_t ordinal =
         static_cast<std::size_t>(instrument_id - 1U);
-    // Wire V2.2 prepublishes every dense daily identity before ACTIVE.
+    // Wire V2.2+ prepublishes every dense daily identity before
+    // ACTIVE/LIVE_PARTIAL.
     // A partial bound prefix is therefore corruption, not an UNBOUND
     // instrument state.
     const std::uint32_t bound_count =
@@ -1660,8 +1715,7 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
         header->reserved_catalog == 0U &&
         header->catalog_version != 0U &&
         AnyNonzero(header->layout_digest) &&
-        KnownServerState(initial_state) &&
-        HeaderFlagsValid(initial_flags) &&
+        StateFlagsValid(initial_state, initial_flags) &&
         ((header->window_count != 0U) ==
          ((initial_flags &
            l2flow::ipc::kRealtimeHeaderKLineEnabledV2) != 0U)) &&
@@ -1894,8 +1948,7 @@ extern "C" int l2flow_shm_reader_session_v2(
         reader->header->catalog_trade_date;
     result.catalog_version =
         reader->header->catalog_version;
-    if (!KnownServerState(result.server_state) ||
-        !HeaderFlagsValid(result.flags) ||
+    if (!StateFlagsValid(result.server_state, result.flags) ||
         result.tick_contiguous_published_sequence >
             result.tick_highest_published_sequence) {
         return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
@@ -1929,8 +1982,7 @@ extern "C" int l2flow_shm_reader_health_v2(
         if (state_begin != result.server_state) {
             continue;
         }
-        if (!KnownServerState(result.server_state) ||
-            !HeaderFlagsValid(result.flags)) {
+        if (!StateFlagsValid(result.server_state, result.flags)) {
             return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
         }
         *output = result;

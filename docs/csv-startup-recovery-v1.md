@@ -3,23 +3,52 @@
 ## 1. 目标与边界
 
 当 `mdl-production-router` 在交易日盘中才启动时，通联客户端已经生成了从
-开盘到当前时刻的 CSV。V1 在连接实时 SDK 的同时暂存回调，将 CSV 中的历史
-前缀按正常生产路径送入 decoder、Instrument Store、KLine 和 latest；在同一
-会话、无损 callback 的显式运维契约下，再用精确重叠及 tuple fence/cutoff
-验证 CSV/live 闭合接管，最后排空暂存消息并原子切换到实时直通。
+开盘到当前时刻的 CSV。V1 现在提供两个显式模式：
 
-本功能解决的是**同一进程本次启动时的盘中补数**。它不是 Raw WAL，不读取
-任意应用 checkpoint，也不加载上一次进程序列化的内部顺序号、KLine/因子
-状态或 IPC cursor；需要的 Store、KLine 与 latest 状态由本次 CSV 回放经
-正常路径重新构建。CSV 回放和接管成功后，新的进程仍生成自己从 1 开始的
+- `blocking`（默认）：连接实时 SDK 后先把 callback 深拷贝到有界内存
+  startup buffer；CSV 通过生产 pipeline 重建 Store，闭合 CSV/live 接缝并
+  排空 buffer 后才开放完整服务。这保留原有行为。
+- `online`：唯一 SDK owner 先把受支持 callback 深拷贝到有界、异步写盘的
+  live journal，再立即推进独立 `LIVE_PARTIAL` preview pipeline；CSV 只
+  进入 SDK-less shadow pipeline，shadow 从 journal 追到固定边界后才开放
+  recovered 服务。
+
+两种模式都在同一会话、无损 callback 的显式运维契约下，用精确重叠及
+tuple fence/cutoff 验证 CSV/live 闭合接管。`online` 不会让较旧 CSV 与较新
+live callback 直接并发写同一个 Store；preview 与 shadow 始终是两套状态。
+
+本功能解决的是**同一进程本次启动时的盘中补数**。它不读取任意应用
+checkpoint，也不加载上一次进程序列化的内部顺序号、KLine/因子状态或 IPC
+cursor；需要的完整 Store、KLine 与 Factor 状态由本次 CSV+live journal 经
+shadow 正常路径重新构建。`online` 的 live journal 只服务当前 bootstrap
+session：新进程要求 journal 目录为空，不恢复旧 segment，因此它不是进程
+崩溃后的自动续跑机制。恢复成功后，各 pipeline 仍生成自己从 1 开始的
 `global_ingress_sequence`、`source_sequence` 和 `tick_stream_sequence`。
 
-生产入口要求以下两个选项恰好选择一个：
+生产入口要求以下三个 startup mode 恰好选择一个：
 
 ```text
 --intraday-store-from-open
 --intraday-recovery-csv-dir /absolute/path/to/vendor-csv-directory
+--intraday-live-partial
 ```
+
+前两个是能够建立 `coverage_from_open=true` 的 coverage source；第三个明确
+表示盘中从本进程启动点开始、且不进行 recovery。它只开放
+`LIVE_PARTIAL` latest 查询，强完整性 flags 全为 false，不属于本文描述的 CSV
+恢复流程，也不能随后在同一 run 内升级为完整 ACTIVE。
+
+只有选择 CSV 时才允许再指定：
+
+```text
+--intraday-recovery-mode blocking|online
+```
+
+不显式指定时为 `blocking`。盘中启动、不 recovery 时应显式使用
+`--intraday-live-partial`；此时不允许 recovery tuning、KLine、CERTIFIED 或
+event aggregator。盘中启动却使用
+`--intraday-store-from-open` 仍是错误的事实声明；该参数只适用于本进程确实
+从首条相关市场消息前开始接收并持续健康的会话。
 
 选择 `--intraday-recovery-csv-dir` 是运维方的事实断言：
 
@@ -36,7 +65,7 @@
 开盘完整”，程序也不能仅凭文件大小证明外部 writer 没有把一条更早收到的
 完整消息延迟到 capture 之后才落盘。
 
-恢复模式暂不允许与 `--event-aggregator-socket` 组合。外部
+两种恢复模式都暂不允许与 `--event-aggregator-socket` 组合。外部
 `mdl-order-event-aggregator` 没有在 ACTIVE 前接收整段回放的专用接管协议，
 也不能假设其有界 ring 足以容纳全天前缀。
 
@@ -65,10 +94,12 @@ record。所有由 CSV 重建并成功应用的 record 都携带
 ## 3. 文件快照与 CSV 解析契约
 
 客户端可以在回放期间继续追加 CSV。每个逻辑消息 tuple 在打开其根文件前，
-先在 live callback buffer 中记录一个 tuple-local serial fence。随后每个实际
-文件只打开一次，并在这个固定文件描述符上 `fstat` 一次取得初始 byte
-prefix；后续固定前缀解析使用同一个描述符和显式 offset，不会按路径重新
-打开而意外读到换名后的另一 inode：
+先把 tuple-local serial fence 与 callback capture 线性化：`blocking` 在
+startup buffer 锁下取 fence，`online` 在 live journal 分配 global/tuple
+callback serial 的同一 mutex 下取 fence。随后每个实际文件只打开一次，并
+在这个固定文件描述符上 `fstat` 一次取得初始 byte prefix；后续固定前缀
+解析使用同一个描述符和显式 offset，不会按路径重新打开而意外读到换名后的
+另一 inode：
 
 - 只有 LF 或 CRLF 结束的完整 record 才可发布；
 - 初始 cut 尾端尚未提交行终止符的半行会触发一次有界 extension；若仍不
@@ -183,7 +214,8 @@ V4 PDF 的 `mdl_6_28_0.csv` schema **没有 `ChannelNo` 列**，而当前 SDK
 - 同一上海 channel 的 `BizIndex` 顺序；
 - 同一深圳 channel 内 6.33/6.36 的联合 `ApplSeqNum` 顺序；
 - 每个快照文件自身的 record 顺序；
-- 实时 buffer 在排空阶段的 SDK callback 顺序。
+- 当前模式 capture 序列中的 SDK callback 顺序：`blocking` 为 startup
+  buffer 顺序，`online` 为 journal global callback serial。
 
 实现不声明可以还原开盘以来原始的跨市场或跨 channel callback 全序。
 回放时产生的进程内 global/tick 顺序是本次恢复进程的确定性应用顺序，不是
@@ -210,7 +242,7 @@ callback 顺序。这个接受条件不是对交易所序列的推断，也不�
 
 ## 6. 启动状态机与闭合接管
 
-恢复使用下面的单向状态机：
+`blocking` 使用下面的单向状态机：
 
 ```text
 建立全部有界下游
@@ -224,10 +256,34 @@ callback 顺序。这个接受条件不是对交易所序列的推断，也不�
   -> 等待已接受恢复前缀全部 applied
 ```
 
-SDK 必须先连接并开始暂存，不能先读完 CSV 再连接，否则两步之间存在不可
-证明的行情空洞。另一方面，CSV 不能直接 append 到 Store；它必须经过与
-实时消息相同的 admission、A 股过滤、catalog 查找、decoder、History、
-KLine、latest 和 applied sink 路径，否则会绕过顺序号、状态机和派生状态。
+`online` 使用独立状态，不能把上图中的 buffer 简单换成磁盘文件后仍写同一
+Store：
+
+```text
+建立 preview、journal、shadow、recovered IPC 和 CERTIFIED worker
+  -> SDK Connect
+  -> 每个受支持 callback：先 copy/reserve journal，再推进 preview
+  -> 逐 tuple 在线性化点记录 journal tuple fence，并固定 CSV byte prefix
+  -> CSV 只经 shadow admission/decoder/History/KLine/Factor/CERTIFIED 回放
+  -> 用 journal 中的 SeqNo + 语义 fingerprint/cutoff 验证并去重接缝
+  -> CSV 完成后固定 journal accepted_serial 为 promotion frontier B
+  -> journal reader 只从 durable committed prefix 追到 B
+  -> shadow generation + CERTIFIED prefix barrier
+  -> 开放 recovered control，记录 promotion realtime ns
+  -> 永久执行 cutoff guard，并按 global callback serial 继续消费 B+ journal
+```
+
+SDK 必须先连接并开始 lossless capture，不能先读完 CSV 再连接，否则两步
+之间存在不可证明的行情空洞。另一方面，CSV 不能在 live 已经推进之后直接
+append 到那个 live Store：`blocking` 在生产 Store 尚未接受 live 时通过同一
+pipeline 重建；`online` 则只写 shadow Store。两者都必须经过正常 admission、
+A 股过滤、catalog 查找、decoder、History、KLine、Factor 与 applied sink，
+否则会绕过顺序号、状态机和派生状态。
+
+online preview 的外部承诺仅是 latest snapshot/tick。实现内部仍使用从进程
+启动点开始的 partial Store，以保证 IPC latest record 的生命周期；它不是
+支持乱序历史插入的 Store，也不是物理上的专用 latest-only map。CSV 永远
+不会写进这个 partial Store。
 
 在 tuple fence 之前或同时已复制的 callback 必须在保留的 CSV 尾部找到
 相同 `SeqNo`；找不到就失败。在 fence 之后复制的 callback 有两种合法
@@ -237,10 +293,11 @@ KLine、latest 和 applied sink 路径，否则会绕过顺序号、状态机和
 小于等于 cutoff 的身份即使已经从 tail 淘汰也一律失败，不能被重复写入
 Store。进入 live suffix 后又回到 CSV prefix 同样失败。
 
-这个 guard 不在 startup buffer 暂空时销毁。CSV writer 可能已经提交某条
-record，而对应 callback 尚在厂商网络/SDK 内部、还没有进入本进程，因此
-`callback_pending=0` 不能证明所有重复项都已到达。恢复 session 的整个生命
-周期都保留每 tuple 的 immutable cutoff 与有界尾部指纹：
+这个 guard 不在 startup buffer 暂空或 journal reader 追到某个瞬时 frontier
+时销毁。CSV writer 可能已经提交某条 record，而对应 callback 尚在厂商
+网络/SDK 内部、还没有进入本进程，因此 `callback_pending=0` 或
+`journal_accepted == journal_consumed` 都不能证明所有重复项已到达。恢复
+session 的整个生命周期都保留每 tuple 的 immutable cutoff 与有界尾部指纹：
 
 - 后续 `SequenceID > cutoff` 的 callback 按厂商 callback 顺序正常进入
   实时路径；
@@ -265,36 +322,96 @@ offset、空字段的非规范 offset 诊断位或整个 body 的原始字节。
 “CSV 没有该字段”误判成随机冲突，也不会用忽略整个 payload 的方式掩盖
 真实冲突。
 
-CSV bulk replay 遇到 decoder 短暂背压时可在有界超时内等待，以便尽快追上
-当前实时位置；完成接管后的正常 SDK callback 仍保持非阻塞且满载
-fail-close。startup live buffer 同时受消息数和总字节数限制，不允许用无界
-内存换取恢复成功。
+CSV bulk replay 遇到 decoder 短暂背压时可在有界超时内等待。`blocking` 的
+startup live buffer 同时受消息数和总 wire bytes 限制；完成接管后的 SDK
+callback 仍保持非阻塞 admission、满载 fail-close。`online` callback 不等待
+CSV、shadow 或磁盘 `fdatasync`，但必须同步完成一次独立 head/body 深拷贝、
+逻辑 WAL 容量 reservation 和有界 writer-queue 入队；任何一步失败都在
+preview 推进前 fail-close。磁盘提交、容量和回放背压契约见第 11 节。
 
 ## 7. 首个 generation 与 FAST 查询可见性
 
-恢复模式下，FAST 共享映射先以 `INITIALIZING` 状态建立，可以接收内部
+两种模式的 recovered FAST 映射都先以 `INITIALIZING` 建立，可以接收内部
 applied record 和 generation publication，但控制线程尚未启动，外部客户端
 不能取得一个半恢复 session。
 
-Pipeline 创建成功表示 CSV 回放、闭合 live handoff、buffer 排空和恢复前缀
-applied 均已完成。生产入口随后立即执行一次
-`CutAndPublishGeneration`，发布首个 immutable Store generation，并发布
-已配置的对应 KLine generation；只有这些适用步骤都成功后才启动 FAST
-控制线程并进入 `ACTIVE`。因此：
+### 7.1 blocking promotion
 
-- 首次可成功打开的 complete-history/delta 查询已经有完整恢复前缀可固定；
-- 激活时 latest 与已启用的 KLine 已由同一回放路径重建；
-- 之后继续按正常实时路径接收，并由周期 cut 发布后续 generation；
-- replay、handoff 或首 generation 任一步失败都不会把 FAST 切到 ACTIVE。
+blocking Pipeline 创建成功表示 CSV 回放、闭合 live handoff、buffer 排空和
+恢复前缀 applied 均已完成。生产入口随后立即执行一次
+`CutAndPublishGeneration`，发布首个 immutable Store generation、匹配的
+Factor generation，以及已配置的 KLine generation；只有这些适用步骤都成功
+后才启动 FAST 控制线程并进入 `ACTIVE`。因此首次可成功打开的完整
+History/delta 查询已经有从开盘闭合的 generation 可固定。
 
-可选 CERTIFIED sidecar 在恢复期间也只启动投影 worker，不启动查询控制
-线程。首个 generation 成功且 FAST 激活后，入口向 CERTIFIED handoff
-队列插入 FIFO barrier；worker 必须先处理完 barrier 之前的 observation 和
-applied record、完成 Tick/Event 投影并提交状态 header，才会启动
-CERTIFIED 控制线程。激活点只接受 `NO_DATA` 或 `CONTIGUOUS` 的一致状态；
-gap、conflict、资源冻结、barrier 超时或控制线程启动失败都会让这个可选
-sidecar 显式降级并停止，但不会撤销已经完整恢复的必需 FAST 服务。CERTIFIED
-不能替代 FAST 的恢复成功判定。
+blocking 的可选 CERTIFIED sidecar 在恢复期间只启动投影 worker。FAST 已经
+激活后，入口再插入 FIFO prefix barrier；worker 处理完 barrier 之前的
+observation/applied record 并提交 `NO_DATA` 或 `CONTIGUOUS` 状态后，才启动
+CERTIFIED 控制线程。该模式下，gap、conflict、资源冻结、barrier 超时或
+CERTIFIED control 启动失败只降级可选 sidecar，不撤销已完整恢复的 FAST。
+
+### 7.2 online preview 与 promotion
+
+online 会先开放另一个 socket/run：
+
+```text
+server_state=LIVE_PARTIAL
+coverage_from_open=false
+startup_prefix_recovered=false
+full_day_kline_valid=false
+full_day_factor_valid=false
+certified_prefix_valid=false
+```
+
+preview 的 `GET_SESSION` 和 latest snapshot/tick 可用；History 和 tick delta
+由服务端拒绝。`LIVE_PARTIAL` 即使随后进入 `DRAINING` 或 `STOPPED_CLEAN`，
+也不会因状态名字变化而获得 from-open coverage。正常 heartbeat stale、
+coverage-lost 与布局验证仍然适用。
+
+CSV 完成并确认五个生产 tuple fence 都已捕获后，coordinator 在 journal capture
+mutex 的一致快照中读取 `accepted_serial`，固定为 promotion frontier `B`。
+后来的 callback 只能获得 `B+1...`，不能移动 `B`。reader 等待 journal 的
+`committed_serial >= B`，验证并消费恰好到 `B`；然后 shadow pipeline 的 parked
+generation fence 等待已接受前缀 applied，发布首个 Store/Factor/KLine
+generation。
+
+默认开启 native-gap recovery 时，online CERTIFIED worker 是 promotion 的
+必需组成部分。`WaitForPrefixBarrier` 只封闭 worker FIFO prefix，不提前启动
+查询 control；worker stop、gap/conflict、resource exhaustion/freeze、dropped
+handoff 或 barrier 失败都会终止整个 promotion，而不是退化成只有 FAST。
+显式 `--disable-native-gap-recovery` 时不创建该 sidecar，最终
+`certified_prefix_valid=false`。
+
+最终 promotion 在一个进程内 mutex 中与 shutdown 的未完成取消决策互斥。
+临界区在 control exposure 前、以及 FAST/flag publication 后分别复核：journal
+仍处于 healthy WRITING、其 committed frontier 仍覆盖 B、唯一 preview/SDK
+pipeline 仍在 accepting 且未 fatal/跨交易日、preview IPC 未失败。顺序为：
+
+```text
+首 generation 已发布
+  -> CERTIFIED prefix barrier 已完成（若启用）
+  -> CERTIFIED control 启动（若启用）
+  -> recovered FAST control 启动并进入 ACTIVE
+  -> FAST release-publish certified_prefix_valid（若启用）
+  -> 记录非零 system-clock realtime ns
+  -> promoted=true
+```
+
+因此 completion time 是上述整组操作全部成功后的时间，不是 CSV EOF、B 捕获
+或首 generation cut 的时间。FAST control 启动到 certified flag publication
+之间存在同一临界区内的极短发布窗口；此时 flag 仍为 false，不会虚构已证明
+状态，且后续任一步失败会把 recovered mapping 标记为 FAILED。
+
+preview、recovered FAST 和 CERTIFIED 使用独立 UDS。多个 socket 无法用一个
+CPU 指令同时开始对查询返回可用 session；实现选择先启动已经封闭 prefix 的
+CERTIFIED control，最后启动 authoritative recovered FAST control。这里也
+没有把 preview Store 原地替换为 shadow Store：preview/recovered 拥有不同
+`run_id`，客户端必须显式切换 socket 并丢弃旧 run 的 cursor/checkpoint。
+promotion 后 preview 仍保持 partial 查询，shadow 则按 journal global serial
+消费 `B+`，并由周期 generation cut 继续发布严格连续的 recovered prefix。
+preview header 当前不携带 recovered `run_id` 或自动 redirect；部署层应根据
+promotion 日志/健康探针重试 recovered `GET_SESSION`，不能等待 preview 自己
+变成 ACTIVE。
 
 ## 8. 失败语义
 
@@ -309,13 +426,25 @@ sidecar 显式降级并停止，但不会撤销已经完整恢复的必需 FAST 
 - CSV/live 缺少应有 overlap，或同一 overlap 身份的 payload 冲突；
 - ACTIVE 后迟到 callback 命中已淘汰的 CSV 身份、与 CSV 语义冲突，或在
   已进入 live suffix 后返回 CSV prefix；
-- live buffer、CSV pending merge、消息池、Store 或其他有界资源耗尽；
+- blocking live buffer、online journal writer queue/逻辑 byte budget、CSV
+  pending merge、消息池、Store 或其他有界资源耗尽；
+- journal 目录非空/不合法、segment create/open/write/`fdatasync` 失败、
+  committed record 的 header/session/serial/offset/CRC32C/SHA-256 校验失败，
+  或 shutdown 后 committed frontier 未追平 accepted frontier；
+- online preview callback 已无法完成独立 capture，或 preview/shadow pipeline
+  任一方 fatal；
+- online CERTIFIED worker 停止、resource freeze/exhaustion、dropped handoff、
+  conflicting duplicate、prefix barrier 或 control activation 失败；
 - 回放背压、接管或 applied-prefix 等待超时；
+- 首 generation、KLine/Factor publication、FAST/CERTIFIED control activation
+  或 promotion completion timestamp 失败；
 - 正常生产路径中的 catalog miss、跨交易日或下游应用失败。
 
-任一错误都使 Pipeline 创建/恢复失败并关闭本次 session；程序不会把部分
-Store 标记为“已从开盘恢复”，也不会在错误后跳过记录继续实时运行。诊断应
-包含错误类别，并在 CSV 错误可定位时包含文件和行号。
+任一错误都使 Pipeline 创建/恢复失败并关闭本次 session；online 在失败被
+主循环观察前可能短暂仍能查询其明确标记的 partial preview，但 recovered
+mapping 不会因此进入完整 ACTIVE。程序不会把部分 Store 标记为“已从开盘
+恢复”，也不会在错误后跳过记录继续实时运行。诊断应包含错误类别，并在
+CSV 错误可定位时包含文件和行号。
 
 ## 9. 三种完整性不能混为一谈
 
@@ -324,6 +453,26 @@ Store 标记为“已从开盘恢复”，也不会在错误后跳过记录继�
 | `coverage_from_open` | 运维声明该交易日从开盘到启动点由 CSV 覆盖，之后由闭合 live handoff 连续接管；只有整个恢复成功才允许成立 | 程序仅凭 `SeqNo` 自动证明了外部文件从开盘完整；上游交易所没有延迟发布或漏发 |
 | `record_coverage_complete` | 某个已发布 immutable generation/cursor 包含本进程在其 cut 范围内应有的全部 Store record | 载荷包含 SDK 的所有源字段；跨市场原始 callback 全序已恢复 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | record 数量或时间覆盖完整 |
+
+Wire V2.3 把服务状态与这些事实分开编码。健康 online preview 必须是
+`LIVE_PARTIAL`，且 `coverage_from_open`、`startup_prefix_recovered`、
+`full_day_kline_valid`、`full_day_factor_valid`、
+`certified_prefix_valid` 全为 false。`KLINE_ENABLED` 只表示布局里有 KLine
+表，不能替代 `full_day_kline_valid`；当前生产 preview 连 KLine window 也
+不配置。reader 会拒绝以下组合：
+
+- `ACTIVE` 但没有 `coverage_from_open`；
+- `LIVE_PARTIAL` 携带任一 from-open/recovered/full-day/CERTIFIED 强标志；
+- 任一强标志存在但 `coverage_from_open=false`；
+- `full_day_kline_valid=true` 但 KLine 布局未启用；
+- 任意未知 header flag bit。
+
+promotion 成功后的 recovered FAST 才会同时声明
+`server_state=ACTIVE`、`coverage_from_open=true`、
+`startup_prefix_recovered=true` 和适用的 full-day flags；只有启用了
+CERTIFIED 且 prefix barrier/control 成功时，
+`certified_prefix_valid=true`。`coverage_lost` 是独立的 fail-closed 覆盖项，
+一旦置位，原有 from-open 来源声明也不能使 session 继续被视为健康。
 
 现有 CoreV1 history/delta wire 的
 `record_coverage_complete=true` 与 `field_complete=false` 约定不因 CSV
@@ -349,14 +498,20 @@ Store 标记为“已从开盘恢复”，也不会在错误后跳过记录继�
    中的完整后缀交给 live；
 4. 恢复期间这些已打开文件保持 append-only，不原位改写、truncate/rewrite
    或复用 inode；
-5. Store record/内存上限和 startup buffer 上限足以容纳历史前缀及回放期间
-   的实时增长；
+5. Store record/内存上限足以容纳完整前缀；blocking 的 startup buffer 足以
+   容纳回放期间实时增长，online 则同时考虑 preview partial Store、shadow
+   full Store、journal queue/cache 和 WAL 磁盘增长；
 6. 未配置 `--event-aggregator-socket`；
 7. 预期 `coverage_from_open` 是运维事实声明，并接受深圳快照
    `ChannelNo=0` 及上海队列操作/订单 ID 为零、同时携带 source-field
-   unavailable notice 的字段边界。
+   unavailable notice 的字段边界；
+8. online 的 preview、recovered FAST、CERTIFIED（若启用）socket 两两不同，
+   都不存在旧路径；journal 目录为空、与 CSV 目录不同，底层文件系统有足够
+   空间且 I/O 延迟能支撑实测 callback 峰值；
+9. 客户端知道 preview 与 recovered 是两个 `run_id`，会在 promotion 后重新
+   GET_SESSION/建 cursor，不会跨 run 复用 instrument cursor/checkpoint。
 
-示例：
+blocking 示例：
 
 ```bash
 build/mdl-production-router \
@@ -373,12 +528,33 @@ build/mdl-production-router \
   --intraday-recovery-csv-dir /absolute/path/to/20260730
 ```
 
-startup live buffer 的消息/字节上限、总 warmup 和逐次背压等待可分别用
+online 示例：
+
+```bash
+build/mdl-production-router \
+  --sdk-library /absolute/path/to/vendor.so \
+  --session-epoch 1 \
+  --trade-date 20260730 \
+  --daily-catalog /absolute/path/to/daily.catalog \
+  --catalog-version 20260730 \
+  --server-address HOST:PORT \
+  --user-name USER \
+  --ipc-socket /absolute/path/to/recovered.sock \
+  --live-preview-ipc-socket /absolute/path/to/live-preview.sock \
+  --intraday-store-max-records 100000000 \
+  --intraday-store-memory-gib 64 \
+  --intraday-recovery-csv-dir /absolute/path/to/20260730 \
+  --intraday-recovery-mode online \
+  --intraday-recovery-journal-dir /absolute/path/to/empty-journal
+```
+
+blocking startup live buffer 的消息/字节上限可分别用
 `--intraday-recovery-live-buffer-messages`、
-`--intraday-recovery-live-buffer-mib`、
-`--intraday-recovery-warmup-seconds` 与
-`--intraday-recovery-backpressure-seconds` 调整；它们只能与 CSV 恢复模式
-一起使用。默认值依次为 262,144 条、512 MiB、1,800 秒和 30 秒。
+`--intraday-recovery-live-buffer-mib` 调整，默认 262,144 条和 512 MiB；这
+两个参数在 online 模式会被拒绝。两种 CSV 模式的总 warmup 和 shadow/
+replay 单条 admission 等待分别使用
+`--intraday-recovery-warmup-seconds`（默认 1,800）与
+`--intraday-recovery-backpressure-seconds`（默认 30）。
 
 消息上限统计 A 股过滤前、五个受支持 tuple 的全部已复制 callback；字节
 上限只统计每条消息精确的 MDL head+body，不包含 allocator、deque、哈希表
@@ -388,3 +564,146 @@ CSV replay+buffer drain 时长，再加运行余量；默认值只是有界 fall
 `SequenceID`，K 随 live buffer 消息上限设置。深圳双文件 merge 另有独立
 默认上限：2,000,000 条 pending message 和 512 MiB pending body；因此
 实际 RSS 可以明显高于 512 MiB live wire-byte 上限。
+
+## 11. online journal、追赶与背压契约
+
+### 11.1 callback capture 与 WAL 格式
+
+正常 `--intraday-store-from-open` 和 blocking callback 路径不创建 online
+journal。pipeline 配置里的 capture sink 为 null 时，普通 callback 只多一次
+nullable pointer 条件判断，仍直接进入原 `Ingest`；不会因此新增第二次
+inspect、clock read、message copy、allocation、virtual call 或 queue 操作。
+
+online 配置 capture sink 后，唯一 SDK callback owner 对每个受支持生产 tuple
+执行：
+
+```text
+一次结构 inspect
+  -> 读取 realtime/monotonic callback clocks
+  -> 深拷贝完整 vendor MDLMessageHead + body
+  -> 提取 tuple/source slot/SequenceID/native sequence descriptor
+  -> 在一个短 mutex 中分配 global serial + tuple serial
+  -> 预留本 record 及可能的新 segment header 的逻辑 WAL bytes
+  -> 放入有界 writer queue
+  -> 原消息进入 preview Ingest
+```
+
+五个受支持 tuple 中的非 A 股 callback 也先进入 journal，随后才由 preview/
+shadow 的既有 admission filter 排除。这样它们仍参与 tuple fence、SeqNo、
+digest/native descriptor 的闭合证明；过滤发生在 Store admission，而不是在
+lossless capture 之前。SDK 仍被配置为一个 callback thread，global serial
+因此表示本进程观察到的 callback 顺序，不声称是交易所跨市场全序。
+
+目录中的 segment 名为：
+
+```text
+segment-0000000001.wal
+segment-0000000002.wal
+...
+```
+
+segment header 绑定 journal major/minor、little-endian marker、preview
+`run_id`、trade date、segment index、first global serial、创建 realtime/
+monotonic ns，并带 CRC32C。每条 record 保存：
+
+- record/global/tuple serial 与 segment offset；
+- callback receive realtime/monotonic ns；
+- tuple、source slot、vendor `SequenceID`；
+- 完整 vendor header 与 body；
+- 可提取时的 native market/channel/sequence descriptor；
+- body SHA-256、body CRC32C 和覆盖 record header+body 的 CRC32C。
+
+reader 还会核对长度、保留字节、tuple/head 一致性、trade date、segment/offset
+连续性和严格 global serial。任一错误把整个 journal 标记为 failed；不会
+跳过坏 record 寻找下一个看似可读的后缀。
+
+### 11.2 accepted 不等于 committed
+
+`Capture()` 返回 true 的精确定义是：完整消息已有独立所有权、global/tuple
+serial 已分配、对应逻辑 byte budget 已 reservation，并已进入有界 writer
+queue。它**不表示该 callback 返回前已执行 `fdatasync`**。这样 callback 不
+受 CSV 速度或每条磁盘同步延迟阻塞，但 queue/byte reservation 失败会在
+preview 推进前立即失败整个 session。
+
+writer 按有界 batch 写 segment。只有当前 batch 的每个 record 都写完，所有
+跨越的旧 segment 在 close 前同步、最后 segment 也通过 `fdatasync` 后，才在
+mutex 下 release-publish：
+
+```text
+committed_serial = batch.back.global_serial
+```
+
+shadow reader 只等待和读取 `committed_serial` 覆盖的 prefix；从不把
+`accepted_serial` 当作磁盘可读性证明。`StopAndFlush()` 停止新 capture、排空
+queue、同步并 join writer，且只在 `committed_serial == accepted_serial` 时
+成功。
+
+`--intraday-recovery-journal-max-gib` 限制的是 segment/record header 与 body
+的**逻辑序列化总字节数**。实现会在 callback 入队前精确 reservation，但不
+做 fallocate，也不保证底层文件系统真的还有相同物理空间；真正的
+create/write/sync 失败仍会异步使 preview/recovery fail-closed。segment 大小
+必须不大于 total cap。当前 CLI 默认值为 512 GiB total、256 MiB segment、
+65,536 个 queued records；目录必须为空，已有 segment 不会被续写或自动
+清理。
+
+### 11.3 固定 frontier B 与永久 seam guard
+
+online CSV replay 完成后才快照 journal `accepted_serial` 为固定 `B`。这个
+快照和 callback serial 分配共用 journal mutex，所以并发 callback 要么属于
+`<=B`，要么严格属于 `B+`，不存在半分配 record。reader 随后等待 durable
+commit 并按 global serial 消费到 `B`：
+
+- 命中 retained `(tuple, SequenceID, semantic digest)` 的 record 是 CSV
+  duplicate，payload 相同才抑制；
+- 未命中但 tuple serial 不超过该 tuple fence，失败；
+- 未命中且 `SequenceID==0` 或 `SequenceID<=CSV maximum cutoff`，失败；
+- 只有同时越过 tuple fence 与 immutable maximum cutoff 的 record 才作为
+  live suffix 进入 shadow；
+- 某 tuple 一旦进入 live suffix，后来再命中 CSV prefix 也失败。
+
+CSV fingerprint 每 tuple 只保留数值最大的 262,144 个 `SequenceID`（当前
+生产 online 入口没有单独的 retention CLI）；全天只另存常数大小 maximum
+cutoff。若 fence 前身份已因容量淘汰，恢复选择 `overlap_missing` fail-close，
+不会猜测它等同于 CSV。到达 B 后的 parked generation barrier 证明 shadow
+已应用自身 accepted prefix；B 本身是 journal callback frontier，而
+`promotion_shadow_ingress_frontier` 只统计真正进入 A 股 shadow pipeline 的
+CSV/live publication，两者数值不要求相等。
+
+promotion 之后同一个 reader 和 seam 状态继续消费 `B+`，所以 cutoff guard
+不是启动临时对象。新到 journal record 可能在 shadow 中短暂滞后于 preview；
+recovered Store 始终保持从开盘连续的已应用前缀，而 `ACTIVE` 不等价于
+“已经读到此刻最后一个 SDK callback”。当前 Wire header 没有单独暴露
+journal accepted-minus-consumed backlog，运维应结合 promotion/final 日志和
+journal/recovery snapshot 指标观察这一差值。
+
+tail loop 每轮 journal read 最多等待 100 ms，并在下一轮复核唯一 preview/SDK
+owner 是否仍 accepting、未 fatal/跨交易日且 preview IPC 未失败。非 shutdown
+场景下任一条件失效会立即把 preview/recovered 标为 FAILED 并停止 CERTIFIED
+control；journal write/sync/corruption failure 则由 reader 的 condition wakeup
+直接传播，不等待最长可达 60 秒的 generation interval。
+
+### 11.4 CERTIFIED pressure gate 与现有调度边界
+
+online 的优先关系是 SDK callback capture/preview 高于 shadow CSV replay。
+coordinator 在每条 CSV publication 前读取 CERTIFIED handoff queue 估算水位：
+
+```text
+pressure < 50%                  立即继续
+50% <= pressure < high         每条 CSV sleep 50 us
+high <= pressure < 90%         每条 CSV sleep 500 us
+pressure >= 90%                每 1 ms 重查并暂停 CSV
+```
+
+`high` 由
+`--intraday-recovery-certified-high-watermark-percent` 配置，范围 51..89，
+默认 75。journal suffix 为了优先追赶 live，不执行 50%/high 的短 sleep，但在
+90% 同样暂停，避免主动向已接近满载的 CERTIFIED queue 继续灌入。每次检查还
+要求 worker running，且 resource freeze/exhaustion、dropped handoff、
+conflicting duplicate 均为 terminal；单纯暂停不能把已经丢失的证明修好。
+
+这里实现的是单 recovery thread 上的 per-record cooperative throttling，不是
+严格 CPU scheduler。当前没有 `--intraday-recovery-replay-workers`、
+`--intraday-recovery-replay-max-cpu-percent`、CPU quota 或 affinity 参数，也
+不会动态改变 decoder worker 数或 replay batch。若需要硬 CPU/IO 隔离，应在
+部署层使用 cgroup/调度策略并另行压测；不能把本水位 gate 描述成 CPU 百分比
+上限。

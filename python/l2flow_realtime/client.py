@@ -212,7 +212,11 @@ class L2FlowClient:
         if (
             self._stale_after_ns is not None
             and health.server_state
-            in (ServerState.ACTIVE, ServerState.DRAINING)
+            in (
+                ServerState.ACTIVE,
+                ServerState.LIVE_PARTIAL,
+                ServerState.DRAINING,
+            )
         ):
             heartbeat = health.heartbeat_monotonic_ns
             now = time.monotonic_ns()

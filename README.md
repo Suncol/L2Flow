@@ -7,7 +7,7 @@ strict premarket daily A-share catalog
   -> exact-key sort/deduplicate
   -> dense session-local IDs
   -> Store/runtime/IPC preallocation
-  -> Wire V2.2 ACTIVE
+  -> Wire V2.3 ACTIVE
 
 single-threaded vendor SDK callback
   -> inspect and exact-key extraction
@@ -34,7 +34,7 @@ The SDK remains configured for one callback thread.
 Before SDK Connect, production must load an absolute, regular, non-symlink
 catalog file that declares the configured trade date, a positive source
 version, complete Shanghai+Shenzhen subscription coverage, and exact opaque
-`SecurityID`/`SecurityIDSource` bytes. Wire V2.2 exposes:
+`SecurityID`/`SecurityIDSource` bytes. Wire V2.3 exposes:
 
 ```text
 catalog_scope             = DECLARED_DAILY_A_SHARE
@@ -64,6 +64,13 @@ catalog digest and cannot cross sessions.
 configured Shanghai+Shenzhen A-share subscription scope complete. It does not
 claim complete exchange-wide products, complete-from-open history, or that
 every catalog member has received data.
+
+Wire minor 3 adds `LIVE_PARTIAL` plus explicit from-open, startup-recovered,
+full-day KLine/Factor, and CERTIFIED-prefix flags. The C header exports stable
+numeric enums and the Python model exposes the same state/flags, but readers
+still validate the exact supported wire minor. Deploy the producer, native
+reader library, and Python package together; a V2.2 reader must reject a V2.3
+mapping instead of silently interpreting the new state.
 
 ## Latency-sensitive path
 
@@ -113,14 +120,21 @@ releases all lanes together. Post-cut records cannot enter History or mutate
 generation availability before the snapshot. Timeout, begin, or seal failure
 wakes every lane and fails closed.
 
-The runtime itself still does not persist captured messages and the optional
-Raw WAL is not a recovery source. It does, however, support one bounded
-mid-session startup path: replay the same-day, complete-from-open CSV files
-written by the vendor client, validate a closed CSV/live handoff with exact
-identity matches and tuple cutoffs under the explicit same-session,
-lossless-callback operating contract, and then switch to the live SDK stream.
-This is startup catch-up, not arbitrary checkpoint or process-crash recovery.
-The exact input, ordering, quality, and fail-closed contracts are documented in
+The ordinary from-open path does not persist captured callbacks. Same-day CSV
+startup recovery has two explicit modes. `blocking` retains the original
+bounded in-memory handoff and withholds production queries until replay is
+complete. `online` opts the single SDK owner into an asynchronous disk-backed
+live journal, publishes a separate `LIVE_PARTIAL` latest-value preview, and
+rebuilds a second shadow Store/KLine/Factor/CERTIFIED pipeline before exposing
+the recovered socket. Both modes validate a closed CSV/live handoff with exact
+identity matches and immutable tuple cutoffs under the explicit same-session,
+lossless-callback operating contract.
+
+The online journal is a session-local bootstrap source, not an arbitrary
+checkpoint or a previous-process restart source: a new run requires an empty
+journal directory and this version does not resume existing segments after a
+producer crash. The exact input, ordering, WAL, publication, and fail-closed
+contracts are documented in
 [`docs/csv-startup-recovery-v1.md`](docs/csv-startup-recovery-v1.md).
 
 ## Build and test
@@ -172,24 +186,115 @@ re-certified in a subsequent from-open live session. Deployments may set
 drain-time measurements; the certified handoff capacity must be a power of
 two. Queue exhaustion remains explicit and fail-closed for FAST source
 admission, while CERTIFIED exhaustion freezes only its last proven prefix.
+The online recovery coordinator additionally treats that frozen/dropped
+CERTIFIED state as terminal for promotion and the recovered session.
 
-The control socket must not already exist. Production requires exactly one
-coverage source:
+Control socket paths must not already exist. Production requires exactly one
+startup mode:
 
 - `--intraday-store-from-open` asserts that this process started before the
   first relevant market message and stayed healthy; or
 - `--intraday-recovery-csv-dir /absolute/path/to/same-day-csv` asserts that
   the vendor directory contains the current trade day's complete saved prefix
-  from market open. The router connects the live feed into a bounded startup
-  buffer while it reconstructs the Store through the normal decode path.
+  from market open; or
+- `--intraday-live-partial` explicitly starts a process-start-only service
+  without CSV recovery and without claiming coverage from market open.
 
-Recovery deployments can size that bounded handoff explicitly with
-`--intraday-recovery-live-buffer-messages`,
-`--intraday-recovery-live-buffer-mib`,
-`--intraday-recovery-warmup-seconds`, and
-`--intraday-recovery-backpressure-seconds`. The defaults are 262144 messages,
-512 MiB, 1800 seconds, and 30 seconds respectively; exceeding either live
-buffer bound fails startup instead of dropping data. The byte bound counts
+The standalone partial mode uses `--ipc-socket` as its only service socket. It
+connects the real SDK immediately and serves GET_SESSION plus latest
+snapshot/tick reads with `server_state=LIVE_PARTIAL`; History and delta opens
+are rejected. `coverage_from_open`, `startup_prefix_recovered`, both full-day
+validity flags, and `certified_prefix_valid` remain false for the whole run.
+It creates no startup buffer, live journal, CSV source, shadow pipeline, or
+CERTIFIED sidecar. KLine windows, a CERTIFIED socket, and the event aggregator
+are therefore rejected rather than silently exposed with provisional
+semantics. This is the factually correct mode for a mid-session launch that
+deliberately does not recover the market-open prefix; using
+`--intraday-store-from-open` in that situation remains an invalid operator
+assertion.
+
+CSV recovery selects `--intraday-recovery-mode blocking|online`; `blocking` is
+the default. Blocking mode connects the live feed into a bounded startup
+buffer while it reconstructs the production Store through the normal decode
+path. Its buffer can be sized with
+`--intraday-recovery-live-buffer-messages` and
+`--intraday-recovery-live-buffer-mib`; warmup and per-admission waits use
+`--intraday-recovery-warmup-seconds` and
+`--intraday-recovery-backpressure-seconds`. Defaults are 262,144 messages,
+512 MiB, 1,800 seconds, and 30 seconds. Exceeding either live-buffer bound
+fails startup instead of dropping data.
+
+Online mode requires all of:
+
+```text
+--intraday-recovery-mode online
+--intraday-recovery-csv-dir /absolute/path/to/same-day-csv
+--intraday-recovery-journal-dir /absolute/path/to/empty-journal-directory
+--live-preview-ipc-socket /absolute/path/to/live-preview.sock
+--ipc-socket /absolute/path/to/recovered.sock
+```
+
+The callback first makes an independent vendor-head/body copy and reserves its
+logical WAL bytes, then admits the original message to the preview pipeline.
+That successful capture is an asynchronous retention boundary, not proof that
+the record has already passed `fdatasync`. The WAL publishes a separate
+`committed_serial` only after the complete batch, including every crossed
+segment, is durable; shadow recovery never reads beyond that committed
+frontier. Queue exhaustion, logical journal-capacity exhaustion, write/sync
+failure, CRC/SHA mismatch, truncated segments, or a final
+`committed_serial != accepted_serial` fails the session closed.
+
+The preview and recovered services have different sockets and different
+`run_id` values. Before promotion, the preview reports `LIVE_PARTIAL`,
+`coverage_from_open=false`, and every full-day/recovered/CERTIFIED validity
+flag false. It serves GET_SESSION and latest snapshot/tick reads only;
+History/delta are rejected. Internally it currently retains a process-start
+partial Store to keep latest-record lifetimes safe—it is not a specialized
+physical latest-only container. The recovered mapping stays INITIALIZING and
+has no control worker until shadow replay has reached a fixed journal frontier,
+published its first Store/KLine/Factor generation, and completed the
+CERTIFIED prefix barrier when that default-on sidecar is enabled.
+
+The final promotion critical section rechecks the journal's health and durable
+coverage of that fixed frontier, plus the single SDK/preview owner's accepting,
+trade-date, pipeline, and IPC health, both before control exposure and after
+FAST/flag publication. A writer or preview failure during the cold generation/
+barrier window therefore cannot be logged as a successful promotion.
+
+Promotion starts the recovered control planes and records its realtime
+nanosecond only after all required steps and validity-flag publication have
+succeeded. The two Unix sockets cannot begin returning queryable sessions by
+one CPU instruction: CERTIFIED control is started first and recovered FAST
+last. Clients must explicitly switch from the preview socket/run to the
+recovered socket/run; there is no in-place Store replacement and cursors
+cannot cross the switch.
+The preview remains independently queryable while the process runs.
+It does not carry an automatic redirect or the recovered `run_id`; deployment
+readiness or a client-side probe must discover the recovered GET_SESSION.
+After promotion, the journal reader propagates WAL failure directly and its
+at-most-100-ms tail poll also checks the single preview/SDK owner. A non-shutdown
+owner failure marks both mappings FAILED and stops CERTIFIED control without
+waiting for the independently configurable generation interval.
+
+Online WAL tuning is bounded by
+`--intraday-recovery-journal-max-gib` (default 512),
+`--intraday-recovery-journal-segment-mib` (default 256), and
+`--intraday-recovery-journal-queue-records` (default 65,536). The byte cap is
+logical serialized WAL bytes, not filesystem preallocation or a guarantee of
+free physical space. The directory must be empty (or absent with an existing
+parent so it can be created) and distinct from the CSV directory. Explicit
+legacy live-buffer byte/message tuning is rejected in online mode.
+
+Online CSV replay samples the CERTIFIED handoff queue before each CSV
+publication: below 50% it runs normally, from 50% it sleeps briefly, at the
+configurable high watermark (default 75%) it slows further, and at 90% it
+pauses. Journal suffix catch-up skips the low/high sleeps but also pauses at
+90%. Worker stop, resource freeze/exhaustion, dropped handoffs, or conflicting
+duplicates is terminal rather than recoverable pressure. This version does
+not expose replay-worker-count, CPU-percent, CPU-quota, or affinity options;
+the pressure gate is cooperative per-record throttling.
+
+In blocking mode, the byte bound counts
 copied MDL head+body bytes, not allocator/deque/fingerprint overhead, and the
 message bound covers every supported subscribed callback before the A-share
 filter. Size both bounds from measured peak callback message/byte rates times
@@ -201,16 +306,21 @@ Shenzhen cross-file merge also has independent fixed defaults of 2,000,000 pendi
 messages and 512 MiB of pending body bytes, so process RSS can exceed the live
 wire-byte bound.
 
-In recovery mode the FAST control socket is not made ACTIVE until replay,
-closed live handoff, the first immutable Store generation, and any configured
-KLine publication all succeed. A failed or partial recovery is therefore
-never exposed as a queryable complete session.
+In both recovery modes the recovered FAST control socket is not made ACTIVE
+until replay, the closed live handoff through its selected frontier, the first
+immutable Store/Factor generation, and any configured KLine publication all
+succeed. A failed or partial recovery is therefore never exposed as a
+queryable complete session. Only the explicitly partial preview is available
+during online rebuild.
 
 The optional CERTIFIED sidecar starts only its projection worker during
-recovery. After FAST becomes active, a FIFO prefix barrier must commit a
-consistent `NO_DATA` or `CONTIGUOUS` certified state before its query control
-thread starts. A gap, conflict, resource freeze, or barrier failure degrades
-only that optional sidecar and leaves the required FAST service active.
+recovery. In blocking mode, FAST can become active first; a later FIFO prefix
+barrier must commit `NO_DATA` or `CONTIGUOUS` before CERTIFIED control starts,
+and sidecar failure degrades only CERTIFIED. In online mode, the default-on
+CERTIFIED worker is part of promotion: terminal handoff health or barrier/
+control failure aborts promotion, and recovered FAST is exposed only after the
+barrier. Disabling native-gap recovery explicitly removes that sidecar and
+leaves `certified_prefix_valid=false`.
 
 CSV recovery cannot be combined with `--event-aggregator-socket` in this
 version. The external aggregator has no pre-ACTIVE full-replay handoff and its

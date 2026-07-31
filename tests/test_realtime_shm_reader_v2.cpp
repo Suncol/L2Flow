@@ -270,7 +270,8 @@ public:
         header_->session_epoch = 17U;
         header_->trade_date = kTradeDate;
         header_->flags =
-            ipc::kRealtimeHeaderKLineEnabledV2;
+            ipc::kRealtimeHeaderKLineEnabledV2 |
+            ipc::kRealtimeHeaderCoverageFromOpenV2;
         header_->capacity = kCapacity;
         header_->window_count = 1U;
         header_->catalog_scope =
@@ -665,7 +666,9 @@ bool TestSessionAndPointStates() {
             health.server_state ==
                 static_cast<std::uint32_t>(
                     ipc::RealtimeServerStateV2::kActive) &&
-            health.flags == ipc::kRealtimeHeaderKLineEnabledV2 &&
+            health.flags ==
+                (ipc::kRealtimeHeaderKLineEnabledV2 |
+                 ipc::kRealtimeHeaderCoverageFromOpenV2) &&
             std::all_of(
                 std::begin(health.reserved),
                 std::end(health.reserved),
@@ -1188,6 +1191,50 @@ bool TestAvailableLatestIgnoresBusyInstrumentRow() {
 
 bool TestHardLayoutAndSealRejection() {
     bool ok = true;
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for ACTIVE coverage rejection");
+        fixture.header()->flags =
+            ipc::kRealtimeHeaderKLineEnabledV2;
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_LAYOUT_INVALID_V2,
+            "reader rejects impossible ACTIVE without coverage_from_open");
+    }
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for LIVE_PARTIAL state validation");
+        fixture.header()->server_state = static_cast<std::uint32_t>(
+            ipc::RealtimeServerStateV2::kLivePartial);
+        fixture.header()->flags =
+            ipc::kRealtimeHeaderKLineEnabledV2;
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_OK_V2,
+            "reader accepts LIVE_PARTIAL with only provisional KLine enablement");
+    }
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for LIVE_PARTIAL strong-flag rejection");
+        fixture.header()->server_state = static_cast<std::uint32_t>(
+            ipc::RealtimeServerStateV2::kLivePartial);
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_LAYOUT_INVALID_V2,
+            "reader rejects LIVE_PARTIAL carrying coverage_from_open");
+    }
     {
         MappedFixture fixture;
         ok &= Expect(
