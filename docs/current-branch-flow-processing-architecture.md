@@ -182,11 +182,11 @@ flowchart TB
 
 ```text
 apps
-  ├── recovery/mdl_csv_startup_replay
-  │     └── sdk message layout
+  ├── recovery/mdl_csv_startup_replay + live_journal + online_recovery
+  │     ├── sdk message layout
+  │     └── runtime/realtime_pipeline external-ingress API
   ├── runtime/realtime_pipeline
-  │     ├── sdk + recovery/startup_replay interface
-  │     ├── realtime/owned_ingress + optional_wal
+  │     ├── sdk + realtime/owned_ingress/capture interface
   │     ├── market/decoder + history + store + kline + latest
   │     └── factor
   └── ipc
@@ -210,13 +210,15 @@ Store generation 则由生产应用在每次 Pipeline cut 成功后显式传给 
 
 `--intraday-store-from-open`、`--intraday-recovery-csv-dir` 与
 `--intraday-live-partial` 的控制面激活点不同：常规 from-open 模式在创建
-Pipeline 前已经启动 FAST 控制线程；CSV 恢复
-模式则让 FAST 保持 INITIALIZING，SDK 先进入有界 callback buffer，完成 CSV
-回放与闭合接管并发布首个 Store/KLine generation 后才进入 ACTIVE。详见
+Pipeline 前已经启动 FAST 控制线程；CSV 恢复只使用 online 路径，先启动
+独立 `LIVE_PARTIAL` preview，再由唯一 SDK owner 把 callback 同步 capture 到
+live journal 并推进 preview。SDK-less shadow 从 CSV 和 durable journal 重建
+完整状态；recovered FAST 在 shadow generation 与可选 CERTIFIED prefix barrier
+完成后才进入 ACTIVE。详见
 [`csv-startup-recovery-v1.md`](csv-startup-recovery-v1.md)。
 
 盘中明确不恢复时，partial 模式在连接 SDK 前以 `LIVE_PARTIAL` 启动控制面，
-只允许 latest 查询。它不创建 startup buffer/journal/shadow，也不宣称
+只允许 latest 查询。它不创建 journal/shadow，也不宣称
 `coverage_from_open`，History/delta/KLine/CERTIFIED 均不可用。
 
 ```mermaid
@@ -224,77 +226,85 @@ sequenceDiagram
     autonumber
     participant Main as 生产主线程
     participant Reg as Registry
-    participant Ipc as IPC Service
-    participant Pipe as RealtimePipeline
-    participant Hist as RealtimeHistory
-    participant Dec as Decoder Threads
+    participant Preview as Preview IPC
+    participant Journal as Live Journal
+    participant Live as SDK-owner Pipeline
     participant Sdk as SDK
+    participant Shadow as SDK-less Shadow
+    participant Recovered as Recovered IPC
+    participant Certified as CERTIFIED
 
     Main->>Main: 校验当前 UTC+8 日期 == --trade-date
     Main->>Reg: 安全打开目录并校验 owner/version/SHA
     Reg-->>Main: 固定 session registry
-    Main->>Main: 生成 run_id，构造 PipelineConfig
-    opt 启用 IPC
-        Main->>Main: 校验 tick ring 可覆盖最坏重排窗口
-        Main->>Ipc: Create/Initialize memfd、布局、UDS
-        Ipc-->>Main: applied_record_sink
-    end
+    Main->>Main: 生成 run_id
     alt 从开盘实时启动
-        Main->>Ipc: Start 控制线程，state = active
-        Note over Main,Ipc: history/delta 在首个成功 cut 前仍返回 unavailable
-    else CSV 盘中恢复
-        Note over Main,Ipc: FAST 保持 INITIALIZING，不对外返回半恢复 session
+        Main->>Main: 校验 tick ring 可覆盖最坏重排窗口
+        Main->>Recovered: Create 并 Start FAST
+        Main->>Live: Create from-open Pipeline
+        Live->>Sdk: 最后创建并 Connect
+        Note over Live,Sdk: callback 直接进入 admission/decoder/History
+    else CSV online recovery
+        Main->>Journal: Create empty session-local WAL
+        Main->>Preview: Create 并 StartLivePartial
+        Main->>Live: Create preview Pipeline(capture=Journal)
+        Live->>Sdk: 最后创建并 Connect
+        Note over Live,Journal: 每个受支持 callback 先 copy/reserve，再进入 preview
+        Main->>Recovered: Create，控制面保持不可查询
+        Main->>Certified: 可选 Create + StartWorker
+        Main->>Shadow: Create(sdk=false, external ingress=true)
+        Main->>Shadow: CSV replay + durable journal prefix
+        Shadow-->>Main: 固定 promotion frontier 已 accepted
+        Main->>Shadow: CutAndPublishGeneration
+        Main->>Certified: 可选 prefix barrier + StartControl
+        Main->>Recovered: Start FAST
+        Main->>Recovered: 可选 MarkCertifiedPrefixValid
+        Note over Main,Recovered: recovery/promotion 在后台线程；主线程并行检查健康状态
+        Note over Journal,Shadow: promotion 后继续消费 journal tail
     end
-    Main->>Pipe: Create(config)
-    Pipe->>Hist: 创建 Store、latest、KLine worker 与 4×W 队列
-    Hist->>Hist: 启动 W 个 worker + 1 个 builder
-    Pipe->>Dec: 创建四个 decoder 并启动四线程
-    Pipe->>Sdk: 最后创建并 Connect
-    Note over Pipe,Sdk: Connect 可能同步触发回调；此时全部下游已就绪
-    alt CSV 盘中恢复
-        Note over Pipe,Sdk: callback 暂存；CSV 经同一 decoder/History 路径回放并闭合接管
-        Pipe-->>Main: 恢复前缀已全部 applied
-        Main->>Pipe: CutAndPublishGeneration
-        Main->>Ipc: 发布 KLine generation 并 Start FAST
-    else 从开盘实时启动
-        Pipe-->>Main: 实时路径已连接
-    end
-    Main->>Main: 进入周期 cut / 健康检查循环
-    Note over Main,Ipc: FAST history/delta 只固定已经发布的 immutable Store generation
+    Main->>Main: 周期健康检查；online promotion 后才周期 cut
+    Note over Shadow,Recovered: recovered history/delta 只固定已发布的 immutable Store generation
 ```
 
 具体顺序：
 
 1. 校验交易日，禁止把新交易日数据写入旧 session。
 2. 加载并校验固定 Registry。运行期间标的 universe 和 ordinal 不变化。
-3. 生成本次进程唯一的 `run_id`。
-4. 若启用 IPC，先建立共享内存布局、绑定监听 socket，并准备有界
-   history-reader slot，再把服务作为 `applied_record_sink` 注入 Pipeline；
-   此时尚无 Store generation 可读。常规从开盘模式紧接着启动 FAST 控制
-   线程；CSV 恢复模式则明确保持 `INITIALIZING`。
-5. CSV 恢复且启用 CERTIFIED 时，只预先启动其投影 worker，不启动查询控制
-   线程；常规模式直接启动其 worker/control。
-6. Pipeline 依次创建：
+3. 生成本次进程唯一的 `run_id`；online recovery 另外生成独立 preview
+   `run_id`，两个 socket/cursor 不能跨 run 复用。
+4. 常规 from-open 模式先建立并启动 FAST 控制面，再创建唯一的 SDK-owner
+   Pipeline。online recovery 则先创建空 live journal 和 `LIVE_PARTIAL` preview
+   控制面，再创建带 capture sink 的 SDK-owner preview Pipeline；这保证 SDK
+   Connect 后的受支持 callback 先进入 journal，再推进 partial preview。
+5. online recovery 随后创建尚不可查询的 recovered IPC、可选 CERTIFIED
+   worker，以及 `sdk=false`、`external_ingress_enabled=true` 的 shadow Pipeline。
+   CSV 和 durable journal record 都只进入 shadow；preview 与 shadow 不共享
+   Store、runtime state 或 `run_id`。
+6. 每个 Pipeline 依次创建：
    - 有界 `OwnedIngressMessagePoolV1`；
    - `RealtimeHistoryV1`，内部含 Store、latest、KLine、worker 与 builder；
-   - 可选 WAL；
    - Factor engine；
    - 四个 source owner 和四个 decoder queue；`Wd=0` 时它们执行完整
      decode。`Wd>0` 只预分配有界 issue/completion/task-lease 状态，parse
      workers 与四个 ordered committers 在首次 source-local farm activation
      时才 lazy-start；
-   - 最后才加载并连接 SDK。
-7. CSV 恢复模式必须再发布首个 Store/KLine generation；只有完整恢复前缀
-   可查询后才把 FAST 切到 `active`。可选 CERTIFIED 随后还必须通过其 worker
-   FIFO prefix barrier，不能提前开放控制线程。
+   - 仅 SDK-owner Pipeline 最后加载并连接 SDK；shadow 创建后直接接受外部
+     owned message 注入。
+7. online coordinator 固定 CSV/journal handoff 与已接受的 promotion frontier；
+   随后的 `CutAndPublishGeneration` 等待该 shadow prefix 全部 applied，并发布
+   首个 Store/KLine/Factor generation。可选 CERTIFIED 先完成 FIFO prefix
+   barrier 并启动 control，最后才启动 recovered FAST；promotion 后同一
+   coordinator 继续消费 durable journal tail。
 8. 每次周期或终局 cut 完成后，生产主线程先发布 exact Store generation，
    再发布可选 KLine generation。第一次 Store generation 发布前，
    `OPEN_HISTORY` 和 `OPEN_DELTA_SESSION` 会明确返回 unavailable，而不是读取
    mutable Store。
 
-常规模式在 SDK 连接前先设置 `accepting=true`；CSV 恢复模式则先设置
-`startup_state=buffering`。原因是厂商 `Connect()` 可能同步调用回调；无论
-哪种模式，此时 History、decoder 和所有有界内存池都必须已经就绪。
+SDK-owner Pipeline 在连接前设置 `accepting=true`。原因是厂商 `Connect()`
+可能同步调用回调；此时 History、decoder 和所有有界内存池都必须已经就绪。
+普通 from-open callback 直接 admission；online preview callback 根据是否配置
+capture sink 选择 `CaptureAndIngestLive`。生产 Pipeline 不再包含 CSV replay、
+startup buffering 或恢复后 direct-callback cutoff 分支。
 
 ---
 
@@ -1128,7 +1138,7 @@ V2 一个 session 可以顺序打开多个 instrument cursor，但在 session �
 
 | 字段 | 它实际声明什么 | 它不声明什么 |
 | --- | --- | --- |
-| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 通过闭合 live handoff 恢复成功。生产入口只有在 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 模式设置它；`--intraday-live-partial` 明确保持 false，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
+| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 与 session-local live journal 通过 online shadow 的闭合 handoff 恢复成功。生产入口只有在 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 模式设置它；`--intraday-live-partial` 明确保持 false，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
 | `record_coverage_complete` | generation 是本进程已接受记录的完整 cut 前缀；对 V1 是该 instrument 四路 Store 记录，对 V2 是该 instrument 在所选 source 1/3 与半开区间内的 tick | 进程覆盖了开盘；上游 feed 完整；payload 字段无损 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | 是否读到了所有 record |
 

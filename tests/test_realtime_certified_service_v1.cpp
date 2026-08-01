@@ -498,14 +498,14 @@ void RunGapBeforeBarrierRejectsActivationScenario(
 
     int system_error = 0;
     test->Expect(
-        !fixture.service->ActivateControlAfterPrefix(
+        !fixture.service->WaitForPrefixBarrier(
             5s, &system_error) &&
             system_error == EIO,
-        "pre-barrier GAP_OPEN rejects control activation with EIO");
+        "pre-barrier GAP_OPEN rejects the prefix barrier with EIO");
     test->Expect(
         WorkerOnlyControlHasNoResponse(
             fixture.service_config.control_socket_path),
-        "rejected GAP_OPEN activation leaves control unavailable");
+        "rejected GAP_OPEN barrier leaves control unavailable");
 }
 
 void RunFrozenBeforeBarrierRejectsActivationScenario(
@@ -536,14 +536,14 @@ void RunFrozenBeforeBarrierRejectsActivationScenario(
 
     int system_error = 0;
     test->Expect(
-        !fixture.service->ActivateControlAfterPrefix(
+        !fixture.service->WaitForPrefixBarrier(
             5s, &system_error) &&
             system_error == EIO,
-        "pre-barrier FROZEN_RESOURCE rejects activation with EIO");
+        "pre-barrier FROZEN_RESOURCE rejects the prefix barrier with EIO");
     test->Expect(
         WorkerOnlyControlHasNoResponse(
             fixture.service_config.control_socket_path),
-        "rejected FROZEN activation leaves control unavailable");
+        "rejected FROZEN barrier leaves control unavailable");
 }
 
 void RunPostBarrierGapCannotRewriteActivationScenario(
@@ -568,9 +568,10 @@ void RunPostBarrierGapCannotRewriteActivationScenario(
         "healthy prefix is fully committed before exact barrier");
 
     int system_error = 0;
+    const bool barrier_ready =
+        fixture.service->WaitForPrefixBarrier(5s, &system_error);
     const bool activated =
-        fixture.service->ActivateControlAfterPrefix(
-            5s, &system_error);
+        barrier_ready && fixture.service->StartControl(&system_error);
     test->Expect(
         activated && system_error == 0,
         "healthy exact barrier activates control");
@@ -784,7 +785,10 @@ void RunRecoveryScenario(TestContext* test) {
     }
 
     test->Expect(
-        service->ActivateControlAfterPrefix(5s, &system_error),
+        service->WaitForPrefixBarrier(5s, &system_error),
+        "commit certified prefix barrier before control activation");
+    test->Expect(
+        service->StartControl(&system_error),
         "activate certified control after committed prefix barrier");
     test->Expect(
         !service->StartControl(&system_error),

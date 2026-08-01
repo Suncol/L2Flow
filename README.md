@@ -146,14 +146,14 @@ generation availability before the snapshot. Timeout, begin, or seal failure
 wakes every lane and fails closed.
 
 The ordinary from-open path does not persist captured callbacks. Same-day CSV
-startup recovery has two explicit modes. `blocking` retains the original
-bounded in-memory handoff and withholds production queries until replay is
-complete. `online` opts the single SDK owner into an asynchronous disk-backed
-live journal, publishes a separate `LIVE_PARTIAL` latest-value preview, and
-rebuilds a second shadow Store/KLine/Factor/CERTIFIED pipeline before exposing
-the recovered socket. Both modes validate a closed CSV/live handoff with exact
-identity matches and immutable tuple cutoffs under the explicit same-session,
-lossless-callback operating contract.
+startup recovery is online-only: the single SDK owner writes an asynchronous
+disk-backed live journal, publishes a separate `LIVE_PARTIAL` latest-value
+preview, and rebuilds a second shadow Store/KLine/Factor/CERTIFIED pipeline
+before exposing the recovered socket. The coordinator validates a closed
+CSV/live handoff with exact identity matches and immutable tuple cutoffs under
+the explicit same-session, lossless-callback operating contract. There is no
+synchronous CSV replay or in-memory startup-buffer path in the production
+pipeline.
 
 The online journal is a session-local bootstrap source, not an arbitrary
 checkpoint or a previous-process restart source: a new run requires an empty
@@ -252,21 +252,11 @@ deliberately does not recover the market-open prefix; using
 `--intraday-store-from-open` in that situation remains an invalid operator
 assertion.
 
-CSV recovery selects `--intraday-recovery-mode blocking|online`; `blocking` is
-the default. Blocking mode connects the live feed into a bounded startup
-buffer while it reconstructs the production Store through the normal decode
-path. Its buffer can be sized with
-`--intraday-recovery-live-buffer-messages` and
-`--intraday-recovery-live-buffer-mib`; warmup and per-admission waits use
-`--intraday-recovery-warmup-seconds` and
-`--intraday-recovery-backpressure-seconds`. Defaults are 262,144 messages,
-512 MiB, 1,800 seconds, and 30 seconds. Exceeding either live-buffer bound
-fails startup instead of dropping data.
-
-Online mode requires all of:
+CSV recovery is online whenever `--intraday-recovery-csv-dir` is present.
+`--intraday-recovery-mode online` remains an optional explicit selector;
+`blocking` is rejected. Online recovery requires all of:
 
 ```text
---intraday-recovery-mode online
 --intraday-recovery-csv-dir /absolute/path/to/same-day-csv
 --intraday-recovery-journal-dir /absolute/path/to/empty-journal-directory
 --live-preview-ipc-socket /absolute/path/to/live-preview.sock
@@ -321,8 +311,8 @@ Online WAL tuning is bounded by
 `--intraday-recovery-journal-queue-records` (default 65,536). The byte cap is
 logical serialized WAL bytes, not filesystem preallocation or a guarantee of
 free physical space. The directory must be empty (or absent with an existing
-parent so it can be created) and distinct from the CSV directory. Explicit
-legacy live-buffer byte/message tuning is rejected in online mode.
+parent so it can be created) and distinct from the CSV directory. The removed
+startup-buffer byte/message options are no longer accepted.
 
 Online CSV replay samples the CERTIFIED handoff queue before each CSV
 publication: below 50% it runs normally, from 50% it sleeps briefly, at the
@@ -333,19 +323,7 @@ duplicates is terminal rather than recoverable pressure. This version does
 not expose replay-worker-count, CPU-percent, CPU-quota, or affinity options;
 the pressure gate is cooperative per-record throttling.
 
-In blocking mode, the byte bound counts
-copied MDL head+body bytes, not allocator/deque/fingerprint overhead, and the
-message bound covers every supported subscribed callback before the A-share
-filter. Size both bounds from measured peak callback message/byte rates times
-the worst measured replay-and-drain duration, with operational headroom; the
-defaults are bounded fallbacks, not a throughput guarantee. Replay-tail
-fingerprints are retained separately per message tuple by the greatest
-SequenceIDs, not by potentially reordered replay publication order. The
-Shenzhen cross-file merge also has independent fixed defaults of 2,000,000 pending
-messages and 512 MiB of pending body bytes, so process RSS can exceed the live
-wire-byte bound.
-
-In both recovery modes the recovered FAST control socket is not made ACTIVE
+The recovered FAST control socket is not made ACTIVE
 until replay, the closed live handoff through its selected frontier, the first
 immutable Store/Factor generation, and any configured KLine publication all
 succeed. A failed or partial recovery is therefore never exposed as a
@@ -353,10 +331,8 @@ queryable complete session. Only the explicitly partial preview is available
 during online rebuild.
 
 The optional CERTIFIED sidecar starts only its projection worker during
-recovery. In blocking mode, FAST can become active first; a later FIFO prefix
-barrier must commit `NO_DATA` or `CONTIGUOUS` before CERTIFIED control starts,
-and sidecar failure degrades only CERTIFIED. In online mode, the default-on
-CERTIFIED worker is part of promotion: terminal handoff health or barrier/
+recovery. Its default-on worker is part of online promotion: terminal handoff
+health or barrier/
 control failure aborts promotion, and recovered FAST is exposed only after the
 barrier. Disabling native-gap recovery explicitly removes that sidecar and
 leaves `certified_prefix_valid=false`.

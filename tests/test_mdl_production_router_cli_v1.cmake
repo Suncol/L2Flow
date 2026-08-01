@@ -33,6 +33,12 @@ run_case(
     "--parallel-decoder-workers N  0..64, default 0"
     --help)
 
+run_case(
+    help_lists_online_as_only_csv_recovery_mode
+    0
+    "online (the only supported mode)"
+    --help)
+
 set(base
     --sdk-library /nonexistent/libmdl_api.so
     --session-epoch 1
@@ -133,3 +139,53 @@ run_case(
     ${base}
     --intraday-live-partial
     --intraday-recovery-mode online)
+
+run_case(
+    blocking_csv_recovery_is_rejected
+    2
+    "blocking CSV recovery is no longer supported"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv
+    --intraday-recovery-mode blocking)
+
+run_case(
+    blocking_live_buffer_option_is_removed
+    2
+    "unknown option: --intraday-recovery-live-buffer-messages"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv
+    --intraday-recovery-live-buffer-messages 1024)
+
+run_case(
+    blocking_live_buffer_mib_option_is_removed
+    2
+    "unknown option: --intraday-recovery-live-buffer-mib"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv
+    --intraday-recovery-live-buffer-mib 512)
+
+run_case(
+    csv_recovery_defaults_to_online_requirements
+    2
+    "online recovery requires"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv)
+
+run_case(
+    implicit_online_csv_recovery_reaches_runtime
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv
+    --intraday-recovery-journal-dir /tmp/l2flow-cli-journal
+    --live-preview-ipc-socket /tmp/l2flow-cli-preview.sock)
+
+run_case(
+    explicit_online_csv_recovery_reaches_runtime
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv
+    --intraday-recovery-mode online
+    --intraday-recovery-journal-dir /tmp/l2flow-cli-journal
+    --live-preview-ipc-socket /tmp/l2flow-cli-preview.sock)

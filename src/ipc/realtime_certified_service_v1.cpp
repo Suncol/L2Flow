@@ -999,13 +999,6 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool ActivateControlAfterPrefix(
-        std::chrono::milliseconds timeout,
-        int* system_error_number) noexcept {
-        return WaitForPrefixBarrier(timeout, system_error_number) &&
-               StartControl(system_error_number);
-    }
-
 private:
     [[nodiscard]] bool StartClaimedControl(
         int* system_error_number) noexcept {
@@ -2623,15 +2616,6 @@ bool RealtimeCertifiedMarketServiceV1::WaitForPrefixBarrier(
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
            impl_->WaitForPrefixBarrier(timeout, system_error_number);
-}
-
-bool RealtimeCertifiedMarketServiceV1::
-    ActivateControlAfterPrefix(
-        std::chrono::milliseconds timeout,
-        int* system_error_number) noexcept {
-    return impl_ != nullptr &&
-           impl_->ActivateControlAfterPrefix(
-               timeout, system_error_number);
 }
 
 bool RealtimeCertifiedMarketServiceV1::PublishApplied(

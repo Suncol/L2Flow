@@ -217,12 +217,6 @@ public:
     [[nodiscard]] bool WaitForPrefixBarrier(
         std::chrono::milliseconds timeout,
         int* system_error_number = nullptr) noexcept;
-    // Compatibility composition: WaitForPrefixBarrier() followed by
-    // StartControl().
-    // timeout must be positive and no greater than 24 hours.
-    [[nodiscard]] bool ActivateControlAfterPrefix(
-        std::chrono::milliseconds timeout,
-        int* system_error_number = nullptr) noexcept;
 
     // Required FAST publication happens first. A false return can therefore
     // mean only that FAST itself failed. Queue pressure, conflicts, gaps, and

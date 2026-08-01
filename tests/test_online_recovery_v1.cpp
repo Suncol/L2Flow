@@ -685,6 +685,55 @@ void TestFenceHealthAndQuietSession(TestContext* test) {
     }
 }
 
+void TestShanghaiDigestExcludesDecoderStatePhase(TestContext* test) {
+    market::ShanghaiTickV1 first{};
+    first.common.kind = market::MarketEventKindV1::kShanghaiTick;
+    first.common.market = market::MarketV1::kShanghai;
+    first.common.security_id = "600001";
+    first.common.security_id_valid = true;
+    first.business_index = 1;
+    first.channel = 12;
+    first.raw_type = "A";
+    first.raw_tick_flag = "B";
+    first.raw_type_valid = true;
+    first.raw_tick_flag_valid = true;
+    first.fields.action = market::TickActionV1::kAdd;
+    first.fields.phase = market::TradingPhaseV1::kStart;
+    first.fields.validity_bitmap = 0U;
+
+    market::ShanghaiTickV1 state_advanced = first;
+    state_advanced.fields.phase = market::TradingPhaseV1::kContinuous;
+    state_advanced.fields.validity_bitmap = market::kTickPhaseValidV1;
+
+    common::Sha256Digest first_digest{};
+    common::Sha256Digest state_advanced_digest{};
+    const bool first_ok =
+        runtime::RealtimePipelineStartupSemanticDigestV1(
+            market::DecodedMarketEventV1{first},
+            false,
+            &first_digest);
+    const bool state_advanced_ok =
+        runtime::RealtimePipelineStartupSemanticDigestV1(
+            market::DecodedMarketEventV1{state_advanced},
+            false,
+            &state_advanced_digest);
+    test->Expect(
+        first_ok && state_advanced_ok &&
+            first_digest == state_advanced_digest,
+        "online Shanghai overlap digest excludes decoder-state-derived phase");
+
+    state_advanced.raw_tick_flag = "S";
+    common::Sha256Digest changed_payload_digest{};
+    const bool changed_payload_ok =
+        runtime::RealtimePipelineStartupSemanticDigestV1(
+            market::DecodedMarketEventV1{state_advanced},
+            false,
+            &changed_payload_digest);
+    test->Expect(
+        changed_payload_ok && changed_payload_digest != first_digest,
+        "online Shanghai overlap digest still binds raw payload semantics");
+}
+
 }  // namespace
 
 int main() {
@@ -692,6 +741,7 @@ int main() {
     TestPromotionBoundaryAndTail(&test);
     TestOverlapFailures(&test);
     TestFenceHealthAndQuietSession(&test);
+    TestShanghaiDigestExcludesDecoderStatePhase(&test);
     if (test.failures() == 0) {
         std::cout << "online recovery V1 tests passed\n";
         return 0;

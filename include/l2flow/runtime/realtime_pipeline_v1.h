@@ -13,7 +13,6 @@
 #include "l2flow/realtime/native_sequence_observer_v1.h"
 #include "l2flow/realtime/owned_ingress_message_v1.h"
 #include "l2flow/realtime/processing_progress_v2.h"
-#include "l2flow/recovery/startup_replay_v1.h"
 #include "l2flow/sdk/sdk_runtime.h"
 
 #include "mdl_api.h"
@@ -23,7 +22,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -143,7 +141,7 @@ struct RealtimePipelineConfigV1 final {
     std::shared_ptr<l2flow::realtime::ProcessingProgressSinkV2>
         processing_progress_sink;
     // Optional online-recovery capture.  It is valid only for the real SDK
-    // owner and cannot be combined with the synchronous startup replay mode.
+    // owner.
     // The callback first copies the supported raw message into this sink and
     // only then admits the same callback to this pipeline's partial preview.
     // Capture failure is completeness loss and fails this pipeline closed.
@@ -151,54 +149,9 @@ struct RealtimePipelineConfigV1 final {
     std::shared_ptr<l2flow::realtime::RealtimeIngressCaptureSinkV1>
         live_ingress_capture_sink;
     // Enables the bounded production injection API for an SDK-less shadow
-    // owner.  It is mutually exclusive with sdk.enabled and with synchronous
-    // startup replay.  Tests should continue to use InjectSdkMessageForTest.
+    // owner.  It is mutually exclusive with sdk.enabled. Tests should
+    // continue to use InjectSdkMessageForTest.
     bool external_ingress_enabled = false;
-    // Optional mid-session recovery source. It is valid only with the real
-    // SDK path enabled and with intraday_store.coverage_from_open explicitly
-    // asserted by the operator. The mere presence or successful return of an
-    // arbitrary source never promotes that strong coverage claim. Create
-    // first starts every data-path consumer, then connects the SDK into an
-    // independent bounded raw-message buffer, replays this source through the
-    // normal admission/decode/History path, proves the closed CSV/live
-    // handoff, drains buffered callbacks in callback order, and returns only
-    // after the recovered handoff prefix is applied.
-    std::shared_ptr<l2flow::recovery::StartupReplaySourceV1>
-        startup_replay_source;
-    // Payload bounds for live messages retained between SDK Connect and the
-    // atomic switch to direct admission. Bytes count the exact vendor
-    // header+body copies; both bounds are required when recovery is enabled.
-    std::size_t startup_live_buffer_maximum_messages = 262'144U;
-    std::uint64_t startup_live_buffer_maximum_bytes =
-        512ULL * 1024ULL * 1024ULL;
-    // Shared bound for CSV replay, handoff validation/drain, and waiting until
-    // its accepted prefix is fully applied. This does not require traffic in
-    // any tuple: a quiet but successfully replayed session is legal.
-    std::chrono::nanoseconds startup_warmup_timeout =
-        std::chrono::minutes(30);
-    // Per-message maximum wait for source decoder capacity during bulk
-    // replay/buffer drain. Normal direct callback admission remains
-    // nonblocking and fail-closed on queue saturation.
-    std::chrono::nanoseconds startup_replay_backpressure_timeout =
-        std::chrono::seconds(30);
-    // Optional cooperative abort for long recovery startup (for example an
-    // application SIGINT/SIGTERM flag). It is sampled only by the recovery
-    // coordinator, never by the normal post-handoff callback hot path.
-    std::function<bool()> startup_cancel_requested;
-    // Per production tuple, retain fingerprints for the greatest this many
-    // CSV SequenceIDs for exact duplicate/conflict checks. Selecting by
-    // identity rather than Publish call order is required because Shenzhen
-    // native gap repair can release one tuple out of CSV SeqNo order. Replay
-    // SequenceID must be nonzero; the maximum value seen per tuple is retained
-    // as a bounded cutoff so an evicted prefix identity cannot be mistaken for
-    // a new live suffix.
-    // Production CSV roots independently enforce their physical-file
-    // recovery sequence contract. Replay publication can differ from that
-    // order while reconstructing exchange-native cross-file order. The
-    // immutable cutoff and tail remain active after handoff to catch a
-    // callback delayed outside this process; no day-long SequenceID set is
-    // retained.
-    std::size_t startup_overlap_retention_per_message = 262'144U;
     // Optional required Wire V2 immutable-generation publication. When
     // configured, CutAndPublishGeneration invokes this exact sink after the
     // Store generation is current and healthy, and before Factor calculation.
@@ -229,11 +182,10 @@ struct RealtimePipelineConfigV1 final {
     const RealtimePipelineConfigV1& config,
     std::size_t* output) noexcept;
 
-// Exact semantic fingerprint used by both the legacy buffered handoff and the
-// online journal handoff.  It excludes vendor dynamic-layout offsets and the
-// documented CSV-unavailable fields; callers must first decode through a
-// correctly configured MarketDecoderV1.  Keeping one implementation prevents
-// the two recovery modes from disagreeing about overlap equality.
+// Exact semantic fingerprint used by the online CSV/journal handoff. It
+// excludes vendor dynamic-layout offsets and the documented CSV-unavailable
+// fields; callers must first decode through a correctly configured
+// MarketDecoderV1.
 [[nodiscard]] bool RealtimePipelineStartupSemanticDigestV1(
     const l2flow::market::DecodedMarketEventV1& event,
     bool normalize_shenzhen_snapshot_channel,
@@ -349,13 +301,6 @@ enum class RealtimePipelineCreateErrorV1 : std::uint8_t {
     kResourceExhausted,
     kUnexpectedFailure,
     kLatestReadModelCreateFailed,
-    kStartupReplayFailed,
-    kStartupBufferOverflow,
-    kStartupOverlapMissing,
-    kStartupOverlapConflict,
-    kStartupBackpressureTimeout,
-    kStartupWarmupTimeout,
-    kStartupCancelled,
 };
 
 [[nodiscard]] std::string_view RealtimePipelineCreateErrorNameV1(

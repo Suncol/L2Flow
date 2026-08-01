@@ -182,4 +182,4 @@ vendor-CSV bootstrap into arbitrary-checkpoint replay, ring-overrun catch-up,
 or previous-process recovery. Online recovery has a session-local live WAL,
 but a new process requires an empty journal directory and does not resume old
 segments. See `csv-startup-recovery-v1.md` for the distinction between the
-normal, blocking-recovery, preview, and shadow callback paths.
+normal, online preview, and recovered shadow callback paths.

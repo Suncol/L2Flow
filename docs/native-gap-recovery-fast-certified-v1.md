@@ -18,6 +18,13 @@ CERTIFIED 资源错误不会关闭 FAST。FAST 本身仍保持原有语义：回
 也可能成为它最近一次到达的 latest；需要有序、可证明结果的读者必须读取
 CERTIFIED。
 
+上述 fail-open 是 sidecar/FAST sink 的组件契约，也是常规
+`--intraday-store-from-open` 组合的服务策略。online CSV recovery 在启用
+CERTIFIED 时有更强的 session promotion 契约：coordinator 会把 worker、handoff、
+barrier 或 control failure 视为 recovered session 终止条件，不能把未完成证明的
+完整会话降级成 FAST-only。显式 `--disable-native-gap-recovery` 才会从 online
+组合中移除 sidecar。
+
 ## 2. SDK 文档依据
 
 采用的连续性键只来自 SDK 文档明确承诺的交易所原生字段：
@@ -49,9 +56,11 @@ epoch。需要完整 FAST/CERTIFIED 前缀的生产运行要求从
 `--intraday-store-from-open` 与 `--intraday-recovery-csv-dir` 中选择一个
 coverage source。两者都会重建一个
 fresh session，所以原生 domain 的期望原点仍固定为 1：前者直接观察从开盘
-开始的实时消息，后者把同日从开盘保存的 CSV 先送入同一投影 worker，再以
-闭合的 live handoff 接管。任意晚于开盘的可信 checkpoint、上次进程状态或
-ring overrun catch-up 仍不在本协议范围内。
+开始的实时消息；后者由唯一 SDK owner 把 callback 写入 live journal，同时
+让同日从开盘保存的 CSV 与 durable journal suffix 依次进入同一个 SDK-less
+shadow Pipeline，闭合 handoff 后发布 recovered FAST/CERTIFIED 前缀。任意
+晚于开盘的可信 checkpoint、上次进程状态或 ring overrun catch-up 仍不在
+本协议范围内。
 
 `--intraday-live-partial` 是第三种 startup mode，但不是 coverage source：它
 只服务进程启动后的 latest 数据，自动禁用 CERTIFIED sidecar，并始终保持
@@ -214,9 +223,10 @@ coherent_canonical_apply_frontier =
 - Event 逻辑容量：生产配置按 Store 最大记录数的四倍保守推导。
 
 Tick memfd 在 sidecar Create 阶段先 `fallocate` 全部有界 backing，再
-`mmap/memset`；普通 `ENOSPC/EDQUOT` 因而成为可捕获的 Create 失败，生产
-自动降级为 FAST-only。Event journal 只预留 header，随后在每次有状态投影
-前按 chunk `fallocate`。
+`mmap/memset`；普通 `ENOSPC/EDQUOT` 因而成为可捕获的 Create 失败。常规
+from-open 组合会降级为 FAST-only；online CSV recovery 则在 recovered control
+暴露前终止 promotion。Event journal 只预留 header，随后在每次有状态投影前
+按 chunk `fallocate`。
 
 History 在所有 publisher join 后、释放 append-only Store 前调用
 `QuiesceRecordReferences()`；CERTIFIED worker 先排空/停止，从而保证 queue
@@ -238,9 +248,11 @@ Native recovery / CERTIFIED 默认开启：
     显式关闭，运行原 FAST-only 组合
 ```
 
-CERTIFIED Create/Start/容量配置失败只记录 `DEGRADED`，pipeline 继续使用
-原 FAST sink。成功时 pipeline 才安装 observation sink 与 FAST-first
-wrapper。
+常规 from-open 组合中，CERTIFIED Create/Start/容量配置失败只记录
+`DEGRADED`，pipeline 继续使用原 FAST sink；成功时才安装 observation sink 与
+FAST-first wrapper。online CSV recovery 不采用这个降级策略：启用 sidecar 时，
+Create/StartWorker、handoff health、prefix barrier 或 StartControl 失败都会终止
+promotion，不会开放一个缺少所声明 CERTIFIED 前缀的 recovered session。
 
 ## 8. 验证
 
