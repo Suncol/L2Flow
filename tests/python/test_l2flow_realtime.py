@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import importlib
 import struct
 import sys
@@ -21,11 +22,15 @@ from l2flow_realtime import (
     InstrumentKey,
     InstrumentLookupStatus,
     InstrumentStatus,
+    KLineCoverageFlag,
+    KLineTemporalCoverage,
     L2FlowClient,
+    LatestKLine,
     LatestStatus,
     SelectionScope,
     ServerState,
     SessionInfo,
+    WireFormatError,
 )
 from l2flow_realtime import native
 from l2flow_realtime.control import build_get_session_request
@@ -36,6 +41,7 @@ from l2flow_realtime.wire import (
     TICK_BYTES,
     WIRE_MAJOR,
     WIRE_MINOR,
+    parse_kline_payload,
 )
 
 
@@ -186,13 +192,17 @@ def tick_payload(instrument_id: int = 1) -> bytes:
     return bytes(payload)
 
 
-def kline_payload(instrument_id: int = 1, window_id: int = 1) -> bytes:
+def kline_payload(
+    instrument_id: int = 1,
+    window_id: int = 1,
+    coverage_flags: int = 0,
+) -> bytes:
     return _KLINE.pack(
         8,
         20260729,
         instrument_id,
         window_id,
-        0,
+        coverage_flags,
         60_000_000_000,
         1,
         2,
@@ -236,12 +246,24 @@ class FakeV2Library:
 
     def __init__(self):
         self.promote_instrument_2_on_copy = False
+        self.session_server_state = ServerState.ACTIVE
+        self.session_flags = 6
+        self.kline_coverage_result = native.OK
+        self.kline_coverage_session_epoch = SESSION_EPOCH
+        self.kline_coverage_start_unix_ns = 0
+        self.kline_coverage_kind = KLineTemporalCoverage.FROM_OPEN
+        self.kline_coverage_reserved0 = 0
+        self.kline_coverage_reserved = 0
+        self.kline_payload_coverage_flags = KLineCoverageFlag.NONE
         self.l2flow_shm_reader_open_fd_v2 = FakeFunction(self._open)
         self.l2flow_shm_reader_close_v2 = FakeFunction(
             lambda _handle: None
         )
         self.l2flow_shm_reader_session_v2 = FakeFunction(self._session)
         self.l2flow_shm_reader_health_v2 = FakeFunction(self._health)
+        self.l2flow_shm_reader_kline_coverage_v2 = FakeFunction(
+            self._kline_coverage
+        )
         self.l2flow_shm_reader_instrument_v2 = FakeFunction(
             self._instrument
         )
@@ -267,8 +289,7 @@ class FakeV2Library:
         _set_scalar(output, ctypes.c_void_p, 0x1234)
         return native.OK
 
-    @staticmethod
-    def _session(_handle, output):
+    def _session(self, _handle, output):
         result = ctypes.cast(
             output, ctypes.POINTER(native._SessionInfoC)
         ).contents
@@ -292,8 +313,8 @@ class FakeV2Library:
         result.heartbeat_monotonic_ns = time.monotonic_ns()
         result.published_records = 50
         result.trade_date = 20260729
-        result.server_state = int(ServerState.ACTIVE)
-        result.flags = 6
+        result.server_state = int(self.session_server_state)
+        result.flags = self.session_flags
         result.capacity = CAPACITY
         result.window_count = 2
         result.catalog_scope = int(
@@ -309,15 +330,29 @@ class FakeV2Library:
         result.catalog_version = 7
         return native.OK
 
-    @staticmethod
-    def _health(_handle, output):
+    def _health(self, _handle, output):
         result = ctypes.cast(
             output, ctypes.POINTER(native._HealthC)
         ).contents
         result.session_epoch = SESSION_EPOCH
         result.heartbeat_monotonic_ns = time.monotonic_ns()
-        result.server_state = int(ServerState.ACTIVE)
-        result.flags = 6
+        result.server_state = int(self.session_server_state)
+        result.flags = self.session_flags
+        return native.OK
+
+    def _kline_coverage(self, _handle, output):
+        if self.kline_coverage_result != native.OK:
+            return self.kline_coverage_result
+        result = ctypes.cast(
+            output, ctypes.POINTER(native._KLineCoverageInfoC)
+        ).contents
+        result.session_epoch = self.kline_coverage_session_epoch
+        result.coverage_start_unix_ns = (
+            self.kline_coverage_start_unix_ns
+        )
+        result.coverage_kind = int(self.kline_coverage_kind)
+        result.reserved0 = self.kline_coverage_reserved0
+        result.reserved[0] = self.kline_coverage_reserved
         return native.OK
 
     def _instrument(
@@ -470,9 +505,8 @@ class FakeV2Library:
                 )
         return native.OK
 
-    @classmethod
     def _latest_klines(
-        cls,
+        self,
         _handle,
         instrument_ids,
         window_ids,
@@ -486,7 +520,7 @@ class FakeV2Library:
         for index in range(count):
             instrument_id = instrument_ids[index]
             window_id = window_ids[index]
-            status = cls._latest_status(instrument_id)
+            status = self._latest_status(instrument_id)
             if window_id == 0:
                 status = LatestStatus.INVALID_WINDOW_ID
             elif window_id > 2:
@@ -495,7 +529,11 @@ class FakeV2Library:
             if status is LatestStatus.AVAILABLE:
                 ctypes.memmove(
                     ctypes.addressof(outputs) + index * stride,
-                    kline_payload(instrument_id, window_id),
+                    kline_payload(
+                        instrument_id,
+                        window_id,
+                        int(self.kline_payload_coverage_flags),
+                    ),
                     stride,
                 )
         return native.OK
@@ -573,6 +611,7 @@ class AbiContractTests(unittest.TestCase):
         self.assertEqual(ctypes.sizeof(native._SessionInfoC), 240)
         self.assertEqual(ctypes.sizeof(native._SelectionEnvelopeC), 144)
         self.assertEqual(ctypes.sizeof(native._HealthC), 32)
+        self.assertEqual(ctypes.sizeof(native._KLineCoverageInfoC), 32)
         self.assertEqual(native._SessionInfoC.session_epoch.offset, 80)
         self.assertEqual(native._SessionInfoC.accepted_sequence.offset, 104)
         self.assertEqual(native._SessionInfoC.trade_date.offset, 176)
@@ -585,6 +624,14 @@ class AbiContractTests(unittest.TestCase):
             native._SelectionEnvelopeC.accepted_sequence.offset, 72
         )
         self.assertEqual(native._SelectionEnvelopeC.capacity.offset, 96)
+        self.assertEqual(
+            native._KLineCoverageInfoC.coverage_start_unix_ns.offset,
+            8,
+        )
+        self.assertEqual(
+            native._KLineCoverageInfoC.coverage_kind.offset,
+            16,
+        )
 
         library = FakeV2Library()
         native._bind_library(library)
@@ -593,7 +640,7 @@ class AbiContractTests(unittest.TestCase):
             for name, value in vars(library).items()
             if name.startswith("l2flow_shm_reader_")
         ]
-        self.assertEqual(len(functions), 11)
+        self.assertEqual(len(functions), 12)
         self.assertTrue(all(function.argtypes for function in functions))
         self.assertTrue(
             all(
@@ -608,9 +655,9 @@ class AbiContractTests(unittest.TestCase):
         magic, major, minor = struct.unpack_from("<8sHH", request)
         self.assertEqual(magic, CONTROL_MAGIC)
         self.assertEqual((major, minor), (WIRE_MAJOR, WIRE_MINOR))
-        self.assertEqual((major, minor), (2, 3))
+        self.assertEqual((major, minor), (2, 4))
 
-    def test_v23_live_partial_and_prefix_flags(self):
+    def test_v24_live_partial_and_kline_coverage(self):
         self.assertEqual(int(ServerState.LIVE_PARTIAL), 6)
         partial = session_info(
             server_state=ServerState.LIVE_PARTIAL,
@@ -622,6 +669,22 @@ class AbiContractTests(unittest.TestCase):
         self.assertFalse(partial.full_day_kline_valid)
         self.assertFalse(partial.full_day_factor_valid)
         self.assertFalse(partial.certified_prefix_valid)
+        self.assertIs(
+            partial.kline_temporal_coverage,
+            KLineTemporalCoverage.DISABLED,
+        )
+
+        partial_kline = session_info(
+            server_state=ServerState.LIVE_PARTIAL,
+            flags=2,
+        )
+        self.assertTrue(partial_kline.kline_enabled)
+        self.assertFalse(partial_kline.coverage_from_open)
+        self.assertFalse(partial_kline.full_day_kline_valid)
+        self.assertIs(
+            partial_kline.kline_temporal_coverage,
+            KLineTemporalCoverage.PROCESS_START_PARTIAL,
+        )
 
         recovered = session_info(flags=0x7E)
         self.assertFalse(recovered.coverage_lost)
@@ -631,6 +694,10 @@ class AbiContractTests(unittest.TestCase):
         self.assertTrue(recovered.full_day_kline_valid)
         self.assertTrue(recovered.full_day_factor_valid)
         self.assertTrue(recovered.certified_prefix_valid)
+        self.assertIs(
+            recovered.kline_temporal_coverage,
+            KLineTemporalCoverage.FROM_OPEN,
+        )
 
         with self.assertRaises(ValueError):
             session_info(flags=2)
@@ -641,6 +708,20 @@ class AbiContractTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             session_info(flags=0x80)
+
+    def test_kline_payload_coverage_flags_fail_closed(self):
+        partial = parse_kline_payload(
+            kline_payload(coverage_flags=3), 1, 1
+        )
+        self.assertEqual(
+            partial["coverage_flags"],
+            KLineCoverageFlag.PROCESS_START_PARTIAL
+            | KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED,
+        )
+        with self.assertRaises(WireFormatError):
+            parse_kline_payload(kline_payload(coverage_flags=4), 1, 1)
+        with self.assertRaises(WireFormatError):
+            parse_kline_payload(kline_payload(coverage_flags=2), 1, 1)
 
     def test_v2_history_modules_replace_removed_v1_surface(self):
         self.assertTrue(hasattr(l2flow_realtime, "HistoryCursor"))
@@ -710,6 +791,11 @@ class NativeReaderTests(unittest.TestCase):
         self.assertEqual(health.session_epoch, SESSION_EPOCH)
         self.assertIs(health.server_state, ServerState.ACTIVE)
         self.assertEqual(health.flags, 6)
+        self.assertTrue(health.kline_enabled)
+        self.assertIs(
+            health.kline_temporal_coverage,
+            KLineTemporalCoverage.FROM_OPEN,
+        )
         self.assertTrue(health.coverage_from_open)
         self.assertFalse(health.startup_prefix_recovered)
         self.assertFalse(health.full_day_kline_valid)
@@ -723,6 +809,77 @@ class NativeReaderTests(unittest.TestCase):
         self.assertEqual(
             len(self.library.l2flow_shm_reader_health_v2.calls), 1
         )
+
+    def test_kline_coverage_getter_is_separate_and_immutable(self):
+        session_calls = len(
+            self.library.l2flow_shm_reader_session_v2.calls
+        )
+        coverage = self.reader.kline_coverage()
+        self.assertEqual(coverage.session_epoch, SESSION_EPOCH)
+        self.assertEqual(coverage.coverage_start_unix_ns, 0)
+        self.assertIs(
+            coverage.coverage_kind,
+            KLineTemporalCoverage.FROM_OPEN,
+        )
+        self.assertEqual(
+            len(self.library.l2flow_shm_reader_session_v2.calls),
+            session_calls,
+        )
+        self.assertEqual(
+            len(
+                self.library
+                .l2flow_shm_reader_kline_coverage_v2.calls
+            ),
+            1,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            coverage.coverage_start_unix_ns = 1
+
+        self.library.kline_coverage_kind = (
+            KLineTemporalCoverage.PROCESS_START_PARTIAL
+        )
+        self.library.kline_coverage_start_unix_ns = 123
+        partial = self.reader.kline_coverage()
+        self.assertEqual(partial.coverage_start_unix_ns, 123)
+        self.assertIs(
+            partial.coverage_kind,
+            KLineTemporalCoverage.PROCESS_START_PARTIAL,
+        )
+        self.library.kline_coverage_kind = (
+            KLineTemporalCoverage.DISABLED
+        )
+        self.library.kline_coverage_start_unix_ns = 0
+        disabled = self.reader.kline_coverage()
+        self.assertIs(
+            disabled.coverage_kind,
+            KLineTemporalCoverage.DISABLED,
+        )
+
+    def test_kline_coverage_getter_rejects_noncanonical_results(self):
+        self.library.kline_coverage_reserved0 = 1
+        with self.assertRaises(WireFormatError):
+            self.reader.kline_coverage()
+        self.library.kline_coverage_reserved0 = 0
+        self.library.kline_coverage_kind = 99
+        with self.assertRaises(WireFormatError):
+            self.reader.kline_coverage()
+        self.library.kline_coverage_kind = (
+            KLineTemporalCoverage.PROCESS_START_PARTIAL
+        )
+        self.library.kline_coverage_start_unix_ns = 0
+        with self.assertRaises(WireFormatError):
+            self.reader.kline_coverage()
+        self.library.kline_coverage_kind = (
+            KLineTemporalCoverage.FROM_OPEN
+        )
+        self.library.kline_coverage_start_unix_ns = 1
+        with self.assertRaises(WireFormatError):
+            self.reader.kline_coverage()
+
+    def test_kline_coverage_getter_propagates_unavailable(self):
+        self.library.kline_coverage_result = native.UNAVAILABLE
+        with self.assertRaises(l2flow_realtime.UnavailableError):
+            self.reader.kline_coverage()
 
     def test_instrument_two_pass_and_semantic_statuses(self):
         available = self.reader.instrument(1)
@@ -806,6 +963,46 @@ class NativeReaderTests(unittest.TestCase):
             ),
         )
         self.assertEqual(klines[0].close_price_p6, 11)
+        self.assertEqual(
+            klines[0].coverage_flags,
+            KLineCoverageFlag.NONE,
+        )
+        self.assertIs(
+            klines[0].temporal_coverage,
+            KLineTemporalCoverage.FROM_OPEN,
+        )
+        self.assertFalse(klines[0].process_start_partial)
+        self.assertFalse(klines[0].natural_window_left_truncated)
+        self.assertIsNone(klines[1].coverage_flags)
+        self.assertIsNone(klines[1].temporal_coverage)
+
+        self.library.kline_payload_coverage_flags = (
+            KLineCoverageFlag.PROCESS_START_PARTIAL
+            | KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED
+        )
+        partial = self.reader.latest_klines((1,), (1,))[0]
+        self.assertEqual(
+            partial.coverage_flags,
+            KLineCoverageFlag.PROCESS_START_PARTIAL
+            | KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED,
+        )
+        self.assertIs(
+            partial.temporal_coverage,
+            KLineTemporalCoverage.PROCESS_START_PARTIAL,
+        )
+        self.assertTrue(partial.process_start_partial)
+        self.assertTrue(partial.natural_window_left_truncated)
+
+        with self.assertRaises(ValueError):
+            LatestKLine(
+                SESSION_EPOCH,
+                1,
+                1,
+                LatestStatus.TYPE_UNAVAILABLE,
+                coverage_flags=KLineCoverageFlag.PROCESS_START_PARTIAL,
+            )
+        self.assertFalse(klines[1].process_start_partial)
+        self.assertFalse(klines[1].natural_window_left_truncated)
 
     def test_selection_is_one_coherent_daily_catalog_envelope(self):
         selection = self.reader.select_instruments(
@@ -824,6 +1021,45 @@ class NativeReaderTests(unittest.TestCase):
 
 
 class ClientHotPathTests(unittest.TestCase):
+    def test_client_exposes_identity_checked_kline_coverage(self):
+        library = FakeV2Library()
+        reader = native.NativeReader.open_fd(9, library=library)
+        try:
+            client = L2FlowClient(reader, stale_after_ns=None)
+            coverage = client.kline_coverage()
+            self.assertEqual(coverage.session_epoch, SESSION_EPOCH)
+            self.assertIs(
+                coverage.coverage_kind,
+                KLineTemporalCoverage.FROM_OPEN,
+            )
+
+            library.session_server_state = ServerState.LIVE_PARTIAL
+            library.session_flags = 2
+            library.kline_coverage_kind = (
+                KLineTemporalCoverage.PROCESS_START_PARTIAL
+            )
+            library.kline_coverage_start_unix_ns = 123
+            partial = client.kline_coverage()
+            self.assertEqual(partial.coverage_start_unix_ns, 123)
+            self.assertIs(
+                partial.coverage_kind,
+                KLineTemporalCoverage.PROCESS_START_PARTIAL,
+            )
+
+            library.kline_coverage_kind = (
+                KLineTemporalCoverage.FROM_OPEN
+            )
+            library.kline_coverage_start_unix_ns = 0
+            with self.assertRaises(WireFormatError):
+                client.kline_coverage()
+
+            library.kline_coverage_session_epoch = SESSION_EPOCH + 1
+            with self.assertRaises(WireFormatError):
+                client.kline_coverage()
+            client.close()
+        finally:
+            reader.close()
+
     def test_live_partial_is_readable_but_heartbeat_is_still_enforced(self):
         library = FakeV2Library()
         reader = native.NativeReader.open_fd(9, library=library)

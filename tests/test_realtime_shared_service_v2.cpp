@@ -73,6 +73,13 @@ constexpr std::array<std::uint32_t, 4U> kSourceStreamIds{
 constexpr std::uint32_t kWindowId = 60U;
 constexpr std::uint64_t kWindowDurationNs =
     60U * market::kKLineNanosecondsPerSecondV1;
+constexpr std::int64_t kTradeDateMidnightUnixNs =
+    1'785'254'400'000'000'000LL;
+constexpr std::uint64_t kProcessStartKLineCoverageNsSinceMidnight =
+    36'137'000'000'000ULL;
+constexpr std::uint64_t kProcessStartKLineCoverageUnixNs =
+    static_cast<std::uint64_t>(kTradeDateMidnightUnixNs) +
+    kProcessStartKLineCoverageNsSinceMidnight;
 
 bool Expect(bool condition, std::string_view message) {
     if (!condition) {
@@ -2307,10 +2314,18 @@ std::optional<market::RealtimeHistoryEventInputV1> SnapshotInput(
         0U, ingress_sequence, std::move(event), 0U);
 }
 
-std::optional<market::RealtimeHistoryEventInputV1> TickInput(
+std::optional<market::RealtimeHistoryEventInputV1> TickInputAt(
     std::uint64_t source_sequence,
     std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence) {
+    std::uint64_t tick_stream_sequence,
+    std::uint64_t event_time_ns_since_midnight) {
+    constexpr std::uint64_t nanoseconds_per_second =
+        market::kKLineNanosecondsPerSecondV1;
+    constexpr std::uint64_t seconds_per_day = 86'400U;
+    if (event_time_ns_since_midnight >=
+        seconds_per_day * nanoseconds_per_second) {
+        return std::nullopt;
+    }
     market::ShanghaiTickV1 tick{};
     FillCommon(
         &tick.common,
@@ -2320,11 +2335,25 @@ std::optional<market::RealtimeHistoryEventInputV1> TickInput(
         ingress_sequence,
         1U,
         0U);
-    tick.common.exchange_time.raw_hhmmssmmm = 93000000U;
+    const std::uint64_t whole_seconds =
+        event_time_ns_since_midnight / nanoseconds_per_second;
+    const std::uint32_t hours =
+        static_cast<std::uint32_t>(whole_seconds / 3'600U);
+    const std::uint32_t minutes = static_cast<std::uint32_t>(
+        (whole_seconds % 3'600U) / 60U);
+    const std::uint32_t seconds =
+        static_cast<std::uint32_t>(whole_seconds % 60U);
+    const std::uint32_t milliseconds =
+        static_cast<std::uint32_t>(
+            (event_time_ns_since_midnight % nanoseconds_per_second) /
+            1'000'000U);
+    tick.common.exchange_time.raw_hhmmssmmm =
+        hours * 10'000'000U + minutes * 100'000U +
+        seconds * 1'000U + milliseconds;
     tick.common.exchange_time.nanoseconds_since_midnight =
-        34'200'000'000'000ULL + ingress_sequence;
+        event_time_ns_since_midnight;
     tick.common.exchange_time.unix_nanoseconds =
-        1'785'254'400'000'000'000LL +
+        kTradeDateMidnightUnixNs +
         static_cast<std::int64_t>(
             tick.common.exchange_time
                 .nanoseconds_since_midnight);
@@ -2368,6 +2397,17 @@ std::optional<market::RealtimeHistoryEventInputV1> TickInput(
         ingress_sequence,
         std::move(event),
         tick_stream_sequence);
+}
+
+std::optional<market::RealtimeHistoryEventInputV1> TickInput(
+    std::uint64_t source_sequence,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence) {
+    return TickInputAt(
+        source_sequence,
+        ingress_sequence,
+        tick_stream_sequence,
+        34'200'000'000'000ULL + ingress_sequence);
 }
 
 std::optional<market::RealtimeHistoryEventInputV1> AddInput(
@@ -3230,7 +3270,7 @@ bool TestLivePartialSemantics() {
                 transfer.fd.get(), reader.output()) ==
                     L2FLOW_SHM_READER_OK_V2 &&
                 reader.get() != nullptr,
-            "native reader accepts the V2.3 LIVE_PARTIAL state");
+            "native reader accepts the V2.4 LIVE_PARTIAL state");
     }
     transfer.fd.Reset();
     if (reader.get() == nullptr) {
@@ -4699,7 +4739,8 @@ bool TestServiceEndToEnd() {
             item_status == L2FLOW_LATEST_AVAILABLE_V2 &&
             latest_kline.generation == 2U &&
             latest_kline.instrument_id == 1U &&
-            latest_kline.present == 1U,
+            latest_kline.present == 1U &&
+            latest_kline.coverage_flags == 0U,
         "Reader observes published KLine from active table");
     const std::uint64_t catalog_generation =
         session.catalog_generation;
@@ -4769,6 +4810,695 @@ bool TestServiceEndToEnd() {
         "clean terminal mapping preserves exact ring watermark");
     service->StopControl();
     return ok && !service->failed();
+}
+
+bool TestStandaloneProcessStartPartialKLineService() {
+    ScopedTempDirectory temporary;
+    constexpr std::uint64_t partial_epoch = kSessionEpoch + 102U;
+    DailyRuntimeFixture fixture =
+        MakeManualDailyFixture(1U, partial_epoch);
+    if (!Expect(
+            temporary.valid() && static_cast<bool>(fixture),
+            "create standalone partial-KLine fixture")) {
+        return false;
+    }
+
+    const std::filesystem::path socket_path =
+        temporary.path() / "partial-kline.sock";
+    const common::Identity128 run_id = RunId(0x63U);
+    ipc::RealtimeSharedServiceConfigV2 service_config{};
+    service_config.run_id = run_id;
+    service_config.session_epoch = partial_epoch;
+    service_config.trade_date = kTradeDate;
+    service_config.daily_catalog = fixture.catalog;
+    service_config.kline_windows = {{
+        kWindowId,
+        kWindowDurationNs,
+    }};
+    service_config.coverage_from_open = false;
+    service_config.full_day_kline_valid = false;
+    service_config.tick_ring_capacity = 16U;
+    service_config.key_arena_bytes = 128U;
+    service_config.maximum_mapping_bytes =
+        16U * 1024U * 1024U;
+    service_config.control_socket_path = socket_path;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    const ipc::RealtimeSharedServiceCreateErrorV2 create_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            service_config, &service, &system_error);
+    bool ok = Expect(
+        create_error ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            service != nullptr && system_error == 0,
+        "create standalone process-start partial-KLine service");
+    if (service == nullptr) {
+        std::cerr
+            << "partial-KLine create error="
+            << ipc::RealtimeSharedServiceCreateErrorNameV2(
+                   create_error)
+            << " errno=" << system_error << '\n';
+        return false;
+    }
+    ok &= Expect(
+        service->StartLivePartialWithProcessStartHistory(
+            &system_error) &&
+            system_error == 0,
+        "start standalone partial service with configured KLine");
+
+    SessionTransfer transfer = RequestSession(socket_path);
+    ok &= Expect(
+        transfer.fd.get() >= 0 &&
+            transfer.response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeControlStatusV2::kOk),
+        "obtain standalone partial-KLine mapping");
+    ReaderHandle reader;
+    if (transfer.fd.get() >= 0) {
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                transfer.fd.get(), reader.output()) ==
+                    L2FLOW_SHM_READER_OK_V2 &&
+                reader.get() != nullptr,
+            "open unprepared standalone partial-KLine mapping");
+    }
+    if (reader.get() == nullptr) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    transfer.fd.Reset();
+
+    l2flow_shm_session_info_v2 session{};
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.session_epoch == partial_epoch &&
+            session.server_state ==
+                static_cast<std::uint32_t>(
+                    ipc::RealtimeServerStateV2::kLivePartial) &&
+            session.flags ==
+                static_cast<std::uint32_t>(
+                    L2FLOW_SHM_HEADER_KLINE_ENABLED_V2) &&
+            session.window_count == 1U &&
+            session.kline_generation == 0U &&
+            (session.flags &
+             static_cast<std::uint32_t>(
+                 L2FLOW_SHM_HEADER_FULL_DAY_KLINE_VALID_V2)) == 0U,
+        "LIVE_PARTIAL advertises KLine without full-day validity");
+
+    l2flow_kline_coverage_info_v2 coverage{};
+    ok &= Expect(
+        l2flow_shm_reader_kline_coverage_v2(
+            reader.get(), &coverage) ==
+            L2FLOW_SHM_READER_UNAVAILABLE_V2,
+        "partial KLine remains unavailable before its explicit boundary");
+    ok &= Expect(
+        service->PrepareProcessStartKLineCoverage(
+            kProcessStartKLineCoverageUnixNs) &&
+            service->PrepareProcessStartKLineCoverage(
+                kProcessStartKLineCoverageUnixNs),
+        "same process-start KLine boundary is idempotent before publication");
+    ok &= Expect(
+        !service->PrepareProcessStartKLineCoverage(
+            kProcessStartKLineCoverageUnixNs + 1U),
+        "a different process-start KLine boundary is rejected");
+    coverage = {};
+    ok &= Expect(
+        l2flow_shm_reader_kline_coverage_v2(
+            reader.get(), &coverage) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            coverage.session_epoch == partial_epoch &&
+            coverage.coverage_start_unix_ns ==
+                kProcessStartKLineCoverageUnixNs &&
+            coverage.coverage_kind ==
+                static_cast<std::uint32_t>(
+                    L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2) &&
+            coverage.reserved0 == 0U &&
+            coverage.reserved[0U] == 0U,
+        "C getter exposes the exact process-start boundary and coverage kind");
+
+    market::RealtimeHistoryRuntimeConfigV1 runtime_config{};
+    runtime_config.source_stream_ids = kSourceStreamIds;
+    runtime_config.worker_count = 1U;
+    runtime_config.queue_capacity_per_source_worker = 16U;
+    runtime_config.runtime_state = fixture.runtime_state.get();
+    runtime_config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    runtime_config.intraday_store.maximum_session_records = 16U;
+    runtime_config.intraday_store.maximum_session_accounted_bytes =
+        1U << 20U;
+    runtime_config.intraday_store.maximum_records_per_batch = 16U;
+    runtime_config.intraday_store.coverage_from_open = false;
+    runtime_config.kline.trade_date = kTradeDate;
+    runtime_config.kline.windows = {{
+        kWindowId,
+        kWindowDurationNs,
+    }};
+    runtime_config.applied_record_sink = service;
+    std::unique_ptr<market::RealtimeHistoryRuntimeV1> runtime;
+    ok &= Expect(
+        market::RealtimeHistoryRuntimeV1::Create(
+            runtime_config, &runtime) ==
+                market::RealtimeHistoryCreateErrorV1::kNone &&
+            runtime != nullptr,
+        "create process-start partial KLine runtime");
+    if (runtime == nullptr) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    const auto publish_generation =
+        [&](std::uint64_t generation_number,
+            std::uint64_t ingress_sequence_exclusive,
+            std::uint64_t tick_source_sequence_exclusive) {
+            std::shared_ptr<
+                const market::DailyInstrumentCatalogSnapshotV2>
+                catalog;
+            if (!Expect(
+                    fixture.runtime_state->AcquireSnapshot(
+                        &catalog) ==
+                            market::InstrumentRuntimeStateErrorV2::
+                                kNone &&
+                        catalog != nullptr,
+                    "capture partial-KLine generation catalog")) {
+                return false;
+            }
+            const std::array<
+                market::RealtimeSourceWatermarkV1,
+                market::kRealtimeHistorySourceCountV1>
+                sources{{
+                    {kSourceStreamIds[0U], 1U},
+                    {kSourceStreamIds[1U],
+                     tick_source_sequence_exclusive},
+                    {kSourceStreamIds[2U], 1U},
+                    {kSourceStreamIds[3U], 1U},
+                }};
+            market::RealtimeHistoryWatermarkV1 watermark{};
+            const std::uint64_t admitted =
+                ingress_sequence_exclusive - 1U;
+            if (!Expect(
+                    market::BuildRealtimeHistoryWatermarkV1(
+                        run_id,
+                        generation_number,
+                        kTradeDate,
+                        ingress_sequence_exclusive,
+                        100'000U + generation_number,
+                        catalog,
+                        realtime::ProcessingProgressV2{
+                            admitted, admitted},
+                        sources,
+                        &watermark) ==
+                        market::RealtimeHistoryWatermarkErrorV1::
+                            kNone,
+                    "build partial-KLine generation watermark") ||
+                !Expect(
+                    runtime->BeginGeneration(watermark) ==
+                        market::RealtimeHistoryGenerationErrorV1::
+                            kNone,
+                    "begin partial-KLine generation")) {
+                return false;
+            }
+            for (std::uint8_t source = 0U;
+                 source < market::kRealtimeHistorySourceCountV1;
+                 ++source) {
+                if (!Expect(
+                        runtime->SealSource(
+                            source, generation_number) ==
+                            market::RealtimeHistoryGenerationErrorV1::
+                                kNone,
+                        "seal partial-KLine generation source")) {
+                    return false;
+                }
+            }
+            std::shared_ptr<
+                const market::IntradayInstrumentStoreGenerationV1>
+                store_generation;
+            std::shared_ptr<const market::RealtimeKLineGenerationV1>
+                kline_generation;
+            if (!Expect(
+                    runtime->WaitForGeneration(
+                        generation_number,
+                        std::chrono::seconds(3),
+                        &store_generation,
+                        &kline_generation) ==
+                            market::RealtimeHistoryGenerationErrorV1::
+                                kNone &&
+                        store_generation != nullptr &&
+                        kline_generation != nullptr,
+                    "freeze partial-KLine generation")) {
+                return false;
+            }
+            return Expect(
+                service->PublishKLineGeneration(*kline_generation),
+                "publish consecutive partial-KLine generation");
+        };
+
+    constexpr std::uint64_t first_trade_ns_since_midnight =
+        36'150'000'000'000ULL;
+    constexpr std::uint64_t second_trade_ns_since_midnight =
+        36'190'000'000'000ULL;
+    ok &= Expect(
+        Submit(
+            runtime.get(),
+            TickInputAt(
+                1U,
+                1U,
+                1U,
+                first_trade_ns_since_midnight)),
+        "submit first trade after the explicit process-start boundary");
+    ok &= publish_generation(1U, 2U, 2U);
+
+    constexpr std::uint64_t first_window_start_ns =
+        36'120'000'000'000ULL;
+    constexpr std::uint64_t first_window_end_ns =
+        36'180'000'000'000ULL;
+    constexpr std::uint32_t first_coverage_flags =
+        static_cast<std::uint32_t>(
+            L2FLOW_KLINE_PROCESS_START_PARTIAL_V2) |
+        static_cast<std::uint32_t>(
+            L2FLOW_KLINE_NATURAL_WINDOW_LEFT_TRUNCATED_V2);
+    const std::uint32_t instrument_id = 1U;
+    const std::uint32_t window_id = kWindowId;
+    std::uint8_t item_status = 0xffU;
+    ipc::RealtimeWireKLinePayloadV2 latest{};
+    ok &= Expect(
+        l2flow_shm_reader_latest_klines_v2(
+            reader.get(),
+            &instrument_id,
+            &window_id,
+            1U,
+            &latest,
+            sizeof(latest),
+            &item_status) == L2FLOW_SHM_READER_OK_V2 &&
+            item_status == L2FLOW_LATEST_AVAILABLE_V2 &&
+            latest.present == 1U && latest.generation == 1U &&
+            latest.window_start_ns_since_midnight ==
+                first_window_start_ns &&
+            latest.window_end_ns_since_midnight ==
+                first_window_end_ns &&
+            latest.window_start_unix_ns ==
+                kTradeDateMidnightUnixNs +
+                    static_cast<std::int64_t>(
+                        first_window_start_ns) &&
+            latest.window_end_unix_ns ==
+                kTradeDateMidnightUnixNs +
+                    static_cast<std::int64_t>(
+                        first_window_end_ns) &&
+            latest.first_event_time_ns_since_midnight ==
+                first_trade_ns_since_midnight &&
+            latest.coverage_flags == first_coverage_flags,
+        "first natural 10:02 KLine is explicitly left-truncated at process start");
+
+    ok &= Expect(
+        Submit(
+            runtime.get(),
+            TickInputAt(
+                2U,
+                2U,
+                2U,
+                second_trade_ns_since_midnight)),
+        "submit trade in the first complete post-start natural window");
+    ok &= publish_generation(2U, 3U, 3U);
+
+    constexpr std::uint64_t second_window_start_ns =
+        36'180'000'000'000ULL;
+    constexpr std::uint64_t second_window_end_ns =
+        36'240'000'000'000ULL;
+    constexpr std::uint32_t later_coverage_flags =
+        static_cast<std::uint32_t>(
+            L2FLOW_KLINE_PROCESS_START_PARTIAL_V2);
+    latest = {};
+    item_status = 0xffU;
+    ok &= Expect(
+        l2flow_shm_reader_latest_klines_v2(
+            reader.get(),
+            &instrument_id,
+            &window_id,
+            1U,
+            &latest,
+            sizeof(latest),
+            &item_status) == L2FLOW_SHM_READER_OK_V2 &&
+            item_status == L2FLOW_LATEST_AVAILABLE_V2 &&
+            latest.present == 1U && latest.generation == 2U &&
+            latest.window_start_ns_since_midnight ==
+                second_window_start_ns &&
+            latest.window_end_ns_since_midnight ==
+                second_window_end_ns &&
+            latest.first_event_time_ns_since_midnight ==
+                second_trade_ns_since_midnight &&
+            latest.coverage_flags == later_coverage_flags,
+        "later 10:03 KLine retains process-start origin without left truncation");
+
+    service->MarkDraining();
+    ok &= publish_generation(3U, 3U, 3U);
+    latest = {};
+    item_status = 0xffU;
+    ok &= Expect(
+        l2flow_shm_reader_latest_klines_v2(
+            reader.get(),
+            &instrument_id,
+            &window_id,
+            1U,
+            &latest,
+            sizeof(latest),
+            &item_status) == L2FLOW_SHM_READER_OK_V2 &&
+            item_status == L2FLOW_LATEST_AVAILABLE_V2 &&
+            latest.generation == 3U &&
+            latest.window_start_ns_since_midnight ==
+                second_window_start_ns &&
+            latest.coverage_flags == later_coverage_flags &&
+            !service->PrepareProcessStartKLineCoverage(
+                kProcessStartKLineCoverageUnixNs),
+        "final no-new-data generation remains consecutive and freezes the boundary");
+
+    runtime->StopAndDrain();
+    ok &= Expect(
+        service->MarkStoppedClean(2U),
+        "partial-KLine service stops cleanly at its exact tick prefix");
+    session = {};
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.server_state ==
+                static_cast<std::uint32_t>(
+                    ipc::RealtimeServerStateV2::kStoppedClean) &&
+            session.kline_generation == 3U &&
+            (session.flags &
+             static_cast<std::uint32_t>(
+                 L2FLOW_SHM_HEADER_FULL_DAY_KLINE_VALID_V2)) == 0U,
+        "STOPPED_CLEAN preserves partial KLine generation without a full-day claim");
+    coverage = {};
+    ok &= Expect(
+        l2flow_shm_reader_kline_coverage_v2(
+            reader.get(), &coverage) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            coverage.coverage_kind ==
+                static_cast<std::uint32_t>(
+                    L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2) &&
+            coverage.coverage_start_unix_ns ==
+                kProcessStartKLineCoverageUnixNs,
+        "terminal mapping retains the exact process-start KLine contract");
+    service->StopControl();
+    return ok && !runtime->fatal() && !service->failed();
+}
+
+enum class ProcessStartKLineTerminalTransitionV2 : std::uint8_t {
+    kDraining = 0U,
+    kCoverageLost,
+};
+
+enum class ProcessStartKLineRaceScheduleV2 : std::uint8_t {
+    kPrepareFirst = 0U,
+    kTransitionFirst,
+    kSimultaneous,
+};
+
+[[nodiscard]] bool ReadProcessStartKLineBoundaryFromFd(
+    int fd,
+    std::uint64_t* output) {
+    if (fd < 0 || output == nullptr) {
+        return false;
+    }
+    ipc::RealtimeWireHeaderV2 header{};
+    ssize_t bytes = -1;
+    do {
+        bytes = ::pread(fd, &header, sizeof(header), 0);
+    } while (bytes < 0 && errno == EINTR);
+    if (bytes != static_cast<ssize_t>(sizeof(header)) ||
+        header.magic != ipc::kRealtimeShmMagicV2) {
+        return false;
+    }
+    *output = header.kline_coverage_start_unix_ns;
+    return true;
+}
+
+[[nodiscard]] bool ExerciseProcessStartKLineLifecycleRace(
+    const DailyRuntimeFixture& fixture,
+    const std::filesystem::path& directory,
+    std::size_t case_index,
+    ProcessStartKLineTerminalTransitionV2 transition,
+    ProcessStartKLineRaceScheduleV2 schedule) {
+    if (!fixture || fixture.catalog == nullptr) {
+        return false;
+    }
+
+    const std::filesystem::path socket_path =
+        directory /
+        ("partial-kline-race-" + std::to_string(case_index) +
+         ".sock");
+    ipc::RealtimeSharedServiceConfigV2 config{};
+    config.run_id = RunId(static_cast<std::uint8_t>(
+        0x70U + case_index));
+    config.session_epoch = fixture.catalog->session_epoch();
+    config.trade_date = kTradeDate;
+    config.daily_catalog = fixture.catalog;
+    config.kline_windows = {{kWindowId, kWindowDurationNs}};
+    config.coverage_from_open = false;
+    config.full_day_kline_valid = false;
+    config.tick_ring_capacity = 4U;
+    config.key_arena_bytes = 128U;
+    config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.control_socket_path = socket_path;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    bool ok = Expect(
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            config, &service, &system_error) ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            service != nullptr && system_error == 0,
+        "create process-start KLine lifecycle-race service");
+    if (service == nullptr) {
+        return false;
+    }
+    ok &= Expect(
+        service->StartLivePartialWithProcessStartHistory(
+            &system_error) &&
+            system_error == 0,
+        "start process-start KLine lifecycle-race service");
+    if (!ok) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    SessionTransfer transfer = RequestSession(socket_path);
+    ReaderHandle reader;
+    if (transfer.fd.get() >= 0) {
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                transfer.fd.get(), reader.output()) ==
+                    L2FLOW_SHM_READER_OK_V2 &&
+                reader.get() != nullptr,
+            "open process-start KLine lifecycle-race mapping");
+    } else {
+        ok = false;
+    }
+    if (!ok || reader.get() == nullptr) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    std::uint64_t raw_boundary =
+        std::numeric_limits<std::uint64_t>::max();
+    l2flow_kline_coverage_info_v2 coverage{};
+    ok &= Expect(
+        ReadProcessStartKLineBoundaryFromFd(
+            transfer.fd.get(), &raw_boundary) &&
+            raw_boundary == 0U &&
+            l2flow_shm_reader_kline_coverage_v2(
+                reader.get(), &coverage) ==
+                L2FLOW_SHM_READER_UNAVAILABLE_V2,
+        "race mapping begins with an unprepared KLine boundary");
+
+    const auto terminal_transition = [&service, transition] {
+        if (transition ==
+            ProcessStartKLineTerminalTransitionV2::kDraining) {
+            service->MarkDraining();
+        } else {
+            service->MarkCoverageLost();
+        }
+    };
+
+    bool prepared = false;
+    if (schedule ==
+        ProcessStartKLineRaceScheduleV2::kPrepareFirst) {
+        prepared = service->PrepareProcessStartKLineCoverage(
+            kProcessStartKLineCoverageUnixNs);
+        terminal_transition();
+    } else if (
+        schedule ==
+        ProcessStartKLineRaceScheduleV2::kTransitionFirst) {
+        terminal_transition();
+        prepared = service->PrepareProcessStartKLineCoverage(
+            kProcessStartKLineCoverageUnixNs);
+    } else {
+        std::atomic<std::uint32_t> ready{0U};
+        std::atomic<bool> start{false};
+        const auto await_start = [&ready, &start] {
+            ready.fetch_add(1U, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        };
+        std::thread prepare_thread([&] {
+            await_start();
+            prepared =
+                service->PrepareProcessStartKLineCoverage(
+                    kProcessStartKLineCoverageUnixNs);
+        });
+        std::thread transition_thread([&] {
+            await_start();
+            terminal_transition();
+        });
+        while (ready.load(std::memory_order_acquire) != 2U) {
+            std::this_thread::yield();
+        }
+        start.store(true, std::memory_order_release);
+        prepare_thread.join();
+        transition_thread.join();
+    }
+
+    const bool ordered_result_valid =
+        schedule ==
+            ProcessStartKLineRaceScheduleV2::kSimultaneous ||
+        (schedule ==
+             ProcessStartKLineRaceScheduleV2::kPrepareFirst &&
+         prepared) ||
+        (schedule ==
+             ProcessStartKLineRaceScheduleV2::kTransitionFirst &&
+         !prepared);
+    ok &= Expect(
+        ordered_result_valid,
+        "process-start KLine boundary respects real-time lifecycle order");
+
+    l2flow_shm_session_info_v2 session{};
+    const std::uint32_t expected_state =
+        transition ==
+                ProcessStartKLineTerminalTransitionV2::kDraining
+            ? static_cast<std::uint32_t>(
+                  ipc::RealtimeServerStateV2::kDraining)
+            : static_cast<std::uint32_t>(
+                  ipc::RealtimeServerStateV2::kFailed);
+    const std::uint32_t expected_transition_flag =
+        transition ==
+                ProcessStartKLineTerminalTransitionV2::kCoverageLost
+            ? static_cast<std::uint32_t>(
+                  L2FLOW_SHM_HEADER_COVERAGE_LOST_V2)
+            : 0U;
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.server_state == expected_state &&
+            (session.flags & static_cast<std::uint32_t>(
+                                 L2FLOW_SHM_HEADER_KLINE_ENABLED_V2)) !=
+                0U &&
+            (session.flags & static_cast<std::uint32_t>(
+                                 L2FLOW_SHM_HEADER_COVERAGE_LOST_V2)) ==
+                expected_transition_flag,
+        "lifecycle race reaches its exact terminal or failed state");
+
+    const std::uint64_t expected_boundary =
+        prepared ? kProcessStartKLineCoverageUnixNs : 0U;
+    raw_boundary = std::numeric_limits<std::uint64_t>::max();
+    ok &= Expect(
+        ReadProcessStartKLineBoundaryFromFd(
+            transfer.fd.get(), &raw_boundary) &&
+            raw_boundary == expected_boundary,
+        "race winner and immutable raw KLine boundary agree exactly");
+
+    coverage = {};
+    coverage.coverage_start_unix_ns =
+        std::numeric_limits<std::uint64_t>::max();
+    const int coverage_status =
+        l2flow_shm_reader_kline_coverage_v2(
+            reader.get(), &coverage);
+    if (!prepared) {
+        ok &= Expect(
+            coverage_status == L2FLOW_SHM_READER_UNAVAILABLE_V2 &&
+                coverage.coverage_start_unix_ns !=
+                    kProcessStartKLineCoverageUnixNs,
+            "transition winner exposes no process-start KLine boundary");
+    } else if (
+        transition ==
+        ProcessStartKLineTerminalTransitionV2::kDraining) {
+        ok &= Expect(
+            coverage_status == L2FLOW_SHM_READER_OK_V2 &&
+                coverage.coverage_start_unix_ns ==
+                    kProcessStartKLineCoverageUnixNs &&
+                coverage.coverage_kind ==
+                    static_cast<std::uint32_t>(
+                        L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2),
+            "Prepare winner remains observable after DRAINING");
+    } else {
+        ok &= Expect(
+            coverage_status == L2FLOW_SHM_READER_OK_V2 &&
+                coverage.coverage_start_unix_ns ==
+                    kProcessStartKLineCoverageUnixNs &&
+                coverage.coverage_kind ==
+                    static_cast<std::uint32_t>(
+                        L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2),
+            "Prepare winner remains observable after FAILED");
+    }
+
+    service->StopControl();
+    raw_boundary = std::numeric_limits<std::uint64_t>::max();
+    ok &= Expect(
+        ReadProcessStartKLineBoundaryFromFd(
+            transfer.fd.get(), &raw_boundary) &&
+            raw_boundary == expected_boundary,
+        "control shutdown never rewrites the immutable KLine boundary");
+    return ok;
+}
+
+bool TestProcessStartKLineLifecycleLinearization() {
+    ScopedTempDirectory temporary;
+    constexpr std::uint64_t race_epoch = kSessionEpoch + 103U;
+    const DailyRuntimeFixture fixture =
+        MakeManualDailyFixture(1U, race_epoch);
+    if (!Expect(
+            temporary.valid() && static_cast<bool>(fixture),
+            "create process-start KLine lifecycle-race fixture")) {
+        return false;
+    }
+
+    constexpr std::size_t collision_rounds = 32U;
+    std::size_t case_index = 0U;
+    for (const ProcessStartKLineTerminalTransitionV2 transition : {
+             ProcessStartKLineTerminalTransitionV2::kDraining,
+             ProcessStartKLineTerminalTransitionV2::kCoverageLost}) {
+        if (!ExerciseProcessStartKLineLifecycleRace(
+                fixture,
+                temporary.path(),
+                case_index++,
+                transition,
+                ProcessStartKLineRaceScheduleV2::kPrepareFirst) ||
+            !ExerciseProcessStartKLineLifecycleRace(
+                fixture,
+                temporary.path(),
+                case_index++,
+                transition,
+                ProcessStartKLineRaceScheduleV2::kTransitionFirst)) {
+            return false;
+        }
+        for (std::size_t round = 0U;
+             round < collision_rounds;
+             ++round) {
+            if (!ExerciseProcessStartKLineLifecycleRace(
+                    fixture,
+                    temporary.path(),
+                    case_index++,
+                    transition,
+                    ProcessStartKLineRaceScheduleV2::kSimultaneous)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool TestPromotionExposureGate() {
@@ -10147,6 +10877,8 @@ int main(int argc, char** argv) {
         !TestStandaloneLivePartialProcessStartHistory() ||
         !TestPromotionExposureGate() ||
         !TestServiceEndToEnd() ||
+        !TestStandaloneProcessStartPartialKLineService() ||
+        !TestProcessStartKLineLifecycleLinearization() ||
         !TestProcessingAdmissionPublishesWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||
         !TestStoppedCleanRejectsMismatchedWatermark() ||

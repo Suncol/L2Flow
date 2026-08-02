@@ -46,9 +46,14 @@ History 与 tick generation delta；`coverage_from_open` 及全部强完整性 f
 
 不显式指定时 CSV 仍进入 online recovery；`blocking` 会被明确拒绝。盘中启动、
 不 recovery 时应显式使用
-`--intraday-live-partial`；此时不允许 recovery tuning、KLine 或 CERTIFIED，
-但默认启动独立的 process-start Event sidecar，且不作全日或 native-gap
-完整性声明。盘中启动却使用
+`--intraday-live-partial`；此时不允许 recovery tuning 或 CERTIFIED，但可通过
+`--kline-windows-ms` 显式启用 process-start partial KLine。它保留按交易所
+自然时间对齐的窗口，只发布 latest KLine；SDK Connect 成功后立即采样保守的
+live coverage boundary。只有已 materialize 的 bar 严格满足
+`window_start < boundary < window_end` 时才标记为 left-truncated；无成交窗口
+不会合成所谓“首根 bar”。`full_day_kline_valid` 始终为 false。partial
+仍默认启动独立的 process-start Event sidecar，且不作全日或 native-gap 完整性
+声明。盘中启动却使用
 `--intraday-store-from-open` 仍是错误的事实声明；该参数只适用于本进程确实
 从首条相关市场消息前开始接收并持续健康的会话。
 
@@ -465,12 +470,13 @@ CSV 错误可定位时包含文件和行号。
 | `record_coverage_complete` | 某个已发布 immutable generation/cursor 包含本进程在其 cut 范围内应有的全部 Store record | 载荷包含 SDK 的所有源字段；跨市场原始 callback 全序已恢复 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | record 数量或时间覆盖完整 |
 
-Wire V2.3 把服务状态与这些事实分开编码。健康 online preview 必须是
+Wire V2.4 把服务状态与这些事实分开编码。健康 online preview 必须是
 `LIVE_PARTIAL`，且 `coverage_from_open`、`startup_prefix_recovered`、
 `full_day_kline_valid`、`full_day_factor_valid`、
 `certified_prefix_valid` 全为 false。`KLINE_ENABLED` 只表示布局里有 KLine
-表，不能替代 `full_day_kline_valid`；当前生产 preview 连 KLine window 也
-不配置。reader 会拒绝以下组合：
+表，不能替代 `full_day_kline_valid`；CSV online recovery 的 preview 连 KLine
+window 也不配置。standalone partial 可显式配置 process-start KLine，但仍不
+获得全日有效性。reader 会拒绝以下组合：
 
 - `ACTIVE` 但没有 `coverage_from_open`；
 - `LIVE_PARTIAL` 携带任一 from-open/recovered/full-day/CERTIFIED 强标志；

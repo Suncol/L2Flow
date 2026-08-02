@@ -298,7 +298,13 @@ void PrintUsage(std::ostream& output) {
         << "                                1..1048576, default 65536\n"
         << "  --kline-windows-ms LIST       comma-separated unique durations "
            "in 1..86400000;\n"
-        << "                                duration-ms is the window id\n"
+        << "                                duration-ms is the window id; "
+           "partial mode publishes\n"
+        << "                                process-start latest KLine IPC in "
+           "natural exchange windows;\n"
+        << "                                published bars strictly spanning "
+           "the boundary are\n"
+        << "                                left-truncated and not full-day\n"
         << "  --generation-interval-ms N    1..60000, default 1000\n"
         << "  --generation-timeout-ms N     1..600000, default 10000\n"
         << "  --ipc-tick-ring-records N     positive u64, default 262144\n"
@@ -1017,12 +1023,6 @@ bool ParseOptions(
         return false;
     }
     if (parsed.intraday_live_partial) {
-        if (!parsed.kline_windows_ms.empty()) {
-            *error =
-                "--intraday-live-partial cannot publish full-day KLine; "
-                "omit --kline-windows-ms";
-            return false;
-        }
         if (parsed.certified_ipc_socket_set) {
             *error =
                 "--intraday-live-partial does not expose CERTIFIED; "
@@ -1788,12 +1788,14 @@ int RunLivePartial(
     const std::shared_ptr<const market::DailyInstrumentCatalogV2>&
         daily_catalog,
     market::InstrumentRuntimeStateV2* runtime_state) {
+    const std::vector<market::KLineWindowSpecV1> kline_windows =
+        BuildKLineWindows(options);
     ipc::RealtimeSharedServiceConfigV2 ipc_config =
         BuildOnlineIpcConfig(
             options,
             run_id,
             daily_catalog,
-            {},
+            kline_windows,
             options.ipc_socket);
     ipc_config.coverage_from_open = false;
     ipc_config.startup_prefix_recovered = false;
@@ -1870,7 +1872,7 @@ int RunLivePartial(
         BuildOnlinePipelineBase(
             options, run_id, daily_catalog, runtime_state);
     pipeline_config.intraday_store.coverage_from_open = false;
-    pipeline_config.kline.windows.clear();
+    pipeline_config.kline.windows = kline_windows;
     pipeline_config.factor_generation_enabled = false;
     pipeline_config.sdk.enabled = true;
     pipeline_config.sdk.library_path = options.sdk_library;
@@ -1922,6 +1924,28 @@ int RunLivePartial(
         return 1;
     }
 
+    // Create includes SDK Connect and leaves the Pipeline accepting. Sampling
+    // only after it returns avoids claiming coverage for time during which the
+    // subscription was not yet proven active. Any synchronous Connect callback
+    // that already reached KLine is conservatively before this boundary.
+    std::uint64_t kline_coverage_start_unix_ns = 0U;
+    if (!kline_windows.empty() &&
+        (!CurrentRealtimeNs(&kline_coverage_start_unix_ns) ||
+         !ipc_service->PrepareProcessStartKLineCoverage(
+             kline_coverage_start_unix_ns))) {
+        std::cerr
+            << "mdl-production-router: standalone LIVE_PARTIAL KLine "
+               "coverage preparation failed\n";
+        pipeline->StopAndDrain();
+        ipc_service->MarkFailed();
+        ipc_service->StopControl();
+        if (managed_event_sidecar != nullptr) {
+            static_cast<void>(managed_event_sidecar->StopAndWait(
+                std::chrono::milliseconds(2000)));
+        }
+        return 1;
+    }
+
     std::cerr
         << "mdl-production-router: standalone LIVE_PARTIAL available: "
         << "socket=" << ipc_service->control_socket_path()
@@ -1929,6 +1953,15 @@ int RunLivePartial(
         << " coverage_from_open=false"
         << " startup_prefix_recovered=false"
         << " full_day_kline_valid=false"
+        << " kline_enabled="
+        << (!kline_windows.empty() ? "true" : "false")
+        << " window_count=" << kline_windows.size()
+        << " kline_quality="
+        << (!kline_windows.empty()
+                ? "PROCESS_START_PARTIAL"
+                : "DISABLED")
+        << " coverage_start_unix_ns="
+        << kline_coverage_start_unix_ns
         << " full_day_factor_valid=false"
         << " certified_prefix_valid=false"
         << " event_socket=" << options.event_aggregator_socket
@@ -2019,6 +2052,11 @@ int RunLivePartial(
             exit_code = 1;
             break;
         }
+        if (!PublishKLineGeneration(
+                cut, ipc_service, "LIVE_PARTIAL periodic")) {
+            exit_code = 1;
+            break;
+        }
     }
 
     if (!ipc_service->failed()) {
@@ -2033,6 +2071,9 @@ int RunLivePartial(
                    "failed: "
                 << runtime::RealtimePipelineCutErrorNameV1(final.error)
                 << '\n';
+            exit_code = 1;
+        } else if (!PublishKLineGeneration(
+                       final, ipc_service, "LIVE_PARTIAL final")) {
             exit_code = 1;
         }
     } else {

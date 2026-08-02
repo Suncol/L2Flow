@@ -7,7 +7,7 @@ strict premarket daily A-share catalog
   -> exact-key sort/deduplicate
   -> dense session-local IDs
   -> Store/runtime/IPC preallocation
-  -> Wire V2.3 ACTIVE
+  -> Wire V2.4 ACTIVE
 
 single-threaded vendor SDK callback
   -> inspect and exact-key extraction
@@ -46,7 +46,7 @@ ownership during an active farm interval.
 Before SDK Connect, production must load an absolute, regular, non-symlink
 catalog file that declares the configured trade date, a positive source
 version, complete Shanghai+Shenzhen subscription coverage, and exact opaque
-`SecurityID`/`SecurityIDSource` bytes. Wire V2.3 exposes:
+`SecurityID`/`SecurityIDSource` bytes. Wire V2.4 exposes:
 
 ```text
 catalog_scope             = DECLARED_DAILY_A_SHARE
@@ -77,12 +77,14 @@ configured Shanghai+Shenzhen A-share subscription scope complete. It does not
 claim complete exchange-wide products, complete-from-open history, or that
 every catalog member has received data.
 
-Wire minor 3 adds `LIVE_PARTIAL` plus explicit from-open, startup-recovered,
-full-day KLine/Factor, and CERTIFIED-prefix flags. The C header exports stable
-numeric enums and the Python model exposes the same state/flags, but readers
-still validate the exact supported wire minor. Deploy the producer, native
-reader library, and Python package together; a V2.2 reader must reject a V2.3
-mapping instead of silently interpreting the new state.
+Wire minor 4 retains `LIVE_PARTIAL` and the explicit from-open,
+startup-recovered, full-day KLine/Factor, and CERTIFIED-prefix flags introduced
+by minor 3. It adds process-start KLine coverage metadata and per-bar coverage
+flags. The C header exports stable numeric enums and the Python model exposes
+the same state/flags, but readers still validate the exact supported wire
+minor. Deploy the producer, native reader library, and Python package together;
+a V2.3 reader must reject a V2.4 mapping instead of silently interpreting the
+new KLine metadata.
 
 ## Latency-sensitive path
 
@@ -249,6 +251,15 @@ cut also exposes the complete retained single-instrument History from this
 process's start and tick generation delta; before the first cut those opens are
 temporarily unavailable. The generation truthfully carries
 `record_coverage_complete=true` and `coverage_from_open=false`.
+When `--kline-windows-ms` is present, the same cuts publish latest KLine data
+using exchange-natural, local-midnight-aligned windows. Those bars contain only
+trades received by this process. The router samples a conservative live
+coverage boundary immediately after SDK Connect succeeds. A materialized bar
+is marked left-truncated exactly when its natural bounds satisfy
+`window_start < boundary < window_end`; a no-trade window does not synthesize a
+bar. The session advertises process-start partial KLine coverage rather than
+full-day validity. The public IPC surface remains latest-KLine only; it does
+not expose a partial KLine history cursor.
 `startup_prefix_recovered`, both full-day validity flags, and
 `certified_prefix_valid` remain false for the whole run.
 The Event stream is explicitly `FROM_PROCESS_START` and
@@ -263,8 +274,8 @@ unsupervised Event process running. The mode creates no startup buffer, live
 journal, CSV source, shadow pipeline, or CERTIFIED sidecar. It also configures
 `factor_generation_enabled=false`, so
 periodic Store generations remain publishable for History/delta without
-creating or invoking the C++ generation Factor engine. KLine windows, a
-CERTIFIED socket, and full-day Event claims remain unavailable. This is the
+creating or invoking the C++ generation Factor engine. A CERTIFIED socket and
+full-day Event/KLine claims remain unavailable. This is the
 factually correct
 mode for a mid-session launch that deliberately does not recover the
 market-open prefix; using
@@ -273,8 +284,9 @@ assertion.
 
 This opt-in applies only to standalone `--intraday-live-partial`. The separate
 `LIVE_PARTIAL` socket used while CSV online recovery is running remains
-latest-only and continues to reject History/delta, so recovery-side bulk reads
-cannot be introduced through the preview endpoint.
+snapshot/tick latest-only, carries no KLine windows, and continues to reject
+History/delta, so recovery-side bulk reads cannot be introduced through the
+preview endpoint.
 
 CSV recovery is online whenever `--intraday-recovery-csv-dir` is present.
 `--intraday-recovery-mode online` remains an optional explicit selector;
@@ -539,6 +551,22 @@ with L2FlowClient.connect("/absolute/path/to/l2flow.sock") as client:
 `select()` returns its IDs and counts in one coherent daily-catalog envelope.
 Once a caller has a session-scoped ID, `latest_snapshot()`,
 `latest_tick()`, and `latest_kline()` use the direct known-ID path.
+
+KLine consumers can inspect the session boundary and each bar's coverage
+without guessing from its first trade timestamp:
+
+```python
+coverage = client.kline_coverage()
+bar = client.latest_kline(instrument_id=1, window_id=60_000)
+
+print(coverage.coverage_kind, coverage.coverage_start_unix_ns)
+print(bar.temporal_coverage, bar.natural_window_left_truncated)
+```
+
+`PROCESS_START_PARTIAL` is never equivalent to full-day validity. A partial
+bar carries `KLineCoverageFlag.PROCESS_START_PARTIAL`; the natural window that
+strictly contains the process coverage boundary additionally carries
+`NATURAL_WINDOW_LEFT_TRUNCATED`.
 
 The market library also provides deterministic order-analysis cores for the
 Shanghai 4.24 combined order/trade stream and the Shenzhen 6.33/6.36 streams.

@@ -15,7 +15,7 @@ inline constexpr std::array<std::uint8_t, 8U> kRealtimeShmMagicV2{
 inline constexpr std::array<std::uint8_t, 8U> kRealtimeControlMagicV2{
     'L', '2', 'F', 'C', 'T', 'L', '2', '\0'};
 inline constexpr std::uint16_t kRealtimeWireMajorV2 = 2U;
-inline constexpr std::uint16_t kRealtimeWireMinorV2 = 3U;
+inline constexpr std::uint16_t kRealtimeWireMinorV2 = 4U;
 inline constexpr std::uint32_t kRealtimeLittleEndianMarkerV2 =
     0x01020304U;
 inline constexpr std::uint32_t kRealtimeDefaultInstrumentCapacityV2 =
@@ -33,8 +33,10 @@ enum class RealtimeServerStateV2 : std::uint32_t {
     kStoppedClean = 4U,
     kFailed = 5U,
     // Queryable latest-value preview whose retained prefix begins at process
-    // startup rather than market open.  History/KLine/Factor/CERTIFIED must
-    // consult the coverage flags and cannot treat this as complete ACTIVE.
+    // startup rather than market open. History and explicitly enabled KLine
+    // may expose that process-start prefix, but KLine must retain its partial
+    // coverage metadata and cannot be treated as full-day. Factor/CERTIFIED
+    // remain unavailable.
     kLivePartial = 6U,
 };
 
@@ -48,7 +50,30 @@ enum RealtimeHeaderFlagV2 : std::uint32_t {
     kRealtimeHeaderCertifiedPrefixValidV2 = 1U << 6U,
 };
 
-// V2.3 retains the immutable, declared daily Shanghai+Shenzhen A-share
+enum RealtimeWireKLineCoverageFlagV2 : std::uint32_t {
+    // The bar is built only from trades admitted by this process-start
+    // session. It may include synchronous SDK Connect callbacks that precede
+    // the conservative guaranteed-coverage boundary. This is not a claim
+    // that the natural exchange-time window is complete.
+    kRealtimeWireKLineProcessStartPartialV2 = 1U << 0U,
+    // The natural exchange-time window strictly contains the process-start
+    // coverage boundary. This flag always implies process-start partial.
+    kRealtimeWireKLineNaturalWindowLeftTruncatedV2 = 1U << 1U,
+};
+
+[[nodiscard]] constexpr bool RealtimeWireKLineCoverageFlagsValidV2(
+    std::uint32_t flags) noexcept {
+    constexpr std::uint32_t known =
+        kRealtimeWireKLineProcessStartPartialV2 |
+        kRealtimeWireKLineNaturalWindowLeftTruncatedV2;
+    return (flags & ~known) == 0U &&
+           ((flags &
+             kRealtimeWireKLineNaturalWindowLeftTruncatedV2) == 0U ||
+            (flags &
+             kRealtimeWireKLineProcessStartPartialV2) != 0U);
+}
+
+// V2.4 retains the immutable, declared daily Shanghai+Shenzhen A-share
 // catalog introduced by V2.2. It does not claim that every exchange security
 // is subscribed or that every catalog instrument has produced data.
 enum class RealtimeCatalogScopeV2 : std::uint32_t {
@@ -205,7 +230,10 @@ struct alignas(4096) RealtimeWireHeaderV2 final {
     std::uint64_t tick_contiguous_published_sequence = 0U;
     std::uint64_t kline_generation = 0U;
     std::uint64_t published_records = 0U;
-    std::uint64_t reserved_scalar = 0U;
+    // Zero for disabled/from-open KLine. A process-start partial service
+    // release-publishes one nonzero Unix-nanosecond boundary before its first
+    // KLine generation and never changes it afterward.
+    std::uint64_t kline_coverage_start_unix_ns = 0U;
 
     std::uint32_t region_count = 0U;
     std::uint32_t region_descriptor_bytes = 0U;
@@ -238,6 +266,9 @@ static_assert(
     offsetof(RealtimeWireHeaderV2, applied_sequence) == 216U);
 static_assert(
     offsetof(RealtimeWireHeaderV2, heartbeat_monotonic_ns) == 224U);
+static_assert(
+    offsetof(
+        RealtimeWireHeaderV2, kline_coverage_start_unix_ns) == 264U);
 static_assert(offsetof(RealtimeWireHeaderV2, regions) == 280U);
 static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 856U);
 
@@ -437,7 +468,7 @@ struct RealtimeWireKLinePayloadV2 final {
     std::uint32_t trade_date = 0U;
     std::uint32_t instrument_id = 0U;
     std::uint32_t window_id = 0U;
-    std::uint32_t reserved0 = 0U;
+    std::uint32_t coverage_flags = 0U;
     std::uint64_t window_duration_ns = 0U;
     std::uint64_t window_start_ns_since_midnight = 0U;
     std::uint64_t window_end_ns_since_midnight = 0U;
@@ -464,6 +495,8 @@ struct RealtimeWireKLinePayloadV2 final {
     std::array<std::uint8_t, 5U> reserved{};
 };
 static_assert(sizeof(RealtimeWireKLinePayloadV2) == 192U);
+static_assert(
+    offsetof(RealtimeWireKLinePayloadV2, coverage_flags) == 20U);
 
 struct alignas(64) RealtimeWireSnapshotSlotV2 final {
     std::uint64_t publish_tag = 0U;

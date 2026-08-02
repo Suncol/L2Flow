@@ -19,6 +19,7 @@ from .models import (
     Instrument,
     InstrumentKey,
     InstrumentLookupResult,
+    KLineCoverageInfo,
     LatestKLine,
     LatestSnapshot,
     LatestTick,
@@ -255,6 +256,35 @@ class L2FlowClient:
     def session_info(self):
         with self._lock:
             return self._checked_session()
+
+    def kline_coverage(self) -> KLineCoverageInfo:
+        """Return immutable KLine origin and process-start boundary."""
+
+        with self._lock:
+            before = self._checked_session()
+            coverage = self._native.kline_coverage()
+            after = self._checked_session()
+            if (
+                not isinstance(coverage, KLineCoverageInfo)
+                or coverage.session_epoch
+                != self._identity.session_epoch
+            ):
+                raise StaleSessionError(
+                    "KLine coverage belongs to another session"
+                )
+            if before.identity != after.identity:
+                raise StaleSessionError(
+                    "mapped realtime session changed during KLine "
+                    "coverage read"
+                )
+            if (
+                coverage.coverage_kind
+                is not after.kline_temporal_coverage
+            ):
+                raise WireFormatError(
+                    "KLine coverage kind disagrees with session flags"
+                )
+            return coverage
 
     def close(self) -> None:
         with self._lock:

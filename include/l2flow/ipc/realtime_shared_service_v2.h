@@ -124,7 +124,7 @@ enum class RealtimeSharedServiceCreateErrorV2 : std::uint8_t {
 RealtimeSharedServiceCreateErrorNameV2(
     RealtimeSharedServiceCreateErrorV2 error) noexcept;
 
-// Wire V2.3 service. History and delta readers bind to one immutable daily
+// Wire V2.4 service. History and delta readers bind to one immutable daily
 // catalog generation and never enter the live callback/decoder path.
 class RealtimeSharedMarketServiceV2 final
     : public l2flow::market::RealtimeAppliedRecordSinkV1,
@@ -151,13 +151,25 @@ public:
     [[nodiscard]] bool Start(int* system_error_number = nullptr) noexcept;
     // Recovery previews use StartLivePartial() and expose only point reads.
     // A standalone process-start session may explicitly expose immutable
-    // Store generations through History and tick-delta without claiming
-    // coverage from market open. Both variants retain LIVE_PARTIAL and every
-    // strong prefix flag remains false.
+    // Store generations through History and tick-delta, plus explicitly
+    // configured KLine carrying process-start coverage metadata, without
+    // claiming coverage from market open. Both variants retain LIVE_PARTIAL
+    // and every strong prefix flag remains false. Factor/CERTIFIED remain
+    // unavailable.
     [[nodiscard]] bool StartLivePartial(
         int* system_error_number = nullptr) noexcept;
     [[nodiscard]] bool StartLivePartialWithProcessStartHistory(
         int* system_error_number = nullptr) noexcept;
+
+    // A standalone LIVE_PARTIAL service with configured KLine calls this
+    // exactly once before its first KLine generation. The boundary is the
+    // conservative guaranteed-coverage point sampled after SDK Connect has
+    // succeeded; any synchronous Connect callbacks remain partial input.
+    // Repeating the same nonzero value is idempotent; a different value,
+    // another service mode, or an already published KLine generation is
+    // rejected.
+    [[nodiscard]] bool PrepareProcessStartKLineCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept;
 
     // Online recovery calls this only after the CERTIFIED Tick/Event prefix
     // barrier succeeds and before Start(). It publishes the immutable

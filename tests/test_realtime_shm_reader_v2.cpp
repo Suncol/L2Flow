@@ -29,10 +29,14 @@ namespace ipc = l2flow::ipc;
 static_assert(sizeof(l2flow_shm_session_info_v2) == 240U);
 static_assert(sizeof(l2flow_selection_envelope_v2) == 144U);
 static_assert(sizeof(l2flow_shm_health_v2) == 32U);
+static_assert(sizeof(l2flow_kline_coverage_info_v2) == 32U);
 
 constexpr std::uint32_t kCapacity = 4U;
 constexpr std::uint32_t kTradeDate = 20260729U;
 constexpr std::uint64_t kWindowDurationNs = 60'000'000'000ULL;
+// 2026-07-29 10:02:17 at the fixed UTC+8 market-calendar offset.
+constexpr std::uint64_t kProcessStartCoverageUnixNs =
+    1'785'290'537'000'000'000ULL;
 constexpr std::size_t kKeyArenaBytes = 256U;
 constexpr std::size_t kRingCapacity = 4U;
 
@@ -376,6 +380,13 @@ public:
         return instruments_;
     }
 
+    void PublishKLine(
+        const ipc::RealtimeWireKLinePayloadV2& payload) noexcept {
+        // Generation one selects table one. This fixture has one window, so
+        // the second table begins after exactly capacity slots.
+        PublishSlot(&klines_[kCapacity], payload);
+    }
+
     void SetStatusTag(std::uint64_t tag) noexcept {
         AtomicStore(header_->status_publish_tag, tag);
     }
@@ -656,6 +667,19 @@ bool TestSessionAndPointStates() {
                 std::end(session.catalog_digest),
             [](std::uint8_t byte) { return byte != 0U; }),
         "session returns immutable layout and daily catalog digests");
+
+    l2flow_kline_coverage_info_v2 kline_coverage{};
+    ok &= Expect(
+        l2flow_shm_reader_kline_coverage_v2(
+            reader.get(), &kline_coverage) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            kline_coverage.session_epoch == 17U &&
+            kline_coverage.coverage_start_unix_ns == 0U &&
+            kline_coverage.coverage_kind ==
+                L2FLOW_KLINE_COVERAGE_FROM_OPEN_V2 &&
+            kline_coverage.reserved0 == 0U &&
+            kline_coverage.reserved[0U] == 0U,
+        "KLine coverage getter reports a from-open contract without a process-start boundary");
 
     l2flow_shm_health_v2 health{};
     ok &= Expect(
@@ -1209,7 +1233,62 @@ bool TestHardLayoutAndSealRejection() {
         MappedFixture fixture;
         ok &= Expect(
             fixture.Create(),
-            "create fixture for LIVE_PARTIAL state validation");
+            "create fixture for unprepared LIVE_PARTIAL state validation");
+        fixture.header()->server_state = static_cast<std::uint32_t>(
+            ipc::RealtimeServerStateV2::kLivePartial);
+        fixture.header()->flags =
+            ipc::kRealtimeHeaderKLineEnabledV2;
+        fixture.header()->kline_generation = 0U;
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_OK_V2,
+            "reader accepts an unprepared provisional partial-KLine mapping");
+        l2flow_kline_coverage_info_v2 coverage{};
+        ok &= Expect(
+            l2flow_shm_reader_kline_coverage_v2(
+                reader.get(), &coverage) ==
+                L2FLOW_SHM_READER_UNAVAILABLE_V2,
+            "partial KLine coverage stays unavailable until its process-start boundary is published");
+    }
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for prepared LIVE_PARTIAL state validation");
+        fixture.header()->server_state = static_cast<std::uint32_t>(
+            ipc::RealtimeServerStateV2::kLivePartial);
+        fixture.header()->flags =
+            ipc::kRealtimeHeaderKLineEnabledV2;
+        fixture.header()->kline_generation = 0U;
+        fixture.header()->kline_coverage_start_unix_ns =
+            kProcessStartCoverageUnixNs;
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_OK_V2,
+            "reader accepts a prepared process-start partial-KLine contract");
+        l2flow_kline_coverage_info_v2 coverage{};
+        ok &= Expect(
+            l2flow_shm_reader_kline_coverage_v2(
+                reader.get(), &coverage) ==
+                    L2FLOW_SHM_READER_OK_V2 &&
+                coverage.session_epoch == 17U &&
+                coverage.coverage_start_unix_ns ==
+                    kProcessStartCoverageUnixNs &&
+                coverage.coverage_kind ==
+                    L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2 &&
+                coverage.reserved0 == 0U &&
+                coverage.reserved[0U] == 0U,
+            "coverage getter exposes the exact prepared process-start boundary");
+    }
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for missing partial-KLine boundary rejection");
         fixture.header()->server_state = static_cast<std::uint32_t>(
             ipc::RealtimeServerStateV2::kLivePartial);
         fixture.header()->flags =
@@ -1218,8 +1297,8 @@ bool TestHardLayoutAndSealRejection() {
         ok &= Expect(
             l2flow_shm_reader_open_fd_v2(
                 fixture.reader_fd(), reader.output()) ==
-                L2FLOW_SHM_READER_OK_V2,
-            "reader accepts LIVE_PARTIAL with only provisional KLine enablement");
+                L2FLOW_SHM_READER_LAYOUT_INVALID_V2,
+            "reader rejects a published partial KLine generation without its coverage boundary");
     }
     {
         MappedFixture fixture;
@@ -1376,6 +1455,104 @@ bool TestHardLayoutAndSealRejection() {
     return ok;
 }
 
+bool TestKLineCoveragePayloadValidation() {
+    constexpr std::int64_t window_start_unix_ns =
+        static_cast<std::int64_t>(
+            kProcessStartCoverageUnixNs - 17'000'000'000ULL);
+    constexpr std::int64_t window_end_unix_ns =
+        window_start_unix_ns +
+        static_cast<std::int64_t>(kWindowDurationNs);
+    const auto configure_partial = [](
+                                       MappedFixture* fixture,
+                                       std::uint32_t coverage_flags) {
+        fixture->header()->server_state =
+            static_cast<std::uint32_t>(
+                ipc::RealtimeServerStateV2::kLivePartial);
+        fixture->header()->flags =
+            ipc::kRealtimeHeaderKLineEnabledV2;
+        fixture->header()->kline_coverage_start_unix_ns =
+            kProcessStartCoverageUnixNs;
+        ipc::RealtimeWireKLinePayloadV2 payload{};
+        payload.generation = 1U;
+        payload.trade_date = kTradeDate;
+        payload.instrument_id = 1U;
+        payload.window_id = 1U;
+        payload.coverage_flags = coverage_flags;
+        payload.window_duration_ns = kWindowDurationNs;
+        payload.window_start_unix_ns = window_start_unix_ns;
+        payload.window_end_unix_ns = window_end_unix_ns;
+        payload.present = 1U;
+        fixture->PublishKLine(payload);
+    };
+
+    bool ok = true;
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for canonical partial-KLine payload");
+        configure_partial(
+            &fixture,
+            ipc::kRealtimeWireKLineProcessStartPartialV2 |
+                ipc::kRealtimeWireKLineNaturalWindowLeftTruncatedV2);
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_OK_V2,
+            "open canonical partial-KLine mapping");
+        constexpr std::uint32_t instrument_id = 1U;
+        constexpr std::uint32_t window_id = 1U;
+        ipc::RealtimeWireKLinePayloadV2 payload{};
+        std::uint8_t status = 0xffU;
+        ok &= Expect(
+            l2flow_shm_reader_latest_klines_v2(
+                reader.get(),
+                &instrument_id,
+                &window_id,
+                1U,
+                &payload,
+                sizeof(payload),
+                &status) == L2FLOW_SHM_READER_OK_V2 &&
+                status == L2FLOW_LATEST_AVAILABLE_V2 &&
+                payload.coverage_flags ==
+                    (ipc::kRealtimeWireKLineProcessStartPartialV2 |
+                     ipc::
+                         kRealtimeWireKLineNaturalWindowLeftTruncatedV2),
+            "reader accepts exact process-start and left-truncated flags for the natural window containing the boundary");
+    }
+    {
+        MappedFixture fixture;
+        ok &= Expect(
+            fixture.Create(),
+            "create fixture for understated partial-KLine payload");
+        configure_partial(
+            &fixture,
+            ipc::kRealtimeWireKLineProcessStartPartialV2);
+        ReaderHandle reader;
+        ok &= Expect(
+            l2flow_shm_reader_open_fd_v2(
+                fixture.reader_fd(), reader.output()) ==
+                L2FLOW_SHM_READER_OK_V2,
+            "open partial mapping before per-payload validation");
+        constexpr std::uint32_t instrument_id = 1U;
+        constexpr std::uint32_t window_id = 1U;
+        ipc::RealtimeWireKLinePayloadV2 payload{};
+        std::uint8_t status = 0xffU;
+        ok &= Expect(
+            l2flow_shm_reader_latest_klines_v2(
+                reader.get(),
+                &instrument_id,
+                &window_id,
+                1U,
+                &payload,
+                sizeof(payload),
+                &status) == L2FLOW_SHM_READER_LAYOUT_INVALID_V2,
+            "reader rejects a natural window containing the boundary when its left-truncated flag is missing");
+    }
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1386,6 +1563,7 @@ int main() {
     ok &= TestLatestNeverRefreshesKeyIndex();
     ok &= TestAvailableLatestIgnoresBusyInstrumentRow();
     ok &= TestHardLayoutAndSealRejection();
+    ok &= TestKLineCoveragePayloadValidation();
     if (!ok) {
         return 1;
     }

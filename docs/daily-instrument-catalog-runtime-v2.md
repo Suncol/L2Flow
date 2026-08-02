@@ -1,4 +1,4 @@
-# Daily Instrument Catalog Runtime V2.3
+# Daily Instrument Catalog Runtime V2.4
 
 ## Session contract
 
@@ -24,11 +24,12 @@ coverage declaration, ordered identities, metadata, and external IDs.
 Shanghai+Shenzhen A-share scope. It says nothing about other products,
 complete-from-open history, or data availability for each identity.
 
-Wire V2.3 adds `LIVE_PARTIAL` and explicit coverage/recovery/full-day/
-CERTIFIED-prefix header flags while retaining the V2.2 dense-catalog layout
+Wire V2.4 retains `LIVE_PARTIAL` and the explicit coverage/recovery/full-day/
+CERTIFIED-prefix header flags introduced by V2.3, and adds process-start KLine
+coverage metadata and per-bar coverage flags while retaining the dense-catalog
 contract. Readers validate the exact supported minor and invalid state/flag
 combinations, so producer, C reader, and Python client must be upgraded
-together rather than treating V2.3 as an ignorable V2.2 extension.
+together rather than treating V2.4 as an ignorable V2.3 extension.
 
 ## Startup order
 
@@ -36,7 +37,7 @@ together rather than treating V2.3 as an ignorable V2.2 extension.
 load and validate strict premarket file
   -> classify A shares, sort, deduplicate, assign dense IDs, hash, freeze
   -> allocate dense runtime availability state and Store
-  -> create Wire V2.3 mapping
+  -> create Wire V2.4 mapping
   -> prepublish every BOUND_NO_DATA identity and exact key
   -> IPC ACTIVE
   -> order-event aggregator READY (when configured)
@@ -157,7 +158,7 @@ Reader selections are:
 
 The historical `BOUND` and `OBSERVED_ANY` names remain source aliases only;
 Wire V2.2+ readers validate the daily scope and reject legacy/incomplete
-catalogs. Wire V2.3 `LIVE_PARTIAL` changes coverage/query semantics, not this
+catalogs. Wire V2.4 `LIVE_PARTIAL` changes coverage/query semantics, not this
 immutable catalog rule: preview mappings also prepublish the complete daily
 identity table before their latest-value control plane starts.
 

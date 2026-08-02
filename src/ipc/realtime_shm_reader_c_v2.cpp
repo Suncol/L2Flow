@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,29 @@ static_assert(
         l2flow_shm_session_info_v2, catalog_trade_date) == 224U);
 static_assert(
     offsetof(l2flow_shm_session_info_v2, catalog_version) == 232U);
+static_assert(sizeof(l2flow_kline_coverage_info_v2) == 32U);
+static_assert(
+    offsetof(l2flow_kline_coverage_info_v2, session_epoch) == 0U);
+static_assert(
+    offsetof(
+        l2flow_kline_coverage_info_v2,
+        coverage_start_unix_ns) == 8U);
+static_assert(
+    offsetof(l2flow_kline_coverage_info_v2, coverage_kind) == 16U);
+static_assert(
+    offsetof(l2flow_kline_coverage_info_v2, reserved) == 24U);
+static_assert(L2FLOW_KLINE_COVERAGE_DISABLED_V2 == 0);
+static_assert(L2FLOW_KLINE_COVERAGE_FROM_OPEN_V2 == 1);
+static_assert(
+    L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2 == 2);
+static_assert(
+    static_cast<std::uint32_t>(
+        L2FLOW_KLINE_PROCESS_START_PARTIAL_V2) ==
+    l2flow::ipc::kRealtimeWireKLineProcessStartPartialV2);
+static_assert(
+    static_cast<std::uint32_t>(
+        L2FLOW_KLINE_NATURAL_WINDOW_LEFT_TRUNCATED_V2) ==
+    l2flow::ipc::kRealtimeWireKLineNaturalWindowLeftTruncatedV2);
 static_assert(sizeof(l2flow_selection_envelope_v2) == 144U);
 static_assert(
     offsetof(l2flow_selection_envelope_v2, session_epoch) == 48U);
@@ -297,6 +321,99 @@ bool StateFlagsValid(
     // LIVE_PARTIAL, while INITIALIZING/FAILED can retain a configured flag
     // set that was never exposed as ACTIVE.
     return true;
+}
+
+[[nodiscard]] bool FixedUtc8TradeDateFromUnixNs(
+    std::uint64_t unix_ns,
+    std::uint32_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    constexpr std::int64_t utc8_offset_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::hours(8))
+            .count();
+    if (unix_ns > static_cast<std::uint64_t>(
+                      std::numeric_limits<std::int64_t>::max() -
+                      utc8_offset_ns)) {
+        return false;
+    }
+    const auto shifted =
+        std::chrono::sys_time<std::chrono::nanoseconds>(
+            std::chrono::nanoseconds(
+                static_cast<std::int64_t>(unix_ns) +
+                utc8_offset_ns));
+    const std::chrono::year_month_day calendar(
+        std::chrono::floor<std::chrono::days>(shifted));
+    if (!calendar.ok()) {
+        return false;
+    }
+    const int year = static_cast<int>(calendar.year());
+    const unsigned int month =
+        static_cast<unsigned int>(calendar.month());
+    const unsigned int day =
+        static_cast<unsigned int>(calendar.day());
+    if (year <= 0 || year > 9999 || month == 0U || day == 0U) {
+        return false;
+    }
+    *output = static_cast<std::uint32_t>(year) * 10'000U +
+              static_cast<std::uint32_t>(month) * 100U +
+              static_cast<std::uint32_t>(day);
+    return true;
+}
+
+enum class KLineCoverageContractState : std::uint8_t {
+    kInvalid = 0U,
+    kDisabled,
+    kFromOpen,
+    kProcessStartUnprepared,
+    kProcessStartPartial,
+};
+
+[[nodiscard]] KLineCoverageContractState
+EvaluateKLineCoverageContract(
+    const RealtimeWireHeaderV2& header,
+    std::uint32_t state,
+    std::uint32_t flags,
+    std::uint64_t kline_generation,
+    std::uint64_t coverage_start_unix_ns) noexcept {
+    if (!StateFlagsValid(state, flags)) {
+        return KLineCoverageContractState::kInvalid;
+    }
+    const bool enabled =
+        (flags & l2flow::ipc::kRealtimeHeaderKLineEnabledV2) != 0U;
+    const bool from_open =
+        (flags & l2flow::ipc::kRealtimeHeaderCoverageFromOpenV2) != 0U;
+    if (!enabled) {
+        return header.window_count == 0U &&
+                       kline_generation == 0U &&
+                       coverage_start_unix_ns == 0U
+                   ? KLineCoverageContractState::kDisabled
+                   : KLineCoverageContractState::kInvalid;
+    }
+    if (header.window_count == 0U) {
+        return KLineCoverageContractState::kInvalid;
+    }
+    if (from_open) {
+        return coverage_start_unix_ns == 0U
+                   ? KLineCoverageContractState::kFromOpen
+                   : KLineCoverageContractState::kInvalid;
+    }
+    if (coverage_start_unix_ns == 0U) {
+        return kline_generation == 0U
+                   ? KLineCoverageContractState::
+                         kProcessStartUnprepared
+                   : KLineCoverageContractState::kInvalid;
+    }
+    std::uint32_t boundary_trade_date = 0U;
+    if (state == static_cast<std::uint32_t>(
+                     RealtimeServerStateV2::kInitializing) ||
+        !FixedUtc8TradeDateFromUnixNs(
+            coverage_start_unix_ns, &boundary_trade_date) ||
+        boundary_trade_date != header.trade_date) {
+        return KLineCoverageContractState::kInvalid;
+    }
+    return KLineCoverageContractState::kProcessStartPartial;
 }
 
 bool HealthyForRead(const RealtimeWireHeaderV2& header) noexcept {
@@ -1656,6 +1773,12 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
         Atomic(header->server_state).load(std::memory_order_acquire);
     const std::uint32_t initial_flags =
         Atomic(header->flags).load(std::memory_order_acquire);
+    const std::uint64_t initial_kline_generation =
+        Atomic(header->kline_generation)
+            .load(std::memory_order_acquire);
+    const std::uint64_t initial_kline_coverage_start_unix_ns =
+        Atomic(header->kline_coverage_start_unix_ns)
+            .load(std::memory_order_acquire);
     const std::uint64_t capacity = header->capacity;
     const std::uint64_t window_count = header->window_count;
     const std::uint64_t maximum =
@@ -1715,7 +1838,13 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
         header->reserved_catalog == 0U &&
         header->catalog_version != 0U &&
         AnyNonzero(header->layout_digest) &&
-        StateFlagsValid(initial_state, initial_flags) &&
+        EvaluateKLineCoverageContract(
+            *header,
+            initial_state,
+            initial_flags,
+            initial_kline_generation,
+            initial_kline_coverage_start_unix_ns) !=
+            KLineCoverageContractState::kInvalid &&
         ((header->window_count != 0U) ==
          ((initial_flags &
            l2flow::ipc::kRealtimeHeaderKLineEnabledV2) != 0U)) &&
@@ -1723,7 +1852,6 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
             l2flow::ipc::kRealtimeWireRegionCountV2 &&
         header->region_descriptor_bytes ==
             sizeof(RealtimeWireRegionDescriptorV2) &&
-        header->reserved_scalar == 0U &&
         AllZero(header->reserved) &&
         instruments != nullptr &&
         instruments->offset >= sizeof(RealtimeWireHeaderV2) &&
@@ -1948,7 +2076,16 @@ extern "C" int l2flow_shm_reader_session_v2(
         reader->header->catalog_trade_date;
     result.catalog_version =
         reader->header->catalog_version;
-    if (!StateFlagsValid(result.server_state, result.flags) ||
+    const std::uint64_t coverage_start_unix_ns =
+        Atomic(reader->header->kline_coverage_start_unix_ns)
+            .load(std::memory_order_acquire);
+    if (EvaluateKLineCoverageContract(
+            *reader->header,
+            result.server_state,
+            result.flags,
+            result.kline_generation,
+            coverage_start_unix_ns) ==
+            KLineCoverageContractState::kInvalid ||
         result.tick_contiguous_published_sequence >
             result.tick_highest_published_sequence) {
         return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
@@ -1984,6 +2121,76 @@ extern "C" int l2flow_shm_reader_health_v2(
         }
         if (!StateFlagsValid(result.server_state, result.flags)) {
             return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
+        }
+        *output = result;
+        return L2FLOW_SHM_READER_OK_V2;
+    }
+    return L2FLOW_SHM_READER_INCONSISTENT_READ_V2;
+}
+
+extern "C" int l2flow_shm_reader_kline_coverage_v2(
+    const l2flow_shm_reader_v2* reader,
+    l2flow_kline_coverage_info_v2* output) {
+    if (reader == nullptr || output == nullptr) {
+        return L2FLOW_SHM_READER_INVALID_ARGUMENT_V2;
+    }
+    for (std::size_t attempt = 0U; attempt < kReadAttempts;
+         ++attempt) {
+        const std::uint64_t generation_begin =
+            Atomic(reader->header->kline_generation)
+                .load(std::memory_order_acquire);
+        const std::uint32_t state_begin =
+            Atomic(reader->header->server_state)
+                .load(std::memory_order_acquire);
+        const std::uint32_t flags =
+            Atomic(reader->header->flags)
+                .load(std::memory_order_acquire);
+        const std::uint64_t coverage_start_unix_ns =
+            Atomic(reader->header->kline_coverage_start_unix_ns)
+                .load(std::memory_order_acquire);
+        const std::uint64_t generation_end =
+            Atomic(reader->header->kline_generation)
+                .load(std::memory_order_acquire);
+        const std::uint32_t state_end =
+            Atomic(reader->header->server_state)
+                .load(std::memory_order_acquire);
+        if (generation_begin != generation_end ||
+            state_begin != state_end) {
+            continue;
+        }
+        const KLineCoverageContractState coverage =
+            EvaluateKLineCoverageContract(
+                *reader->header,
+                state_end,
+                flags,
+                generation_end,
+                coverage_start_unix_ns);
+        if (coverage == KLineCoverageContractState::kInvalid) {
+            return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
+        }
+        if (coverage ==
+            KLineCoverageContractState::kProcessStartUnprepared) {
+            return L2FLOW_SHM_READER_UNAVAILABLE_V2;
+        }
+        l2flow_kline_coverage_info_v2 result{};
+        result.session_epoch = reader->header->session_epoch;
+        result.coverage_start_unix_ns = coverage_start_unix_ns;
+        switch (coverage) {
+            case KLineCoverageContractState::kDisabled:
+                result.coverage_kind =
+                    L2FLOW_KLINE_COVERAGE_DISABLED_V2;
+                break;
+            case KLineCoverageContractState::kFromOpen:
+                result.coverage_kind =
+                    L2FLOW_KLINE_COVERAGE_FROM_OPEN_V2;
+                break;
+            case KLineCoverageContractState::kProcessStartPartial:
+                result.coverage_kind =
+                    L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2;
+                break;
+            case KLineCoverageContractState::kInvalid:
+            case KLineCoverageContractState::kProcessStartUnprepared:
+                return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
         }
         *output = result;
         return L2FLOW_SHM_READER_OK_V2;
@@ -2264,6 +2471,29 @@ extern "C" int l2flow_shm_reader_latest_klines_v2(
     const std::uint64_t completed_generation =
         Atomic(reader->header->kline_generation)
             .load(std::memory_order_acquire);
+    const std::uint32_t coverage_state_value =
+        Atomic(reader->header->server_state)
+            .load(std::memory_order_acquire);
+    const std::uint32_t coverage_header_flags =
+        Atomic(reader->header->flags)
+            .load(std::memory_order_acquire);
+    const std::uint64_t coverage_start_unix_ns =
+        Atomic(reader->header->kline_coverage_start_unix_ns)
+            .load(std::memory_order_acquire);
+    const KLineCoverageContractState coverage_contract =
+        EvaluateKLineCoverageContract(
+            *reader->header,
+            coverage_state_value,
+            coverage_header_flags,
+            completed_generation,
+            coverage_start_unix_ns);
+    if (coverage_contract == KLineCoverageContractState::kInvalid) {
+        return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
+    }
+    if (coverage_contract ==
+        KLineCoverageContractState::kProcessStartUnprepared) {
+        return L2FLOW_SHM_READER_UNAVAILABLE_V2;
+    }
     const std::uint64_t table =
         completed_generation %
         l2flow::ipc::kRealtimeKLineTableCountV2;
@@ -2333,9 +2563,34 @@ extern "C" int l2flow_shm_reader_latest_klines_v2(
                     payload.window_id != window_ids[index] ||
                     payload.window_duration_ns !=
                         reader->windows[window].duration_ns ||
-                    payload.reserved0 != 0U ||
+                    !l2flow::ipc::
+                        RealtimeWireKLineCoverageFlagsValidV2(
+                            payload.coverage_flags) ||
                     !AllZero(payload.reserved) ||
                     payload.present > 1U) {
+                    return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
+                }
+                std::uint32_t expected_coverage_flags = 0U;
+                if (coverage_contract ==
+                    KLineCoverageContractState::
+                        kProcessStartPartial) {
+                    expected_coverage_flags =
+                        l2flow::ipc::
+                            kRealtimeWireKLineProcessStartPartialV2;
+                    if (payload.present == 1U &&
+                        payload.window_start_unix_ns <
+                            static_cast<std::int64_t>(
+                                coverage_start_unix_ns) &&
+                        static_cast<std::int64_t>(
+                            coverage_start_unix_ns) <
+                            payload.window_end_unix_ns) {
+                        expected_coverage_flags |=
+                            l2flow::ipc::
+                                kRealtimeWireKLineNaturalWindowLeftTruncatedV2;
+                    }
+                }
+                if (payload.coverage_flags !=
+                    expected_coverage_flags) {
                     return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
                 }
                 if (payload.present == 1U) {

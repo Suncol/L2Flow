@@ -64,6 +64,45 @@ void SetSystemError(int* output, int value) noexcept {
     }
 }
 
+[[nodiscard]] bool FixedUtc8TradeDateFromUnixNs(
+    std::uint64_t unix_ns,
+    std::uint32_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    constexpr std::int64_t utc8_offset_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::hours(8))
+            .count();
+    if (unix_ns > static_cast<std::uint64_t>(
+                      std::numeric_limits<std::int64_t>::max() -
+                      utc8_offset_ns)) {
+        return false;
+    }
+    const auto shifted =
+        std::chrono::sys_time<std::chrono::nanoseconds>(
+            std::chrono::nanoseconds(
+                static_cast<std::int64_t>(unix_ns) +
+                utc8_offset_ns));
+    const std::chrono::year_month_day calendar(
+        std::chrono::floor<std::chrono::days>(shifted));
+    if (!calendar.ok()) {
+        return false;
+    }
+    const int year = static_cast<int>(calendar.year());
+    const unsigned int month =
+        static_cast<unsigned int>(calendar.month());
+    const unsigned int day =
+        static_cast<unsigned int>(calendar.day());
+    if (year <= 0 || year > 9999 || month == 0U || day == 0U) {
+        return false;
+    }
+    *output = static_cast<std::uint32_t>(year) * 10'000U +
+              static_cast<std::uint32_t>(month) * 100U +
+              static_cast<std::uint32_t>(day);
+    return true;
+}
+
 bool CheckedAdd(
     std::uint64_t left,
     std::uint64_t right,
@@ -1003,9 +1042,16 @@ bool ProjectSnapshot(
 bool ProjectKLine(
     std::uint64_t generation,
     const market::KLineBarV1& bar,
+    bool process_start_partial,
+    std::uint64_t coverage_start_unix_ns,
     RealtimeWireKLinePayloadV2* output) noexcept {
     if (output == nullptr || generation == 0U ||
         bar.instrument_id == 0U || bar.window_id == 0U ||
+        (process_start_partial !=
+         (coverage_start_unix_ns != 0U)) ||
+        coverage_start_unix_ns >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max()) ||
         static_cast<std::uint8_t>(bar.quantity_unit) >
             static_cast<std::uint8_t>(
                 market::QuantityUnitV1::kIndexUnit)) {
@@ -1016,6 +1062,17 @@ bool ProjectKLine(
     projected.trade_date = bar.trade_date;
     projected.instrument_id = bar.instrument_id;
     projected.window_id = bar.window_id;
+    if (process_start_partial) {
+        projected.coverage_flags =
+            kRealtimeWireKLineProcessStartPartialV2;
+        const std::int64_t signed_boundary =
+            static_cast<std::int64_t>(coverage_start_unix_ns);
+        if (bar.window_start_unix_ns < signed_boundary &&
+            signed_boundary < bar.window_end_unix_ns) {
+            projected.coverage_flags |=
+                kRealtimeWireKLineNaturalWindowLeftTruncatedV2;
+        }
+    }
     projected.window_duration_ns = bar.window_duration_ns;
     projected.window_start_ns_since_midnight =
         bar.window_start_ns_since_midnight;
@@ -2126,6 +2183,61 @@ public:
         }
     }
 
+    [[nodiscard]] bool PrepareProcessStartKLineCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept {
+        std::uint32_t boundary_trade_date = 0U;
+        if (header_ == nullptr || coverage_start_unix_ns == 0U ||
+            config_.coverage_from_open ||
+            config_.kline_windows.empty() ||
+            !FixedUtc8TradeDateFromUnixNs(
+                coverage_start_unix_ns, &boundary_trade_date) ||
+            boundary_trade_date != config_.trade_date) {
+            return false;
+        }
+        // Serialize the one-time boundary with terminal/failure transitions.
+        // A failed post-CAS recheck could not safely roll this immutable wire
+        // field back after a reader had observed it.
+        const std::lock_guard<std::mutex> lifecycle_lock(
+            kline_coverage_lifecycle_mutex_);
+        if (Atomic(header_->server_state)
+                    .load(std::memory_order_acquire) !=
+                static_cast<std::uint32_t>(
+                    RealtimeServerStateV2::kLivePartial) ||
+            Atomic(header_->kline_generation)
+                    .load(std::memory_order_acquire) != 0U) {
+            return false;
+        }
+        const std::uint32_t flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        constexpr std::uint32_t forbidden =
+            kRealtimeHeaderCoverageLostV2 |
+            kRealtimeHeaderCoverageFromOpenV2 |
+            kRealtimeHeaderStartupPrefixRecoveredV2 |
+            kRealtimeHeaderFullDayKLineValidV2 |
+            kRealtimeHeaderFullDayFactorValidV2 |
+            kRealtimeHeaderCertifiedPrefixValidV2;
+        if ((flags & kRealtimeHeaderKLineEnabledV2) == 0U ||
+            (flags & forbidden) != 0U) {
+            return false;
+        }
+        std::uint64_t expected = 0U;
+        if (Atomic(header_->kline_coverage_start_unix_ns)
+                .compare_exchange_strong(
+                    expected,
+                    coverage_start_unix_ns,
+                    std::memory_order_release,
+                    std::memory_order_acquire)) {
+            return true;
+        }
+        return expected == coverage_start_unix_ns &&
+               Atomic(header_->kline_generation)
+                       .load(std::memory_order_acquire) == 0U &&
+               Atomic(header_->server_state)
+                       .load(std::memory_order_acquire) ==
+                   static_cast<std::uint32_t>(
+                       RealtimeServerStateV2::kLivePartial);
+    }
+
     [[nodiscard]] bool PublishApplied(
         std::size_t ordinal,
         const market::RealtimeHistoryRecordV1& record) noexcept {
@@ -2278,6 +2390,8 @@ public:
         if (header_ == nullptr) {
             return;
         }
+        const std::lock_guard<std::mutex> lifecycle_lock(
+            kline_coverage_lifecycle_mutex_);
         Atomic(header_->flags)
             .fetch_or(
                 kRealtimeHeaderCoverageLostV2,
@@ -2393,10 +2507,21 @@ public:
         const market::RealtimeHistoryWatermarkV1& watermark =
             generation.watermark();
         const auto& catalog = watermark.catalog_snapshot;
+        const bool process_start_partial =
+            !config_.coverage_from_open;
+        const std::uint64_t coverage_start_unix_ns =
+            header_ == nullptr
+                ? 0U
+                : Atomic(header_->kline_coverage_start_unix_ns)
+                      .load(std::memory_order_acquire);
         if (header_ == nullptr || config_.kline_windows.empty() ||
             !StateAcceptsPublication(
                 Atomic(header_->server_state)
                     .load(std::memory_order_acquire)) ||
+            generation.coverage_from_open() !=
+                config_.coverage_from_open ||
+            (process_start_partial !=
+             (coverage_start_unix_ns != 0U)) ||
             watermark.run_id != config_.run_id ||
             watermark.trade_date != config_.trade_date ||
             watermark.generation == 0U ||
@@ -2506,6 +2631,10 @@ public:
                     payload.trade_date = config_.trade_date;
                     payload.instrument_id = entry.instrument_id;
                     payload.window_id = window.window_id;
+                    if (process_start_partial) {
+                        payload.coverage_flags =
+                            kRealtimeWireKLineProcessStartPartialV2;
+                    }
                     payload.window_duration_ns =
                         window.duration_ns;
                 } else if (
@@ -2515,7 +2644,11 @@ public:
                     bar.window_id != window.window_id ||
                     bar.window_duration_ns != window.duration_ns ||
                     !ProjectKLine(
-                        generation_number, bar, &payload)) {
+                        generation_number,
+                        bar,
+                        process_start_partial,
+                        coverage_start_unix_ns,
+                        &payload)) {
                     MarkCoverageLost();
                     return false;
                 } else {
@@ -2541,6 +2674,9 @@ public:
             Atomic(header_->kline_generation)
                     .load(std::memory_order_acquire) ==
                 completed &&
+            Atomic(header_->kline_coverage_start_unix_ns)
+                    .load(std::memory_order_acquire) ==
+                coverage_start_unix_ns &&
             StateAcceptsPublication(
                 Atomic(header_->server_state)
                     .load(std::memory_order_acquire));
@@ -2665,6 +2801,8 @@ public:
         if (header_ == nullptr) {
             return;
         }
+        const std::lock_guard<std::mutex> lifecycle_lock(
+            kline_coverage_lifecycle_mutex_);
         std::uint32_t current =
             Atomic(header_->server_state)
                 .load(std::memory_order_acquire);
@@ -5345,6 +5483,10 @@ private:
     bool socket_bound_ = false;
     std::atomic<bool> prefix_notification_pending_{false};
     std::atomic<bool> control_stop_requested_{false};
+    // Cold lifecycle-only serialization for the immutable process-start
+    // KLine boundary. It is deliberately separate from control_stop_mutex_:
+    // StopControl holds that mutex while it may call MarkCoverageLost().
+    std::mutex kline_coverage_lifecycle_mutex_;
     std::mutex control_stop_mutex_;
     std::thread control_thread_;
     std::vector<std::unique_ptr<ClientWorkerSlot>>
@@ -5416,6 +5558,14 @@ bool RealtimeSharedMarketServiceV2::
                RealtimeServerStateV2::kLivePartial,
                true,
                system_error_number);
+}
+
+bool RealtimeSharedMarketServiceV2::
+    PrepareProcessStartKLineCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept {
+    return impl_ != nullptr &&
+           impl_->PrepareProcessStartKLineCoverage(
+               coverage_start_unix_ns);
 }
 
 bool RealtimeSharedMarketServiceV2::

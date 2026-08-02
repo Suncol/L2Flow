@@ -19,6 +19,8 @@ from .models import (
     InstrumentLookupResult,
     InstrumentLookupStatus,
     InstrumentStatus,
+    KLineCoverageInfo,
+    KLineTemporalCoverage,
     LatestKLine,
     LatestSnapshot,
     LatestStatus,
@@ -126,9 +128,20 @@ class _HealthC(ctypes.Structure):
     ]
 
 
+class _KLineCoverageInfoC(ctypes.Structure):
+    _fields_ = [
+        ("session_epoch", ctypes.c_uint64),
+        ("coverage_start_unix_ns", ctypes.c_uint64),
+        ("coverage_kind", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint64 * 1),
+    ]
+
+
 assert ctypes.sizeof(_SessionInfoC) == 240
 assert ctypes.sizeof(_SelectionEnvelopeC) == 144
 assert ctypes.sizeof(_HealthC) == 32
+assert ctypes.sizeof(_KLineCoverageInfoC) == 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +161,18 @@ class NativeSessionHealth:
     @property
     def coverage_lost(self) -> bool:
         return bool(self.flags & 0x1)
+
+    @property
+    def kline_enabled(self) -> bool:
+        return bool(self.flags & (1 << 1))
+
+    @property
+    def kline_temporal_coverage(self) -> KLineTemporalCoverage:
+        if not self.kline_enabled:
+            return KLineTemporalCoverage.DISABLED
+        if self.coverage_from_open:
+            return KLineTemporalCoverage.FROM_OPEN
+        return KLineTemporalCoverage.PROCESS_START_PARTIAL
 
     @property
     def coverage_from_open(self) -> bool:
@@ -223,6 +248,11 @@ def _bind_library(library) -> None:
         ctypes.POINTER(_HealthC),
     ]
     library.l2flow_shm_reader_health_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_kline_coverage_v2.argtypes = [
+        handle,
+        ctypes.POINTER(_KLineCoverageInfoC),
+    ]
+    library.l2flow_shm_reader_kline_coverage_v2.restype = ctypes.c_int
     library.l2flow_shm_reader_instrument_v2.argtypes = [
         handle,
         ctypes.c_uint32,
@@ -426,6 +456,25 @@ def _selection_from_c(
         ) from error
 
 
+def _kline_coverage_from_c(
+    value: _KLineCoverageInfoC,
+) -> KLineCoverageInfo:
+    if value.reserved0 != 0 or any(value.reserved):
+        raise WireFormatError(
+            "KLine coverage C result reserved fields are nonzero"
+        )
+    try:
+        return KLineCoverageInfo(
+            session_epoch=value.session_epoch,
+            coverage_start_unix_ns=value.coverage_start_unix_ns,
+            coverage_kind=value.coverage_kind,
+        )
+    except ValueError as error:
+        raise WireFormatError(
+            f"invalid KLine coverage C result: {error}"
+        ) from error
+
+
 class NativeReader:
     """One read-only Wire V2 mapping; close waits for in-flight methods."""
 
@@ -556,6 +605,25 @@ class NativeReader:
                 server_state=state,
                 flags=output.flags,
             )
+
+    def kline_coverage(self) -> KLineCoverageInfo:
+        with self._lock:
+            self._require_open()
+            output = _KLineCoverageInfoC()
+            code = self._library.l2flow_shm_reader_kline_coverage_v2(
+                self._handle, ctypes.byref(output)
+            )
+            _raise_native("kline_coverage_v2", code)
+            result = _kline_coverage_from_c(output)
+            if (
+                self._session_epoch is not None
+                and result.session_epoch != self._session_epoch
+            ):
+                raise WireFormatError(
+                    "mapped session_epoch changed in place"
+                )
+            self._session_epoch = result.session_epoch
+            return result
 
     def instrument(self, instrument_id: int) -> Instrument:
         instrument_id = _uint32(instrument_id, "instrument_id")

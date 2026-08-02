@@ -14,7 +14,7 @@ namespace {
 namespace ipc = l2flow::ipc;
 
 static_assert(ipc::kRealtimeWireMajorV2 == 2U);
-static_assert(ipc::kRealtimeWireMinorV2 == 3U);
+static_assert(ipc::kRealtimeWireMinorV2 == 4U);
 static_assert(
     ipc::kRealtimeShmMagicV2 ==
     std::array<std::uint8_t, 8U>{
@@ -54,6 +54,10 @@ static_assert(
     offsetof(ipc::RealtimeWireHeaderV2, bound_count) %
         alignof(std::uint32_t) ==
     0U);
+static_assert(
+    offsetof(
+        ipc::RealtimeWireHeaderV2,
+        kline_coverage_start_unix_ns) == 264U);
 
 static_assert(sizeof(ipc::RealtimeWireInstrumentV2) == 128U);
 static_assert(alignof(ipc::RealtimeWireInstrumentV2) == 64U);
@@ -85,6 +89,9 @@ static_assert(
 static_assert(sizeof(ipc::RealtimeWireSnapshotPayloadV2) == 3104U);
 static_assert(sizeof(ipc::RealtimeWireTickPayloadV2) == 336U);
 static_assert(sizeof(ipc::RealtimeWireKLinePayloadV2) == 192U);
+static_assert(
+    offsetof(ipc::RealtimeWireKLinePayloadV2, coverage_flags) ==
+    20U);
 static_assert(sizeof(ipc::RealtimeWireSnapshotSlotV2) == 4096U);
 static_assert(sizeof(ipc::RealtimeWireTickSlotV2) == 512U);
 static_assert(sizeof(ipc::RealtimeWireKLineSlotV2) == 256U);
@@ -292,6 +299,26 @@ bool TestProcessingSequenceInvariants() {
     return ok;
 }
 
+bool TestKLineCoverageFlagInvariants() {
+    bool ok = true;
+    ok &= Expect(
+        ipc::RealtimeWireKLineCoverageFlagsValidV2(0U) &&
+            ipc::RealtimeWireKLineCoverageFlagsValidV2(
+                ipc::kRealtimeWireKLineProcessStartPartialV2) &&
+            ipc::RealtimeWireKLineCoverageFlagsValidV2(
+                ipc::kRealtimeWireKLineProcessStartPartialV2 |
+                ipc::kRealtimeWireKLineNaturalWindowLeftTruncatedV2),
+        "canonical KLine coverage flags are accepted");
+    ok &= Expect(
+        !ipc::RealtimeWireKLineCoverageFlagsValidV2(
+            ipc::kRealtimeWireKLineNaturalWindowLeftTruncatedV2),
+        "left-truncated KLine coverage requires process-start partial");
+    ok &= Expect(
+        !ipc::RealtimeWireKLineCoverageFlagsValidV2(1U << 2U),
+        "unknown KLine coverage flag is rejected");
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -301,6 +328,7 @@ int main() {
     ok &= TestInstrumentStateInvariants();
     ok &= TestCountInvariants();
     ok &= TestProcessingSequenceInvariants();
+    ok &= TestKLineCoverageFlagInvariants();
     if (!ok) {
         return 1;
     }

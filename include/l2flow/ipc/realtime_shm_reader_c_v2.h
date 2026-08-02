@@ -34,11 +34,11 @@ enum l2flow_shm_reader_error_v2 {
     L2FLOW_SHM_READER_INCONSISTENT_READ_V2 = 8,
 };
 
-// Wire V2.3 server states. LIVE_PARTIAL permits point-in-time latest reads and
+// Wire V2.4 server states. LIVE_PARTIAL permits point-in-time latest reads and
 // an explicitly enabled standalone service may also publish immutable
-// process-start History/tick-delta generations. It is never a from-open
-// prefix and cannot be interpreted as ACTIVE by Factor, KLine, or CERTIFIED
-// consumers.
+// process-start History/tick-delta generations. KLine is readable only when
+// explicitly enabled and always retains process-start coverage metadata; it
+// cannot be treated as full-day. Factor/CERTIFIED remain unavailable.
 enum l2flow_shm_server_state_v2 {
     L2FLOW_SHM_SERVER_INITIALIZING_V2 = 1,
     L2FLOW_SHM_SERVER_ACTIVE_V2 = 2,
@@ -56,6 +56,17 @@ enum l2flow_shm_header_flag_v2 {
     L2FLOW_SHM_HEADER_FULL_DAY_KLINE_VALID_V2 = 1U << 4U,
     L2FLOW_SHM_HEADER_FULL_DAY_FACTOR_VALID_V2 = 1U << 5U,
     L2FLOW_SHM_HEADER_CERTIFIED_PREFIX_VALID_V2 = 1U << 6U,
+};
+
+enum l2flow_kline_coverage_kind_v2 {
+    L2FLOW_KLINE_COVERAGE_DISABLED_V2 = 0,
+    L2FLOW_KLINE_COVERAGE_FROM_OPEN_V2 = 1,
+    L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2 = 2,
+};
+
+enum l2flow_kline_coverage_flag_v2 {
+    L2FLOW_KLINE_PROCESS_START_PARTIAL_V2 = 1U << 0U,
+    L2FLOW_KLINE_NATURAL_WINDOW_LEFT_TRUNCATED_V2 = 1U << 1U,
 };
 
 enum l2flow_instrument_status_v2 {
@@ -277,6 +288,18 @@ typedef struct l2flow_shm_health_v2 {
     uint32_t reserved[2];
 } l2flow_shm_health_v2;
 
+// Fixed additive ABI for the KLine temporal-coverage contract. The existing
+// 240-byte session_info_v2 structure remains unchanged. A process-start
+// KLine service returns UNAVAILABLE until its nonzero boundary has been
+// prepared; disabled/from-open KLine always reports a zero boundary.
+typedef struct l2flow_kline_coverage_info_v2 {
+    uint64_t session_epoch;
+    uint64_t coverage_start_unix_ns;
+    uint32_t coverage_kind;
+    uint32_t reserved0;
+    uint64_t reserved[1];
+} l2flow_kline_coverage_info_v2;
+
 // A selection envelope and its ID array describe one stable structural cut.
 // The catalog/data-state identity and selected rows are validated together;
 // accepted/applied progress comes from one coherent status read taken after
@@ -306,7 +329,7 @@ typedef struct l2flow_selection_envelope_v2 {
     uint32_t reserved[2];
 } l2flow_selection_envelope_v2;
 
-// Maps fd read-only and accepts only the sealed Wire V2.3 layout. The caller
+// Maps fd read-only and accepts only the sealed Wire V2.4 layout. The caller
 // retains ownership of fd and may close it immediately after this function
 // returns.
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_open_fd_v2(
@@ -323,6 +346,9 @@ L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_session_v2(
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_health_v2(
     const l2flow_shm_reader_v2* reader,
     l2flow_shm_health_v2* output);
+L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_kline_coverage_v2(
+    const l2flow_shm_reader_v2* reader,
+    l2flow_kline_coverage_info_v2* output);
 
 // Looks up instrument_id in O(1) as ordinal=instrument_id-1 and copies one
 // stable 128-byte row plus its exact opaque key bytes when bound. Required

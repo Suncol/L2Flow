@@ -230,8 +230,12 @@ thread 都就绪且 preview backlog 低于启动高水位后，才对外切到
 允许 latest 查询，并按既有 generation interval 发布不可变 Store generation；
 首次 generation 后可查询从本进程启动点到该 cut 的单标的完整 History 和 tick
 generation delta。它不创建 journal/shadow，也不宣称 `coverage_from_open`；
-KLine/CERTIFIED 仍不可用。router 默认在 SDK connect 前启动并等待独立的
-process-start Event sidecar READY；其本地 tick 流完整，但不声明启动前数据或
+可选 KLine 使用交易所自然时间窗口，只发布 process-start latest KLine；router
+在 SDK Connect 成功后立即采样保守 live coverage boundary。只有已发布 bar
+严格满足 `window_start < boundary < window_end` 时才标记为 left-truncated；
+无成交窗口不合成 bar，且 session 不宣称
+`full_day_kline_valid`；CERTIFIED 仍不可用。router 默认在 SDK connect 前启动
+并等待独立的 process-start Event sidecar READY；其本地 tick 流完整，但不声明启动前数据或
 native gap 已回补。router 低频检查该 sidecar 的 control、heartbeat 和消费
 进度；受管进程还绑定父进程死亡信号并使用有界回收。CSV online recovery 的
 partial preview 使用独立的 latest-only 启动策略，即使内部存在 Store
@@ -1502,7 +1506,7 @@ native C validator 的检查顺序是 fail closed 的：
 3. expected metadata 自身必须 canonical；
 4. fd 必须是 regular、`O_RDONLY`、精确大小，并具有
    `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`；
-5. page magic、Wire ABI 2.3、header 大小、offset、metadata byte image 和 reserved
+5. page magic、Wire ABI 2.4、header 大小、offset、metadata byte image 和 reserved
    字段必须完全匹配；
 6. 每行必须是 canonical CoreV2 tick，instrument/ordinal/trade date/source
    identity 必须匹配；
@@ -2100,8 +2104,9 @@ ConsumeAndCommitRolling(cursor, rolling_store, factor):
 3. standalone partial：不做 recovery、不宣称 from-open，但周期发布
    process-start Store generation，开放单标的 complete-history 与 tick-delta；
    默认受管 Event sidecar 从本进程 tick sequence 1 发布 process-start delta；
-   KLine/CERTIFIED 禁用，并通过 `factor_generation_enabled=false` 不创建或
-   调用 generation Factor engine；
+   可选发布自然交易时间窗口的 process-start partial latest KLine，但不开放
+   KLine history 或 full-day 声明；CERTIFIED 禁用，并通过
+   `factor_generation_enabled=false` 不创建或调用 generation Factor engine；
 4. Wire V2 查询：latest/ring、complete-history V2 和 generation-bound
    tick-delta V2 使用同一 daily-catalog/session identity，并以显式
    unavailable、EOF、overrun 或 checkpoint mismatch fail closed。
@@ -2158,7 +2163,7 @@ V2 pages → transactional rolling/factor state
 | KLine trade 投影与聚合 | [`src/market/kline_aggregator_v1.cpp`](../src/market/kline_aggregator_v1.cpp) |
 | latest 原子发布与读取 | [`src/market/realtime_latest_read_model_v1.cpp`](../src/market/realtime_latest_read_model_v1.cpp) |
 | C++ Factor 计算和原子提交 | [`src/factor/realtime_factor_engine_v1.cpp`](../src/factor/realtime_factor_engine_v1.cpp) |
-| latest/ring 固定 Wire ABI（2.3） | [`include/l2flow/ipc/realtime_wire_v2.h`](../include/l2flow/ipc/realtime_wire_v2.h) |
+| latest/ring 固定 Wire ABI（2.4） | [`include/l2flow/ipc/realtime_wire_v2.h`](../include/l2flow/ipc/realtime_wire_v2.h) |
 | complete-history V2 控制面与页 ABI | [`include/l2flow/ipc/realtime_history_wire_v2.h`](../include/l2flow/ipc/realtime_history_wire_v2.h) |
 | instrument tick-delta V2 endpoint/checkpoint/页 ABI | [`include/l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h`](../include/l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h) |
 | IPC 服务配置、Store/KLine generation 发布接口 | [`include/l2flow/ipc/realtime_shared_service_v2.h`](../include/l2flow/ipc/realtime_shared_service_v2.h) |

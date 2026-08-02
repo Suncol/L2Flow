@@ -51,6 +51,12 @@ run_case(
     "0..1000, default 0; 0 yields"
     --help)
 
+run_case(
+    help_describes_partial_kline_coverage
+    0
+    "published bars strictly spanning the boundary are"
+    --help)
+
 set(base
     --sdk-library /nonexistent/libmdl_api.so
     --session-epoch 1
@@ -121,9 +127,9 @@ run_case(
     --intraday-recovery-csv-dir /nonexistent/csv)
 
 run_case(
-    partial_rejects_kline
-    2
-    "cannot publish full-day KLine"
+    partial_accepts_kline
+    1
+    "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
     --kline-windows-ms 60000)

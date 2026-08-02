@@ -12,6 +12,7 @@ from .models import (
     DecimalValue,
     Instrument,
     InstrumentStatus,
+    KLineCoverageFlag,
     Market,
     MarketEventKind,
     OrderType,
@@ -25,7 +26,7 @@ from .models import (
 
 
 WIRE_MAJOR = 2
-WIRE_MINOR = 3
+WIRE_MINOR = 4
 CONTROL_MAGIC = b"L2FCTL2\x00"
 INSTRUMENT_BYTES = 128
 SNAPSHOT_BYTES = 3104
@@ -349,14 +350,29 @@ def parse_kline_payload(
         raise WireFormatError("KLine identity does not match request")
     if fields[27] != 1:
         raise WireFormatError("available KLine must have present=1")
-    if fields[4] != 0 or any(data[187:192]):
+    known_coverage_flags = int(
+        KLineCoverageFlag.PROCESS_START_PARTIAL
+        | KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED
+    )
+    if fields[4] & ~known_coverage_flags:
+        raise WireFormatError("KLine coverage_flags contain unknown bits")
+    if (
+        fields[4]
+        & int(KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED)
+        and not fields[4]
+        & int(KLineCoverageFlag.PROCESS_START_PARTIAL)
+    ):
+        raise WireFormatError(
+            "left-truncated KLine requires process-start coverage"
+        )
+    if any(data[187:192]):
         raise WireFormatError("KLine reserved fields are nonzero")
     names = (
         "generation",
         "trade_date",
         "instrument_id",
         "window_id",
-        "_reserved0",
+        "coverage_flags",
         "window_duration_ns",
         "window_start_ns_since_midnight",
         "window_end_ns_since_midnight",
@@ -384,6 +400,8 @@ def parse_kline_payload(
     parsed = dict(zip(names, fields))
     del parsed["instrument_id"]
     del parsed["window_id"]
-    del parsed["_reserved0"]
     del parsed["_present"]
+    parsed["coverage_flags"] = KLineCoverageFlag(
+        parsed["coverage_flags"]
+    )
     return parsed

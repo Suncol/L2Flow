@@ -117,6 +117,22 @@ class AvailabilityFlag(IntFlag):
     FACTOR_ELIGIBLE = 1 << 3
 
 
+class KLineTemporalCoverage(IntEnum):
+    """Temporal origin of the configured KLine input prefix."""
+
+    DISABLED = 0
+    FROM_OPEN = 1
+    PROCESS_START_PARTIAL = 2
+
+
+class KLineCoverageFlag(IntFlag):
+    """Per-bar Wire V2.4 KLine coverage qualifiers."""
+
+    NONE = 0
+    PROCESS_START_PARTIAL = 1 << 0
+    NATURAL_WINDOW_LEFT_TRUNCATED = 1 << 1
+
+
 class ServerState(IntEnum):
     INITIALIZING = 1
     ACTIVE = 2
@@ -255,6 +271,32 @@ class SessionIdentity:
         if not any(self.run_id):
             raise ValueError("run_id must be nonzero")
         _uint64(self.session_epoch, "session_epoch", nonzero=True)
+
+
+@dataclass(frozen=True, slots=True)
+class KLineCoverageInfo:
+    """Immutable temporal-coverage metadata for one mapped session."""
+
+    session_epoch: int
+    coverage_start_unix_ns: int
+    coverage_kind: KLineTemporalCoverage
+
+    def __post_init__(self) -> None:
+        _uint64(self.session_epoch, "session_epoch", nonzero=True)
+        _uint64(
+            self.coverage_start_unix_ns,
+            "coverage_start_unix_ns",
+        )
+        coverage_kind = KLineTemporalCoverage(self.coverage_kind)
+        if (
+            coverage_kind
+            is KLineTemporalCoverage.PROCESS_START_PARTIAL
+        ) != (self.coverage_start_unix_ns != 0):
+            raise ValueError(
+                "only PROCESS_START_PARTIAL requires a nonzero "
+                "coverage_start_unix_ns"
+            )
+        object.__setattr__(self, "coverage_kind", coverage_kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,6 +454,14 @@ class SessionInfo:
     @property
     def kline_enabled(self) -> bool:
         return (self.flags & 2) != 0
+
+    @property
+    def kline_temporal_coverage(self) -> KLineTemporalCoverage:
+        if not self.kline_enabled:
+            return KLineTemporalCoverage.DISABLED
+        if self.coverage_from_open:
+            return KLineTemporalCoverage.FROM_OPEN
+        return KLineTemporalCoverage.PROCESS_START_PARTIAL
 
     @property
     def coverage_from_open(self) -> bool:
@@ -708,6 +758,9 @@ class LatestKLine:
     volume_scale: Optional[int] = None
     quantity_unit: Optional[int] = None
     wire_payload: Optional[bytes] = None
+    # Additive V2.4 metadata is intentionally last so existing positional
+    # construction of the older payload fields keeps its meaning.
+    coverage_flags: Optional[KLineCoverageFlag] = None
 
     def __post_init__(self) -> None:
         _uint64(self.session_epoch, "session_epoch", nonzero=True)
@@ -737,9 +790,63 @@ class LatestKLine:
                 or len(self.wire_payload) != 192
             ):
                 raise ValueError("available KLine requires 192 wire bytes")
+            if (
+                not isinstance(self.coverage_flags, int)
+                or isinstance(self.coverage_flags, bool)
+                or self.coverage_flags < 0
+                or self.coverage_flags > _UINT32_MAX
+            ):
+                raise ValueError("KLine coverage_flags must fit uint32")
+            coverage_flags = int(self.coverage_flags)
+            known_coverage_flags = int(
+                KLineCoverageFlag.PROCESS_START_PARTIAL
+                | KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED
+            )
+            if coverage_flags & ~known_coverage_flags:
+                raise ValueError("KLine coverage_flags contain unknown bits")
+            if (
+                coverage_flags
+                & int(KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED)
+                and not coverage_flags
+                & int(KLineCoverageFlag.PROCESS_START_PARTIAL)
+            ):
+                raise ValueError(
+                    "left-truncated KLine requires process-start coverage"
+                )
+            object.__setattr__(
+                self,
+                "coverage_flags",
+                KLineCoverageFlag(coverage_flags),
+            )
         elif self.wire_payload is not None:
             raise ValueError("unavailable KLine has a wire payload")
         object.__setattr__(self, "status", status)
+
+    @property
+    def temporal_coverage(self) -> Optional[KLineTemporalCoverage]:
+        """Coverage origin for an available bar, otherwise ``None``."""
+
+        if self.status is not LatestStatus.AVAILABLE:
+            return None
+        if self.coverage_flags & KLineCoverageFlag.PROCESS_START_PARTIAL:
+            return KLineTemporalCoverage.PROCESS_START_PARTIAL
+        return KLineTemporalCoverage.FROM_OPEN
+
+    @property
+    def process_start_partial(self) -> bool:
+        return bool(
+            self.coverage_flags is not None
+            and self.coverage_flags
+            & KLineCoverageFlag.PROCESS_START_PARTIAL
+        )
+
+    @property
+    def natural_window_left_truncated(self) -> bool:
+        return bool(
+            self.coverage_flags is not None
+            and self.coverage_flags
+            & KLineCoverageFlag.NATURAL_WINDOW_LEFT_TRUNCATED
+        )
 
 
 def _validate_latest(
