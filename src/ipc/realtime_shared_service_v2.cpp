@@ -1248,7 +1248,9 @@ bool BuildGenerationEndpoint(
     const market::RealtimeHistoryWatermarkV1& watermark =
         generation.watermark();
     const auto& catalog = watermark.catalog_snapshot;
-    if (watermark.run_id != config.run_id ||
+    if (generation.coverage_from_open() !=
+            config.coverage_from_open ||
+        watermark.run_id != config.run_id ||
         watermark.generation == 0U ||
         watermark.trade_date != config.trade_date ||
         watermark.ingress_sequence_exclusive == 0U ||
@@ -2065,6 +2067,7 @@ public:
 
     [[nodiscard]] bool Start(
         RealtimeServerStateV2 target_state,
+        bool serve_process_start_history,
         int* system_error_number) noexcept {
         SetSystemError(system_error_number, 0);
         const bool live_partial =
@@ -2081,6 +2084,7 @@ public:
             control_stop_requested_.load(std::memory_order_acquire) ||
             (target_state != RealtimeServerStateV2::kActive &&
              !live_partial) ||
+            (serve_process_start_history && !live_partial) ||
             (Atomic(header_->flags).load(std::memory_order_acquire) &
              kRealtimeHeaderCoverageLostV2) != 0U ||
             (!live_partial &&
@@ -2104,6 +2108,8 @@ public:
             SetSystemError(system_error_number, EINVAL);
             return false;
         }
+        serve_process_start_history_ =
+            serve_process_start_history;
         UpdateHeartbeatNow();
         if (failed()) {
             SetSystemError(system_error_number, EIO);
@@ -2705,6 +2711,28 @@ public:
         return !failed();
     }
 
+    [[nodiscard]] bool PrepareCertifiedPrefixValidBeforeStart()
+        noexcept {
+        if (header_ == nullptr || control_thread_.joinable() ||
+            Atomic(header_->server_state)
+                    .load(std::memory_order_acquire) !=
+                static_cast<std::uint32_t>(
+                    RealtimeServerStateV2::kInitializing)) {
+            return false;
+        }
+        const std::uint32_t flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        if ((flags & kRealtimeHeaderCoverageLostV2) != 0U ||
+            (flags & kRealtimeHeaderCoverageFromOpenV2) == 0U) {
+            return false;
+        }
+        Atomic(header_->flags)
+            .fetch_or(
+                kRealtimeHeaderCertifiedPrefixValidV2,
+                std::memory_order_release);
+        return !failed();
+    }
+
     [[nodiscard]] bool MarkStoppedClean(
         std::uint64_t final_admitted_tick_sequence) noexcept {
         while (header_ != nullptr &&
@@ -2807,6 +2835,15 @@ public:
         return key_arena_used_.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] std::uint64_t tick_contiguous_published_sequence()
+        const noexcept {
+        return header_ == nullptr
+                   ? 0U
+                   : Atomic(
+                         header_->tick_contiguous_published_sequence)
+                         .load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool failed() const noexcept {
         return header_ == nullptr ||
                Atomic(header_->server_state)
@@ -2816,6 +2853,12 @@ public:
                (Atomic(header_->flags)
                     .load(std::memory_order_acquire) &
                 kRealtimeHeaderCoverageLostV2) != 0U;
+    }
+
+    [[nodiscard]] bool ControlExposureReady() const noexcept {
+        return config_.control_exposure_gate == nullptr ||
+               config_.control_exposure_gate->load(
+                   std::memory_order_acquire);
     }
 
     [[nodiscard]] const std::filesystem::path& socket_path()
@@ -4017,6 +4060,39 @@ private:
                PacketReceiveResult::kOk;
     }
 
+    [[nodiscard]] bool StoreGenerationQueriesAvailable()
+        const noexcept {
+        if (header_ == nullptr) {
+            return false;
+        }
+        const std::uint32_t state =
+            Atomic(header_->server_state)
+                .load(std::memory_order_acquire);
+        const std::uint32_t flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        if ((flags & kRealtimeHeaderCoverageLostV2) != 0U) {
+            return false;
+        }
+        const bool coverage_from_open =
+            (flags & kRealtimeHeaderCoverageFromOpenV2) != 0U;
+        if (coverage_from_open != config_.coverage_from_open) {
+            return false;
+        }
+        if (coverage_from_open) {
+            return StateHasFullPrefix(state);
+        }
+        return serve_process_start_history_ &&
+               (state ==
+                    static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kLivePartial) ||
+                state ==
+                    static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kDraining) ||
+                state ==
+                    static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kStoppedClean));
+    }
+
     void ServeHistory(
         int client,
         const RealtimeHistoryOpenRequestV2& request,
@@ -4056,13 +4132,7 @@ private:
                 config_.maximum_history_page_records) {
             status = RealtimeHistoryControlStatusV2::
                 kResourceExhausted;
-        } else if (
-            !StateHasFullPrefix(
-                Atomic(header_->server_state)
-                    .load(std::memory_order_acquire)) ||
-            (Atomic(header_->flags).load(std::memory_order_acquire) &
-             kRealtimeHeaderCoverageFromOpenV2) == 0U ||
-            failed()) {
+        } else if (!StoreGenerationQueriesAvailable()) {
             status =
                 RealtimeHistoryControlStatusV2::kUnavailable;
         }
@@ -4628,13 +4698,7 @@ private:
             status =
                 RealtimeInstrumentTickDeltaControlStatusV2::
                     kUnsupportedVersion;
-        } else if (
-            !StateHasFullPrefix(
-                Atomic(header_->server_state)
-                    .load(std::memory_order_acquire)) ||
-            (Atomic(header_->flags).load(std::memory_order_acquire) &
-             kRealtimeHeaderCoverageFromOpenV2) == 0U ||
-            failed()) {
+        } else if (!StoreGenerationQueriesAvailable()) {
             status =
                 RealtimeInstrumentTickDeltaControlStatusV2::
                     kUnavailable;
@@ -5171,7 +5235,8 @@ private:
                         MarkFailed();
                         return;
                     }
-                    if (!PeerUidAllowed(client) ||
+                    if (!ControlExposureReady() ||
+                        !PeerUidAllowed(client) ||
                         !DispatchClient(client)) {
                         static_cast<void>(::close(client));
                     }
@@ -5284,6 +5349,10 @@ private:
     std::thread control_thread_;
     std::vector<std::unique_ptr<ClientWorkerSlot>>
         client_workers_;
+    // Set once before the control thread is created and never mutated while
+    // request workers can observe it. Keep it last so the existing hot member
+    // offsets are unchanged for ordinary ACTIVE and preview services.
+    bool serve_process_start_history_ = false;
 };
 
 RealtimeSharedMarketServiceV2::RealtimeSharedMarketServiceV2(
@@ -5326,6 +5395,7 @@ bool RealtimeSharedMarketServiceV2::Start(
     return impl_ != nullptr &&
            impl_->Start(
                RealtimeServerStateV2::kActive,
+               false,
                system_error_number);
 }
 
@@ -5334,7 +5404,24 @@ bool RealtimeSharedMarketServiceV2::StartLivePartial(
     return impl_ != nullptr &&
            impl_->Start(
                RealtimeServerStateV2::kLivePartial,
+               false,
                system_error_number);
+}
+
+bool RealtimeSharedMarketServiceV2::
+    StartLivePartialWithProcessStartHistory(
+        int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->Start(
+               RealtimeServerStateV2::kLivePartial,
+               true,
+               system_error_number);
+}
+
+bool RealtimeSharedMarketServiceV2::
+    PrepareCertifiedPrefixValidBeforeStart() noexcept {
+    return impl_ != nullptr &&
+           impl_->PrepareCertifiedPrefixValidBeforeStart();
 }
 
 bool RealtimeSharedMarketServiceV2::PublishApplied(
@@ -5409,6 +5496,13 @@ RealtimeSharedMarketServiceV2::key_arena_used_bytes()
     return impl_ == nullptr
                ? 0U
                : impl_->key_arena_used_bytes();
+}
+
+std::uint64_t RealtimeSharedMarketServiceV2::
+    tick_contiguous_published_sequence() const noexcept {
+    return impl_ == nullptr
+               ? 0U
+               : impl_->tick_contiguous_published_sequence();
 }
 
 bool RealtimeSharedMarketServiceV2::failed() const noexcept {

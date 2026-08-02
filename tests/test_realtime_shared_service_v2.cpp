@@ -1692,6 +1692,51 @@ template <typename Message>
            CMSG_FIRSTHDR(&message) == nullptr;
 }
 
+[[nodiscard]] bool RequestHistoryOpen(
+    const std::filesystem::path& socket_path,
+    std::uint64_t expected_generation,
+    ipc::RealtimeHistoryOpenResponseV2* output) {
+    if (output == nullptr) {
+        return false;
+    }
+    UniqueFd channel = ConnectControlSocket(socket_path);
+    ipc::RealtimeHistoryOpenRequestV2 request{};
+    request.magic = ipc::kRealtimeControlMagicV2;
+    request.protocol_major = ipc::kRealtimeWireMajorV2;
+    request.protocol_minor = ipc::kRealtimeWireMinorV2;
+    request.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeHistoryControlOpcodeV2::kOpenHistory);
+    request.message_bytes = sizeof(request);
+    request.request_id = 0x5041525448495354ULL;
+    request.instrument_id = 1U;
+    request.requested_page_records = 1U;
+    request.expected_generation = expected_generation;
+    return channel.get() >= 0 && SendObject(channel.get(), request) &&
+           ReceiveObjectWithoutDescriptor(channel.get(), output);
+}
+
+[[nodiscard]] bool RequestDeltaOpen(
+    const std::filesystem::path& socket_path,
+    std::uint64_t expected_generation,
+    ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2* output) {
+    if (output == nullptr) {
+        return false;
+    }
+    UniqueFd channel = ConnectControlSocket(socket_path);
+    ipc::RealtimeInstrumentTickDeltaOpenSessionRequestV2 request{};
+    request.magic = ipc::kRealtimeControlMagicV2;
+    request.protocol_major = ipc::kRealtimeWireMajorV2;
+    request.protocol_minor = ipc::kRealtimeWireMinorV2;
+    request.opcode = static_cast<std::uint16_t>(
+        ipc::RealtimeInstrumentTickDeltaControlOpcodeV2::
+            kOpenDeltaSession);
+    request.message_bytes = sizeof(request);
+    request.request_id = 0x5041525444454c54ULL;
+    request.expected_generation = expected_generation;
+    return channel.get() >= 0 && SendObject(channel.get(), request) &&
+           ReceiveObjectWithoutDescriptor(channel.get(), output);
+}
+
 [[nodiscard]] bool CheckCanonicalHistoryReadErrorFrame(
     const std::filesystem::path& socket_path,
     std::uint64_t generation) {
@@ -2658,7 +2703,10 @@ bool ReadNativeRawEventHistory(
     std::span<const std::uint64_t> expected_ingress_sequences,
     std::span<const std::uint64_t> expected_tick_sequences,
     ipc::InstrumentRawEventHistoryCheckpointV2* checkpoint_output,
-    std::string_view label) {
+    std::string_view label,
+    std::uint8_t expected_source_slot = 1U,
+    std::uint8_t expected_event_kind = 2U,
+    std::uint8_t expected_market = 1U) {
     if (checkpoint_output == nullptr ||
         expected_ingress_sequences.size() !=
             expected_tick_sequences.size()) {
@@ -2784,8 +2832,9 @@ bool ReadNativeRawEventHistory(
             tick_sequences.push_back(
                 record.common.tick_stream_sequence);
             ok &= record.common.instrument_id == 1U &&
-                  record.common.source_slot == 1U &&
-                  record.common.event_kind == 2U;
+                  record.common.source_slot == expected_source_slot &&
+                  record.common.event_kind == expected_event_kind &&
+                  record.common.market == expected_market;
         }
     }
     ok &= Expect(
@@ -3114,10 +3163,59 @@ bool TestLivePartialSemantics() {
     ok &= Expect(
         !service->Start(&system_error) && system_error == EINVAL,
         "ACTIVE start rejects a service without from-open coverage");
+
+    market::IntradayInstrumentStoreConfigV1 store_config{};
+    store_config.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    store_config.maximum_session_records = 4U;
+    store_config.maximum_session_accounted_bytes = 1U << 20U;
+    store_config.maximum_records_per_batch = 4U;
+    store_config.coverage_from_open = false;
+    std::unique_ptr<market::IntradayInstrumentStoreV1> startup_store;
+    ok &= Expect(
+        market::IntradayInstrumentStoreV1::Create(
+            store_config,
+            1U,
+            kSourceStreamIds,
+            fixture.runtime_state.get(),
+            &startup_store) ==
+                market::IntradayInstrumentStoreCreateErrorV1::kNone &&
+            startup_store != nullptr,
+        "create direct Store record fixture while service is INITIALIZING");
+    market::InstrumentRouteTokenV1 route{};
+    std::optional<market::RealtimeHistoryEventInputV1> startup_input =
+        SnapshotInput(1U, 1U);
+    const market::RealtimeHistoryRecordV1* startup_record = nullptr;
+    ok &= Expect(
+        startup_store != nullptr && startup_input.has_value() &&
+            startup_store->ResolveRouteToken(0U, 1U, &route) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            startup_store->Append(
+                0U,
+                route,
+                std::move(*startup_input),
+                &startup_record) ==
+                market::IntradayInstrumentStoreAppendErrorV1::kNone &&
+            startup_record != nullptr,
+        "materialize an exact startup snapshot record");
+    if (startup_record == nullptr) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+    ok &= Expect(
+        service->PublishApplied(0U, *startup_record) &&
+            service->PublishProcessingProgress({1U, 1U}),
+        "INITIALIZING accepts exact latest and processing-progress publication");
+    if (service->failed()) {
+        service->StopControl();
+        return false;
+    }
+
     system_error = 0;
     ok &= Expect(
         service->StartLivePartial(&system_error) && system_error == 0,
-        "LIVE_PARTIAL starts from the unchanged INITIALIZING state");
+        "LIVE_PARTIAL exposes the initialized startup prefix");
 
     SessionTransfer transfer = RequestSession(socket_path);
     ok &= Expect(
@@ -3150,8 +3248,14 @@ bool TestLivePartialSemantics() {
             session.flags == 0U &&
             session.coverage_complete == 1U &&
             session.bound_count == session.capacity &&
-            session.available_count == 0U,
-        "preview has complete catalog identity but no from-open or strong prefix claim");
+            session.available_count == 1U &&
+            session.snapshot_available_count == 1U &&
+            session.tick_available_count == 0U &&
+            session.factor_eligible_count == 1U &&
+            session.accepted_sequence == 1U &&
+            session.applied_sequence == 1U &&
+            session.processing_lag_records == 0U,
+        "preview exposes the exact pre-start latest/progress prefix without a strong coverage claim");
 
     constexpr std::uint32_t instrument_id = 1U;
     ipc::RealtimeWireSnapshotPayloadV2 snapshot{};
@@ -3164,8 +3268,19 @@ bool TestLivePartialSemantics() {
             &snapshot,
             sizeof(snapshot),
             &latest_status) == L2FLOW_SHM_READER_OK_V2 &&
-            latest_status == L2FLOW_LATEST_BOUND_NO_DATA_V2,
-        "latest API remains queryable during recovery and reports explicit no-data status");
+            latest_status == L2FLOW_LATEST_AVAILABLE_V2 &&
+            snapshot.common.instrument_id == instrument_id &&
+            snapshot.common.ordinal == 0U &&
+            snapshot.common.source_stream_id == kSourceStreamIds[0U] &&
+            snapshot.common.source_sequence == 1U &&
+            snapshot.common.ingress_sequence == 1U &&
+            snapshot.last_price.valid == 1U &&
+            snapshot.last_price.is_null == 0U &&
+            snapshot.last_price.raw == 1'234'000 &&
+            snapshot.last_price.normalized_p6 == 1'234'000 &&
+            snapshot.trade_volume.valid == 1U &&
+            snapshot.trade_volume.raw == 101,
+        "latest API preserves the exact record published before LIVE_PARTIAL exposure");
     ok &= Expect(
         !service->MarkCertifiedPrefixValid(),
         "LIVE_PARTIAL cannot manufacture a certified from-open prefix");
@@ -3232,6 +3347,420 @@ bool TestLivePartialSemantics() {
         "stopped partial session still refuses complete History and delta semantics");
     service->StopControl();
     return ok && Expect(!service->failed(), "LIVE_PARTIAL lifecycle is nonfatal");
+}
+
+bool TestStandaloneLivePartialProcessStartHistory() {
+    ScopedTempDirectory temporary;
+    constexpr std::uint64_t partial_epoch = kSessionEpoch + 101U;
+    DailyRuntimeFixture fixture =
+        MakePipelineDailyFixture(partial_epoch);
+    if (!Expect(
+            temporary.valid() && static_cast<bool>(fixture),
+            "create standalone partial History fixture")) {
+        return false;
+    }
+
+    const common::Identity128 run_id = RunId(0x62U);
+    ipc::RealtimeSharedServiceConfigV2 base_config{};
+    base_config.run_id = run_id;
+    base_config.session_epoch = partial_epoch;
+    base_config.trade_date = kTradeDate;
+    base_config.daily_catalog = fixture.catalog;
+    base_config.coverage_from_open = false;
+    base_config.tick_ring_capacity = 16U;
+    base_config.key_arena_bytes = 128U;
+    base_config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+
+    ipc::RealtimeSharedServiceConfigV2 preview_config = base_config;
+    const std::filesystem::path preview_socket =
+        temporary.path() / "preview-partial.sock";
+    preview_config.control_socket_path = preview_socket;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> preview_service;
+    int system_error = 0;
+    bool ok = Expect(
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            preview_config, &preview_service, &system_error) ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            preview_service != nullptr && system_error == 0 &&
+            preview_service->StartLivePartial(&system_error),
+        "start default latest-only LIVE_PARTIAL preview");
+    if (preview_service == nullptr) {
+        return false;
+    }
+
+    ipc::RealtimeSharedServiceConfigV2 standalone_config =
+        base_config;
+    const std::filesystem::path standalone_socket =
+        temporary.path() / "standalone-partial.sock";
+    standalone_config.control_socket_path = standalone_socket;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2>
+        standalone_service;
+    system_error = 0;
+    ok &= Expect(
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            standalone_config,
+            &standalone_service,
+            &system_error) ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            standalone_service != nullptr && system_error == 0 &&
+            standalone_service
+                ->StartLivePartialWithProcessStartHistory(
+                    &system_error),
+        "start standalone LIVE_PARTIAL with process-start History");
+    if (standalone_service == nullptr || !ok) {
+        preview_service->MarkFailed();
+        preview_service->StopControl();
+        if (standalone_service != nullptr) {
+            standalone_service->MarkFailed();
+            standalone_service->StopControl();
+        }
+        return false;
+    }
+
+    ipc::RealtimeHistoryOpenResponseV2 history_response{};
+    ipc::RealtimeInstrumentTickDeltaOpenSessionResponseV2
+        delta_response{};
+    ok &= Expect(
+        RequestHistoryOpen(
+            standalone_socket, 0U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::
+                        kUnavailable) &&
+            RequestDeltaOpen(
+                standalone_socket, 0U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnavailable),
+        "opt-in partial queries remain unavailable before generation one");
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    PipelineCleanup pipeline_cleanup(&pipeline);
+    runtime::RealtimePipelineConfigV1 pipeline_config{};
+    pipeline_config.run_id = run_id;
+    pipeline_config.trade_date = kTradeDate;
+    pipeline_config.daily_catalog = fixture.catalog;
+    pipeline_config.runtime_state = fixture.runtime_state.get();
+    pipeline_config.source_stream_ids = kSourceStreamIds;
+    pipeline_config.maximum_sdk_message_bytes = 4'096U;
+    pipeline_config.decoder_queue_capacity_per_source = 8U;
+    pipeline_config.completion_tracker_capacity = 16U;
+    pipeline_config.tick_ring_capacity = 16U;
+    pipeline_config.store_worker_count = 1U;
+    pipeline_config.store_queue_capacity_per_source_worker = 16U;
+    pipeline_config.intraday_store.segment_target_bytes =
+        market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
+    pipeline_config.intraday_store.maximum_session_records = 16U;
+    pipeline_config.intraday_store.maximum_session_accounted_bytes =
+        1U << 20U;
+    pipeline_config.intraday_store.maximum_records_per_batch = 16U;
+    pipeline_config.intraday_store.coverage_from_open = false;
+    pipeline_config.applied_record_sink = standalone_service;
+    pipeline_config.processing_progress_sink = standalone_service;
+    pipeline_config.store_generation_sink = standalone_service;
+    pipeline_config.sdk.enabled = false;
+
+    std::string detail;
+    const runtime::RealtimePipelineCreateErrorV1 pipeline_error =
+        runtime::RealtimePipelineV1::Create(
+            pipeline_config, &pipeline, &detail);
+    ok &= Expect(
+        pipeline_error ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create process-start partial Pipeline: " + detail);
+    if (pipeline == nullptr) {
+        preview_service->MarkFailed();
+        standalone_service->MarkFailed();
+        preview_service->StopControl();
+        standalone_service->StopControl();
+        return false;
+    }
+
+    FakeSdkMessage snapshot(
+        sdk::kProductionMessageKeysV1[2U],
+        PipelineShenzhenSnapshotBody());
+    FakeSdkMessage order(
+        sdk::kProductionMessageKeysV1[3U],
+        PipelineShenzhenOrderBody());
+    const runtime::RealtimePipelineIngressResultV1 snapshot_ingress =
+        pipeline->InjectSdkMessageForTest(&snapshot);
+    const runtime::RealtimePipelineIngressResultV1 order_ingress =
+        pipeline->InjectSdkMessageForTest(&order);
+    ok &= Expect(
+        snapshot_ingress.accepted() && order_ingress.accepted() &&
+            snapshot_ingress.global_ingress_sequence == 1U &&
+            order_ingress.global_ingress_sequence == 2U,
+        "admit one snapshot and one tick into partial generation one");
+
+    const runtime::RealtimePipelineCutResultV1 first_cut =
+        pipeline->CutAndPublishGeneration(std::chrono::seconds(3));
+    ok &= Expect(
+        first_cut.published() &&
+            first_cut.store_generation != nullptr &&
+            first_cut.store_generation->watermark().generation == 1U,
+        "periodic partial cut publishes generation one");
+    bool preview_prefix_published = false;
+    if (first_cut.store_generation != nullptr) {
+        market::IntradayInstrumentScanOptionsV1 options{};
+        options.ingress_sequence_begin_inclusive = 1U;
+        options.ingress_sequence_end_exclusive = 3U;
+        options.maximum_records = 2U;
+        options.direction =
+            market::IntradayInstrumentScanDirectionV1::kOldestFirst;
+        std::unique_ptr<market::IntradayInstrumentCursorV1> cursor;
+        std::array<const market::RealtimeHistoryRecordV1*, 2U>
+            records{};
+        std::size_t written = 0U;
+        preview_prefix_published =
+            first_cut.store_generation->OpenInstrumentCursor(
+                1U, options, &cursor) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            cursor != nullptr &&
+            cursor->ReadBatch(records, &written) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            written == records.size();
+        for (std::size_t index = 0U;
+             preview_prefix_published && index < written;
+             ++index) {
+            preview_prefix_published =
+                records[index] != nullptr &&
+                preview_service->PublishApplied(
+                    0U, *records[index]);
+        }
+        preview_prefix_published =
+            preview_prefix_published &&
+            preview_service->PublishProcessingProgress({2U, 2U}) &&
+            preview_service->PublishStoreGeneration(
+                first_cut.store_generation);
+    }
+    ok &= Expect(
+        preview_prefix_published,
+        "publish a coherent partial prefix and generation into the default preview");
+
+    history_response = {};
+    delta_response = {};
+    ok &= Expect(
+        RequestHistoryOpen(preview_socket, 1U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::
+                        kUnavailable) &&
+            RequestDeltaOpen(preview_socket, 1U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnavailable),
+        "online-style preview rejects History/delta even with a valid partial generation");
+
+    history_response = {};
+    delta_response = {};
+    const std::array<std::uint64_t, 4U> first_counts{{
+        0U, 0U, 1U, 1U}};
+    ok &= Expect(
+        RequestHistoryOpen(
+            standalone_socket, 1U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::kOk) &&
+            history_response.initial_read_token != 0U &&
+            ipc::RealtimeHistoryGenerationInfoCanonicalV2(
+                history_response.generation) &&
+            history_response.generation.endpoint.flags ==
+                ipc::kRealtimeGenerationRecordCoverageCompleteV2 &&
+            history_response.generation
+                    .instrument_source_record_counts ==
+                first_counts &&
+            history_response.generation.instrument_record_count == 2U &&
+            history_response.generation.snapshot_record_count == 1U &&
+            history_response.generation.tick_record_count == 1U &&
+            RequestDeltaOpen(
+                standalone_socket, 1U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kOk) &&
+            delta_response.delta_session_token != 0U &&
+            delta_response.target_generation.flags ==
+                ipc::kRealtimeGenerationRecordCoverageCompleteV2,
+        "standalone partial exposes complete process-start History and delta without from-open coverage");
+
+    SessionTransfer transfer = RequestSession(standalone_socket);
+    ReaderHandle reader;
+    ok &= Expect(
+        transfer.fd.get() >= 0 &&
+            l2flow_shm_reader_open_fd_v2(
+                transfer.fd.get(), reader.output()) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            reader.get() != nullptr,
+        "open standalone partial reader identity");
+    transfer.fd.Reset();
+    l2flow_shm_session_info_v2 session{};
+    ok &= Expect(
+        reader.get() != nullptr &&
+            l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.server_state ==
+                static_cast<std::uint32_t>(
+                    ipc::RealtimeServerStateV2::kLivePartial) &&
+            session.flags == 0U && session.window_count == 0U &&
+            !standalone_service->MarkCertifiedPrefixValid(),
+        "standalone partial retains LIVE_PARTIAL and no strong/KLine/CERTIFIED flags");
+
+    ok &= RunPythonHistoryDeltaSmoke(
+        standalone_socket, 1U, 2U, true);
+    ipc::InstrumentRawEventHistoryCheckpointV2 first_checkpoint{};
+    const std::array<std::uint64_t, 1U> first_ingress{{2U}};
+    const std::array<std::uint64_t, 1U> first_ticks{{1U}};
+    ok &= ReadNativeRawEventHistory(
+        standalone_socket,
+        session,
+        1U,
+        nullptr,
+        first_ingress,
+        first_ticks,
+        &first_checkpoint,
+        "partial native origin",
+        3U,
+        4U,
+        2U);
+
+    preview_service->MarkDraining();
+    ok &= Expect(
+        preview_service->MarkStoppedClean(1U),
+        "default partial preview stops cleanly after hidden generation publication");
+    history_response = {};
+    delta_response = {};
+    ok &= Expect(
+        RequestHistoryOpen(preview_socket, 1U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::
+                        kUnavailable) &&
+            RequestDeltaOpen(preview_socket, 1U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kUnavailable),
+        "default preview remains isolated after DRAINING/STOPPED_CLEAN");
+    preview_service->StopControl();
+
+    FakeSdkMessage transaction(
+        sdk::kProductionMessageKeysV1[4U],
+        PipelineShenzhenTransactionBody());
+    const runtime::RealtimePipelineIngressResultV1 transaction_ingress =
+        pipeline->InjectSdkMessageForTest(&transaction);
+    ok &= Expect(
+        transaction_ingress.accepted() &&
+            transaction_ingress.global_ingress_sequence == 3U,
+        "admit one tick into the next partial generation");
+    const runtime::RealtimePipelineCutResultV1 second_cut =
+        pipeline->CutAndPublishGeneration(std::chrono::seconds(3));
+    ok &= Expect(
+        second_cut.published() &&
+            second_cut.store_generation != nullptr &&
+            second_cut.store_generation->watermark().generation == 2U,
+        "periodic partial cut publishes generation two");
+
+    history_response = {};
+    const std::array<std::uint64_t, 4U> second_counts{{
+        0U, 0U, 1U, 2U}};
+    ok &= Expect(
+        RequestHistoryOpen(
+            standalone_socket, 2U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::kOk) &&
+            history_response.generation.endpoint.flags ==
+                ipc::kRealtimeGenerationRecordCoverageCompleteV2 &&
+            history_response.generation
+                    .instrument_source_record_counts ==
+                second_counts &&
+            history_response.generation.instrument_record_count == 3U &&
+            history_response.generation.snapshot_record_count == 1U &&
+            history_response.generation.tick_record_count == 2U,
+        "generation two History retains the complete process-start prefix");
+    ok &= RunPythonHistoryDeltaSmoke(
+        standalone_socket, 2U, 3U, false);
+
+    ipc::InstrumentRawEventHistoryCheckpointV2 second_checkpoint{};
+    const std::array<std::uint64_t, 1U> second_ingress{{3U}};
+    const std::array<std::uint64_t, 1U> second_ticks{{2U}};
+    ok &= ReadNativeRawEventHistory(
+        standalone_socket,
+        session,
+        2U,
+        &first_checkpoint,
+        second_ingress,
+        second_ticks,
+        &second_checkpoint,
+        "partial native generation delta",
+        3U,
+        5U,
+        2U);
+    ok &= Expect(
+        second_checkpoint.generation.flags ==
+            ipc::kRealtimeGenerationRecordCoverageCompleteV2 &&
+            second_checkpoint.instrument_event_record_count == 2U,
+        "partial generation checkpoint remains complete but explicitly not from-open");
+
+    history_response = {};
+    delta_response = {};
+    ok &= Expect(
+        RequestHistoryOpen(
+            standalone_socket, 1U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::
+                        kGenerationChanged) &&
+            RequestDeltaOpen(
+                standalone_socket, 1U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kCheckpointMismatch),
+        "new partial opens pin only the current immutable generation");
+
+    standalone_service->MarkDraining();
+    history_response = {};
+    delta_response = {};
+    ok &= Expect(
+        RequestHistoryOpen(
+            standalone_socket, 2U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::kOk) &&
+            RequestDeltaOpen(
+                standalone_socket, 2U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kOk),
+        "process-start generation queries remain available while draining");
+    pipeline->StopAndDrain();
+    ok &= Expect(
+        standalone_service->MarkStoppedClean(2U),
+        "standalone partial stops with its exact contiguous tick prefix");
+    history_response = {};
+    delta_response = {};
+    ok &= Expect(
+        RequestHistoryOpen(
+            standalone_socket, 2U, &history_response) &&
+            history_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeHistoryControlStatusV2::kOk) &&
+            RequestDeltaOpen(
+                standalone_socket, 2U, &delta_response) &&
+            delta_response.status ==
+                static_cast<std::uint16_t>(
+                    ipc::RealtimeInstrumentTickDeltaControlStatusV2::
+                        kOk),
+        "stopped standalone partial retains its last complete process-start generation");
+    standalone_service->StopControl();
+    return ok && !pipeline->fatal() &&
+           !preview_service->failed() &&
+           !standalone_service->failed();
 }
 
 bool TestServiceEndToEnd() {
@@ -4240,6 +4769,77 @@ bool TestServiceEndToEnd() {
         "clean terminal mapping preserves exact ring watermark");
     service->StopControl();
     return ok && !service->failed();
+}
+
+bool TestPromotionExposureGate() {
+    ScopedTempDirectory temporary;
+    DailyRuntimeFixture fixture =
+        MakeManualDailyFixture(1U, kSessionEpoch + 300U);
+    if (!Expect(temporary.valid(), "create promotion-gate temp directory") ||
+        !Expect(static_cast<bool>(fixture),
+                "create promotion-gate daily catalog")) {
+        return false;
+    }
+    const std::filesystem::path socket_path =
+        temporary.path() / "promoted-fast.sock";
+    const auto exposure_gate =
+        std::make_shared<std::atomic<bool>>(false);
+    ipc::RealtimeSharedServiceConfigV2 config{};
+    config.run_id = RunId(0x6fU);
+    config.session_epoch = kSessionEpoch + 300U;
+    config.trade_date = kTradeDate;
+    config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = true;
+    config.startup_prefix_recovered = true;
+    config.full_day_factor_valid = true;
+    config.tick_ring_capacity = 4U;
+    config.key_arena_bytes = 128U;
+    config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.control_socket_path = socket_path;
+    config.control_exposure_gate = exposure_gate;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int system_error = 0;
+    bool ok = Expect(
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            config, &service, &system_error) ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            service != nullptr,
+        "create recovered FAST behind a shared exposure gate");
+    if (service == nullptr) {
+        return false;
+    }
+    ok &= Expect(
+        service->PrepareCertifiedPrefixValidBeforeStart() &&
+            service->Start(&system_error),
+        "prepare certified capability before starting gated FAST control");
+    const SessionTransfer hidden = RequestSession(socket_path);
+    ok &= Expect(
+        hidden.fd.get() < 0,
+        "false promotion gate transfers no FAST descriptor");
+
+    exposure_gate->store(true, std::memory_order_release);
+    SessionTransfer visible = RequestSession(socket_path);
+    ipc::RealtimeWireHeaderV2 header{};
+    const ssize_t header_bytes =
+        visible.fd.get() < 0
+            ? -1
+            : ::pread(
+                  visible.fd.get(), &header, sizeof(header), 0);
+    ok &= Expect(
+        visible.fd.get() >= 0 &&
+            header_bytes == static_cast<ssize_t>(sizeof(header)) &&
+            header.server_state == static_cast<std::uint32_t>(
+                ipc::RealtimeServerStateV2::kActive) &&
+            (header.flags &
+             ipc::kRealtimeHeaderCertifiedPrefixValidV2) != 0U,
+        "first obtainable FAST descriptor is ACTIVE with certified prefix");
+    service->MarkDraining();
+    ok &= Expect(
+        service->MarkStoppedClean(0U),
+        "gated FAST service stops cleanly at the empty Tick frontier");
+    service->StopControl();
+    return ok;
 }
 
 bool TestProcessingAdmissionPublishesWireLatest() {
@@ -5698,6 +6298,41 @@ bool RunLatencyBenchmark(bool measure_stage_latency) {
     return ok;
 }
 
+enum class StartupBenchmarkScenarioV1 : std::uint8_t {
+    kFromOpen = 0U,
+    kLivePartialNoRecovery,
+};
+
+[[nodiscard]] std::string_view StartupBenchmarkScenarioNameV1(
+    StartupBenchmarkScenarioV1 scenario) noexcept {
+    switch (scenario) {
+        case StartupBenchmarkScenarioV1::kFromOpen:
+            return "from_open";
+        case StartupBenchmarkScenarioV1::kLivePartialNoRecovery:
+            return "live_partial_no_recovery";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] bool StartupBenchmarkCoverageFromOpenV1(
+    StartupBenchmarkScenarioV1 scenario) noexcept {
+    return scenario == StartupBenchmarkScenarioV1::kFromOpen;
+}
+
+[[nodiscard]] bool StartStartupBenchmarkServiceV1(
+    const std::shared_ptr<ipc::RealtimeSharedMarketServiceV2>& service,
+    StartupBenchmarkScenarioV1 scenario,
+    int* system_error) noexcept {
+    if (service == nullptr) {
+        return false;
+    }
+    if (scenario == StartupBenchmarkScenarioV1::kFromOpen) {
+        return service->Start(system_error);
+    }
+    return service->StartLivePartialWithProcessStartHistory(
+        system_error);
+}
+
 enum class ThroughputWorkloadV1 : std::uint8_t {
     kSingleInstrument = 0U,
     kFiveTupleUniform,
@@ -5723,6 +6358,9 @@ struct ThroughputBenchmarkConfigV1 final {
     ThroughputWorkloadV1 workload =
         ThroughputWorkloadV1::kSingleInstrument;
     ThroughputSinkV1 sink = ThroughputSinkV1::kFast;
+    StartupBenchmarkScenarioV1 scenario =
+        StartupBenchmarkScenarioV1::kFromOpen;
+    std::chrono::milliseconds generation_interval{0};
 };
 
 [[nodiscard]] std::string_view ThroughputWorkloadNameV1(
@@ -5874,6 +6512,174 @@ struct ThroughputInstrumentMessagesV1 final {
     return 1U;
 }
 
+struct ThroughputHistoryValidationV1 final {
+    std::uint64_t scan_elapsed_ns = 0U;
+    std::uint64_t scanned_records = 0U;
+    std::uint64_t unique_ingress_sequences = 0U;
+    std::uint64_t duplicate_ingress_sequences = 0U;
+    std::uint64_t out_of_range_ingress_sequences = 0U;
+    std::uint64_t invalid_source_slots = 0U;
+    std::array<std::uint64_t, 4U> scanned_source_records{};
+    std::uint16_t history_control_status =
+        std::numeric_limits<std::uint16_t>::max();
+    std::uint32_t endpoint_flags = 0U;
+    bool cursor_opened = false;
+    bool explicit_eof = false;
+    bool endpoint_valid = false;
+    bool generation_valid = false;
+    bool source_counts_valid = false;
+    bool passed = false;
+};
+
+[[nodiscard]] ThroughputHistoryValidationV1
+ValidateThroughputHistoryGenerationV1(
+    const std::filesystem::path& socket_path,
+    const std::shared_ptr<const market::
+            IntradayInstrumentStoreGenerationV1>& generation,
+    StartupBenchmarkScenarioV1 scenario,
+    std::uint64_t planned,
+    const std::array<std::uint64_t, 4U>& expected_source_records) {
+    ThroughputHistoryValidationV1 result{};
+    const std::uint64_t begin_ns = MonotonicNowNs();
+    if (generation == nullptr || planned == 0U || begin_ns == 0U ||
+        planned >= std::numeric_limits<std::uint64_t>::max()) {
+        return result;
+    }
+
+    const bool coverage_from_open =
+        StartupBenchmarkCoverageFromOpenV1(scenario);
+    const market::RealtimeHistoryWatermarkV1& watermark =
+        generation->watermark();
+    result.generation_valid =
+        generation->record_count() == planned &&
+        generation->coverage_from_open() == coverage_from_open &&
+        watermark.generation != 0U &&
+        watermark.ingress_sequence_exclusive == planned + 1U &&
+        watermark.processing_progress.valid() &&
+        watermark.processing_progress.accepted_sequence == planned &&
+        watermark.processing_progress.applied_sequence == planned;
+    for (std::size_t source = 0U;
+         source < expected_source_records.size();
+         ++source) {
+        result.generation_valid =
+            result.generation_valid &&
+            watermark.sources[source].sequence_exclusive ==
+                expected_source_records[source] + 1U;
+    }
+
+    ipc::RealtimeHistoryOpenResponseV2 history{};
+    if (RequestHistoryOpen(
+            socket_path, watermark.generation, &history)) {
+        result.history_control_status = history.status;
+        result.endpoint_flags = history.generation.endpoint.flags;
+        const std::uint32_t expected_flags =
+            ipc::kRealtimeGenerationRecordCoverageCompleteV2 |
+            (coverage_from_open
+                 ? ipc::kRealtimeGenerationCoverageFromOpenV2
+                 : 0U);
+        result.endpoint_valid =
+            history.status == static_cast<std::uint16_t>(
+                                  ipc::RealtimeHistoryControlStatusV2::
+                                      kOk) &&
+            ipc::RealtimeHistoryGenerationInfoCanonicalV2(
+                history.generation) &&
+            history.generation.endpoint.generation ==
+                watermark.generation &&
+            history.generation.endpoint.flags == expected_flags &&
+            history.generation.endpoint.ingress_sequence_exclusive ==
+                planned + 1U;
+        for (std::size_t source = 0U;
+             source < expected_source_records.size();
+             ++source) {
+            result.endpoint_valid =
+                result.endpoint_valid &&
+                history.generation.endpoint
+                        .source_sequence_exclusive[source] ==
+                    expected_source_records[source] + 1U;
+        }
+    }
+
+    market::IntradayInstrumentScanOptionsV1 options{};
+    options.ingress_sequence_begin_inclusive = 1U;
+    options.ingress_sequence_end_exclusive = planned + 1U;
+    options.maximum_records = planned;
+    options.direction =
+        market::IntradayInstrumentScanDirectionV1::kOldestFirst;
+    std::unique_ptr<market::IntradayUniverseCursorV1> cursor;
+    result.cursor_opened =
+        generation->OpenUniverseCursor(options, &cursor) ==
+            market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+        cursor != nullptr;
+    if (result.cursor_opened) {
+        try {
+            std::vector<std::uint8_t> seen(
+                static_cast<std::size_t>(planned + 1U), 0U);
+            std::vector<const market::RealtimeHistoryRecordV1*> batch(
+                65'536U, nullptr);
+            for (;;) {
+                std::size_t written = 0U;
+                const auto read_error = cursor->ReadBatch(
+                    batch, &written);
+                if (read_error !=
+                    market::IntradayInstrumentStoreQueryErrorV1::kNone) {
+                    break;
+                }
+                if (written == 0U) {
+                    result.explicit_eof = cursor->done();
+                    break;
+                }
+                for (std::size_t index = 0U;
+                     index < written;
+                     ++index) {
+                    const market::RealtimeHistoryRecordV1* const record =
+                        batch[index];
+                    ++result.scanned_records;
+                    if (record == nullptr ||
+                        record->ingress_sequence() == 0U ||
+                        record->ingress_sequence() > planned) {
+                        ++result.out_of_range_ingress_sequences;
+                        continue;
+                    }
+                    const std::size_t ingress =
+                        static_cast<std::size_t>(
+                            record->ingress_sequence());
+                    if (seen[ingress] != 0U) {
+                        ++result.duplicate_ingress_sequences;
+                    } else {
+                        seen[ingress] = 1U;
+                        ++result.unique_ingress_sequences;
+                    }
+                    const std::size_t source = record->source_slot();
+                    if (source >= result.scanned_source_records.size()) {
+                        ++result.invalid_source_slots;
+                    } else {
+                        ++result.scanned_source_records[source];
+                    }
+                }
+            }
+        } catch (...) {
+            result.explicit_eof = false;
+        }
+    }
+
+    result.source_counts_valid =
+        result.scanned_source_records == expected_source_records;
+    result.passed =
+        result.generation_valid && result.endpoint_valid &&
+        result.cursor_opened && result.explicit_eof &&
+        result.scanned_records == planned &&
+        result.unique_ingress_sequences == planned &&
+        result.duplicate_ingress_sequences == 0U &&
+        result.out_of_range_ingress_sequences == 0U &&
+        result.invalid_source_slots == 0U &&
+        result.source_counts_valid;
+    const std::uint64_t end_ns = MonotonicNowNs();
+    if (end_ns >= begin_ns) {
+        result.scan_elapsed_ns = end_ns - begin_ns;
+    }
+    return result;
+}
+
 bool RunThroughputProfileBenchmark(
     const ThroughputBenchmarkConfigV1& benchmark) {
     constexpr std::uint64_t kTickRingCapacity = 262'144U;
@@ -5885,6 +6691,8 @@ bool RunThroughputProfileBenchmark(
         32ULL * 1024ULL * 1024ULL * 1024ULL;
     const std::uint64_t duration_ms =
         static_cast<std::uint64_t>(benchmark.duration.count());
+    const bool factor_generation_enabled =
+        benchmark.scenario == StartupBenchmarkScenarioV1::kFromOpen;
     if (benchmark.target_rate == 0U ||
         benchmark.target_rate > kMaximumTargetRate ||
         duration_ms == 0U || duration_ms > kMaximumDurationMs ||
@@ -5893,7 +6701,11 @@ bool RunThroughputProfileBenchmark(
         benchmark.store_worker_count == 0U ||
         benchmark.decoder_queue_capacity_per_source < 2U ||
         benchmark.store_queue_capacity_per_source_worker < 2U ||
-        benchmark.segment_kib < 64U) {
+        benchmark.segment_kib < 64U ||
+        benchmark.generation_interval.count() < 0 ||
+        (benchmark.scenario ==
+             StartupBenchmarkScenarioV1::kLivePartialNoRecovery &&
+         benchmark.sink != ThroughputSinkV1::kFast)) {
         std::cerr << "invalid throughput profile arguments\n";
         return false;
     }
@@ -5926,6 +6738,27 @@ bool RunThroughputProfileBenchmark(
         << " duration_ms=" << duration_ms
         << " planned_callbacks=" << planned
         << " callback_contract=serialized"
+        << " scenario="
+        << StartupBenchmarkScenarioNameV1(benchmark.scenario)
+        << " server_state="
+        << (benchmark.scenario ==
+                    StartupBenchmarkScenarioV1::kFromOpen
+                ? "ACTIVE"
+                : "LIVE_PARTIAL")
+        << " coverage_from_open="
+        << (StartupBenchmarkCoverageFromOpenV1(benchmark.scenario)
+                ? 1
+                : 0)
+        << " online_recovery=0"
+        << " factor_generation_enabled="
+        << (factor_generation_enabled ? 1 : 0)
+        << " generation_interval_ms="
+        << benchmark.generation_interval.count()
+        << " native_sequence_base="
+        << (benchmark.scenario ==
+                    StartupBenchmarkScenarioV1::kFromOpen
+                ? 0U
+                : 10'000'000U)
         << " workload=" << ThroughputWorkloadNameV1(benchmark.workload)
         << " instruments_per_market="
         << benchmark.instruments_per_market
@@ -5951,7 +6784,7 @@ bool RunThroughputProfileBenchmark(
         << " store_segment_kib=" << benchmark.segment_kib
         << " tick_ring_capacity=" << kTickRingCapacity
         << " sink=" << ThroughputSinkNameV1(benchmark.sink)
-        << " pacing=absolute_deadline_no_batch_wait"
+        << " pacing=absolute_deadline_one_based_no_batch_wait"
         << " clock=CLOCK_MONOTONIC"
         << " affinity=" << CpuAffinityText() << '\n';
 
@@ -5975,7 +6808,8 @@ bool RunThroughputProfileBenchmark(
     service_config.session_epoch = 82U;
     service_config.trade_date = kTradeDate;
     service_config.daily_catalog = fixture.catalog;
-    service_config.coverage_from_open = true;
+    service_config.coverage_from_open =
+        StartupBenchmarkCoverageFromOpenV1(benchmark.scenario);
     service_config.tick_ring_capacity = kTickRingCapacity;
     service_config.maximum_history_readers = 4U;
     service_config.maximum_history_page_records = 65'536U;
@@ -5999,7 +6833,9 @@ bool RunThroughputProfileBenchmark(
                 service != nullptr && system_error == 0,
             "create throughput profile FAST service") ||
         !Expect(
-            service->Start(&system_error) && system_error == 0,
+            StartStartupBenchmarkServiceV1(
+                service, benchmark.scenario, &system_error) &&
+                system_error == 0,
             "start throughput profile FAST service")) {
         if (service != nullptr) {
             service->StopControl();
@@ -6083,7 +6919,10 @@ bool RunThroughputProfileBenchmark(
         kMaximumAccountedBytes;
     pipeline_config.intraday_store.maximum_records_per_batch =
         65'536U;
-    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.intraday_store.coverage_from_open =
+        StartupBenchmarkCoverageFromOpenV1(benchmark.scenario);
+    pipeline_config.factor_generation_enabled =
+        factor_generation_enabled;
     pipeline_config.applied_record_sink =
         certified_service != nullptr
             ? std::static_pointer_cast<
@@ -6148,12 +6987,95 @@ bool RunThroughputProfileBenchmark(
 
     std::array<std::uint64_t, 5U> offered_by_tuple{};
     std::array<std::uint64_t, 4U> backlog_at_quarter{};
-    std::uint64_t shanghai_business_sequence = 0U;
-    std::uint64_t shenzhen_native_sequence = 0U;
+    const std::uint64_t native_sequence_base =
+        benchmark.scenario ==
+                StartupBenchmarkScenarioV1::kFromOpen
+            ? 0U
+            : 10'000'000U;
+    std::uint64_t shanghai_business_sequence = native_sequence_base;
+    std::uint64_t shenzhen_native_sequence = native_sequence_base;
     const std::size_t cycle_size =
         ThroughputCycleSizeV1(benchmark.workload);
+
+    std::mutex generation_mutex;
+    std::condition_variable generation_cv;
+    bool stop_generation_thread = false;
+    std::atomic<std::uint64_t> periodic_generation_cuts{0U};
+    std::atomic<bool> periodic_generation_failed{false};
+    std::atomic<std::uint32_t> periodic_cut_error{0U};
+    std::atomic<std::uint32_t> periodic_generation_error{0U};
+    std::thread generation_thread;
+    if (benchmark.generation_interval.count() > 0) {
+        try {
+            generation_thread = std::thread(
+                [&]() noexcept {
+                    std::unique_lock<std::mutex> lock(
+                        generation_mutex);
+                    auto deadline =
+                        std::chrono::steady_clock::now() +
+                        benchmark.generation_interval;
+                    while (!generation_cv.wait_until(
+                        lock,
+                        deadline,
+                        [&]() noexcept {
+                            return stop_generation_thread;
+                        })) {
+                        lock.unlock();
+                        const runtime::RealtimePipelineCutResultV1 cut =
+                            pipeline->CutAndPublishGeneration(
+                                std::chrono::seconds(60));
+                        const bool factor_contract_valid =
+                            cut.factor_generation_enabled ==
+                                factor_generation_enabled &&
+                            (factor_generation_enabled
+                                 ? cut.factor_generation != nullptr
+                                 : cut.factor_generation == nullptr);
+                        if (!cut.published() ||
+                            !factor_contract_valid) {
+                            periodic_cut_error.store(
+                                static_cast<std::uint32_t>(cut.error),
+                                std::memory_order_release);
+                            periodic_generation_error.store(
+                                static_cast<std::uint32_t>(
+                                    cut.generation_error),
+                                std::memory_order_release);
+                            periodic_generation_failed.store(
+                                true, std::memory_order_release);
+                            return;
+                        }
+                        periodic_generation_cuts.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        lock.lock();
+                        deadline =
+                            std::chrono::steady_clock::now() +
+                            benchmark.generation_interval;
+                    }
+                });
+        } catch (...) {
+            std::cerr
+                << "throughput generation thread creation failed\n";
+            if (certified_service != nullptr) {
+                certified_service->StopControl();
+            }
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
+    const auto stop_periodic_generations = [&]() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(generation_mutex);
+            stop_generation_thread = true;
+        }
+        generation_cv.notify_all();
+        if (generation_thread.joinable()) {
+            generation_thread.join();
+        }
+    };
+
     const std::uint64_t start_ns = MonotonicNowNs();
     if (!Expect(start_ns != 0U, "start throughput profile clock")) {
+        stop_periodic_generations();
         service->MarkFailed();
         service->StopControl();
         return false;
@@ -6243,8 +7165,11 @@ bool RunThroughputProfileBenchmark(
             break;
         }
 
+        // Pace N callback offers over N complete rate intervals.  Scheduling
+        // callback zero at start_ns would cover only N - 1 intervals while
+        // the reported rate divides N by the elapsed time.
         const std::uint64_t deadline_ns =
-            start_ns + index * 1'000'000'000ULL /
+            start_ns + (index + 1U) * 1'000'000'000ULL /
                            benchmark.target_rate;
         for (;;) {
             const std::uint64_t now_ns = MonotonicNowNs();
@@ -6284,6 +7209,7 @@ bool RunThroughputProfileBenchmark(
     const std::uint64_t offer_complete_ns = MonotonicNowNs();
     const runtime::RealtimePipelineSnapshotV1 before_drain =
         pipeline->Snapshot();
+    stop_periodic_generations();
     const std::uint64_t applied_before_drain =
         before_drain.processing_progress.applied_sequence;
     const std::uint64_t backlog_before_drain =
@@ -6294,7 +7220,9 @@ bool RunThroughputProfileBenchmark(
         certified_service->MarkDraining();
     }
     const std::uint64_t drain_start_ns = MonotonicNowNs();
-    pipeline->StopAndDrain();
+    const runtime::RealtimePipelineCutResultV1 final_cut =
+        pipeline->StopAndPublishFinalGeneration(
+            std::chrono::seconds(60));
     const std::uint64_t drain_complete_ns = MonotonicNowNs();
     const runtime::RealtimePipelineSnapshotV1 final =
         pipeline->Snapshot();
@@ -6307,6 +7235,20 @@ bool RunThroughputProfileBenchmark(
         certified_service->MarkStoppedClean();
         certified_snapshot = certified_service->Snapshot();
     }
+
+    const std::array<std::uint64_t, 4U> expected_source_records{{
+        offered_by_tuple[0U],
+        offered_by_tuple[1U],
+        offered_by_tuple[2U],
+        offered_by_tuple[3U] + offered_by_tuple[4U],
+    }};
+    const ThroughputHistoryValidationV1 history_validation =
+        ValidateThroughputHistoryGenerationV1(
+            socket_path,
+            final_cut.store_generation,
+            benchmark.scenario,
+            planned,
+            expected_source_records);
 
     std::size_t decoder_depth_before_drain = 0U;
     std::size_t decoder_high_water_max = 0U;
@@ -6390,15 +7332,42 @@ bool RunThroughputProfileBenchmark(
         offer_complete_ns >= start_ns
             ? offer_complete_ns - start_ns
             : 0U;
-    const std::uint64_t drain_elapsed_ns =
+    const std::uint64_t final_drain_and_cut_elapsed_ns =
         drain_complete_ns >= drain_start_ns
             ? drain_complete_ns - drain_start_ns
+            : 0U;
+    const std::uint64_t history_ready_elapsed_ns =
+        drain_complete_ns >= start_ns
+            ? drain_complete_ns - start_ns
             : 0U;
     const double achieved_offered_rps =
         producer_elapsed_ns == 0U
             ? 0.0
             : static_cast<double>(invoked) * 1'000'000'000.0 /
                   static_cast<double>(producer_elapsed_ns);
+    const double history_ready_rps =
+        history_ready_elapsed_ns == 0U
+            ? 0.0
+            : static_cast<double>(planned) * 1'000'000'000.0 /
+                  static_cast<double>(history_ready_elapsed_ns);
+    const std::uint64_t published_periodic_generations =
+        periodic_generation_cuts.load(std::memory_order_acquire);
+    const bool periodic_failed =
+        periodic_generation_failed.load(std::memory_order_acquire);
+    const bool generation_sequence_valid =
+        final_cut.published() &&
+        final_cut.factor_generation_enabled ==
+            factor_generation_enabled &&
+        (factor_generation_enabled
+             ? final_cut.factor_generation != nullptr
+             : final_cut.factor_generation == nullptr) &&
+        final_cut.store_generation != nullptr &&
+        final_cut.store_generation->watermark().generation ==
+            published_periodic_generations + 1U &&
+        (benchmark.generation_interval.count() == 0 ||
+         duration_ms < static_cast<std::uint64_t>(
+                           benchmark.generation_interval.count()) ||
+         published_periodic_generations != 0U);
     const bool certified_healthy =
         certified_service == nullptr ||
         (certified_idle &&
@@ -6409,12 +7378,15 @@ bool RunThroughputProfileBenchmark(
              certified_snapshot.enqueued_observations +
                  certified_snapshot.enqueued_applied_records);
     const bool complete_prefix =
-        !final.fatal && final.accepted_messages == planned &&
+        !final.fatal && !periodic_failed && generation_sequence_valid &&
+        invoked == planned && final.accepted_messages == planned &&
+        final.rejected_messages == 0U && final.post_cut_messages == 0U &&
         final.decoded_messages == planned &&
         final.processing_progress.applied_sequence == planned &&
         final.store.appended_records == planned &&
-        final.store.failed_appends == 0U && !service->failed() &&
-        certified_healthy &&
+        final.store.failed_appends == 0U &&
+        !final.store.coverage_lost && !service->failed() &&
+        history_validation.passed && certified_healthy &&
         ((benchmark.parallel_decoder_worker_count == 0U &&
           !final.parallel_decoder.enabled) ||
          (final.parallel_decoder.enabled &&
@@ -6459,15 +7431,37 @@ bool RunThroughputProfileBenchmark(
     std::ostringstream achieved_text;
     achieved_text << std::fixed << std::setprecision(3)
                   << achieved_offered_rps;
+    std::ostringstream history_ready_text;
+    history_ready_text << std::fixed << std::setprecision(3)
+                       << history_ready_rps;
     std::cout
         << "THROUGHPUT_RESULT target_rps=" << benchmark.target_rate
         << " duration_ms=" << duration_ms
+        << " scenario="
+        << StartupBenchmarkScenarioNameV1(benchmark.scenario)
+        << " server_state="
+        << (benchmark.scenario ==
+                    StartupBenchmarkScenarioV1::kFromOpen
+                ? "ACTIVE"
+                : "LIVE_PARTIAL")
+        << " coverage_from_open="
+        << (StartupBenchmarkCoverageFromOpenV1(benchmark.scenario)
+                ? 1
+                : 0)
+        << " online_recovery=0"
+        << " factor_generation_enabled="
+        << (factor_generation_enabled ? 1 : 0)
         << " workload=" << ThroughputWorkloadNameV1(benchmark.workload)
         << " sink=" << ThroughputSinkNameV1(benchmark.sink)
         << " instruments_per_market="
         << benchmark.instruments_per_market
         << " parallel_decoder_workers="
         << benchmark.parallel_decoder_worker_count
+        << " decoder_queue_capacity_per_source="
+        << benchmark.decoder_queue_capacity_per_source
+        << " store_queue_capacity_per_source_worker="
+        << benchmark.store_queue_capacity_per_source_worker
+        << " store_segment_kib=" << benchmark.segment_kib
         << " parallel_idle_inline="
         << (final.parallel_decoder.idle_inline_enabled ? 1 : 0)
         << " store_worker_count=" << benchmark.store_worker_count
@@ -6477,6 +7471,9 @@ bool RunThroughputProfileBenchmark(
         << " invoked_callbacks=" << invoked
         << " producer_elapsed_ns=" << producer_elapsed_ns
         << " achieved_offered_rps=" << achieved_text.str()
+        << " history_ready_elapsed_ns="
+        << history_ready_elapsed_ns
+        << " history_ready_rps=" << history_ready_text.str()
         << " target_met=" << (target_met ? 1 : 0)
         << " process_survived=1"
         << " fatal_during_offer=" << (fatal_during_offer ? 1 : 0)
@@ -6502,6 +7499,8 @@ bool RunThroughputProfileBenchmark(
         << " store_appended_before_drain="
         << before_drain.store.appended_records
         << " store_failed_appends=" << final.store.failed_appends
+        << " store_coverage_lost="
+        << (final.store.coverage_lost ? 1 : 0)
         << " decoder_depth_before_drain="
         << decoder_depth_before_drain
         << " decoder_high_water_max="
@@ -6559,12 +7558,73 @@ bool RunThroughputProfileBenchmark(
         << " tuple2_offered=" << offered_by_tuple[2U]
         << " tuple3_offered=" << offered_by_tuple[3U]
         << " tuple4_offered=" << offered_by_tuple[4U]
+        << " generation_interval_ms="
+        << benchmark.generation_interval.count()
+        << " periodic_generation_cuts="
+        << published_periodic_generations
+        << " periodic_generation_failed="
+        << (periodic_failed ? 1 : 0)
+        << " periodic_cut_error="
+        << periodic_cut_error.load(std::memory_order_acquire)
+        << " periodic_generation_error="
+        << periodic_generation_error.load(std::memory_order_acquire)
+        << " final_cut_published="
+        << (final_cut.published() ? 1 : 0)
+        << " final_cut_error="
+        << static_cast<std::uint32_t>(final_cut.error)
+        << " final_generation_error="
+        << static_cast<std::uint32_t>(final_cut.generation_error)
+        << " final_generation="
+        << (final_cut.store_generation == nullptr
+                ? 0U
+                : final_cut.store_generation->watermark().generation)
+        << " final_factor_generation_present="
+        << (final_cut.factor_generation != nullptr ? 1 : 0)
+        << " generation_sequence_valid="
+        << (generation_sequence_valid ? 1 : 0)
+        << " history_control_status="
+        << history_validation.history_control_status
+        << " history_endpoint_flags="
+        << history_validation.endpoint_flags
+        << " history_endpoint_valid="
+        << (history_validation.endpoint_valid ? 1 : 0)
+        << " history_generation_valid="
+        << (history_validation.generation_valid ? 1 : 0)
+        << " history_scan_cursor_opened="
+        << (history_validation.cursor_opened ? 1 : 0)
+        << " history_scan_explicit_eof="
+        << (history_validation.explicit_eof ? 1 : 0)
+        << " history_scan_records="
+        << history_validation.scanned_records
+        << " history_unique_ingress="
+        << history_validation.unique_ingress_sequences
+        << " history_duplicate_ingress="
+        << history_validation.duplicate_ingress_sequences
+        << " history_out_of_range_ingress="
+        << history_validation.out_of_range_ingress_sequences
+        << " history_invalid_source_slots="
+        << history_validation.invalid_source_slots
+        << " history_source0_records="
+        << history_validation.scanned_source_records[0U]
+        << " history_source1_records="
+        << history_validation.scanned_source_records[1U]
+        << " history_source2_records="
+        << history_validation.scanned_source_records[2U]
+        << " history_source3_records="
+        << history_validation.scanned_source_records[3U]
+        << " history_source_counts_valid="
+        << (history_validation.source_counts_valid ? 1 : 0)
+        << " history_integrity_validation_elapsed_ns="
+        << history_validation.scan_elapsed_ns
+        << " history_lossless="
+        << (history_validation.passed ? 1 : 0)
         << " last_decode_error="
         << static_cast<unsigned int>(final.last_decode_error)
         << " service_failed=" << (service->failed() ? 1 : 0)
         << " complete_prefix=" << (complete_prefix ? 1 : 0)
         << " stopped_clean=" << (stopped_clean ? 1 : 0)
-        << " drain_elapsed_ns=" << drain_elapsed_ns
+        << " final_drain_and_cut_elapsed_ns="
+        << final_drain_and_cut_elapsed_ns
         << " certified_idle=" << (certified_idle ? 1 : 0)
         << " certified_healthy=" << (certified_healthy ? 1 : 0)
         << " certified_enqueued_observations="
@@ -6580,7 +7640,7 @@ bool RunThroughputProfileBenchmark(
         << " certified_global_frozen="
         << (certified_snapshot.globally_frozen_resource ? 1 : 0)
         << '\n';
-    return true;
+    return target_met && complete_prefix && stopped_clean;
 }
 
 bool RunThroughputStabilityBenchmark(
@@ -6614,6 +7674,7 @@ bool RunThroughputStabilityBenchmark(
         << " store_queue_capacity_per_source_worker=" << kQueueCapacity
         << " store_worker_count=" << kStoreWorkerCount
         << " tick_ring_capacity=" << kTickRingCapacity
+        << " pacing=absolute_deadline_one_based_no_batch_wait"
         << " clock=CLOCK_MONOTONIC"
         << " affinity=" << CpuAffinityText() << '\n';
 
@@ -6729,7 +7790,8 @@ bool RunThroughputStabilityBenchmark(
     bool fatal_during_offer = false;
     for (std::uint64_t index = 0U; index < planned; ++index) {
         const std::uint64_t deadline_ns =
-            start_ns + index * 1'000'000'000ULL / target_rate;
+            start_ns +
+            (index + 1U) * 1'000'000'000ULL / target_rate;
         for (;;) {
             const std::uint64_t now_ns = MonotonicNowNs();
             if (now_ns == 0U || now_ns >= deadline_ns) {
@@ -6841,12 +7903,14 @@ bool RunThroughputStabilityBenchmark(
         << " complete_prefix=" << (complete_prefix ? 1 : 0)
         << " stopped_clean=" << (stopped_clean ? 1 : 0)
         << " drain_elapsed_ns=" << drain_elapsed_ns << '\n';
-    return true;
+    return target_met && complete_prefix && stopped_clean;
 }
 
 bool RunHistoryLatencyBenchmark(
     std::uint32_t parallel_decoder_worker_count,
-    bool callback_polars_only = false) {
+    bool callback_polars_only = false,
+    StartupBenchmarkScenarioV1 scenario =
+        StartupBenchmarkScenarioV1::kFromOpen) {
     constexpr std::size_t kShanghaiInstrumentCount = 3U;
     constexpr std::size_t kSnapshotFillCount = 11'997U;
     constexpr std::size_t kCapacity =
@@ -6867,9 +7931,22 @@ bool RunHistoryLatencyBenchmark(
     constexpr std::size_t kRawPolarsRepeats = 20U;
     constexpr std::size_t kPriceRepeats = 20U;
     constexpr std::size_t kAllColumnRepeats = 10U;
+    const bool factor_generation_enabled =
+        scenario == StartupBenchmarkScenarioV1::kFromOpen;
 
     std::cout
         << "HISTORY_ENV capacity=" << kCapacity
+        << " scenario=" << StartupBenchmarkScenarioNameV1(scenario)
+        << " server_state="
+        << (scenario == StartupBenchmarkScenarioV1::kFromOpen
+                ? "ACTIVE"
+                : "LIVE_PARTIAL")
+        << " coverage_from_open="
+        << (StartupBenchmarkCoverageFromOpenV1(scenario) ? 1 : 0)
+        << " online_recovery=0"
+        << " factor_generation_enabled="
+        << (factor_generation_enabled ? 1 : 0)
+        << " generation_visibility=forced_cut"
         << " bound_instruments=" << kBoundInstrumentCount
         << " snapshot_fill=" << kSnapshotFillCount
         << " worker_count=" << kStoreWorkerCount
@@ -6910,7 +7987,8 @@ bool RunHistoryLatencyBenchmark(
     service_config.session_epoch = 67U;
     service_config.trade_date = kTradeDate;
     service_config.daily_catalog = fixture.catalog;
-    service_config.coverage_from_open = true;
+    service_config.coverage_from_open =
+        StartupBenchmarkCoverageFromOpenV1(scenario);
     service_config.tick_ring_capacity = kTickRingCapacity;
     service_config.maximum_history_readers = 8U;
     service_config.maximum_history_page_records = 4'096U;
@@ -6935,7 +8013,9 @@ bool RunHistoryLatencyBenchmark(
                 service != nullptr && system_error == 0,
             "create history Wire V2 service") ||
         !Expect(
-            service->Start(&system_error) && system_error == 0,
+            StartStartupBenchmarkServiceV1(
+                service, scenario, &system_error) &&
+                system_error == 0,
             "start history Wire V2 service")) {
         if (service != nullptr) {
             service->StopControl();
@@ -6971,7 +8051,10 @@ bool RunHistoryLatencyBenchmark(
         2ULL * 1024ULL * 1024ULL * 1024ULL;
     pipeline_config.intraday_store.maximum_records_per_batch =
         kQueueCapacity;
-    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.intraday_store.coverage_from_open =
+        StartupBenchmarkCoverageFromOpenV1(scenario);
+    pipeline_config.factor_generation_enabled =
+        factor_generation_enabled;
     pipeline_config.applied_record_sink = timed_applied;
     pipeline_config.processing_progress_sink = service;
     pipeline_config.store_generation_sink = service;
@@ -7006,6 +8089,15 @@ bool RunHistoryLatencyBenchmark(
         service->StopControl();
         return false;
     }
+    const auto cut_matches_factor_contract =
+        [factor_generation_enabled](
+            const runtime::RealtimePipelineCutResultV1& cut) noexcept {
+            return cut.factor_generation_enabled ==
+                       factor_generation_enabled &&
+                   (factor_generation_enabled
+                        ? cut.factor_generation != nullptr
+                        : cut.factor_generation == nullptr);
+        };
     mdl::MessageHandlerBase* const handler = sdk_state->handler();
     if (!Expect(
             handler != nullptr,
@@ -7330,7 +8422,8 @@ bool RunHistoryLatencyBenchmark(
         pipeline->CutAndPublishGeneration(std::chrono::seconds(60));
     if (!Expect(
             polars_baseline_cut.published() &&
-                polars_baseline_cut.store_generation != nullptr,
+                polars_baseline_cut.store_generation != nullptr &&
+                cut_matches_factor_contract(polars_baseline_cut),
             "publish empty raw-Polars baseline generation")) {
         return false;
     }
@@ -7376,6 +8469,10 @@ bool RunHistoryLatencyBenchmark(
         };
 
     PolarsIngressBoundary raw_polars_boundary{};
+    const std::uint64_t polars_native_sequence_base =
+        scenario == StartupBenchmarkScenarioV1::kFromOpen
+            ? 0U
+            : 10'000'000U;
     for (std::size_t index = 0U;
          index < kRawPolarsRecords;
          ++index) {
@@ -7383,7 +8480,8 @@ bool RunHistoryLatencyBenchmark(
             sdk::kProductionMessageKeysV1[1U],
             PipelineShanghaiTickBody(
                 "600003",
-                static_cast<std::uint64_t>(index + 1U),
+                polars_native_sequence_base +
+                    static_cast<std::uint64_t>(index + 1U),
                 1U));
         const std::uint64_t sequence = next_sequence;
         const std::uint64_t call_start = MonotonicNowNs();
@@ -7411,18 +8509,40 @@ bool RunHistoryLatencyBenchmark(
         pipeline->CutAndPublishGeneration(std::chrono::seconds(60));
     if (!Expect(
             raw_polars_cut.published() &&
-                raw_polars_cut.store_generation != nullptr,
+                raw_polars_cut.store_generation != nullptr &&
+                cut_matches_factor_contract(raw_polars_cut),
             "publish raw Polars batch generation")) {
         return false;
     }
     const std::uint64_t raw_polars_generation =
         raw_polars_cut.store_generation->watermark().generation;
+    ipc::RealtimeHistoryOpenResponseV2 raw_history_response{};
+    const std::uint32_t expected_generation_flags =
+        ipc::kRealtimeGenerationRecordCoverageCompleteV2 |
+        (StartupBenchmarkCoverageFromOpenV1(scenario)
+             ? ipc::kRealtimeGenerationCoverageFromOpenV2
+             : 0U);
+    if (!Expect(
+            RequestHistoryOpen(
+                socket_path,
+                raw_polars_generation,
+                &raw_history_response) &&
+                raw_history_response.status ==
+                    static_cast<std::uint16_t>(
+                        ipc::RealtimeHistoryControlStatusV2::kOk) &&
+                raw_history_response.generation.endpoint.flags ==
+                    expected_generation_flags,
+            "raw Polars generation preserves startup coverage flags")) {
+        return false;
+    }
     if (!run_python_lines(
             "RAW_POLARS_UPDATE " +
                 std::to_string(kRawBatchInstrument) + " " +
                 std::to_string(raw_polars_generation) + " " +
                 std::to_string(kRawPolarsRepeats) + " " +
-                std::to_string(kRawPolarsRecords),
+                std::to_string(kRawPolarsRecords) + " " +
+                std::to_string(raw_polars_boundary.first_sequence) + " " +
+                std::to_string(raw_polars_boundary.last_sequence),
             "RAW_POLARS_SAMPLE ",
             kRawPolarsRepeats,
             &polars_lines)) {
@@ -7463,9 +8583,14 @@ bool RunHistoryLatencyBenchmark(
     }
     std::cout
         << "POLARS_BOUNDARY workload=raw_batch_4096_all_columns"
+        << " scenario=" << StartupBenchmarkScenarioNameV1(scenario)
         << " generation=" << raw_polars_generation
         << " records=" << kRawPolarsRecords
         << " columns=55"
+        << " first_ingress_sequence="
+        << raw_polars_boundary.first_sequence
+        << " last_ingress_sequence="
+        << raw_polars_boundary.last_sequence
         << " first_caller_before_callback_ns="
         << raw_polars_boundary.first_call_start_ns
         << " last_caller_before_callback_ns="
@@ -7483,10 +8608,23 @@ bool RunHistoryLatencyBenchmark(
 
     PolarsIngressBoundary derived_boundary{};
     const std::array<std::vector<std::byte>, 4U> derived_bodies{{
-        PipelineShanghaiStatusBody("600002", 4'096U, "TRADE"),
-        PipelineShanghaiTickBody("600002", 4'097U, 101U),
-        PipelineShanghaiAddBody("600002", 4'098U, 50U, 101U),
-        PipelineShanghaiTickBody("600002", 4'099U, 50U),
+        PipelineShanghaiStatusBody(
+            "600002",
+            polars_native_sequence_base + 4'096U,
+            "TRADE"),
+        PipelineShanghaiTickBody(
+            "600002",
+            polars_native_sequence_base + 4'097U,
+            101U),
+        PipelineShanghaiAddBody(
+            "600002",
+            polars_native_sequence_base + 4'098U,
+            50U,
+            101U),
+        PipelineShanghaiTickBody(
+            "600002",
+            polars_native_sequence_base + 4'099U,
+            50U),
     }};
     for (std::size_t index = 0U;
          index < derived_bodies.size();
@@ -7520,7 +8658,8 @@ bool RunHistoryLatencyBenchmark(
         pipeline->CutAndPublishGeneration(std::chrono::seconds(60));
     if (!Expect(
             derived_polars_cut.published() &&
-                derived_polars_cut.store_generation != nullptr,
+                derived_polars_cut.store_generation != nullptr &&
+                cut_matches_factor_contract(derived_polars_cut),
             "publish derived Polars lifecycle generation")) {
         return false;
     }
@@ -7572,6 +8711,7 @@ bool RunHistoryLatencyBenchmark(
     }
     std::cout
         << "POLARS_BOUNDARY workload=derived_complete_order_lifecycle"
+        << " scenario=" << StartupBenchmarkScenarioNameV1(scenario)
         << " generation=" << derived_polars_generation
         << " raw_records=4 derived_events=6"
         << " order_sequence_events=5 order_id=11001"
@@ -7625,6 +8765,15 @@ bool RunHistoryLatencyBenchmark(
         std::cout
             << "CALLBACK_POLARS_TOPOLOGY enabled="
             << (final.parallel_decoder.enabled ? 1 : 0)
+            << " scenario="
+            << StartupBenchmarkScenarioNameV1(scenario)
+            << " coverage_from_open="
+            << (StartupBenchmarkCoverageFromOpenV1(scenario) ? 1 : 0)
+            << " online_recovery=0"
+            << " factor_generation_enabled="
+            << (factor_generation_enabled ? 1 : 0)
+            << " final_factor_generation_present="
+            << (derived_polars_cut.factor_generation != nullptr ? 1 : 0)
             << " configured_workers="
             << parallel_decoder_worker_count
             << " reported_workers="
@@ -7644,8 +8793,19 @@ bool RunHistoryLatencyBenchmark(
         const bool complete =
             !pipeline->fatal() && !final.fatal &&
             final.accepted_messages == next_sequence - 1U &&
+            final.rejected_messages == 0U &&
+            final.post_cut_messages == 0U &&
+            final.decoded_messages == next_sequence - 1U &&
             final.processing_progress.applied_sequence ==
                 next_sequence - 1U &&
+            final.store.appended_records == next_sequence - 1U &&
+            final.store.failed_appends == 0U &&
+            !final.store.coverage_lost &&
+            derived_polars_cut.store_generation != nullptr &&
+            derived_polars_cut.store_generation->record_count() ==
+                next_sequence - 1U &&
+            derived_polars_cut.store_generation->coverage_from_open() ==
+                StartupBenchmarkCoverageFromOpenV1(scenario) &&
             !service->failed() && !history_stages.failed();
         service->MarkDraining();
         const bool stopped =
@@ -7673,7 +8833,8 @@ bool RunHistoryLatencyBenchmark(
             const auto cut_return = MonotonicNowNs();
             if (!Expect(
                     cut.published() &&
-                        cut.store_generation != nullptr,
+                        cut.store_generation != nullptr &&
+                        cut_matches_factor_contract(cut),
                     "publish history generation for " +
                         std::string(workload))) {
                 return false;
@@ -7914,7 +9075,8 @@ bool RunHistoryLatencyBenchmark(
             const auto cut = pipeline->CutAndPublishGeneration(
                 std::chrono::seconds(60));
             if (!cut.published() ||
-                cut.store_generation == nullptr) {
+                cut.store_generation == nullptr ||
+                !cut_matches_factor_contract(cut)) {
                 const auto state = pipeline->Snapshot();
                 std::cerr
                     << "delta cut failed target_tick_count="
@@ -8282,7 +9444,8 @@ bool RunHistoryLatencyBenchmark(
         std::chrono::seconds(60));
     if (!Expect(
             mixed_cut.published() &&
-                mixed_cut.store_generation != nullptr,
+                mixed_cut.store_generation != nullptr &&
+                cut_matches_factor_contract(mixed_cut),
             "publish mixed history generation")) {
         return false;
     }
@@ -8737,7 +9900,24 @@ int main(int argc, char** argv) {
         *output = value;
         return true;
     };
-    if (argc == 13 &&
+    auto parse_scenario = [](
+                              std::string_view text,
+                              StartupBenchmarkScenarioV1* output) {
+        if (output == nullptr) {
+            return false;
+        }
+        if (text == "from_open") {
+            *output = StartupBenchmarkScenarioV1::kFromOpen;
+            return true;
+        }
+        if (text == "live_partial_no_recovery") {
+            *output =
+                StartupBenchmarkScenarioV1::kLivePartialNoRecovery;
+            return true;
+        }
+        return false;
+    };
+    if ((argc == 13 || argc == 14 || argc == 15) &&
         std::string_view(argv[1]) ==
             "--throughput-profile-benchmark") {
         std::array<std::uint64_t, 8U> numeric{};
@@ -8822,9 +10002,33 @@ int main(int argc, char** argv) {
             static_cast<std::uint32_t>(segment_kib);
         config.workload = workload;
         config.sink = sink;
+        if (argc >= 14 &&
+            !parse_scenario(argv[13], &config.scenario)) {
+            std::cerr << "invalid throughput startup scenario\n";
+            return 2;
+        }
+        if (argc == 15) {
+            std::uint64_t generation_interval_ms = 0U;
+            if (!parse_unsigned(
+                    argv[14], &generation_interval_ms) ||
+                generation_interval_ms == 0U ||
+                generation_interval_ms > 60'000U ||
+                generation_interval_ms >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::chrono::
+                                milliseconds::rep>::max())) {
+                std::cerr
+                    << "invalid throughput generation interval\n";
+                return 2;
+            }
+            config.generation_interval =
+                std::chrono::milliseconds(
+                    static_cast<std::chrono::milliseconds::rep>(
+                        generation_interval_ms));
+        }
         return RunThroughputProfileBenchmark(config) ? 0 : 1;
     }
-    if (argc == 3 &&
+    if ((argc == 3 || argc == 4) &&
         std::string_view(argv[1]) ==
             "--history-latency-benchmark-workers") {
         std::uint64_t worker_count = 0U;
@@ -8834,12 +10038,20 @@ int main(int argc, char** argv) {
             std::cerr << "invalid parallel decoder worker count\n";
             return 2;
         }
+        StartupBenchmarkScenarioV1 scenario =
+            StartupBenchmarkScenarioV1::kFromOpen;
+        if (argc == 4 && !parse_scenario(argv[3], &scenario)) {
+            std::cerr << "invalid history startup scenario\n";
+            return 2;
+        }
         return RunHistoryLatencyBenchmark(
-                   static_cast<std::uint32_t>(worker_count))
+                   static_cast<std::uint32_t>(worker_count),
+                   false,
+                   scenario)
                    ? 0
                    : 1;
     }
-    if (argc == 3 &&
+    if ((argc == 3 || argc == 4) &&
         std::string_view(argv[1]) ==
             "--callback-polars-latency-benchmark-workers") {
         std::uint64_t worker_count = 0U;
@@ -8849,8 +10061,17 @@ int main(int argc, char** argv) {
             std::cerr << "invalid parallel decoder worker count\n";
             return 2;
         }
+        StartupBenchmarkScenarioV1 scenario =
+            StartupBenchmarkScenarioV1::kFromOpen;
+        if (argc == 4 && !parse_scenario(argv[3], &scenario)) {
+            std::cerr
+                << "invalid callback-to-Polars startup scenario\n";
+            return 2;
+        }
         return RunHistoryLatencyBenchmark(
-                   static_cast<std::uint32_t>(worker_count), true)
+                   static_cast<std::uint32_t>(worker_count),
+                   true,
+                   scenario)
                    ? 0
                    : 1;
     }
@@ -8907,18 +10128,24 @@ int main(int argc, char** argv) {
             << " [--latency-benchmark"
                "|--latency-benchmark-stages"
                "|--history-latency-benchmark"
-               "|--history-latency-benchmark-workers WORKERS"
-               "|--callback-polars-latency-benchmark-workers WORKERS"
+               "|--history-latency-benchmark-workers WORKERS "
+               "[SCENARIO]"
+               "|--callback-polars-latency-benchmark-workers "
+               "WORKERS [SCENARIO]"
                "|--throughput-stability-benchmark RATE DURATION_MS"
                "|--throughput-profile-benchmark RATE DURATION_MS "
                "INSTRUMENTS_PER_MARKET STORE_WORKERS "
                "PARALLEL_DECODER_WORKERS IDLE_INLINE "
                "DECODER_QUEUE STORE_QUEUE "
-               "SEGMENT_KIB WORKLOAD SINK]\n";
+               "SEGMENT_KIB WORKLOAD SINK [SCENARIO "
+               "GENERATION_INTERVAL_MS]]\n"
+               "  SCENARIO: from_open|live_partial_no_recovery\n";
         return 2;
     }
     if (!TestMalformedHistoryResponseClosesReceivedDescriptor() ||
         !TestLivePartialSemantics() ||
+        !TestStandaloneLivePartialProcessStartHistory() ||
+        !TestPromotionExposureGate() ||
         !TestServiceEndToEnd() ||
         !TestProcessingAdmissionPublishesWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||

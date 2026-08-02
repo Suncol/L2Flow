@@ -52,7 +52,13 @@ bool CertifiedOrderEventHeaderCanonicalV1(
         header.header_bytes != kCertifiedOrderEventHeaderBytesV1 ||
         header.endian_marker !=
             kCertifiedOrderEventEndianMarkerV1 ||
-        header.flags != 0U || !AnyNonzero(header.run_id) ||
+        (header.flags & ~kCertifiedOrderEventKnownCoverageFlagsV1) != 0U ||
+        (header.flags & kCertifiedOrderEventCoverageFromOpenV1) == 0U ||
+        ((header.flags &
+              kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U &&
+         (header.flags &
+              kCertifiedOrderEventCoverageFromOpenV1) == 0U) ||
+        !AnyNonzero(header.run_id) ||
         header.session_epoch == 0U ||
         !ValidTradeDate(header.trade_date) ||
         header.reserved_identity != 0U ||

@@ -780,6 +780,61 @@ void CheckStoreGenerationSinkOrderingAndFailure(
     pipeline->StopAndDrain();
 }
 
+void CheckStoreOnlyGenerationSkipsFactor(TestContext* test) {
+    PipelineCatalogFixture fixture;
+    test->Expect(
+        MakeCatalogFixture(21U, &fixture),
+        "create store-only generation daily catalog");
+    if (fixture.runtime_state == nullptr) {
+        return;
+    }
+
+    const auto projection = std::make_shared<ProjectionProbe>();
+    const auto order = std::make_shared<GenerationPublicationOrder>();
+    const auto calculator =
+        std::make_shared<OrderedFactorCalculator>(order);
+    runtime::RealtimePipelineConfigV1 config =
+        MakeConfig(fixture, projection);
+    config.factor_calculator = calculator;
+    config.factor_generation_enabled = false;
+
+    std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+    std::string detail;
+    test->Expect(
+        runtime::RealtimePipelineV1::Create(
+            config, &pipeline, &detail) ==
+                runtime::RealtimePipelineCreateErrorV1::kNone &&
+            pipeline != nullptr,
+        "create store-only generation pipeline: " + detail);
+    if (pipeline == nullptr) {
+        return;
+    }
+
+    const runtime::RealtimePipelineCutResultV1 periodic =
+        pipeline->CutAndPublishGeneration(3s);
+    test->Expect(
+        periodic.published() &&
+            !periodic.factor_generation_enabled &&
+            periodic.store_generation != nullptr &&
+            periodic.factor_generation == nullptr &&
+            periodic.factor_result.generation == nullptr &&
+            pipeline->AcquireLatestFactorGeneration() == nullptr &&
+            order->factor_calls() == 0U,
+        "store-only periodic generation publishes without Factor work");
+
+    const runtime::RealtimePipelineCutResultV1 terminal =
+        pipeline->StopAndPublishFinalGeneration(3s);
+    test->Expect(
+        terminal.published() &&
+            !terminal.factor_generation_enabled &&
+            terminal.store_generation != nullptr &&
+            terminal.factor_generation == nullptr &&
+            terminal.factor_result.generation == nullptr &&
+            pipeline->AcquireLatestFactorGeneration() == nullptr &&
+            order->factor_calls() == 0U && !pipeline->fatal(),
+        "store-only terminal generation publishes without Factor work");
+}
+
 template <typename Predicate>
 [[nodiscard]] bool WaitUntil(Predicate predicate) {
     const auto deadline =
@@ -3350,6 +3405,7 @@ int main() {
     CheckOpeningBurstCapacityHeadroom(&test);
     CheckExternalIngressCapacityRetryOwnershipAndStop(&test);
     CheckStoreGenerationSinkOrderingAndFailure(&test);
+    CheckStoreOnlyGenerationSkipsFactor(&test);
     CheckFastDecoderAcceptedPublicationAndIdleBoundary(&test);
     CheckParallelDecodeFarmOrderedFenceAndDrain(&test);
     CheckParallelDecodeFarmFourSourceWorkerOffsetMapping(&test);

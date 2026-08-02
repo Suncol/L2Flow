@@ -67,6 +67,10 @@ l2flow_order_event_delta_session_v1 CSession(
     result.trade_date = source.trade_date;
     result.ring_capacity = source.ring_capacity;
     result.total_mapping_bytes = source.total_mapping_bytes;
+    result.temporal_coverage = static_cast<std::uint32_t>(
+        source.temporal_coverage);
+    result.stream_quality = static_cast<std::uint32_t>(
+        source.stream_quality);
     return result;
 }
 
@@ -146,6 +150,14 @@ void TestAbiAndArguments(bool* ok) {
                 L2FLOW_ORDER_EVENT_DELTA_INVALID_ARGUMENT_V1 &&
             reader == nullptr,
         "C open rejects nonzero session reserve");
+    session = CSession(producer->session());
+    session.temporal_coverage = 0U;
+    *ok &= Expect(
+        l2flow_order_event_delta_reader_open_v1(
+            descriptor, &session, &reader, nullptr) ==
+                L2FLOW_ORDER_EVENT_DELTA_INVALID_ARGUMENT_V1 &&
+            reader == nullptr,
+        "C open rejects unknown temporal coverage");
     *ok &= Expect(
         ::fcntl(descriptor, F_GETFD) >= 0,
         "C open never consumes caller descriptor");
@@ -173,7 +185,11 @@ void TestReadAndOwnership(bool* ok) {
                 L2FLOW_ORDER_EVENT_DELTA_OK_V1 &&
             returned_session.session_epoch ==
                 producer->session().session_epoch &&
-            returned_session.ring_capacity == 8U,
+            returned_session.ring_capacity == 8U &&
+            returned_session.temporal_coverage ==
+                L2FLOW_ORDER_EVENT_DELTA_FROM_MARKET_OPEN_V1 &&
+            returned_session.stream_quality ==
+                L2FLOW_ORDER_EVENT_DELTA_LOCAL_TICK_STREAM_CONTIGUOUS_V1,
         "C reader returns exact session");
 
     // Open made a private duplicate; close the caller's fd before reading.

@@ -4,12 +4,12 @@
 
 | 项目 | 当前基线 |
 | --- | --- |
-| 分支 | `perf/parallel-decoder-500k-v1` |
-| 基线提交 | `3bc4f4108786e6df7e37f585fb294c258a02f367`（本文还覆盖当前未提交工作树） |
-| 本次对比 | 同一提交的原始生产源码与当前并行解码工作树 |
+| 分支 | `perf/online-recovery-fast-isolation` |
+| HEAD | `6851ce6ec992b6da2f18b75de345ca3cc211b643`（本文还覆盖当前未提交工作树） |
+| 文档范围 | 当前生产数据面、Wire V2 查询面和 online CSV recovery 生命周期 |
 | 生产入口 | `apps/mdl_production_main.cpp` |
 | 核心编排 | `runtime::RealtimePipelineV1` |
-| 文档更新日期 | 2026-08-01 |
+| 文档更新日期 | 2026-08-02 |
 
 ---
 
@@ -29,14 +29,14 @@
 
 当前实现不是一条单线程流水线，而是三个互相咬合、但一致性语义不同的执行平面：
 
-1. **逐条消息热路径**：串行 SDK 回调分配全局顺序并复制消息，四个 source owner 并行处理；启用 production-default adaptive topology 且某次 Pop 已读取的 source-local ring 剩余深度达到门槛时，stateless parse 再分发到 `Wd` 个 worker，随后按 source 顺序 finalize。该判断复用 Pop 本来就需要的 tail acquire，不增加第二次跨核 depth 读取；它是逐次 Pop 的瞬时观测，不是持续时间判定。完整 event 再按 `instrument_id % worker_count` 路由到唯一 Store worker；Store worker 严格按
+1. **逐条消息热路径**：串行 SDK 回调分配全局顺序并复制消息，四个 source owner 并行处理；显式启用 adaptive topology 且某次 Pop 已读取的 source-local ring 剩余深度达到门槛时，stateless parse 再分发到 `Wd` 个 worker，随后按 source 顺序 finalize。该判断复用 Pop 本来就需要的 tail acquire，不增加第二次跨核 depth 读取；它是逐次 Pop 的瞬时观测，不是持续时间判定。完整 event 再按 `instrument_id % worker_count` 路由到唯一 Store worker；Store worker 严格按
    `Store → KLine → handoff 回收 → 进程内 latest → 外部 applied sink/IPC`
    的顺序提交一条“已应用记录”。
-2. **代际发布冷路径**：控制线程冻结一个排他 watermark，把 marker 注入四个 decoder；marker 在 `source × worker` 队列中变为 fence。所有 worker 到达同一屏障后，只复制 Store 端点和 KLine 快照，由 builder 构造不可变 generation，随后发布 Store、KLine 和 Factor。
+2. **代际发布冷路径**：控制线程冻结一个排他 watermark，把 marker 注入四个 decoder；marker 在 `source × worker` 队列中变为 fence。所有 worker 到达同一屏障后，只复制 Store 端点和 KLine 快照，由 builder 构造不可变 generation，随后发布 Store、KLine 和配置启用时的 Factor。
 3. **跨进程读取平面**：IPC 服务同时提供四种不同读模型：
    - per-instrument latest：低延迟当前值，逐行一致；
    - bounded mixed-tick ring：全市场 tick 连续流，过慢会显式 overrun；
-   - complete-history V1：固定一次 Store generation，读取某标的的 snapshot 与 tick 全历史；
+   - complete-history V2：固定一次 Store generation，读取某标的的 snapshot 与 tick 全历史；
    - instrument tick-delta V2：一个 session 固定同一目标 generation，按 origin 或已验证 checkpoint 读取多个标的的有限 tick 增量。只有读到显式 EOF 后，目标 checkpoint 才可提交。
 
 三个平面共享同一套顺序号和 Registry 身份；热路径/generation 的完整性失败
@@ -47,7 +47,9 @@
 - generation 路径追求一个完整、可验证、可长期持有的一致前缀；
 - history/delta 读取只消费已经发布的不可变 Store generation，不回读正在追加的 mutable Store；
 - live latest 是“每个标的、每种类别最新已应用记录”，不是全市场原子快照；
-- WAL 是 best-effort 旁路，不参与实时正确性；
+- session-local live journal 只存在于 online CSV recovery；每个受支持 callback
+  必须先成功 capture，随后才可进入 preview admission，capture 失败会使
+  Pipeline/session fail closed。普通 from-open 与 standalone partial 不创建它；
 - IPC 启用后属于生产输出的一部分：逐条投影、Store/KLine generation 发布或控制面健康失败都会让进程 fail closed；
 - `record_coverage_complete`、`coverage_from_open`、`field_complete` 是三件不同的事，不能互相替代。
 
@@ -69,6 +71,8 @@ flowchart TB
     subgraph SDKSIDE["SDK 串行回调边界"]
         SDK["厂商 SDK DSO<br/>IOManager + Subscriber<br/>multithread_callback=false"]
         CB["OnMessage<br/>active callback 计数"]
+        CAPTURE{"online capture configured<br/>且为受支持 recovery tuple?"}
+        JOURNAL["session-local live journal<br/>独立 copy + 有界异步持久化"]
         ADM["admission_mutex<br/>分类、时钟、交易日、顺序号候选"]
         COPY["OwnedIngress Pool<br/>复制 head + body"]
     end
@@ -104,12 +108,11 @@ flowchart TB
         SINK["RealtimeAppliedRecordSink"]
     end
 
-    subgraph OPTIONAL["旁路与跨进程发布"]
-        WAL["可选 WAL writer<br/>best-effort 独立队列"]
+    subgraph OPTIONAL["跨进程发布"]
         IPC["RealtimeSharedService<br/>只读 memfd + UDS 控制面"]
         RING["全局 mixed-tick 有界环"]
         LATESTIPC["per-instrument latest<br/>snapshot / tick"]
-        HISTV1["complete history V1<br/>单 cursor 固定 Store generation"]
+        HISTV2["complete history V2<br/>单 cursor 固定 Store generation"]
         DELTAV2["instrument tick delta V2<br/>单 session 固定目标 generation"]
         PY["C reader / Python Client<br/>NumPy / Arrow / Polars"]
         ROLL["checkpoint-bound rolling<br/>shadow → EOF → atomic commit"]
@@ -120,17 +123,20 @@ flowchart TB
         SLICE["Worker Store 端点<br/>+ KLine snapshot"]
         STOREGEN["Store Generation N"]
         KGEN["KLine Generation N<br/>持有同一个 Store N"]
-        FACTOR["Factor Generation N<br/>持有同一个 Store N"]
+        FACTOR["可选 Factor Generation N<br/>持有同一个 Store N"]
     end
 
     APP --> SDK
-    SDK --> CB --> ADM --> COPY
+    SDK --> CB --> CAPTURE
+    CAPTURE -->|否| ADM
+    CAPTURE -->|是| JOURNAL
+    JOURNAL -->|Capture 成功| ADM
+    JOURNAL -. "失败：session fatal" .-> STOP
+    ADM --> COPY
     COPY --> DQ0 --> DEC0
     COPY --> DQ1 --> DEC1
     COPY --> DQ2 --> DEC2
     COPY --> DQ3 --> DEC3
-    COPY -. "额外 intrusive ref" .-> WAL
-
     DEC0 -->|inline| ROUTE
     DEC1 -->|inline| ROUTE
     DEC2 -->|inline| ROUTE
@@ -166,9 +172,9 @@ flowchart TB
     STOREGEN --> FACTOR
     STOREGEN -. "应用层按代发布" .-> IPC
     KGEN -. "偶/奇 generation 完整表切换" .-> IPC
-    IPC -. "固定 generation + SCM_RIGHTS 页 fd" .-> HISTV1
+    IPC -. "固定 generation + SCM_RIGHTS 页 fd" .-> HISTV2
     IPC -. "固定目标 generation + checkpoint" .-> DELTAV2
-    HISTV1 -.-> PY
+    HISTV2 -.-> PY
     DELTAV2 -. "native 全页校验后复制" .-> PY
     PY --> ROLL
     STOREGEN -. "一致只读" .-> APP
@@ -191,7 +197,7 @@ apps
   │     └── factor
   └── ipc
         ├── latest/ring wire projection
-        ├── Store complete-history V1 wire
+        ├── Store complete-history V2 wire
         ├── generation-bound instrument tick-delta V2 wire
         ├── shared service + bounded history-reader workers
         └── native validator / Python reader / checkpoint / rolling
@@ -210,16 +216,26 @@ Store generation 则由生产应用在每次 Pipeline cut 成功后显式传给 
 
 `--intraday-store-from-open`、`--intraday-recovery-csv-dir` 与
 `--intraday-live-partial` 的控制面激活点不同：常规 from-open 模式在创建
-Pipeline 前已经启动 FAST 控制线程；CSV 恢复只使用 online 路径，先启动
-独立 `LIVE_PARTIAL` preview，再由唯一 SDK owner 把 callback 同步 capture 到
-live journal 并推进 preview。SDK-less shadow 从 CSV 和 durable journal 重建
+Pipeline 前已经启动 FAST 控制线程；CSV 恢复只使用 online 路径，先创建
+`LIVE_PARTIAL` preview mapping 但保持 `INITIALIZING`，再由唯一 SDK owner 把
+callback 同步 capture 到 live journal 并推进 preview。recovered mapping、
+CERTIFIED worker、SDK-less shadow、handoff 固定容量和已 parked 的 recovery
+thread 都就绪且 preview backlog 低于启动高水位后，才对外切到
+`LIVE_PARTIAL` 并释放 recovery thread。shadow 从 CSV 和 durable journal 重建
 完整状态；recovered FAST 在 shadow generation 与可选 CERTIFIED prefix barrier
 完成后才进入 ACTIVE。详见
 [`csv-startup-recovery-v1.md`](csv-startup-recovery-v1.md)。
 
 盘中明确不恢复时，partial 模式在连接 SDK 前以 `LIVE_PARTIAL` 启动控制面，
-只允许 latest 查询。它不创建 journal/shadow，也不宣称
-`coverage_from_open`，History/delta/KLine/CERTIFIED 均不可用。
+允许 latest 查询，并按既有 generation interval 发布不可变 Store generation；
+首次 generation 后可查询从本进程启动点到该 cut 的单标的完整 History 和 tick
+generation delta。它不创建 journal/shadow，也不宣称 `coverage_from_open`；
+KLine/CERTIFIED 仍不可用。router 默认在 SDK connect 前启动并等待独立的
+process-start Event sidecar READY；其本地 tick 流完整，但不声明启动前数据或
+native gap 已回补。router 低频检查该 sidecar 的 control、heartbeat 和消费
+进度；受管进程还绑定父进程死亡信号并使用有界回收。CSV online recovery 的
+partial preview 使用独立的 latest-only 启动策略，即使内部存在 Store
+generation 也不会开放 History/delta。
 
 ```mermaid
 sequenceDiagram
@@ -245,20 +261,33 @@ sequenceDiagram
         Live->>Sdk: 最后创建并 Connect
         Note over Live,Sdk: callback 直接进入 admission/decoder/History
     else CSV online recovery
-        Main->>Journal: Create empty session-local WAL
-        Main->>Preview: Create 并 StartLivePartial
+        Main->>Journal: Create empty session-local live journal
+        Main->>Preview: Create，保持 INITIALIZING
         Main->>Live: Create preview Pipeline(capture=Journal)
         Live->>Sdk: 最后创建并 Connect
         Note over Live,Journal: 每个受支持 callback 先 copy/reserve，再进入 preview
         Main->>Recovered: Create，控制面保持不可查询
         Main->>Certified: 可选 Create + StartWorker
         Main->>Shadow: Create(sdk=false, external ingress=true)
-        Main->>Shadow: CSV replay + durable journal prefix
-        Shadow-->>Main: 固定 promotion frontier 已 accepted
-        Main->>Shadow: CutAndPublishGeneration
-        Main->>Certified: 可选 prefix barrier + StartControl
-        Main->>Recovered: Start FAST
-        Main->>Recovered: 可选 MarkCertifiedPrefixValid
+        Main->>Shadow: Create parked recovery thread
+        Main->>Main: 等待 preview backlog 低于启动高水位并复核全组件健康
+        Main->>Preview: StartLivePartial
+        Main->>Shadow: release recovery thread
+        Main->>Shadow: CSV replay + durable journal 初始候选 B0
+        Main->>Shadow: 等待 B0 对应 shadow prefix applied
+        Main->>Certified: 可重复 FIFO probe（无 coverage 副作用）
+        loop native/Event prefix 尚不完整
+            Main->>Shadow: 严格消费下一条 durable journal record
+            Main->>Shadow: 等待 candidate shadow prefix applied
+            Main->>Certified: 重做 FIFO probe
+        end
+        Shadow-->>Main: 冻结最早完整 promotion frontier P
+        Main->>Shadow: 一次 CutAndPublishGeneration
+        Main->>Certified: 可选最终 one-shot prefix commit
+        Main->>Recovered: 可选准备 certified flag（仍 INITIALIZING）
+        Main->>Certified: 可选 StartControl（共享 gate=false）
+        Main->>Recovered: Start FAST（共享 gate=false）
+        Main->>Main: 最终健康复核 + timestamp + gate=true
         Note over Main,Recovered: recovery/promotion 在后台线程；主线程并行检查健康状态
         Note over Journal,Shadow: promotion 后继续消费 journal tail
     end
@@ -273,28 +302,37 @@ sequenceDiagram
 3. 生成本次进程唯一的 `run_id`；online recovery 另外生成独立 preview
    `run_id`，两个 socket/cursor 不能跨 run 复用。
 4. 常规 from-open 模式先建立并启动 FAST 控制面，再创建唯一的 SDK-owner
-   Pipeline。online recovery 则先创建空 live journal 和 `LIVE_PARTIAL` preview
-   控制面，再创建带 capture sink 的 SDK-owner preview Pipeline；这保证 SDK
-   Connect 后的受支持 callback 先进入 journal，再推进 partial preview。
+   Pipeline。online recovery 则先创建空 live journal 和尚未对外启动的
+   `LIVE_PARTIAL` preview mapping，再创建带 capture sink 的 SDK-owner preview
+   Pipeline；这保证 SDK Connect 后的受支持 callback 先进入 journal，再推进
+   partial preview，同时允许 `INITIALIZING` mapping 保存已 applied 的 latest 与
+   processing progress。
 5. online recovery 随后创建尚不可查询的 recovered IPC、可选 CERTIFIED
-   worker，以及 `sdk=false`、`external_ingress_enabled=true` 的 shadow Pipeline。
-   CSV 和 durable journal record 都只进入 shadow；preview 与 shadow 不共享
-   Store、runtime state 或 `run_id`。
+   worker，以及 `sdk=false`、`external_ingress_enabled=true` 的 shadow Pipeline；
+   handoff 会在此时预留 overlap hash/heap，recovery thread 也先创建并停在
+   start/cancel latch。固定冷资源完成、全组件健康且 preview backlog 低于
+   64 条后，才启动 preview control 并释放 bulk recovery。CSV 和 durable
+   journal record 都只进入 shadow；preview 与 shadow 不共享 Store、runtime
+   state、mapping 或 `run_id`。
 6. 每个 Pipeline 依次创建：
    - 有界 `OwnedIngressMessagePoolV1`；
    - `RealtimeHistoryV1`，内部含 Store、latest、KLine、worker 与 builder；
-   - Factor engine；
+   - 配置启用时才创建 Factor engine；standalone partial 显式禁用；
    - 四个 source owner 和四个 decoder queue；`Wd=0` 时它们执行完整
      decode。`Wd>0` 只预分配有界 issue/completion/task-lease 状态，parse
      workers 与四个 ordered committers 在首次 source-local farm activation
      时才 lazy-start；
    - 仅 SDK-owner Pipeline 最后加载并连接 SDK；shadow 创建后直接接受外部
      owned message 注入。
-7. online coordinator 固定 CSV/journal handoff 与已接受的 promotion frontier；
-   随后的 `CutAndPublishGeneration` 等待该 shadow prefix 全部 applied，并发布
-   首个 Store/KLine/Factor generation。可选 CERTIFIED 先完成 FIFO prefix
-   barrier 并启动 control，最后才启动 recovered FAST；promotion 后同一
-   coordinator 继续消费 durable journal tail。
+7. online coordinator 先固定有限初始候选 `B0`。可选 CERTIFIED 对该候选做
+   无 coverage 副作用的 exact FIFO probe；`GAP_OPEN/CATCHING_UP` 时 coordinator
+   使用同一 reader/seam、同一 absolute deadline，逐个 global serial 扩展候选，
+   每次先等待对应 shadow applied frontier 再 probe，并在第一个完整前缀冻结
+   最终 `P`。随后只执行一次 `CutAndPublishGeneration`，其 watermark 必须匹配
+   冻结 shadow frontier，再执行一次最终 CERTIFIED prefix commit。CERTIFIED 与
+   recovered FAST control 在同一个关闭的 exposure gate 后启动；最终健康复核
+   与 promotion timestamp 成功后，仅一次 release store 打开 gate。promotion
+   后同一 coordinator 从 `P+1` 继续消费 durable journal tail。
 8. 每次周期或终局 cut 完成后，生产主线程先发布 exact Store generation，
    再发布可选 KLine generation。第一次 Store generation 发布前，
    `OPEN_HISTORY` 和 `OPEN_DELTA_SESSION` 会明确返回 unavailable，而不是读取
@@ -367,7 +405,7 @@ sequenceDiagram
     participant Adm as Pipeline admission
     participant Pool as OwnedIngress Pool
     participant DQ as source decoder SPSC
-    participant WAL as 可选 WAL
+    participant Journal as online-only live journal
     participant Owner as source owner
     participant Parse as Wd stateless parse workers
     participant Commit as source ordered committer
@@ -388,18 +426,18 @@ sequenceDiagram
         Adm->>Adm: close accepting + fatal
         Adm-->>SDK: rejected
     else 合法消息
+        opt online recovery capture configured
+            Adm->>Journal: Capture 独立 head/body copy + 预留 logical bytes
+            break capture 失败
+                Adm->>Adm: close accepting + fatal
+                Adm-->>SDK: rejected；不进入 preview admission
+            end
+        end
         Adm->>Pool: 复制 head + body，写入候选 metadata
         Pool-->>Adm: 独占 intrusive handle
-        opt WAL enabled
-            Adm->>Adm: 为 WAL 增加一个 intrusive ref
-        end
         Adm->>DQ: TryPush(OwnedMessage)
         DQ-->>Adm: 成功
         Adm->>Adm: 提交 global/source/tick sequence
-        opt WAL enabled
-            Adm->>WAL: TryEnqueue(独立 handle)
-            Note over Adm,WAL: 失败只污染 WAL 覆盖，不回滚实时 admission
-        end
         Adm-->>SDK: 释放 admission_mutex，回调完成
 
         DQ->>Owner: Pop OwnedMessage
@@ -451,7 +489,11 @@ source decoder queue TryPush 成功
 提交 global/source/tick 计数器
 ```
 
-此前的错误不推进序列；此后的可选 WAL 失败不能回滚已经可见的实时消息。这里刻意把实时正确性和审计旁路拆开。
+此前的错误不推进序列。普通 from-open 与 standalone partial 直接进入上述
+admission。online recovery 的受支持 callback 则在进入 admission 前经过
+required capture：live journal 独立复制 vendor head/body 并预留队列和逻辑
+字节，capture 失败会关闭 preview admission 并使 Pipeline fatal，不存在
+“preview 已接受、journal 丢失却仍继续”的容错路径。
 
 ### 5.3 解码与 Registry 解析
 
@@ -651,7 +693,7 @@ ordinal 重新组装，并把 Store 的 `SessionState` 放进共享所有权中�
    `shared_ptr` 都能延长底层 session/arena 的生命周期；
 4. 新 generation 可以继续复用同一批稳定 segment，不需要复制当天全部历史。
 
-这也是 complete-history V1 和 tick-delta V2 的共同事实基础：两者都从
+这也是 complete-history V2 和 tick-delta V2 的共同事实基础：两者都从
 immutable generation 打开 cursor，而不是在正在写入的 Store 上加一把长时间
 读锁。
 
@@ -756,7 +798,7 @@ tick_slots[registry_size]      // 每项独立 atomic<const Record*>
 ## 11. generation cut、屏障与发布
 
 generation 路径入口在
-[`RealtimePipelineV1::Impl::CutWithLock`](../src/runtime/realtime_pipeline_v1.cpp#L1510)。
+[`RealtimePipelineV1::Impl::CutWithLock`](../src/runtime/realtime_pipeline_v1.cpp)。
 
 ### 11.1 完整时序
 
@@ -810,10 +852,13 @@ sequenceDiagram
     Build->>Hist: release-store latest_generation = N
     Build->>KL: release-store latest_kline = N
     Hist-->>Ctrl: WaitForGeneration 返回 Store N / KLine N
-    Ctrl->>Factor: Calculate(Store N)
-    Factor->>Hist: CommitIfCurrentAndHealthy(N)
-    Factor->>Factor: 原子发布完整 FactorGeneration N
-    Factor-->>Ctrl: 返回 exact Store N / KLine N / Factor N
+    opt factor_generation_enabled
+        Ctrl->>Factor: Calculate(Store N)
+        Factor->>Hist: CommitIfCurrentAndHealthy(N)
+        Factor->>Factor: 原子发布完整 FactorGeneration N
+        Factor-->>Ctrl: 返回 exact Factor N
+    end
+    Note over Ctrl: CutResult 携带 exact Store/KLine、Factor enabled flag<br/>以及启用时的 exact Factor
     opt IPC enabled
         Ctrl->>IPC: PublishStoreGeneration(exact Store N)
         opt KLine enabled
@@ -893,7 +938,9 @@ Pipeline 内部发布 Store generation 后，生产主线程还要把同一个
 
 ## 12. Factor 发布逻辑
 
-Factor 不在逐条 worker 热路径运行，而是在完整 Store generation 发布后计算：
+Factor 不在逐条 worker 热路径运行。`factor_generation_enabled=true` 时，它在
+完整 Store generation 发布后计算；false 时不创建 calculator，也不要求 cut
+结果携带 Factor generation：
 
 ```text
 Store Generation N 构建并发布
@@ -914,28 +961,36 @@ History::CommitIfCurrentAndHealthy(Store N)
 - 没有合法值则输出 canonical invalid `+0`；
 - 必须为 Registry 中每个 instrument 恰好输出一行，顺序完全一致。
 
-Factor generation 持有它的 input Store generation。需要一致读取时，应先 acquire Factor，再从 `factor->input_store()` 访问 Store，而不是分别 acquire “最新 Factor”和“最新 Store”，否则两次 acquire 之间可能跨代。
+启用时，Factor generation 持有它的 input Store generation。需要一致读取
+时，应先 acquire Factor，再从 `factor->input_store()` 访问 Store，而不是分别
+acquire “最新 Factor”和“最新 Store”，否则两次 acquire 之间可能跨代。
 
 ---
 
-## 13. WAL 旁路
+## 13. Online recovery 的 session-local live journal
 
-WAL 与实时主路径共享同一份 OwnedIngress block，但通过额外 intrusive reference 获得独立生命周期：
+live journal 不是通用审计旁路，只在指定 CSV online recovery 时创建。对于
+五类受支持行情 callback，SDK-owner preview Pipeline 的顺序是：
 
 ```text
-OwnedIngress
-  ├── decoder 唯一实时所有权
-  └── WAL writer 独立引用
+检查受支持的 vendor head/body
+  -> journal Capture：独立复制 head/body，预留 queue 与 logical bytes
+  -> Capture 成功
+  -> preview Ingest/admission
 ```
 
-WAL enqueue 位于 decoder queue admission 和序列提交之后。它的 queue pressure、文件写入或 `fdatasync` 故障：
+`Capture()` 成功是异步 retention boundary，不等于该 record 已经
+`fdatasync`。writer 只有在一个完整 batch 及其跨越的 segment 全部持久化后才
+推进 `committed_serial`；shadow reader 不读取该 durable frontier 之后的记录。
+capture queue/容量耗尽、write/sync 失败、journal reader 校验失败，或者最终
+`committed_serial != accepted_serial` 都会使 online recovery session fail
+closed。普通 from-open 和 standalone `--intraday-live-partial` 的配置保持
+`live_ingress_capture_sink == nullptr`，因此完全不进入这条 capture 路径。
 
-- 标记 WAL 自身 `coverage_lost`；
-- 不撤销实时消息；
-- 不使 Store/History/Factor fatal；
-- 停止时尽力排空并关闭文件。
-
-因此 WAL 只能被解释为 best-effort 审计副本，不能用来证明实时 Store 覆盖完整。
+journal 的启动、flush 和 reader tail 生命周期由生产应用与 online recovery
+coordinator 管理，并不属于 `RealtimePipelineV1::StopAndDrain()` 的职责。详细
+闭合 handoff 与 durable frontier 契约见
+[`csv-startup-recovery-v1.md`](csv-startup-recovery-v1.md)。
 
 ---
 
@@ -1072,7 +1127,7 @@ cut 返回的 exact handles，而不是来自两个独立 IPC 数字碰巧相等
 
 - `SO_PEERCRED` 要求 peer UID 等于服务 effective UID；
 - 普通 `GET_SESSION` 返回长期 latest/ring mapping 的只读 fd；
-- `OPEN_HISTORY` 建立一个 complete-history V1 cursor；
+- `OPEN_HISTORY` 建立一个 complete-history V2 cursor；
 - `OPEN_DELTA_SESSION` 建立一个 instrument tick-delta V2 session；
 - 每个非终局 history/delta `READ` 返回一个新建、写完、解除 writable
   mapping、加满四个 seal 后重新以 `O_RDONLY` 打开的 memfd；
@@ -1097,19 +1152,19 @@ symbol lookup 走长期 mapping 的 native C reader，组合键是：
 实现先返回 `INVALID_MARKET`。`security_id_source` 为空本身不是单独错误，
 仍按完整组合键查找。
 
-complete-history V1 与 tick-delta V2 共用同一组服务端 worker slot。生产入口
-没有为这些参数提供 CLI 覆盖，因而使用 `RealtimeSharedServiceConfigV1`
+complete-history V2 与 tick-delta V2 共用同一组服务端 worker slot。生产入口
+没有为这些参数提供 CLI 覆盖，因而使用 `RealtimeSharedServiceConfigV2`
 默认值：
 
 | 限制 | 默认值 | 含义 |
 | --- | ---: | --- |
-| `maximum_history_readers` | 8 | V1 cursor 与 V2 session 合计最多 8 个活动连接 |
+| `maximum_history_readers` | 8 | history cursor 与 delta session 合计最多 8 个活动连接 |
 | `maximum_history_page_records` | 16,384 | 服务端单页行数上限；还会与客户端请求取较小值 |
 | `maximum_history_page_bytes` | 64 MiB | header + payload 的单页上限 |
 | `history_reader_idle_timeout` | 30 s | 等待该连接下一请求/发送响应的超时 |
 
-V2 一个 session 可以顺序打开多个 instrument cursor，但在 session 生命周期内
-一直占用一个 slot；V1 每个 instrument cursor 占用一个 slot。reader 资源
+delta session 可以顺序打开多个 instrument cursor，但在 session 生命周期内
+一直占用一个 slot；每个 history cursor 占用一个 slot。reader 资源
 耗尽会返回明确的 `RESOURCE_EXHAUSTED`，不会降级成 mutable/不固定读取。
 
 ---
@@ -1124,25 +1179,25 @@ V2 一个 session 可以顺序打开多个 instrument cursor，但在 session �
 | latest snapshot/tick | 单条 applied sink 成功后 | 每标的每类别仅一条 | 指定 instrument | 每行稳定、请求顺序保留 | 多标的同代、每个中间更新 |
 | latest KLine | 完整 KLine generation 发布后 | 每标的每窗口一条 | 指定 instrument/window pair | 一次读取绑定已发布 KLine 表代际 | KLine 全历史、逐 tick 刷新 |
 | global tick ring | slot 在单条 tick applied 时发布；cursor 只读到 contiguous prefix | 固定容量 | 全市场 mixed tick | 从 cursor 起点连续，未到达返回空，覆盖返回 overrun | 慢 consumer 永久保留 |
-| complete-history V1 | Store generation 发布后；cursor open 时固定 | Store session 配额内的完整历史 | 一个 instrument 的 snapshot + tick | 固定 generation、每条 Store record 有一行、显式 EOF 对账 | Store 全字段无损、多个独立 cursor 自动同代 |
+| complete-history V2 | Store generation 发布后；cursor open 时固定 | Store session 配额内的完整历史 | 一个 instrument 的 snapshot + tick | 固定 generation、每条 Store record 有一行、显式 EOF 对账 | Store 全字段无损、多个独立 cursor 自动同代 |
 | instrument tick-delta V2 | Store generation 发布后；session open 时固定目标 | Store session 配额内的 source 1/3 tick | 同一目标 generation 下顺序读取多个 instrument | origin/checkpoint 到 target 的有限半开增量；EOF 后给出 verified checkpoint | snapshot、逐条最低延迟、字段无损 |
 
 简单地说：
 
 - 只要“现在是多少”用 latest；
 - 要全市场逐笔低延迟流用 ring；
-- 要某标的在固定代际中的 snapshot/tick 全部历史用 V1；
-- 要维护单标的可恢复 rolling/factor 状态用 V2。
+- 要某标的在固定代际中的 snapshot/tick 全部历史用 history V2；
+- 要维护单标的可恢复 rolling/factor 状态用 tick-delta V2。
 
 文中反复出现的三个“完整性”字段含义不同：
 
 | 字段 | 它实际声明什么 | 它不声明什么 |
 | --- | --- | --- |
-| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 与 session-local live journal 通过 online shadow 的闭合 handoff 恢复成功。生产入口只有在 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 模式设置它；`--intraday-live-partial` 明确保持 false，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV1 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
-| `record_coverage_complete` | generation 是本进程已接受记录的完整 cut 前缀；对 V1 是该 instrument 四路 Store 记录，对 V2 是该 instrument 在所选 source 1/3 与半开区间内的 tick | 进程覆盖了开盘；上游 feed 完整；payload 字段无损 |
+| `coverage_from_open` | 一个由运维配置给出的事实断言：要么进程在首条相关市场消息前启动并持续健康，要么同交易日、从开盘完整的通联 CSV 与 session-local live journal 通过 online shadow 的闭合 handoff 恢复成功。生产入口只有在 `--intraday-store-from-open` 或 `--intraday-recovery-csv-dir` 模式设置它；`--intraday-live-partial` 明确保持 false，不根据“序列从 1 开始”自动推断 | 厂商上游行情本身没有丢包；CoreV2 保存了所有 C++ 字段；PDF 未保存的深圳快照 `ChannelNo` 可凭空恢复 |
+| `record_coverage_complete` | generation 是本进程已接受记录的完整 cut 前缀；对 complete history 是该 instrument 四路 Store 记录，对 tick delta 是该 instrument 在所选 source 1/3 与半开区间内的 tick | 进程覆盖了开盘；上游 feed 完整；payload 字段无损 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | 是否读到了所有 record |
 
-V1 和 V2 两种 CoreV1 协议都要求相应的
+complete-history 与 tick-delta 两种 Wire V2 协议都要求相应的
 `record_coverage_complete=true`，同时固定 `field_complete=false`。另有
 sticky `coverage_lost` 健康状态：
 一旦置位，服务直接拒绝继续把任何上述标志解释为有效完整性承诺。
@@ -1185,9 +1240,9 @@ sequenceDiagram
 重复项和原顺序。得到稳定 `instrument_id` 后，调用方才把该 ID 用于 latest、
 history 或 delta API。
 
-### 15.2 complete-history V1：固定一代并完整扫描
+### 15.2 complete-history V2：固定一代并完整扫描
 
-V1 的“完整”指一个 instrument 在固定 Store generation 中的所有四路
+complete-history 的“完整”指一个 instrument 在固定 Store generation 中的所有四路
 Store record，而不是“截至调用瞬间的 mutable Store”：
 
 ```mermaid
@@ -1200,7 +1255,7 @@ sequenceDiagram
     participant Fd as sealed page memfd
 
     Py->>Svc: OPEN_HISTORY(instrument_id, requested_page_records)
-    Svc->>Svc: 检查 ACTIVE/DRAINING/STOPPED_CLEAN 与 coverage
+    Svc->>Svc: 检查当前启动模式允许 generation 查询且 coverage 未丢失
     Svc->>Gen: acquire 当前已发布 Store generation
     Svc->>Gen: Find instrument summary
     Svc->>Cur: OpenInstrumentCursor([1, UINT64_MAX), oldest-first)
@@ -1227,21 +1282,29 @@ same-UID 连接上的顺序 nonce，不是跨用户认证机制。V2 数据页�
 page-index + rotating-token lockstep。
 
 open 时固定的是当时“最近一次成功发布给 IPC”的 Store generation。之后
-generation N+1、N+2 可以继续发布，但当前 cursor 始终读取 N。V1 的每个
+generation N+1、N+2 可以继续发布，但当前 cursor 始终读取 N。每个 history
 cursor 都独立 open 最新 generation；如果分别打开多个 instrument，中间恰好
-发生新发布，它们可能固定到不同代。V1 本身没有“指定 generation number”
-或“一个 session 固定多个 instrument”的接口。
+发生新发布，它们可能固定到不同代。history open 本身没有“一个 session 固定多个 instrument”
+的接口；调用方可以用 `expected_generation` 拒绝意外跨代。
 
 已注册但在 N 中没有任何 record 的 instrument 是合法空历史：open 成功，
 第一次 READ 就返回显式 EOF。未注册 ID 返回 `NOT_FOUND`。在第一代 Store
 尚未发布时返回 `UNAVAILABLE`。
 
-### 15.3 V1 页布局与“记录完整、字段不完整”
+查询 gate 同时区分启动模式，不能只按 `server_state` 推断：from-open 或成功
+recovered、且 `coverage_from_open=true` 的服务在完整前缀状态
+`ACTIVE/DRAINING/STOPPED_CLEAN` 下开放；standalone partial 只有通过
+`StartLivePartialWithProcessStartHistory()` 显式启用 process-start generation
+查询后，才在 `LIVE_PARTIAL/DRAINING/STOPPED_CLEAN` 开放。online recovery
+preview 使用 latest-only `StartLivePartial()`，因此即使内部持有 generation 也
+始终拒绝 History/delta。
 
-一个非终局 V1 页的规范布局是：
+### 15.3 complete-history V2 页布局与“记录完整、字段不完整”
+
+一个非终局 history V2 页的规范布局是：
 
 ```text
-4096-byte RealtimeHistoryPageHeaderV1  // page magic "L2FHST1\0"
+4096-byte RealtimeHistoryPageHeaderV2  // page magic "L2FHST2\0"
 N × 40-byte record descriptors       // 保留原始 mixed ingress 顺序
 S × 3104-byte snapshot payloads       // dense snapshot array
 T × 336-byte tick payloads            // dense tick array
@@ -1264,12 +1327,12 @@ descriptor 中的 `payload_kind + payload_index` 指向对应 dense array，同�
 `to_polars_by_kind()` 分成两张同质表。`records()` 则按原始顺序逐条迭代，
 无需一次物化全天历史，但仍必须把迭代器耗尽到 EOF 才算完整。
 
-V1 `CoreV1` 的承诺是：
+history V2 `CoreV2` 的承诺是：
 
 ```text
 record_coverage_complete = true
 field_complete           = false
-payload_projection       = CoreV1
+payload_projection       = CoreV2
 ```
 
 也就是 fixed generation 中每个 Store record 都有且只有一个输出 record，
@@ -1367,9 +1430,9 @@ V2 有两种 base：
 2. `CHECKPOINT`：必须是某次相同 instrument cursor 在显式 EOF 后返回的完整
    target checkpoint。
 
-wire 结构刻意保留冗余校验信息：全局 generation endpoint 是 256 bytes，
-在其后加 instrument 身份与本地计数形成 320-byte checkpoint；base
-checkpoint、target checkpoint、delta 计数和半开边界共同组成 736-byte
+wire 结构刻意保留冗余校验信息：全局 generation endpoint 是 248 bytes，
+在其后加 instrument 身份与本地计数形成 312-byte checkpoint；base
+checkpoint、target checkpoint、delta 计数和半开边界共同组成 720-byte
 metadata。
 
 一个 checkpoint 同时锚定三层信息：
@@ -1417,18 +1480,18 @@ checkpoint 作为同一个一致性单元保存和加载。
 最后一条 row，仍不足以提交 checkpoint；稀疏输出无法代表完整 target
 边界。
 
-### 15.6 V2 页验证、复制与 NumPy 语义
+### 15.6 tick-delta V2 页验证、复制与 NumPy 语义
 
-V2 数据页比 V1 简单，只有：
+tick-delta 数据页比 mixed history 页简单，只有：
 
 ```text
 4096-byte RealtimeInstrumentTickDeltaPageHeaderV2  // magic "L2FIDT2\0"
-N × 336-byte RealtimeWireTickPayloadV1
+N × 336-byte RealtimeWireTickPayloadV2
 
 mapping_bytes = 4096 + 336 × N
 ```
 
-header 内嵌 open 时返回的完整 736-byte delta metadata，并记录 page index、
+header 内嵌 open 时返回的完整 720-byte delta metadata，并记录 page index、
 row count、首末 ingress sequence 和首末 mixed-tick sequence。每个数据页
 非空；EOF 是控制响应，不创建 memfd。
 
@@ -1439,9 +1502,9 @@ native C validator 的检查顺序是 fail closed 的：
 3. expected metadata 自身必须 canonical；
 4. fd 必须是 regular、`O_RDONLY`、精确大小，并具有
    `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`；
-5. page magic、ABI 1.1、header 大小、offset、metadata byte image 和 reserved
+5. page magic、Wire ABI 2.3、header 大小、offset、metadata byte image 和 reserved
    字段必须完全匹配；
-6. 每行必须是 canonical CoreV1 tick，instrument/ordinal/trade date/source
+6. 每行必须是 canonical CoreV2 tick，instrument/ordinal/trade date/source
    identity 必须匹配；
 7. event kind 只能是 source 1 的 SH tick，或 source 3 的 SZ
    order/transaction；
@@ -1473,7 +1536,7 @@ NumPy structured array
 全局 ring 的 `TickCursor.read_columns()` 使用相同的 client-owned
 fixed-record block 思路；传统 `read()` 仍保留完整 Python 对象 API。
 
-V2 复用 CoreV1 tick payload，因此同样：
+tick-delta V2 复用 CoreV2 tick payload，因此同样：
 
 ```text
 tick_record_coverage_complete = true
@@ -1582,10 +1645,10 @@ Python 进程内这次 rolling commit 的原子替换。
 | V2 rolling factor | generation-bound instrument delta columns | page update + EOF generation hook | verified checkpoint 后事务提交 |
 | C++ `RealtimeFactorEngineV1` | 完整 Store generation | 每次 Pipeline cut | 全 Registry exact Store generation |
 
-V1 complete-history 使用对象模型，因为它同时承载 snapshot 与 tick 两类
-CoreV1 payload；V2 是后续新增的 tick-only column-first 快路径，不是对 V1
+complete-history 使用对象模型，因为它同时承载 snapshot 与 tick 两类
+CoreV2 payload；tick-delta 是 tick-only column-first 快路径，不是 history
 API 的透明替换。benchmark-only
-`RealtimeHistoryPageStageObserverV1` 只在显式安装时记录 V1 页阶段耗时，
+`RealtimeHistoryPageStageObserverV2` 只在显式安装时记录 history 页阶段耗时，
 默认是 null，不进入 wire ABI，也不会给生产 history path 添加计时调用。
 
 ---
@@ -1618,12 +1681,32 @@ stateDiagram-v2
 5. 释放 Subscriber、Manager、factory；
 6. decoder 仍在运行，使用已冻结计数执行最后一次 marker cut；
 7. 等待 Store/KLine generation，发布最后 Factor；
-8. 停止并排空 decoder、History 和 WAL；
+8. 停止并排空 decoder 与 History；
 9. 向 IPC 先发布最后 Store generation，再发布可选 KLine generation；
 10. IPC 只有在 ring 的 highest 与 contiguous 前缀都等于 Pipeline 最终已接收
     tick sequence 时才进入 `stopped_clean`。
 
 跨交易日回调不是数据损坏：它关闭 admission 且不推进任何 sequence，主线程随后发布旧交易日的完整最终前缀。
+
+promotion 后的 online recovery 还多一层应用级闭合顺序。主线程先调用
+`BeginCleanShutdownTailDrain(deadline)`，允许 tail governor 把 preview 后续的
+non-accepting/stopped 解释为预期 quiesce；随后停止唯一 SDK owner 并发布
+preview final generation，再调用 journal `StopAndFlush()`。recovery thread 必须
+在绝对 deadline 前继续读取 durable suffix 直到显式 End；pressure 永久不下降
+会以 `BACKPRESSURE_TIMEOUT` fail-close，避免 shutdown 的无界 join。join 后应用验证
+`last_journal_serial == committed_serial == accepted_serial`，最后才发布 shadow
+的 recovered final generation。该模式只放宽预期 lifecycle 状态；preview
+fatal、非法 progress 或 trade-date boundary 仍会使 tail/session fail closed。
+在线 governor 同时区分 CERTIFIED 的 data worker 与 control/accept thread：
+worker-only recovery warmup 允许 control 尚未启动，但 `StartControl()` 之后的
+异常 accept-loop 退出会使 promotion final gate 或永久 tail fail closed；该探针
+只读 service 原子状态，不进入 FAST/CERTIFIED reader 数据路径。
+普通 from-open 组合保持既有 FAST fail-open 策略：主循环仅以 atomic-only
+control-state 低频记录 CERTIFIED accept-loop 降级，不停止 FAST，也不扫描
+CERTIFIED wire header。control lifecycle 由单一 enum 线性化，promotion 的最终
+确认使用同值 CAS，和并发的 terminal CAS 明确排序。online 的两个 recovered
+accept loop 还共享一只单调原子 gate：gate=false 时允许线程完成启动但禁止
+转移 descriptor；最后一次 release store(true) 是唯一外部暴露点。
 
 ### 16.2 `StopAndDrain` 的语义
 
@@ -1631,18 +1714,24 @@ stateDiagram-v2
 
 - 拒绝新 admission；
 - SDK 回调已静止；
-- decoder queue、History queue 和 WAL 被排空；
+- decoder queue 与 History queue 被排空；
 - worker 停止。
 
-它不额外发布一个 final generation。生产健康退出应使用终局 generation API；`StopAndDrain` 更适合 fatal 清理或调用者明确不需要终局不可变前缀的场景。
+它不额外发布一个 final generation，也不停止、flush 或消费 online live
+journal；journal 属于应用级 recovery 生命周期。生产健康退出应使用终局
+generation API；`StopAndDrain` 更适合 fatal 清理或调用者明确不需要终局
+不可变前缀的场景。
 
 ### 16.3 clean stop 后的读取窗口
 
-IPC 的 `HistoryHealthy()` 接受 `ACTIVE`、`DRAINING` 和
-`STOPPED_CLEAN`，但拒绝 `INITIALIZING`/`FAILED` 或 coverage lost。因此在
-控制线程和 socket 尚未析构期间：
+IPC 的 `StoreGenerationQueriesAvailable()` 按启动模式判定：from-open/recovered
+服务接受完整前缀的 `ACTIVE`、`DRAINING` 和 `STOPPED_CLEAN`；显式启用
+process-start History 的 standalone partial 接受 `LIVE_PARTIAL`、`DRAINING`
+和 `STOPPED_CLEAN`。两者都拒绝 `INITIALIZING`/`FAILED` 或 coverage lost，
+online recovery preview 也不会得到 partial History 能力。因此在控制线程和
+socket 尚未析构期间：
 
-- draining 中的 V1/V2 cursor 可继续读取它们已经固定的 generation；
+- draining 中已打开的 history/delta cursor 可继续读取它们已经固定的 generation；
 - final Store generation 发布后，新 cursor/session 可以固定 final
   generation；
 - `STOPPED_CLEAN` mapping 的 latest/ring/KLine 仍是可验证的静态最终状态。
@@ -1668,15 +1757,16 @@ IPC 的 `HistoryHealthy()` 接受 `ACTIVE`、`DRAINING` 和
 | in-process latest 发布失败 | Store/KLine 已成功 | latest 及完整链 | latest coverage lost + fatal |
 | IPC applied publish 失败 | Store/KLine/latest 已成功 | IPC 及完整链 | IPC failed，History 随后 fatal |
 | generation watermark/barrier/build 失败 | 热记录可能已写 | generation/完整链 | 不发布不完整 generation，fatal |
-| Factor 计算或校验失败 | Store N 已发布 | Factor/完整链 | 不发布部分 Factor，Pipeline fatal |
+| 已启用的 Factor 计算或校验失败 | Store N 已发布 | Factor/完整链 | 不发布部分 Factor，Pipeline fatal |
 | IPC Store generation provenance/计数/代际校验失败 | Pipeline generation 已发布 | IPC/生产进程 | IPC coverage lost，主循环退出并标记 failed |
 | IPC KLine generation 校验失败 | Store IPC generation 可能已发布 | IPC/生产进程 | 不切换错误 KLine 表，IPC failed |
-| WAL queue/write/sync 失败 | 是 | 仅 WAL | WAL coverage lost，实时链继续 |
+| online journal capture queue/容量耗尽 | 否 | preview、recovered session | callback 不进入 preview admission；Pipeline/session fail closed |
+| online journal write/sync 或 reader 完整性失败 | preview 消息序列可能已推进 | preview、recovered session | session fail closed；不得 promotion 或继续声明 recovered prefix |
 | global tick cursor 落后超过 ring | 不适用 | 单 reader | explicit overrun，不静默跳号 |
 | history/delta reader slot 或单页资源耗尽 | 不适用 | 单请求/连接 | explicit resource exhausted；不改写 Store |
-| V1 页投影/计数内部不一致 | 不适用 | IPC history 与连接 | 不发送伪完整 EOF；内部一致性错误会使服务 coverage lost |
+| history V2 页投影/计数内部不一致 | 不适用 | IPC history 与连接 | 不发送伪完整 EOF；内部一致性错误会使服务 coverage lost |
 | V2 checkpoint 不属于 pinned target | 不适用 | 当前 instrument open | explicit checkpoint mismatch；不伪造增量，session 可继续处理合法请求 |
-| V2 服务端 query/projection/计数内部不一致 | 不适用 | 当前 V2 session | 返回 internal failure 并关闭 session；当前实现与 V1 不同，不在该路径自动置全局 coverage lost |
+| delta V2 服务端 query/projection/计数内部不一致 | 不适用 | 当前 delta session | 返回 internal failure 并关闭 session；与 complete-history 路径不同，该路径当前不自动置全局 coverage lost |
 | V2 fd/page/跨页序列校验失败 | 不适用 | 当前 Python delta session | client fail closed、关闭 fd/socket；不提交 checkpoint |
 | rolling page/factor/EOF/commit 失败 | 不适用 | 当前 Python transaction | abort shadow，committed rolling state 保持不变 |
 
@@ -1707,13 +1797,13 @@ Pipeline fatal = true
 | source owner | 4 | source queue/dispatch；仅在无 farm outstanding 的 inline 区间持有 decoder 可变状态 | 每 source decoder SPSC；source-local activation；与 committer 的 release/acquire ownership handoff；marker 顺序 |
 | stateless parse worker | `Wd`，首次 farm activation 才启动 | issue shard 中 task 的 schema parse 与 immutable identity | 每 worker × source SPSC issue shard；completion release publication |
 | source ordered committer | 4，随 parse farm lazy-start | 按 source sequence finalize、History submission 与 task retirement | per-source completion/failure ring；committed/retired release frontier |
-| WAL writer | 0/1 | WAL fd 与写 offset | 独立有界 queue/semaphore |
+| online journal writer | online CSV recovery 时 1 个，否则 0 | journal fd、segment 与 durable frontier | 独立有界 queue/semaphore；应用显式 `StopAndFlush` |
 | History worker | W | `instrument_id % W` 的 Store/KLine 热写 | 4 条输入 SPSC；无需 append 全局锁 |
 | generation builder | 1 | pending generation 构建 | History generation mutex/condition variable |
 | IPC control thread | 0/1 | UDS、heartbeat、tick contiguous 补推进 | poll/eventfd |
-| IPC history reader worker | 启用 IPC 时最多 8 个 slot，按连接启停 | 一个 V1 cursor 或一个 V2 session 固定的 Store generation、socket、临时页 | slot running flag、socket mutex、idle timeout；V1/V2 共用配额 |
+| IPC history reader worker | 启用 IPC 时最多 8 个 slot，按连接启停 | 一个 history cursor 或一个 delta session 固定的 Store generation、socket、临时页 | slot running flag、socket mutex、idle timeout；两种 Wire V2 查询共用配额 |
 | Python latest/ring client | 任意 | 自己的长期只读 mapping、cursor 与 owned batch | client/native reader lock + seqcount retry |
-| Python V1/V2 reader | 受服务端 slot 限制 | 独立 SOCK_SEQPACKET、收到的 page fd、累计 frontier | 每 cursor/session lock；page index + rotating token |
+| Python history/delta reader | 受服务端 slot 限制 | 独立 SOCK_SEQPACKET、收到的 page fd、累计 frontier | 每 cursor/session lock；page index + rotating token |
 | Python rolling store | 通常每 instrument 一个 | bounded tick tail、checkpoint、factor state | 每 Store 至多一个 active transaction；token/version commit |
 
 ### 18.1 热路径避免的锁
@@ -1756,7 +1846,7 @@ Pipeline fatal = true
 6. generation 发布前验证总记录数等于 watermark 前缀。
 7. IPC Store generation 必须来自同一 Store session，代际恰好递增，且全局、
    分 source、分 instrument 计数全部可对账。
-8. V1/V2 只从 immutable generation 打开 cursor，不在 mutable Store 上做
+8. history/delta 只从 immutable generation 打开 cursor，不在 mutable Store 上做
    跨进程长扫描。
 
 ### 19.2 一致性
@@ -1764,10 +1854,11 @@ Pipeline fatal = true
 1. live latest：单行一致，不保证 batch 全市场一致。
 2. Store generation：固定 watermark 的全市场完整前缀。
 3. KLine generation：绑定 exact Store generation。
-4. Factor generation：绑定 exact Store generation。
+4. 启用时的 Factor generation：绑定 exact Store generation；禁用时 cut 的
+   published 判定不要求 Factor handle。
 5. IPC KLine：整表按 generation 原子切换。
 6. IPC tick cursor：序列连续或显式 not-yet/overrun。
-7. V1 complete history：一个 cursor 固定一个 generation；记录覆盖完整不
+7. complete history：一个 cursor 固定一个 generation；记录覆盖完整不
    等于字段无损，也不等于从开盘覆盖。
 8. V2 delta session：多个顺序 instrument cursor 固定同一 target
    generation；ingress/tick 全局严格递增、source sequence 在各自 lane 内
@@ -1783,7 +1874,7 @@ Pipeline fatal = true
 4. clean stop 只有在 final tick 连续前缀完整时才对 IPC 宣称 `stopped_clean`。
 5. Python client 固定 session，不静默跨 `run_id/session_epoch`。
 6. generation/cursor 的共享所有权保证 Store segment 在读取期间不销毁。
-7. V1/V2 page fd 在所有退出路径关闭；V2 提前关闭 cursor 会关闭整个
+7. history/delta page fd 在所有退出路径关闭；delta 提前关闭 cursor 会关闭整个
    lockstep session。
 8. rolling abort 幂等并保留上一次 committed checkpoint/state。
 
@@ -1796,6 +1887,15 @@ Pipeline fatal = true
 ```cpp
 OnSdkMessage(message):
     enter_active_callback()
+
+    if live_ingress_capture_sink != null:
+        inspection = inspect_supported_recovery_tuple(message)
+        if inspection is supported_recovery_tuple:
+            if !live_ingress_capture_sink.capture_independent_copy(inspection):
+                trip_fatal_without_preview_admission
+                leave_active_callback()
+                return
+
     lock(admission_mutex)
 
     if fatal || !accepting:
@@ -1810,13 +1910,11 @@ OnSdkMessage(message):
     validate_clock_and_trade_date()
     metadata = candidate(global + 1, source + 1, optional_tick + 1)
     owned = ingress_pool.copy(inspection, metadata)
-    wal_ref = optional_intrusive_copy(owned)
 
     if !decoder_queue[source].try_push(move(owned)):
         trip_fatal_without_sequence_advance
 
     commit_sequences(metadata)
-    optional_wal.try_enqueue(move(wal_ref))  // best effort
     unlock(admission_mutex)
     leave_active_callback()
 
@@ -1904,7 +2002,8 @@ CutAndPublish():
     unlock(admission_mutex)
 
     store_gen, kline_gen = history.wait_for_generation(generation)
-    factor_gen = factor.calculate_and_publish(store_gen)
+    if factor_generation_enabled:
+        factor_gen = factor.calculate_and_publish(store_gen)
     publish_pipeline_generation(generation)
 
     if ipc_enabled:
@@ -1915,11 +2014,11 @@ CutAndPublish():
     return exact(store_gen, kline_gen, factor_gen)
 ```
 
-### 20.3 complete-history V1
+### 20.3 complete-history V2
 
 ```python
 OpenHistory(instrument_id, requested_rows):
-    require(service_state in {ACTIVE, DRAINING, STOPPED_CLEAN})
+    require(store_generation_queries_available_for_startup_mode)
     generation = atomic_acquire(latest_ipc_store_generation)
     require(generation is not None)
     summary = generation.find(instrument_id)
@@ -1987,35 +2086,27 @@ ConsumeAndCommitRolling(cursor, rolling_store, factor):
 
 ---
 
-## 21. 当前分支相对上一阶段的关键增量
+## 21. 当前工作树的组合能力
 
-当前分支以 `feature/live-latest-tick-snapshot-v1 @ 7a1a404` 为
-merge-base，新增两个提交：
+本文不再用一个已经过时的 merge-base/提交列表描述“当前分支”。当前工作树把
+以下能力组合在同一个生产入口中：
 
-1. `83c4916 feat(ipc): add symbol lookup and complete Store history reads`
-   - 在长期只读 mapping 上新增 exact opaque-byte symbol lookup；
-   - 生产主线程开始把每次 exact Store generation 发布给 IPC；
-   - 新增 complete-history V1 UDS 协议：单 instrument、固定最新 Store
-     generation、oldest-first 全扫描、sealed memfd 分页、rotating token 和
-     explicit EOF；
-   - 新增 Python `HistoryCursor` 及按 kind 的 object/column/Arrow/Polars
-     适配；
-   - 新增默认关闭的 history stage observer 和可复现 benchmark。observer
-     不进入生产 wire ABI。
-2. `ee0a88a feat(ipc): add generation-bound instrument tick delta V2`
-   - Store generation 新增 source 1/3 tick-only delta cursor；
-   - 新增两层 V2 协议：一个 session 固定目标 generation，再顺序打开多个
-     instrument cursor；
-   - 新增 generation endpoint、instrument-local checkpoint、origin/checkpoint
-     base、严格计数与半开边界校验；
-   - 新增 native sealed-page validator，以及 client-owned tick block /
-     zero-copy NumPy structured view；
-   - 新增严格可序列化 checkpoint 和 count-window rolling/factor transaction；
-   - 加强 fd、socket、native reader、cursor 与 transaction 在异常和
-     `BaseException` 路径上的资源回收。
+1. ordinary from-open：不创建 live journal，直接运行 SDK-owner Pipeline，
+   并发布从开盘覆盖的 FAST、Store generation、KLine/Factor，以及默认的
+   CERTIFIED canonical Tick/Event；
+2. CSV online recovery：required live capture 维持 queryable latest-only
+   preview，SDK-less shadow 从 CSV 与 durable journal 闭合 handoff，完成
+   generation/CERTIFIED Tick+Event barrier 后发布独立 recovered session；
+3. standalone partial：不做 recovery、不宣称 from-open，但周期发布
+   process-start Store generation，开放单标的 complete-history 与 tick-delta；
+   默认受管 Event sidecar 从本进程 tick sequence 1 发布 process-start delta；
+   KLine/CERTIFIED 禁用，并通过 `factor_generation_enabled=false` 不创建或
+   调用 generation Factor engine；
+4. Wire V2 查询：latest/ring、complete-history V2 和 generation-bound
+   tick-delta V2 使用同一 daily-catalog/session identity，并以显式
+   unavailable、EOF、overrun 或 checkpoint mismatch fail closed。
 
-从 merge-base 继承的 latest、tick ring、KLine 和 C++ generation Factor
-没有被 V1/V2 替代。当前完整形态是：
+当前完整形态是：
 
 ```text
 SDK
@@ -2028,11 +2119,14 @@ SDK
 → in-process latest
 → optional IPC latest/tick ring
 
+online recovery SDK-owner 特有前置路径：
+supported callback → required live-journal Capture → preview admission
+
 并行控制路径：
 watermark/fence
 → Store generation
 → KLine generation
-→ Factor generation
+→ optional Factor generation（standalone partial 显式禁用）
 → optional IPC Store generation
 → optional IPC KLine generation
 
@@ -2040,7 +2134,7 @@ watermark/fence
 registry mapping → exact symbol lookup
 latest mapping  → latest snapshot/tick/KLine
 tick ring       → global contiguous cursor / column block
-Store generation → complete-history V1
+Store generation → complete-history V2
 Store generation → checkpoint-bound instrument tick-delta V2
 V2 pages → transactional rolling/factor state
 ```
@@ -2054,6 +2148,8 @@ V2 pages → transactional rolling/factor state
 | 生产装配、周期/终局 cut、IPC Store→KLine 发布 | [`apps/mdl_production_main.cpp`](../apps/mdl_production_main.cpp) |
 | Pipeline 对外配置与返回的 exact generation handles | [`include/l2flow/runtime/realtime_pipeline_v1.h`](../include/l2flow/runtime/realtime_pipeline_v1.h) |
 | Pipeline 初始化、SDK 回调/admission、cut、quiesce | [`src/runtime/realtime_pipeline_v1.cpp`](../src/runtime/realtime_pipeline_v1.cpp) |
+| live journal capture、durable frontier 与 segment reader | [`include/l2flow/recovery/live_journal_v1.h`](../include/l2flow/recovery/live_journal_v1.h)、[`src/recovery/live_journal_v1.cpp`](../src/recovery/live_journal_v1.cpp) |
+| CSV replay 与 online handoff/governor | [`src/recovery/mdl_csv_startup_replay_v1.cpp`](../src/recovery/mdl_csv_startup_replay_v1.cpp)、[`src/recovery/online_recovery_v1.cpp`](../src/recovery/online_recovery_v1.cpp) |
 | owned ingress 分类、复制与 pool | [`src/realtime/owned_ingress_message_v1.cpp`](../src/realtime/owned_ingress_message_v1.cpp) |
 | decoder schema 分发与 Registry 解析 | [`src/market/market_decoder.cpp`](../src/market/market_decoder.cpp) |
 | History 接收、4×W queue、worker apply、fence、builder/commit | [`src/market/realtime_history_v1.cpp`](../src/market/realtime_history_v1.cpp) |
@@ -2062,15 +2158,15 @@ V2 pages → transactional rolling/factor state
 | KLine trade 投影与聚合 | [`src/market/kline_aggregator_v1.cpp`](../src/market/kline_aggregator_v1.cpp) |
 | latest 原子发布与读取 | [`src/market/realtime_latest_read_model_v1.cpp`](../src/market/realtime_latest_read_model_v1.cpp) |
 | C++ Factor 计算和原子提交 | [`src/factor/realtime_factor_engine_v1.cpp`](../src/factor/realtime_factor_engine_v1.cpp) |
-| latest/ring 固定 wire ABI（1.1） | [`include/l2flow/ipc/realtime_wire_v1.h`](../include/l2flow/ipc/realtime_wire_v1.h) |
-| complete-history V1 控制面与页 ABI | [`include/l2flow/ipc/realtime_history_wire_v1.h`](../include/l2flow/ipc/realtime_history_wire_v1.h) |
+| latest/ring 固定 Wire ABI（2.3） | [`include/l2flow/ipc/realtime_wire_v2.h`](../include/l2flow/ipc/realtime_wire_v2.h) |
+| complete-history V2 控制面与页 ABI | [`include/l2flow/ipc/realtime_history_wire_v2.h`](../include/l2flow/ipc/realtime_history_wire_v2.h) |
 | instrument tick-delta V2 endpoint/checkpoint/页 ABI | [`include/l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h`](../include/l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h) |
-| IPC 服务配置、Store/KLine generation 发布接口 | [`include/l2flow/ipc/realtime_shared_service_v1.h`](../include/l2flow/ipc/realtime_shared_service_v1.h) |
-| IPC 单条/ring、Store generation 校验、V1/V2 worker 与 memfd 页构建 | [`src/ipc/realtime_shared_service_v1.cpp`](../src/ipc/realtime_shared_service_v1.cpp) |
-| native reader 与 V2 全页 validator C ABI | [`include/l2flow/ipc/realtime_shm_reader_c_v1.h`](../include/l2flow/ipc/realtime_shm_reader_c_v1.h) |
-| native reader、symbol lookup、ring column block、V2 validator 实现 | [`src/ipc/realtime_shm_reader_c_v1.cpp`](../src/ipc/realtime_shm_reader_c_v1.cpp) |
-| Python session/latest/ring/V1/V2 入口 | [`python/l2flow_realtime/client.py`](../python/l2flow_realtime/client.py) |
-| Python complete-history V1 cursor/页校验 | [`python/l2flow_realtime/history.py`](../python/l2flow_realtime/history.py) |
+| IPC 服务配置、Store/KLine generation 发布接口 | [`include/l2flow/ipc/realtime_shared_service_v2.h`](../include/l2flow/ipc/realtime_shared_service_v2.h) |
+| IPC 单条/ring、Store generation 校验、history/delta worker 与 memfd 页构建 | [`src/ipc/realtime_shared_service_v2.cpp`](../src/ipc/realtime_shared_service_v2.cpp) |
+| native reader 与 V2 全页 validator C ABI | [`include/l2flow/ipc/realtime_shm_reader_c_v2.h`](../include/l2flow/ipc/realtime_shm_reader_c_v2.h) |
+| native reader、symbol lookup、ring column block、V2 validator 实现 | [`src/ipc/realtime_shm_reader_c_v2.cpp`](../src/ipc/realtime_shm_reader_c_v2.cpp) |
+| Python session/latest/ring/history/delta 入口 | [`python/l2flow_realtime/client.py`](../python/l2flow_realtime/client.py) |
+| Python complete-history V2 cursor/页校验 | [`python/l2flow_realtime/history.py`](../python/l2flow_realtime/history.py) |
 | Python instrument tick-delta V2 session/cursor | [`python/l2flow_realtime/instrument_delta.py`](../python/l2flow_realtime/instrument_delta.py) |
 | Python 严格 checkpoint 模型 | [`python/l2flow_realtime/checkpoint.py`](../python/l2flow_realtime/checkpoint.py) |
 | Python count-window rolling/factor transaction | [`python/l2flow_realtime/rolling.py`](../python/l2flow_realtime/rolling.py) |
@@ -2078,7 +2174,7 @@ V2 pages → transactional rolling/factor state
 | Python native ctypes wrapper 与 fd ownership | [`python/l2flow_realtime/native.py`](../python/l2flow_realtime/native.py)、[`python/l2flow_realtime/_fd_owner.py`](../python/l2flow_realtime/_fd_owner.py) |
 | Python microbatch factor runner | [`python/l2flow_realtime/factor.py`](../python/l2flow_realtime/factor.py) |
 | Polars latest snapshot 示例 | [`python/examples/latest_snapshot_factor.py`](../python/examples/latest_snapshot_factor.py) |
-| V1 single-instrument stage benchmark 说明 | [`benchmarks/single_instrument_history_stages.md`](../benchmarks/single_instrument_history_stages.md) |
+| online recovery FAST latency 验证边界 | [`online-recovery-fast-latency-validation-20260801.md`](online-recovery-fast-latency-validation-20260801.md) |
 
 ---
 
@@ -2093,8 +2189,8 @@ V2 pages → transactional rolling/factor state
 5. 新增对外读模型：明确它是逐条 latest、连续 stream 还是 generation，不混用一致性声明。
 6. 修改 IPC ring：重新计算最坏内部重排上界，并保留 explicit overrun。
 7. 修改 Store generation 发布：同时检查 Pipeline 与 IPC 两层 identity、provenance、全局/分路/分标的计数，以及空增量 generation。
-8. 修改 V1 页：保持 mixed descriptor 与 dense payload 索引一致、长字段 omission 可区分，并以零行无 fd 的显式 EOF 完成总数对账。
-9. 修改 V2 页或 checkpoint：同时更新 256-byte endpoint、320-byte checkpoint、736-byte metadata、native validator 和 Python parser，保留 origin 与半开边界语义。
+8. 修改 history V2 页：保持 mixed descriptor 与 dense payload 索引一致、长字段 omission 可区分，并以零行无 fd 的显式 EOF 完成总数对账。
+9. 修改 delta V2 页或 checkpoint：同时更新 248-byte endpoint、312-byte checkpoint、720-byte metadata、native validator 和 Python parser，保留 origin 与半开边界语义。
 10. 修改 NumPy 快路径：明确哪一段发生 copy；不能把 client-owned `bytes` 上的 view 描述成 server memfd 端到端零拷贝。
 11. 修改 rolling/factor：保证数据页只写 shadow，只有显式 EOF 后才能提交 checkpoint；外部发布与持久化仍需应用级事务或幂等协议。
 12. 修改停止流程：验证 SDK callback quiesce、final cut、Store→KLine 的终局 IPC 发布顺序和 `stopped_clean` 的 tick 前缀证明。

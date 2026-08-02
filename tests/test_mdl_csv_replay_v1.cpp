@@ -224,6 +224,22 @@ public:
         }
     }
 
+    bool CooperativeCheckpoint(
+        std::string* detail) noexcept override {
+        ++cooperative_checkpoint_calls;
+        if (!cooperative_checkpoint_hook) {
+            return true;
+        }
+        try {
+            return cooperative_checkpoint_hook(detail);
+        } catch (...) {
+            if (detail != nullptr) {
+                *detail = "test cooperative checkpoint hook threw";
+            }
+            return false;
+        }
+    }
+
     bool Publish(
         const recovery::StartupReplayPublicationV1& publication,
         std::string* detail) noexcept override {
@@ -281,10 +297,13 @@ public:
     std::vector<l2flow::sdk::MessageKey> publication_keys;
     std::vector<std::uint64_t> publication_sequences;
     std::vector<l2flow::sdk::MessageKey> fences;
+    std::size_t cooperative_checkpoint_calls = 0U;
     std::function<bool(
         const l2flow::sdk::MessageKey&,
         std::string*)>
         fence_hook;
+    std::function<bool(std::string*)>
+        cooperative_checkpoint_hook;
     std::function<void(
         const recovery::StartupReplayPublicationV1&)>
         publish_hook;
@@ -1673,6 +1692,53 @@ void TestFenceOrderingAndSnapshotTailJoin(TestContext* test) {
 void TestShenzhenZeroChannelAndMergeBounds(TestContext* test) {
     {
         TempDirectory directory;
+        std::vector<Row> blocked_orders;
+        blocked_orders.reserve(
+            recovery::kStartupReplayCooperativeCheckpointRecordsV1 +
+            32U);
+        for (std::size_t index = 0U;
+             index <
+                 recovery::kStartupReplayCooperativeCheckpointRecordsV1 +
+                     32U;
+             ++index) {
+            blocked_orders.push_back(ShenzhenOrderRow(
+                std::to_string(index + 1U),
+                "2",
+                std::to_string(10'000U + index)));
+        }
+        WriteTable(
+            directory.path() / "mdl_6_33_0.csv",
+            kShenzhenOrderColumns,
+            blocked_orders);
+        WriteTable(
+            directory.path() / "mdl_6_36_0.csv",
+            kShenzhenTransactionColumns,
+            {});
+        recovery::StartupReplayConfigV1 config;
+        config.directory = directory.path();
+        config.enabled_messages =
+            recovery::StartupReplayMessageSetV1::kShenzhenOrder;
+        config.maximum_pending_messages = blocked_orders.size() + 1U;
+        config.maximum_pending_bytes = 16U * 1024U * 1024U;
+        DecodeSink sink;
+        sink.cooperative_checkpoint_hook =
+            [](std::string* detail) {
+                if (detail != nullptr) {
+                    *detail = "checkpoint stop";
+                }
+                return false;
+            };
+        const auto result = Replay(std::move(config), &sink);
+        test->Expect(
+            result.error ==
+                    recovery::StartupReplayErrorV1::kSinkRejected &&
+                result.detail == "checkpoint stop" &&
+                sink.cooperative_checkpoint_calls == 1U &&
+                sink.events.empty(),
+            "bounded parser checkpoint can stop a long Shenzhen gap before any publication");
+    }
+    {
+        TempDirectory directory;
         WriteTable(
             directory.path() / "mdl_6_33_0.csv",
             kShenzhenOrderColumns,
@@ -1798,6 +1864,53 @@ void TestShenzhenZeroChannelAndMergeBounds(TestContext* test) {
                     std::vector<std::uint64_t>{101U, 102U, 100U},
             "cross-channel Shenzhen gap repair can publish one tuple's physical SeqNo out of order");
     }
+}
+
+void TestCooperativeCheckpointBounds(TestContext* test) {
+    TempDirectory directory;
+    Row tick = ZeroRow(kShanghaiTickColumns);
+    tick["BizIndex"] = "1";
+    tick["Channel"] = "1";
+    // The comma forces a quoted field, and the logical row crosses the fixed
+    // 64 KiB input buffer without reaching a record terminator.
+    tick["SecurityID"] =
+        std::string(
+            recovery::kStartupReplayCooperativeCheckpointBytesV1 +
+                4U * 1024U,
+            '6') +
+        ",quoted";
+    tick["TickTime"] = "09:30:00.001";
+    tick["Type"] = "A";
+    tick["TickBSFlag"] = "B";
+    tick["LocalTime"] = "09:30:00.002";
+    tick["SeqNo"] = "1";
+    const std::filesystem::path input =
+        directory.path() / "mdl_4_24_0.csv";
+    WriteTable(input, kShanghaiTickColumns, {tick});
+
+    DecodeSink sink;
+    sink.cooperative_checkpoint_hook =
+        [&sink](std::string* detail) {
+            if (sink.cooperative_checkpoint_calls < 2U) {
+                return true;
+            }
+            if (detail != nullptr) {
+                *detail = "long-record checkpoint stop";
+            }
+            return false;
+        };
+    const auto result = Replay(
+        directory.path(),
+        recovery::StartupReplayMessageSetV1::kShanghaiTick,
+        &sink);
+    test->Expect(
+        result.error ==
+                recovery::StartupReplayErrorV1::kSinkRejected &&
+            result.error_file == input && result.error_line == 2U &&
+            result.detail == "long-record checkpoint stop" &&
+            sink.cooperative_checkpoint_calls == 2U &&
+            sink.events.empty(),
+        "a quoted record crossing 64 KiB can be cancelled before publication with exact source context");
 }
 
 void TestAppendedBoundaryClosesSharedSequence(TestContext* test) {
@@ -2012,6 +2125,7 @@ int main() {
     TestTupleFencesAndReservedValues(&test);
     TestFenceOrderingAndSnapshotTailJoin(&test);
     TestShenzhenZeroChannelAndMergeBounds(&test);
+    TestCooperativeCheckpointBounds(&test);
     TestAppendedBoundaryClosesSharedSequence(&test);
     TestRetainedDescriptorDoesNotFollowReplacement(&test);
     TestRecoverySequenceIntegrity(&test);

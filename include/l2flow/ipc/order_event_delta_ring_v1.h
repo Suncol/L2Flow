@@ -19,6 +19,11 @@ struct OrderEventDeltaRingConfigV1 final {
     std::uint64_t maximum_mapping_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t producer_started_monotonic_ns = 0U;
+    OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        OrderEventDeltaTemporalCoverageV1::kFromMarketOpen;
+    OrderEventDeltaStreamQualityV1 stream_quality =
+        OrderEventDeltaStreamQualityV1::
+            kLocalTickStreamContiguous;
 };
 
 struct OrderEventDeltaSessionV1 final {
@@ -27,6 +32,11 @@ struct OrderEventDeltaSessionV1 final {
     std::uint32_t trade_date = 0U;
     std::uint64_t ring_capacity = 0U;
     std::uint64_t total_mapping_bytes = 0U;
+    OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        OrderEventDeltaTemporalCoverageV1::kFromMarketOpen;
+    OrderEventDeltaStreamQualityV1 stream_quality =
+        OrderEventDeltaStreamQualityV1::
+            kLocalTickStreamContiguous;
 
     [[nodiscard]] friend bool operator==(
         const OrderEventDeltaSessionV1&,

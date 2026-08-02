@@ -106,7 +106,12 @@ public:
     [[nodiscard]] bool Spawn(
         const std::filesystem::path& executable,
         const std::filesystem::path& source_socket,
-        const std::filesystem::path& event_socket) {
+        const std::filesystem::path& event_socket,
+        ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+            ipc::OrderEventDeltaTemporalCoverageV1::
+                kFromMarketOpen,
+        std::uint32_t poll_interval_ms = 1U,
+        std::uint64_t managed_parent_pid = 0U) {
         std::vector<std::string> arguments{
             executable.string(),
             "--source-socket",
@@ -128,10 +133,21 @@ public:
             "--read-batch-records",
             "4",
             "--poll-ms",
-            "1",
+            std::to_string(poll_interval_ms),
             "--timeout-ms",
             "1000",
+            "--temporal-coverage",
+            temporal_coverage ==
+                    ipc::OrderEventDeltaTemporalCoverageV1::
+                        kFromMarketOpen
+                ? "from-open"
+                : "process-start",
         };
+        if (managed_parent_pid != 0U) {
+            arguments.emplace_back("--parent-pid");
+            arguments.emplace_back(
+                std::to_string(managed_parent_pid));
+        }
         std::vector<char*> child_argv;
         child_argv.reserve(arguments.size() + 1U);
         for (std::string& argument : arguments) {
@@ -326,7 +342,9 @@ DailyRuntimeFixture MakeDailyRuntimeFixture() {
 
 ipc::OrderEventDeltaSourceSessionV1 SourceSession(
     const common::Identity128& run_id,
-    const market::DailyInstrumentCatalogV2& catalog) {
+    const market::DailyInstrumentCatalogV2& catalog,
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen) {
     ipc::OrderEventDeltaSourceSessionV1 result{};
     result.run_id = run_id;
     result.catalog_digest = catalog.catalog_digest();
@@ -341,6 +359,7 @@ ipc::OrderEventDeltaSourceSessionV1 SourceSession(
     result.catalog_scope = static_cast<std::uint32_t>(
         ipc::RealtimeCatalogScopeV2::kDeclaredDailyAShare);
     result.coverage_complete = 1U;
+    result.temporal_coverage = temporal_coverage;
     return result;
 }
 
@@ -363,6 +382,21 @@ int main(int argc, char** argv) {
         temporary.path() / "source.sock";
     const std::filesystem::path event_socket =
         temporary.path() / "events.sock";
+
+    ChildProcess wrong_parent_child;
+    int wrong_parent_exit = 0;
+    ok &= Expect(
+        wrong_parent_child.Spawn(
+            argv[1],
+            temporary.path() / "missing-source.sock",
+            temporary.path() / "wrong-parent-events.sock",
+            ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen,
+            0U,
+            static_cast<std::uint64_t>(::getpid()) + 1U) &&
+            wrong_parent_child.Wait(
+                std::chrono::seconds(1), &wrong_parent_exit) &&
+            wrong_parent_exit != 0,
+        "managed Event rejects a parent mismatch before source attach");
 
     ipc::RealtimeSharedServiceConfigV2 config{};
     config.run_id = RunId();
@@ -438,6 +472,112 @@ int main(int argc, char** argv) {
                 ipc::OrderEventDeltaProducerStateV1::kStoppedClean,
         "source clean stop drains aggregator and clean-stops event ring");
     service->StopControl();
+
+    DailyRuntimeFixture partial_fixture = MakeDailyRuntimeFixture();
+    const std::filesystem::path partial_source_socket =
+        temporary.path() / "source-partial.sock";
+    const std::filesystem::path partial_event_socket =
+        temporary.path() / "events-partial.sock";
+    ipc::RealtimeSharedServiceConfigV2 partial_config = config;
+    partial_config.run_id = RunId(0x44U);
+    partial_config.daily_catalog = partial_fixture.catalog;
+    partial_config.coverage_from_open = false;
+    partial_config.control_socket_path = partial_source_socket;
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2>
+        partial_service;
+    system_error = 0;
+    const auto partial_create_error =
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            partial_config, &partial_service, &system_error);
+    ok &= Expect(
+        static_cast<bool>(partial_fixture) &&
+            partial_create_error ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            partial_service != nullptr &&
+            partial_service->StartLivePartial(&system_error),
+        "start LIVE_PARTIAL Wire V2 source");
+    if (!ok) {
+        if (partial_service != nullptr) {
+            partial_service->MarkFailed();
+            partial_service->StopControl();
+        }
+        return 1;
+    }
+
+    ChildProcess mismatched_partial_child;
+    ok &= Expect(
+        mismatched_partial_child.Spawn(
+            argv[1], partial_source_socket, partial_event_socket),
+        "spawn default from-open aggregator against partial source");
+    int mismatched_partial_exit = 0;
+    ok &= Expect(
+        mismatched_partial_child.Wait(
+            std::chrono::seconds(5), &mismatched_partial_exit) &&
+            mismatched_partial_exit != 0,
+        "default from-open mode rejects LIVE_PARTIAL source");
+
+    constexpr auto process_start =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromProcessStart;
+    ChildProcess partial_child;
+    transcript.clear();
+    ok &= Expect(
+        partial_child.Spawn(
+            argv[1],
+            partial_source_socket,
+            partial_event_socket,
+            process_start,
+            0U,
+            static_cast<std::uint64_t>(::getpid())) &&
+            partial_child.ReadReady(
+                std::chrono::seconds(5), &transcript),
+        "explicit process-start aggregator reaches READY from local seq=1");
+    if (!ok) {
+        std::cerr << transcript;
+        partial_service->MarkFailed();
+        partial_service->StopControl();
+        return 1;
+    }
+
+    ipc::OrderEventDeltaControlClientConfigV1 partial_client_config{};
+    partial_client_config.control_socket_path = partial_event_socket;
+    partial_client_config.expected_source_session = SourceSession(
+        RunId(0x44U), *partial_fixture.catalog, process_start);
+    partial_client_config.timeout = std::chrono::seconds(1);
+    ipc::OrderEventDeltaControlSnapshotV1 partial_snapshot{};
+    std::unique_ptr<ipc::OrderEventDeltaRingReaderV1>
+        partial_event_reader;
+    ok &= Expect(
+        ipc::OrderEventDeltaControlConnectV1(
+            partial_client_config,
+            &partial_snapshot,
+            &partial_event_reader) ==
+                ipc::OrderEventDeltaControlClientErrorV1::kNone &&
+            partial_event_reader != nullptr &&
+            partial_snapshot.source_tick_consumed_sequence == 0U &&
+            partial_snapshot.event_published_sequence == 0U &&
+            partial_snapshot.source_session.temporal_coverage ==
+                process_start &&
+            partial_snapshot.event_session.temporal_coverage ==
+                process_start &&
+            partial_snapshot.event_session.stream_quality ==
+                ipc::OrderEventDeltaStreamQualityV1::
+                    kLocalTickStreamContiguous,
+        "partial READY exposes process-start temporal and local quality");
+
+    partial_service->MarkDraining();
+    ok &= Expect(
+        partial_service->MarkStoppedClean(0U),
+        "empty partial source reaches STOPPED_CLEAN watermark");
+    int partial_exit_code = -1;
+    ok &= Expect(
+        partial_child.Wait(
+            std::chrono::seconds(5), &partial_exit_code) &&
+            partial_exit_code == 0 &&
+            partial_event_reader != nullptr &&
+            partial_event_reader->state() ==
+                ipc::OrderEventDeltaProducerStateV1::kStoppedClean,
+        "partial source clean stop drains process-start event ring");
+    partial_service->StopControl();
 
     DailyRuntimeFixture second_fixture = MakeDailyRuntimeFixture();
     const std::filesystem::path second_source_socket =

@@ -63,7 +63,8 @@ shadow Pipeline，闭合 handoff 后发布 recovered FAST/CERTIFIED 前缀。任
 本协议范围内。
 
 `--intraday-live-partial` 是第三种 startup mode，但不是 coverage source：它
-只服务进程启动后的 latest 数据，自动禁用 CERTIFIED sidecar，并始终保持
+服务进程启动后的 latest 数据，并可通过不可变 generation 查询同一起点的
+单标的 History/tick delta；它自动禁用 CERTIFIED sidecar，并始终保持
 `certified_prefix_valid=false`。它不能用启动后的 native sequence 片段伪造
 从开盘完整的 CERTIFIED 前缀。
 
@@ -251,8 +252,13 @@ Native recovery / CERTIFIED 默认开启：
 常规 from-open 组合中，CERTIFIED Create/Start/容量配置失败只记录
 `DEGRADED`，pipeline 继续使用原 FAST sink；成功时才安装 observation sink 与
 FAST-first wrapper。online CSV recovery 不采用这个降级策略：启用 sidecar 时，
-Create/StartWorker、handoff health、prefix barrier 或 StartControl 失败都会终止
-promotion，不会开放一个缺少所声明 CERTIFIED 前缀的 recovered session。
+Create/StartWorker、handoff health、最终 prefix commit 或 StartControl 失败都会
+终止 promotion，不会开放一个缺少所声明 CERTIFIED 前缀的 recovered session。
+候选阶段的 exact FIFO probe 可重复且不修改 recovered coverage；
+`GAP_OPEN/CATCHING_UP` 会驱动同一 online recovery session 逐条消费新的 durable
+journal record，直到最早完整前缀被找到或同一个 absolute warmup deadline 到期。
+`FROZEN_CONFLICT/FROZEN_RESOURCE`、handoff drop 和内部 Tick/Event frontier
+不一致仍是不可重试的终态。
 
 ## 8. 验证
 

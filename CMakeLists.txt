@@ -113,6 +113,12 @@ add_library(L2Flow::common ALIAS l2flow_common)
 l2flow_configure_target(l2flow_common)
 set_target_properties(l2flow_common PROPERTIES
     POSITION_INDEPENDENT_CODE ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(l2flow_common PRIVATE
+        src/common/linux_thread_affinity_v1.cpp)
+    target_compile_definitions(l2flow_common PRIVATE _GNU_SOURCE)
+    target_link_libraries(l2flow_common PUBLIC Threads::Threads)
+endif()
 
 # Physical SDK lifecycle and the single five-message subscription catalog.
 add_library(l2flow_sdk STATIC
@@ -227,6 +233,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Stable native acquire/seqcount helper. Python loads this with ctypes;
     # it has no Python, Arrow, or Polars build dependency.
     add_library(l2flow_shm_reader SHARED
+        src/ipc/certified_order_event_reader_c_v1.cpp
         src/ipc/instrument_derived_event_history_c_v1.cpp
         src/ipc/order_event_delta_ring_c_v1.cpp
         src/ipc/realtime_shm_reader_c_v2.cpp)
@@ -250,7 +257,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         INTERFACE L2Flow::ipc l2flow_shm_reader)
 endif()
 
-add_executable(mdl_production_router apps/mdl_production_main.cpp)
+add_executable(mdl_production_router
+    apps/event_cpu_partition_v1.cpp
+    apps/managed_sidecar_process_v1.cpp
+    apps/mdl_production_main.cpp)
 l2flow_configure_target(mdl_production_router)
 target_link_libraries(mdl_production_router PRIVATE L2Flow::realtime)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -409,6 +419,20 @@ if(L2FLOW_BUILD_TESTS)
     target_link_libraries(test_mdl_csv_startup_replay
         PRIVATE L2Flow::market)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_event_cpu_partition_v1
+            apps/event_cpu_partition_v1.cpp
+            tests/test_event_cpu_partition_v1.cpp)
+        l2flow_configure_target(test_event_cpu_partition_v1)
+        target_link_libraries(test_event_cpu_partition_v1
+            PRIVATE L2Flow::common)
+        add_test(NAME test_event_cpu_partition_v1
+            COMMAND test_event_cpu_partition_v1)
+        add_executable(test_managed_sidecar_process_v1
+            apps/managed_sidecar_process_v1.cpp
+            tests/test_managed_sidecar_process_v1.cpp)
+        l2flow_configure_target(test_managed_sidecar_process_v1)
+        add_test(NAME test_managed_sidecar_process_v1
+            COMMAND test_managed_sidecar_process_v1)
         l2flow_add_test(test_realtime_wire_v2
             tests/test_realtime_wire_v2.cpp L2Flow::common)
         l2flow_add_test(test_realtime_certified_wire_v1
@@ -424,7 +448,7 @@ if(L2FLOW_BUILD_TESTS)
             tests/test_realtime_certified_service_v1.cpp
             L2Flow::ipc)
         target_link_libraries(test_realtime_certified_service_v1
-            PRIVATE L2Flow::realtime)
+            PRIVATE L2Flow::realtime l2flow_shm_reader)
         # Explicit, bounded latency probe. It is intentionally not registered
         # with ctest because stable measurements require operator-selected CPU
         # affinity and repeated/interleaved runs.
@@ -433,6 +457,15 @@ if(L2FLOW_BUILD_TESTS)
         l2flow_configure_target(benchmark_realtime_certified_v1)
         target_link_libraries(benchmark_realtime_certified_v1
             PRIVATE L2Flow::ipc L2Flow::realtime)
+        # Online recovery FAST-isolation A/B probe. Like the CERTIFIED probe,
+        # it is deliberately opt-in: latency verdicts require fixed affinity,
+        # storage placement, and repeated/interleaved operator runs rather
+        # than a noisy one-shot CTest threshold.
+        add_executable(benchmark_online_recovery_fast_v1
+            tests/benchmark_online_recovery_fast_v1.cpp)
+        l2flow_configure_target(benchmark_online_recovery_fast_v1)
+        target_link_libraries(benchmark_online_recovery_fast_v1
+            PRIVATE L2Flow::ipc L2Flow::realtime l2flow_shm_reader)
         l2flow_add_test(test_certified_order_event_history_v1
             tests/test_certified_order_event_history_v1.cpp
             L2Flow::ipc)

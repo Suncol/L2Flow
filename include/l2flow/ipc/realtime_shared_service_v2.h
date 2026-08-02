@@ -7,6 +7,7 @@
 #include "l2flow/ipc/realtime_store_generation_sink_v2.h"
 #include "l2flow/realtime/processing_progress_v2.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -61,16 +62,25 @@ struct RealtimeSharedServiceConfigV2 final {
         const l2flow::market::DailyInstrumentCatalogV2>
         daily_catalog;
     std::vector<l2flow::market::KLineWindowSpecV1> kline_windows;
-    // Explicit service semantics.  A preview leaves every value false and is
-    // started with StartLivePartial().  A recovered service sets the first
-    // four strong claims before Start(); CERTIFIED remains false until its
-    // independent prefix barrier succeeds and MarkCertifiedPrefixValid() is
-    // called.
+    // Explicit service semantics. A preview leaves every value false and is
+    // started with StartLivePartial(). Ordinary complete services set their
+    // known strong claims before Start(); from-open CERTIFIED may publish its
+    // independent flag later with MarkCertifiedPrefixValid(). Online recovery
+    // may instead prepare that flag while INITIALIZING and start behind the
+    // shared control_exposure_gate, so the first obtainable descriptor already
+    // contains the complete promoted capability set.
     bool coverage_from_open = false;
     bool startup_prefix_recovered = false;
     bool full_day_kline_valid = false;
     bool full_day_factor_valid = false;
     bool certified_prefix_valid = false;
+    // Optional monotonic control-plane exposure gate. When non-null and
+    // false, the control thread may be running but closes new clients before
+    // dispatching any request or descriptor. Online promotion shares one
+    // gate with the CERTIFIED service and flips it exactly once only after
+    // both control planes and all prefix barriers are ready. Normal sessions
+    // leave this null and preserve the existing control path.
+    std::shared_ptr<const std::atomic<bool>> control_exposure_gate;
     std::uint64_t tick_ring_capacity = 262'144U;
     // Fixed for the session. Exhaustion is fatal; V2 deliberately has no
     // rollover or variable-size compatibility path.
@@ -139,8 +149,23 @@ public:
     // Starts only the control plane. All catalog rows are already published,
     // so ACTIVE always begins with bound_count == capacity.
     [[nodiscard]] bool Start(int* system_error_number = nullptr) noexcept;
+    // Recovery previews use StartLivePartial() and expose only point reads.
+    // A standalone process-start session may explicitly expose immutable
+    // Store generations through History and tick-delta without claiming
+    // coverage from market open. Both variants retain LIVE_PARTIAL and every
+    // strong prefix flag remains false.
     [[nodiscard]] bool StartLivePartial(
         int* system_error_number = nullptr) noexcept;
+    [[nodiscard]] bool StartLivePartialWithProcessStartHistory(
+        int* system_error_number = nullptr) noexcept;
+
+    // Online recovery calls this only after the CERTIFIED Tick/Event prefix
+    // barrier succeeds and before Start(). It publishes the immutable
+    // capability flag while the mapping is still INITIALIZING, so the first
+    // externally obtainable FAST descriptor already carries the complete
+    // capability set. Ordinary from-open startup continues to use the
+    // post-Start MarkCertifiedPrefixValid() path.
+    [[nodiscard]] bool PrepareCertifiedPrefixValidBeforeStart() noexcept;
 
     [[nodiscard]] bool PublishApplied(
         std::size_t ordinal,
@@ -169,6 +194,11 @@ public:
 
     [[nodiscard]] std::uint64_t mapping_bytes() const noexcept;
     [[nodiscard]] std::uint64_t key_arena_used_bytes() const noexcept;
+    // Low-frequency owner health sample: the exact dense Tick prefix that is
+    // currently readable from the ring. This is one acquire load and is not
+    // used by callback or reader hot paths.
+    [[nodiscard]] std::uint64_t tick_contiguous_published_sequence()
+        const noexcept;
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] const std::filesystem::path& control_socket_path()
         const noexcept;

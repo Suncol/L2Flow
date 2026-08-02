@@ -17,10 +17,12 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -163,13 +165,17 @@ public:
     TestReplaySource(
         std::vector<std::shared_ptr<TestMessage>> messages,
         std::vector<sdk::MessageKey> fences,
-        std::function<bool()> after_fences = {})
+        std::function<bool()> after_fences = {},
+        std::size_t checkpoints_before_messages = 0U)
         : messages_(std::move(messages)),
           fences_(std::move(fences)),
-          after_fences_(std::move(after_fences)) {}
+          after_fences_(std::move(after_fences)),
+          checkpoints_before_messages_(
+              checkpoints_before_messages) {}
 
     recovery::StartupReplayResultV1 Replay(
         recovery::StartupReplaySinkV1& sink) noexcept override {
+        replay_calls.fetch_add(1U, std::memory_order_relaxed);
         recovery::StartupReplayResultV1 result{};
         for (const sdk::MessageKey& key : fences_) {
             std::string detail;
@@ -184,6 +190,19 @@ public:
             result.detail = "test journal capture failed";
             return result;
         }
+        for (std::size_t index = 0U;
+             index < checkpoints_before_messages_;
+             ++index) {
+            cooperative_checkpoint_calls.fetch_add(
+                1U, std::memory_order_relaxed);
+            std::string detail;
+            if (!sink.CooperativeCheckpoint(&detail)) {
+                result.error =
+                    recovery::StartupReplayErrorV1::kSinkRejected;
+                result.detail = std::move(detail);
+                return result;
+            }
+        }
         for (std::size_t index = 0U; index < messages_.size(); ++index) {
             recovery::StartupReplayPublicationV1 publication{};
             publication.message = messages_[index].get();
@@ -192,6 +211,7 @@ public:
             publication.csv_sequence =
                 messages_[index]->GetHead()->SequenceID;
             std::string detail;
+            publish_calls.fetch_add(1U, std::memory_order_relaxed);
             if (!sink.Publish(publication, &detail)) {
                 result.error = recovery::StartupReplayErrorV1::kSinkRejected;
                 result.error_line = publication.source_line;
@@ -203,10 +223,53 @@ public:
         return result;
     }
 
+    std::atomic<std::size_t> cooperative_checkpoint_calls{0U};
+    std::atomic<std::size_t> publish_calls{0U};
+    std::atomic<std::size_t> replay_calls{0U};
+
 private:
     std::vector<std::shared_ptr<TestMessage>> messages_;
     std::vector<sdk::MessageKey> fences_;
     std::function<bool()> after_fences_;
+    std::size_t checkpoints_before_messages_ = 0U;
+};
+
+class BlockingAppliedSink final
+    : public market::RealtimeAppliedRecordSinkV1 {
+public:
+    [[nodiscard]] bool PublishApplied(
+        std::size_t,
+        const market::RealtimeHistoryRecordV1&) noexcept override {
+        blocked_.store(true, std::memory_order_release);
+        while (!released_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
+    void MarkCoverageLost() noexcept override {
+        Release();
+    }
+
+    [[nodiscard]] bool WaitUntilBlocked() const {
+        const auto deadline =
+            std::chrono::steady_clock::now() + 1s;
+        while (!blocked_.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
+    void Release() noexcept {
+        released_.store(true, std::memory_order_release);
+    }
+
+private:
+    std::atomic<bool> blocked_{false};
+    std::atomic<bool> released_{false};
 };
 
 [[nodiscard]] common::Identity128 RunId(std::uint8_t first) {
@@ -214,6 +277,30 @@ private:
     result[0U] = static_cast<std::byte>(first);
     result[15U] = std::byte{0xa5U};
     return result;
+}
+
+[[nodiscard]] runtime::RealtimePipelineLiveStatusV1 HealthyLiveStatus(
+    std::uint64_t accepted,
+    std::uint64_t applied) {
+    runtime::RealtimePipelineLiveStatusV1 result{};
+    result.processing_progress.accepted_sequence = accepted;
+    result.processing_progress.applied_sequence = applied;
+    result.accepting = true;
+    return result;
+}
+
+template <typename Predicate>
+[[nodiscard]] bool WaitUntil(
+    Predicate predicate,
+    std::chrono::milliseconds timeout = 1s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
 }
 
 [[nodiscard]] std::vector<sdk::MessageKey> AllFences() {
@@ -245,7 +332,11 @@ struct OnlineFixture final {
             std::filesystem::remove_all(journal_path, error));
     }
 
-    [[nodiscard]] bool Create(std::uint8_t identity) {
+    [[nodiscard]] bool Create(
+        std::uint8_t identity,
+        std::shared_ptr<market::RealtimeAppliedRecordSinkV1>
+            applied_sink = nullptr,
+        std::size_t decoder_queue_capacity = 16U) {
         market::DailyInstrumentSourceEntryV2 source{};
         source.key.market = market::MarketV1::kShenzhen;
         source.key.security_id_source = {
@@ -289,7 +380,8 @@ struct OnlineFixture final {
         pipeline_config.runtime_state = runtime_state.get();
         pipeline_config.source_stream_ids = kSourceStreamIds;
         pipeline_config.maximum_sdk_message_bytes = 4096U;
-        pipeline_config.decoder_queue_capacity_per_source = 16U;
+        pipeline_config.decoder_queue_capacity_per_source =
+            decoder_queue_capacity;
         pipeline_config.store_worker_count = 1U;
         pipeline_config.store_queue_capacity_per_source_worker = 16U;
         pipeline_config.intraday_store.segment_target_bytes =
@@ -301,6 +393,8 @@ struct OnlineFixture final {
         pipeline_config.intraday_store.coverage_from_open = true;
         pipeline_config.sdk.enabled = false;
         pipeline_config.external_ingress_enabled = true;
+        pipeline_config.applied_record_sink =
+            std::move(applied_sink);
         std::string detail;
         if (runtime::RealtimePipelineV1::Create(
                 pipeline_config, &shadow, &detail) !=
@@ -409,8 +503,14 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
                    fixture.Capture(*suffix, 2'000U);
         });
     auto config = fixture.Config(source);
+    config.governor_quantum_records = 1U;
     config.certified_queue_utilization_percent = [] { return 80U; };
     config.certified_handoff_healthy = [] { return true; };
+    std::atomic<std::uint64_t> preview_samples{0U};
+    config.preview_live_status = [&preview_samples] {
+        preview_samples.fetch_add(1U, std::memory_order_relaxed);
+        return HealthyLiveStatus(0U, 0U);
+    };
     auto handoff = CreateHandoff(
         test, std::move(config), "create online boundary handoff");
     if (handoff == nullptr) {
@@ -430,11 +530,13 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
             recovered.csv_publications == 1U &&
             recovered.journal_records_read == 2U &&
             recovered.journal_duplicates_suppressed == 1U &&
+            recovered.journal_overlap_digests == 1U &&
+            recovered.journal_live_suffix_digests_skipped == 1U &&
             recovered.journal_suffix_publications == 1U &&
             recovered.last_journal_serial == 2U &&
             recovered.promotion_journal_frontier == 2U &&
             recovered.promotion_shadow_ingress_frontier == 2U &&
-            recovered.replay_throttle_events == 1U,
+            recovered.replay_throttle_events == 3U,
         "CSV duplicate is suppressed, suffix is admitted, and B is fixed under throttling");
 
     const runtime::RealtimePipelineCutResultV1 first_generation =
@@ -452,6 +554,7 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
             !handoff->MarkPromoted(10'000U),
         "promotion completion timestamp is nonzero and write-once");
 
+    preview_samples.store(0U, std::memory_order_relaxed);
     auto tail = std::make_shared<TestMessage>(102U, 102U, 102'000U);
     test->Expect(
         fixture.Capture(*tail, 3'000U),
@@ -467,11 +570,13 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
         pumped.disposition ==
                 recovery::OnlineRecoveryPumpDispositionV1::kRecord &&
             pumped.error == recovery::OnlineRecoveryErrorV1::kNone &&
-            pumped.journal_serial == 3U,
-        "permanent tail consumes B+1 only after boundary handling");
+            pumped.journal_serial == 3U &&
+            preview_samples.load(std::memory_order_relaxed) == 1U,
+        "permanent tail consumes B+1 after one owner-health sample");
     test->Expect(
         fixture.journal->StopAndFlush(),
         "flush online tail journal");
+    preview_samples.store(0U, std::memory_order_relaxed);
     const auto end = handoff->PumpNext(
         std::chrono::steady_clock::now() + 3s);
     const auto final_snapshot = handoff->Snapshot();
@@ -480,8 +585,12 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
             final_snapshot.promoted &&
             final_snapshot.promotion_realtime_ns == 9'999U &&
             final_snapshot.last_journal_serial == 3U &&
-            final_snapshot.journal_suffix_publications == 2U,
-        "tail reaches exact durable End without changing promotion identity");
+            final_snapshot.journal_overlap_digests == 1U &&
+            final_snapshot.journal_live_suffix_digests_skipped == 2U &&
+            final_snapshot.replay_throttle_events == 3U &&
+            final_snapshot.journal_suffix_publications == 2U &&
+            preview_samples.load(std::memory_order_relaxed) == 1U,
+        "tail skips redundant digests/cooldown and samples owner health once before End");
 
     const runtime::RealtimePipelineCutResultV1 final_generation =
         fixture.shadow->CutAndPublishGeneration(3s);
@@ -492,6 +601,1231 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             final_row.record_count == 3U,
         "post-promotion authoritative Store continues on the journal suffix");
+}
+
+void TestPrePromotionCandidateCatchUpAndPhases(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(32U),
+        "create pre-promotion candidate fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    auto handoff = CreateHandoff(
+        test,
+        fixture.Config(source),
+        "create pre-promotion candidate handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+
+    const auto requested_deadline =
+        std::chrono::steady_clock::now() + 3s;
+    const auto initial =
+        handoff->PrepareInitialCandidate(requested_deadline);
+    const auto initial_snapshot = handoff->Snapshot();
+    test->Expect(
+        initial.ready() && initial.journal_frontier == 0U &&
+            initial.shadow_ingress_frontier == 0U &&
+            initial.warmup_deadline == requested_deadline &&
+            source->replay_calls.load(std::memory_order_relaxed) == 1U &&
+            initial_snapshot.csv_complete &&
+            initial_snapshot.candidate_boundary_ready &&
+            initial_snapshot.phase ==
+                recovery::OnlineRecoveryPhaseV1::kCandidateReady &&
+            !initial_snapshot.promotion_boundary_ready &&
+            initial_snapshot.promotion_journal_frontier == 0U &&
+            initial_snapshot.promotion_shadow_ingress_frontier == 0U,
+        "initial preparation publishes only candidate B=0 under one fixed deadline");
+
+    const auto duplicate_prepare =
+        handoff->PrepareInitialCandidate(requested_deadline + 1s);
+    const auto pre_promotion_pump = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 10ms);
+    const auto after_invalid_calls = handoff->Snapshot();
+    test->Expect(
+        duplicate_prepare.error ==
+                recovery::OnlineRecoveryErrorV1::kInvalidConfiguration &&
+            !duplicate_prepare.ready() &&
+            source->replay_calls.load(std::memory_order_relaxed) == 1U &&
+            pre_promotion_pump.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kFailed &&
+            pre_promotion_pump.error ==
+                recovery::OnlineRecoveryErrorV1::kInvalidConfiguration &&
+            after_invalid_calls.error ==
+                recovery::OnlineRecoveryErrorV1::kNone &&
+            after_invalid_calls.phase ==
+                recovery::OnlineRecoveryPhaseV1::kCandidateReady &&
+            after_invalid_calls.candidate_boundary_ready &&
+            !after_invalid_calls.promotion_boundary_ready,
+        "CSV initialization is once-only and tail pumping is gated before promotion");
+
+    const auto idle = handoff->CatchUpOneBeforePromotion(
+        std::chrono::steady_clock::now());
+    test->Expect(
+        idle.disposition ==
+                recovery::OnlineRecoveryCandidateAdvanceDispositionV1::
+                    kIdle &&
+            idle.error == recovery::OnlineRecoveryErrorV1::kNone &&
+            idle.candidate.ready() &&
+            idle.candidate.journal_frontier == 0U &&
+            idle.candidate.warmup_deadline == initial.warmup_deadline,
+        "an expired short poll leaves the ready candidate unchanged");
+
+    std::array<std::shared_ptr<TestMessage>, 3U> suffixes{
+        std::make_shared<TestMessage>(1U, 1U, 100'001U),
+        std::make_shared<TestMessage>(2U, 2U, 100'002U),
+        std::make_shared<TestMessage>(3U, 3U, 100'003U)};
+    bool captured = true;
+    for (std::size_t index = 0U; index < suffixes.size(); ++index) {
+        captured = captured && fixture.Capture(
+            *suffixes[index],
+            1'000U + static_cast<std::uint64_t>(index));
+    }
+    const bool committed = WaitUntil([&fixture] {
+        const auto journal = fixture.journal->Snapshot();
+        return journal.healthy() && journal.accepted_serial == 3U &&
+               journal.committed_serial == 3U;
+    });
+    test->Expect(
+        captured && committed,
+        "commit three durable suffix serials before candidate polling");
+    if (!captured || !committed) {
+        return;
+    }
+
+    for (std::uint64_t expected = 1U; expected <= 3U; ++expected) {
+        const auto advanced = handoff->CatchUpOneBeforePromotion(
+            std::chrono::steady_clock::now() + 1s);
+        const auto snapshot = handoff->Snapshot();
+        test->Expect(
+            advanced.disposition ==
+                    recovery::OnlineRecoveryCandidateAdvanceDispositionV1::
+                        kAdvanced &&
+                advanced.error == recovery::OnlineRecoveryErrorV1::kNone &&
+                advanced.candidate.ready() &&
+                advanced.candidate.journal_frontier == expected &&
+                advanced.candidate.shadow_ingress_frontier == expected &&
+                advanced.candidate.warmup_deadline ==
+                    initial.warmup_deadline &&
+                snapshot.last_journal_serial == expected &&
+                snapshot.candidate_journal_frontier == expected &&
+                snapshot.candidate_shadow_ingress_frontier == expected &&
+                snapshot.candidate_boundary_ready &&
+                snapshot.phase ==
+                    recovery::OnlineRecoveryPhaseV1::kCandidateReady &&
+                !snapshot.promotion_boundary_ready &&
+                snapshot.promotion_journal_frontier == 0U &&
+                snapshot.promotion_shadow_ingress_frontier == 0U,
+            "each pre-promotion catch-up consumes exactly one durable serial without moving final B");
+    }
+
+    const auto boundary = handoff->FreezePromotionBoundary();
+    const auto frozen = handoff->Snapshot();
+    const auto catch_up_after_freeze =
+        handoff->CatchUpOneBeforePromotion(
+            std::chrono::steady_clock::now() + 10ms);
+    const auto pump_before_mark = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 10ms);
+    const auto frozen_after_invalid_calls = handoff->Snapshot();
+    test->Expect(
+        boundary.ready() && boundary.journal_frontier == 3U &&
+            boundary.shadow_ingress_frontier == 3U &&
+            frozen.promotion_boundary_ready && !frozen.promoted &&
+            frozen.phase ==
+                recovery::OnlineRecoveryPhaseV1::kPromotionFrozen &&
+            frozen.promotion_journal_frontier == 3U &&
+            frozen.promotion_shadow_ingress_frontier == 3U &&
+            catch_up_after_freeze.disposition ==
+                recovery::OnlineRecoveryCandidateAdvanceDispositionV1::
+                    kFailed &&
+            catch_up_after_freeze.error ==
+                recovery::OnlineRecoveryErrorV1::kInvalidConfiguration &&
+            pump_before_mark.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kFailed &&
+            pump_before_mark.error ==
+                recovery::OnlineRecoveryErrorV1::kInvalidConfiguration &&
+            frozen_after_invalid_calls.error ==
+                recovery::OnlineRecoveryErrorV1::kNone &&
+            frozen_after_invalid_calls.phase ==
+                recovery::OnlineRecoveryPhaseV1::kPromotionFrozen &&
+            frozen_after_invalid_calls.promotion_journal_frontier == 3U,
+        "only FreezePromotionBoundary fixes B and all pre-promotion APIs remain phase gated");
+
+    test->Expect(
+        handoff->MarkPromoted(9'001U) &&
+            handoff->Snapshot().phase ==
+                recovery::OnlineRecoveryPhaseV1::kPromoted,
+        "promotion explicitly unlocks the permanent journal tail");
+}
+
+void TestEarlyFreezeLeavesDurableSuffixForPromotedTail(
+    TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(35U),
+        "create early-freeze candidate fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    auto handoff = CreateHandoff(
+        test,
+        fixture.Config(source),
+        "create early-freeze candidate handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+
+    const auto initial = handoff->PrepareInitialCandidate(
+        std::chrono::steady_clock::now() + 3s);
+    test->Expect(
+        initial.ready() && initial.journal_frontier == 0U &&
+            initial.shadow_ingress_frontier == 0U,
+        "early-freeze fixture starts from candidate B0=0");
+    if (!initial.ready()) {
+        return;
+    }
+
+    std::array<std::shared_ptr<TestMessage>, 3U> suffixes{
+        std::make_shared<TestMessage>(1U, 1U, 400'001U),
+        std::make_shared<TestMessage>(2U, 2U, 400'002U),
+        std::make_shared<TestMessage>(3U, 3U, 400'003U)};
+    bool captured = true;
+    for (std::size_t index = 0U; index < suffixes.size(); ++index) {
+        captured = captured && fixture.Capture(
+            *suffixes[index],
+            40'000U + static_cast<std::uint64_t>(index));
+    }
+    const bool committed = WaitUntil([&fixture] {
+        const auto journal = fixture.journal->Snapshot();
+        return journal.healthy() && journal.accepted_serial == 3U &&
+               journal.committed_serial == 3U;
+    });
+    test->Expect(
+        captured && committed,
+        "make B+1 through B+3 durable before the single catch-up");
+    if (!captured || !committed) {
+        return;
+    }
+
+    const auto advanced = handoff->CatchUpOneBeforePromotion(
+        std::chrono::steady_clock::now() + 1s);
+    const auto after_one = handoff->Snapshot();
+    const auto durable_before_freeze = fixture.journal->Snapshot();
+    test->Expect(
+        advanced.disposition ==
+                recovery::OnlineRecoveryCandidateAdvanceDispositionV1::
+                    kAdvanced &&
+            advanced.error == recovery::OnlineRecoveryErrorV1::kNone &&
+            advanced.candidate.ready() &&
+            advanced.candidate.journal_frontier == 1U &&
+            advanced.candidate.shadow_ingress_frontier == 1U &&
+            after_one.last_journal_serial == 1U &&
+            after_one.candidate_journal_frontier == 1U &&
+            after_one.journal_records_read == 1U &&
+            !after_one.promotion_boundary_ready &&
+            durable_before_freeze.accepted_serial == 3U &&
+            durable_before_freeze.committed_serial == 3U,
+        "one catch-up consumes only B+1 while durable B+2 and B+3 remain unread");
+
+    const auto boundary = handoff->FreezePromotionBoundary();
+    const auto frozen = handoff->Snapshot();
+    test->Expect(
+        boundary.ready() && boundary.journal_frontier == 1U &&
+            boundary.shadow_ingress_frontier == 1U &&
+            frozen.phase ==
+                recovery::OnlineRecoveryPhaseV1::kPromotionFrozen &&
+            frozen.last_journal_serial == 1U &&
+            frozen.journal_records_read == 1U &&
+            frozen.promotion_journal_frontier == 1U &&
+            frozen.promotion_shadow_ingress_frontier == 1U,
+        "early Freeze fixes P=B+1 without consuming already-durable B+2/B+3");
+
+    const bool promoted = handoff->MarkPromoted(9'002U);
+    const auto second = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 1s);
+    const auto after_second = handoff->Snapshot();
+    const auto third = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 1s);
+    const auto after_third = handoff->Snapshot();
+    test->Expect(
+        promoted &&
+            second.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kRecord &&
+            second.error == recovery::OnlineRecoveryErrorV1::kNone &&
+            second.journal_serial == 2U &&
+            after_second.last_journal_serial == 2U &&
+            after_second.promotion_journal_frontier == 1U &&
+            third.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kRecord &&
+            third.error == recovery::OnlineRecoveryErrorV1::kNone &&
+            third.journal_serial == 3U &&
+            after_third.last_journal_serial == 3U &&
+            after_third.journal_records_read == 3U &&
+            after_third.promotion_journal_frontier == 1U &&
+            after_third.promotion_shadow_ingress_frontier == 1U,
+        "only the promoted tail consumes the retained durable suffix in serial order");
+}
+
+void TestPrePromotionCancellationWinsJournalEnd(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(34U),
+        "create pre-promotion cancellation fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    std::atomic<bool> cancel_requested{false};
+    std::atomic<std::uint64_t> cancel_samples{0U};
+    auto config = fixture.Config(source);
+    config.cancel_requested = [&] {
+        const bool requested =
+            cancel_requested.load(std::memory_order_acquire);
+        cancel_samples.fetch_add(1U, std::memory_order_release);
+        return requested;
+    };
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create pre-promotion cancellation handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+
+    const auto initial = handoff->PrepareInitialCandidate(
+        std::chrono::steady_clock::now() + 3s);
+    test->Expect(
+        initial.ready(),
+        "prepare the cancellation-race candidate");
+    if (!initial.ready()) {
+        return;
+    }
+    cancel_samples.store(0U, std::memory_order_release);
+
+    recovery::OnlineRecoveryCandidateAdvanceV1 advance{};
+    std::atomic<bool> finished{false};
+    std::thread worker([&] {
+        advance = handoff->CatchUpOneBeforePromotion(
+            std::chrono::steady_clock::now() + 2s);
+        finished.store(true, std::memory_order_release);
+    });
+    const bool waiting_for_next = WaitUntil([&] {
+        return handoff->Snapshot().phase ==
+                   recovery::OnlineRecoveryPhaseV1::kCandidateCatchUp &&
+               cancel_samples.load(std::memory_order_acquire) >= 3U &&
+               !finished.load(std::memory_order_acquire);
+    });
+    // The third cancellation sample is the final check immediately before
+    // ReadNext.  Give the worker a scheduling window to enter the empty
+    // writing journal's wait for the next durable serial.
+    std::this_thread::sleep_for(10ms);
+    const bool blocked_before_shutdown =
+        waiting_for_next && !finished.load(std::memory_order_acquire);
+    cancel_requested.store(true, std::memory_order_release);
+    const bool stopped = fixture.journal->StopAndFlush();
+    worker.join();
+
+    const auto failed = handoff->Snapshot();
+    test->Expect(
+        blocked_before_shutdown && stopped &&
+            advance.disposition ==
+                recovery::OnlineRecoveryCandidateAdvanceDispositionV1::
+                    kFailed &&
+            advance.error ==
+                recovery::OnlineRecoveryErrorV1::kCancelled &&
+            advance.candidate.error ==
+                recovery::OnlineRecoveryErrorV1::kCancelled &&
+            failed.error ==
+                recovery::OnlineRecoveryErrorV1::kCancelled &&
+            failed.phase == recovery::OnlineRecoveryPhaseV1::kFailed &&
+            failed.error !=
+                recovery::OnlineRecoveryErrorV1::kJournalFailed,
+        "cancellation wins when StopAndFlush wakes a blocked candidate reader with End");
+}
+
+void TestCandidateAdmissionUsesFixedWarmupDeadline(TestContext* test) {
+    OnlineFixture fixture;
+    const auto blocker = std::make_shared<BlockingAppliedSink>();
+    test->Expect(
+        fixture.Create(33U, blocker, 1U),
+        "create pre-promotion admission-budget fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        blocker->Release();
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    auto config = fixture.Config(source);
+    config.warmup_timeout = 2s;
+    config.per_record_admission_timeout = 1s;
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create pre-promotion admission-budget handoff");
+    if (handoff == nullptr) {
+        blocker->Release();
+        return;
+    }
+
+    const auto initial = handoff->PrepareInitialCandidate(
+        std::chrono::steady_clock::now() + 2s);
+    bool shadow_filled = initial.ready();
+    for (std::uint64_t sequence = 1U; sequence <= 10U; ++sequence) {
+        TestMessage message(
+            sequence, sequence, 200'000U + sequence);
+        runtime::RealtimePipelineExternalIngressV1 input{};
+        input.message = &message;
+        input.recv_realtime_ns = 10'000U + sequence;
+        input.recv_monotonic_ns = 20'000U + sequence;
+        input.admission_timeout = 1s;
+        const auto ingress =
+            fixture.shadow->IngestExternalMessage(input);
+        shadow_filled = shadow_filled && ingress.accepted();
+        if (sequence == 1U) {
+            shadow_filled =
+                shadow_filled && blocker->WaitUntilBlocked();
+        }
+    }
+    const auto filled_status = fixture.shadow->LiveStatus();
+    shadow_filled =
+        shadow_filled &&
+        filled_status.processing_progress.accepted_sequence == 10U &&
+        filled_status.processing_progress.applied_sequence == 0U;
+
+    auto suffix =
+        std::make_shared<TestMessage>(100U, 100U, 300'000U);
+    const bool captured = fixture.Capture(*suffix, 30'000U);
+    const bool committed = WaitUntil([&fixture] {
+        const auto journal = fixture.journal->Snapshot();
+        return journal.healthy() && journal.accepted_serial == 1U &&
+               journal.committed_serial == 1U;
+    });
+    test->Expect(
+        shadow_filled && captured && committed,
+        "prepare a durable record behind a full shadow admission queue");
+    if (!shadow_filled || !captured || !committed) {
+        blocker->Release();
+        return;
+    }
+
+    std::thread releaser([blocker] {
+        std::this_thread::sleep_for(80ms);
+        blocker->Release();
+    });
+    const auto started = std::chrono::steady_clock::now();
+    const auto advanced = handoff->CatchUpOneBeforePromotion(
+        started + 20ms);
+    const auto elapsed =
+        std::chrono::steady_clock::now() - started;
+    releaser.join();
+    const auto recovered = handoff->Snapshot();
+    test->Expect(
+        advanced.disposition ==
+                recovery::OnlineRecoveryCandidateAdvanceDispositionV1::
+                    kAdvanced &&
+            advanced.error == recovery::OnlineRecoveryErrorV1::kNone &&
+            advanced.candidate.ready() &&
+            advanced.candidate.journal_frontier == 1U &&
+            advanced.candidate.shadow_ingress_frontier == 11U &&
+            advanced.candidate.warmup_deadline ==
+                initial.warmup_deadline &&
+            elapsed >= 50ms && elapsed < 500ms &&
+            recovered.error == recovery::OnlineRecoveryErrorV1::kNone &&
+            recovered.last_journal_serial == 1U &&
+            !recovered.promotion_boundary_ready,
+        "after dequeue, admission may outlive the short poll but remains inside the fixed warmup deadline");
+}
+
+void TestWorkConservingGovernor(TestContext* test) {
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(18U),
+            "create preview high-water fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto first =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto second =
+                std::make_shared<TestMessage>(101U, 101U, 101'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{
+                    first, second},
+                AllFences(),
+                std::function<bool()>{},
+                recovery::
+                    kStartupReplayCooperativeCheckpointRecordsV1 *
+                    2U);
+            std::atomic<std::uint64_t> preview_accepted{64U};
+            std::atomic<std::uint64_t> preview_applied{0U};
+            auto config = fixture.Config(source);
+            config.preview_outstanding_low_water_records = 0U;
+            config.preview_outstanding_high_water_records = 64U;
+            config.pressure_poll_interval = 100us;
+            config.preview_live_status = [&] {
+                return HealthyLiveStatus(
+                    preview_accepted.load(std::memory_order_acquire),
+                    preview_applied.load(std::memory_order_acquire));
+            };
+            config.certified_pressure_sample = [] {
+                return recovery::OnlineRecoveryCertifiedPressureV1{};
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create preview high-water handoff");
+            if (handoff != nullptr) {
+                recovery::OnlineRecoveryBoundaryV1 boundary{};
+                std::atomic<bool> finished{false};
+                std::thread worker([&] {
+                    boundary = handoff->RecoverToPromotionBoundary();
+                    finished.store(true, std::memory_order_release);
+                });
+                const bool paused = WaitUntil([&] {
+                    return handoff->Snapshot()
+                               .preview_pause_events != 0U;
+                });
+                const auto while_paused = handoff->Snapshot();
+                test->Expect(
+                    paused && !finished.load(std::memory_order_acquire) &&
+                        while_paused.csv_publications == 0U &&
+                        source->cooperative_checkpoint_calls.load(
+                            std::memory_order_relaxed) == 1U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 0U,
+                    "preview high water gates parser work before any publication");
+                preview_applied.store(64U, std::memory_order_release);
+                worker.join();
+                const auto recovered = handoff->Snapshot();
+                const auto generation =
+                    fixture.shadow->CutAndPublishGeneration(3s);
+                market::IntradayInstrumentSummaryV1 row{};
+                test->Expect(
+                    boundary.ready() &&
+                        recovered.preview_pause_events == 1U &&
+                        recovered.csv_parser_checkpoint_events ==
+                            recovery::
+                                kStartupReplayCooperativeCheckpointRecordsV1 *
+                                2U &&
+                        recovered.csv_publications == 2U &&
+                        source->cooperative_checkpoint_calls.load(
+                            std::memory_order_relaxed) ==
+                            recovery::
+                                kStartupReplayCooperativeCheckpointRecordsV1 *
+                                2U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 2U &&
+                        generation.published() &&
+                        generation.store_generation->Find(1U, &row) ==
+                            market::IntradayInstrumentStoreQueryErrorV1::
+                                kNone &&
+                        row.record_count == 2U,
+                    "preview drain resumes complete History without loss");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(19U),
+            "create sustained-small-lag fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto first =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto second =
+                std::make_shared<TestMessage>(101U, 101U, 101'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{
+                    first, second},
+                AllFences());
+            auto config = fixture.Config(source);
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(1U, 0U);
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create sustained-small-lag handoff");
+            if (handoff != nullptr) {
+                const auto boundary =
+                    handoff->RecoverToPromotionBoundary();
+                const auto recovered = handoff->Snapshot();
+                test->Expect(
+                    boundary.ready() &&
+                        recovered.csv_publications == 2U &&
+                        recovered.preview_pause_events == 0U,
+                    "preview lag below high water cannot starve recovery");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(20U),
+            "create quiet-governor fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto first =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto second =
+                std::make_shared<TestMessage>(101U, 101U, 101'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{
+                    first, second},
+                AllFences());
+            std::atomic<std::uint64_t> certified_samples{0U};
+            auto config = fixture.Config(source);
+            config.governor_quantum_records = 1U;
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(0U, 0U);
+            };
+            config.certified_pressure_sample = [&] {
+                certified_samples.fetch_add(
+                    1U, std::memory_order_relaxed);
+                return recovery::OnlineRecoveryCertifiedPressureV1{};
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create quiet-governor handoff");
+            if (handoff != nullptr) {
+                const auto boundary =
+                    handoff->RecoverToPromotionBoundary();
+                const auto recovered = handoff->Snapshot();
+                test->Expect(
+                    boundary.ready() &&
+                        recovered.csv_publications == 2U &&
+                        certified_samples.load(
+                            std::memory_order_relaxed) == 2U &&
+                        recovered.replay_throttle_events == 0U &&
+                        recovered.replay_pause_events == 0U &&
+                        recovered.preview_pause_events == 0U &&
+                        recovered.shadow_pause_events == 0U &&
+                        recovered.cooperative_yield_events == 0U,
+                    "quiet combined-pressure path executes full throughput with no sleep or yield path");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(21U),
+            "create preview pressure deadline fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto message =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{message},
+                AllFences(),
+                std::function<bool()>{},
+                1U);
+            auto config = fixture.Config(source);
+            config.warmup_timeout = 20ms;
+            config.pressure_poll_interval = 100us;
+            config.preview_outstanding_low_water_records = 0U;
+            config.preview_outstanding_high_water_records = 1U;
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(1U, 0U);
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create preview pressure deadline handoff");
+            if (handoff != nullptr) {
+                const auto boundary =
+                    handoff->RecoverToPromotionBoundary();
+                const auto recovered = handoff->Snapshot();
+                test->Expect(
+                    boundary.error ==
+                            recovery::OnlineRecoveryErrorV1::
+                                kWarmupTimeout &&
+                        !boundary.ready() &&
+                        recovered.csv_publications == 0U &&
+                        recovered.csv_parser_checkpoint_events == 1U &&
+                        recovered.preview_pause_events == 1U &&
+                        source->cooperative_checkpoint_calls.load(
+                            std::memory_order_relaxed) == 1U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 0U,
+                    "persistent preview high water cancels no-Publish parsing at the warmup deadline");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(22U),
+            "create retention overflow fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{},
+                AllFences());
+            auto config = fixture.Config(source);
+            config.overlap_retention_per_tuple =
+                std::numeric_limits<std::size_t>::max();
+            std::unique_ptr<recovery::OnlineRecoveryHandoffV1>
+                handoff;
+            std::string detail;
+            const auto error =
+                recovery::OnlineRecoveryHandoffV1::Create(
+                    std::move(config), &handoff, &detail);
+            test->Expect(
+                error ==
+                        recovery::OnlineRecoveryErrorV1::
+                            kInvalidConfiguration &&
+                    handoff == nullptr,
+                "retention capacity rejects K+1 overflow before allocation");
+        }
+    }
+}
+
+void TestTerminalHealthPreemptsPressure(TestContext* test) {
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(23U),
+            "create pressure/CERTIFIED health fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto message =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{message},
+                AllFences(),
+                std::function<bool()>{},
+                1U);
+            std::atomic<bool> certified_healthy{true};
+            auto config = fixture.Config(source);
+            config.pressure_poll_interval = 1ms;
+            config.preview_outstanding_low_water_records = 0U;
+            config.preview_outstanding_high_water_records = 1U;
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(1U, 0U);
+            };
+            config.certified_pressure_sample = [&] {
+                recovery::OnlineRecoveryCertifiedPressureV1 result{};
+                result.healthy = certified_healthy.load(
+                    std::memory_order_acquire);
+                return result;
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create pressure/CERTIFIED health handoff");
+            if (handoff != nullptr) {
+                recovery::OnlineRecoveryBoundaryV1 boundary{};
+                std::thread worker([&] {
+                    boundary = handoff->RecoverToPromotionBoundary();
+                });
+                const bool paused = WaitUntil([&] {
+                    return handoff->Snapshot()
+                               .preview_pause_events == 1U;
+                });
+                certified_healthy.store(false, std::memory_order_release);
+                worker.join();
+                const auto snapshot = handoff->Snapshot();
+                test->Expect(
+                    paused &&
+                        boundary.error ==
+                            recovery::OnlineRecoveryErrorV1::
+                                kCertifiedFailed &&
+                        snapshot.preview_pause_events == 1U &&
+                        snapshot.csv_publications == 0U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 0U,
+                    "preview pressure cannot hide a terminal CERTIFIED failure");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(24U),
+            "create pressure/shadow health fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto message =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{message},
+                AllFences(),
+                std::function<bool()>{},
+                1U);
+            auto config = fixture.Config(source);
+            config.pressure_poll_interval = 1ms;
+            config.preview_outstanding_low_water_records = 0U;
+            config.preview_outstanding_high_water_records = 1U;
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(1U, 0U);
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create pressure/shadow health handoff");
+            if (handoff != nullptr) {
+                recovery::OnlineRecoveryBoundaryV1 boundary{};
+                std::thread worker([&] {
+                    boundary = handoff->RecoverToPromotionBoundary();
+                });
+                const bool paused = WaitUntil([&] {
+                    return handoff->Snapshot()
+                               .preview_pause_events == 1U;
+                });
+                fixture.shadow->StopAndDrain();
+                worker.join();
+                const auto snapshot = handoff->Snapshot();
+                test->Expect(
+                    paused &&
+                        boundary.error ==
+                            recovery::OnlineRecoveryErrorV1::
+                                kShadowAdmissionFailed &&
+                        snapshot.preview_pause_events == 1U &&
+                        snapshot.csv_publications == 0U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 0U,
+                    "preview pressure cannot hide a terminal shadow failure");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(28U),
+            "create pressure/control-plane health fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto message =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{message},
+                AllFences(),
+                std::function<bool()>{},
+                1U);
+            std::atomic<bool> control_planes_healthy{true};
+            auto config = fixture.Config(source);
+            config.pressure_poll_interval = 1ms;
+            config.preview_outstanding_low_water_records = 0U;
+            config.preview_outstanding_high_water_records = 1U;
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(1U, 0U);
+            };
+            config.control_planes_healthy = [&] {
+                return control_planes_healthy.load(
+                    std::memory_order_acquire);
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create pressure/control-plane health handoff");
+            if (handoff != nullptr) {
+                recovery::OnlineRecoveryBoundaryV1 boundary{};
+                std::thread worker([&] {
+                    boundary = handoff->RecoverToPromotionBoundary();
+                });
+                const bool paused = WaitUntil([&] {
+                    return handoff->Snapshot()
+                               .preview_pause_events == 1U;
+                });
+                control_planes_healthy.store(
+                    false, std::memory_order_release);
+                worker.join();
+                const auto snapshot = handoff->Snapshot();
+                test->Expect(
+                    paused &&
+                        boundary.error ==
+                            recovery::OnlineRecoveryErrorV1::
+                                kUnexpectedFailure &&
+                        snapshot.preview_pause_events == 1U &&
+                        snapshot.csv_publications == 0U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 0U,
+                    "preview pressure cannot hide a terminal FAST control-plane failure");
+            }
+        }
+    }
+
+    {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(29U),
+            "create pressure/journal health fixture");
+        if (fixture.shadow != nullptr && fixture.journal != nullptr) {
+            auto message =
+                std::make_shared<TestMessage>(100U, 100U, 100'000U);
+            auto source = std::make_shared<TestReplaySource>(
+                std::vector<std::shared_ptr<TestMessage>>{message},
+                AllFences(),
+                std::function<bool()>{},
+                1U);
+            auto config = fixture.Config(source);
+            config.pressure_poll_interval = 1ms;
+            config.preview_outstanding_low_water_records = 0U;
+            config.preview_outstanding_high_water_records = 1U;
+            config.preview_live_status = [] {
+                return HealthyLiveStatus(1U, 0U);
+            };
+            auto handoff = CreateHandoff(
+                test,
+                std::move(config),
+                "create pressure/journal health handoff");
+            if (handoff != nullptr) {
+                recovery::OnlineRecoveryBoundaryV1 boundary{};
+                std::thread worker([&] {
+                    boundary = handoff->RecoverToPromotionBoundary();
+                });
+                const bool paused = WaitUntil([&] {
+                    return handoff->Snapshot()
+                               .preview_pause_events == 1U;
+                });
+                const bool rejected_invalid_capture =
+                    !fixture.journal->Capture({});
+                worker.join();
+                const auto snapshot = handoff->Snapshot();
+                test->Expect(
+                    paused && rejected_invalid_capture &&
+                        fixture.journal->failed() &&
+                        boundary.error ==
+                            recovery::OnlineRecoveryErrorV1::
+                                kJournalFailed &&
+                        snapshot.preview_pause_events == 1U &&
+                        snapshot.csv_publications == 0U &&
+                        source->publish_calls.load(
+                            std::memory_order_relaxed) == 0U,
+                    "preview pressure cannot hide an asynchronous live-journal failure");
+            }
+        }
+    }
+}
+
+void TestTailHysteresisAcrossDeadlines(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(25U),
+        "create cross-deadline hysteresis fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    std::atomic<std::uint64_t> accepted{0U};
+    std::atomic<std::uint64_t> applied{0U};
+    auto config = fixture.Config(source);
+    config.pressure_poll_interval = 500us;
+    config.preview_outstanding_low_water_records = 0U;
+    config.preview_outstanding_high_water_records = 4U;
+    config.preview_live_status = [&] {
+        return HealthyLiveStatus(
+            accepted.load(std::memory_order_acquire),
+            applied.load(std::memory_order_acquire));
+    };
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create cross-deadline hysteresis handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+    const auto boundary = handoff->RecoverToPromotionBoundary();
+    auto suffix =
+        std::make_shared<TestMessage>(100U, 100U, 100'000U);
+    test->Expect(
+        boundary.ready() && handoff->MarkPromoted(1U) &&
+            fixture.Capture(*suffix, 1'000U),
+        "promote and append suffix for hysteresis test");
+
+    accepted.store(4U, std::memory_order_release);
+    const auto high = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 3ms);
+    const auto after_high = handoff->Snapshot();
+    applied.store(2U, std::memory_order_release);
+    const auto between = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 3ms);
+    const auto after_between = handoff->Snapshot();
+    applied.store(4U, std::memory_order_release);
+    const auto drained = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 2s);
+    test->Expect(
+        high.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kIdle &&
+            between.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kIdle &&
+            drained.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kRecord &&
+            drained.journal_serial == 1U &&
+            after_high.preview_pause_events == 1U &&
+            after_high.last_journal_serial == 0U &&
+            after_between.preview_pause_events == 1U &&
+            after_between.last_journal_serial == 0U,
+        "a high-water episode remains draining between low/high across PumpNext deadlines");
+}
+
+void TestCleanShutdownTailDrain(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(26U),
+        "create clean shutdown tail fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    std::atomic<bool> preview_quiesced{false};
+    auto config = fixture.Config(source);
+    config.preview_live_status = [&] {
+        runtime::RealtimePipelineLiveStatusV1 status =
+            HealthyLiveStatus(1U, 1U);
+        if (preview_quiesced.load(std::memory_order_acquire)) {
+            status.accepting = false;
+            status.stopped = true;
+        }
+        return status;
+    };
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create clean shutdown tail handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+    const auto boundary = handoff->RecoverToPromotionBoundary();
+    auto suffix =
+        std::make_shared<TestMessage>(100U, 100U, 100'000U);
+    const bool rejected_before_promotion =
+        !handoff->BeginCleanShutdownTailDrain(
+            std::chrono::steady_clock::now() + 2s);
+    const bool promoted = handoff->MarkPromoted(1U);
+    const bool suffix_captured = fixture.Capture(*suffix, 1'000U);
+    const bool drain_started =
+        handoff->BeginCleanShutdownTailDrain(
+            std::chrono::steady_clock::now() + 2s);
+    preview_quiesced.store(true, std::memory_order_release);
+    const bool journal_flushed = fixture.journal->StopAndFlush();
+    const auto record = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 2s);
+    const auto end = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 2s);
+    const auto generation =
+        fixture.shadow->StopAndPublishFinalGeneration(2s);
+    market::IntradayInstrumentSummaryV1 row{};
+    const auto snapshot = handoff->Snapshot();
+    const auto journal = fixture.journal->Snapshot();
+    test->Expect(
+        boundary.ready() && rejected_before_promotion && promoted &&
+            suffix_captured && drain_started && journal_flushed &&
+            record.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kRecord &&
+            record.journal_serial == 1U &&
+            end.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kEnd &&
+            snapshot.error ==
+                recovery::OnlineRecoveryErrorV1::kNone &&
+            snapshot.last_journal_serial == journal.committed_serial &&
+            journal.committed_serial == journal.accepted_serial &&
+            generation.published() &&
+            generation.store_generation->Find(1U, &row) ==
+                market::IntradayInstrumentStoreQueryErrorV1::kNone &&
+            row.record_count == 1U,
+        "expected preview quiesce still drains the flushed journal through End into final History");
+}
+
+void TestCleanShutdownTailDrainFailsClosed(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(27U),
+        "create fail-closed shutdown tail fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    std::atomic<bool> preview_failed{false};
+    auto config = fixture.Config(source);
+    config.preview_live_status = [&] {
+        runtime::RealtimePipelineLiveStatusV1 status =
+            HealthyLiveStatus(0U, 0U);
+        if (preview_failed.load(std::memory_order_acquire)) {
+            status.accepting = false;
+            status.stopped = true;
+            status.fatal = true;
+        }
+        return status;
+    };
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create fail-closed shutdown tail handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+    const auto boundary = handoff->RecoverToPromotionBoundary();
+    const bool promoted = handoff->MarkPromoted(1U);
+    const bool drain_started =
+        handoff->BeginCleanShutdownTailDrain(
+            std::chrono::steady_clock::now() + 2s);
+    preview_failed.store(true, std::memory_order_release);
+    const bool journal_flushed = fixture.journal->StopAndFlush();
+    const auto pumped = handoff->PumpNext(
+        std::chrono::steady_clock::now() + 2s);
+    test->Expect(
+        boundary.ready() && promoted && drain_started &&
+            journal_flushed &&
+            pumped.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kFailed &&
+            pumped.error ==
+                recovery::OnlineRecoveryErrorV1::kUnexpectedFailure &&
+            handoff->Snapshot().error ==
+                recovery::OnlineRecoveryErrorV1::kUnexpectedFailure,
+        "shutdown relaxation never hides a fatal preview owner");
+}
+
+void TestCleanShutdownTailDrainDeadline(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(30U),
+        "create bounded shutdown tail fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    std::atomic<bool> permanently_saturated{false};
+    auto config = fixture.Config(source);
+    config.pressure_poll_interval = 100us;
+    config.preview_outstanding_low_water_records = 0U;
+    config.preview_outstanding_high_water_records = 1U;
+    config.preview_live_status = [&] {
+        return permanently_saturated.load(std::memory_order_acquire)
+                   ? HealthyLiveStatus(2U, 0U)
+                   : HealthyLiveStatus(0U, 0U);
+    };
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create bounded shutdown tail handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+    const auto boundary = handoff->RecoverToPromotionBoundary();
+    const bool promoted = handoff->MarkPromoted(1U);
+    const bool rejected_expired_deadline =
+        !handoff->BeginCleanShutdownTailDrain(
+            std::chrono::steady_clock::now());
+    const bool drain_started =
+        handoff->BeginCleanShutdownTailDrain(
+            std::chrono::steady_clock::now() + 10ms);
+    const bool rejected_deadline_extension =
+        !handoff->BeginCleanShutdownTailDrain(
+            std::chrono::steady_clock::now() + 1s);
+    permanently_saturated.store(true, std::memory_order_release);
+    const bool journal_flushed = fixture.journal->StopAndFlush();
+    const auto started = std::chrono::steady_clock::now();
+    const auto pumped = handoff->PumpNext(
+        started + 1s);
+    const auto elapsed =
+        std::chrono::steady_clock::now() - started;
+    test->Expect(
+        boundary.ready() && promoted && rejected_expired_deadline &&
+            drain_started && rejected_deadline_extension &&
+            journal_flushed &&
+            pumped.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kFailed &&
+            pumped.error ==
+                recovery::OnlineRecoveryErrorV1::kBackpressureTimeout &&
+            handoff->Snapshot().error ==
+                recovery::OnlineRecoveryErrorV1::kBackpressureTimeout &&
+            elapsed < 250ms,
+        "permanent tail pressure fails closed at the clean shutdown deadline");
+}
+
+void TestCleanShutdownAdmissionUsesRemainingDeadline(
+    TestContext* test) {
+    OnlineFixture fixture;
+    const auto blocker = std::make_shared<BlockingAppliedSink>();
+    test->Expect(
+        fixture.Create(31U, blocker, 1U),
+        "create bounded shadow-admission fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        blocker->Release();
+        return;
+    }
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences());
+    auto config = fixture.Config(source);
+    config.per_record_admission_timeout = 2s;
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create bounded shadow-admission handoff");
+    if (handoff == nullptr) {
+        blocker->Release();
+        return;
+    }
+
+    bool shadow_filled = true;
+    for (std::uint64_t sequence = 1U; sequence <= 10U; ++sequence) {
+        TestMessage message(
+            sequence, sequence, 100'000U + sequence);
+        runtime::RealtimePipelineExternalIngressV1 input{};
+        input.message = &message;
+        input.recv_realtime_ns = 1'000U + sequence;
+        input.recv_monotonic_ns = 2'000U + sequence;
+        input.admission_timeout = 1s;
+        const auto ingress =
+            fixture.shadow->IngestExternalMessage(input);
+        shadow_filled = shadow_filled && ingress.accepted();
+        if (sequence == 1U) {
+            shadow_filled =
+                shadow_filled && blocker->WaitUntilBlocked();
+        }
+    }
+    const runtime::RealtimePipelineLiveStatusV1 filled_status =
+        fixture.shadow->LiveStatus();
+    shadow_filled =
+        shadow_filled &&
+        filled_status.processing_progress.accepted_sequence == 10U &&
+        filled_status.processing_progress.applied_sequence == 0U;
+
+    const auto boundary = handoff->RecoverToPromotionBoundary();
+    const bool promoted = handoff->MarkPromoted(1U);
+    auto suffix =
+        std::make_shared<TestMessage>(100U, 100U, 200'000U);
+    const bool suffix_captured = fixture.Capture(*suffix, 3'000U);
+    const bool journal_flushed = fixture.journal->StopAndFlush();
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + 20ms;
+    const bool drain_started =
+        handoff->BeginCleanShutdownTailDrain(drain_deadline);
+    const auto started = std::chrono::steady_clock::now();
+    const auto pumped = handoff->PumpNext(started + 1s);
+    const auto elapsed =
+        std::chrono::steady_clock::now() - started;
+    blocker->Release();
+
+    test->Expect(
+        shadow_filled && boundary.ready() && promoted &&
+            suffix_captured && journal_flushed && drain_started &&
+            pumped.disposition ==
+                recovery::OnlineRecoveryPumpDispositionV1::kFailed &&
+            pumped.error ==
+                recovery::OnlineRecoveryErrorV1::kBackpressureTimeout &&
+            elapsed < 250ms,
+        "a full shadow source queue cannot extend clean shutdown to the ordinary admission timeout");
 }
 
 void TestOverlapFailures(TestContext* test) {
@@ -516,12 +1850,14 @@ void TestOverlapFailures(TestContext* test) {
             if (handoff != nullptr) {
                 const auto boundary =
                     handoff->RecoverToPromotionBoundary();
+                const auto recovered = handoff->Snapshot();
                 test->Expect(
                     boundary.error ==
                             recovery::OnlineRecoveryErrorV1::kOverlapConflict &&
                         !boundary.ready() &&
-                        handoff->Snapshot().error ==
-                            recovery::OnlineRecoveryErrorV1::kOverlapConflict,
+                        recovered.error ==
+                            recovery::OnlineRecoveryErrorV1::kOverlapConflict &&
+                        recovered.journal_overlap_digests == 1U,
                     "same tuple/SequenceID with different semantic payload fails closed");
             }
         }
@@ -585,11 +1921,14 @@ void TestOverlapFailures(TestContext* test) {
             if (handoff != nullptr) {
                 const auto boundary =
                     handoff->RecoverToPromotionBoundary();
+                const auto recovered = handoff->Snapshot();
                 test->Expect(
                     boundary.error ==
                             recovery::OnlineRecoveryErrorV1::kOverlapConflict &&
-                        handoff->Snapshot().journal_suffix_publications == 1U,
-                    "tuple cannot return to retained CSV prefix after entering live suffix");
+                        recovered.journal_suffix_publications == 1U &&
+                        recovered.journal_overlap_digests == 0U &&
+                        recovered.journal_live_suffix_digests_skipped == 1U,
+                    "tuple return to retained prefix fails before another semantic decode");
             }
         }
     }
@@ -739,6 +2078,17 @@ void TestShanghaiDigestExcludesDecoderStatePhase(TestContext* test) {
 int main() {
     TestContext test;
     TestPromotionBoundaryAndTail(&test);
+    TestPrePromotionCandidateCatchUpAndPhases(&test);
+    TestEarlyFreezeLeavesDurableSuffixForPromotedTail(&test);
+    TestPrePromotionCancellationWinsJournalEnd(&test);
+    TestCandidateAdmissionUsesFixedWarmupDeadline(&test);
+    TestWorkConservingGovernor(&test);
+    TestTerminalHealthPreemptsPressure(&test);
+    TestTailHysteresisAcrossDeadlines(&test);
+    TestCleanShutdownTailDrain(&test);
+    TestCleanShutdownTailDrainFailsClosed(&test);
+    TestCleanShutdownTailDrainDeadline(&test);
+    TestCleanShutdownAdmissionUsesRemainingDeadline(&test);
     TestOverlapFailures(&test);
     TestFenceHealthAndQuietSession(&test);
     TestShanghaiDigestExcludesDecoderStatePhase(&test);

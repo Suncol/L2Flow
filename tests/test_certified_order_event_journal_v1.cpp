@@ -314,13 +314,28 @@ bool TestLazyCommitAndCoherentCut() {
         return false;
     }
 
+    ipc::CertifiedOrderEventStatusSnapshotV1 status{};
+    ok &= Expect(
+        reader->ReadStatus(&status) ==
+                ipc::CertifiedOrderEventReadResultV1::kOk &&
+            status.coverage_from_open() &&
+            !status.startup_prefix_recovered(),
+        "ordinary journal starts with from-open, non-recovered coverage");
+    ok &= Expect(
+        journal->MarkStartupPrefixRecovered() &&
+            journal->MarkStartupPrefixRecovered() &&
+            reader->ReadStatus(&status) ==
+                ipc::CertifiedOrderEventReadResultV1::kOk &&
+            status.coverage_from_open() &&
+            status.startup_prefix_recovered(),
+        "startup-prefix recovery coverage is monotonic and reader-visible");
+
     auto first = ShanghaiTrade(1U);
     ok &= Expect(
         journal->PublishCanonicalTick(
             1U, 0U, 0U, std::span(&first, 1U)) ==
             ipc::CertifiedOrderEventJournalPublishErrorV1::kNone,
         "publish first Event before Tick/Event coherent read");
-    ipc::CertifiedOrderEventStatusSnapshotV1 status{};
     ok &= Expect(
         reader->ReadStatus(&status) ==
                 ipc::CertifiedOrderEventReadResultV1::kOk &&

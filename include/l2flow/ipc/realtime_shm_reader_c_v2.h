@@ -34,9 +34,11 @@ enum l2flow_shm_reader_error_v2 {
     L2FLOW_SHM_READER_INCONSISTENT_READ_V2 = 8,
 };
 
-// Wire V2.3 server states. LIVE_PARTIAL permits point-in-time latest reads,
-// but it is not a from-open prefix and therefore cannot be interpreted as
-// ACTIVE by History, Factor, KLine, or CERTIFIED consumers.
+// Wire V2.3 server states. LIVE_PARTIAL permits point-in-time latest reads and
+// an explicitly enabled standalone service may also publish immutable
+// process-start History/tick-delta generations. It is never a from-open
+// prefix and cannot be interpreted as ACTIVE by Factor, KLine, or CERTIFIED
+// consumers.
 enum l2flow_shm_server_state_v2 {
     L2FLOW_SHM_SERVER_INITIALIZING_V2 = 1,
     L2FLOW_SHM_SERVER_ACTIVE_V2 = 2,

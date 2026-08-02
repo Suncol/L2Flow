@@ -40,6 +40,8 @@ from l2flow_realtime.order_event_delta_control import (
 )
 from l2flow_realtime.order_event_delta_live import (
     LiveOrderEventDeltaProducerState,
+    LiveOrderEventDeltaStreamQuality,
+    LiveOrderEventDeltaTemporalCoverage,
     _DerivedEventRowC,
     _LiveReadResultC,
     _LiveSessionC,
@@ -111,6 +113,15 @@ class _FakeEventLibrary:
             or session.trade_date != _TRADE_DATE
             or session.ring_capacity != _RING_CAPACITY
             or session.total_mapping_bytes != _MAPPING_BYTES
+            or session.temporal_coverage
+            != int(
+                LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+            )
+            or session.stream_quality
+            != int(
+                LiveOrderEventDeltaStreamQuality.
+                LOCAL_TICK_STREAM_CONTIGUOUS
+            )
         ):
             return 7
         os.fstat(self.opened_fd)
@@ -214,6 +225,12 @@ def _source_session(
     bound_count=_CATALOG_CAPACITY,
     catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
     coverage_complete=True,
+    temporal_coverage=(
+        LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+    ),
+    stream_quality=(
+        LiveOrderEventDeltaStreamQuality.LOCAL_TICK_STREAM_CONTIGUOUS
+    ),
 ):
     return LiveOrderEventDeltaSourceSession(
         run_id=run_id,
@@ -227,6 +244,8 @@ def _source_session(
         bound_count=bound_count,
         catalog_scope=catalog_scope,
         coverage_complete=coverage_complete,
+        temporal_coverage=temporal_coverage,
+        stream_quality=stream_quality,
     )
 
 
@@ -248,6 +267,12 @@ def _response(
     source_bound_count=_CATALOG_CAPACITY,
     source_catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
     source_coverage_complete=1,
+    source_temporal_coverage=(
+        LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+    ),
+    source_stream_quality=(
+        LiveOrderEventDeltaStreamQuality.LOCAL_TICK_STREAM_CONTIGUOUS
+    ),
     producer_state=LiveOrderEventDeltaProducerState.ACTIVE,
     event_run_id=_EVENT_RUN_ID,
     event_session_epoch=_EVENT_EPOCH,
@@ -255,6 +280,12 @@ def _response(
     event_header_flags=0,
     event_ring_capacity=_RING_CAPACITY,
     event_total_mapping_bytes=_MAPPING_BYTES,
+    event_temporal_coverage=(
+        LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+    ),
+    event_stream_quality=(
+        LiveOrderEventDeltaStreamQuality.LOCAL_TICK_STREAM_CONTIGUOUS
+    ),
     reserved_event=0,
     reserved=None,
 ):
@@ -296,7 +327,11 @@ def _response(
         17,
         999,
         111,
-        *(reserved if reserved is not None else (0,) * 6),
+        int(source_temporal_coverage),
+        int(source_stream_quality),
+        int(event_temporal_coverage),
+        int(event_stream_quality),
+        *(reserved if reserved is not None else (0,) * 4),
     )
 
 
@@ -378,7 +413,7 @@ def _session_info(
         published_records=5,
         trade_date=trade_date,
         server_state=ServerState.ACTIVE,
-        flags=0,
+        flags=1 << 2,
         capacity=4,
         window_count=0,
         catalog_scope=CatalogScope.DECLARED_DAILY_A_SHARE,
@@ -419,7 +454,7 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
     def test_ctypes_and_control_wire_sizes_match_native_abi(self):
         self.assertEqual(_REQUEST.size, 144)
         self.assertEqual(_RESPONSE.size, 264)
-        self.assertEqual(CONTROL_MINOR, 1)
+        self.assertEqual(CONTROL_MINOR, 2)
         self.assertEqual(ctypes.sizeof(_LiveSessionC), 64)
         self.assertEqual(ctypes.sizeof(_LiveReadResultC), 80)
         self.assertEqual(ctypes.sizeof(_DerivedEventRowC), 320)
@@ -483,7 +518,7 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
 
             request = _REQUEST.unpack(captured["request"])
             self.assertEqual(request[0], CONTROL_MAGIC)
-            self.assertEqual(request[1:7], (1, 1, 1, 0, 144, 0))
+            self.assertEqual(request[1:7], (1, 2, 1, 0, 144, 0))
             self.assertEqual(request[7], 1234)
             self.assertEqual(request[8], _SOURCE_RUN_ID)
             self.assertEqual(request[9], _CATALOG_DIGEST)
@@ -498,7 +533,7 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                 int(CatalogScope.DECLARED_DAILY_A_SHARE),
                 1,
             ))
-            self.assertEqual(request[19:], (0, 0))
+            self.assertEqual(request[19:], (1, 1, 0))
             self.assertEqual(len(captured["timeouts"]), 3)
             self.assertTrue(
                 all(
@@ -532,6 +567,8 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
             {"source_bound_count": _CATALOG_CAPACITY - 1},
             {"source_catalog_scope": 1},
             {"source_coverage_complete": 0},
+            {"source_temporal_coverage": 2},
+            {"source_stream_quality": 2},
         )
         for override in variants:
             with self.subTest(override=override):
@@ -786,7 +823,7 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
             (
                 "reserved",
                 lambda request: _response(
-                    request, reserved=(0, 0, 1, 0, 0, 0)
+                    request, reserved=(0, 0, 1, 0)
                 ),
             ),
             (
@@ -802,6 +839,18 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                 "coverage_lost",
                 lambda request: _response(
                     request, event_header_flags=1
+                ),
+            ),
+            (
+                "event_temporal_coverage_mismatch",
+                lambda request: _response(
+                    request, event_temporal_coverage=2
+                ),
+            ),
+            (
+                "unknown_event_stream_quality",
+                lambda request: _response(
+                    request, event_stream_quality=2
                 ),
             ),
             (

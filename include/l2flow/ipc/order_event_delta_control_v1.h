@@ -28,6 +28,11 @@ struct OrderEventDeltaSourceSessionV1 final {
     std::uint32_t bound_count = 0U;
     std::uint32_t catalog_scope = 0U;
     std::uint32_t coverage_complete = 0U;
+    OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        OrderEventDeltaTemporalCoverageV1::kFromMarketOpen;
+    OrderEventDeltaStreamQualityV1 stream_quality =
+        OrderEventDeltaStreamQualityV1::
+            kLocalTickStreamContiguous;
 
     [[nodiscard]] friend bool operator==(
         const OrderEventDeltaSourceSessionV1&,
@@ -52,7 +57,8 @@ struct OrderEventDeltaControlSnapshotV1 final {
 struct OrderEventDeltaControlServerConfigV1 final {
     OrderEventDeltaSourceSessionV1 source_session{};
     // Non-owning. The producer must outlive the server, including its
-    // internally joined control thread.
+    // internally joined control thread. Source and ring temporal/quality
+    // contracts must match exactly.
     const OrderEventDeltaRingProducerV1* event_ring = nullptr;
     // Absolute pathname below a same-UID, owner-only directory. Create never
     // unlinks an existing filesystem object.
@@ -120,8 +126,10 @@ public:
 
     // Lifecycle calls are serial-only. A server is single-start: after Stop,
     // it cannot be restarted. Start succeeds (READY) only while the ring is
-    // ACTIVE and coverage-complete. Every successful GET_SESSION repeats that
-    // same test immediately before transferring the descriptor.
+    // ACTIVE and its declared local stream has not lost coverage. The
+    // temporal origin may be market-open or process-start and is never
+    // upgraded implicitly. Every successful GET_SESSION repeats that same
+    // test immediately before transferring the descriptor.
     [[nodiscard]] bool Start(
         int* system_error_number = nullptr) noexcept;
     void Stop() noexcept;

@@ -51,6 +51,7 @@ CertifiedOrderEventReadResultNameV1(
 
 struct CertifiedOrderEventStatusSnapshotV1 final {
     RealtimeCertifiedStatusSnapshotV1 tick{};
+    std::uint32_t coverage_flags = 0U;
     std::uint64_t event_publish_tag = 0U;
     std::uint64_t event_heartbeat_monotonic_ns = 0U;
     std::uint64_t event_canonical_apply_frontier = 0U;
@@ -64,6 +65,15 @@ struct CertifiedOrderEventStatusSnapshotV1 final {
     // its append is intentionally fallible and precedes Tick slot overwrite;
     // such rows remain hidden until the Tick header reaches the same input.
     std::uint64_t coherent_canonical_apply_frontier = 0U;
+
+    [[nodiscard]] bool coverage_from_open() const noexcept {
+        return (coverage_flags &
+                kCertifiedOrderEventCoverageFromOpenV1) != 0U;
+    }
+    [[nodiscard]] bool startup_prefix_recovered() const noexcept {
+        return (coverage_flags &
+                kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U;
+    }
 };
 
 struct CertifiedOrderEventReadBatchResultV1 final {

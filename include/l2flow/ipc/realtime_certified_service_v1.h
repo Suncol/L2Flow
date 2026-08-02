@@ -1,17 +1,20 @@
 #pragma once
 
 #include "l2flow/common/identity128.h"
+#include "l2flow/common/linux_thread_affinity_v1.h"
 #include "l2flow/ipc/certified_order_event_history_v1.h"
 #include "l2flow/ipc/realtime_certified_wire_v1.h"
 #include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
 #include "l2flow/realtime/native_sequence_observer_v1.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <string_view>
 
 namespace l2flow::ipc {
@@ -120,9 +123,32 @@ struct RealtimeCertifiedServiceConfigV1 final {
     std::uint64_t derived_event_lazy_commit_chunk_bytes =
         64ULL * 1024ULL * 1024ULL;
 
+    // Optional strict Linux cpusets using the grammar accepted by
+    // ParseLinuxCpuSetV1 (for example "4-7,12"). Empty strings preserve the
+    // inherited process affinity and perform no affinity syscall. Nonempty
+    // masks are parsed during Create, then applied and read back exactly
+    // inside each new thread before StartWorker/StartControl can report
+    // success. The target-thread syscall is the authoritative allowed-mask
+    // check: a production launcher may intentionally narrow its creator
+    // thread to FAST CPUs before these workers expand to disjoint Event CPUs.
+    std::string worker_cpu_set;
+    std::string control_cpu_set;
+
+    // Optional monotonic gate shared with a recovered FAST service. The
+    // control thread is allowed to start behind the gate, but no Tick/Event
+    // descriptor is transferred until the single shared atomic becomes
+    // true. Empty preserves the ordinary immediately-visible behavior.
+    std::shared_ptr<const std::atomic<bool>> control_exposure_gate;
+
     // Absolute path below an operator-owned directory. Create never unlinks a
     // pre-existing path.
     std::filesystem::path control_socket_path;
+
+    // Online-recovery sessions set this true. Their control plane cannot start
+    // until the one-shot recovered-prefix commit succeeds. Appending this
+    // default-false field preserves existing positional aggregate initializers
+    // and ordinary live-from-open startup behavior.
+    bool control_requires_prefix_commit = false;
 };
 
 enum class RealtimeCertifiedServiceCreateErrorV1 : std::uint8_t {
@@ -173,6 +199,71 @@ struct RealtimeCertifiedServiceSnapshotV1 final {
     // counter-only fields below remain current, but callers must not treat
     // the wire-derived state/frontiers as one coherent snapshot.
     bool wire_snapshot_consistent = false;
+    // Control-plane lifecycle is distinct from the data worker: online
+    // recovery starts the worker before exposing the socket. The single state
+    // is one coherent linearization point for start, normal stop, and an
+    // asynchronous accept-loop failure.
+    enum class ControlState : std::uint8_t {
+        kNotStarted = 0U,
+        kRunning,
+        kStopping,
+        kStopped,
+        kFailed,
+    } control_state = ControlState::kNotStarted;
+};
+
+enum class RealtimeCertifiedPrefixFenceOperationErrorV1
+    : std::uint8_t {
+    kNone = 0U,
+    kInvalidArgument,
+    kInvalidLifecycle,
+    kTimedOut,
+    kWorkerFailed,
+    kInternalFailure,
+};
+
+[[nodiscard]] std::string_view
+RealtimeCertifiedPrefixFenceOperationErrorNameV1(
+    RealtimeCertifiedPrefixFenceOperationErrorV1 error) noexcept;
+
+// One immutable Tick/Event cut captured by the CERTIFIED worker at an exact
+// FIFO handoff boundary. A completed GapOpen/CatchingUp probe has operation
+// error kNone: its operation completed successfully, but its native-sequence
+// health is not yet promotable.
+struct RealtimeCertifiedPrefixFenceResultV1 final {
+    RealtimeCertifiedPrefixFenceOperationErrorV1 operation_error =
+        RealtimeCertifiedPrefixFenceOperationErrorV1::kNone;
+    RealtimeCertifiedStateV1 state =
+        RealtimeCertifiedStateV1::kNoData;
+    std::uint64_t fence_id = 0U;
+    std::uint64_t header_publish_tag = 0U;
+    std::uint64_t canonical_apply_frontier = 0U;
+    std::uint64_t correction_epoch = 0U;
+    std::uint32_t gap_open_channel_count = 0U;
+    std::uint32_t catching_up_channel_count = 0U;
+    std::uint32_t frozen_channel_count = 0U;
+    CertifiedOrderEventHistorySnapshotV1 event_history{};
+    std::uint64_t event_journal_frontier = 0U;
+    std::uint64_t event_published_sequence = 0U;
+
+    [[nodiscard]] bool ready() const noexcept {
+        return operation_error ==
+                   RealtimeCertifiedPrefixFenceOperationErrorV1::kNone &&
+               (state == RealtimeCertifiedStateV1::kNoData ||
+                state == RealtimeCertifiedStateV1::kContiguous);
+    }
+    [[nodiscard]] bool retryable() const noexcept {
+        return operation_error ==
+                   RealtimeCertifiedPrefixFenceOperationErrorV1::kNone &&
+               (state == RealtimeCertifiedStateV1::kGapOpen ||
+                state == RealtimeCertifiedStateV1::kCatchingUp);
+    }
+    [[nodiscard]] bool terminal() const noexcept {
+        return operation_error ==
+                   RealtimeCertifiedPrefixFenceOperationErrorV1::kNone &&
+               (state == RealtimeCertifiedStateV1::kFrozenConflict ||
+                state == RealtimeCertifiedStateV1::kFrozenResource);
+    }
 };
 
 // Default-on production composition for native-gap recovery. It is both the
@@ -208,6 +299,14 @@ public:
         int* system_error_number = nullptr) noexcept;
     [[nodiscard]] bool StartControl(
         int* system_error_number = nullptr) noexcept;
+    // Repeatable, side-effect-free recovery readiness probe. It commits the
+    // ordinary Tick/Event data prefix at an exact worker FIFO boundary, but
+    // never marks startup-prefix recovery and never authorizes control start.
+    [[nodiscard]] RealtimeCertifiedPrefixFenceOperationErrorV1
+    ProbePrefixFence(
+        std::chrono::milliseconds timeout,
+        RealtimeCertifiedPrefixFenceResultV1* output,
+        int* system_error_number = nullptr) noexcept;
     // Enqueues a FIFO worker barrier and waits until all handoffs before it
     // have been projected and their headers committed.  It deliberately does
     // not expose the query socket; online recovery uses this split phase so
@@ -217,6 +316,12 @@ public:
     [[nodiscard]] bool WaitForPrefixBarrier(
         std::chrono::milliseconds timeout,
         int* system_error_number = nullptr) noexcept;
+    // Detailed overload returning the exact immutable Tick/Event cut committed
+    // by the final one-shot barrier. The legacy overload above is preserved.
+    [[nodiscard]] bool WaitForPrefixBarrier(
+        std::chrono::milliseconds timeout,
+        RealtimeCertifiedPrefixFenceResultV1* output,
+        int* system_error_number) noexcept;
 
     // Required FAST publication happens first. A false return can therefore
     // mean only that FAST itself failed. Queue pressure, conflicts, gaps, and
@@ -238,6 +343,14 @@ public:
     void MarkDraining() noexcept;
     void MarkStoppedClean() noexcept;
     void StopControl() noexcept;
+    // Linearizable promotion confirmation. The same-value RMW succeeds only
+    // while the accept loop is still Running; a competing failure/stop CAS
+    // is therefore ordered before or after this exact confirmation point.
+    [[nodiscard]] bool ControlRunningConfirmed() noexcept;
+    // Atomic-only lifecycle sample for low-frequency health monitoring. It
+    // does not scan or touch the CERTIFIED wire data/header.
+    [[nodiscard]] RealtimeCertifiedServiceSnapshotV1::ControlState
+    ControlStateSnapshot() const noexcept;
 
     [[nodiscard]] RealtimeCertifiedServiceSnapshotV1 Snapshot()
         const noexcept;
@@ -251,6 +364,25 @@ public:
         int* output_fd) const noexcept;
     [[nodiscard]] bool WaitUntilIdleForTest(
         std::chrono::milliseconds timeout) const noexcept;
+    // Injects an asynchronous control-loop wakeup without requesting a normal
+    // stop, allowing lifecycle tests to verify fail-closed health reporting.
+    [[nodiscard]] bool FailControlForTest() noexcept;
+    void SetPrefixProbePausedForTest(bool paused) noexcept;
+    [[nodiscard]] bool PrefixProbeReachedForTest() const noexcept;
+    [[nodiscard]] bool PrefixProbeWaitingForPriorAckForTest()
+        const noexcept;
+    void SetPrefixCommitPausedForTest(bool paused) noexcept;
+    [[nodiscard]] bool PrefixCommitReachedForTest() const noexcept;
+    [[nodiscard]] bool PrefixCommitFinishedForTest() const noexcept;
+    [[nodiscard]] bool StartupPrefixRecoveredForTest() const noexcept;
+    // Serial lifecycle probes. They read the kernel mask of the live native
+    // thread rather than echoing configuration.
+    [[nodiscard]] bool ReadWorkerCpuSetForTest(
+        l2flow::common::LinuxCpuSetV1* output,
+        int* system_error_number = nullptr) noexcept;
+    [[nodiscard]] bool ReadControlCpuSetForTest(
+        l2flow::common::LinuxCpuSetV1* output,
+        int* system_error_number = nullptr) noexcept;
 
     // Legacy in-process mirror. It never returns the projector's physically
     // staged N generation while the public Tick header is still at N-1.

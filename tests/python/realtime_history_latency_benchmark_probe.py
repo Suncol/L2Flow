@@ -28,6 +28,10 @@ After one ``READY`` line, stdin accepts these exact commands:
     WORKER_DELTA_FROM_VERIFIED \
         INSTRUMENT GENERATION validate|price REPEATS EXPECTED_RECORDS
     LATEST_SERIES INSTRUMENT FIRST_INGRESS COUNT
+    RAW_POLARS_BASELINE INSTRUMENT GENERATION
+    RAW_POLARS_UPDATE \
+        INSTRUMENT GENERATION REPEATS EXPECTED_RECORDS \
+        EXPECTED_FIRST_INGRESS EXPECTED_LAST_INGRESS
     QUIT
 
 Every measured repetition emits one ``*_SAMPLE`` key/value line.  A ``DONE``
@@ -1952,10 +1956,18 @@ def _run_raw_polars_update(
     expected_generation: int,
     repeats: int,
     expected_records: int,
+    expected_first_ingress: int,
+    expected_last_ingress: int,
 ) -> None:
     _require(
         instrument_id in checkpoints,
         "raw Polars update has no verified baseline",
+    )
+    _require(
+        expected_last_ingress >= expected_first_ingress
+        and expected_last_ingress - expected_first_ingress + 1
+        == expected_records,
+        "raw Polars expected ingress interval is inconsistent",
     )
     base = checkpoints[instrument_id]
     target_checkpoint = None
@@ -1982,6 +1994,9 @@ def _run_raw_polars_update(
         ingress_sum = frame.select(
             polars.col("ingress_sequence").sum()
         ).item()
+        unique_ingress = frame.select(
+            polars.col("ingress_sequence").n_unique()
+        ).item()
         first_recv_ns, last_recv_ns = frame.select(
             polars.col("recv_monotonic_ns").min().alias("first_recv"),
             polars.col("recv_monotonic_ns").max().alias("last_recv"),
@@ -2001,11 +2016,30 @@ def _run_raw_polars_update(
         )
         _require(
             isinstance(ingress_sum, int)
+            and isinstance(unique_ingress, int)
             and isinstance(first_recv_ns, int)
             and isinstance(last_recv_ns, int)
             and isinstance(first_ingress, int)
             and isinstance(last_ingress, int),
             "raw Polars aggregate returned a non-integer",
+        )
+        _require(
+            unique_ingress == expected_records,
+            "raw Polars ingress sequence is not unique",
+        )
+        _require(
+            first_ingress == expected_first_ingress
+            and last_ingress == expected_last_ingress,
+            "raw Polars ingress interval differs from the offered interval",
+        )
+        expected_ingress_sum = (
+            (expected_first_ingress + expected_last_ingress)
+            * expected_records
+            // 2
+        )
+        _require(
+            ingress_sum == expected_ingress_sum,
+            "raw Polars ingress interval is not complete",
         )
         _require(
             isinstance(checkpoint.history_published_monotonic_ns, int)
@@ -2034,6 +2068,7 @@ def _run_raw_polars_update(
             batches=batch_count,
             first_ingress=first_ingress,
             last_ingress=last_ingress,
+            unique_ingress=unique_ingress,
             ingress_sum=ingress_sum,
             first_callback_entry_ns=first_recv_ns,
             last_callback_entry_ns=last_recv_ns,
@@ -2278,6 +2313,8 @@ def main(argv: list[str]) -> int:
             run_id=session.run_id.hex(),
             session_epoch=session.session_epoch,
             trade_date=session.trade_date,
+            server_state=session.server_state.name,
+            coverage_from_open=int(session.coverage_from_open),
             capacity=session.capacity,
             bound_count=session.bound_count,
             monotonic_implementation=(
@@ -2484,8 +2521,8 @@ def main(argv: list[str]) -> int:
                     continue
                 if operation == "RAW_POLARS_UPDATE":
                     _require(
-                        len(words) == 5,
-                        "RAW_POLARS_UPDATE requires four arguments",
+                        len(words) == 7,
+                        "RAW_POLARS_UPDATE requires six arguments",
                     )
                     instrument_id = _decimal(
                         words[1],
@@ -2511,6 +2548,18 @@ def main(argv: list[str]) -> int:
                         maximum=_UINT64_MAX,
                         allow_zero=False,
                     )
+                    expected_first_ingress = _decimal(
+                        words[5],
+                        "expected_first_ingress",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_last_ingress = _decimal(
+                        words[6],
+                        "expected_last_ingress",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
                     command_index += 1
                     _run_raw_polars_update(
                         pl,
@@ -2521,6 +2570,8 @@ def main(argv: list[str]) -> int:
                         expected_generation=generation,
                         repeats=repeats,
                         expected_records=expected_records,
+                        expected_first_ingress=expected_first_ingress,
+                        expected_last_ingress=expected_last_ingress,
                     )
                     continue
                 if operation == "DERIVED_POLARS":

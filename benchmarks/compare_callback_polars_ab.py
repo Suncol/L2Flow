@@ -145,6 +145,7 @@ def _parse_latency_log(
     expected_workers: int,
     expected_affinity: frozenset[int] | None,
     allow_legacy_worker_field_absent: bool = False,
+    expected_scenario: str | None = None,
 ) -> tuple[dict[str, int], dict[str, str | int]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     if any(line.startswith("FAIL:") for line in lines):
@@ -232,6 +233,52 @@ def _parse_latency_log(
             raise ValueError(f"{path}: candidate topology has no inline work")
     if history_env.get("clock") != "CLOCK_MONOTONIC":
         raise ValueError(f"{path}: HISTORY_ENV clock is not CLOCK_MONOTONIC")
+    if expected_scenario is not None:
+        expected_contract = {
+            "from_open": ("ACTIVE", 1),
+            "live_partial_no_recovery": ("LIVE_PARTIAL", 0),
+        }.get(expected_scenario)
+        if expected_contract is None:
+            raise ValueError(
+                f"unsupported expected startup scenario: {expected_scenario}"
+            )
+        expected_state, expected_coverage = expected_contract
+        if history_env.get("scenario") != expected_scenario:
+            raise ValueError(f"{path}: HISTORY_ENV scenario differs")
+        if history_env.get("server_state") != expected_state:
+            raise ValueError(f"{path}: HISTORY_ENV server state differs")
+        if _unsigned(history_env, "coverage_from_open") != expected_coverage:
+            raise ValueError(f"{path}: HISTORY_ENV coverage differs")
+        if _unsigned(history_env, "online_recovery") != 0:
+            raise ValueError(f"{path}: benchmark unexpectedly used recovery")
+        if (
+            _unsigned(history_env, "factor_generation_enabled")
+            != expected_coverage
+        ):
+            raise ValueError(f"{path}: Factor-generation contract differs")
+        if history_env.get("generation_visibility") != "forced_cut":
+            raise ValueError(f"{path}: generation visibility mode differs")
+        if topology.get("scenario") != expected_scenario:
+            raise ValueError(f"{path}: topology scenario differs")
+        if raw_boundary.get("scenario") != expected_scenario:
+            raise ValueError(f"{path}: raw boundary scenario differs")
+        if derived_boundary.get("scenario") != expected_scenario:
+            raise ValueError(f"{path}: derived boundary scenario differs")
+        if _unsigned(topology, "coverage_from_open") != expected_coverage:
+            raise ValueError(f"{path}: topology coverage differs")
+        if _unsigned(topology, "online_recovery") != 0:
+            raise ValueError(f"{path}: topology unexpectedly used recovery")
+        if (
+            _unsigned(topology, "factor_generation_enabled")
+            != expected_coverage
+            or _unsigned(topology, "final_factor_generation_present")
+            != expected_coverage
+        ):
+            raise ValueError(f"{path}: topology Factor contract differs")
+        if python_ready.get("server_state") != expected_state:
+            raise ValueError(f"{path}: Python observed a different state")
+        if _unsigned(python_ready, "coverage_from_open") != expected_coverage:
+            raise ValueError(f"{path}: Python observed different coverage")
     history_affinity_text = history_env.get("affinity", "")
     history_affinity = _affinity_set(history_affinity_text)
     if expected_affinity is not None and history_affinity != expected_affinity:
@@ -294,13 +341,24 @@ def _parse_latency_log(
             raise ValueError(f"{path}: {label} column count differs")
     if _unsigned(raw, "batches") != 1:
         raise ValueError(f"{path}: raw Polars read is not one batch")
-    if (
-        _unsigned(raw, "last_ingress")
-        - _unsigned(raw, "first_ingress")
-        + 1
-        != EXPECTED_RAW_RECORDS
-    ):
+    first_ingress = _unsigned(raw, "first_ingress")
+    last_ingress = _unsigned(raw, "last_ingress")
+    unique_ingress = _unsigned(raw, "unique_ingress")
+    if last_ingress - first_ingress + 1 != EXPECTED_RAW_RECORDS:
         raise ValueError(f"{path}: raw ingress range is not dense")
+    if unique_ingress != EXPECTED_RAW_RECORDS:
+        raise ValueError(f"{path}: raw ingress values are not unique")
+    if _unsigned(raw, "ingress_sum") != (
+        first_ingress + last_ingress
+    ) * EXPECTED_RAW_RECORDS // 2:
+        raise ValueError(f"{path}: raw ingress range is not complete")
+    if (
+        _unsigned(raw_boundary, "first_ingress_sequence")
+        != first_ingress
+        or _unsigned(raw_boundary, "last_ingress_sequence")
+        != last_ingress
+    ):
+        raise ValueError(f"{path}: raw ingress boundary differs")
     if _unsigned(raw, "generation") != _unsigned(
         raw_boundary, "generation"
     ):
@@ -429,6 +487,9 @@ def _parse_latency_log(
         "native_library_sha256": native_library_sha256,
         "probe_sha256": probe_sha256,
         "raw_records": EXPECTED_RAW_RECORDS,
+        "raw_unique_ingress": unique_ingress,
+        "raw_first_ingress": first_ingress,
+        "raw_last_ingress": last_ingress,
         "raw_columns": EXPECTED_RAW_COLUMNS,
         "derived_records": EXPECTED_DERIVED_RECORDS,
         "order_sequence_records": EXPECTED_ORDER_EVENTS,
@@ -444,6 +505,15 @@ def _parse_latency_log(
             topology, "activation_effective_depth"
         ),
     }
+    if expected_scenario is not None:
+        metadata["scenario"] = expected_scenario
+        metadata["coverage_from_open"] = _unsigned(
+            history_env, "coverage_from_open"
+        )
+        metadata["server_state"] = history_env["server_state"]
+        metadata["generation_visibility"] = history_env[
+            "generation_visibility"
+        ]
     return result, metadata
 
 

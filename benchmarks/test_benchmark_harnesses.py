@@ -26,6 +26,10 @@ latency = _load(
     "compare_callback_polars_ab_tested",
     _BENCHMARKS / "compare_callback_polars_ab.py",
 )
+startup = _load(
+    "run_startup_mode_dataflow_tested",
+    _BENCHMARKS / "run_startup_mode_dataflow.py",
+)
 
 
 def _healthy_parallel_row() -> dict[str, object]:
@@ -131,6 +135,9 @@ def _latency_log(workers: int = 8) -> str:
         (
             "HISTORY_ENV capacity=12000 bound_instruments=12000 "
             "snapshot_fill=11997 worker_count=4 tick_ring_capacity=262144 "
+            "scenario=from_open server_state=ACTIVE coverage_from_open=1 "
+            "online_recovery=0 factor_generation_enabled=1 "
+            "generation_visibility=forced_cut "
             "requested_page_records=4096 price_repeats=20 "
             "all_column_repeats=10 raw_polars_records=4096 "
             f"raw_polars_repeats=20 parallel_decoder_workers={workers} "
@@ -140,12 +147,15 @@ def _latency_log(workers: int = 8) -> str:
             "CALLBACK_POLARS_TOPOLOGY "
             f"enabled={1 if workers else 0} configured_workers={workers} "
             f"reported_workers={workers} "
+            "scenario=from_open coverage_from_open=1 online_recovery=0 "
+            "factor_generation_enabled=1 final_factor_generation_present=1 "
             f"inline_messages={12345 if workers else 0} "
             "farm_messages=0 active_parse_workers=0 "
             "activation_configured_depth=8192 "
             "activation_effective_depth=6144",
             "PYTHON_READY protocol=wire_v2_history_latency_2 capacity=12000 "
             "bound_count=12000 monotonic_implementation=test "
+            "server_state=ACTIVE coverage_from_open=1 "
             "monotonic_resolution_ns=1 worker_ring_slots=4 "
             "worker_result_batch_records=4096 raw_polars_columns=55 "
             "python_version=3.12.3 python_implementation=CPython "
@@ -155,6 +165,7 @@ def _latency_log(workers: int = 8) -> str:
             "polars_version=1.0.0",
             "PYTHON_RAW_POLARS_SAMPLE sample=0 generation=2 records=4096 "
             "columns=55 batches=1 first_ingress=1 last_ingress=4096 "
+            "unique_ingress=4096 ingress_sum=8390656 "
             "first_callback_entry_ns=100 last_callback_entry_ns=200 "
             "history_published_monotonic_ns=300 polars_ready_ns=500 "
             "first_callback_to_polars_ns=400 "
@@ -168,13 +179,16 @@ def _latency_log(workers: int = 8) -> str:
             "last_callback_to_polars_ns=300 final_revision=3 "
             "final_remaining_quantity=0",
             "POLARS_BOUNDARY workload=raw_batch_4096_all_columns "
+            "scenario=from_open "
             "generation=2 records=4096 columns=55 "
+            "first_ingress_sequence=1 last_ingress_sequence=4096 "
             "first_caller_before_callback_ns=90 "
             "last_caller_before_callback_ns=190 "
             "first_callback_entry_ns=100 last_callback_entry_ns=200 "
             "polars_ready_ns=500 strict_first_callback_to_polars_ns=410 "
             "strict_last_callback_to_polars_ns=310",
             "POLARS_BOUNDARY workload=derived_complete_order_lifecycle "
+            "scenario=from_open "
             "generation=3 raw_records=4 derived_events=6 "
             "order_sequence_events=5 order_id=11001 final_revision=3 "
             "final_remaining_quantity=0 first_caller_before_callback_ns=590 "
@@ -183,6 +197,127 @@ def _latency_log(workers: int = 8) -> str:
             "polars_ready_ns=1000 strict_first_callback_to_polars_ns=410 "
             "strict_last_callback_to_polars_ns=310",
             "PYTHON_BYE commands=1",
+        )
+    ) + "\n"
+
+
+def _startup_throughput_log() -> str:
+    common: dict[str, object] = {
+        "target_rps": 100,
+        "duration_ms": 1_000,
+        "planned_callbacks": 100,
+        "scenario": "from_open",
+        "server_state": "ACTIVE",
+        "coverage_from_open": 1,
+        "online_recovery": 0,
+        "factor_generation_enabled": 1,
+        "generation_interval_ms": 1_000,
+        "workload": "five_tuple_uniform",
+        "sink": "fast",
+        "instruments_per_market": 256,
+        "parallel_decoder_workers": 0,
+        "decoder_queue_capacity_per_source": 65_536,
+        "store_queue_capacity_per_source_worker": 32_768,
+        "store_worker_count": 4,
+        "store_segment_kib": 64,
+    }
+    env: dict[str, object] = {
+        **common,
+        "callback_contract": "serialized",
+        "native_sequence_base": 0,
+        "production_tuple_count": 5,
+        "parallel_idle_inline": 1,
+        "parallel_farm_activation_configured": 8_192,
+        "parallel_farm_activation_effective": 8_192,
+        "tick_ring_capacity": 262_144,
+        "pacing": "absolute_deadline_one_based_no_batch_wait",
+        "clock": "CLOCK_MONOTONIC",
+        "affinity": "0,1;count=2",
+    }
+    result: dict[str, object] = {
+        **common,
+        "parallel_idle_inline": 0,
+        "invoked_callbacks": 100,
+        "producer_elapsed_ns": 1_000_000_000,
+        "achieved_offered_rps": "100.000",
+        "history_ready_elapsed_ns": 1_000_000_000,
+        "history_ready_rps": "100.000",
+        "accepted": 100,
+        "decoded": 100,
+        "applied": 100,
+        "store_appended": 100,
+        "history_scan_records": 100,
+        "history_unique_ingress": 100,
+        "history_source0_records": 20,
+        "history_source1_records": 20,
+        "history_source2_records": 20,
+        "history_source3_records": 40,
+        "tuple0_offered": 20,
+        "tuple1_offered": 20,
+        "tuple2_offered": 20,
+        "tuple3_offered": 20,
+        "tuple4_offered": 20,
+        "history_endpoint_flags": 3,
+        "periodic_generation_cuts": 1,
+        "final_generation": 2,
+        "final_factor_generation_present": 1,
+        "backlog_before_drain": 0,
+        "final_drain_and_cut_elapsed_ns": 1_000,
+        "history_integrity_validation_elapsed_ns": 2_000,
+    }
+    for key in (
+        "target_met",
+        "process_survived",
+        "accepting_before_drain",
+        "steady_state_met",
+        "complete_prefix",
+        "stopped_clean",
+        "certified_idle",
+        "certified_healthy",
+        "final_cut_published",
+        "generation_sequence_valid",
+        "history_endpoint_valid",
+        "history_generation_valid",
+        "history_scan_cursor_opened",
+        "history_scan_explicit_eof",
+        "history_source_counts_valid",
+        "history_lossless",
+    ):
+        result[key] = 1
+    for key in (
+        "fatal_during_offer",
+        "fatal_final",
+        "message_patch_failed",
+        "rejected",
+        "post_cut",
+        "store_failed_appends",
+        "store_coverage_lost",
+        "decoder_full_count",
+        "service_failed",
+        "periodic_generation_failed",
+        "periodic_cut_error",
+        "periodic_generation_error",
+        "final_cut_error",
+        "final_generation_error",
+        "history_control_status",
+        "history_duplicate_ingress",
+        "history_out_of_range_ingress",
+        "history_invalid_source_slots",
+        "certified_dropped",
+        "certified_frozen_channels",
+        "certified_global_frozen",
+    ):
+        result[key] = 0
+
+    def line(prefix: str, fields: dict[str, object]) -> str:
+        return prefix + " ".join(
+            f"{key}={value}" for key, value in fields.items()
+        )
+
+    return "\n".join(
+        (
+            line("THROUGHPUT_ENV ", env),
+            line("THROUGHPUT_RESULT ", result),
         )
     ) + "\n"
 
@@ -349,6 +484,83 @@ class MatrixHarnessTests(unittest.TestCase):
         )
 
 
+class StartupModeHarnessTests(unittest.TestCase):
+    def _parse(self, text: str):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "throughput.log"
+            path.write_text(text, encoding="utf-8")
+            return startup._parse_throughput_log(
+                path,
+                scenario="from_open",
+                rate=100,
+                duration_ms=1_000,
+                instruments_per_market=256,
+                store_workers=4,
+                parallel_workers=0,
+                decoder_queue=65_536,
+                store_queue=32_768,
+                segment_kib=64,
+                workload="five_tuple_uniform",
+                generation_interval_ms=1_000,
+                requested_affinity=frozenset((0, 1)),
+            )
+
+    def test_exact_throughput_contract_parses(self) -> None:
+        row = self._parse(_startup_throughput_log())
+        self.assertEqual(row["achieved_offered_rps"], 100.0)
+        self.assertEqual(row["history_ready_rps"], 100.0)
+
+    def test_missing_expected_environment_field_fails_closed(self) -> None:
+        malformed = _startup_throughput_log().replace(
+            "store_segment_kib=64 ", "", 1
+        )
+        with self.assertRaisesRegex(ValueError, "store_segment_kib"):
+            self._parse(malformed)
+
+    def test_missing_expected_result_field_fails_closed(self) -> None:
+        lines = _startup_throughput_log().splitlines()
+        lines[1] = lines[1].replace("store_segment_kib=64 ", "")
+        with self.assertRaisesRegex(ValueError, "store_segment_kib"):
+            self._parse("\n".join(lines) + "\n")
+
+    def test_reported_offered_rate_is_independently_recomputed(self) -> None:
+        malformed = _startup_throughput_log().replace(
+            "achieved_offered_rps=100.000",
+            "achieved_offered_rps=99.000",
+        )
+        with self.assertRaisesRegex(ValueError, "integer-derived"):
+            self._parse(malformed)
+
+    def test_reported_history_ready_rate_is_independently_recomputed(
+        self,
+    ) -> None:
+        malformed = _startup_throughput_log().replace(
+            "history_ready_rps=100.000",
+            "history_ready_rps=101.000",
+        )
+        with self.assertRaisesRegex(ValueError, "integer-derived"):
+            self._parse(malformed)
+
+    def test_coupled_nonuniform_tuple_telemetry_fails_oracle(self) -> None:
+        malformed = _startup_throughput_log()
+        for before, after in (
+            ("history_source0_records=20", "history_source0_records=21"),
+            ("history_source1_records=20", "history_source1_records=19"),
+            ("tuple0_offered=20", "tuple0_offered=21"),
+            ("tuple1_offered=20", "tuple1_offered=19"),
+        ):
+            malformed = malformed.replace(before, after)
+        with self.assertRaisesRegex(ValueError, "independent workload oracle"):
+            self._parse(malformed)
+
+    def test_failed_target_verdict_fails_closed(self) -> None:
+        malformed = _startup_throughput_log().replace(
+            "target_met=1", "target_met=0"
+        )
+        with self.assertRaisesRegex(ValueError, "target_met"):
+            self._parse(malformed)
+
+
 class LatencyHarnessTests(unittest.TestCase):
     def _parse(self, text: str):
         with tempfile.TemporaryDirectory() as directory:
@@ -358,6 +570,7 @@ class LatencyHarnessTests(unittest.TestCase):
                 path,
                 expected_workers=8,
                 expected_affinity=frozenset((0, 1)),
+                expected_scenario="from_open",
             )
 
     def test_exact_latency_contract_parses(self) -> None:
@@ -372,6 +585,13 @@ class LatencyHarnessTests(unittest.TestCase):
             "PYTHON_DERIVED_POLARS_SAMPLE generation=3 records=7",
         )
         with self.assertRaisesRegex(ValueError, "derived records"):
+            self._parse(malformed)
+
+    def test_raw_ingress_uniqueness_is_required(self) -> None:
+        malformed = _latency_log().replace(
+            "unique_ingress=4096", "unique_ingress=4095"
+        )
+        with self.assertRaisesRegex(ValueError, "not unique"):
             self._parse(malformed)
 
     def test_raw_publication_must_follow_last_callback(self) -> None:

@@ -236,6 +236,10 @@ public:
 
     [[nodiscard]] bool CreateReader(
         std::unique_ptr<MdlLiveJournalReaderV1>* output) noexcept;
+    // Lock-free terminal failure probe for the online recovery governor.
+    // Normal stop/flush is not a failure. This avoids taking the capture
+    // queue mutex merely to discover an asynchronous writer error.
+    [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] LiveJournalSnapshotV1 Snapshot() const noexcept;
 
     // Stops new captures, drains and fdatasyncs every accepted record, then

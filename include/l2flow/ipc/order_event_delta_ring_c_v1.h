@@ -53,17 +53,31 @@ enum l2flow_order_event_delta_header_flag_v1 {
     L2FLOW_ORDER_EVENT_DELTA_COVERAGE_LOST_V1 = 1U << 0U,
 };
 
-// Exact identity expected from the descriptor. Every reserved byte must be
-// zero. There is no wildcard field: run/date/epoch/capacity/mapping size must
-// all match, preventing a cursor from attaching to a restart or wrong day.
+enum l2flow_order_event_delta_temporal_coverage_v1 {
+    L2FLOW_ORDER_EVENT_DELTA_FROM_MARKET_OPEN_V1 = 1,
+    L2FLOW_ORDER_EVENT_DELTA_FROM_PROCESS_START_V1 = 2,
+};
+
+enum l2flow_order_event_delta_stream_quality_v1 {
+    // Dense local tick_stream_sequence only. This does not assert native
+    // vendor-sequence completeness.
+    L2FLOW_ORDER_EVENT_DELTA_LOCAL_TICK_STREAM_CONTIGUOUS_V1 = 1,
+};
+
+// Exact identity expected from the descriptor. V1.1 reuses former reserved
+// storage for temporal_coverage and stream_quality without changing this
+// 64-byte ABI. Every remaining reserved byte must be zero. There is no
+// wildcard field: every semantic and physical identity field must match.
 typedef struct l2flow_order_event_delta_session_v1 {
     uint8_t run_id[16];
     uint64_t session_epoch;
     uint32_t trade_date;
-    uint32_t reserved0;
+    uint32_t temporal_coverage;
     uint64_t ring_capacity;
     uint64_t total_mapping_bytes;
-    uint8_t reserved[16];
+    uint32_t stream_quality;
+    uint32_t reserved0;
+    uint8_t reserved[8];
 } l2flow_order_event_delta_session_v1;
 
 // Fixed-width result returned for every syntactically valid read call. On
@@ -100,6 +114,14 @@ static_assert(
     offsetof(
         l2flow_order_event_delta_session_v1,
         session_epoch) == 16U);
+static_assert(
+    offsetof(
+        l2flow_order_event_delta_session_v1,
+        temporal_coverage) == 28U);
+static_assert(
+    offsetof(
+        l2flow_order_event_delta_session_v1,
+        stream_quality) == 48U);
 static_assert(
     offsetof(
         l2flow_order_event_delta_read_result_v1,

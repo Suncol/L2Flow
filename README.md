@@ -239,18 +239,42 @@ startup mode:
 - `--intraday-live-partial` explicitly starts a process-start-only service
   without CSV recovery and without claiming coverage from market open.
 
-The standalone partial mode uses `--ipc-socket` as its only service socket. It
-connects the real SDK immediately and serves GET_SESSION plus latest
-snapshot/tick reads with `server_state=LIVE_PARTIAL`; History and delta opens
-are rejected. `coverage_from_open`, `startup_prefix_recovered`, both full-day
-validity flags, and `certified_prefix_valid` remain false for the whole run.
-It creates no startup buffer, live journal, CSV source, shadow pipeline, or
-CERTIFIED sidecar. KLine windows, a CERTIFIED socket, and the event aggregator
-are therefore rejected rather than silently exposed with provisional
-semantics. This is the factually correct mode for a mid-session launch that
-deliberately does not recover the market-open prefix; using
+The standalone partial mode uses `--ipc-socket` for FAST and derives
+`<ipc-socket>.events` for a managed Event sidecar by default. It starts the
+FAST control plane first so the sidecar can attach at local tick sequence 1,
+waits for an exact process-start READY at the zero-prefix origin, and only then
+connects the real SDK. FAST serves GET_SESSION plus latest snapshot/tick reads
+with `server_state=LIVE_PARTIAL`. Each periodic generation
+cut also exposes the complete retained single-instrument History from this
+process's start and tick generation delta; before the first cut those opens are
+temporarily unavailable. The generation truthfully carries
+`record_coverage_complete=true` and `coverage_from_open=false`.
+`startup_prefix_recovered`, both full-day validity flags, and
+`certified_prefix_valid` remain false for the whole run.
+The Event stream is explicitly `FROM_PROCESS_START` and
+`LOCAL_TICK_STREAM_CONTIGUOUS`; it does not claim startup-prefix or native-gap
+recovery. After READY, the router probes Event control identity, heartbeat,
+monotonic consumption, source-ring retention, and forward progress once per
+generation interval. A managed child exit or any managed/external health
+failure is reported as degraded but does not stop or block FAST. Managed
+children additionally arm Linux parent-death signaling and use bounded
+TERM/KILL reaping, so a router crash or shutdown cannot intentionally leave an
+unsupervised Event process running. The mode creates no startup buffer, live
+journal, CSV source, shadow pipeline, or CERTIFIED sidecar. It also configures
+`factor_generation_enabled=false`, so
+periodic Store generations remain publishable for History/delta without
+creating or invoking the C++ generation Factor engine. KLine windows, a
+CERTIFIED socket, and full-day Event claims remain unavailable. This is the
+factually correct
+mode for a mid-session launch that deliberately does not recover the
+market-open prefix; using
 `--intraday-store-from-open` in that situation remains an invalid operator
 assertion.
+
+This opt-in applies only to standalone `--intraday-live-partial`. The separate
+`LIVE_PARTIAL` socket used while CSV online recovery is running remains
+latest-only and continues to reject History/delta, so recovery-side bulk reads
+cannot be introduced through the preview endpoint.
 
 CSV recovery is online whenever `--intraday-recovery-csv-dir` is present.
 `--intraday-recovery-mode online` remains an optional explicit selector;
@@ -280,30 +304,42 @@ flag false. It serves GET_SESSION and latest snapshot/tick reads only;
 History/delta are rejected. Internally it currently retains a process-start
 partial Store to keep latest-record lifetimes safe—it is not a specialized
 physical latest-only container. The recovered mapping stays INITIALIZING and
-has no control worker until shadow replay has reached a fixed journal frontier,
-published its first Store/KLine/Factor generation, and completed the
-CERTIFIED prefix barrier when that default-on sidecar is enabled.
+has no externally usable control plane until shadow replay has reached a fixed
+journal frontier, published its first Store/KLine/Factor generation, and
+completed the CERTIFIED prefix barrier when that default-on sidecar is enabled.
 
 The final promotion critical section rechecks the journal's health and durable
 coverage of that fixed frontier, plus the single SDK/preview owner's accepting,
-trade-date, pipeline, and IPC health, both before control exposure and after
-FAST/flag publication. A writer or preview failure during the cold generation/
-barrier window therefore cannot be logged as a successful promotion.
-
-Promotion starts the recovered control planes and records its realtime
-nanosecond only after all required steps and validity-flag publication have
-succeeded. The two Unix sockets cannot begin returning queryable sessions by
-one CPU instruction: CERTIFIED control is started first and recovered FAST
-last. Clients must explicitly switch from the preview socket/run to the
-recovered socket/run; there is no in-place Store replacement and cursors
-cannot cross the switch.
+trade-date, pipeline, and IPC health, before and after starting the recovered
+controls. Both controls start behind one false monotonic exposure gate, so
+fallible thread/socket activation cannot transfer either descriptor. FAST is
+prepared with its final CERTIFIED capability while still INITIALIZING; after a
+last health confirmation and the nonzero promotion timestamp, one release
+store opens both accept paths. Thus every successfully obtained recovered FAST
+descriptor already reports ACTIVE and the final capability flags, and no
+CERTIFIED Event descriptor can escape before the same promotion point. A
+connection racing the closed gate can be rejected and must retry; it cannot
+observe a half-promoted session. Clients still must explicitly switch from the
+preview socket/run to the recovered socket/run; there is no in-place Store
+replacement and cursors cannot cross the switch.
 The preview remains independently queryable while the process runs.
 It does not carry an automatic redirect or the recovered `run_id`; deployment
 readiness or a client-side probe must discover the recovered GET_SESSION.
-After promotion, the journal reader propagates WAL failure directly and its
-at-most-100-ms tail poll also checks the single preview/SDK owner. A non-shutdown
-owner failure marks both mappings FAILED and stops CERTIFIED control without
-waiting for the independently configurable generation interval.
+After promotion, the journal reader propagates journal failure directly and
+its at-most-100-ms tail poll also checks the single preview/SDK owner. A
+non-shutdown owner failure marks both mappings FAILED and stops CERTIFIED
+control without waiting for the independently configurable generation
+interval. Clean shutdown is an explicit one-way tail-drain transition: the
+application authorizes expected preview quiescence, publishes the preview's
+final generation, closes and durably flushes the journal, then joins the tail
+consumer at journal End. The transition carries an absolute deadline derived
+from `--intraday-recovery-backpressure-seconds`; permanent preview/shadow/
+CERTIFIED pressure therefore fails closed with `BACKPRESSURE_TIMEOUT` instead
+of making process shutdown wait forever. It verifies
+`tail_consumed_serial == committed_serial == accepted_serial` before publishing
+the recovered shadow's final generation. The relaxation covers only the
+expected non-accepting/stopped preview state; fatal, invalid-progress, or
+trade-date-boundary samples still fail closed.
 
 Online WAL tuning is bounded by
 `--intraday-recovery-journal-max-gib` (default 512),
@@ -314,14 +350,34 @@ free physical space. The directory must be empty (or absent with an existing
 parent so it can be created) and distinct from the CSV directory. The removed
 startup-buffer byte/message options are no longer accepted.
 
-Online CSV replay samples the CERTIFIED handoff queue before each CSV
-publication: below 50% it runs normally, from 50% it sleeps briefly, at the
-configurable high watermark (default 75%) it slows further, and at 90% it
-pauses. Journal suffix catch-up skips the low/high sleeps but also pauses at
-90%. Worker stop, resource freeze/exhaustion, dropped handoffs, or conflicting
-duplicates is terminal rather than recoverable pressure. This version does
-not expose replay-worker-count, CPU-percent, CPU-quota, or affinity options;
-the pressure gate is cooperative per-record throttling.
+The online governor samples preview, shadow, journal, both FAST control planes,
+and CERTIFIED data-worker plus socket-accept health before entering any
+pressure wait, so sustained backlog cannot hide a failed downstream owner.
+CERTIFIED worker-only warmup remains healthy before intentional control
+activation; once activated, an unexpected accept-loop exit is terminal. These
+additional probes exist
+only inside the online-recovery handoff; ordinary from-open and standalone
+partial-no-recovery reads do not execute them. Preview backlog reaching 64
+records drains through 0;
+shadow backlog reaching 1,024 drains through 256. Those hysteresis states
+survive bounded journal-tail polls. Bulk CSV/journal publications are grouped
+into 64-record quanta: the maximum sub-pause CERTIFIED utilization observed in
+a quantum applies one 50-us cooldown at 50-74% or one 500-us cooldown at
+75-89%. Any sample at 90% or above instead enters the 50-us pressure-poll loop
+until the terminal/pressure gate changes. A low-pressure quantum that observed
+new preview admissions cooperatively yields once. Bounded CSV parser
+checkpoints sample all terminal and high/low pressure gates without counting
+as publications or triggering a quantum cooldown. Permanent post-promotion
+journal tailing skips the 50/75% bulk cooldowns, but retains preview/shadow
+gates and the 90% CERTIFIED pause. Worker stop, resource freeze/exhaustion,
+dropped handoffs, or conflicting duplicates is terminal rather than
+recoverable pressure. This version does not expose replay-worker-count,
+CPU-percent, or CPU-quota controls. `--event-cpu-set LIST` is the one affinity
+control: when explicitly set, Event worker/control threads use that exact
+logical-CPU set and all FAST/router threads inherit the exact nonempty startup
+affinity complement. When omitted, no affinity syscall is added and existing
+placement is preserved. CPU numbering alone cannot prove physical-core, SMT,
+NUMA, IRQ, or storage isolation; operators must choose the set accordingly.
 
 The recovered FAST control socket is not made ACTIVE
 until replay, the closed live handoff through its selected frontier, the first
@@ -330,16 +386,21 @@ succeed. A failed or partial recovery is therefore never exposed as a
 queryable complete session. Only the explicitly partial preview is available
 during online rebuild.
 
-The optional CERTIFIED sidecar starts only its projection worker during
+The default-on CERTIFIED sidecar starts only its projection worker during
 recovery. Its default-on worker is part of online promotion: terminal handoff
 health or barrier/
 control failure aborts promotion, and recovered FAST is exposed only after the
-barrier. Disabling native-gap recovery explicitly removes that sidecar and
-leaves `certified_prefix_valid=false`.
+barrier. The same worker builds the append-only canonical full-day Event
+journal while replaying; `kGetEventHistory` becomes queryable only after the
+barrier and supports one History-to-live-tail cursor. Disabling native-gap
+recovery explicitly removes that canonical Event service and leaves
+`certified_prefix_valid=false`.
 
-CSV recovery cannot be combined with `--event-aggregator-socket` in this
-version. The external aggregator has no pre-ACTIVE full-replay handoff and its
-bounded ring cannot be assumed to retain an entire intraday replay. See the
+CSV recovery cannot be combined with the legacy
+`--event-aggregator-socket` in this version. The external event-delta process
+has no pre-ACTIVE full-replay handoff and its bounded ring cannot be assumed to
+retain an entire intraday replay; the default CERTIFIED Event journal is the
+supported recovered path. See the
 [CSV startup recovery contract](docs/csv-startup-recovery-v1.md) before using
 the recovery option.
 
@@ -354,7 +415,7 @@ sz	31303220	303030303031	share	equity	documented_core	-
 The Shenzhen source above decodes to the four bytes `102 `; the loader never
 trims or normalizes it.
 
-For the strict live order-event path, add
+For the optional standalone event-delta compatibility path, add
 `--event-aggregator-socket /absolute/private/events.sock` to the router and
 start `build/mdl-order-event-aggregator` against the router's source socket:
 
@@ -369,6 +430,7 @@ build/mdl-order-event-aggregator \
   --event-ring-capacity 1048576 \
   --event-maximum-mapping-bytes 1073741824 \
   --read-batch-records 4096 \
+  --temporal-coverage from-open \
   --poll-ms 1 \
   --timeout-ms 1000
 ```
@@ -380,6 +442,24 @@ run and frozen daily-catalog identity at the zero-prefix origin before
 creating the SDK pipeline. Size the source and event rings for measured rates
 and maximum reader pauses; an overrun fails closed and this version does not
 catch up or recover.
+
+For ordinary from-open and promoted online-recovery sessions, the default
+native-gap CERTIFIED service is instead the canonical order-event path. It
+reorders/repairs native positions before projection and exposes the entire
+append-only history plus future live events on the CERTIFIED socket:
+
+```python
+with client.open_certified_order_events(
+    "/absolute/private/l2flow.sock.certified"
+) as events:
+    while True:
+        batch = events.read_batch()
+        consume_zero_copy(batch.buffer)
+```
+
+Online clients may attach only after recovered FAST advertises
+`certified_prefix_valid=true`; the Event coverage flags are immutable once the
+CERTIFIED control socket is exposed.
 
 ### Default Mainland A-share admission filter
 

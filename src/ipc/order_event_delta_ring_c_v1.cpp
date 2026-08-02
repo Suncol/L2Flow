@@ -38,7 +38,13 @@ static_assert(
 
 [[nodiscard]] bool CanonicalSession(
     const l2flow_order_event_delta_session_v1& session) noexcept {
-    return session.reserved0 == 0U &&
+    return (session.temporal_coverage ==
+                L2FLOW_ORDER_EVENT_DELTA_FROM_MARKET_OPEN_V1 ||
+            session.temporal_coverage ==
+                L2FLOW_ORDER_EVENT_DELTA_FROM_PROCESS_START_V1) &&
+           session.stream_quality ==
+               L2FLOW_ORDER_EVENT_DELTA_LOCAL_TICK_STREAM_CONTIGUOUS_V1 &&
+           session.reserved0 == 0U &&
            AllZero(session.reserved, sizeof(session.reserved)) &&
            session.session_epoch != 0U && session.trade_date != 0U &&
            session.ring_capacity != 0U &&
@@ -60,6 +66,12 @@ static_assert(
     result.trade_date = source.trade_date;
     result.ring_capacity = source.ring_capacity;
     result.total_mapping_bytes = source.total_mapping_bytes;
+    result.temporal_coverage =
+        static_cast<ipc::OrderEventDeltaTemporalCoverageV1>(
+            source.temporal_coverage);
+    result.stream_quality =
+        static_cast<ipc::OrderEventDeltaStreamQualityV1>(
+            source.stream_quality);
     return result;
 }
 
@@ -75,6 +87,10 @@ void ToCSession(
     output->trade_date = source.trade_date;
     output->ring_capacity = source.ring_capacity;
     output->total_mapping_bytes = source.total_mapping_bytes;
+    output->temporal_coverage = static_cast<std::uint32_t>(
+        source.temporal_coverage);
+    output->stream_quality = static_cast<std::uint32_t>(
+        source.stream_quality);
 }
 
 void InitializeResult(

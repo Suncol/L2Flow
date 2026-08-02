@@ -168,6 +168,12 @@ struct RealtimePipelineConfigV1 final {
     // source market and exact SecurityID match the centralized Mainland
     // A-share rules. A filtered callback consumes no sequence and enters no
     // owned pool or queue. This invariant is intentionally not configurable.
+    // Appended to preserve existing member offsets and positional initializers.
+    // False publishes Store/KLine generations without constructing or invoking
+    // a Factor engine. The default preserves the original full-generation
+    // contract; standalone process-start History may opt out explicitly when
+    // it does not expose Factor data.
+    bool factor_generation_enabled = true;
 };
 
 // Returns the finite completion window enforced after each source-local
@@ -408,11 +414,13 @@ struct RealtimePipelineCutResultV1 final {
     std::shared_ptr<const l2flow::market::RealtimeKLineGenerationV1>
         kline_generation;
     bool kline_enabled = false;
+    bool factor_generation_enabled = true;
 
     [[nodiscard]] bool published() const noexcept {
         return error == RealtimePipelineCutErrorV1::kNone &&
                store_generation != nullptr &&
-               factor_generation != nullptr &&
+               (!factor_generation_enabled ||
+                factor_generation != nullptr) &&
                (!kline_enabled || kline_generation != nullptr);
     }
 };
@@ -487,6 +495,19 @@ struct RealtimeParallelDecoderSnapshotV1 final {
     std::array<RealtimeParallelDecoderSourceSnapshotV1,
                l2flow::market::kRealtimeHistorySourceCountV1>
         sources{};
+};
+
+struct RealtimePipelineLiveStatusV1 final {
+    l2flow::realtime::ProcessingProgressV2 processing_progress{};
+    bool accepting = false;
+    bool fatal = false;
+    bool stopped = false;
+    bool trade_date_boundary_reached = false;
+
+    [[nodiscard]] bool healthy() const noexcept {
+        return processing_progress.valid() && accepting && !fatal &&
+               !stopped && !trade_date_boundary_reached;
+    }
 };
 
 struct RealtimePipelineSnapshotV1 final {
@@ -579,6 +600,23 @@ public:
     [[nodiscard]] RealtimePipelineCutResultV1 CutAndPublishGeneration(
         std::chrono::nanoseconds timeout) noexcept;
 
+    // Cold control-plane wait used while assembling an online-recovery
+    // promotion prefix. target_sequence must already be part of the accepted
+    // ingress prefix when this call begins; this method never waits for future
+    // admission and returns false if target_sequence is greater than the
+    // current accepted frontier. The accepted frontier is monotonic, so it
+    // cannot recede below a target validated at entry while this method waits.
+    // A zero target is the empty prefix and always succeeds. For a nonzero
+    // target, fatal state or expiration before the applied prefix reaches the
+    // target returns false. An already-applied healthy target succeeds even
+    // when deadline has passed. The absolute steady-clock deadline lets a
+    // promotion controller share one budget across repeated cold-path waits.
+    // This does not freeze admission, cut or publish a generation, or enter
+    // any FAST/read hot path.
+    [[nodiscard]] bool WaitAppliedThroughPrefix(
+        std::uint64_t target_sequence,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+
     // Terminal publication path. It first closes callback admission and
     // performs SDK Shutdown so no accepted message can appear after the cut.
     // It then releases the quiesced SDK objects, publishes the exact final
@@ -634,6 +672,14 @@ public:
         const l2flow::factor::RealtimeFactorGenerationV1>
     AcquireLatestFactorGeneration() const noexcept;
     [[nodiscard]] RealtimePipelineSnapshotV1 Snapshot() const noexcept;
+    // Cheap control-plane status for a live or shadow pipeline. It reads only
+    // atomic progress/terminal/admission state and never takes the admission
+    // mutex. The progress pair preserves applied <= accepted, but the sample
+    // does not pin the lifecycle: callers must tolerate a terminal transition
+    // immediately after this method returns.
+    [[nodiscard]] RealtimePipelineLiveStatusV1 LiveStatus() const noexcept;
+    // Convenience predicate with the same mutex-free sampling semantics.
+    [[nodiscard]] bool LiveIngressHealthy() const noexcept;
     // Histogram summaries are coherent after StopAndPublishFinalGeneration or
     // StopAndDrain.  A live call is safe but may combine adjacent in-flight
     // observations and is intended only for diagnostics.

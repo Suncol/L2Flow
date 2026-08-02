@@ -32,6 +32,16 @@ inline constexpr std::uint64_t
     kStartupReplayNoticeShanghaiOrderQueueMetadataUnavailableV1 =
         1ULL << 1U;
 
+// CSV parsing invokes cooperative checkpoints after this many complete
+// logical records (including headers) and before each bounded input read.
+// The default sink implementation is a predictable no-op; online recovery
+// overrides it to sample its FAST-aware governor even when native-sequence
+// gaps or a single large record have not produced a publication.
+inline constexpr std::size_t
+    kStartupReplayCooperativeCheckpointRecordsV1 = 256U;
+inline constexpr std::size_t
+    kStartupReplayCooperativeCheckpointBytesV1 = 64U * 1024U;
+
 enum class StartupReplayMessageSetV1 : std::uint32_t {
     kNone = 0U,
     kShanghaiSnapshot = 1U << 0U,
@@ -166,6 +176,23 @@ public:
     [[nodiscard]] virtual bool Publish(
         const StartupReplayPublicationV1& publication,
         std::string* detail) noexcept = 0;
+
+    // Optional bounded-frequency parsing checkpoint.  A false return stops
+    // replay with kSinkRejected and copies detail into the replay result.  It
+    // is deliberately separate from Publish because Shenzhen native-sequence
+    // repair may retain a long run in its pending maps without publishing.
+    // Appending this virtual after Publish preserves Publish's existing vtable
+    // slot and avoids needless slot churn. Adding a virtual still requires C++
+    // sinks to be rebuilt; the public stable boundary remains the reader C ABI.
+    // Standalone sinks pay one predictable virtual no-op per bounded read and per
+    // kStartupReplayCooperativeCheckpointRecordsV1 complete records.
+    [[nodiscard]] virtual bool CooperativeCheckpoint(
+        std::string* detail) noexcept {
+        if (detail != nullptr) {
+            detail->clear();
+        }
+        return true;
+    }
 };
 
 struct StartupReplayCountsV1 final {

@@ -144,6 +144,23 @@ void CopyIdentity(
     return (flags & ~kOrderEventDeltaCoverageLostV1) == 0U;
 }
 
+[[nodiscard]] bool KnownTemporalCoverage(
+    std::uint32_t value) noexcept {
+    return value == static_cast<std::uint32_t>(
+                        OrderEventDeltaTemporalCoverageV1::
+                            kFromMarketOpen) ||
+           value == static_cast<std::uint32_t>(
+                        OrderEventDeltaTemporalCoverageV1::
+                            kFromProcessStart);
+}
+
+[[nodiscard]] bool KnownStreamQuality(
+    std::uint32_t value) noexcept {
+    return value == static_cast<std::uint32_t>(
+                        OrderEventDeltaStreamQualityV1::
+                            kLocalTickStreamContiguous);
+}
+
 [[nodiscard]] bool ReadableState(std::uint32_t state) noexcept {
     return state ==
                static_cast<std::uint32_t>(
@@ -187,7 +204,8 @@ void CopyIdentity(
         header.ring_capacity == 0U ||
         header.slot_stride != sizeof(OrderEventDeltaSlotV1) ||
         header.slots_offset != sizeof(OrderEventDeltaHeaderV1) ||
-        header.reserved_scalar != 0U ||
+        !KnownTemporalCoverage(header.temporal_coverage) ||
+        !KnownStreamQuality(header.stream_quality) ||
         !AllZero(header.reserved)) {
         return false;
     }
@@ -212,6 +230,12 @@ void CopyIdentity(
     result.trade_date = header.trade_date;
     result.ring_capacity = header.ring_capacity;
     result.total_mapping_bytes = header.total_mapping_bytes;
+    result.temporal_coverage =
+        static_cast<OrderEventDeltaTemporalCoverageV1>(
+            header.temporal_coverage);
+    result.stream_quality =
+        static_cast<OrderEventDeltaStreamQualityV1>(
+            header.stream_quality);
     return result;
 }
 
@@ -466,6 +490,10 @@ public:
         if (!IdentityNonzero(config_.run_id) ||
             config_.session_epoch == 0U || config_.trade_date == 0U ||
             config_.ring_capacity == 0U ||
+            !KnownTemporalCoverage(static_cast<std::uint32_t>(
+                config_.temporal_coverage)) ||
+            !KnownStreamQuality(static_cast<std::uint32_t>(
+                config_.stream_quality)) ||
             config_.maximum_mapping_bytes <
                 sizeof(OrderEventDeltaHeaderV1)) {
             return OrderEventDeltaRingCreateErrorV1::
@@ -566,6 +594,10 @@ public:
         header_->slots_offset = sizeof(OrderEventDeltaHeaderV1);
         header_->producer_started_monotonic_ns =
             config_.producer_started_monotonic_ns;
+        header_->temporal_coverage = static_cast<std::uint32_t>(
+            config_.temporal_coverage);
+        header_->stream_quality = static_cast<std::uint32_t>(
+            config_.stream_quality);
         Atomic(header_->producer_state)
             .store(
                 static_cast<std::uint32_t>(
@@ -943,6 +975,10 @@ public:
             expected_session.session_epoch == 0U ||
             expected_session.trade_date == 0U ||
             expected_session.ring_capacity == 0U ||
+            !KnownTemporalCoverage(static_cast<std::uint32_t>(
+                expected_session.temporal_coverage)) ||
+            !KnownStreamQuality(static_cast<std::uint32_t>(
+                expected_session.stream_quality)) ||
             expected_session.total_mapping_bytes <
                 sizeof(OrderEventDeltaHeaderV1)) {
             return OrderEventDeltaReaderOpenErrorV1::

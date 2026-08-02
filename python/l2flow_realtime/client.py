@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from .instrument_raw_event_history import InstrumentRawEventHistoryReader
     from .instrument_delta import InstrumentTickDeltaSession
     from .order_event_delta_live import LiveOrderEventDeltaReader
+    from .certified_order_events import CertifiedOrderEventReader
 
 
 DEFAULT_STALE_AFTER_NS = 3_000_000_000
@@ -485,6 +486,79 @@ class L2FlowClient:
                 ):
                     raise StaleSessionError(
                         "live event reader has the wrong source session"
+                    )
+            return reader
+        except BaseException:
+            reader.close()
+            raise
+
+    def open_certified_order_events(
+        self,
+        certified_control_socket_path,
+        *,
+        native_library=None,
+        native_library_path=None,
+        timeout=_USE_CLIENT_CONTROL_TIMEOUT,
+        start_event_sequence: int = 1,
+        batch_records: int = 4096,
+    ) -> "CertifiedOrderEventReader":
+        """Open one full-day CERTIFIED Event history-to-tail cursor.
+
+        The same reader drains the immutable prefix already present when it
+        attaches and subsequently returns newly appended rows. Online-recovery
+        sessions are attachable only after FAST advertises the completed
+        CERTIFIED promotion barrier.
+        """
+
+        from .certified_order_events import open_certified_order_events
+
+        if native_library is not None and native_library_path is not None:
+            raise ValueError(
+                "native_library and native_library_path are mutually "
+                "exclusive"
+            )
+        with self._lock:
+            session = self._checked_session()
+            effective_timeout = (
+                self._control_timeout
+                if timeout is _USE_CLIENT_CONTROL_TIMEOUT
+                else timeout
+            )
+            effective_library = native_library
+            if (
+                effective_library is None
+                and native_library_path is None
+            ):
+                effective_library = getattr(
+                    self._native, "_library", None
+                )
+                if effective_library is None:
+                    raise UnavailableError(
+                        "a CERTIFIED event native library or path is required"
+                    )
+
+        reader = open_certified_order_events(
+            certified_control_socket_path,
+            expected_session=session,
+            native_library=effective_library,
+            native_library_path=native_library_path,
+            timeout=effective_timeout,
+            start_event_sequence=start_event_sequence,
+            batch_records=batch_records,
+        )
+        try:
+            with self._lock:
+                current = self._checked_session()
+                if current.identity != session.identity:
+                    raise StaleSessionError(
+                        "FAST session changed while opening CERTIFIED events"
+                    )
+                if (
+                    not current.coverage_from_open
+                    or not current.certified_prefix_valid
+                ):
+                    raise UnavailableError(
+                        "FAST no longer advertises a valid CERTIFIED prefix"
                     )
             return reader
         except BaseException:

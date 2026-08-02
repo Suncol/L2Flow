@@ -30,12 +30,14 @@ from .order_event_delta_live import (
     LiveOrderEventDeltaProducerState,
     LiveOrderEventDeltaReader,
     LiveOrderEventDeltaSession,
+    LiveOrderEventDeltaStreamQuality,
+    LiveOrderEventDeltaTemporalCoverage,
 )
 
 
 CONTROL_MAGIC = b"L2FECT1\0"
 CONTROL_MAJOR = 1
-CONTROL_MINOR = 1
+CONTROL_MINOR = 2
 GET_SESSION = 1
 CONTROL_OK = 0
 CONTROL_INVALID_REQUEST = 1
@@ -44,11 +46,17 @@ CONTROL_UNAVAILABLE = 3
 CONTROL_SOURCE_SESSION_MISMATCH = 4
 CONTROL_INTERNAL_ERROR = 5
 
+_SOURCE_SESSION_FORMAT = "16s32sQQQIIIIII"
 _REQUEST = struct.Struct(
-    "<8sHHHHIIQ16s32sQQQIIIIIIQQ"
+    "<8sHHHHIIQ" + _SOURCE_SESSION_FORMAT + "IIQ"
 )
 _RESPONSE = struct.Struct(
-    "<8sHHHHIIQ16s32sQQQIIIIII16sQIIII" + "Q" * 12
+    "<8sHHHHIIQ"
+    + _SOURCE_SESSION_FORMAT
+    + "16sQIIII"
+    + "Q" * 6
+    + "IIII"
+    + "Q" * 4
 )
 _UCRED = struct.Struct("3i")
 _UINT32_MAX = (1 << 32) - 1
@@ -111,6 +119,12 @@ class LiveOrderEventDeltaSourceSession:
     bound_count: int
     catalog_scope: CatalogScope
     coverage_complete: bool
+    temporal_coverage: LiveOrderEventDeltaTemporalCoverage = (
+        LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+    )
+    stream_quality: LiveOrderEventDeltaStreamQuality = (
+        LiveOrderEventDeltaStreamQuality.LOCAL_TICK_STREAM_CONTIGUOUS
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -176,7 +190,25 @@ class LiveOrderEventDeltaSourceSession:
             raise ValueError(
                 "source daily A-share catalog coverage must be complete"
             )
+        try:
+            temporal_coverage = LiveOrderEventDeltaTemporalCoverage(
+                self.temporal_coverage
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "source temporal_coverage is invalid"
+            ) from error
+        try:
+            stream_quality = LiveOrderEventDeltaStreamQuality(
+                self.stream_quality
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("source stream_quality is invalid") from error
         object.__setattr__(self, "catalog_scope", scope)
+        object.__setattr__(
+            self, "temporal_coverage", temporal_coverage
+        )
+        object.__setattr__(self, "stream_quality", stream_quality)
 
     @classmethod
     def from_session_info(
@@ -196,6 +228,11 @@ class LiveOrderEventDeltaSourceSession:
             bound_count=session.bound_count,
             catalog_scope=session.catalog_scope,
             coverage_complete=session.coverage_complete,
+            temporal_coverage=(
+                LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+                if session.coverage_from_open
+                else LiveOrderEventDeltaTemporalCoverage.FROM_PROCESS_START
+            ),
         )
 
 
@@ -227,6 +264,15 @@ class LiveOrderEventDeltaControlSnapshot:
             != self.source_session.trade_date
         ):
             raise ValueError("source and event trading dates disagree")
+        if (
+            self.event_session.temporal_coverage
+            != self.source_session.temporal_coverage
+            or self.event_session.stream_quality
+            != self.source_session.stream_quality
+        ):
+            raise ValueError(
+                "source and event stream coverage contracts disagree"
+            )
         for field, value in (
             (
                 "event_published_sequence",
@@ -293,7 +339,8 @@ def build_live_order_event_get_session_request(
         expected_source_session.bound_count,
         int(expected_source_session.catalog_scope),
         int(expected_source_session.coverage_complete),
-        0,
+        int(expected_source_session.temporal_coverage),
+        int(expected_source_session.stream_quality),
         0,
     )
 
@@ -413,6 +460,10 @@ def _snapshot_from_response(
         source_tick_consumed_sequence,
         heartbeat_monotonic_ns,
         producer_started_monotonic_ns,
+        source_temporal_coverage,
+        source_stream_quality,
+        event_temporal_coverage,
+        event_stream_quality,
         *reserved,
     ) = fields
     if (
@@ -446,6 +497,10 @@ def _snapshot_from_response(
         != int(expected_source_session.catalog_scope)
         or source_coverage_complete
         != int(expected_source_session.coverage_complete)
+        or source_temporal_coverage
+        != int(expected_source_session.temporal_coverage)
+        or source_stream_quality
+        != int(expected_source_session.stream_quality)
     ):
         raise LiveOrderEventDeltaSourceSessionMismatchError(
             "event control response source identity changed"
@@ -458,6 +513,8 @@ def _snapshot_from_response(
             trade_date=event_trade_date,
             ring_capacity=event_ring_capacity,
             total_mapping_bytes=event_total_mapping_bytes,
+            temporal_coverage=event_temporal_coverage,
+            stream_quality=event_stream_quality,
         )
         return LiveOrderEventDeltaControlSnapshot(
             request_id=response_request_id,

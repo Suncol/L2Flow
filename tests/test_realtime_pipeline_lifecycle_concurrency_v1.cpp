@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -817,6 +818,25 @@ void RunOnlineIngressSeamTests(TestContext* test) {
             if (pipeline != nullptr) {
                 ingress = pipeline->IngestExternalMessage(input);
             }
+            bool empty_prefix_applied = false;
+            bool future_prefix_rejected = false;
+            bool accepted_prefix_applied = false;
+            runtime::RealtimePipelineLiveStatusV1 drained_status{};
+            if (pipeline != nullptr && ingress.accepted()) {
+                empty_prefix_applied =
+                    pipeline->WaitAppliedThroughPrefix(
+                        0U,
+                        std::chrono::steady_clock::time_point::min());
+                future_prefix_rejected =
+                    !pipeline->WaitAppliedThroughPrefix(
+                        ingress.global_ingress_sequence + 1U,
+                        std::chrono::steady_clock::now() + 2s);
+                accepted_prefix_applied =
+                    pipeline->WaitAppliedThroughPrefix(
+                        ingress.global_ingress_sequence,
+                        std::chrono::steady_clock::now() + 2s);
+                drained_status = pipeline->LiveStatus();
+            }
             runtime::RealtimePipelineCutResultV1 generation{};
             if (pipeline != nullptr && ingress.accepted()) {
                 generation = pipeline->CutAndPublishGeneration(3s);
@@ -828,6 +848,10 @@ void RunOnlineIngressSeamTests(TestContext* test) {
                     pipeline != nullptr && ingress.accepted() &&
                     ingress.global_ingress_sequence == 1U &&
                     ingress.source_sequence == 1U &&
+                    empty_prefix_applied && future_prefix_rejected &&
+                    accepted_prefix_applied &&
+                    drained_status.processing_progress.applied_sequence >=
+                        ingress.global_ingress_sequence &&
                     generation.published() &&
                     generation.store_generation->Find(1U, &row) ==
                         market::IntradayInstrumentStoreQueryErrorV1::kNone &&
@@ -941,6 +965,46 @@ void RunOnlineIngressSeamTests(TestContext* test) {
                 capture->valid() && sdk_state->shutdown_calls == 1U,
             "capture refusal prevents preview admission and fails the sole SDK owner closed");
     }
+
+    {
+        PipelineCatalogFixture fixture;
+        test->Expect(
+            MakeCatalogFixture(&fixture),
+            "live-ingress fatal-health fixture");
+        auto sdk_state = std::make_shared<ReplaySdkState>();
+        std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
+        std::string detail;
+        const auto create_error =
+            runtime::RealtimePipelineV1::CreateForTest(
+                MakeConfig(fixture),
+                std::make_shared<ReplayFactory>(sdk_state),
+                &pipeline,
+                &detail);
+        runtime::RealtimePipelineIngressResultV1 ingress{};
+        bool healthy_before_failure = false;
+        if (pipeline != nullptr) {
+            healthy_before_failure = pipeline->LiveIngressHealthy();
+            ingress = pipeline->InjectSdkMessageForTest(nullptr);
+        }
+        const runtime::RealtimePipelineLiveStatusV1 live_status =
+            pipeline == nullptr
+                ? runtime::RealtimePipelineLiveStatusV1{}
+                : pipeline->LiveStatus();
+        test->Expect(
+            create_error == runtime::RealtimePipelineCreateErrorV1::kNone &&
+                pipeline != nullptr && healthy_before_failure &&
+                ingress.error ==
+                    runtime::RealtimePipelineIngressErrorV1::kNullMessage &&
+                live_status.processing_progress.valid() &&
+                live_status.fatal && !live_status.accepting &&
+                !live_status.healthy() &&
+                !pipeline->LiveIngressHealthy(),
+            "fatal admission failure closes the live-ingress health probe: " +
+                detail);
+        if (pipeline != nullptr) {
+            pipeline->StopAndDrain();
+        }
+    }
 }
 
 }  // namespace
@@ -1034,6 +1098,23 @@ int main() {
         callback_blocked,
         "callback reaches the owned-ingress accessor while holding admission");
 
+    std::promise<runtime::RealtimePipelineLiveStatusV1> health_promise;
+    std::future<runtime::RealtimePipelineLiveStatusV1> health_future =
+        health_promise.get_future();
+    std::thread health_thread([&] {
+        health_promise.set_value(pipeline->LiveStatus());
+    });
+    const std::future_status health_status = health_future.wait_for(2s);
+    const bool health_ready = health_status == std::future_status::ready;
+    const runtime::RealtimePipelineLiveStatusV1 health_value =
+        health_ready
+            ? health_future.get()
+            : runtime::RealtimePipelineLiveStatusV1{};
+    test.Expect(
+        callback_blocked && health_ready && health_value.healthy() &&
+            health_value.processing_progress.valid(),
+        "live status remains mutex-free while callback admission is held");
+
     runtime::RealtimePipelineCutResultV1 terminal{};
     std::thread terminal_thread([&] {
         state->TerminalCallStarted();
@@ -1051,6 +1132,7 @@ int main() {
         "blocked admitted callback has not been followed by SDK release");
     message_gate->Open();
     callback_thread.join();
+    health_thread.join();
 
     const bool shutdown_quiesced = state->WaitForShutdownQuiesced(2s);
     test.Expect(
@@ -1071,6 +1153,14 @@ int main() {
     test.Expect(
         terminal.published(),
         "terminal publishes after the admitted callback exits");
+    const runtime::RealtimePipelineLiveStatusV1 stopped_status =
+        pipeline->LiveStatus();
+    test.Expect(
+        stopped_status.processing_progress.valid() &&
+            stopped_status.stopped && !stopped_status.accepting &&
+            !stopped_status.healthy() &&
+            !pipeline->LiveIngressHealthy(),
+        "terminal stop closes the live status and health probe");
     if (terminal.published()) {
         const market::RealtimeHistoryWatermarkV1& watermark =
             terminal.store_generation->watermark();

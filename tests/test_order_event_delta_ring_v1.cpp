@@ -154,7 +154,14 @@ void TestAbiAndValidation(bool* ok) {
     *ok &= Expect(
         sizeof(ipc::OrderEventDeltaPayloadV1) == 320U &&
             sizeof(ipc::OrderEventDeltaHeaderV1) == 4096U &&
-            sizeof(ipc::OrderEventDeltaSlotV1) == 384U,
+            sizeof(ipc::OrderEventDeltaSlotV1) == 384U &&
+            ipc::kOrderEventDeltaWireMinorV1 == 1U &&
+            offsetof(
+                ipc::OrderEventDeltaHeaderV1,
+                temporal_coverage) == 120U &&
+            offsetof(
+                ipc::OrderEventDeltaHeaderV1,
+                stream_quality) == 124U,
         "fixed event-delta ABI sizes");
 
     auto event = Order(1U, 42);
@@ -196,6 +203,19 @@ void TestCreateAndOpenValidation(bool* ok) {
     }
     {
         auto config = Config(4U);
+        config.temporal_coverage =
+            static_cast<ipc::OrderEventDeltaTemporalCoverageV1>(0U);
+        std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> producer;
+        *ok &= Expect(
+            ipc::OrderEventDeltaRingProducerV1::Create(
+                config, &producer) ==
+                ipc::OrderEventDeltaRingCreateErrorV1::
+                    kInvalidConfiguration &&
+                producer == nullptr,
+            "unknown temporal coverage is rejected");
+    }
+    {
+        auto config = Config(4U);
         config.maximum_mapping_bytes =
             sizeof(ipc::OrderEventDeltaHeaderV1);
         std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> producer;
@@ -229,6 +249,24 @@ void TestCreateAndOpenValidation(bool* ok) {
         static_cast<void>(::close(descriptor));
     }
 
+    descriptor = -1;
+    *ok &= Expect(
+        producer->DuplicateReadOnlyDescriptor(&descriptor),
+        "duplicate descriptor for temporal mismatch test");
+    wrong = producer->session();
+    wrong.temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromProcessStart;
+    *ok &= Expect(
+        ipc::OrderEventDeltaRingReaderV1::Open(
+            descriptor, wrong, &reader) ==
+                ipc::OrderEventDeltaReaderOpenErrorV1::
+                    kSessionMismatch &&
+            reader == nullptr,
+        "reader rejects wrong temporal coverage identity");
+    if (descriptor >= 0) {
+        static_cast<void>(::close(descriptor));
+    }
+
     const int writable =
         ::open("/dev/null", O_RDWR | O_CLOEXEC);
     *ok &= Expect(writable >= 0, "open writable descriptor probe");
@@ -240,6 +278,32 @@ void TestCreateAndOpenValidation(bool* ok) {
                     kDescriptorNotReadOnly,
             "reader rejects writable descriptor");
         static_cast<void>(::close(writable));
+    }
+}
+
+void TestProcessStartCoverageSession(bool* ok) {
+    auto config = Config(8U, 15U);
+    config.temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromProcessStart;
+    std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> producer;
+    *ok &= Expect(
+        ipc::OrderEventDeltaRingProducerV1::Create(
+            config, &producer) ==
+                ipc::OrderEventDeltaRingCreateErrorV1::kNone &&
+            producer != nullptr &&
+            producer->session().temporal_coverage ==
+                ipc::OrderEventDeltaTemporalCoverageV1::
+                    kFromProcessStart &&
+            producer->session().stream_quality ==
+                ipc::OrderEventDeltaStreamQualityV1::
+                    kLocalTickStreamContiguous,
+        "process-start coverage is an exact ring-session identity");
+    if (producer != nullptr) {
+        auto reader = Reader(*producer, ok);
+        *ok &= Expect(
+            reader != nullptr &&
+                reader->session() == producer->session(),
+            "reader preserves process-start coverage identity");
     }
 }
 
@@ -590,6 +654,7 @@ int main() {
     bool ok = true;
     TestAbiAndValidation(&ok);
     TestCreateAndOpenValidation(&ok);
+    TestProcessStartCoverageSession(&ok);
     TestBasicPublication(&ok);
     TestOverrunFailClosed(&ok);
     TestSourceGapAndCapacityFailClosed(&ok);

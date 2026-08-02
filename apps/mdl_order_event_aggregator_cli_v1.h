@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l2flow/common/linux_thread_affinity_v1.h"
 #include "l2flow/ipc/order_event_delta_wire_v1.h"
 
 #include <charconv>
@@ -27,6 +28,16 @@ struct OrderEventAggregatorOptionsV1 final {
     std::size_t read_batch_records = 0U;
     std::uint32_t poll_interval_ms = 0U;
     std::uint32_t control_timeout_ms = 0U;
+    // Nonzero only for a router-managed sidecar. The process arms Linux
+    // parent-death signaling and verifies this exact parent before attaching
+    // any source mapping. Standalone/external deployments leave it zero.
+    std::uint64_t managed_parent_pid = 0U;
+    // Empty preserves inherited affinity. A nonempty value is applied and
+    // read back exactly by the aggregation thread before source attach; the
+    // control thread subsequently inherits that same mask.
+    std::string cpu_set;
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen;
 };
 
 enum class OrderEventAggregatorParseResultV1 : std::uint8_t {
@@ -50,13 +61,25 @@ OrderEventAggregatorHelpV1() noexcept {
         "  --event-ring-capacity N           derived-event ring row capacity\n"
         "  --event-maximum-mapping-bytes N   hard event mapping byte limit\n"
         "  --read-batch-records N            Wire ticks copied per read\n"
-        "  --poll-ms N                       idle poll interval, 1..1000\n"
+        "  --poll-ms N                       idle poll interval, 0..1000; "
+        "0 yields\n"
         "  --timeout-ms N                    control I/O timeout, 1..60000\n"
+        "\n"
+        "Optional coverage contract:\n"
+        "  --temporal-coverage MODE          from-open (default) or "
+        "process-start\n"
+        "                                      process-start explicitly "
+        "accepts LIVE_PARTIAL\n"
+        "  --cpu-set LIST                    optional strict logical CPU "
+        "set for this Event process\n"
+        "  --parent-pid N                    managed mode: exact router PID "
+        "death guard\n"
         "\n"
         "Other:\n"
         "  --help                            print this help and exit\n"
         "\n"
-        "The process always starts at global tick sequence 1. It has no\n"
+        "The process always starts at the selected source coverage's local\n"
+        "tick sequence 1. It has no\n"
         "skip, overrun catch-up, WAL, recovery, Parquet, or compaction "
         "mode.\n";
 }
@@ -154,6 +177,9 @@ ParseOrderEventAggregatorArgumentsV1(
         bool batch_seen = false;
         bool poll_seen = false;
         bool timeout_seen = false;
+        bool temporal_coverage_seen = false;
+        bool cpu_set_seen = false;
+        bool parent_pid_seen = false;
 
         const auto duplicate = [&](bool* seen,
                                    std::string_view name) {
@@ -316,6 +342,59 @@ ParseOrderEventAggregatorArgumentsV1(
                 }
                 parsed.read_batch_records =
                     static_cast<std::size_t>(numeric);
+            } else if (name == "--temporal-coverage") {
+                if (duplicate(&temporal_coverage_seen, name)) {
+                    return OrderEventAggregatorParseResultV1::kError;
+                }
+                if (value == "from-open") {
+                    parsed.temporal_coverage =
+                        ipc::OrderEventDeltaTemporalCoverageV1::
+                            kFromMarketOpen;
+                } else if (value == "process-start") {
+                    parsed.temporal_coverage =
+                        ipc::OrderEventDeltaTemporalCoverageV1::
+                            kFromProcessStart;
+                } else {
+                    SetError(
+                        error_message,
+                        "--temporal-coverage must be from-open or "
+                        "process-start");
+                    return OrderEventAggregatorParseResultV1::kError;
+                }
+            } else if (name == "--cpu-set") {
+                if (duplicate(&cpu_set_seen, name)) {
+                    return OrderEventAggregatorParseResultV1::kError;
+                }
+                l2flow::common::LinuxCpuSetV1 cpu_set{};
+                const auto cpu_error =
+                    l2flow::common::ParseLinuxCpuSetV1(
+                        value, &cpu_set);
+                if (cpu_error !=
+                    l2flow::common::LinuxCpuSetParseErrorV1::kNone) {
+                    SetError(
+                        error_message,
+                        std::string("--cpu-set is invalid: ") +
+                            std::string(
+                                l2flow::common::
+                                    LinuxCpuSetParseErrorNameV1(
+                                        cpu_error)));
+                    return OrderEventAggregatorParseResultV1::kError;
+                }
+                parsed.cpu_set = std::string(value);
+            } else if (name == "--parent-pid") {
+                if (duplicate(&parent_pid_seen, name) ||
+                    !ParseUnsigned(value, &numeric) ||
+                    numeric == 0U ||
+                    numeric > static_cast<std::uint64_t>(
+                                  std::numeric_limits<int>::max())) {
+                    if (error_message->empty()) {
+                        SetError(
+                            error_message,
+                            "--parent-pid must be a positive Linux pid_t");
+                    }
+                    return OrderEventAggregatorParseResultV1::kError;
+                }
+                parsed.managed_parent_pid = numeric;
             } else if (
                 name == "--poll-ms" || name == "--timeout-ms") {
                 bool* const seen =
@@ -324,11 +403,13 @@ ParseOrderEventAggregatorArgumentsV1(
                     name == "--poll-ms" ? 1'000U : 60'000U;
                 if (duplicate(seen, name) ||
                     !ParseUnsigned(value, &numeric) ||
-                    numeric == 0U || numeric > maximum) {
+                    (name == "--timeout-ms" && numeric == 0U) ||
+                    numeric > maximum) {
                     if (error_message->empty()) {
                         SetError(
                             error_message,
-                            std::string(name) + " must be in 1.." +
+                            std::string(name) + " must be in " +
+                                (name == "--poll-ms" ? "0.." : "1..") +
                                 std::to_string(maximum));
                     }
                     return OrderEventAggregatorParseResultV1::kError;

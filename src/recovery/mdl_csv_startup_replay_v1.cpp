@@ -223,9 +223,41 @@ public:
         return false;
     }
 
+    bool ObserveCompleteRecord(
+        const std::filesystem::path& file,
+        std::uint64_t line) {
+        ++records_since_cooperative_checkpoint_;
+        if (records_since_cooperative_checkpoint_ <
+            kStartupReplayCooperativeCheckpointRecordsV1) {
+            return true;
+        }
+        records_since_cooperative_checkpoint_ = 0U;
+
+        return CooperativeCheckpoint(file, line);
+    }
+
+    bool CooperativeCheckpoint(
+        const std::filesystem::path& file,
+        std::uint64_t line) {
+        std::string detail;
+        if (sink.CooperativeCheckpoint(&detail)) {
+            return true;
+        }
+        return Fail(
+            StartupReplayErrorV1::kSinkRejected,
+            file,
+            line,
+            detail.empty()
+                ? "startup replay cooperative checkpoint was rejected"
+                : std::move(detail));
+    }
+
     const StartupReplayConfigV1& config;
     StartupReplaySinkV1& sink;
     StartupReplayResultV1 result{};
+
+private:
+    std::size_t records_since_cooperative_checkpoint_ = 0U;
 };
 
 class CsvRecordReader final {
@@ -298,13 +330,17 @@ public:
                         "record contains invalid UTF-8 or NUL");
                 }
             }
+            if (!state_->ObserveCompleteRecord(
+                    input_.path, output->line)) {
+                return false;
+            }
             *available = true;
             return true;
         };
 
         while (remaining_ != 0U) {
             char character = '\0';
-            if (!ReadByte(&character)) {
+            if (!ReadByte(&character, output->line)) {
                 return false;
             }
             ++record_bytes;
@@ -476,11 +512,21 @@ public:
     }
 
 private:
-    bool ReadByte(char* output) {
+    bool ReadByte(
+        char* output,
+        std::uint64_t checkpoint_line) {
         if (output == nullptr || remaining_ == 0U) {
             return false;
         }
         if (buffer_index_ == buffer_size_) {
+            // A single logical record can be many MiB and repeatedly grow its
+            // field strings without ever reaching the record-count gate.
+            // Check before each bounded pread so online recovery gets a
+            // cancellation/backpressure point at most one 64 KiB chunk away.
+            if (!state_->CooperativeCheckpoint(
+                    input_.path, checkpoint_line)) {
+                return false;
+            }
             const std::uint64_t requested_u64 = std::min(
                 remaining_,
                 static_cast<std::uint64_t>(buffer_.size()));
@@ -539,7 +585,7 @@ private:
             return false;
         }
         char next = '\0';
-        if (!ReadByte(&next)) {
+        if (!ReadByte(&next, record_line)) {
             return false;
         }
         ++(*record_bytes);
@@ -580,7 +626,10 @@ private:
     bool extension_attempted_ = false;
     std::uint64_t partial_start_offset_ = 0U;
     std::uint64_t partial_start_line_ = 1U;
-    std::array<char, 64U * 1024U> buffer_{};
+    std::array<
+        char,
+        kStartupReplayCooperativeCheckpointBytesV1>
+        buffer_{};
     std::size_t buffer_index_ = 0U;
     std::size_t buffer_size_ = 0U;
 };

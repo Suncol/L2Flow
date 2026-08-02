@@ -29,6 +29,7 @@
 
 #include <fcntl.h>
 #include <sys/random.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -38,6 +39,7 @@
 namespace {
 
 namespace app = l2flow::apps;
+namespace common = l2flow::common;
 namespace ipc = l2flow::ipc;
 
 volatile std::sig_atomic_t g_stop_requested = 0;
@@ -203,6 +205,44 @@ template <typename Value, std::size_t Size>
     action.sa_flags = 0;
     return ::sigaction(SIGINT, &action, nullptr) == 0 &&
            ::sigaction(SIGTERM, &action, nullptr) == 0;
+}
+
+[[nodiscard]] bool ArmManagedParentDeathGuard(
+    const app::OrderEventAggregatorOptionsV1& options,
+    std::string* error) noexcept {
+    if (options.managed_parent_pid == 0U) {
+        return true;
+    }
+    if (error == nullptr) {
+        return false;
+    }
+    const pid_t expected_parent =
+        static_cast<pid_t>(options.managed_parent_pid);
+    if (expected_parent <= 0 || ::getppid() != expected_parent) {
+        *error = "managed parent exited before Event initialization";
+        return false;
+    }
+    if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+        *error =
+            "PR_SET_PDEATHSIG failed: errno=" +
+            std::to_string(errno);
+        return false;
+    }
+    // Close the race where the parent exits between the first getppid and
+    // PR_SET_PDEATHSIG. In that case the kernel could not deliver the signal
+    // retroactively, but reparenting makes this exact comparison fail.
+    if (::getppid() != expected_parent) {
+        *error = "managed parent exited while arming Event death guard";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool ManagedParentAlive(
+    const app::OrderEventAggregatorOptionsV1& options) noexcept {
+    return options.managed_parent_pid == 0U ||
+           ::getppid() ==
+               static_cast<pid_t>(options.managed_parent_pid);
 }
 
 using IoDeadline = std::chrono::steady_clock::time_point;
@@ -555,6 +595,15 @@ struct SourceResponse final {
            AllZero(response.reserved);
 }
 
+[[nodiscard]] ipc::OrderEventDeltaTemporalCoverageV1
+SourceTemporalCoverage(std::uint32_t flags) noexcept {
+    return (flags & ipc::kRealtimeHeaderCoverageFromOpenV2) != 0U
+               ? ipc::OrderEventDeltaTemporalCoverageV1::
+                     kFromMarketOpen
+               : ipc::OrderEventDeltaTemporalCoverageV1::
+                     kFromProcessStart;
+}
+
 [[nodiscard]] SourceAttachError AttachSource(
     const app::OrderEventAggregatorOptionsV1& options,
     ShmReaderPtr* output_reader,
@@ -694,7 +743,21 @@ struct SourceResponse final {
         session.catalog_scope !=
             static_cast<std::uint32_t>(
                 ipc::RealtimeCatalogScopeV2::
-                    kDeclaredDailyAShare)) {
+                    kDeclaredDailyAShare) ||
+        SourceTemporalCoverage(session.flags) !=
+            options.temporal_coverage ||
+        (session.server_state ==
+             static_cast<std::uint32_t>(
+                 ipc::RealtimeServerStateV2::kLivePartial) &&
+         options.temporal_coverage !=
+             ipc::OrderEventDeltaTemporalCoverageV1::
+                 kFromProcessStart) ||
+        (session.server_state ==
+             static_cast<std::uint32_t>(
+                 ipc::RealtimeServerStateV2::kActive) &&
+         options.temporal_coverage !=
+             ipc::OrderEventDeltaTemporalCoverageV1::
+                 kFromMarketOpen)) {
         return SourceAttachError::kIdentity;
     }
     *output_session = session;
@@ -723,7 +786,9 @@ struct SourceResponse final {
            left.capacity == right.capacity &&
            left.bound_count == right.bound_count &&
            left.catalog_scope == right.catalog_scope &&
-           left.coverage_complete == right.coverage_complete;
+           left.coverage_complete == right.coverage_complete &&
+           SourceTemporalCoverage(left.flags) ==
+               SourceTemporalCoverage(right.flags);
 }
 
 [[nodiscard]] bool SourceStateReadable(
@@ -736,15 +801,22 @@ struct SourceResponse final {
                    ipc::RealtimeServerStateV2::kDraining) ||
            state ==
                static_cast<std::uint32_t>(
-                   ipc::RealtimeServerStateV2::kStoppedClean);
+                   ipc::RealtimeServerStateV2::kStoppedClean) ||
+           state ==
+               static_cast<std::uint32_t>(
+                   ipc::RealtimeServerStateV2::kLivePartial);
 }
 
 [[nodiscard]] bool SourceHealthUsable(
     const l2flow_shm_health_v2& health,
-    std::uint64_t expected_epoch) noexcept {
+    std::uint64_t expected_epoch,
+    ipc::OrderEventDeltaTemporalCoverageV1
+        expected_temporal_coverage) noexcept {
     return health.session_epoch == expected_epoch &&
            (health.flags &
             ipc::kRealtimeHeaderCoverageLostV2) == 0U &&
+           SourceTemporalCoverage(health.flags) ==
+               expected_temporal_coverage &&
            SourceStateReadable(health.server_state);
 }
 
@@ -803,6 +875,11 @@ SourceSession(
     result.bound_count = source.bound_count;
     result.catalog_scope = source.catalog_scope;
     result.coverage_complete = source.coverage_complete;
+    result.temporal_coverage =
+        SourceTemporalCoverage(source.flags);
+    result.stream_quality =
+        ipc::OrderEventDeltaStreamQualityV1::
+            kLocalTickStreamContiguous;
     return result;
 }
 
@@ -995,8 +1072,11 @@ enum class LiveLoopResult : std::uint8_t {
     std::uint64_t* next_heartbeat_ns,
     std::string* error) {
     for (;;) {
-        if (g_stop_requested != 0) {
-            *error = "termination signal received";
+        if (g_stop_requested != 0 || !ManagedParentAlive(options)) {
+            *error = options.managed_parent_pid != 0U &&
+                             !ManagedParentAlive(options)
+                         ? "managed parent exited"
+                         : "termination signal received";
             return LiveLoopResult::kInterrupted;
         }
         l2flow_shm_health_v2 health{};
@@ -1004,7 +1084,9 @@ enum class LiveLoopResult : std::uint8_t {
             l2flow_shm_reader_health_v2(source_reader, &health);
         if (health_error != L2FLOW_SHM_READER_OK_V2 ||
             !SourceHealthUsable(
-                health, initial_source.session_epoch)) {
+                health,
+                initial_source.session_epoch,
+                SourceTemporalCoverage(initial_source.flags))) {
             *error =
                 "source health became unavailable: code=" +
                 std::to_string(health_error) +
@@ -1072,9 +1154,15 @@ enum class LiveLoopResult : std::uint8_t {
                 "watermark";
             return LiveLoopResult::kFailed;
         }
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(
-                options.poll_interval_ms));
+        if (options.poll_interval_ms == 0U) {
+            // The explicit zero-latency mode remains scheduler-friendly and
+            // never changes the source or event publication contracts.
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(
+                    options.poll_interval_ms));
+        }
     }
 }
 
@@ -1095,10 +1183,50 @@ enum class LiveLoopResult : std::uint8_t {
 
 [[nodiscard]] int Run(
     const app::OrderEventAggregatorOptionsV1& options) {
+    if (!options.cpu_set.empty()) {
+        common::LinuxCpuSetV1 requested{};
+        const common::LinuxCpuSetParseErrorV1 parse_error =
+            common::ParseLinuxCpuSetV1(
+                options.cpu_set, &requested);
+        common::LinuxCpuSetV1 observed{};
+        int affinity_system_error = 0;
+        const common::LinuxThreadAffinityErrorV1 affinity_error =
+            parse_error == common::LinuxCpuSetParseErrorV1::kNone
+                ? common::ApplyCurrentLinuxThreadAffinityExactV1(
+                      requested,
+                      &observed,
+                      &affinity_system_error)
+                : common::LinuxThreadAffinityErrorV1::kEmptyCpuSet;
+        if (parse_error != common::LinuxCpuSetParseErrorV1::kNone ||
+            affinity_error !=
+                common::LinuxThreadAffinityErrorV1::kNone ||
+            !(observed == requested)) {
+            std::cerr
+                << "mdl-order-event-aggregator: CPU affinity "
+                   "apply/readback failed: parse="
+                << common::LinuxCpuSetParseErrorNameV1(parse_error)
+                << " affinity="
+                << common::LinuxThreadAffinityErrorNameV1(
+                       affinity_error)
+                << " errno=" << affinity_system_error << '\n';
+            return 1;
+        }
+        std::cerr
+            << "mdl-order-event-aggregator: strict CPU affinity active: "
+            << "cpu_set=" << options.cpu_set
+            << " cpu_count=" << requested.count() << '\n';
+    }
     if (!InstallSignalHandlers()) {
         std::cerr
             << "mdl-order-event-aggregator: failed to install "
                "signal handlers\n";
+        return 1;
+    }
+    std::string parent_guard_error;
+    if (!ArmManagedParentDeathGuard(options, &parent_guard_error)) {
+        std::cerr
+            << "mdl-order-event-aggregator: managed parent guard failed: "
+            << parent_guard_error << '\n';
         return 1;
     }
 
@@ -1152,6 +1280,11 @@ enum class LiveLoopResult : std::uint8_t {
     ring_config.maximum_mapping_bytes =
         options.event_maximum_mapping_bytes;
     ring_config.producer_started_monotonic_ns = started_ns;
+    ring_config.temporal_coverage =
+        SourceTemporalCoverage(initial_source.flags);
+    ring_config.stream_quality =
+        ipc::OrderEventDeltaStreamQualityV1::
+            kLocalTickStreamContiguous;
     std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> producer;
     const auto ring_error =
         ipc::OrderEventDeltaRingProducerV1::Create(
@@ -1299,6 +1432,12 @@ enum class LiveLoopResult : std::uint8_t {
         << "READY source_epoch=" << options.session_epoch
         << " trade_date=" << options.trade_date
         << " source_cut=" << attach_cut
+        << " temporal_coverage="
+        << (options.temporal_coverage ==
+                    ipc::OrderEventDeltaTemporalCoverageV1::
+                        kFromMarketOpen
+                ? "from-open"
+                : "process-start")
         << " event_prefix="
         << producer->published_event_sequence()
         << " event_socket="

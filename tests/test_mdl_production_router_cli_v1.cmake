@@ -39,6 +39,18 @@ run_case(
     "online (the only supported mode)"
     --help)
 
+run_case(
+    help_lists_default_partial_event_socket
+    0
+    "partial mode derives <ipc>.events by default"
+    --help)
+
+run_case(
+    help_lists_zero_latency_event_poll
+    0
+    "0..1000, default 0; 0 yields"
+    --help)
+
 set(base
     --sdk-library /nonexistent/libmdl_api.so
     --session-epoch 1
@@ -125,12 +137,78 @@ run_case(
     --certified-ipc-socket /tmp/l2flow-cli-certified.sock)
 
 run_case(
-    partial_rejects_event_aggregator
-    2
-    "process-start partial-coverage contract"
+    partial_accepts_explicit_event_aggregator
+    1
+    "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
     --event-aggregator-socket /tmp/l2flow-cli-events.sock)
+
+run_case(
+    partial_accepts_zero_event_poll
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --event-aggregator-poll-ms 0)
+
+run_case(
+    partial_rejects_event_poll_above_bound
+    2
+    "--event-aggregator-poll-ms must be 0..1000"
+    ${base}
+    --intraday-live-partial
+    --event-aggregator-poll-ms 1001)
+
+run_case(
+    partial_rejects_invalid_event_cpu_set
+    2
+    "--event-cpu-set is invalid: invalid_syntax"
+    ${base}
+    --intraday-live-partial
+    --event-cpu-set "8, 9")
+
+run_case(
+    partial_external_event_cannot_claim_managed_affinity
+    2
+    "cannot pin an externally supervised partial Event process"
+    ${base}
+    --intraday-live-partial
+    --event-aggregator-socket /tmp/l2flow-cli-events.sock
+    --event-cpu-set 8)
+
+run_case(
+    partial_rejects_relative_event_executable
+    2
+    "--event-aggregator-executable must be an absolute path"
+    ${base}
+    --intraday-live-partial
+    --event-aggregator-executable relative-event-aggregator)
+
+run_case(
+    from_open_rejects_partial_event_executable
+    2
+    "--event-aggregator-executable is only used by --intraday-live-partial"
+    ${base}
+    --intraday-store-from-open
+    --event-aggregator-executable /tmp/mdl-order-event-aggregator)
+
+run_case(
+    from_open_external_event_cannot_claim_router_affinity
+    2
+    "cannot pin the legacy externally supervised Event process"
+    ${base}
+    --intraday-store-from-open
+    --event-aggregator-socket /tmp/l2flow-cli-events.sock
+    --event-cpu-set 8)
+
+run_case(
+    partial_rejects_event_socket_aliasing_fast
+    2
+    "--event-aggregator-socket must be distinct from --ipc-socket"
+    ${base}
+    --intraday-live-partial
+    --event-aggregator-socket /tmp/l2flow-cli-test.sock)
 
 run_case(
     partial_rejects_recovery_mode

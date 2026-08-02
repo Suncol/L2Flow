@@ -115,6 +115,11 @@ public:
         const noexcept;
     [[nodiscard]] std::uint64_t committed_mapping_bytes()
         const noexcept;
+    // Called by the CERTIFIED worker at the exact successful online-recovery
+    // prefix barrier, before the control socket is exposed. This is a
+    // monotonic transition and remains false for ordinary from-open startup.
+    [[nodiscard]] bool MarkStartupPrefixRecovered() noexcept;
+    [[nodiscard]] std::uint32_t coverage_flags() const noexcept;
     [[nodiscard]] bool failed() const noexcept;
 
 private:

@@ -18,7 +18,7 @@ inline constexpr std::array<std::uint8_t, 8U>
     kCertifiedOrderEventMagicV1{
         'L', '2', 'F', 'C', 'E', 'V', 'T', '1'};
 inline constexpr std::uint16_t kCertifiedOrderEventWireMajorV1 = 1U;
-inline constexpr std::uint16_t kCertifiedOrderEventWireMinorV1 = 0U;
+inline constexpr std::uint16_t kCertifiedOrderEventWireMinorV1 = 1U;
 inline constexpr std::uint32_t kCertifiedOrderEventEndianMarkerV1 =
     0x01020304U;
 inline constexpr std::uint32_t kCertifiedOrderEventHeaderBytesV1 =
@@ -31,6 +31,20 @@ inline constexpr std::uint64_t
     kCertifiedOrderEventControlResponseMagicV1 =
         0x315456454346324cULL;  // "L2FCEVT1" little-endian
 
+enum CertifiedOrderEventCoverageFlagV1 : std::uint32_t {
+    // CERTIFIED always proves native continuity from the documented sequence
+    // origin. It is never exposed for a process-start partial session.
+    kCertifiedOrderEventCoverageFromOpenV1 = 1U << 0U,
+    // The from-open prefix was rebuilt behind an exact worker barrier before
+    // the control socket became queryable. Ordinary from-open startup leaves
+    // this bit clear.
+    kCertifiedOrderEventStartupPrefixRecoveredV1 = 1U << 1U,
+};
+inline constexpr std::uint32_t
+    kCertifiedOrderEventKnownCoverageFlagsV1 =
+        kCertifiedOrderEventCoverageFromOpenV1 |
+        kCertifiedOrderEventStartupPrefixRecoveredV1;
+
 // Every mutable scalar is accessed through an always-lock-free atomic_ref.
 // The journal is append-only: event_published_sequence is the immutable
 // visible prefix, while canonical_apply_frontier also advances for an input
@@ -41,7 +55,8 @@ struct alignas(4096) CertifiedOrderEventHeaderV1 final {
     std::uint16_t abi_minor = 0U;
     std::uint32_t header_bytes = 0U;
     std::uint32_t endian_marker = 0U;
-    std::uint32_t flags = 0U;
+    std::uint32_t flags =
+        kCertifiedOrderEventCoverageFromOpenV1;
     std::uint64_t total_mapping_bytes = 0U;
 
     std::array<std::uint8_t, 16U> run_id{};
@@ -128,7 +143,7 @@ struct CertifiedOrderEventControlResponseV1 final {
     std::uint64_t event_capacity = 0U;
     std::uint32_t slot_stride =
         kCertifiedOrderEventSlotBytesV1;
-    std::uint32_t reserved1 = 0U;
+    std::uint32_t coverage_flags = 0U;
     std::array<std::uint8_t, 48U> reserved{};
 };
 static_assert(sizeof(CertifiedOrderEventControlResponseV1) == 128U);

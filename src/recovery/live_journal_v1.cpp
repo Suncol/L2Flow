@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <condition_variable>
@@ -436,6 +437,7 @@ public:
             reservation_segment_bytes_ = kSegmentHeaderBytes;
             reservation_segment_count_ = 1U;
             state_ = LiveJournalStateV1::kWriting;
+            failed_.store(false, std::memory_order_release);
             writer_thread_ = std::thread(
                 [self = shared_from_this()] { self->WriterLoop(); });
             return LiveJournalErrorV1::kNone;
@@ -604,6 +606,10 @@ public:
             result.error = LiveJournalErrorV1::kUnexpectedFailure;
         }
         return result;
+    }
+
+    [[nodiscard]] bool failed() const noexcept {
+        return failed_.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] bool StopAndFlush() noexcept {
@@ -938,6 +944,7 @@ private:
             system_error_number_ = system_error_number;
         }
         state_ = LiveJournalStateV1::kFailed;
+        failed_.store(true, std::memory_order_release);
         stop_requested_ = true;
         queue_cv_.notify_all();
         commit_cv_.notify_all();
@@ -959,6 +966,7 @@ private:
     LiveJournalStateV1 state_ = LiveJournalStateV1::kFailed;
     LiveJournalErrorV1 error_ = LiveJournalErrorV1::kNone;
     int system_error_number_ = 0;
+    std::atomic<bool> failed_{true};
     bool stop_requested_ = false;
     std::uint64_t accepted_serial_ = 0U;
     std::uint64_t committed_serial_ = 0U;
@@ -1328,6 +1336,10 @@ bool MdlLiveJournalV1::CreateReader(
     } catch (...) {
         return false;
     }
+}
+
+bool MdlLiveJournalV1::failed() const noexcept {
+    return impl_ == nullptr || impl_->failed();
 }
 
 LiveJournalSnapshotV1 MdlLiveJournalV1::Snapshot() const noexcept {

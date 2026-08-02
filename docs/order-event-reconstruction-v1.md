@@ -228,6 +228,22 @@ generation：
 revision 正确更新为 A-backed exact revision。checkpoint 只有消费显式 EOF 后
 可用，且外层 derived checkpoint 只对返回它的存活 reader 有效。
 
+## Canonical CERTIFIED Event：完整历史到实时 tail
+
+普通 from-open 和成功 promotion 的 online recovery 默认使用 CERTIFIED worker
+中的 canonical projector。native sequence coordinator 先处理 gap、重复与乱序
+回补，再把严格 canonical apply 顺序同时提交给 CERTIFIED Tick 和 append-only
+Event journal。因此晚到的 `3,1,2` 修复不会进入下面 arrival-order standalone
+engine 的非递增保护，也不会重写已经公开的 Event prefix。
+
+CERTIFIED control 的 `kGetEventHistory` 返回独立只读 mapping。C++、稳定 C ABI
+和 Python `L2FlowClient.open_certified_order_events()` 使用同一 stateful cursor
+先读 attach 时的完整历史，再在 idle 后继续读取新 append 的 live events。
+online recovery 在 control 暴露前执行 FIFO prefix barrier 并原子标记
+`startup_prefix_recovered`；control 可查询后 late barrier 被拒绝，所以 coverage
+不会在 reader attach 后改变。该路径是需要全日 Event/history 或需要 native
+gap 回补时的默认路径。
+
 ## Low-latency event-delta 实时链路
 
 正式实时链路为：
@@ -240,8 +256,9 @@ Wire V2 global tick ring
   -> C++ / stable C ABI / Python live reader
 ```
 
-`OrderEventLiveAggregationEngineV1` 必须从
-`tick_stream_sequence=1` 开始稠密消费沪深混合 global tick 流。快照等非目标
+`OrderEventLiveAggregationEngineV1` 必须从所声明时间覆盖起点的
+`tick_stream_sequence=1` 开始稠密消费沪深混合 global tick 流。默认起点是开盘；
+显式 process-start 模式的起点是本进程开始接收行情。快照等非目标
 消息产生零条派生事件，但仍推进 source cursor；不能只读关心的证券或 source
 slot。每个目标 tick 只调用一次 `PublishSourceTick`：
 
@@ -273,6 +290,27 @@ fail-close；V1 没有跳过缺口、overrun catch-up、reset 或恢复入口。
 5. 运行时源 overrun、序号缺口、状态容量耗尽或任何投影/发布失败均关闭
    event session。
 
+默认 `--temporal-coverage from-open` 只接受带
+`coverage_from_open=true` 的源。`--temporal-coverage process-start` 才接受
+`LIVE_PARTIAL`，并从该源的本地 tick sequence 1 建立完整的本进程期内事件流。
+event/source session 都传递同一 temporal coverage 和
+`LOCAL_TICK_STREAM_CONTIGUOUS` quality。后者只证明本地
+`tick_stream_sequence` 稠密；它不声称启动前数据或 vendor-native gap 已回补。
+沪深 native `BizIndex/ApplSeqNum` 的非递增保护仍独立 fail-close。
+
+`--intraday-live-partial` 默认由 router 派生 `<ipc-socket>.events` 并管理该
+进程；显式 `--event-aggregator-socket` 则保留给外部 supervisor。受管模式在
+SDK connect 前等待 process-start READY，因此不会丢失第一条 callback。Event
+进程运行期失败只降级 Event，不反向停止或阻塞 FAST。router 每个 generation
+周期检查 control identity、heartbeat、消费进度与 source-ring lag；受管进程还
+用 `PR_SET_PDEATHSIG` 绑定精确父 PID，并以有界 TERM/KILL 流程回收。外部模式
+同样接受运行期健康检查，但进程生命周期仍由外部 supervisor 负责。
+
+可选 `--event-cpu-set LIST` 会把启动允许的逻辑 CPU 严格分成
+`Event=LIST` 与 `FAST=allowed-LIST`；两者均经内核 exact readback，FAST 补集
+必须非空。缺省不执行 affinity syscall。该集合关系不等价于物理核、SMT、
+NUMA 或 IRQ 隔离，拓扑选择仍由部署方负责。
+
 生产 router 的 `--event-aggregator-socket` 是可选兼容开关；配置后则是强制
 启动门槛。router 在创建 SDK pipeline 之前等待同一
 `source run_id/session_epoch/trade_date` 及完整冻结 daily-catalog identity
@@ -282,10 +320,10 @@ READY，并额外要求
 门槛时，SDK 第一条 callback 不可能先于聚合器 READY。超时由
 `--event-aggregator-ready-timeout-ms` 控制。
 
-event control V1.1 使用固定宽度 Unix `SOCK_SEQPACKET` 协议、双向 same-UID
+event control V1.2 使用固定宽度 Unix `SOCK_SEQPACKET` 协议、双向 same-UID
 `SO_PEERCRED` 校验和 `SCM_RIGHTS`。只有 ACTIVE 且 coverage 未丢失时才传递
 O_RDONLY ring fd；source session 和 event session 是两个独立身份，重启聚合器
-不会静默复用旧 event session。V1.0 peer 因 minor 和消息尺寸不匹配而
+不会静默复用旧 event session。V1.0/V1.1 peer 因 exact minor 不匹配而
 fail-closed。
 
 源端进入 `STOPPED_CLEAN` 后，进程先读尽最终 contiguous tick prefix，再把
@@ -308,7 +346,8 @@ Python 控制面再次校验 source identity、协议保留字段、same-UID pee
 Python 对象；`.row(i)` 只用于冷路径检查。
 
 实时可见性不等待 immutable generation。进程在有数据时连续 drain；只有空读
-才按 `--poll-ms` 休眠，因此空闲后第一批的额外检测延迟上界约为该配置值。
+才按 `--poll-ms` 等待。正值按对应毫秒休眠；`0` 执行 scheduler yield，供受管
+partial sidecar 的低延迟默认值使用，不增加固定毫秒级等待。
 instrument full/update 历史接口则仍受 generation 周期约束，两者用途不能混淆。
 
 容量至少同时满足：

@@ -46,8 +46,16 @@ namespace {
 namespace realtime = l2flow::realtime;
 namespace market = l2flow::market;
 namespace sdk = l2flow::sdk;
+namespace common = l2flow::common;
 
 static_assert(sizeof(std::size_t) <= sizeof(std::uint64_t));
+
+enum class ThreadStartupStateV1 : std::uint8_t {
+    kNotStarted = 0U,
+    kStarting,
+    kReady,
+    kFailed,
+};
 
 template <typename T>
 [[nodiscard]] std::atomic_ref<T> Atomic(T& value) noexcept {
@@ -63,6 +71,26 @@ void SetSystemError(int* output, int value) noexcept {
     if (output != nullptr) {
         *output = value;
     }
+}
+
+[[nodiscard]] bool ApplyOptionalCurrentThreadCpuSet(
+    const common::LinuxCpuSetV1& requested,
+    int* system_error_number) noexcept {
+    SetSystemError(system_error_number, 0);
+    if (requested.empty()) {
+        return true;
+    }
+    const auto error =
+        common::ApplyCurrentLinuxThreadAffinityExactV1(
+            requested, nullptr, system_error_number);
+    if (error == common::LinuxThreadAffinityErrorV1::kNone) {
+        return true;
+    }
+    if (system_error_number != nullptr &&
+        *system_error_number == 0) {
+        *system_error_number = EINVAL;
+    }
+    return false;
 }
 
 void CloseDescriptor(int* descriptor) noexcept {
@@ -182,7 +210,18 @@ void CopyIdentity(
 enum class HandoffKind : std::uint8_t {
     kObservation = 1U,
     kApplied = 2U,
-    kBarrier = 3U,
+    kPrefixProbe = 3U,
+    kPrefixCommit = 4U,
+};
+
+enum class PrefixCommitPhase : std::uint8_t {
+    kNotStarted = 0U,
+    kPending,
+    kCompleting,
+    kSucceeded,
+    kFailed,
+    kCancelled,
+    kWorkerFailed,
 };
 
 struct HandoffEvent final {
@@ -472,6 +511,29 @@ std::string_view RealtimeCertifiedServiceCreateErrorNameV1(
     return "unknown";
 }
 
+std::string_view RealtimeCertifiedPrefixFenceOperationErrorNameV1(
+    RealtimeCertifiedPrefixFenceOperationErrorV1 error) noexcept {
+    switch (error) {
+        case RealtimeCertifiedPrefixFenceOperationErrorV1::kNone:
+            return "none";
+        case RealtimeCertifiedPrefixFenceOperationErrorV1::
+            kInvalidArgument:
+            return "invalid_argument";
+        case RealtimeCertifiedPrefixFenceOperationErrorV1::
+            kInvalidLifecycle:
+            return "invalid_lifecycle";
+        case RealtimeCertifiedPrefixFenceOperationErrorV1::kTimedOut:
+            return "timed_out";
+        case RealtimeCertifiedPrefixFenceOperationErrorV1::
+            kWorkerFailed:
+            return "worker_failed";
+        case RealtimeCertifiedPrefixFenceOperationErrorV1::
+            kInternalFailure:
+            return "internal_failure";
+    }
+    return "unknown";
+}
+
 class RealtimeCertifiedMarketServiceV1::Impl final {
 private:
     struct ChannelLess final {
@@ -566,6 +628,21 @@ public:
                     4096U !=
                 0U ||
             !ValidSocketPath(config_.control_socket_path)) {
+            return RealtimeCertifiedServiceCreateErrorV1::
+                kInvalidConfiguration;
+        }
+
+        worker_cpu_set_.Clear();
+        control_cpu_set_.Clear();
+        if ((!config_.worker_cpu_set.empty() &&
+             common::ParseLinuxCpuSetV1(
+                 config_.worker_cpu_set, &worker_cpu_set_) !=
+                 common::LinuxCpuSetParseErrorV1::kNone) ||
+            (!config_.control_cpu_set.empty() &&
+             common::ParseLinuxCpuSetV1(
+                 config_.control_cpu_set, &control_cpu_set_) !=
+                 common::LinuxCpuSetParseErrorV1::kNone)) {
+            SetSystemError(system_error_number, EINVAL);
             return RealtimeCertifiedServiceCreateErrorV1::
                 kInvalidConfiguration;
         }
@@ -878,141 +955,565 @@ public:
                 expected, true, std::memory_order_acq_rel)) {
             return false;
         }
-        accepting_.store(true, std::memory_order_release);
-        worker_running_.store(true, std::memory_order_release);
+        worker_affinity_system_error_.store(
+            0, std::memory_order_relaxed);
+        worker_startup_state_.store(
+            ThreadStartupStateV1::kStarting,
+            std::memory_order_release);
         try {
             worker_thread_ = std::thread([this]() noexcept {
+                int affinity_error = 0;
+                if (!ApplyOptionalCurrentThreadCpuSet(
+                        worker_cpu_set_, &affinity_error)) {
+                    worker_affinity_system_error_.store(
+                        affinity_error, std::memory_order_relaxed);
+                    worker_startup_state_.store(
+                        ThreadStartupStateV1::kFailed,
+                        std::memory_order_release);
+                    worker_startup_state_.notify_all();
+                    return;
+                }
+                accepting_.store(true, std::memory_order_release);
+                worker_running_.store(true, std::memory_order_release);
+                worker_startup_state_.store(
+                    ThreadStartupStateV1::kReady,
+                    std::memory_order_release);
+                worker_startup_state_.notify_all();
                 WorkerLoop();
             });
-            return true;
         } catch (...) {
-            accepting_.store(false, std::memory_order_release);
-            worker_stop_requested_.store(
-                true, std::memory_order_release);
-            worker_running_.store(false, std::memory_order_release);
-            wake_epoch_.fetch_add(1U, std::memory_order_release);
-            wake_epoch_.notify_all();
-            if (worker_thread_.joinable()) {
-                worker_thread_.join();
-            }
-            SetSystemError(system_error_number, EAGAIN);
-            return false;
+            worker_affinity_system_error_.store(
+                EAGAIN, std::memory_order_relaxed);
+            worker_startup_state_.store(
+                ThreadStartupStateV1::kFailed,
+                std::memory_order_release);
+            worker_startup_state_.notify_all();
         }
+        ThreadStartupStateV1 startup =
+            worker_startup_state_.load(std::memory_order_acquire);
+        while (startup == ThreadStartupStateV1::kStarting) {
+            worker_startup_state_.wait(
+                startup, std::memory_order_acquire);
+            startup = worker_startup_state_.load(
+                std::memory_order_acquire);
+        }
+        if (startup == ThreadStartupStateV1::kReady) {
+            return true;
+        }
+        accepting_.store(false, std::memory_order_release);
+        worker_stop_requested_.store(true, std::memory_order_release);
+        worker_running_.store(false, std::memory_order_release);
+        WakeWorker();
+        if (worker_thread_.joinable()) {
+            worker_thread_.join();
+        }
+        const int affinity_error =
+            worker_affinity_system_error_.load(
+                std::memory_order_relaxed);
+        SetSystemError(
+            system_error_number,
+            affinity_error == 0 ? EINVAL : affinity_error);
+        return false;
     }
 
     [[nodiscard]] bool StartControl(
         int* system_error_number) noexcept {
+        std::lock_guard<std::mutex> lifecycle(
+            control_lifecycle_mutex_);
         SetSystemError(system_error_number, 0);
         if (!started_.load(std::memory_order_acquire) ||
             !worker_running_.load(std::memory_order_acquire)) {
             SetSystemError(system_error_number, EINVAL);
             return false;
         }
-        bool expected = false;
-        if (!control_started_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel)) {
+        if (prefix_probe_active_.load(std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EBUSY);
+            return false;
+        }
+        if ((config_.control_requires_prefix_commit ||
+             prefix_barrier_started_.load(std::memory_order_acquire)) &&
+            !prefix_barrier_completed_.load(
+                std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EBUSY);
+            return false;
+        }
+        auto expected =
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kNotStarted;
+        if (!control_state_.compare_exchange_strong(
+                expected,
+                RealtimeCertifiedServiceSnapshotV1::ControlState::
+                    kRunning,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
             return false;
         }
         return StartClaimedControl(system_error_number);
     }
 
-    [[nodiscard]] bool WaitForPrefixBarrier(
+    [[nodiscard]] RealtimeCertifiedPrefixFenceOperationErrorV1
+    ProbePrefixFence(
         std::chrono::milliseconds timeout,
+        RealtimeCertifiedPrefixFenceResultV1* output,
         int* system_error_number) noexcept {
         SetSystemError(system_error_number, 0);
-        if (timeout <= std::chrono::milliseconds::zero() ||
-            timeout > std::chrono::hours(24) ||
-            !started_.load(std::memory_order_acquire) ||
-            !worker_running_.load(std::memory_order_acquire) ||
-            worker_stop_requested_.load(std::memory_order_acquire)) {
+        if (output == nullptr) {
             SetSystemError(system_error_number, EINVAL);
-            return false;
+            return RealtimeCertifiedPrefixFenceOperationErrorV1::
+                kInvalidArgument;
         }
-        bool expected = false;
-        if (!prefix_barrier_started_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel)) {
-            SetSystemError(system_error_number, EALREADY);
-            return false;
+        *output = {};
+        if (timeout <= std::chrono::milliseconds::zero() ||
+            timeout > std::chrono::hours(24)) {
+            output->operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInvalidArgument;
+            SetSystemError(system_error_number, EINVAL);
+            return output->operation_error;
         }
-        std::uint64_t previous =
-            next_barrier_id_.load(std::memory_order_acquire);
-        for (;;) {
-            if (previous ==
-                std::numeric_limits<std::uint64_t>::max()) {
-                SetSystemError(system_error_number, EOVERFLOW);
-                return false;
-            }
-            if (next_barrier_id_.compare_exchange_weak(
-                    previous,
-                    previous + 1U,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                break;
-            }
-        }
-        const std::uint64_t barrier_id = previous + 1U;
-        HandoffEvent barrier{};
-        barrier.kind = HandoffKind::kBarrier;
-        barrier.barrier_id = barrier_id;
         const auto deadline =
             std::chrono::steady_clock::now() + timeout;
+        // Only fence callers serialize for the potentially long queue/wait
+        // interval. The control lifecycle lock is held just long enough to
+        // establish whether this probe or StartControl linearizes first, so
+        // StopControl is never blocked by a caller-supplied fence timeout.
+        std::lock_guard<std::mutex> prefix_call(prefix_call_mutex_);
+        {
+            std::lock_guard<std::mutex> lifecycle(
+                control_lifecycle_mutex_);
+            if (!started_.load(std::memory_order_acquire) ||
+                control_state_.load(std::memory_order_acquire) !=
+                    RealtimeCertifiedServiceSnapshotV1::ControlState::
+                        kNotStarted ||
+                prefix_commit_phase_.load(
+                    std::memory_order_acquire) !=
+                    PrefixCommitPhase::kNotStarted) {
+                output->operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kInvalidLifecycle;
+                SetSystemError(system_error_number, EINVAL);
+                return output->operation_error;
+            }
+            if (!worker_running_.load(std::memory_order_acquire) ||
+                worker_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                output->operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kWorkerFailed;
+                SetSystemError(system_error_number, EPIPE);
+                return output->operation_error;
+            }
+            prefix_probe_active_.store(true, std::memory_order_release);
+        }
+        const auto finish = [this](
+            RealtimeCertifiedPrefixFenceOperationErrorV1 error) noexcept {
+            prefix_probe_waiting_for_prior_ack_for_test_.store(
+                false, std::memory_order_release);
+            prefix_probe_active_.store(false, std::memory_order_release);
+            prefix_probe_active_.notify_all();
+            return error;
+        };
+        if (outstanding_probe_fence_id_ != 0U) {
+            prefix_probe_waiting_for_prior_ack_for_test_.store(
+                true, std::memory_order_release);
+            for (;;) {
+                if (completed_prefix_fence_id_.load(
+                        std::memory_order_acquire) >=
+                    outstanding_probe_fence_id_) {
+                    outstanding_probe_fence_id_ = 0U;
+                    prefix_probe_waiting_for_prior_ack_for_test_.store(
+                        false, std::memory_order_release);
+                    break;
+                }
+                if (!worker_running_.load(std::memory_order_acquire) ||
+                    worker_stop_requested_.load(
+                        std::memory_order_acquire)) {
+                    output->operation_error =
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kWorkerFailed;
+                    SetSystemError(system_error_number, EPIPE);
+                    return finish(output->operation_error);
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    output->operation_error =
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kTimedOut;
+                    SetSystemError(system_error_number, ETIMEDOUT);
+                    return finish(output->operation_error);
+                }
+                std::this_thread::yield();
+            }
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            output->operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::kTimedOut;
+            SetSystemError(system_error_number, ETIMEDOUT);
+            return finish(output->operation_error);
+        }
+        std::uint64_t fence_id = 0U;
+        if (!AllocatePrefixFenceId(&fence_id)) {
+            output->operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInternalFailure;
+            SetSystemError(system_error_number, EOVERFLOW);
+            return finish(output->operation_error);
+        }
+        output->fence_id = fence_id;
+        HandoffEvent fence{};
+        fence.kind = HandoffKind::kPrefixProbe;
+        fence.barrier_id = fence_id;
         for (;;) {
-            if (queue_ != nullptr && queue_->TryPush(barrier)) {
+            if (queue_ != nullptr && queue_->TryPush(fence)) {
+                outstanding_probe_fence_id_ = fence_id;
                 WakeWorker();
                 break;
             }
-            if (!worker_running_.load(std::memory_order_acquire)) {
+            if (!worker_running_.load(std::memory_order_acquire) ||
+                worker_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                output->operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kWorkerFailed;
                 SetSystemError(system_error_number, EPIPE);
-                return false;
+                return finish(output->operation_error);
             }
             if (std::chrono::steady_clock::now() >= deadline) {
+                output->operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kTimedOut;
                 SetSystemError(system_error_number, ETIMEDOUT);
-                return false;
+                return finish(output->operation_error);
             }
             std::this_thread::yield();
         }
         for (;;) {
-            if (completed_barrier_id_.load(
-                    std::memory_order_acquire) >= barrier_id) {
+            if (completed_prefix_fence_id_.load(
+                    std::memory_order_acquire) >= fence_id) {
+                if (!CopyCompletedPrefixFence(fence_id, output)) {
+                    output->operation_error =
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kInternalFailure;
+                    SetSystemError(system_error_number, EIO);
+                } else if (output->operation_error ==
+                           RealtimeCertifiedPrefixFenceOperationErrorV1::
+                               kInternalFailure) {
+                    SetSystemError(system_error_number, EIO);
+                }
+                if (outstanding_probe_fence_id_ == fence_id) {
+                    outstanding_probe_fence_id_ = 0U;
+                }
+                return finish(output->operation_error);
+            }
+            if (!worker_running_.load(std::memory_order_acquire) ||
+                worker_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                output->operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kWorkerFailed;
+                SetSystemError(system_error_number, EPIPE);
+                return finish(output->operation_error);
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                output->operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kTimedOut;
+                SetSystemError(system_error_number, ETIMEDOUT);
+                return finish(output->operation_error);
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    [[nodiscard]] bool WaitForPrefixBarrier(
+        std::chrono::milliseconds timeout,
+        RealtimeCertifiedPrefixFenceResultV1* output,
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (output != nullptr) {
+            *output = {};
+        }
+        if (timeout <= std::chrono::milliseconds::zero() ||
+            timeout > std::chrono::hours(24)) {
+            SetFenceOperationError(
+                output,
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInvalidArgument);
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        // Fence calls serialize independently. The lifecycle lock protects
+        // only the transition that orders this final commit against both
+        // StartControl and StopControl; the queue/wait interval holds no
+        // control lock.
+        std::lock_guard<std::mutex> prefix_call(prefix_call_mutex_);
+        {
+            std::lock_guard<std::mutex> lifecycle(
+                control_lifecycle_mutex_);
+            if (!started_.load(std::memory_order_acquire)) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kInvalidArgument);
+                SetSystemError(system_error_number, EINVAL);
+                return false;
+            }
+            if (!worker_running_.load(std::memory_order_acquire) ||
+                worker_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kWorkerFailed);
+                SetSystemError(system_error_number, EPIPE);
+                return false;
+            }
+            if (control_state_.load(std::memory_order_acquire) !=
+                RealtimeCertifiedServiceSnapshotV1::ControlState::
+                    kNotStarted) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kInvalidLifecycle);
+                SetSystemError(system_error_number, EALREADY);
+                return false;
+            }
+            bool expected_started = false;
+            if (!prefix_barrier_started_.compare_exchange_strong(
+                    expected_started,
+                    true,
+                    std::memory_order_acq_rel)) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kInvalidLifecycle);
+                SetSystemError(system_error_number, EALREADY);
+                return false;
+            }
+            auto expected_phase = PrefixCommitPhase::kNotStarted;
+            if (!prefix_commit_phase_.compare_exchange_strong(
+                    expected_phase,
+                    PrefixCommitPhase::kPending,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kInvalidLifecycle);
+                SetSystemError(system_error_number, EALREADY);
+                return false;
+            }
+            prefix_commit_finished_for_test_.store(
+                false, std::memory_order_release);
+        }
+        std::uint64_t fence_id = 0U;
+        if (!AllocatePrefixFenceId(&fence_id)) {
+            prefix_commit_phase_.store(
+                PrefixCommitPhase::kFailed,
+                std::memory_order_release);
+            SetFenceOperationError(
+                output,
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInternalFailure);
+            SetSystemError(system_error_number, EOVERFLOW);
+            return false;
+        }
+        if (output != nullptr) {
+            output->fence_id = fence_id;
+        }
+        HandoffEvent fence{};
+        fence.kind = HandoffKind::kPrefixCommit;
+        fence.barrier_id = fence_id;
+        const auto deadline =
+            std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (queue_ != nullptr && queue_->TryPush(fence)) {
+                WakeWorker();
                 break;
             }
-            if (!worker_running_.load(std::memory_order_acquire)) {
+            if (!worker_running_.load(std::memory_order_acquire) ||
+                worker_stop_requested_.load(
+                    std::memory_order_acquire)) {
+                auto pending = PrefixCommitPhase::kPending;
+                static_cast<void>(prefix_commit_phase_
+                                      .compare_exchange_strong(
+                                          pending,
+                                          PrefixCommitPhase::kWorkerFailed,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire));
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kWorkerFailed);
                 SetSystemError(system_error_number, EPIPE);
                 return false;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
-                SetSystemError(system_error_number, ETIMEDOUT);
-                return false;
+                auto pending = PrefixCommitPhase::kPending;
+                if (prefix_commit_phase_.compare_exchange_strong(
+                        pending,
+                        PrefixCommitPhase::kCancelled,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    SetFenceOperationError(
+                        output,
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kTimedOut);
+                    SetSystemError(system_error_number, ETIMEDOUT);
+                    return false;
+                }
             }
             std::this_thread::yield();
         }
-        // completed_barrier_id_ is the release publication for the exact
-        // health result captured by the worker at that FIFO boundary.
-        // Reading a fresh mutable service Snapshot here would let later live
-        // handoffs spuriously change the activation decision.
-        if (!completed_barrier_healthy_.load(
-                std::memory_order_acquire)) {
-            SetSystemError(system_error_number, EIO);
-            return false;
+        for (;;) {
+            const PrefixCommitPhase phase =
+                prefix_commit_phase_.load(std::memory_order_acquire);
+            if (phase == PrefixCommitPhase::kSucceeded ||
+                phase == PrefixCommitPhase::kFailed) {
+                if (!CopyCompletedPrefixFence(fence_id, output)) {
+                    SetFenceOperationError(
+                        output,
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kInternalFailure);
+                    SetSystemError(system_error_number, EIO);
+                    return false;
+                }
+                if (phase == PrefixCommitPhase::kSucceeded) {
+                    return true;
+                }
+                SetSystemError(
+                    system_error_number,
+                    output != nullptr &&
+                            output->operation_error ==
+                                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                                    kWorkerFailed
+                        ? EPIPE
+                        : EIO);
+                return false;
+            }
+            if (phase == PrefixCommitPhase::kCancelled) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kTimedOut);
+                SetSystemError(system_error_number, ETIMEDOUT);
+                return false;
+            }
+            if (phase == PrefixCommitPhase::kWorkerFailed) {
+                SetFenceOperationError(
+                    output,
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kWorkerFailed);
+                SetSystemError(system_error_number, EPIPE);
+                return false;
+            }
+            if ((!worker_running_.load(std::memory_order_acquire) ||
+                 worker_stop_requested_.load(
+                     std::memory_order_acquire)) &&
+                phase == PrefixCommitPhase::kPending) {
+                auto pending = PrefixCommitPhase::kPending;
+                if (prefix_commit_phase_.compare_exchange_strong(
+                        pending,
+                        PrefixCommitPhase::kWorkerFailed,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    SetFenceOperationError(
+                        output,
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kWorkerFailed);
+                    SetSystemError(system_error_number, EPIPE);
+                    return false;
+                }
+                continue;
+            }
+            if (phase == PrefixCommitPhase::kPending &&
+                std::chrono::steady_clock::now() >= deadline) {
+                auto pending = PrefixCommitPhase::kPending;
+                if (prefix_commit_phase_.compare_exchange_strong(
+                        pending,
+                        PrefixCommitPhase::kCancelled,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    SetFenceOperationError(
+                        output,
+                        RealtimeCertifiedPrefixFenceOperationErrorV1::
+                            kTimedOut);
+                    SetSystemError(system_error_number, ETIMEDOUT);
+                    return false;
+                }
+                // The worker owns kCompleting. It performs only the no-throw
+                // metadata commit and release publications, so wait for its
+                // terminal result instead of returning a false timeout.
+            }
+            std::this_thread::yield();
         }
-        prefix_barrier_completed_.store(true, std::memory_order_release);
-        return true;
     }
 
 private:
     [[nodiscard]] bool StartClaimedControl(
         int* system_error_number) noexcept {
-        control_running_.store(true, std::memory_order_release);
+        control_affinity_system_error_.store(
+            0, std::memory_order_relaxed);
+        control_startup_state_.store(
+            ThreadStartupStateV1::kStarting,
+            std::memory_order_release);
         try {
             control_thread_ = std::thread([this]() noexcept {
+                int affinity_error = 0;
+                if (!ApplyOptionalCurrentThreadCpuSet(
+                        control_cpu_set_, &affinity_error)) {
+                    control_affinity_system_error_.store(
+                        affinity_error, std::memory_order_relaxed);
+                    MarkControlFailedIfRunning();
+                    control_startup_state_.store(
+                        ThreadStartupStateV1::kFailed,
+                        std::memory_order_release);
+                    control_startup_state_.notify_all();
+                    return;
+                }
+                control_startup_state_.store(
+                    ThreadStartupStateV1::kReady,
+                    std::memory_order_release);
+                control_startup_state_.notify_all();
                 ControlLoop();
             });
-            return true;
         } catch (...) {
-            control_running_.store(false, std::memory_order_release);
-            SetSystemError(system_error_number, EAGAIN);
-            return false;
+            control_affinity_system_error_.store(
+                EAGAIN, std::memory_order_relaxed);
+            auto expected =
+                RealtimeCertifiedServiceSnapshotV1::ControlState::
+                    kRunning;
+            static_cast<void>(control_state_.compare_exchange_strong(
+                expected,
+                RealtimeCertifiedServiceSnapshotV1::ControlState::
+                    kFailed,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire));
+            control_startup_state_.store(
+                ThreadStartupStateV1::kFailed,
+                std::memory_order_release);
+            control_startup_state_.notify_all();
         }
+        ThreadStartupStateV1 startup =
+            control_startup_state_.load(std::memory_order_acquire);
+        while (startup == ThreadStartupStateV1::kStarting) {
+            control_startup_state_.wait(
+                startup, std::memory_order_acquire);
+            startup = control_startup_state_.load(
+                std::memory_order_acquire);
+        }
+        if (startup == ThreadStartupStateV1::kReady) {
+            return true;
+        }
+        if (control_thread_.joinable()) {
+            control_thread_.join();
+        }
+        const int affinity_error =
+            control_affinity_system_error_.load(
+                std::memory_order_relaxed);
+        SetSystemError(
+            system_error_number,
+            affinity_error == 0 ? EINVAL : affinity_error);
+        return false;
     }
 
 public:
@@ -1076,6 +1577,7 @@ public:
         // pointer. History invokes this barrier after all publishers stop and
         // before releasing that Store, including partial pipeline-Create
         // failure. Draining here makes every queued pointer lifetime-safe.
+        AbortPendingPrefixCommitForWorkerStop();
         accepting_.store(false, std::memory_order_release);
         worker_stop_requested_.store(true, std::memory_order_release);
         WakeWorker();
@@ -1131,6 +1633,7 @@ public:
     }
 
     void MarkStoppedClean() noexcept {
+        AbortPendingPrefixCommitForWorkerStop();
         accepting_.store(false, std::memory_order_release);
         worker_stop_requested_.store(true, std::memory_order_release);
         WakeWorker();
@@ -1142,9 +1645,36 @@ public:
     }
 
     void StopControl() noexcept {
+        std::lock_guard<std::mutex> lifecycle(
+            control_lifecycle_mutex_);
+        // Order shutdown against a final prefix commit without holding this
+        // lifecycle mutex while the caller waits. If the worker already owns
+        // kCompleting, promotion linearized first and shutdown waits for that
+        // no-throw commit; otherwise shutdown wins and promotion is forbidden.
+        AbortPendingPrefixCommitForWorkerStop();
         accepting_.store(false, std::memory_order_release);
         worker_stop_requested_.store(true, std::memory_order_release);
-        control_running_.store(false, std::memory_order_release);
+        auto control_state =
+            control_state_.load(std::memory_order_acquire);
+        for (;;) {
+            using ControlState =
+                RealtimeCertifiedServiceSnapshotV1::ControlState;
+            if (control_state != ControlState::kRunning &&
+                control_state != ControlState::kNotStarted) {
+                break;
+            }
+            const ControlState desired =
+                control_state == ControlState::kRunning
+                    ? ControlState::kStopping
+                    : ControlState::kStopped;
+            if (control_state_.compare_exchange_weak(
+                    control_state,
+                    desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+        }
         WakeWorker();
         SignalStopEvent();
         if (worker_thread_.joinable()) {
@@ -1153,6 +1683,15 @@ public:
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
+        auto stopping =
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kStopping;
+        static_cast<void>(control_state_.compare_exchange_strong(
+            stopping,
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kStopped,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire));
         worker_running_.store(false, std::memory_order_release);
         if (started_.load(std::memory_order_acquire) &&
             header_ != nullptr) {
@@ -1244,6 +1783,8 @@ public:
             globally_frozen_resource_.load(
                 std::memory_order_acquire);
         result.wire_snapshot_consistent = stable_snapshot;
+        result.control_state =
+            control_state_.load(std::memory_order_acquire);
         return result;
     }
 
@@ -1370,6 +1911,169 @@ public:
     }
 
 private:
+    void AbortPendingPrefixCommitForWorkerStop() noexcept {
+        auto pending = PrefixCommitPhase::kPending;
+        if (prefix_commit_phase_.compare_exchange_strong(
+                pending,
+                PrefixCommitPhase::kWorkerFailed,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            prefix_commit_phase_.notify_all();
+        }
+    }
+
+    static void SetFenceOperationError(
+        RealtimeCertifiedPrefixFenceResultV1* output,
+        RealtimeCertifiedPrefixFenceOperationErrorV1 error) noexcept {
+        if (output != nullptr) {
+            output->operation_error = error;
+        }
+    }
+
+    [[nodiscard]] bool AllocatePrefixFenceId(
+        std::uint64_t* output) noexcept {
+        if (output == nullptr) {
+            return false;
+        }
+        std::uint64_t previous =
+            next_prefix_fence_id_.load(std::memory_order_acquire);
+        for (;;) {
+            if (previous ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                return false;
+            }
+            if (next_prefix_fence_id_.compare_exchange_weak(
+                    previous,
+                    previous + 1U,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                *output = previous + 1U;
+                return true;
+            }
+        }
+    }
+
+    void ApplyGlobalResourceFreezeToFence(
+        RealtimeCertifiedPrefixFenceResultV1* result) const noexcept {
+        if (result != nullptr &&
+            globally_frozen_resource_.load(
+                std::memory_order_acquire)) {
+            // Global handoff/resource loss is monotonic and is not represented
+            // by a channel row. It must dominate an older healthy header cut,
+            // including the PublishHeader-to-capture race window.
+            result->state =
+                RealtimeCertifiedStateV1::kFrozenResource;
+        }
+    }
+
+    [[nodiscard]] RealtimeCertifiedPrefixFenceResultV1
+    CapturePrefixFenceResult(
+        std::uint64_t fence_id,
+        bool header_committed) noexcept {
+        RealtimeCertifiedPrefixFenceResultV1 result{};
+        result.fence_id = fence_id;
+        if (!header_committed || header_ == nullptr ||
+            event_journal_ == nullptr) {
+            result.operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInternalFailure;
+            result.state = RealtimeCertifiedStateV1::kFrozenResource;
+            ApplyGlobalResourceFreezeToFence(&result);
+            return result;
+        }
+        result.header_publish_tag =
+            Atomic(header_->status_publish_tag)
+                .load(std::memory_order_acquire);
+        result.state = static_cast<RealtimeCertifiedStateV1>(
+            Atomic(header_->aggregate_state)
+                .load(std::memory_order_acquire));
+        result.canonical_apply_frontier =
+            Atomic(header_->canonical_apply_frontier)
+                .load(std::memory_order_acquire);
+        result.correction_epoch =
+            Atomic(header_->correction_epoch)
+                .load(std::memory_order_acquire);
+        result.gap_open_channel_count =
+            Atomic(header_->gap_open_channel_count)
+                .load(std::memory_order_acquire);
+        result.catching_up_channel_count =
+            Atomic(header_->catching_up_channel_count)
+                .load(std::memory_order_acquire);
+        result.frozen_channel_count =
+            Atomic(header_->frozen_channel_count)
+                .load(std::memory_order_acquire);
+        {
+            const std::lock_guard<std::mutex> lock(
+                committed_event_generation_mutex_);
+            result.event_history = committed_event_generation_;
+        }
+        result.event_journal_frontier =
+            event_journal_->canonical_apply_frontier();
+        result.event_published_sequence =
+            event_journal_->published_event_sequence();
+
+        const CertifiedOrderEventHistoryGenerationV1 generation =
+            result.event_history.generation();
+        const bool state_valid =
+            result.state == RealtimeCertifiedStateV1::kNoData ||
+            result.state == RealtimeCertifiedStateV1::kContiguous ||
+            result.state == RealtimeCertifiedStateV1::kGapOpen ||
+            result.state == RealtimeCertifiedStateV1::kCatchingUp ||
+            result.state == RealtimeCertifiedStateV1::kFrozenConflict ||
+            result.state == RealtimeCertifiedStateV1::kFrozenResource;
+        const bool event_count_valid =
+            generation.derived_event_sequence_exclusive != 0U &&
+            generation.event_count <=
+                std::numeric_limits<std::uint64_t>::max() &&
+            generation.derived_event_sequence_exclusive - 1U ==
+                static_cast<std::uint64_t>(generation.event_count);
+        if (result.header_publish_tag == 0U ||
+            (result.header_publish_tag & 1U) != 0U ||
+            !state_valid || !result.event_history.valid() ||
+            generation.input_frontier.canonical_apply_sequence !=
+                result.canonical_apply_frontier ||
+            result.event_journal_frontier !=
+                result.canonical_apply_frontier ||
+            !event_count_valid ||
+            result.event_published_sequence !=
+                static_cast<std::uint64_t>(generation.event_count)) {
+            result.operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInternalFailure;
+            result.state = RealtimeCertifiedStateV1::kFrozenResource;
+        }
+        ApplyGlobalResourceFreezeToFence(&result);
+        return result;
+    }
+
+    void PublishCompletedPrefixFence(
+        RealtimeCertifiedPrefixFenceResultV1 result) noexcept {
+        const std::uint64_t fence_id = result.fence_id;
+        {
+            const std::lock_guard<std::mutex> lock(
+                prefix_fence_result_mutex_);
+            completed_prefix_fence_result_ = std::move(result);
+        }
+        completed_prefix_fence_id_.store(
+            fence_id, std::memory_order_release);
+        completed_prefix_fence_id_.notify_all();
+    }
+
+    [[nodiscard]] bool CopyCompletedPrefixFence(
+        std::uint64_t fence_id,
+        RealtimeCertifiedPrefixFenceResultV1* output) const noexcept {
+        if (output == nullptr) {
+            return true;
+        }
+        const std::lock_guard<std::mutex> lock(
+            prefix_fence_result_mutex_);
+        if (completed_prefix_fence_result_.fence_id != fence_id) {
+            return false;
+        }
+        *output = completed_prefix_fence_result_;
+        return true;
+    }
+
     void WakeWorker() noexcept {
         wake_epoch_.fetch_add(1U, std::memory_order_release);
         wake_epoch_.notify_one();
@@ -1397,15 +2101,16 @@ private:
         try {
             for (;;) {
                 std::size_t batch = 0U;
-                std::uint64_t completed_barrier = 0U;
+                HandoffEvent completed_fence{};
                 HandoffEvent event{};
                 while (batch < 1024U && queue_->TryPop(&event)) {
-                    if (event.kind == HandoffKind::kBarrier) {
-                        completed_barrier = event.barrier_id;
+                    if (event.kind == HandoffKind::kPrefixProbe ||
+                        event.kind == HandoffKind::kPrefixCommit) {
+                        completed_fence = event;
                         ++batch;
-                        // A barrier is an exact FIFO prefix boundary. Do not
+                        // A fence is an exact FIFO prefix boundary. Do not
                         // pop any later live handoff into the same header
-                        // publication that acknowledges this barrier.
+                        // publication that acknowledges this fence.
                         break;
                     }
                     if (!globally_frozen_resource_.load(
@@ -1427,25 +2132,106 @@ private:
                     DeriveAggregateState();
                 const bool header_committed =
                     PublishHeader(barrier_state);
-                if (completed_barrier != 0U) {
-                    const auto committed_state =
-                        static_cast<RealtimeCertifiedStateV1>(
-                            Atomic(header_->aggregate_state)
-                                .load(std::memory_order_acquire));
-                    completed_barrier_healthy_.store(
-                        header_committed &&
-                            !globally_frozen_resource_.load(
-                                std::memory_order_acquire) &&
-                            (committed_state ==
-                                 RealtimeCertifiedStateV1::kNoData ||
-                             committed_state ==
-                                 RealtimeCertifiedStateV1::
-                                     kContiguous),
-                        std::memory_order_release);
-                    completed_barrier_id_.store(
-                        completed_barrier,
-                        std::memory_order_release);
-                    completed_barrier_id_.notify_all();
+                if (completed_fence.barrier_id != 0U) {
+                    if (completed_fence.kind ==
+                        HandoffKind::kPrefixProbe) {
+                        prefix_probe_reached_for_test_.store(
+                            true, std::memory_order_release);
+                        while (prefix_probe_paused_for_test_.load(
+                                   std::memory_order_acquire) &&
+                               !worker_stop_requested_.load(
+                                   std::memory_order_acquire)) {
+                            std::this_thread::yield();
+                        }
+                    } else if (completed_fence.kind ==
+                               HandoffKind::kPrefixCommit) {
+                        prefix_commit_reached_for_test_.store(
+                            true, std::memory_order_release);
+                        while (prefix_commit_paused_for_test_.load(
+                                   std::memory_order_acquire) &&
+                               !worker_stop_requested_.load(
+                                   std::memory_order_acquire)) {
+                            std::this_thread::yield();
+                        }
+                    }
+                    RealtimeCertifiedPrefixFenceResultV1 result =
+                        CapturePrefixFenceResult(
+                            completed_fence.barrier_id,
+                            header_committed);
+                    if (completed_fence.kind ==
+                        HandoffKind::kPrefixProbe) {
+                        // Probe completion deliberately has no coverage or
+                        // control-lifecycle side effect.
+                        PublishCompletedPrefixFence(std::move(result));
+                    } else {
+                        // Acquire every potentially-throwing resource before
+                        // claiming irreversible commit ownership. Once the
+                        // Pending->Completing CAS wins, only noexcept Event
+                        // metadata and atomic publications remain.
+                        std::unique_lock<std::mutex> result_lock(
+                            prefix_fence_result_mutex_);
+                        // Capture already checks the monotonic global freeze,
+                        // but it can race immediately after capture. Recheck
+                        // at the final Pending->Completing linearization point
+                        // so an already-published resource loss can never be
+                        // promoted as recovered coverage.
+                        ApplyGlobalResourceFreezeToFence(&result);
+                        if (worker_stop_requested_.load(
+                                std::memory_order_acquire)) {
+                            result.operation_error =
+                                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                                    kWorkerFailed;
+                            result.state =
+                                RealtimeCertifiedStateV1::kFrozenResource;
+                        }
+                        auto pending = PrefixCommitPhase::kPending;
+                        if (prefix_commit_phase_
+                                .compare_exchange_strong(
+                                    pending,
+                                    PrefixCommitPhase::kCompleting,
+                                    std::memory_order_acq_rel,
+                                    std::memory_order_acquire)) {
+                            const bool coverage_published =
+                                result.ready() &&
+                                event_journal_
+                                    ->MarkStartupPrefixRecovered();
+                            if (result.ready() && !coverage_published) {
+                                result.operation_error =
+                                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                                        kInternalFailure;
+                                result.state =
+                                    RealtimeCertifiedStateV1::
+                                        kFrozenResource;
+                            }
+                            completed_prefix_fence_result_ =
+                                std::move(result);
+                            result_lock.unlock();
+                            completed_prefix_fence_id_.store(
+                                completed_fence.barrier_id,
+                                std::memory_order_release);
+                            completed_prefix_fence_id_.notify_all();
+                            if (coverage_published) {
+                                prefix_barrier_completed_.store(
+                                    true,
+                                    std::memory_order_release);
+                                prefix_commit_phase_.store(
+                                    PrefixCommitPhase::kSucceeded,
+                                    std::memory_order_release);
+                            } else {
+                                prefix_commit_phase_.store(
+                                    PrefixCommitPhase::kFailed,
+                                    std::memory_order_release);
+                            }
+                            prefix_commit_phase_.notify_all();
+                        } else {
+                            result_lock.unlock();
+                        }
+                        prefix_commit_finished_for_test_.store(
+                            true, std::memory_order_release);
+                        prefix_commit_finished_for_test_.notify_all();
+                        // If timeout cancellation won Pending->Cancelled, the
+                        // worker must not publish recovered coverage later.
+                    }
                 }
                 if (worker_stop_requested_.load(
                         std::memory_order_acquire) &&
@@ -2286,13 +3072,34 @@ private:
         } while (result < 0 && errno == EINTR);
     }
 
+    void MarkControlFailedIfRunning() noexcept {
+        auto expected =
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kRunning;
+        static_cast<void>(control_state_.compare_exchange_strong(
+            expected,
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kFailed,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire));
+    }
+
+    [[nodiscard]] bool ControlExposureReady() const noexcept {
+        return config_.control_exposure_gate == nullptr ||
+               config_.control_exposure_gate->load(
+                   std::memory_order_acquire);
+    }
+
     void ControlLoop() noexcept {
+        using ControlState =
+            RealtimeCertifiedServiceSnapshotV1::ControlState;
         std::array<pollfd, 2U> descriptors{};
         descriptors[0].fd = listener_fd_;
         descriptors[0].events = POLLIN;
         descriptors[1].fd = stop_event_fd_;
         descriptors[1].events = POLLIN;
-        while (control_running_.load(std::memory_order_acquire)) {
+        while (control_state_.load(std::memory_order_acquire) ==
+               ControlState::kRunning) {
             int result = -1;
             do {
                 result = ::poll(
@@ -2300,15 +3107,29 @@ private:
                     static_cast<nfds_t>(descriptors.size()),
                     -1);
             } while (result < 0 && errno == EINTR);
-            if (result <= 0 ||
-                (descriptors[1].revents &
-                 (POLLIN | POLLERR | POLLHUP)) != 0) {
+            if (result <= 0) {
+                MarkControlFailedIfRunning();
+                break;
+            }
+            if ((descriptors[1].revents &
+                 (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                MarkControlFailedIfRunning();
+                break;
+            }
+            if ((descriptors[0].revents &
+                 (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                MarkControlFailedIfRunning();
                 break;
             }
             if ((descriptors[0].revents & POLLIN) == 0) {
                 continue;
             }
-            for (;;) {
+            constexpr std::size_t kMaximumAcceptBatch = 64U;
+            std::size_t attempts = 0U;
+            while (attempts < kMaximumAcceptBatch &&
+                   control_state_.load(std::memory_order_acquire) ==
+                       ControlState::kRunning) {
+                ++attempts;
                 const int client = ::accept4(
                     listener_fd_,
                     nullptr,
@@ -2317,6 +3138,12 @@ private:
                 if (client < 0) {
                     if (errno == EINTR) {
                         continue;
+                    }
+                    if (errno == ECONNABORTED) {
+                        continue;
+                    }
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        MarkControlFailedIfRunning();
                     }
                     break;
                 }
@@ -2333,7 +3160,9 @@ private:
                     SO_SNDTIMEO,
                     &timeout,
                     sizeof(timeout)));
-                HandleClient(client);
+                if (ControlExposureReady()) {
+                    HandleClient(client);
+                }
                 int close_result = -1;
                 do {
                     close_result = ::close(client);
@@ -2342,6 +3171,112 @@ private:
         }
     }
 
+public:
+    [[nodiscard]] bool FailControlForTest() noexcept {
+        if (control_state_.load(std::memory_order_acquire) !=
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kRunning) {
+            return false;
+        }
+        SignalStopEvent();
+        return true;
+    }
+
+    void SetPrefixProbePausedForTest(bool paused) noexcept {
+        if (paused) {
+            prefix_probe_reached_for_test_.store(
+                false, std::memory_order_release);
+        }
+        prefix_probe_paused_for_test_.store(
+            paused, std::memory_order_release);
+        if (!paused) {
+            WakeWorker();
+        }
+    }
+
+    [[nodiscard]] bool PrefixProbeReachedForTest() const noexcept {
+        return prefix_probe_reached_for_test_.load(
+            std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool PrefixProbeWaitingForPriorAckForTest()
+        const noexcept {
+        return prefix_probe_waiting_for_prior_ack_for_test_.load(
+            std::memory_order_acquire);
+    }
+
+    void SetPrefixCommitPausedForTest(bool paused) noexcept {
+        prefix_commit_paused_for_test_.store(
+            paused, std::memory_order_release);
+        if (!paused) {
+            WakeWorker();
+        }
+    }
+
+    [[nodiscard]] bool PrefixCommitReachedForTest() const noexcept {
+        return prefix_commit_reached_for_test_.load(
+            std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool PrefixCommitFinishedForTest() const noexcept {
+        return prefix_commit_finished_for_test_.load(
+            std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool StartupPrefixRecoveredForTest() const noexcept {
+        return event_journal_ != nullptr &&
+               (event_journal_->coverage_flags() &
+                kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U;
+    }
+
+    [[nodiscard]] bool ReadWorkerCpuSetForTest(
+        common::LinuxCpuSetV1* output,
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (output == nullptr || !worker_thread_.joinable()) {
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        return common::ReadLinuxThreadAffinityV1(
+                   worker_thread_.native_handle(),
+                   output,
+                   system_error_number) ==
+               common::LinuxThreadAffinityErrorV1::kNone;
+    }
+
+    [[nodiscard]] bool ReadControlCpuSetForTest(
+        common::LinuxCpuSetV1* output,
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (output == nullptr || !control_thread_.joinable()) {
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        return common::ReadLinuxThreadAffinityV1(
+                   control_thread_.native_handle(),
+                   output,
+                   system_error_number) ==
+               common::LinuxThreadAffinityErrorV1::kNone;
+    }
+
+    [[nodiscard]] bool ControlRunningConfirmed() noexcept {
+        auto expected =
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kRunning;
+        return control_state_.compare_exchange_strong(
+            expected,
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kRunning,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
+    [[nodiscard]] RealtimeCertifiedServiceSnapshotV1::ControlState
+    ControlStateSnapshot() const noexcept {
+        return control_state_.load(std::memory_order_acquire);
+    }
+
+private:
     void HandleClient(int client) noexcept {
         if (client < 0) {
             return;
@@ -2453,6 +3388,8 @@ private:
             event_journal_->session();
         response.mapping_bytes = session.total_mapping_bytes;
         response.event_capacity = session.event_capacity;
+        response.coverage_flags =
+            event_journal_->coverage_flags();
         int descriptor = -1;
         if (!event_journal_->DuplicateReadOnlyDescriptor(
                 &descriptor)) {
@@ -2492,6 +3429,8 @@ private:
     }
 
     RealtimeCertifiedServiceConfigV1 config_{};
+    common::LinuxCpuSetV1 worker_cpu_set_{};
+    common::LinuxCpuSetV1 control_cpu_set_{};
     std::unique_ptr<BoundedMpmcQueue<HandoffEvent>> queue_;
     std::unique_ptr<
         realtime::NativeSequenceRecoveryCoordinatorV1>
@@ -2521,6 +3460,8 @@ private:
     bool socket_bound_ = false;
     std::thread worker_thread_;
     std::thread control_thread_;
+    std::mutex control_lifecycle_mutex_;
+    std::mutex prefix_call_mutex_;
 
     std::map<
         realtime::NativeSequenceChannelV1,
@@ -2534,18 +3475,42 @@ private:
     bool unrepresented_resource_failure_ = false;
 
     std::atomic<bool> started_{false};
-    std::atomic<bool> control_started_{false};
+    std::atomic<ThreadStartupStateV1> worker_startup_state_{
+        ThreadStartupStateV1::kNotStarted};
+    std::atomic<ThreadStartupStateV1> control_startup_state_{
+        ThreadStartupStateV1::kNotStarted};
+    std::atomic<int> worker_affinity_system_error_{0};
+    std::atomic<int> control_affinity_system_error_{0};
+    std::atomic<RealtimeCertifiedServiceSnapshotV1::ControlState>
+        control_state_{
+            RealtimeCertifiedServiceSnapshotV1::ControlState::
+                kNotStarted};
     std::atomic<bool> prefix_barrier_started_{false};
     std::atomic<bool> prefix_barrier_completed_{false};
+    std::atomic<PrefixCommitPhase> prefix_commit_phase_{
+        PrefixCommitPhase::kNotStarted};
+    std::atomic<bool> prefix_probe_active_{false};
     std::atomic<bool> accepting_{false};
     std::atomic<bool> draining_{false};
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> worker_stop_requested_{false};
-    std::atomic<bool> control_running_{false};
     std::atomic<bool> globally_frozen_resource_{false};
-    std::atomic<std::uint64_t> next_barrier_id_{0U};
-    std::atomic<std::uint64_t> completed_barrier_id_{0U};
-    std::atomic<bool> completed_barrier_healthy_{false};
+    std::atomic<std::uint64_t> next_prefix_fence_id_{0U};
+    std::atomic<std::uint64_t> completed_prefix_fence_id_{0U};
+    // Protected by prefix_call_mutex_. A timed-out marker remains here until
+    // a later Probe observes its worker acknowledgement; no second probe is
+    // enqueued while this id is nonzero.
+    std::uint64_t outstanding_probe_fence_id_ = 0U;
+    mutable std::mutex prefix_fence_result_mutex_;
+    RealtimeCertifiedPrefixFenceResultV1
+        completed_prefix_fence_result_{};
+    std::atomic<bool> prefix_commit_paused_for_test_{false};
+    std::atomic<bool> prefix_commit_reached_for_test_{false};
+    std::atomic<bool> prefix_commit_finished_for_test_{false};
+    std::atomic<bool> prefix_probe_paused_for_test_{false};
+    std::atomic<bool> prefix_probe_reached_for_test_{false};
+    std::atomic<bool>
+        prefix_probe_waiting_for_prior_ack_for_test_{false};
     std::atomic<std::uint64_t> wake_epoch_{0U};
     std::atomic<std::uint64_t> enqueued_observations_{0U};
     std::atomic<std::uint64_t> enqueued_applied_records_{0U};
@@ -2611,11 +3576,50 @@ bool RealtimeCertifiedMarketServiceV1::StartControl(
            impl_->StartControl(system_error_number);
 }
 
+RealtimeCertifiedPrefixFenceOperationErrorV1
+RealtimeCertifiedMarketServiceV1::ProbePrefixFence(
+    std::chrono::milliseconds timeout,
+    RealtimeCertifiedPrefixFenceResultV1* output,
+    int* system_error_number) noexcept {
+    if (impl_ == nullptr) {
+        if (output != nullptr) {
+            *output = {};
+            output->operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInvalidLifecycle;
+        }
+        SetSystemError(system_error_number, EINVAL);
+        return RealtimeCertifiedPrefixFenceOperationErrorV1::
+            kInvalidLifecycle;
+    }
+    return impl_->ProbePrefixFence(
+        timeout, output, system_error_number);
+}
+
 bool RealtimeCertifiedMarketServiceV1::WaitForPrefixBarrier(
     std::chrono::milliseconds timeout,
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
-           impl_->WaitForPrefixBarrier(timeout, system_error_number);
+           impl_->WaitForPrefixBarrier(
+               timeout, nullptr, system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::WaitForPrefixBarrier(
+    std::chrono::milliseconds timeout,
+    RealtimeCertifiedPrefixFenceResultV1* output,
+    int* system_error_number) noexcept {
+    if (impl_ == nullptr) {
+        if (output != nullptr) {
+            *output = {};
+            output->operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kInvalidLifecycle;
+        }
+        SetSystemError(system_error_number, EINVAL);
+        return false;
+    }
+    return impl_->WaitForPrefixBarrier(
+        timeout, output, system_error_number);
 }
 
 bool RealtimeCertifiedMarketServiceV1::PublishApplied(
@@ -2674,6 +3678,20 @@ void RealtimeCertifiedMarketServiceV1::StopControl() noexcept {
     }
 }
 
+bool RealtimeCertifiedMarketServiceV1::ControlRunningConfirmed()
+    noexcept {
+    return impl_ != nullptr && impl_->ControlRunningConfirmed();
+}
+
+RealtimeCertifiedServiceSnapshotV1::ControlState
+RealtimeCertifiedMarketServiceV1::ControlStateSnapshot()
+    const noexcept {
+    return impl_ == nullptr
+               ? RealtimeCertifiedServiceSnapshotV1::ControlState::
+                     kFailed
+               : impl_->ControlStateSnapshot();
+}
+
 RealtimeCertifiedServiceSnapshotV1
 RealtimeCertifiedMarketServiceV1::Snapshot() const noexcept {
     return impl_ == nullptr
@@ -2705,6 +3723,66 @@ bool RealtimeCertifiedMarketServiceV1::WaitUntilIdleForTest(
     std::chrono::milliseconds timeout) const noexcept {
     return impl_ != nullptr &&
            impl_->WaitUntilIdle(timeout);
+}
+
+bool RealtimeCertifiedMarketServiceV1::FailControlForTest() noexcept {
+    return impl_ != nullptr && impl_->FailControlForTest();
+}
+
+void RealtimeCertifiedMarketServiceV1::SetPrefixProbePausedForTest(
+    bool paused) noexcept {
+    if (impl_ != nullptr) {
+        impl_->SetPrefixProbePausedForTest(paused);
+    }
+}
+
+bool RealtimeCertifiedMarketServiceV1::PrefixProbeReachedForTest()
+    const noexcept {
+    return impl_ != nullptr && impl_->PrefixProbeReachedForTest();
+}
+
+bool RealtimeCertifiedMarketServiceV1::
+    PrefixProbeWaitingForPriorAckForTest() const noexcept {
+    return impl_ != nullptr &&
+           impl_->PrefixProbeWaitingForPriorAckForTest();
+}
+
+void RealtimeCertifiedMarketServiceV1::SetPrefixCommitPausedForTest(
+    bool paused) noexcept {
+    if (impl_ != nullptr) {
+        impl_->SetPrefixCommitPausedForTest(paused);
+    }
+}
+
+bool RealtimeCertifiedMarketServiceV1::PrefixCommitReachedForTest()
+    const noexcept {
+    return impl_ != nullptr && impl_->PrefixCommitReachedForTest();
+}
+
+bool RealtimeCertifiedMarketServiceV1::PrefixCommitFinishedForTest()
+    const noexcept {
+    return impl_ != nullptr && impl_->PrefixCommitFinishedForTest();
+}
+
+bool RealtimeCertifiedMarketServiceV1::StartupPrefixRecoveredForTest()
+    const noexcept {
+    return impl_ != nullptr && impl_->StartupPrefixRecoveredForTest();
+}
+
+bool RealtimeCertifiedMarketServiceV1::ReadWorkerCpuSetForTest(
+    common::LinuxCpuSetV1* output,
+    int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->ReadWorkerCpuSetForTest(
+               output, system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::ReadControlCpuSetForTest(
+    common::LinuxCpuSetV1* output,
+    int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->ReadControlCpuSetForTest(
+               output, system_error_number);
 }
 
 CertifiedOrderEventHistoryErrorV1

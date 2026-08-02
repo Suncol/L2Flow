@@ -14,7 +14,10 @@ inline constexpr std::array<std::uint8_t, 8U>
     kOrderEventDeltaMagicV1{
         'L', '2', 'F', 'E', 'V', 'T', '1', '\0'};
 inline constexpr std::uint16_t kOrderEventDeltaWireMajorV1 = 1U;
-inline constexpr std::uint16_t kOrderEventDeltaWireMinorV1 = 0U;
+// V1.1 consumes the former 64-bit header reserved scalar as two semantic
+// fields. The header size and every pre-existing offset remain unchanged,
+// while exact-minor validation makes older readers fail closed.
+inline constexpr std::uint16_t kOrderEventDeltaWireMinorV1 = 1U;
 inline constexpr std::uint32_t kOrderEventDeltaEndianMarkerV1 =
     0x01020304U;
 inline constexpr std::uint32_t kOrderEventDeltaPayloadSchemaV1 =
@@ -29,6 +32,22 @@ enum class OrderEventDeltaProducerStateV1 : std::uint32_t {
     kDraining = 3U,
     kStoppedClean = 4U,
     kFailed = 5U,
+};
+
+// Defines the beginning of the locally contiguous source-tick sequence. This
+// is a temporal coverage statement, not a claim that every vendor-native
+// sequence number was observed.
+enum class OrderEventDeltaTemporalCoverageV1 : std::uint32_t {
+    kFromMarketOpen = 1U,
+    kFromProcessStart = 2U,
+};
+
+// The event ring currently supports one stream-quality contract: source
+// tick_stream_sequence is dense from one and every accepted source tick is
+// committed exactly once. Native BizIndex/ApplSeqNum monotonicity remains a
+// separate aggregation-engine guard and is not weakened by this value.
+enum class OrderEventDeltaStreamQualityV1 : std::uint32_t {
+    kLocalTickStreamContiguous = 1U,
 };
 
 enum OrderEventDeltaHeaderFlagV1 : std::uint32_t {
@@ -94,7 +113,8 @@ struct alignas(4096) OrderEventDeltaHeaderV1 final {
     std::uint64_t source_tick_consumed_sequence = 0U;
     std::uint64_t heartbeat_monotonic_ns = 0U;
     std::uint64_t producer_started_monotonic_ns = 0U;
-    std::uint64_t reserved_scalar = 0U;
+    std::uint32_t temporal_coverage = 0U;
+    std::uint32_t stream_quality = 0U;
     std::array<std::uint8_t, 3968U> reserved{};
 };
 static_assert(sizeof(OrderEventDeltaHeaderV1) == 4096U);
@@ -112,6 +132,10 @@ static_assert(
     offsetof(
         OrderEventDeltaHeaderV1,
         source_tick_consumed_sequence) == 96U);
+static_assert(
+    offsetof(OrderEventDeltaHeaderV1, temporal_coverage) == 120U);
+static_assert(
+    offsetof(OrderEventDeltaHeaderV1, stream_quality) == 124U);
 static_assert(offsetof(OrderEventDeltaHeaderV1, reserved) == 128U);
 
 // Slot payload is protected by an even/odd publish tag. Reserved bytes remain

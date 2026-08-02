@@ -57,15 +57,30 @@ class LiveOrderEventDeltaProducerState(IntEnum):
     FAILED = 5
 
 
+class LiveOrderEventDeltaTemporalCoverage(IntEnum):
+    """Beginning of the ring's dense local source-tick sequence."""
+
+    FROM_MARKET_OPEN = 1
+    FROM_PROCESS_START = 2
+
+
+class LiveOrderEventDeltaStreamQuality(IntEnum):
+    """Local stream contract; it does not claim native gap backfill."""
+
+    LOCAL_TICK_STREAM_CONTIGUOUS = 1
+
+
 class _LiveSessionC(ctypes.Structure):
     _fields_ = [
         ("run_id", ctypes.c_uint8 * 16),
         ("session_epoch", ctypes.c_uint64),
         ("trade_date", ctypes.c_uint32),
-        ("reserved0", ctypes.c_uint32),
+        ("temporal_coverage", ctypes.c_uint32),
         ("ring_capacity", ctypes.c_uint64),
         ("total_mapping_bytes", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint8 * 16),
+        ("stream_quality", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint8 * 8),
     ]
 
 
@@ -99,6 +114,12 @@ class LiveOrderEventDeltaSession:
     trade_date: int
     ring_capacity: int
     total_mapping_bytes: int
+    temporal_coverage: LiveOrderEventDeltaTemporalCoverage = (
+        LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+    )
+    stream_quality: LiveOrderEventDeltaStreamQuality = (
+        LiveOrderEventDeltaStreamQuality.LOCAL_TICK_STREAM_CONTIGUOUS
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -134,6 +155,22 @@ class LiveOrderEventDeltaSession:
             raise ValueError(
                 "total_mapping_bytes does not match ring_capacity"
             )
+        try:
+            temporal_coverage = LiveOrderEventDeltaTemporalCoverage(
+                self.temporal_coverage
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("temporal_coverage is invalid") from error
+        try:
+            stream_quality = LiveOrderEventDeltaStreamQuality(
+                self.stream_quality
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("stream_quality is invalid") from error
+        object.__setattr__(
+            self, "temporal_coverage", temporal_coverage
+        )
+        object.__setattr__(self, "stream_quality", stream_quality)
 
     def _to_c(self) -> _LiveSessionC:
         result = _LiveSessionC()
@@ -143,6 +180,8 @@ class LiveOrderEventDeltaSession:
         result.trade_date = self.trade_date
         result.ring_capacity = self.ring_capacity
         result.total_mapping_bytes = self.total_mapping_bytes
+        result.temporal_coverage = int(self.temporal_coverage)
+        result.stream_quality = int(self.stream_quality)
         return result
 
 
@@ -692,6 +731,8 @@ __all__ = [
     "LiveOrderEventDeltaReadMetadata",
     "LiveOrderEventDeltaReader",
     "LiveOrderEventDeltaSession",
+    "LiveOrderEventDeltaStreamQuality",
+    "LiveOrderEventDeltaTemporalCoverage",
     "LiveOrderEventDeltaUnavailableError",
     "LiveOrderEventDeltaWireError",
 ]

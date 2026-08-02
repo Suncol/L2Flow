@@ -55,6 +55,8 @@ from .order_event_delta_live import (
     LiveOrderEventDeltaReadMetadata,
     LiveOrderEventDeltaReader,
     LiveOrderEventDeltaSession,
+    LiveOrderEventDeltaStreamQuality,
+    LiveOrderEventDeltaTemporalCoverage,
     LiveOrderEventDeltaUnavailableError,
     LiveOrderEventDeltaWireError,
 )
@@ -65,6 +67,16 @@ from .order_event_delta_control import (
     LiveOrderEventDeltaSourceSession,
     LiveOrderEventDeltaSourceSessionMismatchError,
     open_live_order_events,
+)
+from .certified_order_events import (
+    CertifiedOrderEvent,
+    CertifiedOrderEventBatch,
+    CertifiedOrderEventError,
+    CertifiedOrderEventReader,
+    CertifiedOrderEventSession,
+    CertifiedOrderEventState,
+    CertifiedOrderEventStatus,
+    open_certified_order_events,
 )
 from .instrument_delta import (
     DeltaCheckpointUnverifiedError,
@@ -137,6 +149,13 @@ __all__ = [
     "AvailabilityFlag",
     "BindingState",
     "CatalogScope",
+    "CertifiedOrderEvent",
+    "CertifiedOrderEventBatch",
+    "CertifiedOrderEventError",
+    "CertifiedOrderEventReader",
+    "CertifiedOrderEventSession",
+    "CertifiedOrderEventState",
+    "CertifiedOrderEventStatus",
     "ClientClosedError",
     "CommonRecord",
     "DEFAULT_STALE_AFTER_NS",
@@ -198,6 +217,8 @@ __all__ = [
     "LiveOrderEventDeltaReadMetadata",
     "LiveOrderEventDeltaReader",
     "LiveOrderEventDeltaSession",
+    "LiveOrderEventDeltaStreamQuality",
+    "LiveOrderEventDeltaTemporalCoverage",
     "LiveOrderEventDeltaSourceSession",
     "LiveOrderEventDeltaSourceSessionMismatchError",
     "LiveOrderEventDeltaUnavailableError",
@@ -241,4 +262,5 @@ __all__ = [
     "WireFormatError",
     "connect",
     "open_live_order_events",
+    "open_certified_order_events",
 ]

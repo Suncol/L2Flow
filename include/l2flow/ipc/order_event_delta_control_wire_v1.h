@@ -13,7 +13,7 @@ inline constexpr std::array<std::uint8_t, 8U>
 inline constexpr std::uint16_t
     kOrderEventDeltaControlProtocolMajorV1 = 1U;
 inline constexpr std::uint16_t
-    kOrderEventDeltaControlProtocolMinorV1 = 1U;
+    kOrderEventDeltaControlProtocolMinorV1 = 2U;
 
 enum class OrderEventDeltaControlOpcodeV1 : std::uint16_t {
     kGetSession = 1U,
@@ -28,7 +28,7 @@ enum class OrderEventDeltaControlStatusV1 : std::uint16_t {
     kInternalError = 5U,
 };
 
-// Protocol V1.1 carries the complete immutable daily-catalog identity of the
+// Protocol V1.2 carries the complete immutable daily-catalog identity of the
 // upstream Wire V2.2+ source. This prevents a retained event-control socket
 // path from silently rebinding to another catalog within the same nominal
 // run, epoch, or trading day.
@@ -76,7 +76,11 @@ struct OrderEventDeltaControlGetSessionRequestV1 final {
     std::uint32_t reserved0 = 0U;
     std::uint64_t request_id = 0U;
     OrderEventDeltaSourceSessionWireV1 expected_source_session{};
-    std::array<std::uint64_t, 2U> reserved{};
+    // V1.2 reuses the former two reserved uint64 words. Fixed request size and
+    // all offsets through expected_source_session are unchanged.
+    std::uint32_t expected_source_temporal_coverage = 0U;
+    std::uint32_t expected_source_stream_quality = 0U;
+    std::uint64_t reserved = 0U;
 };
 static_assert(
     sizeof(OrderEventDeltaControlGetSessionRequestV1) == 144U);
@@ -94,7 +98,13 @@ static_assert(offsetof(
                   expected_source_session) == 32U);
 static_assert(offsetof(
                   OrderEventDeltaControlGetSessionRequestV1,
-                  reserved) == 128U);
+                  expected_source_temporal_coverage) == 128U);
+static_assert(offsetof(
+                  OrderEventDeltaControlGetSessionRequestV1,
+                  expected_source_stream_quality) == 132U);
+static_assert(offsetof(
+                  OrderEventDeltaControlGetSessionRequestV1,
+                  reserved) == 136U);
 
 // A successful response is accompanied by exactly one SCM_RIGHTS descriptor.
 // The descriptor is O_RDONLY and names the event ring described below.
@@ -126,7 +136,13 @@ struct OrderEventDeltaControlGetSessionResponseV1 final {
     std::uint64_t source_tick_consumed_sequence = 0U;
     std::uint64_t heartbeat_monotonic_ns = 0U;
     std::uint64_t producer_started_monotonic_ns = 0U;
-    std::array<std::uint64_t, 6U> reserved{};
+    // V1.2 reuses four of the former six reserved words. Fixed response size
+    // and all earlier offsets are unchanged.
+    std::uint32_t source_temporal_coverage = 0U;
+    std::uint32_t source_stream_quality = 0U;
+    std::uint32_t event_temporal_coverage = 0U;
+    std::uint32_t event_stream_quality = 0U;
+    std::array<std::uint64_t, 4U> reserved{};
 };
 static_assert(
     sizeof(OrderEventDeltaControlGetSessionResponseV1) == 264U);
@@ -156,6 +172,12 @@ static_assert(offsetof(
                   event_published_sequence) == 184U);
 static_assert(offsetof(
                   OrderEventDeltaControlGetSessionResponseV1,
-                  reserved) == 216U);
+                  source_temporal_coverage) == 216U);
+static_assert(offsetof(
+                  OrderEventDeltaControlGetSessionResponseV1,
+                  event_temporal_coverage) == 224U);
+static_assert(offsetof(
+                  OrderEventDeltaControlGetSessionResponseV1,
+                  reserved) == 232U);
 
 }  // namespace l2flow::ipc

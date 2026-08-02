@@ -16,7 +16,17 @@ The default vendor headers are read from `mdl_sdk_2_13_234/include`; override `-
 
 ## Python Virtual Environment
 
-The repository-local `.venv` is managed with uv and currently uses Python 3.12.3. Activate it with `source .venv/bin/activate`. It contains the editable `l2flow-realtime` package plus Polars, PyArrow, NumPy, Pandas, DuckDB, pytest, and JupyterLab (`jupyter lab`). Contributors and agents may add, remove, or upgrade environment packages when a task requires it, preferably with `uv pip install --python .venv/bin/python PACKAGE`. Never commit `.venv`; record durable project requirements in `python/pyproject.toml` instead of relying only on local state.
+The repository-local `.venv` is managed with uv and must satisfy the Python
+version declared in `python/pyproject.toml` (currently Python 3.10 or newer).
+Activate it with `source .venv/bin/activate`; use `.venv/bin/python --version`
+when an exact local interpreter version matters instead of relying on a
+hard-coded documentation value. The environment contains the editable
+`l2flow-realtime` package plus Polars, PyArrow, NumPy, Pandas, DuckDB, pytest,
+and JupyterLab (`jupyter lab`). Contributors and agents may add, remove, or
+upgrade environment packages when a task requires it, preferably with
+`uv pip install --python .venv/bin/python PACKAGE`. Never commit `.venv`;
+record durable project requirements in `python/pyproject.toml` instead of
+relying only on local state.
 
 ## Coding Style & Naming Conventions
 

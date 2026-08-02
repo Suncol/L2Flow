@@ -2448,25 +2448,28 @@ public:
                     kStoreRuntimeCreateFailed;
             }
 
-            if (config_.factor_calculator == nullptr) {
-                config_.factor_calculator =
-                    std::make_shared<factor::SnapshotLastPriceProjectionV1>();
-            }
-            factor::RealtimeFactorEngineConfigV1 factor_config{};
-            factor_config.generation_runtime = history_.get();
-            factor_config.calculator = config_.factor_calculator;
-            const factor::RealtimeFactorEngineCreateErrorV1 factor_error =
-                factor::RealtimeFactorEngineV1::Create(
-                    std::move(factor_config), &factor_);
-            if (factor_error !=
-                factor::RealtimeFactorEngineCreateErrorV1::kNone) {
-                SetDetail(
-                    detail,
-                    "factor engine create failed: " +
-                        std::string(
-                            factor::RealtimeFactorEngineCreateErrorNameV1(
-                                factor_error)));
-                return RealtimePipelineCreateErrorV1::kFactorCreateFailed;
+            if (config_.factor_generation_enabled) {
+                if (config_.factor_calculator == nullptr) {
+                    config_.factor_calculator = std::make_shared<
+                        factor::SnapshotLastPriceProjectionV1>();
+                }
+                factor::RealtimeFactorEngineConfigV1 factor_config{};
+                factor_config.generation_runtime = history_.get();
+                factor_config.calculator = config_.factor_calculator;
+                const factor::RealtimeFactorEngineCreateErrorV1
+                    factor_error = factor::RealtimeFactorEngineV1::Create(
+                        std::move(factor_config), &factor_);
+                if (factor_error !=
+                    factor::RealtimeFactorEngineCreateErrorV1::kNone) {
+                    SetDetail(
+                        detail,
+                        "factor engine create failed: " +
+                            std::string(
+                                factor::RealtimeFactorEngineCreateErrorNameV1(
+                                    factor_error)));
+                    return RealtimePipelineCreateErrorV1::
+                        kFactorCreateFailed;
+                }
             }
 
             for (std::uint8_t source = 0U;
@@ -3077,6 +3080,8 @@ public:
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
         result.kline_enabled = config_.kline.enabled();
+        result.factor_generation_enabled =
+            config_.factor_generation_enabled;
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -3097,6 +3102,8 @@ public:
         std::chrono::nanoseconds timeout) noexcept {
         RealtimePipelineCutResultV1 result{};
         result.kline_enabled = config_.kline.enabled();
+        result.factor_generation_enabled =
+            config_.factor_generation_enabled;
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -3153,6 +3160,8 @@ public:
         std::optional<std::uint64_t> preclosed_monotonic_cut_ns) noexcept {
         RealtimePipelineCutResultV1 result{};
         result.kline_enabled = config_.kline.enabled();
+        result.factor_generation_enabled =
+            config_.factor_generation_enabled;
         if (timeout <= std::chrono::nanoseconds::zero() ||
             timeout > kMaximumCutTimeout) {
             result.error = RealtimePipelineCutErrorV1::kInvalidTimeout;
@@ -3386,15 +3395,23 @@ public:
                 return result;
             }
 
-            result.factor_result =
-                factor_->CalculateAndPublish(result.store_generation);
-            if (!result.factor_result.published()) {
-                result.error =
-                    RealtimePipelineCutErrorV1::kFactorPublishFailed;
-                TripFatal();
-                return result;
+            if (config_.factor_generation_enabled) {
+                if (factor_ == nullptr) {
+                    result.error =
+                        RealtimePipelineCutErrorV1::kFactorPublishFailed;
+                    TripFatal();
+                    return result;
+                }
+                result.factor_result =
+                    factor_->CalculateAndPublish(result.store_generation);
+                if (!result.factor_result.published()) {
+                    result.error =
+                        RealtimePipelineCutErrorV1::kFactorPublishFailed;
+                    TripFatal();
+                    return result;
+                }
+                result.factor_generation = result.factor_result.generation;
             }
-            result.factor_generation = result.factor_result.generation;
             last_published_generation_.store(
                 generation, std::memory_order_release);
             return result;
@@ -3637,6 +3654,52 @@ public:
     [[nodiscard]] bool fatal() const noexcept {
         return fatal_.load(std::memory_order_acquire) ||
                (history_ != nullptr && history_->fatal());
+    }
+
+    [[nodiscard]] RealtimePipelineLiveStatusV1 LiveStatus()
+        const noexcept {
+        RealtimePipelineLiveStatusV1 result{};
+        // Read downstream publication first. Its release chain originates
+        // after accepted publication, so the final accepted acquire cannot
+        // produce a torn applied > accepted pair.
+        result.processing_progress.applied_sequence =
+            applied_sequence_.load(std::memory_order_acquire);
+        result.processing_progress.accepted_sequence =
+            accepted_sequence_.load(std::memory_order_acquire);
+        result.accepting = accepting_.load(std::memory_order_acquire);
+        result.fatal = fatal();
+        result.stopped = stopped_.load(std::memory_order_acquire);
+        result.trade_date_boundary_reached =
+            trade_date_boundary_reached_.load(std::memory_order_acquire);
+        return result;
+    }
+
+    [[nodiscard]] bool LiveIngressHealthy() const noexcept {
+        return LiveStatus().healthy();
+    }
+
+    [[nodiscard]] bool WaitAppliedThroughPrefix(
+        std::uint64_t target_sequence,
+        std::chrono::steady_clock::time_point deadline) noexcept {
+        if (target_sequence == 0U) {
+            return true;
+        }
+        // This control-plane API drains only a prefix that admission has
+        // already committed. In particular, it must not turn a journal
+        // frontier mistake into an unbounded wait for future live traffic.
+        const std::uint64_t accepted =
+            accepted_sequence_.load(std::memory_order_acquire);
+        if (target_sequence > accepted || fatal()) {
+            return false;
+        }
+        if (!WaitAppliedThrough(target_sequence, deadline)) {
+            return false;
+        }
+        // WaitAppliedThrough preserves the original generation-cut behavior
+        // and fast-success ordering. The public promotion wait additionally
+        // fail-closes if a terminal History/Pipeline transition raced with
+        // reaching the requested applied prefix.
+        return !fatal();
     }
 
     [[nodiscard]] market::RealtimeHistoryGenerationErrorV1
@@ -6137,6 +6200,12 @@ RealtimePipelineV1::CutAndPublishGeneration(
     return impl_->Cut(timeout);
 }
 
+bool RealtimePipelineV1::WaitAppliedThroughPrefix(
+    std::uint64_t target_sequence,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    return impl_->WaitAppliedThroughPrefix(target_sequence, deadline);
+}
+
 RealtimePipelineCutResultV1
 RealtimePipelineV1::StopAndPublishFinalGeneration(
     std::chrono::nanoseconds timeout) noexcept {
@@ -6188,6 +6257,15 @@ RealtimePipelineV1::AcquireLatestFactorGeneration() const noexcept {
 
 RealtimePipelineSnapshotV1 RealtimePipelineV1::Snapshot() const noexcept {
     return impl_->Snapshot();
+}
+
+RealtimePipelineLiveStatusV1 RealtimePipelineV1::LiveStatus()
+    const noexcept {
+    return impl_->LiveStatus();
+}
+
+bool RealtimePipelineV1::LiveIngressHealthy() const noexcept {
+    return impl_->LiveIngressHealthy();
 }
 
 RealtimePipelineStageLatencySnapshotV1

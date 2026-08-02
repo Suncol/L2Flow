@@ -106,6 +106,20 @@ template <typename Value>
         });
 }
 
+[[nodiscard]] bool KnownTemporalCoverage(
+    OrderEventDeltaTemporalCoverageV1 value) noexcept {
+    return value ==
+               OrderEventDeltaTemporalCoverageV1::kFromMarketOpen ||
+           value == OrderEventDeltaTemporalCoverageV1::
+                        kFromProcessStart;
+}
+
+[[nodiscard]] bool KnownStreamQuality(
+    OrderEventDeltaStreamQualityV1 value) noexcept {
+    return value == OrderEventDeltaStreamQualityV1::
+                        kLocalTickStreamContiguous;
+}
+
 [[nodiscard]] bool SourceSessionValid(
     const OrderEventDeltaSourceSessionV1& session) noexcept {
     return IdentityNonzero(session.run_id) &&
@@ -120,7 +134,9 @@ template <typename Value>
            session.catalog_scope ==
                static_cast<std::uint32_t>(
                    RealtimeCatalogScopeV2::kDeclaredDailyAShare) &&
-           session.coverage_complete == 1U;
+           session.coverage_complete == 1U &&
+           KnownTemporalCoverage(session.temporal_coverage) &&
+           KnownStreamQuality(session.stream_quality);
 }
 
 [[nodiscard]] OrderEventDeltaSourceSessionV1
@@ -165,6 +181,8 @@ void SourceSessionToWire(
     if (!IdentityNonzero(session.run_id) ||
         session.session_epoch == 0U || session.trade_date == 0U ||
         session.ring_capacity == 0U ||
+        !KnownTemporalCoverage(session.temporal_coverage) ||
+        !KnownStreamQuality(session.stream_quality) ||
         session.ring_capacity >
             (std::numeric_limits<std::uint64_t>::max() -
              sizeof(OrderEventDeltaHeaderV1)) /
@@ -561,7 +579,11 @@ template <typename Packet>
         header.ring_capacity != session.ring_capacity ||
         header.slot_stride != sizeof(OrderEventDeltaSlotV1) ||
         header.slots_offset != sizeof(OrderEventDeltaHeaderV1) ||
-        header.reserved_scalar != 0U ||
+        header.temporal_coverage !=
+            static_cast<std::uint32_t>(
+                session.temporal_coverage) ||
+        header.stream_quality !=
+            static_cast<std::uint32_t>(session.stream_quality) ||
         !ObjectBytesZero(header.reserved)) {
         return false;
     }
@@ -600,6 +622,18 @@ void SnapshotToResponse(
         snapshot.heartbeat_monotonic_ns;
     response->producer_started_monotonic_ns =
         snapshot.producer_started_monotonic_ns;
+    response->source_temporal_coverage =
+        static_cast<std::uint32_t>(
+            snapshot.source_session.temporal_coverage);
+    response->source_stream_quality =
+        static_cast<std::uint32_t>(
+            snapshot.source_session.stream_quality);
+    response->event_temporal_coverage =
+        static_cast<std::uint32_t>(
+            snapshot.event_session.temporal_coverage);
+    response->event_stream_quality =
+        static_cast<std::uint32_t>(
+            snapshot.event_session.stream_quality);
 }
 
 [[nodiscard]] OrderEventDeltaControlSnapshotV1
@@ -609,6 +643,12 @@ SnapshotFromResponse(
     OrderEventDeltaControlSnapshotV1 result{};
     result.source_session =
         SourceSessionFromWire(response.source_session);
+    result.source_session.temporal_coverage =
+        static_cast<OrderEventDeltaTemporalCoverageV1>(
+            response.source_temporal_coverage);
+    result.source_session.stream_quality =
+        static_cast<OrderEventDeltaStreamQualityV1>(
+            response.source_stream_quality);
     result.event_session.run_id =
         IdentityFromBytes(response.event_run_id);
     result.event_session.session_epoch =
@@ -619,6 +659,12 @@ SnapshotFromResponse(
         response.event_ring_capacity;
     result.event_session.total_mapping_bytes =
         response.event_total_mapping_bytes;
+    result.event_session.temporal_coverage =
+        static_cast<OrderEventDeltaTemporalCoverageV1>(
+            response.event_temporal_coverage);
+    result.event_session.stream_quality =
+        static_cast<OrderEventDeltaStreamQualityV1>(
+            response.event_stream_quality);
     result.event_published_sequence =
         response.event_published_sequence;
     result.source_tick_consumed_sequence =
@@ -763,7 +809,11 @@ public:
         event_session_ = config_.event_ring->session();
         if (!EventSessionValid(event_session_) ||
             event_session_.trade_date !=
-                config_.source_session.trade_date) {
+                config_.source_session.trade_date ||
+            event_session_.temporal_coverage !=
+                config_.source_session.temporal_coverage ||
+            event_session_.stream_quality !=
+                config_.source_session.stream_quality) {
             return OrderEventDeltaControlServerCreateErrorV1::
                 kInvalidConfiguration;
         }
@@ -1134,6 +1184,14 @@ private:
         const OrderEventDeltaSourceSessionV1 requested_source_session =
             SourceSessionFromWire(
                 request.expected_source_session);
+        OrderEventDeltaSourceSessionV1 requested =
+            requested_source_session;
+        requested.temporal_coverage =
+            static_cast<OrderEventDeltaTemporalCoverageV1>(
+                request.expected_source_temporal_coverage);
+        requested.stream_quality =
+            static_cast<OrderEventDeltaStreamQualityV1>(
+                request.expected_source_stream_quality);
         if (request.magic != kOrderEventDeltaControlMagicV1 ||
             request.opcode != static_cast<std::uint16_t>(
                                   OrderEventDeltaControlOpcodeV1::
@@ -1141,8 +1199,7 @@ private:
             request.message_bytes != sizeof(request) ||
             request.flags != 0U || request.reserved0 != 0U ||
             request.request_id == 0U ||
-            !ObjectBytesZero(request.reserved) ||
-            !SourceSessionValid(requested_source_session)) {
+            request.reserved != 0U) {
             status =
                 OrderEventDeltaControlStatusV1::kInvalidRequest;
         } else if (
@@ -1152,8 +1209,11 @@ private:
                 kOrderEventDeltaControlProtocolMinorV1) {
             status = OrderEventDeltaControlStatusV1::
                 kUnsupportedVersion;
+        } else if (!SourceSessionValid(requested)) {
+            status =
+                OrderEventDeltaControlStatusV1::kInvalidRequest;
         } else if (
-            requested_source_session != config_.source_session) {
+            requested != config_.source_session) {
             status = OrderEventDeltaControlStatusV1::
                 kSourceSessionMismatch;
         } else if (!snapshot_valid) {
@@ -1456,6 +1516,10 @@ namespace {
            EventSessionValid(snapshot.event_session) &&
            snapshot.event_session.trade_date ==
                snapshot.source_session.trade_date &&
+           snapshot.event_session.temporal_coverage ==
+               snapshot.source_session.temporal_coverage &&
+           snapshot.event_session.stream_quality ==
+               snapshot.source_session.stream_quality &&
            snapshot.event_producer_state ==
                static_cast<std::uint32_t>(
                    OrderEventDeltaProducerStateV1::kActive) &&
@@ -1519,6 +1583,12 @@ OrderEventDeltaControlGetSessionV1(
         SourceSessionToWire(
             config.expected_source_session,
             &request.expected_source_session);
+        request.expected_source_temporal_coverage =
+            static_cast<std::uint32_t>(
+                config.expected_source_session.temporal_coverage);
+        request.expected_source_stream_quality =
+            static_cast<std::uint32_t>(
+                config.expected_source_session.stream_quality);
 
         IoResult io = SendPacket(
             socket_fd,

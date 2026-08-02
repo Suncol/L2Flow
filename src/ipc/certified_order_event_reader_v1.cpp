@@ -87,6 +87,7 @@ void CloseDescriptor(int* descriptor) noexcept {
 }
 
 struct EventStatus final {
+    std::uint32_t coverage_flags = 0U;
     std::uint64_t publish_tag = 0U;
     std::uint64_t heartbeat_monotonic_ns = 0U;
     std::uint64_t canonical_apply_frontier = 0U;
@@ -116,6 +117,8 @@ struct EventStatus final {
         }
         EventStatus status{};
         status.publish_tag = begin;
+        status.coverage_flags =
+            Atomic(header.flags).load(std::memory_order_relaxed);
         status.heartbeat_monotonic_ns =
             Atomic(header.heartbeat_monotonic_ns)
                 .load(std::memory_order_relaxed);
@@ -147,7 +150,11 @@ struct EventStatus final {
         if (begin != end || (end & 1U) != 0U) {
             continue;
         }
-        if (status.heartbeat_monotonic_ns == 0U ||
+        if ((status.coverage_flags &
+                 ~kCertifiedOrderEventKnownCoverageFlagsV1) != 0U ||
+            (status.coverage_flags &
+                 kCertifiedOrderEventCoverageFromOpenV1) == 0U ||
+            status.heartbeat_monotonic_ns == 0U ||
             status.generation !=
                 status.canonical_apply_frontier ||
             status.event_published_sequence >
@@ -175,7 +182,7 @@ struct EventStatus final {
     result.abi_minor = source.abi_minor;
     result.header_bytes = source.header_bytes;
     result.endian_marker = source.endian_marker;
-    result.flags = source.flags;
+    result.flags = status.coverage_flags;
     result.total_mapping_bytes = source.total_mapping_bytes;
     result.run_id = source.run_id;
     result.session_epoch = source.session_epoch;
@@ -406,8 +413,13 @@ struct ReceivedEventSession final {
 RequestEventDescriptor(
     const RealtimeCertifiedReaderOpenOptionsV1& options,
     int* output_descriptor,
+    std::uint32_t* output_coverage_flags,
     int* system_error_number) noexcept {
     *output_descriptor = -1;
+    if (output_coverage_flags == nullptr) {
+        return CertifiedOrderEventReaderOpenErrorV1::kInvalidArgument;
+    }
+    *output_coverage_flags = 0U;
     if (!SocketPathSyntaxValid(options.control_socket_path)) {
         return CertifiedOrderEventReaderOpenErrorV1::
             kSocketPathInvalid;
@@ -507,7 +519,8 @@ RequestEventDescriptor(
         response.response_bytes == sizeof(response) &&
         response.nonce == request.nonce &&
         response.reserved0 == 0U &&
-        response.reserved1 == 0U &&
+        (response.coverage_flags &
+             ~kCertifiedOrderEventKnownCoverageFlagsV1) == 0U &&
         AllZero(response.reserved) &&
         response.status <= static_cast<std::uint16_t>(
             RealtimeCertifiedControlStatusV1::kInternal);
@@ -560,6 +573,7 @@ RequestEventDescriptor(
             kDescriptorInvalid;
     }
     *output_descriptor = received.descriptor;
+    *output_coverage_flags = response.coverage_flags;
     received.descriptor = -1;
     return CertifiedOrderEventReaderOpenErrorV1::kNone;
 }
@@ -705,6 +719,7 @@ public:
         }
         CertifiedOrderEventStatusSnapshotV1 result{};
         result.tick = tick;
+        result.coverage_flags = event.coverage_flags;
         result.event_publish_tag = event.publish_tag;
         result.event_heartbeat_monotonic_ns =
             event.heartbeat_monotonic_ns;
@@ -972,8 +987,12 @@ CertifiedOrderEventReaderV1::Open(
             kTickReaderOpenFailed;
     }
     int descriptor = -1;
+    std::uint32_t control_coverage_flags = 0U;
     const auto request_error = RequestEventDescriptor(
-        options, &descriptor, system_error_number);
+        options,
+        &descriptor,
+        &control_coverage_flags,
+        system_error_number);
     if (request_error !=
         CertifiedOrderEventReaderOpenErrorV1::kNone) {
         return request_error;
@@ -989,6 +1008,12 @@ CertifiedOrderEventReaderV1::Open(
     if (open_error !=
         CertifiedOrderEventReaderOpenErrorV1::kNone) {
         return open_error;
+    }
+    CertifiedOrderEventStatusSnapshotV1 status{};
+    if (impl->ReadStatus(&status) !=
+            CertifiedOrderEventReadResultV1::kOk ||
+        status.coverage_flags != control_coverage_flags) {
+        return CertifiedOrderEventReaderOpenErrorV1::kProtocolError;
     }
     auto reader = std::unique_ptr<CertifiedOrderEventReaderV1>(
         new (std::nothrow)

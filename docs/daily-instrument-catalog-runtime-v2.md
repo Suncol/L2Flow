@@ -93,19 +93,24 @@ dynamic identity IPC sink.
 ## Applied window
 
 After a decoder pops a message and before full decode/History submission, it
-waits for:
+waits for the bounded completion window below. Let `C` be the source count,
+`Q` the decoder-queue capacity per source, `Wd` the configured parallel decode
+worker count, and `S` the task leases per `(source, parallel worker)`:
 
 ```text
-D = min(sum(source message capacities) + source_count,
+D = min(C * (Q + 1 + Wd * S),
         completion_tracker_capacity - 1,
         tick_ring_capacity - 1)
 
 0 < global_sequence - applied_sequence <= D
 ```
 
-The tracker and tick ring capacities must both be strictly larger than `D`.
-Accepted-minus-applied may be larger because source-queue messages that have
-not crossed the gate are not part of the completion window.
+`Wd=0` makes the parallel-inflight term zero. The `+1` accounts for the
+command currently owned by each source dispatcher; `Wd * S` accounts for that
+source's commands held in parallel decode leases while its FIFO can remain
+full. The tracker and tick ring capacities must both be strictly larger than
+`D`. Accepted-minus-applied may be larger because source-queue messages that
+have not crossed the gate are not part of the completion window.
 
 Different lanes may complete out of order. `ContiguousSequenceTrackerV2`
 retains those completions internally and publishes only the greatest complete

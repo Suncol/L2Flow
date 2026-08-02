@@ -59,7 +59,9 @@ l2flow::common::Sha256Digest Digest(std::uint8_t seed) {
     return result;
 }
 
-ipc::OrderEventDeltaSourceSessionV1 SourceSession() {
+ipc::OrderEventDeltaSourceSessionV1 SourceSession(
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen) {
     ipc::OrderEventDeltaSourceSessionV1 result{};
     result.run_id = Identity(90U);
     result.catalog_digest = Digest(120U);
@@ -73,11 +75,14 @@ ipc::OrderEventDeltaSourceSessionV1 SourceSession() {
     result.catalog_scope = static_cast<std::uint32_t>(
         ipc::RealtimeCatalogScopeV2::kDeclaredDailyAShare);
     result.coverage_complete = 1U;
+    result.temporal_coverage = temporal_coverage;
     return result;
 }
 
 ipc::OrderEventDeltaRingConfigV1 RingConfig(
-    std::uint8_t seed = 10U) {
+    std::uint8_t seed = 10U,
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen) {
     ipc::OrderEventDeltaRingConfigV1 result{};
     result.run_id = Identity(seed);
     result.session_epoch = 19U;
@@ -85,6 +90,7 @@ ipc::OrderEventDeltaRingConfigV1 RingConfig(
     result.ring_capacity = 8U;
     result.maximum_mapping_bytes = 16ULL * 1024ULL * 1024ULL;
     result.producer_started_monotonic_ns = 1'234U;
+    result.temporal_coverage = temporal_coverage;
     return result;
 }
 
@@ -119,12 +125,16 @@ ipc::OrderEventDeltaPayloadV1 OrderEvent(
 
 std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> MakeProducer(
     bool* ok,
-    std::uint8_t seed = 10U) {
+    std::uint8_t seed = 10U,
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen) {
     std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> result;
     int system_error = -1;
     const auto error =
         ipc::OrderEventDeltaRingProducerV1::Create(
-            RingConfig(seed), &result, &system_error);
+            RingConfig(seed, temporal_coverage),
+            &result,
+            &system_error);
     *ok &= Expect(
         error == ipc::OrderEventDeltaRingCreateErrorV1::kNone &&
             result != nullptr && system_error == 0,
@@ -134,9 +144,11 @@ std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> MakeProducer(
 
 ipc::OrderEventDeltaControlServerConfigV1 ServerConfig(
     const std::filesystem::path& socket_path,
-    const ipc::OrderEventDeltaRingProducerV1* producer) {
+    const ipc::OrderEventDeltaRingProducerV1* producer,
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen) {
     ipc::OrderEventDeltaControlServerConfigV1 result{};
-    result.source_session = SourceSession();
+    result.source_session = SourceSession(temporal_coverage);
     result.event_ring = producer;
     result.control_socket_path = socket_path;
     result.request_timeout = std::chrono::milliseconds(250);
@@ -144,10 +156,12 @@ ipc::OrderEventDeltaControlServerConfigV1 ServerConfig(
 }
 
 ipc::OrderEventDeltaControlClientConfigV1 ClientConfig(
-    const std::filesystem::path& socket_path) {
+    const std::filesystem::path& socket_path,
+    ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen) {
     ipc::OrderEventDeltaControlClientConfigV1 result{};
     result.control_socket_path = socket_path;
-    result.expected_source_session = SourceSession();
+    result.expected_source_session = SourceSession(temporal_coverage);
     result.timeout = std::chrono::milliseconds(500);
     return result;
 }
@@ -241,7 +255,13 @@ void TestWireAbi(bool* ok) {
             sizeof(
                 ipc::OrderEventDeltaControlGetSessionResponseV1) ==
                 264U &&
-            ipc::kOrderEventDeltaControlProtocolMinorV1 == 1U,
+            ipc::kOrderEventDeltaControlProtocolMinorV1 == 2U &&
+            offsetof(
+                ipc::OrderEventDeltaControlGetSessionRequestV1,
+                expected_source_temporal_coverage) == 128U &&
+            offsetof(
+                ipc::OrderEventDeltaControlGetSessionResponseV1,
+                source_temporal_coverage) == 216U,
         "fixed-width control wire sizes");
 }
 
@@ -280,6 +300,22 @@ void TestPathAndStartValidation(
                             kInvalidConfiguration &&
                 server == nullptr,
             "server rejects noncanonical daily catalog identity");
+    }
+    {
+        auto config =
+            ServerConfig(
+                directory / "coverage-mismatch.sock",
+                producer.get(),
+                ipc::OrderEventDeltaTemporalCoverageV1::
+                    kFromProcessStart);
+        std::unique_ptr<ipc::OrderEventDeltaControlServerV1> server;
+        *ok &= Expect(
+            ipc::OrderEventDeltaControlServerV1::Create(
+                config, &server) ==
+                    ipc::OrderEventDeltaControlServerCreateErrorV1::
+                        kInvalidConfiguration &&
+                server == nullptr,
+            "server rejects source/event temporal coverage mismatch");
     }
     {
         const std::filesystem::path existing =
@@ -575,6 +611,61 @@ void TestBoundedClientTimeout(
     static_cast<void>(::unlink(socket_path.c_str()));
 }
 
+void TestProcessStartCoverageControl(
+    const std::filesystem::path& directory,
+    bool* ok) {
+    constexpr auto coverage =
+        ipc::OrderEventDeltaTemporalCoverageV1::kFromProcessStart;
+    auto producer = MakeProducer(ok, 40U, coverage);
+    if (producer == nullptr) {
+        return;
+    }
+    const std::filesystem::path socket_path =
+        directory / "process-start.sock";
+    std::unique_ptr<ipc::OrderEventDeltaControlServerV1> server;
+    int system_error = -1;
+    *ok &= Expect(
+        ipc::OrderEventDeltaControlServerV1::Create(
+            ServerConfig(socket_path, producer.get(), coverage),
+            &server,
+            &system_error) ==
+                ipc::OrderEventDeltaControlServerCreateErrorV1::
+                    kNone &&
+            server != nullptr && system_error == 0 &&
+            server->Start(&system_error),
+        "process-start event control reaches READY");
+    if (server == nullptr || !server->ready()) {
+        return;
+    }
+
+    ipc::OrderEventDeltaControlSnapshotV1 snapshot{};
+    *ok &= Expect(
+        ipc::OrderEventDeltaControlProbeV1(
+            ClientConfig(socket_path, coverage),
+            &snapshot,
+            &system_error) ==
+                ipc::OrderEventDeltaControlClientErrorV1::kNone &&
+            snapshot.source_session.temporal_coverage == coverage &&
+            snapshot.event_session.temporal_coverage == coverage &&
+            snapshot.source_session.stream_quality ==
+                ipc::OrderEventDeltaStreamQualityV1::
+                    kLocalTickStreamContiguous &&
+            snapshot.event_session.stream_quality ==
+                snapshot.source_session.stream_quality,
+        "control round-trips process-start coverage and local quality");
+
+    snapshot = {};
+    *ok &= Expect(
+        ipc::OrderEventDeltaControlProbeV1(
+            ClientConfig(socket_path),
+            &snapshot,
+            &system_error) ==
+                ipc::OrderEventDeltaControlClientErrorV1::
+                    kSourceSessionMismatch,
+        "from-open client cannot attach to process-start event ring");
+    server->Stop();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -589,6 +680,7 @@ int main(int argc, char** argv) {
     if (!directory.empty()) {
         TestPathAndStartValidation(directory, &ok);
         TestLiveServer(directory, &ok);
+        TestProcessStartCoverageControl(directory, &ok);
         TestBoundedClientTimeout(directory, &ok);
         CleanupDirectory(directory);
     }

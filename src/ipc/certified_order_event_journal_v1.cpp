@@ -264,6 +264,8 @@ public:
             kCertifiedOrderEventHeaderBytesV1;
         header_->endian_marker =
             kCertifiedOrderEventEndianMarkerV1;
+        header_->flags =
+            kCertifiedOrderEventCoverageFromOpenV1;
         header_->total_mapping_bytes = mapping_bytes_;
         CopyIdentity(config_.run_id, &header_->run_id);
         header_->session_epoch = config_.session_epoch;
@@ -596,6 +598,55 @@ public:
         return committed_mapping_bytes_;
     }
 
+    [[nodiscard]] bool MarkStartupPrefixRecovered() noexcept {
+        if (failed_ || header_ == nullptr) {
+            return false;
+        }
+        const std::uint32_t current_flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        if ((current_flags &
+             kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U) {
+            return true;
+        }
+        if (current_flags !=
+            kCertifiedOrderEventCoverageFromOpenV1) {
+            failed_ = true;
+            return false;
+        }
+        std::atomic_ref<std::uint64_t> tag =
+            Atomic(header_->status_publish_tag);
+        const std::uint64_t stable =
+            tag.load(std::memory_order_acquire);
+        if (stable == 0U || (stable & 1U) != 0U ||
+            stable >
+                std::numeric_limits<std::uint64_t>::max() - 2U) {
+            failed_ = true;
+            return false;
+        }
+        std::uint64_t expected = stable;
+        if (!tag.compare_exchange_strong(
+                expected,
+                stable + 1U,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            failed_ = true;
+            return false;
+        }
+        Atomic(header_->flags).store(
+            current_flags |
+                kCertifiedOrderEventStartupPrefixRecoveredV1,
+            std::memory_order_relaxed);
+        tag.store(stable + 2U, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] std::uint32_t coverage_flags() const noexcept {
+        return header_ == nullptr
+                   ? 0U
+                   : Atomic(header_->flags)
+                         .load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool failed() const noexcept {
         return failed_;
     }
@@ -771,6 +822,17 @@ std::uint64_t CertifiedOrderEventJournalProducerV1::
     committed_mapping_bytes() const noexcept {
     return impl_ == nullptr ? 0U
                             : impl_->committed_mapping_bytes();
+}
+
+bool CertifiedOrderEventJournalProducerV1::
+    MarkStartupPrefixRecovered() noexcept {
+    return impl_ != nullptr &&
+           impl_->MarkStartupPrefixRecovered();
+}
+
+std::uint32_t CertifiedOrderEventJournalProducerV1::coverage_flags()
+    const noexcept {
+    return impl_ == nullptr ? 0U : impl_->coverage_flags();
 }
 
 bool CertifiedOrderEventJournalProducerV1::failed() const noexcept {

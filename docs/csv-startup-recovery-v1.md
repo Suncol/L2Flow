@@ -31,9 +31,12 @@ session：新进程要求 journal 目录为空，不恢复旧 segment，因此�
 ```
 
 前两个是能够建立 `coverage_from_open=true` 的 coverage source；第三个明确
-表示盘中从本进程启动点开始、且不进行 recovery。它只开放
-`LIVE_PARTIAL` latest 查询，强完整性 flags 全为 false，不属于本文描述的 CSV
-恢复流程，也不能随后在同一 run 内升级为完整 ACTIVE。
+表示盘中从本进程启动点开始、且不进行 recovery。它开放 `LIVE_PARTIAL`
+latest，并在首次周期 generation 后开放从本进程启动点开始的单标的完整
+History 与 tick generation delta；`coverage_from_open` 及全部强完整性 flags
+仍为 false。它不属于本文描述的 CSV 恢复流程，也不能随后在同一 run 内升级
+为完整 ACTIVE。online recovery 使用的另一条 preview socket 仍只开放 latest，
+始终拒绝 History/delta。
 
 选择 CSV 时可选地显式指定：
 
@@ -43,8 +46,9 @@ session：新进程要求 journal 目录为空，不恢复旧 segment，因此�
 
 不显式指定时 CSV 仍进入 online recovery；`blocking` 会被明确拒绝。盘中启动、
 不 recovery 时应显式使用
-`--intraday-live-partial`；此时不允许 recovery tuning、KLine、CERTIFIED 或
-event aggregator。盘中启动却使用
+`--intraday-live-partial`；此时不允许 recovery tuning、KLine 或 CERTIFIED，
+但默认启动独立的 process-start Event sidecar，且不作全日或 native-gap
+完整性声明。盘中启动却使用
 `--intraday-store-from-open` 仍是错误的事实声明；该参数只适用于本进程确实
 从首条相关市场消息前开始接收并持续健康的会话。
 
@@ -63,9 +67,11 @@ event aggregator。盘中启动却使用
 开盘完整”，程序也不能仅凭文件大小证明外部 writer 没有把一条更早收到的
 完整消息延迟到 capture 之后才落盘。
 
-CSV 恢复暂不允许与 `--event-aggregator-socket` 组合。外部
+CSV 恢复暂不允许与旧的 `--event-aggregator-socket` 组合。外部
 `mdl-order-event-aggregator` 没有在 ACTIVE 前接收整段回放的专用接管协议，
-也不能假设其有界 ring 足以容纳全天前缀。
+也不能假设其有界 ring 足以容纳全天前缀。默认开启的 CERTIFIED worker 会在
+隐藏阶段按 canonical 顺序构建 append-only Event journal，并在 promotion
+barrier 后与 recovered FAST 一起开放 History-to-live-tail API。
 
 ## 2. 支持的消息与八个 CSV 文件
 
@@ -242,18 +248,25 @@ callback 顺序。这个接受条件不是对交易所序列的推断，也不�
 online recovery 使用以下状态机：
 
 ```text
-建立 live journal 与 LIVE_PARTIAL preview IPC
+建立 live journal 与 INITIALIZING preview IPC
   -> 创建唯一 SDK-owner preview Pipeline 并 SDK Connect
   -> 每个受支持 callback：先 copy/reserve journal，再推进 preview
   -> 建立 recovered IPC、CERTIFIED worker 与 SDK-less shadow Pipeline
+  -> 预留 overlap hash/min-heap，预创建 parked recovery thread
+  -> preview backlog < 64 且所有依赖健康后开放 LIVE_PARTIAL
+  -> release recovery thread
   -> 逐 tuple 在线性化点记录 journal tuple fence，并固定 CSV byte prefix
   -> CSV 只经 shadow admission/decoder/History/KLine/Factor/CERTIFIED 回放
   -> 用 journal 中的 SeqNo + 语义 fingerprint/cutoff 验证并去重接缝
-  -> CSV 完成后固定 journal accepted_serial 为 promotion frontier B
-  -> journal reader 只从 durable committed prefix 追到 B
-  -> shadow generation + CERTIFIED prefix barrier
-  -> 开放 recovered control，记录 promotion realtime ns
-  -> 永久执行 cutoff guard，并按 global callback serial 继续消费 B+ journal
+  -> CSV 完成后固定初始候选 journal frontier B0
+  -> journal reader 只从 durable committed prefix 追到 B0
+  -> 等待 shadow applied frontier，并执行无副作用 CERTIFIED/Event FIFO probe
+  -> 若 GAP_OPEN/CATCHING_UP，逐个 global serial 消费 journal B0+1... 并重做 probe
+  -> 在第一个完整候选处冻结最终 promotion frontier P
+  -> 只执行一次 shadow generation 与一次最终 CERTIFIED prefix commit
+  -> 两个 recovered control 在共享关闭 gate 后启动
+  -> 最终复核、记录 promotion realtime ns，并用一次 release store 开放 gate
+  -> 永久执行 cutoff guard，并按 global callback serial 继续消费 P+ journal
 ```
 
 SDK 必须先连接并开始 lossless capture，不能先读完 CSV 再连接，否则两步
@@ -267,6 +280,15 @@ online preview 的外部承诺仅是 latest snapshot/tick。实现内部仍使�
 启动点开始的 partial Store，以保证 IPC latest record 的生命周期；它不是
 支持乱序历史插入的 Store，也不是物理上的专用 latest-only map。CSV 永远
 不会写进这个 partial Store。
+
+preview SDK 在 control exposure 前连接的隐藏窗口不是丢弃窗口：shared
+mapping 在 `INITIALIZING` 状态已经接受 applied record 和 processing progress，
+`StartLivePartial` 只改变外部可查询状态，不会清空此前记录。启动前会持续
+复核 preview/shadow/journal/CERTIFIED/recovered IPC 健康，并在有界 deadline
+内等待 preview lag 低于 64；lag 是压力信号，不是终态失败。启动后的第二次
+复核只判断终态健康，不会因为一个合法的瞬时 callback burst 刚跨过 64 就把
+已经开放的 session 错误标记为失败。recovery thread 在 exposure 前已经创建，
+因此 thread stack/TCB 分配失败也发生在客户端可取得 session 之前。
 
 在 tuple fence 之前或同时已复制的 callback 必须在保留的 CSV 尾部找到
 相同 `SeqNo`；找不到就失败。在 fence 之后复制的 callback 有两种合法
@@ -297,6 +319,9 @@ cutoff 关系，不能从 V4 文件本身证明两个外部会话等价。
 
 重叠指纹只保留每个 tuple 中数值最大的有界 K 个 CSV `SequenceID`，而
 不是最后 K 次 `Publish`；这保证深圳乱序释放不会淘汰真实物理文件尾部。
+handoff 在 preview exposure 前为每个 tuple 的 fingerprint hash 与 `K+1`
+min-heap 预留容量；min-heap 仍逐次淘汰最小 identity，但避免原 `std::set`
+逐节点分配及 bulk replay 中的 hash rehash。
 另保存一个常数大小的 tuple 最大 cutoff，不建立全天 `SeqNo` 集合。二者在
 恢复 session 内保持只读。比较使用字段语义而不是动态 string/list 的相对
 offset、空字段的非规范 offset 诊断位或整个 body 的原始字节。深圳
@@ -318,7 +343,7 @@ applied record 和 generation publication，但控制线程尚未启动，外部
 
 ### 7.1 preview 与 promotion
 
-online 会先开放另一个 socket/run：
+online 在上述隐藏初始化和 backlog/健康门禁通过后开放另一个 socket/run：
 
 ```text
 server_state=LIVE_PARTIAL
@@ -332,49 +357,69 @@ certified_prefix_valid=false
 preview 的 `GET_SESSION` 和 latest snapshot/tick 可用；History 和 tick delta
 由服务端拒绝。`LIVE_PARTIAL` 即使随后进入 `DRAINING` 或 `STOPPED_CLEAN`，
 也不会因状态名字变化而获得 from-open coverage。正常 heartbeat stale、
-coverage-lost 与布局验证仍然适用。
+coverage-lost 与布局验证仍然适用。门禁前已写入 `INITIALIZING` mapping 的
+latest/progress 会原样成为第一个可见 prefix，而不是在 `StartLivePartial`
+时从零重新开始。
 
 CSV 完成并确认五个生产 tuple fence 都已捕获后，coordinator 在 journal capture
-mutex 的一致快照中读取 `accepted_serial`，固定为 promotion frontier `B`。
-后来的 callback 只能获得 `B+1...`，不能移动 `B`。reader 等待 journal 的
-`committed_serial >= B`，验证并消费恰好到 `B`；然后 shadow pipeline 的 parked
-generation fence 等待已接受前缀 applied，发布首个 Store/Factor/KLine
-generation。
+mutex 的一致快照中读取 `accepted_serial`，固定为有限的初始候选 `B0`。
+reader 等待 `committed_serial >= B0`，验证并消费恰好到 `B0`。若此候选的
+CERTIFIED/Event FIFO probe 为 `GAP_OPEN` 或 `CATCHING_UP`，同一 reader、tuple
+fence、fingerprint/cutoff 和 warmup absolute deadline 会继续保留；coordinator
+每次只消费下一个 durable global serial，再等待对应 shadow applied frontier 并
+重新 probe。第一个完整候选被冻结为最终 promotion frontier `P`。因此若
+`B0+1` 修复旧 gap 而 `B0+2` 打开新 gap，系统会在 `P=B0+1` promotion，不会因
+批量追到 `B0+2` 而错过已经完整的前缀。后来的 callback 可以继续获得
+`P+1...`，不要求 promotion 时 `accepted_serial == P`。
+
+找到 `P` 前不执行完整 generation cut。只有候选 probe 完整后，shadow pipeline
+才执行一次 parked generation fence，等待冻结的 shadow accepted frontier 全部
+applied，并发布首个 Store/Factor/KLine generation；发布 watermark 的 accepted
+和 applied frontier 都必须等于该冻结 shadow frontier。
 
 默认开启 native-gap recovery 时，online CERTIFIED worker 是 promotion 的
-必需组成部分。`WaitForPrefixBarrier` 只封闭 worker FIFO prefix，不提前启动
-查询 control；worker stop、gap/conflict、resource exhaustion/freeze、dropped
-handoff 或 barrier 失败都会终止整个 promotion，而不是退化成只有 FAST。
+必需组成部分。可重复的 `ProbePrefixFence` 只观察精确 worker FIFO prefix，
+不写 `startup_prefix_recovered`、不授权 control；`GAP_OPEN/CATCHING_UP` 是可等待
+新 journal record 的候选状态。conflict、resource exhaustion/freeze、dropped
+handoff、worker failure 和 seam/journal 错误仍立即终止。找到完整候选并冻结
+`P` 后，`WaitForPrefixBarrier` 才执行一次不可重试的最终 commit；只有这个 commit
+可以发布 recovered coverage 并授权 recovery-mode control。
 显式 `--disable-native-gap-recovery` 时不创建该 sidecar，最终
 `certified_prefix_valid=false`。
 
 最终 promotion 在一个进程内 mutex 中与 shutdown 的未完成取消决策互斥。
-临界区在 control exposure 前、以及 FAST/flag publication 后分别复核：journal
-仍处于 healthy WRITING、其 committed frontier 仍覆盖 B、唯一 preview/SDK
-pipeline 仍在 accepting 且未 fatal/跨交易日、preview IPC 未失败。顺序为：
+recovered FAST 与 CERTIFIED control 共用同一个初值为 false 的单调 exposure
+gate；accept thread 可以在 gate 后先启动，但 gate 打开前只会关闭新连接，不会
+分发请求或传递 memfd。临界区在启动 control 前后都复核 journal 仍处于
+healthy WRITING、其 committed frontier 仍覆盖 P、唯一 preview/SDK pipeline
+仍在 accepting 且未 fatal/跨交易日、preview IPC 未失败。顺序为：
 
 ```text
-首 generation 已发布
-  -> CERTIFIED prefix barrier 已完成（若启用）
-  -> CERTIFIED control 启动（若启用）
-  -> recovered FAST control 启动并进入 ACTIVE
-  -> FAST release-publish certified_prefix_valid（若启用）
+最早完整候选 P 已冻结
+  -> 首 generation 已发布且 watermark 匹配冻结 shadow frontier
+  -> CERTIFIED 最终 prefix commit 已完成（若启用）
+  -> FAST 在 INITIALIZING 中准备最终 certified_prefix_valid（若启用）
+  -> CERTIFIED control 在关闭的共享 gate 后启动（若启用）
+  -> recovered FAST control 在同一关闭 gate 后启动并进入 ACTIVE
+  -> 再次确认 journal/preview/FAST/CERTIFIED control 健康
   -> 记录非零 system-clock realtime ns
-  -> promoted=true
+  -> handoff 标记 promoted（tail API 由此变为可用）
+  -> 对共享 gate 执行唯一一次 release store(true)
+  -> 发布主线程 periodic-cut eligibility
 ```
 
-因此 completion time 是上述整组操作全部成功后的时间，不是 CSV EOF、B 捕获
-或首 generation cut 的时间。FAST control 启动到 certified flag publication
-之间存在同一临界区内的极短发布窗口；此时 flag 仍为 false，不会虚构已证明
-状态，且后续任一步失败会把 recovered mapping 标记为 FAILED。
+因此 completion time 是上述整组操作全部成功后的时间，不是 CSV EOF、B0 捕获
+或首 generation cut 的时间。gate 打开是 recovered 对外可见性的线性化点：
+此前没有 FAST 或 Event descriptor 能成功转移；此后首个成功 FAST descriptor
+已经包含 ACTIVE 与最终强 flags。与 gate 竞争的旧连接允许被拒绝并重试，但
+不能取得半 promotion mapping。gate 打开后不再执行可能失败的 promotion 步骤。
 
-preview、recovered FAST 和 CERTIFIED 使用独立 UDS。多个 socket 无法用一个
-CPU 指令同时开始对查询返回可用 session；实现选择先启动已经封闭 prefix 的
-CERTIFIED control，最后启动 authoritative recovered FAST control。这里也
-没有把 preview Store 原地替换为 shadow Store：preview/recovered 拥有不同
+preview、recovered FAST 和 CERTIFIED 使用独立 UDS；启用 CERTIFIED 时，两个
+recovered accept loop 读取同一个 gate。这里也没有把 preview Store 原地替换为 shadow Store：
+preview/recovered 拥有不同
 `run_id`，客户端必须显式切换 socket 并丢弃旧 run 的 cursor/checkpoint。
 promotion 后 preview 仍保持 partial 查询，shadow 则按 journal global serial
-消费 `B+`，并由周期 generation cut 继续发布严格连续的 recovered prefix。
+消费 `P+`，并由周期 generation cut 继续发布严格连续的 recovered prefix。
 preview header 当前不携带 recovered `run_id` 或自动 redirect；部署层应根据
 promotion 日志/健康探针重试 recovered `GET_SESSION`，不能等待 preview 自己
 变成 ACTIVE。
@@ -440,7 +485,7 @@ CERTIFIED 且 prefix barrier/control 成功时，
 `certified_prefix_valid=true`。`coverage_lost` 是独立的 fail-closed 覆盖项，
 一旦置位，原有 from-open 来源声明也不能使 session 继续被视为健康。
 
-现有 CoreV1 history/delta wire 的
+现有 CoreV2 history/delta wire 的
 `record_coverage_complete=true` 与 `field_complete=false` 约定不因 CSV
 恢复而改变。深圳快照缺少 `ChannelNo`、上海队列缺少操作/订单 ID 的 notice
 进一步说明：记录可以完整存在，同时某些源字段不可从 CSV 获得。
@@ -466,7 +511,8 @@ CERTIFIED 且 prefix barrier/control 成功时，
    或复用 inode；
 5. Store record/内存上限足以容纳完整前缀，并同时考虑 preview partial
    Store、shadow full Store、journal queue/cache 和 WAL 磁盘增长；
-6. 未配置 `--event-aggregator-socket`；
+6. 未配置旧的外部 `--event-aggregator-socket`；若需要 CPU 隔离，显式选择
+   `--event-cpu-set`，并确认它是启动 affinity 的真子集；
 7. 预期 `coverage_from_open` 是运维事实声明，并接受深圳快照
    `ChannelNo=0` 及上海队列操作/订单 ID 为零、同时携带 source-field
    unavailable notice 的字段边界；
@@ -498,6 +544,12 @@ build/mdl-production-router \
 总 warmup 和 shadow/replay 单条 admission 等待分别使用
 `--intraday-recovery-warmup-seconds`（默认 1,800）与
 `--intraday-recovery-backpressure-seconds`（默认 30）。
+CSV、candidate journal wait、applied wait、probe、cut 和 final commit 的所有
+可取消等待共享同一个 steady-clock absolute warmup deadline，candidate retry
+不会重置预算。这个 deadline 不是对任意用户 calculator 或 lifecycle syscall 的
+强制抢占：`CutAndPublishGeneration` 的 setup/calculator work 仍遵守其既有契约；
+final commit 若已通过 `Pending -> Completing` 取得不可逆提交权，调用方会等待
+短 commit tail 得出唯一结果，而不会在 metadata 发布后错误返回 timeout。
 
 重叠指纹按 tuple 分开，各保留数值最大的 262,144 个 `SequenceID`；当前生产
 入口没有单独的 retention CLI。深圳双文件 merge 另有独立默认上限：
@@ -584,12 +636,13 @@ create/write/sync 失败仍会异步使 preview/recovery fail-closed。segment �
 65,536 个 queued records；目录必须为空，已有 segment 不会被续写或自动
 清理。
 
-### 11.3 固定 frontier B 与永久 seam guard
+### 11.3 有限候选 B0、最终 frontier P 与永久 seam guard
 
-online CSV replay 完成后才快照 journal `accepted_serial` 为固定 `B`。这个
+online CSV replay 完成后才快照 journal `accepted_serial` 为有限候选 `B0`。这个
 快照和 callback serial 分配共用 journal mutex，所以并发 callback 要么属于
-`<=B`，要么严格属于 `B+`，不存在半分配 record。reader 随后等待 durable
-commit 并按 global serial 消费到 `B`：
+`<=B0`，要么严格属于 `B0+`，不存在半分配 record。reader 随后等待 durable
+commit 并按 global serial 消费到 `B0`；若 native/Event probe 尚不完整，则
+继续逐个 serial 扩展候选，直到冻结最早完整的 `P`：
 
 - 命中 retained `(tuple, SequenceID, semantic digest)` 的 record 是 CSV
   duplicate，payload 相同才抑制；
@@ -602,46 +655,113 @@ commit 并按 global serial 消费到 `B`：
 CSV fingerprint 每 tuple 只保留数值最大的 262,144 个 `SequenceID`（当前
 生产 online 入口没有单独的 retention CLI）；全天只另存常数大小 maximum
 cutoff。若 fence 前身份已因容量淘汰，恢复选择 `overlap_missing` fail-close，
-不会猜测它等同于 CSV。到达 B 后的 parked generation barrier 证明 shadow
-已应用自身 accepted prefix；B 本身是 journal callback frontier，而
+不会猜测它等同于 CSV。每个候选先等待 shadow applied frontier，再插入
+CERTIFIED/Event FIFO probe；只有到达 P 后才执行 parked generation barrier。
+P 本身是 journal callback frontier，而
 `promotion_shadow_ingress_frontier` 只统计真正进入 A 股 shadow pipeline 的
 CSV/live publication，两者数值不要求相等。
 
-promotion 之后同一个 reader 和 seam 状态继续消费 `B+`，所以 cutoff guard
+promotion 之后同一个 reader 和 seam 状态继续消费 `P+`，所以 cutoff guard
 不是启动临时对象。新到 journal record 可能在 shadow 中短暂滞后于 preview；
 recovered Store 始终保持从开盘连续的已应用前缀，而 `ACTIVE` 不等价于
 “已经读到此刻最后一个 SDK callback”。当前 Wire header 没有单独暴露
 journal accepted-minus-consumed backlog，运维应结合 promotion/final 日志和
 journal/recovery snapshot 指标观察这一差值。
 
-tail loop 每轮 journal read 最多等待 100 ms，并在下一轮复核唯一 preview/SDK
-owner 是否仍 accepting、未 fatal/跨交易日且 preview IPC 未失败。非 shutdown
-场景下任一条件失效会立即把 preview/recovered 标为 FAILED 并停止 CERTIFIED
-control；journal write/sync/corruption failure 则由 reader 的 condition wakeup
-直接传播，不等待最长可达 60 秒的 generation interval。
+tail loop 每轮 journal read 最多等待 100 ms。`PumpNext` 在每次 read 前通过
+同一个低成本 health gate 复核唯一 preview/SDK owner、shadow、journal 的
+lock-free failure bit、preview/recovered FAST 控制面与 CERTIFIED；应用层不会
+在其外再重复读取 preview progress cacheline。非 shutdown 场景下任一终态
+条件失效会立即把 preview/recovered 标为 FAILED 并停止 CERTIFIED control；
+journal write/sync/corruption failure 也不再可能被持续 pressure wait 遮蔽。
 
-### 11.4 CERTIFIED pressure gate 与现有调度边界
+promotion 后的正常停止不是上述 owner failure。应用先调用
+`BeginCleanShutdownTailDrain(deadline)` 进入单向 clean-drain 状态，再 quiesce
+唯一 SDK owner 并发布 preview final generation，随后 `StopAndFlush()` journal。
+tail 在 deadline 前不被正常 stop signal cancel，并尽力继续读到 End；pressure
+wait、journal read 和随后发起的 shadow admission 都被该绝对 deadline 限制。
+若 preview/shadow/CERTIFIED 压力永久不下降，则以 `BACKPRESSURE_TIMEOUT`
+fail-close，而不是让 join 永久等待。成功 join 后显式验证
+`last_journal_serial == committed_serial == accepted_serial`，最后才发布 shadow
+final generation。放宽仅接受 preview 的预期 non-accepting/stopped 状态；fatal、
+非法 applied/accepted progress 或 trade-date boundary 仍 fail-close。
+
+### 11.4 FAST-aware work-conserving governor
 
 online 的优先关系是 SDK callback capture/preview 高于 shadow CSV replay。
-coordinator 在每条 CSV publication 前读取 CERTIFIED handoff queue 估算水位：
+coordinator 在任何新的昂贵 publication 前检查三类压力：
 
 ```text
-pressure < 50%                  立即继续
-50% <= pressure < high         每条 CSV sleep 50 us
-high <= pressure < 90%         每条 CSV sleep 500 us
-pressure >= 90%                每 1 ms 重查并暂停 CSV
+preview accepted-applied lag       high=64，触发后 drain 到 low=0
+shadow accepted-applied lag        high=1024，触发后 drain 到 low=256
+CERTIFIED handoff queue            low=50%，high=配置值（默认75%），pause=90%
 ```
 
-`high` 由
-`--intraday-recovery-certified-high-watermark-percent` 配置，范围 51..89，
-默认 75。journal suffix 为了优先追赶 live，不执行 50%/high 的短 sleep，但在
-90% 同样暂停，避免主动向已接近满载的 CERTIFIED queue 继续灌入。每次检查还
-要求 worker running，且 resource freeze/exhaustion、dropped handoff、
-conflicting duplicate 均为 terminal；单纯暂停不能把已经丢失的证明修好。
+每轮在进入任何 pressure sleep 前先采齐 preview、shadow、journal、两套 FAST
+控制面与 CERTIFIED terminal health，避免前一个 backlog 分支遮蔽后一个 owner
+failure。CERTIFIED 在 worker-only warmup 阶段不要求 socket control 已启动；一旦
+`StartControl()` 成功，accept loop 的异常退出会通过独立原子状态立即变为 terminal。
+journal 使用独立 atomic failure bit，控制面使用现有 atomic state，因此不获取
+callback capture queue mutex。preview/shadow 达到
+high 后以 50 us 间隔复查并等待到 low；draining 状态由单 consumer handoff
+持有并跨 100-ms `PumpNext` deadline 保留，因而不会在下一轮 tail poll 提前恢复
+灌入。CERTIFIED 的 health 与 utilization 从同一次 service snapshot 得出；
+worker stop、resource freeze/exhaustion、dropped handoff、conflicting duplicate
+都是 terminal，不能用 sleep 掩盖。达到 90% 时同样暂停并复查。
 
-这里实现的是单 recovery thread 上的 per-record cooperative throttling，不是
-严格 CPU scheduler。当前没有 `--intraday-recovery-replay-workers`、
-`--intraday-recovery-replay-max-cpu-percent`、CPU quota 或 affinity 参数，也
-不会动态改变 decoder worker 数或 replay batch。若需要硬 CPU/IO 隔离，应在
-部署层使用 cgroup/调度策略并另行压测；不能把本水位 gate 描述成 CPU 百分比
-上限。
+低于 pause 时调度以 64 个实际 bulk publication 为一个 quantum：无任何压力
+时不 sleep、不 yield；CERTIFIED 位于 low/high 或 high/pause 区间时，每个
+quantum 最多执行一次 50 us/500 us cooldown，不再逐 record sleep。若 quantum
+内观察到新的 preview callback，但 backlog 未达到 high，则在 quantum 边界
+cooperative yield 一次，使恢复保持 work-conserving，同时给实时 worker 调度
+机会。promotion 后永久 journal tail 本来就是一进一出，不执行 bulk cooldown，
+但仍保留 preview/shadow terminal health 和 CERTIFIED 90% pause gate。
+
+publication 不是 CSV 唯一的重工作边界。深圳 `6.33`/`6.36` native-sequence
+gap 可能让 parser 持续向 pending map 插入而尚未产生任何 `Publish`；超长 quoted
+record 也可能在单行内增长到 MiB。因此 parser 另外在每 256 个完整 logical
+record、以及每次新的 64 KiB `pread` 前调用同一 governor。该 checkpoint 不
+伪造 bulk publication 计数，并保留准确 source file/record-start line；持续
+压力、cancel 或 warmup deadline 会在下一有界 checkpoint fail-close。
+
+每条 journal record 不再无条件执行第二次 semantic decode。只有 identity
+确实命中 retained CSV overlap 时才计算 semantic digest；已经可证明进入 live
+suffix 的 record 直接交给 shadow 的正常 decoder。snapshot 中的
+`journal_overlap_digests`、`journal_live_suffix_digests_skipped`、
+`csv_parser_checkpoint_events`、preview/shadow pause 与 cooperative-yield
+计数用于区分正确性工作和调度动作。
+
+这里仍是应用层 cooperative governor，不是严格 CPU/IO scheduler。一个正在
+执行的 `pread`、page fault、allocator 或首 generation seal 不能在任意指令处
+抢占；当前也没有 replay CPU quota/affinity CLI。若生产验收要求在整机过载、
+共享磁盘拥塞下仍给出硬 p999 上界，必须再用独立 CPU/NUMA、I/O cgroup 或
+进程级资源隔离，并在目标机器按下节 benchmark 重复验收。
+
+### 11.5 latency A/B 验证
+
+`benchmark_online_recovery_fast_v1` 是 opt-in target，不注册到 CTest。它用
+真实 CSV source、journal、shadow、`LIVE_PARTIAL` Wire V2 服务和 C reader
+提供三个模式：
+
+- `ordinary`：null-capture/no-recovery callback 数据面；synthetic control 仍是
+  `LIVE_PARTIAL`，不单独证明生产 from-open `ACTIVE` 生命周期；
+- `parked`：online journal/handoff 已建立，但 bulk recovery 暂停；
+- `active`：50,000 条 CSV 与所有 measured callback 同期恢复。
+
+固定 CPU 后分别运行：
+
+```bash
+taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode ordinary
+taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode parked
+taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode active
+```
+
+验收必须交错重复运行，而不是对单次 p999 设 CTest 阈值；同时检查
+`history_records == history_expected`、`promotion_overlap_samples == samples`
+（active）、零丢序/错误状态、recovery duration/throughput 和全部 governor
+telemetry。普通 FAST/CERTIFIED 则继续用
+`benchmark_realtime_certified_v1 --all`，从而把“online bulk 的增量影响”和
+“无需 online recovery 的常规路径”分开判断。
+
+2026-08-01 的固定 CPU 五轮 paired 结果与完整性/sanitizer 记录见
+[`online-recovery-fast-latency-validation-20260801.md`](online-recovery-fast-latency-validation-20260801.md)。
