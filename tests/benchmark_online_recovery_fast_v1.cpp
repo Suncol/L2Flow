@@ -71,6 +71,7 @@ struct Options final {
     std::size_t warmup_samples = 128U;
     std::size_t measured_samples = 2'048U;
     std::size_t replay_records = 50'000U;
+    std::uint32_t parallel_decoder_workers = 0U;
     bool mode_supplied = false;
 };
 
@@ -151,6 +152,21 @@ struct Options final {
             } else {
                 parsed.replay_records = value;
             }
+            continue;
+        }
+        if (argument == "--parallel-decoder-workers") {
+            if (index + 1 >= argc) {
+                return false;
+            }
+            std::size_t value = 0U;
+            if (!ParseSize(
+                    argv[++index],
+                    runtime::kRealtimeParallelDecoderMaximumWorkersV1,
+                    &value)) {
+                return false;
+            }
+            parsed.parallel_decoder_workers =
+                static_cast<std::uint32_t>(value);
             continue;
         }
         return false;
@@ -856,7 +872,8 @@ struct DailyFixture final {
     const std::shared_ptr<const market::DailyInstrumentCatalogV2>& catalog,
     market::InstrumentRuntimeStateV2* runtime_state,
     std::uint64_t maximum_records,
-    bool coverage_from_open) {
+    bool coverage_from_open,
+    std::uint32_t parallel_decoder_workers) {
     runtime::RealtimePipelineConfigV1 config{};
     config.run_id = run_id;
     config.trade_date = kTradeDate;
@@ -865,6 +882,7 @@ struct DailyFixture final {
     config.source_stream_ids = kSourceStreamIds;
     config.maximum_sdk_message_bytes = 4096U;
     config.decoder_queue_capacity_per_source = kPipelineQueueCapacity;
+    config.parallel_decoder_worker_count = parallel_decoder_workers;
     config.completion_tracker_capacity = kCompletionCapacity;
     config.tick_ring_capacity = kCompletionCapacity;
     config.store_worker_count = 4U;
@@ -1340,7 +1358,8 @@ private:
             daily_.catalog,
             daily_.shadow_state.get(),
             maximum_records_,
-            true);
+            true,
+            options_.parallel_decoder_workers);
         shadow_config.sdk.enabled = false;
         shadow_config.external_ingress_enabled = true;
         shadow_config.applied_record_sink = recovered_service_;
@@ -1389,7 +1408,8 @@ private:
             daily_.catalog,
             daily_.preview_state.get(),
             maximum_records_,
-            false);
+            false,
+            options_.parallel_decoder_workers);
         preview_config.sdk.enabled = true;
         preview_config.sdk.server_address = "benchmark.invalid";
         preview_config.sdk.user_name = "online-recovery-benchmark";
@@ -1613,6 +1633,8 @@ private:
         << " measured_samples=" << options.measured_samples
         << " pure_reads_per_sample=" << kPureReadsPerSample
         << " replay_records=" << options.replay_records
+        << " parallel_decoder_workers="
+        << options.parallel_decoder_workers
         << " replay_source=mdl_csv_shenzhen_transaction"
         << " reader=wire_v2_c_latest_tick"
         << " clock=CLOCK_MONOTONIC"
@@ -1673,6 +1695,8 @@ private:
         << " mode=" << ModeName(options.mode)
         << " success=1"
         << " measured_samples=" << options.measured_samples
+        << " parallel_decoder_workers="
+        << options.parallel_decoder_workers
         << " pure_latest_samples=" << latency.pure_latest_read_ns.size()
         << " poll_calls=" << latency.poll_calls
         << " inconsistent_reads=" << latency.inconsistent_reads
@@ -1738,7 +1762,7 @@ int main(int argc, char** argv) {
         std::cerr
             << "usage: benchmark_online_recovery_fast_v1 --mode "
                "ordinary|parked|active [--warmup-samples N] [--samples N] "
-               "[--replay-records N]\n";
+               "[--replay-records N] [--parallel-decoder-workers N]\n";
         return 2;
     }
     return RunBenchmark(options) ? 0 : 1;

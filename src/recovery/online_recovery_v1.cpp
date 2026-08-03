@@ -342,6 +342,11 @@ public:
             }
             const StartupReplayResultV1 replay =
                 config_.csv_replay_source->Replay(sink);
+            {
+                std::lock_guard<std::mutex> lock(snapshot_mutex_);
+                snapshot_.csv_boundary_alignment =
+                    replay.boundary_alignment;
+            }
             if (!replay.ok()) {
                 std::string detail = "online CSV replay failed: ";
                 detail += StartupReplayErrorNameV1(replay.error);
@@ -569,16 +574,74 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool HandleReplayDeadline(
+        bool boundary_deadline,
+        bool* boundary_deadline_expired,
+        std::string_view warmup_message,
+        std::string* detail) noexcept {
+        if (boundary_deadline) {
+            if (boundary_deadline_expired != nullptr) {
+                *boundary_deadline_expired = true;
+            }
+            SetDetail(detail, {});
+            return false;
+        }
+        Fail(
+            OnlineRecoveryErrorV1::kWarmupTimeout,
+            warmup_message,
+            detail);
+        return false;
+    }
+
     [[nodiscard]] bool PublishCsv(
         const StartupReplayPublicationV1& publication,
         std::string* detail) noexcept {
+        return PublishCsvCore(
+            publication,
+            warmup_deadline_,
+            false,
+            nullptr,
+            detail);
+    }
+
+    [[nodiscard]] StartupReplaySinkCallResultV1 PublishCsvUntil(
+        const StartupReplayPublicationV1& publication,
+        std::chrono::steady_clock::time_point deadline,
+        std::string* detail) noexcept {
+        if (deadline >= warmup_deadline_) {
+            return PublishCsv(publication, detail)
+                       ? StartupReplaySinkCallResultV1::kAccepted
+                       : StartupReplaySinkCallResultV1::kRejected;
+        }
+        bool deadline_expired = false;
+        const bool accepted = PublishCsvCore(
+            publication,
+            deadline,
+            true,
+            &deadline_expired,
+            detail);
+        if (deadline_expired) {
+            return StartupReplaySinkCallResultV1::kDeadline;
+        }
+        return accepted
+                   ? StartupReplaySinkCallResultV1::kAccepted
+                   : StartupReplaySinkCallResultV1::kRejected;
+    }
+
+    [[nodiscard]] bool PublishCsvCore(
+        const StartupReplayPublicationV1& publication,
+        std::chrono::steady_clock::time_point operation_deadline,
+        bool boundary_deadline,
+        bool* boundary_deadline_expired,
+        std::string* detail) noexcept {
         try {
-            if (std::chrono::steady_clock::now() >= warmup_deadline_) {
-                Fail(
-                    OnlineRecoveryErrorV1::kWarmupTimeout,
+            if (std::chrono::steady_clock::now() >=
+                operation_deadline) {
+                return HandleReplayDeadline(
+                    boundary_deadline,
+                    boundary_deadline_expired,
                     "online CSV replay exceeded the warmup timeout",
                     detail);
-                return false;
             }
             if (CancellationRequested()) {
                 Fail(
@@ -604,8 +667,15 @@ public:
             // gate after those operations would still let bulk recovery steal
             // CPU and cache from an already-lagging exposed preview.
             const ThrottleResult throttle = Throttle(
-                GovernorPhase::kCsv, warmup_deadline_, true);
+                GovernorPhase::kCsv, operation_deadline, true);
             if (throttle != ThrottleResult::kReady) {
+                if (throttle == ThrottleResult::kDeadline) {
+                    return HandleReplayDeadline(
+                        boundary_deadline,
+                        boundary_deadline_expired,
+                        "online CSV replay exceeded the warmup timeout",
+                        detail);
+                }
                 Fail(
                     throttle == ThrottleResult::kCancelled
                         ? OnlineRecoveryErrorV1::kCancelled
@@ -634,6 +704,14 @@ public:
                         : "CSV replay could not pass the recovery pressure gate",
                     detail);
                 return false;
+            }
+            if (std::chrono::steady_clock::now() >=
+                operation_deadline) {
+                return HandleReplayDeadline(
+                    boundary_deadline,
+                    boundary_deadline_expired,
+                    "online CSV replay exceeded the warmup timeout",
+                    detail);
             }
             realtime::OwnedIngressMessageInspectionV1 inspection{};
             const realtime::OwnedIngressMessageErrorV1 inspect_error =
@@ -702,17 +780,17 @@ public:
             }
             const auto admission_now =
                 std::chrono::steady_clock::now();
-            if (admission_now >= warmup_deadline_) {
-                Fail(
-                    OnlineRecoveryErrorV1::kWarmupTimeout,
+            if (admission_now >= operation_deadline) {
+                return HandleReplayDeadline(
+                    boundary_deadline,
+                    boundary_deadline_expired,
                     "online CSV replay exceeded the warmup timeout",
                     detail);
-                return false;
             }
             const auto admission_remaining = std::max(
                 std::chrono::nanoseconds(1),
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    warmup_deadline_ - admission_now));
+                    operation_deadline - admission_now));
             const runtime::RealtimePipelineIngressResultV1 ingress =
                 IngestShadow(
                     publication.message,
@@ -729,17 +807,30 @@ public:
                         kFilteredNonAShare) {
                 const bool admission_expired =
                     std::chrono::steady_clock::now() >=
-                    warmup_deadline_;
+                    operation_deadline;
+                if (admission_expired &&
+                    ingress.error ==
+                        runtime::RealtimePipelineIngressErrorV1::
+                            kDecoderAdmissionFailed) {
+                    return HandleReplayDeadline(
+                        boundary_deadline,
+                        boundary_deadline_expired,
+                        "online CSV replay exceeded the warmup timeout",
+                        detail);
+                }
                 Fail(
-                    admission_expired
-                        ? OnlineRecoveryErrorV1::kWarmupTimeout
-                        : OnlineRecoveryErrorV1::
-                              kShadowAdmissionFailed,
-                    admission_expired
-                        ? "online CSV replay exceeded the warmup timeout"
-                        : "shadow rejected a CSV replay publication",
+                    OnlineRecoveryErrorV1::kShadowAdmissionFailed,
+                    "shadow rejected a CSV replay publication",
                     detail);
                 return false;
+            }
+            if (std::chrono::steady_clock::now() >=
+                operation_deadline) {
+                return HandleReplayDeadline(
+                    boundary_deadline,
+                    boundary_deadline_expired,
+                    "online CSV replay exceeded the warmup timeout",
+                    detail);
             }
             RetainFingerprint(*tuple, fingerprint);
             replay_cutoff_[*tuple] = replay_cutoff_seen_[*tuple]
@@ -776,6 +867,15 @@ public:
 
     [[nodiscard]] bool CooperativeCheckpoint(
         std::string* detail) noexcept {
+        return CooperativeCheckpointCore(
+            warmup_deadline_, false, nullptr, detail);
+    }
+
+    [[nodiscard]] bool CooperativeCheckpointCore(
+        std::chrono::steady_clock::time_point operation_deadline,
+        bool boundary_deadline,
+        bool* boundary_deadline_expired,
+        std::string* detail) noexcept {
         try {
             {
                 std::lock_guard<std::mutex> lock(snapshot_mutex_);
@@ -786,10 +886,25 @@ public:
             // same health/backpressure gate here, but do not account a
             // synthetic publication in the bulk-record quantum.
             const ThrottleResult throttle = Throttle(
-                GovernorPhase::kCsv, warmup_deadline_, false);
+                GovernorPhase::kCsv, operation_deadline, false);
             if (throttle == ThrottleResult::kReady) {
+                if (std::chrono::steady_clock::now() >=
+                    operation_deadline) {
+                    return HandleReplayDeadline(
+                        boundary_deadline,
+                        boundary_deadline_expired,
+                        "online CSV parser exceeded the warmup timeout",
+                        detail);
+                }
                 SetDetail(detail, {});
                 return true;
+            }
+            if (throttle == ThrottleResult::kDeadline) {
+                return HandleReplayDeadline(
+                    boundary_deadline,
+                    boundary_deadline_expired,
+                    "online CSV parser exceeded the warmup timeout",
+                    detail);
             }
             Fail(
                 throttle == ThrottleResult::kCancelled
@@ -825,6 +940,35 @@ public:
                 detail);
             return false;
         }
+    }
+
+    [[nodiscard]] StartupReplaySinkCallResultV1
+    CooperativeCheckpointUntil(
+        std::chrono::steady_clock::time_point deadline,
+        std::string* detail) noexcept {
+        if (deadline >= warmup_deadline_) {
+            return CooperativeCheckpoint(detail)
+                       ? StartupReplaySinkCallResultV1::kAccepted
+                       : StartupReplaySinkCallResultV1::kRejected;
+        }
+        bool deadline_expired = false;
+        const bool accepted = CooperativeCheckpointCore(
+            deadline,
+            true,
+            &deadline_expired,
+            detail);
+        if (deadline_expired) {
+            return StartupReplaySinkCallResultV1::kDeadline;
+        }
+        return accepted
+                   ? StartupReplaySinkCallResultV1::kAccepted
+                   : StartupReplaySinkCallResultV1::kRejected;
+    }
+
+    void ObserveBoundaryAlignment(
+        const StartupReplayBoundaryAlignmentStatsV1& stats) noexcept {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        snapshot_.csv_boundary_alignment = stats;
     }
 
     [[nodiscard]] OnlineRecoveryPumpResultV1 PumpNext(
@@ -1949,6 +2093,33 @@ bool OnlineRecoveryHandoffV1::CaptureTupleFence(
 bool OnlineRecoveryHandoffV1::CooperativeCheckpoint(
     std::string* detail) noexcept {
     return impl_ != nullptr && impl_->CooperativeCheckpoint(detail);
+}
+
+void OnlineRecoveryHandoffV1::ObserveBoundaryAlignment(
+    const StartupReplayBoundaryAlignmentStatsV1& stats) noexcept {
+    if (impl_ != nullptr) {
+        impl_->ObserveBoundaryAlignment(stats);
+    }
+}
+
+StartupReplaySinkCallResultV1 OnlineRecoveryHandoffV1::PublishUntil(
+    const StartupReplayPublicationV1& publication,
+    std::chrono::steady_clock::time_point deadline,
+    std::string* detail) noexcept {
+    return impl_ != nullptr
+               ? impl_->PublishCsvUntil(
+                     publication, deadline, detail)
+               : StartupReplaySinkCallResultV1::kRejected;
+}
+
+StartupReplaySinkCallResultV1
+OnlineRecoveryHandoffV1::CooperativeCheckpointUntil(
+    std::chrono::steady_clock::time_point deadline,
+    std::string* detail) noexcept {
+    return impl_ != nullptr
+               ? impl_->CooperativeCheckpointUntil(
+                     deadline, detail)
+               : StartupReplaySinkCallResultV1::kRejected;
 }
 
 bool OnlineRecoveryHandoffV1::Publish(

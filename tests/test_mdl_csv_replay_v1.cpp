@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -240,6 +241,19 @@ public:
         }
     }
 
+    void ObserveBoundaryAlignment(
+        const recovery::StartupReplayBoundaryAlignmentStatsV1& stats)
+        noexcept override {
+        if (!boundary_alignment_hook) {
+            return;
+        }
+        try {
+            boundary_alignment_hook(stats);
+        } catch (...) {
+            boundary_alignment_hook_threw = true;
+        }
+    }
+
     bool Publish(
         const recovery::StartupReplayPublicationV1& publication,
         std::string* detail) noexcept override {
@@ -307,6 +321,10 @@ public:
     std::function<void(
         const recovery::StartupReplayPublicationV1&)>
         publish_hook;
+    std::function<void(
+        const recovery::StartupReplayBoundaryAlignmentStatsV1&)>
+        boundary_alignment_hook;
+    bool boundary_alignment_hook_threw = false;
 
 private:
     market::MarketDecoderV1 decoder_;
@@ -1226,8 +1244,17 @@ void TestPartialSuffixAndFailures(TestContext* test) {
             &sink);
         test->Expect(
             result.error ==
-                recovery::StartupReplayErrorV1::kSequenceGap,
-            "shared Shenzhen ApplSeqNum gap fails at EOF");
+                recovery::StartupReplayErrorV1::
+                    kBoundaryAlignmentTimeout &&
+                recovery::StartupReplayErrorNameV1(result.error) ==
+                    "boundary_alignment_timeout" &&
+                result.detail.find(
+                    "representative_missing_channel=1") !=
+                    std::string::npos &&
+                result.detail.find(
+                    "representative_missing_appl_seq=1") !=
+                    std::string::npos,
+            "shared Shenzhen ApplSeqNum gap fails after bounded alignment");
     }
 }
 
@@ -1913,27 +1940,18 @@ void TestCooperativeCheckpointBounds(TestContext* test) {
         "a quoted record crossing 64 KiB can be cancelled before publication with exact source context");
 }
 
-void TestAppendedBoundaryClosesSharedSequence(TestContext* test) {
+void TestMinimumBoundaryAlignmentClosesSharedSequence(
+    TestContext* test) {
     TempDirectory directory;
     const Row first = ShenzhenOrderRow("7", "1", "100");
-    const Row boundary = ShenzhenOrderRow("7", "2", "101");
-    std::string incomplete_order = CsvLine(
-        kShenzhenOrderColumns, boundary);
-    incomplete_order.pop_back();
-    std::string incomplete_transaction = CsvLine(
-        kShenzhenTransactionColumns,
-        ShenzhenTransactionRow("7", "4", "103"));
-    incomplete_transaction.pop_back();
     WriteTable(
         directory.path() / "mdl_6_33_0.csv",
         kShenzhenOrderColumns,
-        {first},
-        incomplete_order);
+        {first, ShenzhenOrderRow("7", "3", "102")});
     WriteTable(
         directory.path() / "mdl_6_36_0.csv",
         kShenzhenTransactionColumns,
-        {ShenzhenTransactionRow("7", "3", "102")},
-        incomplete_transaction);
+        {});
 
     bool appended = false;
     DecodeSink sink;
@@ -1946,11 +1964,15 @@ void TestAppendedBoundaryClosesSharedSequence(TestContext* test) {
                 std::ofstream output(
                     directory.path() / "mdl_6_33_0.csv",
                     std::ios::binary | std::ios::app);
-                output << '\n';
+                output << CsvLine(
+                    kShenzhenOrderColumns,
+                    ShenzhenOrderRow("7", "4", "103"));
                 std::ofstream transaction_output(
                     directory.path() / "mdl_6_36_0.csv",
                     std::ios::binary | std::ios::app);
-                transaction_output << '\n';
+                transaction_output << CsvLine(
+                    kShenzhenTransactionColumns,
+                    ShenzhenTransactionRow("7", "2", "101"));
                 appended = true;
             }
         };
@@ -1963,9 +1985,804 @@ void TestAppendedBoundaryClosesSharedSequence(TestContext* test) {
     test->Expect(
         result.ok() && appended &&
             result.counts.shenzhen_orders == 2U &&
-            result.counts.shenzhen_transactions == 2U &&
-            sink.events.size() == 4U,
-        "two-sided finite extension is consumed completely after closing the initial shared-sequence gap");
+            result.counts.shenzhen_transactions == 1U &&
+            sink.events.size() == 3U &&
+            result.boundary_alignment.attempted &&
+            result.boundary_alignment.sealed &&
+            result.boundary_alignment.phase ==
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kSealed &&
+            recovery::StartupReplayBoundaryAlignmentPhaseNameV1(
+                result.boundary_alignment.phase) == "SEALED" &&
+            result.boundary_alignment.extension_records == 1U &&
+            result.boundary_alignment.sealed_order_cut ==
+                result.boundary_alignment.initial_order_cut &&
+            sink.publication_sequences ==
+                std::vector<std::uint64_t>({100U, 101U, 102U}),
+        "Shenzhen alignment seals at the first joint continuous prefix and leaves read-ahead live tail unpublished");
+}
+
+void TestBoundaryAlignmentRefreshesUntilClosure(TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    bool appended = false;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (!appended && stats.poll_count == 2U) {
+                std::ofstream output(
+                    transaction_path,
+                    std::ios::binary | std::ios::app);
+                output << CsvLine(
+                    kShenzhenTransactionColumns,
+                    ShenzhenTransactionRow("7", "2", "101"));
+                appended = true;
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.ok() && appended &&
+            !sink.boundary_alignment_hook_threw &&
+            result.boundary_alignment.poll_count == 2U &&
+            result.boundary_alignment.extension_records == 1U &&
+            result.counts.shenzhen_orders == 2U &&
+            result.counts.shenzhen_transactions == 1U,
+        "Shenzhen alignment repeats retained-descriptor refreshes until the missing cross-file sequence becomes visible");
+}
+
+void TestBoundaryAlignmentDoesNotChaseFastTail(TestContext* test) {
+    TempDirectory directory;
+    const std::filesystem::path order_path =
+        directory.path() / "mdl_6_33_0.csv";
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        order_path,
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count == 1U) {
+                std::ofstream output(
+                    order_path,
+                    std::ios::binary | std::ios::app);
+                output << CsvLine(
+                    kShenzhenOrderColumns,
+                    ShenzhenOrderRow("7", "4", "103"));
+            } else if (stats.poll_count == 2U) {
+                std::ofstream output(
+                    transaction_path,
+                    std::ios::binary | std::ios::app);
+                output << CsvLine(
+                    kShenzhenTransactionColumns,
+                    ShenzhenTransactionRow("7", "2", "101"));
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.ok() &&
+            result.boundary_alignment.poll_count == 2U &&
+            result.boundary_alignment.extension_records == 1U &&
+            result.boundary_alignment.order_extension_bytes == 0U &&
+            result.boundary_alignment.sealed_order_cut ==
+                result.boundary_alignment.initial_order_cut &&
+            sink.publication_sequences ==
+                std::vector<std::uint64_t>({100U, 101U, 102U}),
+        "a fast-side N+2 row remains provisional while alignment waits for N in the opposite file");
+}
+
+void TestBoundaryAlignmentUsesClosingCandidatesBeforeMoreScan(
+    TestContext* test) {
+    TempDirectory directory;
+    const std::filesystem::path order_path =
+        directory.path() / "mdl_6_33_0.csv";
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        order_path,
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "2", "102")});
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {ShenzhenTransactionRow("8", "2", "202")});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count != 1U) {
+                return;
+            }
+            std::ofstream order_output(
+                order_path,
+                std::ios::binary | std::ios::app);
+            order_output << CsvLine(
+                kShenzhenOrderColumns,
+                ShenzhenOrderRow("8", "1", "103"));
+            order_output << CsvLine(
+                kShenzhenOrderColumns,
+                ShenzhenOrderRow("9", "1", "104"));
+            std::ofstream transaction_output(
+                transaction_path,
+                std::ios::binary | std::ios::app);
+            transaction_output << CsvLine(
+                kShenzhenTransactionColumns,
+                ShenzhenTransactionRow("7", "1", "203"));
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    config.maximum_boundary_alignment_records = 2U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.ok() && result.boundary_alignment.sealed &&
+            result.boundary_alignment.scanned_records == 2U &&
+            result.boundary_alignment.extension_records == 2U &&
+            result.boundary_alignment.sealed_order_cut <
+                result.boundary_alignment.order_available_end &&
+            result.counts.shenzhen_orders == 2U &&
+            result.counts.shenzhen_transactions == 2U,
+        "decisive candidates on both files close existing channels before any extra tail scan spends the exact record budget");
+}
+
+void TestBoundaryAlignmentCompletesInitialPartialRow(
+    TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    std::string partial = CsvLine(
+        kShenzhenTransactionColumns,
+        ShenzhenTransactionRow("7", "2", "101"));
+    partial.pop_back();
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {},
+        partial);
+
+    DecodeSink sink;
+    bool terminated = false;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (!terminated && stats.poll_count == 2U) {
+                std::ofstream output(
+                    transaction_path,
+                    std::ios::binary | std::ios::app);
+                output << '\n';
+                terminated = true;
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.ok() && terminated &&
+            result.boundary_alignment.poll_count == 2U &&
+            result.boundary_alignment.extension_records == 1U &&
+            result.boundary_alignment.transaction_extension_bytes ==
+                1U &&
+            result.counts.shenzhen_orders == 2U &&
+            result.counts.shenzhen_transactions == 1U,
+        "an initial-cut Shenzhen partial row is mandatory and commits only after its LF becomes visible");
+}
+
+void TestBoundaryAlignmentCompletesPartialWithoutSequenceGap(
+    TestContext* test) {
+    TempDirectory directory;
+    const std::filesystem::path order_path =
+        directory.path() / "mdl_6_33_0.csv";
+    std::string partial = CsvLine(
+        kShenzhenOrderColumns,
+        ShenzhenOrderRow("7", "2", "101"));
+    partial.pop_back();
+    WriteTable(
+        order_path,
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100")},
+        partial);
+    WriteTable(
+        directory.path() / "mdl_6_36_0.csv",
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count == 2U) {
+                std::ofstream output(
+                    order_path,
+                    std::ios::binary | std::ios::app);
+                output << '\n';
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.ok() &&
+            result.boundary_alignment.attempted &&
+            result.boundary_alignment.sealed &&
+            result.boundary_alignment.poll_count == 2U &&
+            result.boundary_alignment.extension_records == 1U &&
+            result.counts.shenzhen_orders == 2U &&
+            sink.publication_sequences ==
+                std::vector<std::uint64_t>({100U, 101U}),
+        "an initial-cut partial row remains mandatory even when no native-sequence gap is pending");
+}
+
+void TestBoundaryAlignmentIgnoresPartialAfterClosure(
+    TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count != 1U) {
+                return;
+            }
+            std::string suffix = CsvLine(
+                kShenzhenTransactionColumns,
+                ShenzhenTransactionRow("7", "2", "101"));
+            std::string optional_partial = CsvLine(
+                kShenzhenTransactionColumns,
+                ShenzhenTransactionRow("7", "4", "103"));
+            optional_partial.pop_back();
+            std::ofstream output(
+                transaction_path,
+                std::ios::binary | std::ios::app);
+            output << suffix << optional_partial;
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.ok() &&
+            result.boundary_alignment.poll_count == 1U &&
+            result.boundary_alignment.extension_records == 1U &&
+            result.boundary_alignment.sealed_transaction_cut <
+                result.boundary_alignment.transaction_available_end &&
+            !result.boundary_alignment
+                 .transaction_mandatory_partial &&
+            result.counts.shenzhen_transactions == 1U &&
+            sink.publication_sequences ==
+                std::vector<std::uint64_t>({100U, 101U, 102U}),
+        "a live-side partial row after the first closed prefix does not delay sealing");
+}
+
+void TestBoundaryAlignmentCapsFragmentedPartialScan(
+    TestContext* test) {
+    TempDirectory directory;
+    const std::filesystem::path order_path =
+        directory.path() / "mdl_6_33_0.csv";
+    const std::string complete = CsvLine(
+        kShenzhenOrderColumns,
+        ShenzhenOrderRow("7", "2", "101"));
+    const std::size_t initial_size = complete.size() / 2U;
+    WriteTable(
+        order_path,
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100")},
+        complete.substr(0U, initial_size));
+    WriteTable(
+        directory.path() / "mdl_6_36_0.csv",
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count == 1U) {
+                std::ofstream output(
+                    order_path,
+                    std::ios::binary | std::ios::app);
+                output << complete.substr(initial_size, 1U);
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    config.maximum_boundary_alignment_bytes =
+        static_cast<std::uint64_t>(initial_size + 1U);
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+            result.error ==
+                recovery::StartupReplayErrorV1::kResourceExhausted &&
+            result.boundary_alignment.order_scanned_bytes ==
+                initial_size + 1U &&
+            result.counts.shenzhen_orders == 1U,
+        "fragmented partial rows count reparsed bytes against the alignment scan budget");
+}
+
+void TestBoundaryAlignmentCapsCompleteRecords(TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "4", "103")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count == 1U) {
+                std::ofstream output(
+                    transaction_path,
+                    std::ios::binary | std::ios::app);
+                output << CsvLine(
+                    kShenzhenTransactionColumns,
+                    ShenzhenTransactionRow("7", "2", "101"));
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    config.maximum_boundary_alignment_records = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.error ==
+                recovery::StartupReplayErrorV1::kResourceExhausted &&
+            result.boundary_alignment.scanned_records == 1U &&
+            result.boundary_alignment.extension_records == 1U &&
+            !result.boundary_alignment.sealed &&
+            result.counts.shenzhen_orders == 1U &&
+            result.counts.shenzhen_transactions == 1U,
+        "an exact complete-record scan cap fails closed when the joint prefix still has another gap");
+}
+
+void TestBoundaryAlignmentRejectsMalformedExtension(
+    TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count == 1U) {
+                std::ofstream output(
+                    transaction_path,
+                    std::ios::binary | std::ios::app);
+                output << "malformed,extension\n";
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.error ==
+                recovery::StartupReplayErrorV1::
+                    kColumnCountMismatch &&
+            result.boundary_alignment.phase ==
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kTailAligning &&
+            !result.boundary_alignment.sealed &&
+            result.counts.shenzhen_transactions == 0U,
+        "a complete malformed row encountered while seeking a missing sequence fails immediately");
+}
+
+void TestBoundaryAlignmentRejectsDuplicateAndDecrease(
+    TestContext* test) {
+    {
+        TempDirectory directory;
+        WriteTable(
+            directory.path() / "mdl_6_33_0.csv",
+            kShenzhenOrderColumns,
+            {ShenzhenOrderRow("7", "1", "100"),
+             ShenzhenOrderRow("7", "3", "102")});
+        const std::filesystem::path transaction_path =
+            directory.path() / "mdl_6_36_0.csv";
+        WriteTable(
+            transaction_path,
+            kShenzhenTransactionColumns,
+            {});
+
+        DecodeSink sink;
+        sink.boundary_alignment_hook =
+            [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                    stats) {
+                if (stats.poll_count == 1U) {
+                    std::ofstream output(
+                        transaction_path,
+                        std::ios::binary | std::ios::app);
+                    output << CsvLine(
+                        kShenzhenTransactionColumns,
+                        ShenzhenTransactionRow("7", "3", "103"));
+                }
+            };
+        recovery::StartupReplayConfigV1 config;
+        config.directory = directory.path();
+        config.enabled_messages =
+            recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+            recovery::StartupReplayMessageSetV1::
+                kShenzhenTransaction;
+        config.boundary_alignment_timeout_ms = 100U;
+        config.boundary_alignment_initial_poll_ms = 1U;
+        config.boundary_alignment_maximum_poll_ms = 1U;
+        const auto result = Replay(std::move(config), &sink);
+        test->Expect(
+            result.error ==
+                    recovery::StartupReplayErrorV1::
+                        kSequenceDuplicate &&
+                !result.boundary_alignment.sealed &&
+                result.boundary_alignment.transaction_available_end >
+                    result.boundary_alignment
+                        .initial_transaction_cut,
+            "an extension row duplicating the opposite file's pending native sequence fails immediately");
+    }
+
+    {
+        TempDirectory directory;
+        WriteTable(
+            directory.path() / "mdl_6_33_0.csv",
+            kShenzhenOrderColumns,
+            {ShenzhenOrderRow("7", "3", "102")});
+        const std::filesystem::path transaction_path =
+            directory.path() / "mdl_6_36_0.csv";
+        WriteTable(
+            transaction_path,
+            kShenzhenTransactionColumns,
+            {ShenzhenTransactionRow("7", "1", "100")});
+
+        DecodeSink sink;
+        sink.boundary_alignment_hook =
+            [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                    stats) {
+                if (stats.poll_count == 1U) {
+                    std::ofstream output(
+                        transaction_path,
+                        std::ios::binary | std::ios::app);
+                    output << CsvLine(
+                        kShenzhenTransactionColumns,
+                        ShenzhenTransactionRow("7", "1", "101"));
+                }
+            };
+        recovery::StartupReplayConfigV1 config;
+        config.directory = directory.path();
+        config.enabled_messages =
+            recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+            recovery::StartupReplayMessageSetV1::
+                kShenzhenTransaction;
+        config.boundary_alignment_timeout_ms = 100U;
+        config.boundary_alignment_initial_poll_ms = 1U;
+        config.boundary_alignment_maximum_poll_ms = 1U;
+        const auto result = Replay(std::move(config), &sink);
+        test->Expect(
+            result.error ==
+                    recovery::StartupReplayErrorV1::
+                        kSequenceDuplicate &&
+                !result.boundary_alignment.sealed,
+            "an extension row decreasing within its physical file/channel fails immediately");
+    }
+}
+
+void TestBoundaryAlignmentRejectsSameInodeShrink(
+    TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    bool shrunk = false;
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count == 1U) {
+                std::error_code error;
+                std::filesystem::resize_file(
+                    transaction_path, 0U, error);
+                shrunk = !error;
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::
+            kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 100U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        shrunk &&
+            result.error ==
+                recovery::StartupReplayErrorV1::kIo &&
+            !result.boundary_alignment.sealed,
+        "same-inode truncate during alignment fails before the captured prefix can be reinterpreted");
+}
+
+void TestBoundaryAlignmentGrowthDoesNotResetDeadline(
+    TestContext* test) {
+    TempDirectory directory;
+    const std::filesystem::path order_path =
+        directory.path() / "mdl_6_33_0.csv";
+    WriteTable(
+        order_path,
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    WriteTable(
+        directory.path() / "mdl_6_36_0.csv",
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    std::uint64_t appended_rows = 0U;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.phase !=
+                    recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                        kTailAligning ||
+                stats.poll_count == 0U) {
+                return;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(3));
+            std::ofstream output(
+                order_path,
+                std::ios::binary | std::ios::app);
+            output << CsvLine(
+                kShenzhenOrderColumns,
+                ShenzhenOrderRow(
+                    "8",
+                    std::to_string(stats.poll_count),
+                    std::to_string(200U + stats.poll_count)));
+            ++appended_rows;
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 8U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.error ==
+                recovery::StartupReplayErrorV1::
+                    kBoundaryAlignmentTimeout &&
+            result.boundary_alignment.poll_count >= 1U &&
+            result.boundary_alignment.poll_count <= 3U &&
+            result.boundary_alignment.waited_ms >= 8U &&
+            appended_rows == result.boundary_alignment.poll_count,
+        "continuous unrelated Shenzhen file growth cannot renew the fixed alignment deadline");
+}
+
+void TestBoundaryAlignmentRejectsClosureAfterDeadline(
+    TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.phase !=
+                    recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                        kTailAligning ||
+                stats.poll_count == 0U) {
+                return;
+            }
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(10));
+            std::ofstream output(
+                transaction_path,
+                std::ios::binary | std::ios::app);
+            output << CsvLine(
+                kShenzhenTransactionColumns,
+                ShenzhenTransactionRow("7", "2", "101"));
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 5U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.error ==
+                recovery::StartupReplayErrorV1::
+                    kBoundaryAlignmentTimeout &&
+            result.boundary_alignment.poll_count == 1U &&
+            !result.boundary_alignment.sealed &&
+            result.counts.shenzhen_transactions == 0U,
+        "a missing row made visible only after the fixed alignment deadline cannot authorize seal");
+}
+
+void TestBoundaryAlignmentStopsPendingReleaseAtDeadline(
+    TestContext* test) {
+    TempDirectory directory;
+    WriteTable(
+        directory.path() / "mdl_6_33_0.csv",
+        kShenzhenOrderColumns,
+        {ShenzhenOrderRow("7", "1", "100"),
+         ShenzhenOrderRow("7", "3", "102"),
+         ShenzhenOrderRow("7", "4", "103")});
+    const std::filesystem::path transaction_path =
+        directory.path() / "mdl_6_36_0.csv";
+    WriteTable(
+        transaction_path,
+        kShenzhenTransactionColumns,
+        {});
+
+    DecodeSink sink;
+    bool alignment_publication = false;
+    sink.boundary_alignment_hook =
+        [&](const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                stats) {
+            if (stats.poll_count != 1U) {
+                return;
+            }
+            std::ofstream output(
+                transaction_path,
+                std::ios::binary | std::ios::app);
+            output << CsvLine(
+                kShenzhenTransactionColumns,
+                ShenzhenTransactionRow("7", "2", "101"));
+            alignment_publication = true;
+        };
+    sink.publish_hook =
+        [&](const recovery::StartupReplayPublicationV1&) {
+            if (alignment_publication) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(10));
+            }
+        };
+    recovery::StartupReplayConfigV1 config;
+    config.directory = directory.path();
+    config.enabled_messages =
+        recovery::StartupReplayMessageSetV1::kShenzhenOrder |
+        recovery::StartupReplayMessageSetV1::kShenzhenTransaction;
+    config.boundary_alignment_timeout_ms = 5U;
+    config.boundary_alignment_initial_poll_ms = 1U;
+    config.boundary_alignment_maximum_poll_ms = 1U;
+    const auto result = Replay(std::move(config), &sink);
+    test->Expect(
+        result.error ==
+                recovery::StartupReplayErrorV1::
+                    kBoundaryAlignmentTimeout &&
+            !result.boundary_alignment.sealed &&
+            result.counts.shenzhen_orders == 1U &&
+            result.counts.shenzhen_transactions == 1U &&
+            sink.publication_sequences ==
+                std::vector<std::uint64_t>({100U, 101U}),
+        "pending release checks the hard deadline after a slow closing publication and cannot seal late");
 }
 
 void TestRetainedDescriptorDoesNotFollowReplacement(
@@ -2015,9 +2832,12 @@ void TestRetainedDescriptorDoesNotFollowReplacement(
         replaced &&
             result.error ==
                 recovery::StartupReplayErrorV1::
-                    kIncompleteBoundary &&
+                    kBoundaryAlignmentTimeout &&
+            result.boundary_alignment.phase ==
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kTailAligning &&
             result.counts.shenzhen_orders == 1U,
-        "extension fstat/read stays on the retained descriptor and cannot follow a replacement path");
+        "alignment fstat/read stays on the retained descriptor and cannot follow a replacement path");
 }
 
 void TestRecoverySequenceIntegrity(TestContext* test) {
@@ -2126,7 +2946,21 @@ int main() {
     TestFenceOrderingAndSnapshotTailJoin(&test);
     TestShenzhenZeroChannelAndMergeBounds(&test);
     TestCooperativeCheckpointBounds(&test);
-    TestAppendedBoundaryClosesSharedSequence(&test);
+    TestMinimumBoundaryAlignmentClosesSharedSequence(&test);
+    TestBoundaryAlignmentRefreshesUntilClosure(&test);
+    TestBoundaryAlignmentDoesNotChaseFastTail(&test);
+    TestBoundaryAlignmentUsesClosingCandidatesBeforeMoreScan(&test);
+    TestBoundaryAlignmentCompletesInitialPartialRow(&test);
+    TestBoundaryAlignmentCompletesPartialWithoutSequenceGap(&test);
+    TestBoundaryAlignmentIgnoresPartialAfterClosure(&test);
+    TestBoundaryAlignmentCapsFragmentedPartialScan(&test);
+    TestBoundaryAlignmentCapsCompleteRecords(&test);
+    TestBoundaryAlignmentRejectsMalformedExtension(&test);
+    TestBoundaryAlignmentRejectsDuplicateAndDecrease(&test);
+    TestBoundaryAlignmentRejectsSameInodeShrink(&test);
+    TestBoundaryAlignmentGrowthDoesNotResetDeadline(&test);
+    TestBoundaryAlignmentRejectsClosureAfterDeadline(&test);
+    TestBoundaryAlignmentStopsPendingReleaseAtDeadline(&test);
     TestRetainedDescriptorDoesNotFollowReplacement(&test);
     TestRecoverySequenceIntegrity(&test);
     if (test.failures != 0) {

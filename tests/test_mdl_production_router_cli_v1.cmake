@@ -40,6 +40,12 @@ run_case(
     --help)
 
 run_case(
+    help_lists_boundary_alignment_timeout
+    0
+    "--intraday-recovery-boundary-alignment-ms N"
+    --help)
+
+run_case(
     help_lists_default_partial_event_socket
     0
     "partial mode derives <ipc>.events by default"
@@ -273,3 +279,13 @@ run_case(
     --intraday-recovery-mode online
     --intraday-recovery-journal-dir /tmp/l2flow-cli-journal
     --live-preview-ipc-socket /tmp/l2flow-cli-preview.sock)
+
+run_case(
+    invalid_boundary_alignment_timeout_is_rejected
+    2
+    "--intraday-recovery-boundary-alignment-ms must be 1..60000"
+    ${base}
+    --intraday-recovery-csv-dir /nonexistent/csv
+    --intraday-recovery-journal-dir /tmp/l2flow-cli-journal
+    --live-preview-ipc-socket /tmp/l2flow-cli-preview.sock
+    --intraday-recovery-boundary-alignment-ms 0)

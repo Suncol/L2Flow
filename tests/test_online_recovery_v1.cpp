@@ -166,12 +166,15 @@ public:
         std::vector<std::shared_ptr<TestMessage>> messages,
         std::vector<sdk::MessageKey> fences,
         std::function<bool()> after_fences = {},
-        std::size_t checkpoints_before_messages = 0U)
+        std::size_t checkpoints_before_messages = 0U,
+        std::function<void()> after_initial_alignment = {})
         : messages_(std::move(messages)),
           fences_(std::move(fences)),
           after_fences_(std::move(after_fences)),
           checkpoints_before_messages_(
-              checkpoints_before_messages) {}
+              checkpoints_before_messages),
+          after_initial_alignment_(
+              std::move(after_initial_alignment)) {}
 
     recovery::StartupReplayResultV1 Replay(
         recovery::StartupReplaySinkV1& sink) noexcept override {
@@ -189,6 +192,19 @@ public:
             result.error = recovery::StartupReplayErrorV1::kUnexpectedFailure;
             result.detail = "test journal capture failed";
             return result;
+        }
+        recovery::StartupReplayBoundaryAlignmentStatsV1 alignment{};
+        if (after_initial_alignment_) {
+            alignment.phase =
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kInitialReplay;
+            sink.ObserveBoundaryAlignment(alignment);
+            after_initial_alignment_();
+            alignment.phase =
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kTailAligning;
+            alignment.attempted = true;
+            sink.ObserveBoundaryAlignment(alignment);
         }
         for (std::size_t index = 0U;
              index < checkpoints_before_messages_;
@@ -220,6 +236,14 @@ public:
             }
             ++result.counts.shenzhen_transactions;
         }
+        if (after_initial_alignment_) {
+            alignment.phase =
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kSealed;
+            alignment.sealed = true;
+            sink.ObserveBoundaryAlignment(alignment);
+            result.boundary_alignment = alignment;
+        }
         return result;
     }
 
@@ -232,6 +256,97 @@ private:
     std::vector<sdk::MessageKey> fences_;
     std::function<bool()> after_fences_;
     std::size_t checkpoints_before_messages_ = 0U;
+    std::function<void()> after_initial_alignment_;
+};
+
+class DeadlineProbeReplaySource final
+    : public recovery::StartupReplaySourceV1 {
+public:
+    enum class Mode : std::uint8_t {
+        kCheckpoint = 0U,
+        kPublish,
+    };
+
+    DeadlineProbeReplaySource(
+        Mode mode,
+        std::vector<sdk::MessageKey> fences)
+        : mode_(mode),
+          fences_(std::move(fences)),
+          message_(std::make_shared<TestMessage>(
+              100U, 100U, 100'000U)) {}
+
+    recovery::StartupReplayResultV1 Replay(
+        recovery::StartupReplaySinkV1& sink) noexcept override {
+        recovery::StartupReplayResultV1 result{};
+        for (const sdk::MessageKey& key : fences_) {
+            std::string detail;
+            if (!sink.CaptureTupleFence(key, &detail)) {
+                result.error =
+                    recovery::StartupReplayErrorV1::kSinkRejected;
+                result.detail = std::move(detail);
+                return result;
+            }
+        }
+        recovery::StartupReplayBoundaryAlignmentStatsV1 alignment{};
+        alignment.phase =
+            recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                kTailAligning;
+        alignment.attempted = true;
+        sink.ObserveBoundaryAlignment(alignment);
+
+        const auto started = std::chrono::steady_clock::now();
+        const auto deadline = started + 10ms;
+        std::string detail;
+        recovery::StartupReplaySinkCallResultV1 call =
+            recovery::StartupReplaySinkCallResultV1::kRejected;
+        if (mode_ == Mode::kCheckpoint) {
+            call = sink.CooperativeCheckpointUntil(
+                deadline, &detail);
+        } else {
+            recovery::StartupReplayPublicationV1 publication{};
+            publication.message = message_.get();
+            publication.key = sdk::MessageKey{6U, 101U, 36U};
+            publication.csv_sequence = 100U;
+            call = sink.PublishUntil(
+                publication, deadline, &detail);
+        }
+        const auto elapsed = std::chrono::duration_cast<
+            std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started);
+        call_result.store(call, std::memory_order_release);
+        elapsed_ns.store(
+            static_cast<std::uint64_t>(
+                std::max<std::int64_t>(0, elapsed.count())),
+            std::memory_order_release);
+        const auto* online_sink = dynamic_cast<
+            const recovery::OnlineRecoveryHandoffV1*>(&sink);
+        sink_error_before_return.store(
+            online_sink == nullptr
+                ? recovery::OnlineRecoveryErrorV1::
+                      kUnexpectedFailure
+                : online_sink->Snapshot().error,
+            std::memory_order_release);
+        result.boundary_alignment = alignment;
+        result.error =
+            call == recovery::StartupReplaySinkCallResultV1::kDeadline
+                ? recovery::StartupReplayErrorV1::
+                      kBoundaryAlignmentTimeout
+                : recovery::StartupReplayErrorV1::kUnexpectedFailure;
+        result.detail = detail;
+        return result;
+    }
+
+    std::atomic<recovery::StartupReplaySinkCallResultV1> call_result{
+        recovery::StartupReplaySinkCallResultV1::kRejected};
+    std::atomic<std::uint64_t> elapsed_ns{0U};
+    std::atomic<recovery::OnlineRecoveryErrorV1>
+        sink_error_before_return{
+            recovery::OnlineRecoveryErrorV1::kUnexpectedFailure};
+
+private:
+    Mode mode_;
+    std::vector<sdk::MessageKey> fences_;
+    std::shared_ptr<TestMessage> message_;
 };
 
 class BlockingAppliedSink final
@@ -760,6 +875,234 @@ void TestPrePromotionCandidateCatchUpAndPhases(TestContext* test) {
             handoff->Snapshot().phase ==
                 recovery::OnlineRecoveryPhaseV1::kPromoted,
         "promotion explicitly unlocks the permanent journal tail");
+}
+
+void TestCsvAlignmentPhaseForwarding(TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(18U),
+        "create CSV alignment phase forwarding fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+
+    std::atomic<bool> initial_observed{false};
+    std::atomic<bool> release_replay{false};
+    auto source = std::make_shared<TestReplaySource>(
+        std::vector<std::shared_ptr<TestMessage>>{},
+        AllFences(),
+        std::function<bool()>{},
+        0U,
+        [&] {
+            initial_observed.store(true, std::memory_order_release);
+            while (!release_replay.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+    auto handoff = CreateHandoff(
+        test,
+        fixture.Config(source),
+        "create CSV alignment phase forwarding handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+
+    recovery::OnlineRecoveryCandidateV1 candidate{};
+    std::thread worker([&] {
+        candidate = handoff->PrepareInitialCandidate(
+            std::chrono::steady_clock::now() + 3s);
+    });
+    const bool observed = WaitUntil([&] {
+        return initial_observed.load(std::memory_order_acquire);
+    });
+    const recovery::OnlineRecoverySnapshotV1 during =
+        handoff->Snapshot();
+    release_replay.store(true, std::memory_order_release);
+    worker.join();
+    const recovery::OnlineRecoverySnapshotV1 after =
+        handoff->Snapshot();
+
+    test->Expect(
+        observed &&
+            during.csv_boundary_alignment.phase ==
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kInitialReplay &&
+            candidate.ready() &&
+            after.csv_boundary_alignment.phase ==
+                recovery::StartupReplayBoundaryAlignmentPhaseV1::
+                    kSealed &&
+            after.csv_boundary_alignment.attempted &&
+            after.csv_boundary_alignment.sealed,
+        "online recovery snapshot forwards live CSV alignment phase transitions");
+}
+
+void TestCsvAlignmentDeadlineBoundsGovernorWaits(
+    TestContext* test) {
+    const std::array<DeadlineProbeReplaySource::Mode, 2U> modes{
+        DeadlineProbeReplaySource::Mode::kCheckpoint,
+        DeadlineProbeReplaySource::Mode::kPublish};
+    std::uint8_t identity = 19U;
+    for (const DeadlineProbeReplaySource::Mode mode : modes) {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(identity++),
+            "create deadline-aware CSV governor fixture");
+        if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+            continue;
+        }
+        auto source = std::make_shared<DeadlineProbeReplaySource>(
+            mode, AllFences());
+        auto config = fixture.Config(source);
+        config.preview_live_status = [] {
+            return HealthyLiveStatus(100U, 0U);
+        };
+        config.pressure_poll_interval = 1ms;
+        auto handoff = CreateHandoff(
+            test,
+            std::move(config),
+            "create deadline-aware CSV governor handoff");
+        if (handoff == nullptr) {
+            continue;
+        }
+
+        const recovery::OnlineRecoveryCandidateV1 candidate =
+            handoff->PrepareInitialCandidate(
+                std::chrono::steady_clock::now() + 2s);
+        const recovery::OnlineRecoverySnapshotV1 snapshot =
+            handoff->Snapshot();
+        const std::uint64_t elapsed =
+            source->elapsed_ns.load(std::memory_order_acquire);
+        test->Expect(
+            !candidate.ready() &&
+                source->call_result.load(std::memory_order_acquire) ==
+                    recovery::StartupReplaySinkCallResultV1::
+                        kDeadline &&
+                source->sink_error_before_return.load(
+                    std::memory_order_acquire) ==
+                    recovery::OnlineRecoveryErrorV1::kNone &&
+                elapsed >= 1'000'000U && elapsed < 500'000'000U &&
+                snapshot.error ==
+                    recovery::OnlineRecoveryErrorV1::
+                        kReplayFailed &&
+                snapshot.csv_boundary_alignment.phase ==
+                    recovery::
+                        StartupReplayBoundaryAlignmentPhaseV1::
+                            kTailAligning,
+            mode == DeadlineProbeReplaySource::Mode::kCheckpoint
+                ? "alignment deadline bounds a persistent-pressure parser checkpoint"
+                : "alignment deadline bounds a persistent-pressure CSV publication");
+    }
+}
+
+void TestCsvAlignmentDeadlineAfterSlowSampler(
+    TestContext* test) {
+    const std::array<DeadlineProbeReplaySource::Mode, 2U> modes{
+        DeadlineProbeReplaySource::Mode::kCheckpoint,
+        DeadlineProbeReplaySource::Mode::kPublish};
+    std::uint8_t identity = 77U;
+    for (const DeadlineProbeReplaySource::Mode mode : modes) {
+        OnlineFixture fixture;
+        test->Expect(
+            fixture.Create(identity++),
+            "create slow-sampler deadline fixture");
+        if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+            continue;
+        }
+        auto source = std::make_shared<DeadlineProbeReplaySource>(
+            mode, AllFences());
+        auto config = fixture.Config(source);
+        config.preview_live_status = [] {
+            std::this_thread::sleep_for(20ms);
+            return HealthyLiveStatus(0U, 0U);
+        };
+        auto handoff = CreateHandoff(
+            test,
+            std::move(config),
+            "create slow-sampler deadline handoff");
+        if (handoff == nullptr) {
+            continue;
+        }
+
+        const recovery::OnlineRecoveryCandidateV1 candidate =
+            handoff->PrepareInitialCandidate(
+                std::chrono::steady_clock::now() + 2s);
+        test->Expect(
+            !candidate.ready() &&
+                source->call_result.load(std::memory_order_acquire) ==
+                    recovery::StartupReplaySinkCallResultV1::
+                        kDeadline &&
+                source->sink_error_before_return.load(
+                    std::memory_order_acquire) ==
+                    recovery::OnlineRecoveryErrorV1::kNone &&
+                source->elapsed_ns.load(std::memory_order_acquire) >=
+                    10'000'000U,
+            mode == DeadlineProbeReplaySource::Mode::kCheckpoint
+                ? "parser checkpoint rejects a slow sampler that crosses its absolute deadline"
+                : "CSV publication rejects a slow sampler that crosses its absolute deadline");
+    }
+}
+
+void TestCsvAlignmentDeadlineContextIsReentrant(
+    TestContext* test) {
+    OnlineFixture fixture;
+    test->Expect(
+        fixture.Create(79U),
+        "create reentrant deadline-context fixture");
+    if (fixture.shadow == nullptr || fixture.journal == nullptr) {
+        return;
+    }
+    auto source = std::make_shared<DeadlineProbeReplaySource>(
+        DeadlineProbeReplaySource::Mode::kCheckpoint,
+        AllFences());
+    auto config = fixture.Config(source);
+    recovery::OnlineRecoveryHandoffV1* callback_handoff = nullptr;
+    std::atomic<bool> reentered{false};
+    std::atomic<bool> nested_call_active{false};
+    std::atomic<recovery::StartupReplaySinkCallResultV1>
+        nested_result{
+            recovery::StartupReplaySinkCallResultV1::kRejected};
+    config.preview_live_status = [&] {
+        if (!reentered.exchange(true, std::memory_order_acq_rel)) {
+            nested_call_active.store(true, std::memory_order_release);
+            nested_result.store(
+                callback_handoff == nullptr
+                    ? recovery::StartupReplaySinkCallResultV1::
+                          kRejected
+                    : callback_handoff->CooperativeCheckpointUntil(
+                          std::chrono::steady_clock::now() + 50ms,
+                          nullptr),
+                std::memory_order_release);
+            nested_call_active.store(false, std::memory_order_release);
+            return HealthyLiveStatus(100U, 0U);
+        }
+        return nested_call_active.load(std::memory_order_acquire)
+                   ? HealthyLiveStatus(0U, 0U)
+                   : HealthyLiveStatus(100U, 0U);
+    };
+    config.pressure_poll_interval = 1ms;
+    auto handoff = CreateHandoff(
+        test,
+        std::move(config),
+        "create reentrant deadline-context handoff");
+    if (handoff == nullptr) {
+        return;
+    }
+    callback_handoff = handoff.get();
+
+    const recovery::OnlineRecoveryCandidateV1 candidate =
+        handoff->PrepareInitialCandidate(
+            std::chrono::steady_clock::now() + 2s);
+    test->Expect(
+        !candidate.ready() &&
+            reentered.load(std::memory_order_acquire) &&
+            nested_result.load(std::memory_order_acquire) ==
+                recovery::StartupReplaySinkCallResultV1::kAccepted &&
+            source->call_result.load(std::memory_order_acquire) ==
+                recovery::StartupReplaySinkCallResultV1::kDeadline &&
+            source->sink_error_before_return.load(
+                std::memory_order_acquire) ==
+                recovery::OnlineRecoveryErrorV1::kNone,
+        "nested deadline-aware checkpoint cannot overwrite the outer alignment deadline context");
 }
 
 void TestEarlyFreezeLeavesDurableSuffixForPromotedTail(
@@ -2079,6 +2422,10 @@ int main() {
     TestContext test;
     TestPromotionBoundaryAndTail(&test);
     TestPrePromotionCandidateCatchUpAndPhases(&test);
+    TestCsvAlignmentPhaseForwarding(&test);
+    TestCsvAlignmentDeadlineBoundsGovernorWaits(&test);
+    TestCsvAlignmentDeadlineAfterSlowSampler(&test);
+    TestCsvAlignmentDeadlineContextIsReentrant(&test);
     TestEarlyFreezeLeavesDurableSuffixForPromotedTail(&test);
     TestPrePromotionCancellationWinsJournalEnd(&test);
     TestCandidateAdmissionUsesFixedWarmupDeadline(&test);

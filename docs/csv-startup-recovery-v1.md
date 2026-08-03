@@ -65,7 +65,9 @@ live coverage boundary。只有已 materialize 的 bar 严格满足
 4. 在本次启动前，目录没有发生未被发现的数据丢失；
 5. 到各 tuple 的 fence/capture 时，writer 已追平 fence 前属于同一订阅的
    已发布消息；唯一允许正在提交的文件边界是一个尚未以 LF/CRLF 完成的
-   末行，该边界必须在一次有界 extension 中完整提交，否则恢复失败。
+   末行。header/snapshot 边界必须在一次有限 extension 中提交；深圳双文件
+   边界必须在配置的 alignment hard deadline 内形成联合连续前缀，否则恢复
+   失败。
 
 程序会严格验证格式、关联、原生逐笔连续性和 CSV/live 接缝，但不能从文件
 内容单独证明上述外部事实。特别是，CSV `SeqNo` 从 1 开始并不等价于“从
@@ -111,8 +113,9 @@ journal 分配 global/tuple callback serial 的同一 mutex 下取 fence。随�
 另一 inode：
 
 - 只有 LF 或 CRLF 结束的完整 record 才可发布；
-- 初始 cut 尾端尚未提交行终止符的半行会触发一次有界 extension；若仍不
-  完整则以 `kIncompleteBoundary` 失败，绝不把半行交给实时接管；
+- 初始 cut 尾端尚未提交行终止符的半行绝不直接发布；header、snapshot
+  关系仍使用一次有限 extension，深圳 `6.33/6.36` 数据行则进入下述
+  `TAIL_ALIGNING` 有界等待；
 - 除下述显式 extension round 外，取得 prefix 之后追加的字节不进入本次
   CSV 回放；
 - 打开的对象必须是 regular file；文件缺失、打开/读取失败、读取时可见的
@@ -127,23 +130,69 @@ inode。固定描述符能防止路径换名/rotation 使本次读取跳到另�
 八个文件不能在同一个系统调用中原子取快照。快照 tuple 在 fence 后先捕获
 子表、最后捕获 root，让 root prefix 成为该 tuple 的主 cut；即便如此，
 主表/子表或深圳 `6.33`/`6.36` 的初始 prefix 仍可能恰好切在同一条逻辑
-关系两侧。初始解析遇到半行或需要闭合 root/child、深圳共享原生序号关系
-时，才对**同一个已打开描述符**执行至多一次有界的再次 `fstat`/读取。
-一旦某文件选中了这个有限 extension，它在该次 `fstat` 长度内的所有完整
-record 都必须消费并校验，不能在第一个 gap 刚闭合时提前停止：
+关系两侧。header、独立上海逐笔和 snapshot root/child 保留原有的一次有限
+extension 语义：一旦选中该次 `fstat` 长度，其中完整 record 都必须消费并
+校验。
 
 - 独立上海逐笔与 snapshot root 的 extension 完整行继续重建并发布；
 - snapshot child 的 extension 行先用于补齐 final root cut 内的关联；严格
   大于最终 root `SeqNo` 的 child 行仍须完整解析、检查顺序与重复后才裁掉；
-- 深圳 `6.33`/`6.36` 会在同一轮扩展两份 retained descriptor，并把两个
-  有限前缀全部归并；gap 提前闭合不结束扫描。
+- 深圳 `6.33/6.36` 不再把两次独立 `fstat` 的当前大小当作必须读完的最终
+  cut。它区分 `initial_cut`、`available_end` 与 `sealed_cut`，并在固定 hard
+  deadline 内重复查看 retained descriptor 的可用末端；文件增长不会重置
+  deadline；
+- `TAIL_ALIGNING` 每次只提交完整行，并在所有 initial joint
+  `ApplSeqNum` gap 与 initial-cut 半行义务首次同时闭合时立即 seal。另一文件
+  已解析但未选中的 read-ahead 行仍推进仅用于校验物理文件单调性的内部 scan
+  frontier，但不发布、不推进 published tuple cutoff/channel `next_expected`、
+  不生成 overlap fingerprint，也不推进 sealed cut；
+- 半行起点在 initial cut 之前时必须等待 LF；闭合点之后的新半行属于 live
+  suffix，不阻止 seal。schema 错误、重复/倒退、文件缩短、资源上限或 sink
+  不健康仍立即 fail-close；目标缺口在 deadline 前未出现则报告
+  `boundary_alignment_timeout`，而不是把当前可用 EOF 描述成永久丢包。
 
-进入 extension 的每条完整 record 都须通过 schema、`SeqNo`、join 和原生
-顺序校验，并在属于最终逻辑 cut 时实际进入重建消息/Store；extension
-不是未经校验的“存在性提示”。extension 末端仍是半行、initial prefix
-内部缺项、静态孤儿或最终原生 gap 都会失败。每个文件最终选定的有限 cut
-（未扩展时为 initial cut，扩展时为再次 `fstat` 的 cut）之后产生的增长才
-属于 live 侧；这依赖第 6 节的永久 cutoff guard 和同一会话的运维保证。
+深圳 alignment 的默认库配置只做一次立即 refresh；production online recovery
+默认等待 10 秒，可用 `--intraday-recovery-boundary-alignment-ms` 在 1..60000
+毫秒内调整，且仍受总 warmup deadline 限制。poll 从 2ms 指数退避到 20ms。
+等待、`fstat` 和 sleep 只发生在 recovery thread；SDK callback、preview 与
+journal capture 不等待 alignment，也不执行磁盘同步。alignment 的绝对期限还会
+传入 parser checkpoint、FAST-aware pressure governor 和 shadow admission；持续
+背压不能让一次 10 秒 alignment 偷用剩余的总 warmup 预算。
+
+被选中的 extension record 仍须通过 schema、`SeqNo` 与原生顺序校验，并在
+属于 sealed prefix 时实际进入重建消息/Store；extension 不是未经校验的
+“存在性提示”。sealed cut 之后的全部字节（seal 时已经存在或随后追加）属于
+live journal 侧，并继续通过
+第 6 节的永久 cutoff guard 验证接缝。
+
+recovery snapshot 与 production final log 暴露
+`INITIAL_REPLAY|TAIL_ALIGNING|SEALED` phase、等待时间/poll、实际扫描
+record 与 parser-consumed byte（包含 provisional read-ahead 与半行重解析）、
+纳入 sealed prefix 的
+extension record/byte、pending gap、mandatory partial 以及两文件
+initial/sealed/available cut。扫描成本和 sealed extension 分开计量；前者受独立
+record/byte hard cap 约束，避免碎片化 append 反复从行首解析而无限消耗冷路径
+CPU。底层 `pread` 也受单次剩余 parser budget 限制，但为了顺序解析会按最多
+64 KiB 缓冲预取；因此 byte 指标不是精确的 page-cache/I/O 计数，seal 时每个
+retained descriptor 最多可能留有一个未消费的预取块。不同 channel 的
+`ApplSeqNum` 不可比较；`representative_missing_*` 固定表示当前有 pending 的
+最小 `ChannelNo` 及其缺失 frontier，只是稳定的诊断代表，不表示跨 channel 的
+等待时间顺序。
+
+`maximum_file_bytes` 仍是 retained physical file 的防御性上限，不只是最终
+sealed cut 上限；alignment 期间文件物理大小越过该值会 fail-close，即使多出的
+fast suffix 最终可能不被选择。production 当前保持默认 unlimited，实际有界的
+冷路径成本由 alignment scan/selected record/byte cap 控制。
+
+当前实现是无 feeder 协议时的安全 reader fallback，不是 committed barrier
+证明。若需要严格、可证明的固定边界，feeder 必须让 marker 穿过其完整有序
+dispatcher、全部 CSV writer queue 和同一 subscriber callback stream，在
+各 writer 完成 marker 前完整行后 ACK 精确 inode/byte cut，并在本地 journal
+对 callback marker 取 immutable fence 后原子发布 manifest。仓库中没有这些
+feeder writer/dispatcher，不能以普通 `fstat` 或 side-channel ACK 冒充该
+证明；任何等待超时仍只能拒绝 promotion，不能安全跳过缺项。
+完整的 producer/marker/manifest/consumer 契约见
+[`feeder-online-recovery-barrier-v1.md`](feeder-online-recovery-barrier-v1.md)。
 
 CSV 按 UTF-8 与 RFC 4180 字段规则解析。header 必须存在、字段唯一，并与
 对应消息的受支持 schema 精确匹配；错误列数、非法引号、非法 UTF-8 或未知
@@ -261,6 +310,7 @@ online recovery 使用以下状态机：
   -> preview backlog < 64 且所有依赖健康后开放 LIVE_PARTIAL
   -> release recovery thread
   -> 逐 tuple 在线性化点记录 journal tuple fence，并固定 CSV byte prefix
+  -> 深圳初始接缝若未闭合则在 recovery thread 执行 TAIL_ALIGNING
   -> CSV 只经 shadow admission/decoder/History/KLine/Factor/CERTIFIED 回放
   -> 用 journal 中的 SeqNo + 语义 fingerprint/cutoff 验证并去重接缝
   -> CSV 完成后固定初始候选 journal frontier B0
@@ -436,7 +486,8 @@ promotion 日志/健康探针重试 recovered `GET_SESSION`，不能等待 previ
 - 必需文件缺失、别名冲突、I/O 或固定 prefix 失败；
 - UTF-8、CSV、header、列数、时间、定点数字或消息布局错误；
 - 快照主/子表重复、孤儿、缺侧或关联字段不一致；
-- 上海 `BizIndex` 或深圳联合 `ApplSeqNum` 重复/缺口；
+- 上海 `BizIndex` 或深圳联合 `ApplSeqNum` 重复，或深圳接缝在固定 deadline
+  内仍未闭合（`boundary_alignment_timeout`）；
 - 恢复协议要求的 tuple-local `SeqNo` 为零、重复、倒退，或 CSV/live
   identity domain 不兼容；
 - CSV/live 缺少应有 overlap，或同一 overlap 身份的 payload 冲突；
@@ -456,11 +507,15 @@ promotion 日志/健康探针重试 recovered `GET_SESSION`，不能等待 previ
   或 promotion completion timestamp 失败；
 - 正常生产路径中的 catalog miss、跨交易日或下游应用失败。
 
-任一错误都使 Pipeline 创建/恢复失败并关闭本次 session；online 在失败被
-主循环观察前可能短暂仍能查询其明确标记的 partial preview，但 recovered
-mapping 不会因此进入完整 ACTIVE。程序不会把部分 Store 标记为“已从开盘
-恢复”，也不会在错误后跳过记录继续实时运行。诊断应包含错误类别，并在
-CSV 错误可定位时包含文件和行号。
+任何 recovery、preview、journal、shadow 或 promotion 终态错误都会使本次
+进程 fail-close 并退出；promotion 前不会开放 recovered/CERTIFIED，也不会把
+部分 shadow Store 标记为“已从开盘恢复”或跳过缺项继续。若以后要求恢复失败
+后让 `LIVE_PARTIAL` 长期独立运行，必须先实现 callback capture gate、journal
+安全脱离以及 shadow/CERTIFIED 资源回收，不能只忽略 recovery error。
+
+诊断包含错误类别，
+CSV/alignment 错误可定位时还包含文件、行号、固定 waited/poll 计数、代表缺失
+channel/`ApplSeqNum`、两侧 initial/sealed/available byte cut 和 extension bytes。
 
 ## 9. 三种完整性不能混为一谈
 
@@ -510,9 +565,10 @@ CERTIFIED 且 prefix barrier/control 成功时，
 3. 客户端自开盘前已开始保存与本程序相同的五类生产订阅，期间没有重启、
    换目录、清空或 `SeqNo` identity reset；盘中 SDK 订阅与这些文件保持
    同一 identity domain、消息集合和无损 callback 顺序；writer 在各
-   capture 点已追平 fence 前消息，若初始末行未完成，则能在一次 bounded
-   extension 中完成它；程序不会把 unresolved partial 或已选 extension
-   中的完整后缀交给 live；
+   capture 点已追平 fence 前消息；若深圳双文件存在短暂跨 writer 可见偏差，
+   它必须能在 boundary alignment hard deadline 内闭合。程序不会把
+   unresolved initial partial 交给 live，也不会把闭合点之后的 read-ahead
+   行误纳入 CSV sealed prefix；
 4. 恢复期间这些已打开文件保持 append-only，不原位改写、truncate/rewrite
    或复用 inode；
 5. Store record/内存上限足以容纳完整前缀，并同时考虑 preview partial
@@ -544,12 +600,16 @@ build/mdl-production-router \
   --intraday-store-max-records 100000000 \
   --intraday-store-memory-gib 64 \
   --intraday-recovery-csv-dir /absolute/path/to/20260730 \
-  --intraday-recovery-journal-dir /absolute/path/to/empty-journal
+  --intraday-recovery-journal-dir /absolute/path/to/empty-journal \
+  --intraday-recovery-boundary-alignment-ms 10000
 ```
 
 总 warmup 和 shadow/replay 单条 admission 等待分别使用
 `--intraday-recovery-warmup-seconds`（默认 1,800）与
 `--intraday-recovery-backpressure-seconds`（默认 30）。
+深圳双文件接缝有界等待使用
+`--intraday-recovery-boundary-alignment-ms`（默认 10,000）；它不会因文件
+继续增长而延长，也不能超过总 warmup deadline。
 CSV、candidate journal wait、applied wait、probe、cut 和 final commit 的所有
 可取消等待共享同一个 steady-clock absolute warmup deadline，candidate retry
 不会重置预算。这个 deadline 不是对任意用户 calculator 或 lifecycle syscall 的
@@ -661,7 +721,12 @@ commit 并按 global serial 消费到 `B0`；若 native/Event probe 尚不完整
 CSV fingerprint 每 tuple 只保留数值最大的 262,144 个 `SequenceID`（当前
 生产 online 入口没有单独的 retention CLI）；全天只另存常数大小 maximum
 cutoff。若 fence 前身份已因容量淘汰，恢复选择 `overlap_missing` fail-close，
-不会猜测它等同于 CSV。每个候选先等待 shadow applied frontier，再插入
+不会猜测它等同于 CSV。production 还把 alignment 的 aggregate selected/scanned
+record cap 保守绑定到同一个 262,144，避免一次最小闭包自身就必然超过单 tuple
+retention；但 fence 与两个 initial cut 之间的外部 writer 差以及 tuple 分布仍
+不能由这个本地 cap 证明，极端大 overlap 仍可能安全地以 `overlap_missing`
+失败。应按实测 writer 可见偏差评估 retention 内存，严格消除该歧义仍依赖
+feeder manifest barrier。每个候选先等待 shadow applied frontier，再插入
 CERTIFIED/Event FIFO probe；只有到达 P 后才执行 parked generation barrier。
 P 本身是 journal callback frontier，而
 `promotion_shadow_ingress_frontier` 只统计真正进入 A 股 shadow pipeline 的
@@ -728,7 +793,12 @@ gap 可能让 parser 持续向 pending map 插入而尚未产生任何 `Publish`
 record 也可能在单行内增长到 MiB。因此 parser 另外在每 256 个完整 logical
 record、以及每次新的 64 KiB `pread` 前调用同一 governor。该 checkpoint 不
 伪造 bulk publication 计数，并保留准确 source file/record-start line；持续
-压力、cancel 或 warmup deadline 会在下一有界 checkpoint fail-close。
+压力、cancel 或 warmup deadline 会在下一有界 checkpoint fail-close。进入
+`TAIL_ALIGNING` 后，checkpoint、CSV `Publish` 的 governor wait 和 shadow
+admission 使用更早的 alignment absolute deadline；deadline 返回给 CSV reader
+并统一归类为 `boundary_alignment_timeout`，不会先污染 handoff 为另一种终态错误。
+外部自定义 sink 若在自己的非协作计算中永久阻塞仍无法被 C++ 虚调用强制抢占，
+必须自行实现 deadline-aware variant 的契约。
 
 每条 journal record 不再无条件执行第二次 semantic decode。只有 identity
 确实命中 retained CSV overlap 时才计算 semantic digest；已经可证明进入 live
@@ -738,8 +808,10 @@ suffix 的 record 直接交给 shadow 的正常 decoder。snapshot 中的
 计数用于区分正确性工作和调度动作。
 
 这里仍是应用层 cooperative governor，不是严格 CPU/IO scheduler。一个正在
-执行的 `pread`、page fault、allocator 或首 generation seal 不能在任意指令处
-抢占；当前也没有 replay CPU quota/affinity CLI。若生产验收要求在整机过载、
+执行的 `pread`、page fault、allocator、外部 shadow ingress serialization 或首
+generation seal 不能在任意指令处抢占；deadline-aware sink 会在这些调用返回后
+再次检查绝对期限并拒绝 seal/promotion，但不承诺在任意机器指令处强制中断。
+当前也没有 replay CPU quota/affinity CLI。若生产验收要求在整机过载、
 共享磁盘拥塞下仍给出硬 p999 上界，必须再用独立 CPU/NUMA、I/O cgroup 或
 进程级资源隔离，并在目标机器按下节 benchmark 重复验收。
 
@@ -757,14 +829,15 @@ suffix 的 record 直接交给 shadow 的正常 decoder。snapshot 中的
 固定 CPU 后分别运行：
 
 ```bash
-taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode ordinary
-taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode parked
-taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode active
+taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode ordinary --parallel-decoder-workers 4
+taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode parked --parallel-decoder-workers 4
+taskset -c 0-31 ./build/benchmark_online_recovery_fast_v1 --mode active --parallel-decoder-workers 4
 ```
 
 验收必须交错重复运行，而不是对单次 p999 设 CTest 阈值；同时检查
-`history_records == history_expected`、`promotion_overlap_samples == samples`
-（active）、零丢序/错误状态、recovery duration/throughput 和全部 governor
+`history_records == history_expected`、active 的
+`promotion_overlap_samples > 0`（并记录实际 overlap 比例）、零丢序/错误状态、
+recovery duration/throughput 和全部 governor
 telemetry。普通 FAST/CERTIFIED 则继续用
 `benchmark_realtime_certified_v1 --all`，从而把“online bulk 的增量影响”和
 “无需 online recovery 的常规路径”分开判断。

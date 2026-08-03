@@ -7,6 +7,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -116,6 +118,41 @@ struct InputFile final {
 struct CsvRecord final {
     std::vector<std::string> fields;
     std::uint64_t line = 0U;
+    std::uint64_t start_offset = 0U;
+    std::uint64_t end_offset = 0U;
+};
+
+class CsvRecordScanAccount final {
+public:
+    CsvRecordScanAccount(
+        bool enabled,
+        const std::size_t* record_bytes,
+        std::uint64_t* total_bytes) noexcept
+        : enabled_(enabled),
+          record_bytes_(record_bytes),
+          total_bytes_(total_bytes) {}
+
+    CsvRecordScanAccount(const CsvRecordScanAccount&) = delete;
+    CsvRecordScanAccount& operator=(const CsvRecordScanAccount&) = delete;
+
+    ~CsvRecordScanAccount() noexcept {
+        if (!enabled_ || record_bytes_ == nullptr ||
+            total_bytes_ == nullptr) {
+            return;
+        }
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(*record_bytes_);
+        *total_bytes_ =
+            bytes > std::numeric_limits<std::uint64_t>::max() -
+                        *total_bytes_
+                ? std::numeric_limits<std::uint64_t>::max()
+                : *total_bytes_ + bytes;
+    }
+
+private:
+    bool enabled_;
+    const std::size_t* record_bytes_;
+    std::uint64_t* total_bytes_;
 };
 
 struct TransparentStringHash final {
@@ -223,17 +260,25 @@ public:
         return false;
     }
 
-    bool ObserveCompleteRecord(
+    StartupReplaySinkCallResultV1 ObserveCompleteRecord(
         const std::filesystem::path& file,
-        std::uint64_t line) {
+        std::uint64_t line,
+        std::optional<std::chrono::steady_clock::time_point>
+            deadline = std::nullopt) {
         ++records_since_cooperative_checkpoint_;
         if (records_since_cooperative_checkpoint_ <
             kStartupReplayCooperativeCheckpointRecordsV1) {
-            return true;
+            return StartupReplaySinkCallResultV1::kAccepted;
         }
         records_since_cooperative_checkpoint_ = 0U;
 
-        return CooperativeCheckpoint(file, line);
+        if (deadline.has_value()) {
+            return CooperativeCheckpointUntil(
+                file, line, *deadline);
+        }
+        return CooperativeCheckpoint(file, line)
+                   ? StartupReplaySinkCallResultV1::kAccepted
+                   : StartupReplaySinkCallResultV1::kRejected;
     }
 
     bool CooperativeCheckpoint(
@@ -250,6 +295,27 @@ public:
             detail.empty()
                 ? "startup replay cooperative checkpoint was rejected"
                 : std::move(detail));
+    }
+
+    StartupReplaySinkCallResultV1 CooperativeCheckpointUntil(
+        const std::filesystem::path& file,
+        std::uint64_t line,
+        std::chrono::steady_clock::time_point deadline) {
+        std::string detail;
+        const StartupReplaySinkCallResultV1 checkpoint_result =
+            sink.CooperativeCheckpointUntil(deadline, &detail);
+        if (checkpoint_result !=
+            StartupReplaySinkCallResultV1::kRejected) {
+            return checkpoint_result;
+        }
+        static_cast<void>(Fail(
+            StartupReplayErrorV1::kSinkRejected,
+            file,
+            line,
+            detail.empty()
+                ? "startup replay cooperative checkpoint was rejected"
+                : std::move(detail)));
+        return StartupReplaySinkCallResultV1::kRejected;
     }
 
     const StartupReplayConfigV1& config;
@@ -287,7 +353,11 @@ public:
                state_->result.error == StartupReplayErrorV1::kNone;
     }
 
-    bool Next(CsvRecord* output, bool* available) {
+    bool Next(
+        CsvRecord* output,
+        bool* available,
+        std::size_t maximum_scan_bytes =
+            std::numeric_limits<std::size_t>::max()) {
         if (output == nullptr || available == nullptr) {
             return state_->Fail(
                 StartupReplayErrorV1::kUnexpectedFailure,
@@ -298,6 +368,8 @@ public:
         *available = false;
         output->fields.clear();
         output->line = physical_line_;
+        output->start_offset = consumed_offset_;
+        output->end_offset = consumed_offset_;
         if (remaining_ == 0U) {
             return true;
         }
@@ -313,6 +385,12 @@ public:
         FieldState field_state = FieldState::kStart;
         std::string field;
         std::size_t record_bytes = 0U;
+        const CsvRecordScanAccount scan_account(
+            scan_accounting_enabled_,
+            &record_bytes,
+            &bytes_read_);
+        const std::size_t effective_maximum_bytes =
+            std::min(maximum_record_bytes_, maximum_scan_bytes);
 
         const auto finish_field = [&]() {
             output->fields.push_back(std::move(field));
@@ -330,27 +408,53 @@ public:
                         "record contains invalid UTF-8 or NUL");
                 }
             }
-            if (!state_->ObserveCompleteRecord(
-                    input_.path, output->line)) {
+            if (scan_accounting_enabled_ &&
+                complete_records_read_ !=
+                    std::numeric_limits<std::uint64_t>::max()) {
+                ++complete_records_read_;
+            }
+            const StartupReplaySinkCallResultV1 record_checkpoint =
+                state_->ObserveCompleteRecord(
+                    input_.path,
+                    output->line,
+                    cooperative_deadline_);
+            if (record_checkpoint ==
+                StartupReplaySinkCallResultV1::kDeadline) {
+                checkpoint_deadline_expired_ = true;
                 return false;
             }
+            if (record_checkpoint ==
+                StartupReplaySinkCallResultV1::kRejected) {
+                return false;
+            }
+            output->start_offset = record_start_offset;
+            output->end_offset = consumed_offset_;
             *available = true;
             return true;
         };
 
         while (remaining_ != 0U) {
+            if (record_bytes == effective_maximum_bytes) {
+                return state_->Fail(
+                    maximum_scan_bytes < maximum_record_bytes_
+                        ? StartupReplayErrorV1::kResourceExhausted
+                        : StartupReplayErrorV1::kLineTooLong,
+                    input_.path,
+                    output->line,
+                    maximum_scan_bytes < maximum_record_bytes_
+                        ? "Shenzhen boundary alignment scan byte "
+                          "limit was exhausted within a record"
+                        : "CSV logical record exceeds "
+                          "maximum_record_bytes");
+            }
             char character = '\0';
-            if (!ReadByte(&character, output->line)) {
+            if (!ReadByte(
+                    &character,
+                    output->line,
+                    effective_maximum_bytes - record_bytes)) {
                 return false;
             }
             ++record_bytes;
-            if (record_bytes > maximum_record_bytes_) {
-                return state_->Fail(
-                    StartupReplayErrorV1::kLineTooLong,
-                    input_.path,
-                    output->line,
-                    "CSV logical record exceeds maximum_record_bytes");
-            }
 
             if (field_state == FieldState::kQuoted) {
                 if (character == '"') {
@@ -383,7 +487,8 @@ public:
                             &record_bytes,
                             output->line,
                             record_start_offset,
-                            record_start_line)) {
+                            record_start_line,
+                            maximum_scan_bytes)) {
                         return state_->result.error ==
                                StartupReplayErrorV1::kNone;
                     }
@@ -422,7 +527,8 @@ public:
                         &record_bytes,
                         output->line,
                         record_start_offset,
-                        record_start_line)) {
+                        record_start_line,
+                        maximum_scan_bytes)) {
                     return state_->result.error ==
                            StartupReplayErrorV1::kNone;
                 }
@@ -434,8 +540,8 @@ public:
         }
 
         // A vendor process may be appending the last row. Do not emit it until
-        // its LF is inside the current finite prefix; a selected one-shot
-        // extension restarts parsing from this record's first byte.
+        // its LF is inside the current available prefix; a later refresh
+        // restarts parsing from this record's first byte.
         output->fields.clear();
         MarkPartial(record_start_offset, record_start_line);
         return true;
@@ -454,6 +560,18 @@ public:
             return true;
         }
         extension_attempted_ = true;
+        return RefreshAvailableEnd(extended);
+    }
+
+    bool RefreshAvailableEnd(bool* extended) {
+        if (extended == nullptr) {
+            return state_->Fail(
+                StartupReplayErrorV1::kUnexpectedFailure,
+                input_.path,
+                physical_line_,
+                "internal null refresh result");
+        }
+        *extended = false;
         std::uint64_t current_size = 0U;
         std::string detail;
         if (input_.stable == nullptr ||
@@ -511,10 +629,52 @@ public:
         return partial_start_line_;
     }
 
+    [[nodiscard]] std::uint64_t incomplete_offset() const noexcept {
+        return partial_start_offset_;
+    }
+
+    [[nodiscard]] std::uint64_t next_record_offset() const noexcept {
+        return partial_suffix_ ? partial_start_offset_ : consumed_offset_;
+    }
+
+    [[nodiscard]] bool has_available_bytes() const noexcept {
+        return remaining_ != 0U;
+    }
+
+    [[nodiscard]] std::uint64_t bytes_read() const noexcept {
+        return bytes_read_;
+    }
+
+    [[nodiscard]] std::uint64_t complete_records_read() const noexcept {
+        return complete_records_read_;
+    }
+
+    void BeginScanAccounting() noexcept {
+        bytes_read_ = 0U;
+        complete_records_read_ = 0U;
+        scan_accounting_enabled_ = true;
+    }
+
+    void SetCooperativeDeadline(
+        std::optional<std::chrono::steady_clock::time_point>
+            deadline) noexcept {
+        cooperative_deadline_ = deadline;
+        checkpoint_deadline_expired_ = false;
+    }
+
+    [[nodiscard]] bool checkpoint_deadline_expired() const noexcept {
+        return checkpoint_deadline_expired_;
+    }
+
+    [[nodiscard]] std::uint64_t available_end() const noexcept {
+        return prefix_end_;
+    }
+
 private:
     bool ReadByte(
         char* output,
-        std::uint64_t checkpoint_line) {
+        std::uint64_t checkpoint_line,
+        std::size_t maximum_prefetch_bytes) {
         if (output == nullptr || remaining_ == 0U) {
             return false;
         }
@@ -523,13 +683,29 @@ private:
             // field strings without ever reaching the record-count gate.
             // Check before each bounded pread so online recovery gets a
             // cancellation/backpressure point at most one 64 KiB chunk away.
-            if (!state_->CooperativeCheckpoint(
-                    input_.path, checkpoint_line)) {
+            if (cooperative_deadline_.has_value()) {
+                const StartupReplaySinkCallResultV1 checkpoint =
+                    state_->CooperativeCheckpointUntil(
+                        input_.path,
+                        checkpoint_line,
+                        *cooperative_deadline_);
+                if (checkpoint ==
+                    StartupReplaySinkCallResultV1::kDeadline) {
+                    checkpoint_deadline_expired_ = true;
+                    return false;
+                }
+                if (checkpoint ==
+                    StartupReplaySinkCallResultV1::kRejected) {
+                    return false;
+                }
+            } else if (!state_->CooperativeCheckpoint(
+                           input_.path, checkpoint_line)) {
                 return false;
             }
             const std::uint64_t requested_u64 = std::min(
                 remaining_,
-                static_cast<std::uint64_t>(buffer_.size()));
+                static_cast<std::uint64_t>(std::min(
+                    buffer_.size(), maximum_prefetch_bytes)));
 #if defined(__linux__)
             std::size_t received = 0U;
             while (received <
@@ -577,25 +753,38 @@ private:
         std::size_t* record_bytes,
         std::uint64_t record_line,
         std::uint64_t record_start_offset,
-        std::uint64_t record_start_line) {
+        std::uint64_t record_start_line,
+        std::size_t maximum_scan_bytes) {
         if (remaining_ == 0U) {
             // CR without the LF in the captured prefix is an incomplete
             // suffix, not a malformed committed record.
             MarkPartial(record_start_offset, record_start_line);
             return false;
         }
+        const std::size_t effective_maximum_bytes =
+            std::min(maximum_record_bytes_, maximum_scan_bytes);
+        if (*record_bytes == effective_maximum_bytes) {
+            static_cast<void>(state_->Fail(
+                maximum_scan_bytes < maximum_record_bytes_
+                    ? StartupReplayErrorV1::kResourceExhausted
+                    : StartupReplayErrorV1::kLineTooLong,
+                input_.path,
+                record_line,
+                maximum_scan_bytes < maximum_record_bytes_
+                    ? "Shenzhen boundary alignment scan byte limit "
+                      "was exhausted within a CRLF terminator"
+                    : "CSV logical record exceeds "
+                      "maximum_record_bytes"));
+            return false;
+        }
         char next = '\0';
-        if (!ReadByte(&next, record_line)) {
+        if (!ReadByte(
+                &next,
+                record_line,
+                effective_maximum_bytes - *record_bytes)) {
             return false;
         }
         ++(*record_bytes);
-        if (*record_bytes > maximum_record_bytes_) {
-            return state_->Fail(
-                StartupReplayErrorV1::kLineTooLong,
-                input_.path,
-                record_line,
-                "CSV logical record exceeds maximum_record_bytes");
-        }
         if (next != '\n') {
             return state_->Fail(
                 StartupReplayErrorV1::kCsvMalformed,
@@ -626,6 +815,12 @@ private:
     bool extension_attempted_ = false;
     std::uint64_t partial_start_offset_ = 0U;
     std::uint64_t partial_start_line_ = 1U;
+    std::uint64_t bytes_read_ = 0U;
+    std::uint64_t complete_records_read_ = 0U;
+    bool scan_accounting_enabled_ = false;
+    std::optional<std::chrono::steady_clock::time_point>
+        cooperative_deadline_;
+    bool checkpoint_deadline_expired_ = false;
     std::array<
         char,
         kStartupReplayCooperativeCheckpointBytesV1>
@@ -742,12 +937,18 @@ public:
                 header.line,
                 "header has an invalid number of columns");
         }
+        header_end_offset_ = header.end_offset;
         header_ = std::move(header.fields);
         return true;
     }
 
-    bool Next(CsvRecord* output, bool* available) {
-        if (!reader_.Next(output, available)) {
+    bool Next(
+        CsvRecord* output,
+        bool* available,
+        std::size_t maximum_scan_bytes =
+            std::numeric_limits<std::size_t>::max()) {
+        if (!reader_.Next(
+                output, available, maximum_scan_bytes)) {
             return false;
         }
         if (!*available) {
@@ -786,6 +987,10 @@ public:
         return reader_.ExtendToCurrent(extended);
     }
 
+    bool RefreshAvailableEnd(bool* extended) {
+        return reader_.RefreshAvailableEnd(extended);
+    }
+
     [[nodiscard]] bool has_incomplete_suffix() const noexcept {
         return reader_.has_incomplete_suffix();
     }
@@ -796,6 +1001,48 @@ public:
 
     [[nodiscard]] std::uint64_t incomplete_line() const noexcept {
         return reader_.incomplete_line();
+    }
+
+    [[nodiscard]] std::uint64_t incomplete_offset() const noexcept {
+        return reader_.incomplete_offset();
+    }
+
+    [[nodiscard]] std::uint64_t next_record_offset() const noexcept {
+        return reader_.next_record_offset();
+    }
+
+    [[nodiscard]] bool has_available_bytes() const noexcept {
+        return reader_.has_available_bytes();
+    }
+
+    [[nodiscard]] std::uint64_t bytes_read() const noexcept {
+        return reader_.bytes_read();
+    }
+
+    [[nodiscard]] std::uint64_t complete_records_read() const noexcept {
+        return reader_.complete_records_read();
+    }
+
+    void BeginScanAccounting() noexcept {
+        reader_.BeginScanAccounting();
+    }
+
+    void SetCooperativeDeadline(
+        std::optional<std::chrono::steady_clock::time_point>
+            deadline) noexcept {
+        reader_.SetCooperativeDeadline(deadline);
+    }
+
+    [[nodiscard]] bool checkpoint_deadline_expired() const noexcept {
+        return reader_.checkpoint_deadline_expired();
+    }
+
+    [[nodiscard]] std::uint64_t available_end() const noexcept {
+        return reader_.available_end();
+    }
+
+    [[nodiscard]] std::uint64_t header_end_offset() const noexcept {
+        return header_end_offset_;
     }
 
     [[nodiscard]] std::string_view Get(
@@ -824,6 +1071,7 @@ private:
     std::vector<std::string> optional_columns_;
     ReplayState* state_;
     std::vector<std::string> header_;
+    std::uint64_t header_end_offset_ = 0U;
     std::unordered_map<
         std::string,
         std::size_t,
@@ -1574,37 +1822,47 @@ struct PendingMessage final {
     std::vector<std::byte> body;
 };
 
-bool PublishMessage(
+enum class PendingPublishResult : std::uint8_t {
+    kPublished = 0U,
+    kFailed,
+    kDeadline,
+};
+
+PendingPublishResult PublishMessageUntil(
     PendingMessage* pending,
-    ReplayState* state) {
+    ReplayState* state,
+    const std::chrono::steady_clock::time_point* deadline) {
     if (pending == nullptr) {
-        return state->Fail(
+        static_cast<void>(state->Fail(
             StartupReplayErrorV1::kUnexpectedFailure,
             {},
             0U,
-            "internal null pending message");
+            "internal null pending message"));
+        return PendingPublishResult::kFailed;
     }
     if (pending->body.size() >
             std::numeric_limits<std::uint32_t>::max() -
                 sizeof(mdl::MDLMessageHead)) {
-        return state->Fail(
+        static_cast<void>(state->Fail(
             StartupReplayErrorV1::kMessageTooLarge,
             *pending->file,
             pending->line,
-            "reconstructed MDL message exceeds configured size");
+            "reconstructed MDL message exceeds configured size"));
+        return PendingPublishResult::kFailed;
     }
     const std::size_t wire_size =
         sizeof(mdl::MDLMessageHead) + pending->body.size();
     if (wire_size > state->config.maximum_message_bytes) {
-        return state->Fail(
+        static_cast<void>(state->Fail(
             StartupReplayErrorV1::kMessageTooLarge,
             *pending->file,
             pending->line,
             "reconstructed MDL total wire size exceeds "
-            "maximum_message_bytes");
+            "maximum_message_bytes"));
+        return PendingPublishResult::kFailed;
     }
     if (!pending->publish) {
-        return true;
+        return PendingPublishResult::kPublished;
     }
     CallbackLifetimeMessage message(
         pending->key,
@@ -1620,15 +1878,26 @@ bool PublishMessage(
         kStartupReplayProvenanceCsvV1,
         pending->notice_flags};
     std::string detail;
-    if (!state->sink.Publish(publication, &detail)) {
+    const StartupReplaySinkCallResultV1 sink_result =
+        deadline != nullptr
+            ? state->sink.PublishUntil(
+                  publication, *deadline, &detail)
+            : state->sink.Publish(publication, &detail)
+                  ? StartupReplaySinkCallResultV1::kAccepted
+                  : StartupReplaySinkCallResultV1::kRejected;
+    if (sink_result == StartupReplaySinkCallResultV1::kDeadline) {
+        return PendingPublishResult::kDeadline;
+    }
+    if (sink_result == StartupReplaySinkCallResultV1::kRejected) {
         if (detail.empty()) {
             detail = "startup replay sink rejected publication";
         }
-        return state->Fail(
+        static_cast<void>(state->Fail(
             StartupReplayErrorV1::kSinkRejected,
             *pending->file,
             pending->line,
-            std::move(detail));
+            std::move(detail)));
+        return PendingPublishResult::kFailed;
     }
     if (pending->key.service_id == 4U &&
         pending->key.message_id == 4U) {
@@ -1646,7 +1915,14 @@ bool PublishMessage(
                pending->key.message_id == 36U) {
         ++state->result.counts.shenzhen_transactions;
     }
-    return true;
+    return PendingPublishResult::kPublished;
+}
+
+bool PublishMessage(
+    PendingMessage* pending,
+    ReplayState* state) {
+    return PublishMessageUntil(pending, state, nullptr) ==
+           PendingPublishResult::kPublished;
 }
 
 bool EnsureWriter(
@@ -3496,6 +3772,9 @@ struct ShenzhenTickCandidate final {
     PendingMessage pending;
     std::uint32_t channel = 0U;
     std::uint64_t application_sequence = 0U;
+    std::uint64_t record_start_offset = 0U;
+    std::uint64_t record_end_offset = 0U;
+    bool completes_mandatory_partial = false;
 };
 
 struct ShenzhenChannelPending final {
@@ -3503,58 +3782,81 @@ struct ShenzhenChannelPending final {
     std::map<std::uint64_t, PendingMessage> messages;
 };
 
-bool InsertShenzhenPending(
+enum class InsertShenzhenPendingResult : std::uint8_t {
+    kInserted = 0U,
+    kFailed,
+    kDeadlineExpired,
+};
+
+InsertShenzhenPendingResult InsertShenzhenPending(
     std::uint32_t channel,
     std::uint64_t application_sequence,
     PendingMessage pending,
     std::map<std::uint32_t, ShenzhenChannelPending>* channels,
     std::size_t* pending_count,
     std::size_t* pending_bytes,
+    const std::chrono::steady_clock::time_point* deadline,
     ReplayState* state) {
+    const auto deadline_expired = [&]() noexcept {
+        return deadline != nullptr &&
+               std::chrono::steady_clock::now() >= *deadline;
+    };
     ShenzhenChannelPending& channel_state = (*channels)[channel];
     if (application_sequence < channel_state.next_sequence ||
         channel_state.messages.find(application_sequence) !=
             channel_state.messages.end()) {
-        return state->Fail(
+        static_cast<void>(state->Fail(
             StartupReplayErrorV1::kSequenceDuplicate,
             *pending.file,
             pending.line,
-            "duplicate or already-published ChannelNo/ApplSeqNum");
+            "duplicate or already-published ChannelNo/ApplSeqNum"));
+        return InsertShenzhenPendingResult::kFailed;
     }
     if (application_sequence == channel_state.next_sequence) {
-        if (!PublishMessage(&pending, state)) {
-            return false;
+        if (deadline_expired()) {
+            return InsertShenzhenPendingResult::kDeadlineExpired;
+        }
+        const PendingPublishResult publication =
+            PublishMessageUntil(&pending, state, deadline);
+        if (publication == PendingPublishResult::kDeadline) {
+            return InsertShenzhenPendingResult::kDeadlineExpired;
+        }
+        if (publication == PendingPublishResult::kFailed) {
+            return InsertShenzhenPendingResult::kFailed;
         }
         if (channel_state.next_sequence ==
             std::numeric_limits<std::uint64_t>::max()) {
-            return state->Fail(
+            static_cast<void>(state->Fail(
                 StartupReplayErrorV1::kNumericOverflow,
                 *pending.file,
                 pending.line,
-                "ApplSeqNum sequence cannot advance without overflow");
+                "ApplSeqNum sequence cannot advance without overflow"));
+            return InsertShenzhenPendingResult::kFailed;
         }
         ++channel_state.next_sequence;
     } else {
         if (*pending_count >=
             state->config.maximum_pending_messages) {
-            return state->Fail(
+            static_cast<void>(state->Fail(
                 StartupReplayErrorV1::kResourceExhausted,
                 *pending.file,
                 pending.line,
                 "Shenzhen cross-file gap window exceeds "
-                "maximum_pending_messages");
+                "maximum_pending_messages"));
+            return InsertShenzhenPendingResult::kFailed;
         }
         if (*pending_bytes >
                 state->config.maximum_pending_bytes ||
             pending.body.size() >
                 state->config.maximum_pending_bytes -
                     *pending_bytes) {
-            return state->Fail(
+            static_cast<void>(state->Fail(
                 StartupReplayErrorV1::kResourceExhausted,
                 *pending.file,
                 pending.line,
                 "Shenzhen cross-file gap window exceeds "
-                "maximum_pending_bytes");
+                "maximum_pending_bytes"));
+            return InsertShenzhenPendingResult::kFailed;
         }
         *pending_bytes += pending.body.size();
         channel_state.messages.emplace(
@@ -3562,25 +3864,34 @@ bool InsertShenzhenPending(
         ++(*pending_count);
     }
     for (;;) {
+        if (deadline_expired()) {
+            return InsertShenzhenPendingResult::kDeadlineExpired;
+        }
         auto found = channel_state.messages.find(
             channel_state.next_sequence);
         if (found == channel_state.messages.end()) {
-            return true;
+            return InsertShenzhenPendingResult::kInserted;
         }
         PendingMessage ready = std::move(found->second);
         channel_state.messages.erase(found);
         --(*pending_count);
         *pending_bytes -= ready.body.size();
-        if (!PublishMessage(&ready, state)) {
-            return false;
+        const PendingPublishResult publication =
+            PublishMessageUntil(&ready, state, deadline);
+        if (publication == PendingPublishResult::kDeadline) {
+            return InsertShenzhenPendingResult::kDeadlineExpired;
+        }
+        if (publication == PendingPublishResult::kFailed) {
+            return InsertShenzhenPendingResult::kFailed;
         }
         if (channel_state.next_sequence ==
             std::numeric_limits<std::uint64_t>::max()) {
-            return state->Fail(
+            static_cast<void>(state->Fail(
                 StartupReplayErrorV1::kNumericOverflow,
                 *ready.file,
                 ready.line,
-                "ApplSeqNum sequence cannot advance without overflow");
+                "ApplSeqNum sequence cannot advance without overflow"));
+            return InsertShenzhenPendingResult::kFailed;
         }
         ++channel_state.next_sequence;
     }
@@ -3598,6 +3909,8 @@ std::uint64_t ShenzhenExpectedSequence(
 bool LoadShenzhenOrderCandidate(
     CsvTable* table,
     bool publish,
+    bool completes_mandatory_partial,
+    std::size_t maximum_scan_bytes,
     std::optional<ShenzhenTickCandidate>* candidate,
     bool* done,
     std::optional<std::uint64_t>* previous_recovery_sequence,
@@ -3609,7 +3922,8 @@ bool LoadShenzhenOrderCandidate(
     }
     CsvRecord record;
     bool available = false;
-    if (!table->Next(&record, &available)) {
+    if (!table->Next(
+            &record, &available, maximum_scan_bytes)) {
         return false;
     }
     if (!available) {
@@ -3649,6 +3963,10 @@ bool LoadShenzhenOrderCandidate(
     *previous_recovery_sequence = next.pending.csv_sequence;
     (*previous_native_sequence)[next.channel] =
         next.application_sequence;
+    next.record_start_offset = record.start_offset;
+    next.record_end_offset = record.end_offset;
+    next.completes_mandatory_partial =
+        completes_mandatory_partial;
     *candidate = std::move(next);
     return true;
 }
@@ -3656,6 +3974,8 @@ bool LoadShenzhenOrderCandidate(
 bool LoadShenzhenTransactionCandidate(
     CsvTable* table,
     bool publish,
+    bool completes_mandatory_partial,
+    std::size_t maximum_scan_bytes,
     std::optional<ShenzhenTickCandidate>* candidate,
     bool* done,
     std::optional<std::uint64_t>* previous_recovery_sequence,
@@ -3667,7 +3987,8 @@ bool LoadShenzhenTransactionCandidate(
     }
     CsvRecord record;
     bool available = false;
-    if (!table->Next(&record, &available)) {
+    if (!table->Next(
+            &record, &available, maximum_scan_bytes)) {
         return false;
     }
     if (!available) {
@@ -3707,6 +4028,10 @@ bool LoadShenzhenTransactionCandidate(
     *previous_recovery_sequence = next.pending.csv_sequence;
     (*previous_native_sequence)[next.channel] =
         next.application_sequence;
+    next.record_start_offset = record.start_offset;
+    next.record_end_offset = record.end_offset;
+    next.completes_mandatory_partial =
+        completes_mandatory_partial;
     *candidate = std::move(next);
     return true;
 }
@@ -3717,6 +4042,18 @@ bool ReplayShenzhenTicks(
     bool publish_orders,
     bool publish_transactions,
     ReplayState* state) {
+    StartupReplayBoundaryAlignmentStatsV1& alignment =
+        state->result.boundary_alignment;
+    alignment.phase =
+        StartupReplayBoundaryAlignmentPhaseV1::kInitialReplay;
+    alignment.initial_order_cut = order_input.prefix_bytes;
+    alignment.initial_transaction_cut =
+        transaction_input.prefix_bytes;
+    alignment.order_available_end = order_input.prefix_bytes;
+    alignment.transaction_available_end =
+        transaction_input.prefix_bytes;
+    state->sink.ObserveBoundaryAlignment(alignment);
+
     CsvTable orders(
         order_input, ShenzhenOrderColumns(), {}, state);
     CsvTable transactions(
@@ -3727,6 +4064,13 @@ bool ReplayShenzhenTicks(
     if (!orders.Initialize() || !transactions.Initialize()) {
         return false;
     }
+    alignment.sealed_order_cut = orders.header_end_offset();
+    alignment.sealed_transaction_cut =
+        transactions.header_end_offset();
+    alignment.order_available_end = orders.available_end();
+    alignment.transaction_available_end =
+        transactions.available_end();
+    state->sink.ObserveBoundaryAlignment(alignment);
     bool orders_done = false;
     bool transactions_done = false;
     std::optional<ShenzhenTickCandidate> order_candidate;
@@ -3741,51 +4085,413 @@ bool ReplayShenzhenTicks(
     std::map<std::uint32_t, ShenzhenChannelPending> channels;
     std::size_t pending_count = 0U;
     std::size_t pending_bytes = 0U;
-    bool extension_round = false;
+    bool aligning = false;
+    bool order_mandatory_partial = false;
+    bool transaction_mandatory_partial = false;
+    bool first_alignment_poll = true;
+    using AlignmentClock = std::chrono::steady_clock;
+    AlignmentClock::time_point alignment_started{};
+    AlignmentClock::time_point alignment_deadline{};
+    std::chrono::milliseconds alignment_poll_delay(
+        state->config.boundary_alignment_initial_poll_ms);
+
+    const auto saturating_add = [](
+                                    std::uint64_t left,
+                                    std::uint64_t right) noexcept {
+        return right > std::numeric_limits<std::uint64_t>::max() - left
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : left + right;
+    };
+    const auto update_alignment_scan = [&]() {
+        if (!aligning) {
+            return;
+        }
+        alignment.order_scanned_bytes =
+            orders.bytes_read();
+        alignment.transaction_scanned_bytes =
+            transactions.bytes_read();
+        alignment.scanned_records = saturating_add(
+            orders.complete_records_read(),
+            transactions.complete_records_read());
+    };
+
+    const auto update_waited = [&]() {
+        if (!aligning) {
+            return;
+        }
+        const auto elapsed = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            AlignmentClock::now() - alignment_started);
+        alignment.waited_ms = elapsed.count() <= 0
+                                  ? 0U
+                                  : static_cast<std::uint64_t>(
+                                        elapsed.count());
+    };
+    const auto update_alignment_observation = [&]() {
+        alignment.pending_messages =
+            static_cast<std::uint64_t>(pending_count);
+        alignment.pending_channels = 0U;
+        alignment.representative_missing_channel = 0U;
+        alignment.representative_missing_appl_seq = 0U;
+        for (const auto& [channel, channel_state] : channels) {
+            if (channel_state.messages.empty()) {
+                continue;
+            }
+            if (alignment.pending_channels == 0U) {
+                alignment.representative_missing_channel = channel;
+                alignment.representative_missing_appl_seq =
+                    channel_state.next_sequence;
+            }
+            ++alignment.pending_channels;
+        }
+        alignment.peak_pending_messages = std::max(
+            alignment.peak_pending_messages,
+            static_cast<std::uint64_t>(pending_count));
+        alignment.order_available_end = orders.available_end();
+        alignment.transaction_available_end =
+            transactions.available_end();
+        alignment.order_mandatory_partial =
+            order_mandatory_partial;
+        alignment.transaction_mandatory_partial =
+            transaction_mandatory_partial;
+    };
+    const auto alignment_closed = [&]() noexcept {
+        return pending_count == 0U &&
+               !order_mandatory_partial &&
+               !transaction_mandatory_partial;
+    };
+    const auto fail_alignment_timeout = [&]() {
+        update_waited();
+        update_alignment_scan();
+        update_alignment_observation();
+        const PendingMessage* first_pending = nullptr;
+        std::uint32_t missing_channel = 0U;
+        std::uint64_t missing_sequence = 0U;
+        std::size_t pending_channels = 0U;
+        for (const auto& [channel, channel_state] : channels) {
+            if (channel_state.messages.empty()) {
+                continue;
+            }
+            ++pending_channels;
+            if (first_pending == nullptr) {
+                first_pending = &channel_state.messages.begin()->second;
+                missing_channel = channel;
+                missing_sequence = channel_state.next_sequence;
+            }
+        }
+        std::ostringstream detail;
+        detail << "waited_ms=" << alignment.waited_ms
+               << " polls=" << alignment.poll_count
+               << " pending_messages=" << pending_count
+               << " pending_channels=" << pending_channels;
+        if (first_pending != nullptr) {
+            detail << " representative_missing_channel="
+                   << missing_channel
+                   << " representative_missing_appl_seq="
+                   << missing_sequence;
+        }
+        detail << " order_initial_cut="
+               << alignment.initial_order_cut
+               << " order_sealed_cut="
+               << alignment.sealed_order_cut
+               << " order_available_end=" << orders.available_end()
+               << " transaction_initial_cut="
+               << alignment.initial_transaction_cut
+               << " transaction_sealed_cut="
+               << alignment.sealed_transaction_cut
+               << " transaction_available_end="
+               << transactions.available_end()
+               << " order_extension_bytes="
+               << alignment.order_extension_bytes
+               << " transaction_extension_bytes="
+               << alignment.transaction_extension_bytes
+               << " scanned_records="
+               << alignment.scanned_records
+               << " order_scanned_bytes="
+               << alignment.order_scanned_bytes
+               << " transaction_scanned_bytes="
+               << alignment.transaction_scanned_bytes
+               << " order_partial="
+               << (order_mandatory_partial ? "true" : "false")
+               << " transaction_partial="
+               << (transaction_mandatory_partial ? "true" : "false");
+        const std::filesystem::path& error_file =
+            first_pending != nullptr
+                ? *first_pending->file
+                : (order_mandatory_partial
+                       ? orders.input().path
+                       : transactions.input().path);
+        const std::uint64_t error_line =
+            first_pending != nullptr
+                ? first_pending->line
+                : (order_mandatory_partial
+                       ? orders.incomplete_line()
+                       : transactions.incomplete_line());
+        return state->Fail(
+            StartupReplayErrorV1::kBoundaryAlignmentTimeout,
+            error_file,
+            error_line,
+            detail.str());
+    };
+    const auto closes_gap_or_is_invalid =
+        [&](const ShenzhenTickCandidate& candidate) {
+            const auto found = channels.find(candidate.channel);
+            if (found == channels.end()) {
+                return false;
+            }
+            return candidate.application_sequence <
+                       found->second.next_sequence ||
+                   found->second.messages.find(
+                       candidate.application_sequence) !=
+                       found->second.messages.end() ||
+                   (candidate.application_sequence ==
+                        found->second.next_sequence &&
+                    !found->second.messages.empty());
+        };
+    const auto file_can_still_contain_missing =
+        [&](const std::map<std::uint32_t, std::uint64_t>&
+                previous_native_sequence) {
+            for (const auto& [channel, channel_state] : channels) {
+                if (channel_state.messages.empty()) {
+                    continue;
+                }
+                const auto previous =
+                    previous_native_sequence.find(channel);
+                if (previous == previous_native_sequence.end() ||
+                    previous->second < channel_state.next_sequence) {
+                    return true;
+                }
+            }
+            return false;
+        };
+    const auto alignment_scan_exhausted = [&]() noexcept {
+        if (alignment.scanned_records >
+            state->config.maximum_boundary_alignment_records) {
+            return true;
+        }
+        return alignment.order_scanned_bytes >
+                   state->config.maximum_boundary_alignment_bytes ||
+               alignment.transaction_scanned_bytes >
+                   state->config.maximum_boundary_alignment_bytes -
+                       std::min(
+                           alignment.order_scanned_bytes,
+                           state->config
+                               .maximum_boundary_alignment_bytes);
+    };
 
     for (;;) {
-        while (!orders_done || !transactions_done ||
-               order_candidate.has_value() ||
-               transaction_candidate.has_value()) {
-            if (!LoadShenzhenOrderCandidate(
-                    &orders,
-                    publish_orders,
-                    &order_candidate,
-                    &orders_done,
-                    &previous_order_recovery_sequence,
-                    &previous_order_native_sequence,
-                    state) ||
-                !LoadShenzhenTransactionCandidate(
-                    &transactions,
-                    publish_transactions,
-                    &transaction_candidate,
-                    &transactions_done,
-                    &previous_transaction_recovery_sequence,
-                    &previous_transaction_native_sequence,
-                    state)) {
-                return false;
+        for (;;) {
+            if (aligning &&
+                state->config.boundary_alignment_timeout_ms != 0U &&
+                AlignmentClock::now() >= alignment_deadline) {
+                return fail_alignment_timeout();
+            }
+            const bool order_initial_work =
+                !aligning &&
+                orders.next_record_offset() <
+                    alignment.initial_order_cut;
+            const bool transaction_initial_work =
+                !aligning &&
+                transactions.next_record_offset() <
+                    alignment.initial_transaction_cut;
+            const bool order_alignment_work =
+                aligning &&
+                (order_mandatory_partial ||
+                 file_can_still_contain_missing(
+                     previous_order_native_sequence));
+            const bool transaction_alignment_work =
+                aligning &&
+                (transaction_mandatory_partial ||
+                 file_can_still_contain_missing(
+                     previous_transaction_native_sequence));
+            const bool existing_order_candidate_is_decisive =
+                aligning && order_candidate.has_value() &&
+                (order_candidate->completes_mandatory_partial ||
+                 closes_gap_or_is_invalid(*order_candidate));
+            const bool existing_transaction_candidate_is_decisive =
+                aligning && transaction_candidate.has_value() &&
+                (transaction_candidate
+                     ->completes_mandatory_partial ||
+                 closes_gap_or_is_invalid(
+                     *transaction_candidate));
+            const bool have_existing_decisive_candidate =
+                existing_order_candidate_is_decisive ||
+                existing_transaction_candidate_is_decisive;
+            const bool load_order =
+                !order_candidate.has_value() && !orders_done &&
+                !have_existing_decisive_candidate &&
+                (order_initial_work || order_alignment_work);
+            const bool load_transaction =
+                !transaction_candidate.has_value() &&
+                !transactions_done &&
+                !have_existing_decisive_candidate &&
+                (transaction_initial_work ||
+                 transaction_alignment_work);
+            const auto remaining_scan_bytes = [&]() {
+                update_alignment_scan();
+                if (alignment_scan_exhausted()) {
+                    return std::size_t{0U};
+                }
+                const std::uint64_t used =
+                    alignment.order_scanned_bytes +
+                    alignment.transaction_scanned_bytes;
+                const std::uint64_t remaining =
+                    state->config.maximum_boundary_alignment_bytes -
+                    used;
+                return remaining >
+                               static_cast<std::uint64_t>(
+                                   std::numeric_limits<
+                                       std::size_t>::max())
+                           ? std::numeric_limits<std::size_t>::max()
+                           : static_cast<std::size_t>(remaining);
+            };
+            const auto fail_scan_resource = [&] (
+                                                const CsvTable& table) {
+                update_alignment_scan();
+                std::ostringstream detail;
+                detail << "Shenzhen boundary alignment scanned "
+                       << alignment.scanned_records
+                       << " records and "
+                       << alignment.order_scanned_bytes
+                       << "+"
+                       << alignment.transaction_scanned_bytes
+                       << " bytes";
+                return state->Fail(
+                    StartupReplayErrorV1::kResourceExhausted,
+                    table.input().path,
+                    table.incomplete_line(),
+                    detail.str());
+            };
+            const auto load_scan_budget = [&]() {
+                return aligning
+                           ? remaining_scan_bytes()
+                           : std::numeric_limits<std::size_t>::max();
+            };
+            if (load_order) {
+                if (aligning && orders.has_available_bytes() &&
+                    (alignment.scanned_records >=
+                         state->config
+                             .maximum_boundary_alignment_records ||
+                     remaining_scan_bytes() == 0U)) {
+                    return fail_scan_resource(orders);
+                }
+                if (!LoadShenzhenOrderCandidate(
+                        &orders,
+                        publish_orders,
+                        order_mandatory_partial,
+                        load_scan_budget(),
+                        &order_candidate,
+                        &orders_done,
+                        &previous_order_recovery_sequence,
+                        &previous_order_native_sequence,
+                        state)) {
+                    update_alignment_scan();
+                    if (aligning &&
+                        orders.checkpoint_deadline_expired()) {
+                        return fail_alignment_timeout();
+                    }
+                    return false;
+                }
+                if (aligning) {
+                    update_alignment_scan();
+                    if (alignment_scan_exhausted()) {
+                        return fail_scan_resource(orders);
+                    }
+                }
+            }
+            const bool order_candidate_is_decisive =
+                aligning && order_candidate.has_value() &&
+                (order_candidate->completes_mandatory_partial ||
+                 closes_gap_or_is_invalid(*order_candidate));
+            const bool load_transaction_now =
+                load_transaction && !order_candidate_is_decisive;
+            if (load_transaction_now) {
+                if (aligning && transactions.has_available_bytes() &&
+                    (alignment.scanned_records >=
+                         state->config
+                             .maximum_boundary_alignment_records ||
+                     remaining_scan_bytes() == 0U)) {
+                    return fail_scan_resource(transactions);
+                }
+                if (!LoadShenzhenTransactionCandidate(
+                        &transactions,
+                        publish_transactions,
+                        transaction_mandatory_partial,
+                        load_scan_budget(),
+                        &transaction_candidate,
+                        &transactions_done,
+                        &previous_transaction_recovery_sequence,
+                        &previous_transaction_native_sequence,
+                        state)) {
+                    update_alignment_scan();
+                    if (aligning &&
+                        transactions
+                            .checkpoint_deadline_expired()) {
+                        return fail_alignment_timeout();
+                    }
+                    return false;
+                }
+                if (aligning) {
+                    update_alignment_scan();
+                    if (alignment_scan_exhausted()) {
+                        return fail_scan_resource(transactions);
+                    }
+                }
             }
             if (!order_candidate.has_value() &&
                 !transaction_candidate.has_value()) {
                 break;
             }
-
-            const auto is_ready =
-                [&](const ShenzhenTickCandidate& candidate) {
-                    return candidate.application_sequence <=
-                           ShenzhenExpectedSequence(
-                               channels, candidate.channel);
-                };
+            const bool order_closes_or_is_invalid =
+                order_candidate.has_value() &&
+                closes_gap_or_is_invalid(*order_candidate);
+            const bool transaction_closes_or_is_invalid =
+                transaction_candidate.has_value() &&
+                closes_gap_or_is_invalid(*transaction_candidate);
+            const bool order_required =
+                order_candidate.has_value() &&
+                ((!aligning &&
+                 order_candidate->record_start_offset <
+                      alignment.initial_order_cut) ||
+                 (aligning &&
+                  (order_candidate->completes_mandatory_partial ||
+                   order_closes_or_is_invalid ||
+                   file_can_still_contain_missing(
+                       previous_order_native_sequence))));
+            const bool transaction_required =
+                transaction_candidate.has_value() &&
+                ((!aligning &&
+                  transaction_candidate->record_start_offset <
+                      alignment.initial_transaction_cut) ||
+                 (aligning &&
+                  (transaction_candidate
+                       ->completes_mandatory_partial ||
+                   transaction_closes_or_is_invalid ||
+                   file_can_still_contain_missing(
+                       previous_transaction_native_sequence))));
+            if (!order_required && !transaction_required) {
+                // Both retained files have already advanced past every
+                // current missing native sequence. Keep their parsed heads
+                // provisional and wait for the opposite writer instead of
+                // moving the sealed CSV seam along a fast live tail.
+                break;
+            }
             bool take_order = false;
-            if (order_candidate.has_value() &&
-                is_ready(*order_candidate)) {
+            if (order_closes_or_is_invalid) {
+                take_order = true;
+            } else if (transaction_closes_or_is_invalid) {
+                take_order = false;
+            } else if (order_candidate.has_value() &&
+                       order_candidate
+                           ->completes_mandatory_partial) {
                 take_order = true;
             } else if (transaction_candidate.has_value() &&
-                       is_ready(*transaction_candidate)) {
+                       transaction_candidate
+                           ->completes_mandatory_partial) {
                 take_order = false;
-            } else if (!transaction_candidate.has_value()) {
+            } else if (order_required && !transaction_required) {
                 take_order = true;
-            } else if (!order_candidate.has_value()) {
+            } else if (!order_required && transaction_required) {
                 take_order = false;
             } else {
                 const std::uint64_t order_gap =
@@ -3809,73 +4515,297 @@ bool ReplayShenzhenTicks(
             } else {
                 transaction_candidate.reset();
             }
-            if (!InsertShenzhenPending(
+            if (selected.record_end_offset <
+                selected.record_start_offset) {
+                return state->Fail(
+                    StartupReplayErrorV1::kUnexpectedFailure,
+                    *selected.pending.file,
+                    selected.pending.line,
+                    "Shenzhen candidate has an invalid byte range");
+            }
+            const std::uint64_t initial_cut =
+                take_order
+                    ? alignment.initial_order_cut
+                    : alignment.initial_transaction_cut;
+            const std::uint64_t extension_bytes =
+                selected.record_end_offset <= initial_cut
+                    ? 0U
+                    : selected.record_end_offset -
+                          std::max(
+                              selected.record_start_offset,
+                              initial_cut);
+            if (aligning) {
+                const std::uint64_t used_bytes =
+                    alignment.order_extension_bytes;
+                if (alignment.transaction_extension_bytes >
+                        state->config.maximum_boundary_alignment_bytes ||
+                    used_bytes >
+                        state->config.maximum_boundary_alignment_bytes -
+                            alignment.transaction_extension_bytes ||
+                    extension_bytes >
+                        state->config.maximum_boundary_alignment_bytes -
+                            used_bytes -
+                            alignment.transaction_extension_bytes ||
+                    alignment.extension_records >=
+                        state->config.maximum_boundary_alignment_records) {
+                    return state->Fail(
+                        StartupReplayErrorV1::kResourceExhausted,
+                        *selected.pending.file,
+                        selected.pending.line,
+                        "Shenzhen boundary alignment exceeds its "
+                        "record/byte limit");
+                }
+                if (state->config.boundary_alignment_timeout_ms != 0U &&
+                    AlignmentClock::now() >= alignment_deadline) {
+                    return fail_alignment_timeout();
+                }
+            }
+            const std::chrono::steady_clock::time_point*
+                insert_deadline =
+                    aligning &&
+                            state->config
+                                    .boundary_alignment_timeout_ms !=
+                                0U
+                        ? &alignment_deadline
+                        : nullptr;
+            const InsertShenzhenPendingResult insert_result =
+                InsertShenzhenPending(
                     selected.channel,
                     selected.application_sequence,
                     std::move(selected.pending),
                     &channels,
                     &pending_count,
                     &pending_bytes,
-                    state)) {
+                    insert_deadline,
+                    state);
+            if (insert_result ==
+                InsertShenzhenPendingResult::kDeadlineExpired) {
+                return fail_alignment_timeout();
+            }
+            if (insert_result ==
+                InsertShenzhenPendingResult::kFailed) {
                 return false;
+            }
+            if (take_order) {
+                alignment.sealed_order_cut =
+                    selected.record_end_offset;
+                if (selected.completes_mandatory_partial) {
+                    order_mandatory_partial = false;
+                }
+                if (aligning) {
+                    alignment.order_extension_bytes +=
+                        extension_bytes;
+                }
+            } else {
+                alignment.sealed_transaction_cut =
+                    selected.record_end_offset;
+                if (selected.completes_mandatory_partial) {
+                    transaction_mandatory_partial = false;
+                }
+                if (aligning) {
+                    alignment.transaction_extension_bytes +=
+                        extension_bytes;
+                }
+            }
+            if (aligning) {
+                ++alignment.extension_records;
+                update_alignment_observation();
+                if (state->config.boundary_alignment_timeout_ms != 0U &&
+                    AlignmentClock::now() >= alignment_deadline) {
+                    return fail_alignment_timeout();
+                }
+                if (alignment_closed()) {
+                    update_waited();
+                    update_alignment_scan();
+                    alignment.phase =
+                        StartupReplayBoundaryAlignmentPhaseV1::
+                            kSealed;
+                    alignment.sealed = true;
+                    state->sink.ObserveBoundaryAlignment(alignment);
+                    return true;
+                }
             }
         }
 
-        const bool extension_required =
-            pending_count != 0U ||
-            orders.has_incomplete_suffix() ||
-            transactions.has_incomplete_suffix();
-        if (!extension_round && extension_required) {
-            bool orders_extended = false;
-            bool transactions_extended = false;
-            if (!orders.ExtendToCurrent(&orders_extended) ||
-                !transactions.ExtendToCurrent(
-                    &transactions_extended)) {
-                return false;
-            }
-            extension_round = true;
-            orders_done = !orders_extended;
-            transactions_done = !transactions_extended;
-            if (orders_extended || transactions_extended) {
-                continue;
+        if (aligning && !alignment_closed()) {
+            update_alignment_scan();
+            const bool record_budget_spent =
+                alignment.scanned_records >=
+                state->config.maximum_boundary_alignment_records;
+            const bool byte_budget_spent =
+                alignment.order_scanned_bytes >=
+                    state->config.maximum_boundary_alignment_bytes ||
+                alignment.transaction_scanned_bytes >=
+                    state->config.maximum_boundary_alignment_bytes -
+                        std::min(
+                            alignment.order_scanned_bytes,
+                            state->config
+                                .maximum_boundary_alignment_bytes);
+            if (record_budget_spent || byte_budget_spent) {
+                std::ostringstream detail;
+                detail << "Shenzhen boundary alignment exhausted its "
+                          "scan budget with "
+                       << alignment.scanned_records
+                       << " records and "
+                       << alignment.order_scanned_bytes
+                       << "+"
+                       << alignment.transaction_scanned_bytes
+                       << " bytes before closure";
+                return state->Fail(
+                    StartupReplayErrorV1::kResourceExhausted,
+                    order_mandatory_partial
+                        ? orders.input().path
+                        : transactions.input().path,
+                    order_mandatory_partial
+                        ? orders.incomplete_line()
+                        : transactions.incomplete_line(),
+                    detail.str());
             }
         }
-        break;
-    }
 
-    if (orders.has_incomplete_suffix()) {
-        return state->Fail(
-            StartupReplayErrorV1::kIncompleteBoundary,
-            orders.input().path,
-            orders.incomplete_line(),
-            "Shenzhen order record is incomplete after the bounded extension");
-    }
-    if (transactions.has_incomplete_suffix()) {
-        return state->Fail(
-            StartupReplayErrorV1::kIncompleteBoundary,
-            transactions.input().path,
-            transactions.incomplete_line(),
-            "Shenzhen transaction record is incomplete after the bounded extension");
-    }
-
-    for (const auto& [channel, channel_state] : channels) {
-        if (channel_state.messages.empty()) {
+        if (!aligning) {
+            order_mandatory_partial =
+                orders.has_incomplete_suffix() &&
+                orders.incomplete_offset() <
+                    alignment.initial_order_cut;
+            transaction_mandatory_partial =
+                transactions.has_incomplete_suffix() &&
+                transactions.incomplete_offset() <
+                    alignment.initial_transaction_cut;
+            if (alignment_closed()) {
+                alignment.phase =
+                    StartupReplayBoundaryAlignmentPhaseV1::kSealed;
+                alignment.sealed = true;
+                state->sink.ObserveBoundaryAlignment(alignment);
+                return true;
+            }
+            aligning = true;
+            alignment.attempted = true;
+            alignment.phase =
+                StartupReplayBoundaryAlignmentPhaseV1::
+                    kTailAligning;
+            alignment_started = AlignmentClock::now();
+            alignment_deadline =
+                alignment_started + std::chrono::milliseconds(
+                    state->config.boundary_alignment_timeout_ms);
+            const std::optional<AlignmentClock::time_point>
+                cooperative_deadline =
+                    state->config
+                                .boundary_alignment_timeout_ms != 0U
+                        ? std::optional<AlignmentClock::time_point>(
+                              alignment_deadline)
+                        : std::nullopt;
+            orders.SetCooperativeDeadline(cooperative_deadline);
+            transactions.SetCooperativeDeadline(
+                cooperative_deadline);
+            orders.BeginScanAccounting();
+            transactions.BeginScanAccounting();
+            update_alignment_observation();
+            state->sink.ObserveBoundaryAlignment(alignment);
+            // Header completion may already have exposed data bytes beyond an
+            // initial cut. Re-enter selection once so only rows needed for an
+            // existing initial obligation are considered before polling.
             continue;
         }
-        const PendingMessage& first =
-            channel_state.messages.begin()->second;
-        std::ostringstream detail;
-        detail << "ChannelNo " << channel
-               << " is missing ApplSeqNum "
-               << channel_state.next_sequence
-               << " before bounded extension EOF";
-        return state->Fail(
-            StartupReplayErrorV1::kSequenceGap,
-            *first.file,
-            first.line,
-            detail.str());
+        if (alignment_closed()) {
+            update_waited();
+            update_alignment_scan();
+            alignment.phase =
+                StartupReplayBoundaryAlignmentPhaseV1::kSealed;
+            alignment.sealed = true;
+            state->sink.ObserveBoundaryAlignment(alignment);
+            return true;
+        }
+
+        if (!first_alignment_poll) {
+            if (state->config.boundary_alignment_timeout_ms == 0U ||
+                AlignmentClock::now() >= alignment_deadline) {
+                return fail_alignment_timeout();
+            }
+            const auto remaining = alignment_deadline -
+                                   AlignmentClock::now();
+            if (remaining <= AlignmentClock::duration::zero()) {
+                return fail_alignment_timeout();
+            }
+            const auto sleep_duration = std::min(
+                std::chrono::duration_cast<AlignmentClock::duration>(
+                    alignment_poll_delay),
+                remaining);
+            std::this_thread::sleep_for(sleep_duration);
+            const std::uint64_t doubled_poll_ms =
+                static_cast<std::uint64_t>(
+                    alignment_poll_delay.count()) * 2U;
+            alignment_poll_delay = std::chrono::milliseconds(
+                std::min(
+                    doubled_poll_ms,
+                    state->config
+                        .boundary_alignment_maximum_poll_ms));
+            if (state->config.boundary_alignment_timeout_ms != 0U &&
+                AlignmentClock::now() >= alignment_deadline) {
+                return fail_alignment_timeout();
+            }
+        }
+        const std::filesystem::path& checkpoint_file =
+            order_mandatory_partial
+                ? orders.input().path
+                : transactions.input().path;
+        const std::uint64_t checkpoint_line =
+            order_mandatory_partial
+                ? orders.incomplete_line()
+                : transactions.incomplete_line();
+        if (state->config.boundary_alignment_timeout_ms != 0U) {
+            const StartupReplaySinkCallResultV1 checkpoint =
+                state->CooperativeCheckpointUntil(
+                    checkpoint_file,
+                    checkpoint_line,
+                    alignment_deadline);
+            if (checkpoint ==
+                StartupReplaySinkCallResultV1::kDeadline) {
+                return fail_alignment_timeout();
+            }
+            if (checkpoint ==
+                StartupReplaySinkCallResultV1::kRejected) {
+                return false;
+            }
+        } else if (!state->CooperativeCheckpoint(
+                       checkpoint_file, checkpoint_line)) {
+            return false;
+        }
+        if (state->config.boundary_alignment_timeout_ms != 0U &&
+            AlignmentClock::now() >= alignment_deadline) {
+            return fail_alignment_timeout();
+        }
+
+        update_waited();
+        update_alignment_observation();
+        ++alignment.poll_count;
+        state->sink.ObserveBoundaryAlignment(alignment);
+        if (state->config.boundary_alignment_timeout_ms != 0U &&
+            AlignmentClock::now() >= alignment_deadline) {
+            return fail_alignment_timeout();
+        }
+        bool orders_extended = false;
+        bool transactions_extended = false;
+        if (!orders.RefreshAvailableEnd(&orders_extended)) {
+            return false;
+        }
+        update_alignment_observation();
+        if (!transactions.RefreshAvailableEnd(
+                &transactions_extended)) {
+            return false;
+        }
+        update_alignment_observation();
+        if (state->config.boundary_alignment_timeout_ms != 0U &&
+            AlignmentClock::now() >= alignment_deadline) {
+            return fail_alignment_timeout();
+        }
+        first_alignment_poll = false;
+        orders_done = !orders_extended;
+        transactions_done = !transactions_extended;
+        if (orders_extended || transactions_extended) {
+            continue;
+        }
     }
-    return true;
 }
 
 struct CapturedInputs final {
@@ -4221,8 +5151,25 @@ std::string_view StartupReplayErrorNameV1(
             return "resource_exhausted";
         case StartupReplayErrorV1::kUnexpectedFailure:
             return "unexpected_failure";
+        case StartupReplayErrorV1::kBoundaryAlignmentTimeout:
+            return "boundary_alignment_timeout";
     }
     return "unexpected_failure";
+}
+
+std::string_view StartupReplayBoundaryAlignmentPhaseNameV1(
+    StartupReplayBoundaryAlignmentPhaseV1 phase) noexcept {
+    switch (phase) {
+        case StartupReplayBoundaryAlignmentPhaseV1::kNotApplicable:
+            return "NOT_APPLICABLE";
+        case StartupReplayBoundaryAlignmentPhaseV1::kInitialReplay:
+            return "INITIAL_REPLAY";
+        case StartupReplayBoundaryAlignmentPhaseV1::kTailAligning:
+            return "TAIL_ALIGNING";
+        case StartupReplayBoundaryAlignmentPhaseV1::kSealed:
+            return "SEALED";
+    }
+    return "NOT_APPLICABLE";
 }
 
 MdlCsvStartupReplaySourceV1::MdlCsvStartupReplaySourceV1(
@@ -4248,7 +5195,15 @@ StartupReplayResultV1 MdlCsvStartupReplaySourceV1::Replay(
                 sizeof(mdl::MDLMessageHead) +
                     sizeof(sh::SHL2MarketData) ||
             config_.maximum_pending_messages == 0U ||
-            config_.maximum_pending_bytes == 0U) {
+            config_.maximum_pending_bytes == 0U ||
+            config_.boundary_alignment_timeout_ms > 86'400'000U ||
+            config_.boundary_alignment_initial_poll_ms == 0U ||
+            config_.boundary_alignment_initial_poll_ms > 60'000U ||
+            config_.boundary_alignment_maximum_poll_ms <
+                config_.boundary_alignment_initial_poll_ms ||
+            config_.boundary_alignment_maximum_poll_ms > 60'000U ||
+            config_.maximum_boundary_alignment_records == 0U ||
+            config_.maximum_boundary_alignment_bytes == 0U) {
             static_cast<void>(state.Fail(
                 StartupReplayErrorV1::kInvalidConfiguration,
                 config_.directory,

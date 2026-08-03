@@ -194,6 +194,7 @@ struct Options final {
     std::uint64_t intraday_recovery_journal_queue_records = 65'536U;
     std::uint32_t
         intraday_recovery_certified_high_watermark_percent = 75U;
+    std::uint32_t intraday_recovery_boundary_alignment_ms = 10'000U;
     std::uint32_t intraday_recovery_warmup_seconds = 30U * 60U;
     std::uint32_t intraday_recovery_backpressure_seconds = 30U;
     bool intraday_store_maximum_records_set = false;
@@ -277,6 +278,8 @@ void PrintUsage(std::ostream& output) {
         << "                                1..4194304, default 65536\n"
         << "    --intraday-recovery-certified-high-watermark-percent N\n"
         << "                                51..89, default 75 (pause is 90)\n"
+        << "    --intraday-recovery-boundary-alignment-ms N\n"
+        << "                                1..60000, default 10000\n"
         << "Optional:\n"
         << "  --intraday-recovery-warmup-seconds N\n"
         << "                                1..86400, default 1800\n"
@@ -529,6 +532,8 @@ bool ParseOptions(
             option != "--intraday-recovery-journal-queue-records" &&
             option !=
                 "--intraday-recovery-certified-high-watermark-percent" &&
+            option !=
+                "--intraday-recovery-boundary-alignment-ms" &&
             option != "--intraday-recovery-warmup-seconds" &&
             option != "--intraday-recovery-backpressure-seconds" &&
             option != "--kline-windows-ms" &&
@@ -778,6 +783,22 @@ bool ParseOptions(
                 *error =
                     "--intraday-recovery-certified-high-watermark-percent "
                     "must be 51..89";
+                return false;
+            }
+            parsed.intraday_recovery_online_tuning_set = true;
+        } else if (
+            option ==
+            "--intraday-recovery-boundary-alignment-ms") {
+            if (!ParseU32(
+                    value,
+                    &parsed
+                         .intraday_recovery_boundary_alignment_ms) ||
+                parsed.intraday_recovery_boundary_alignment_ms == 0U ||
+                parsed.intraday_recovery_boundary_alignment_ms >
+                    60'000U) {
+                *error =
+                    "--intraday-recovery-boundary-alignment-ms must "
+                    "be 1..60000";
                 return false;
             }
             parsed.intraday_recovery_online_tuning_set = true;
@@ -2504,6 +2525,13 @@ int RunOnlineRecovery(
     replay_config.directory = options.intraday_recovery_csv_dir;
     replay_config.maximum_message_bytes =
         16U * 1024U * 1024U;
+    replay_config.boundary_alignment_timeout_ms =
+        options.intraday_recovery_boundary_alignment_ms;
+    // Keep a single alignment seam inside one tuple's retained overlap
+    // identity budget. This aggregate cap is deliberately conservative when
+    // both Shenzhen files contribute selected rows.
+    replay_config.maximum_boundary_alignment_records =
+        kOnlineRecoveryOverlapRetentionPerTuple;
     std::shared_ptr<recovery::StartupReplaySourceV1> replay_source;
     try {
         replay_source = std::make_shared<
@@ -3665,6 +3693,70 @@ int RunOnlineRecovery(
         << final_recovery.promotion_shadow_ingress_frontier
         << " csv_publications="
         << final_recovery.csv_publications
+        << " csv_alignment_phase="
+        << recovery::StartupReplayBoundaryAlignmentPhaseNameV1(
+               final_recovery.csv_boundary_alignment.phase)
+        << " csv_alignment_attempted="
+        << (final_recovery.csv_boundary_alignment.attempted
+                ? "true"
+                : "false")
+        << " csv_alignment_sealed="
+        << (final_recovery.csv_boundary_alignment.sealed
+                ? "true"
+                : "false")
+        << " csv_alignment_wait_ms="
+        << final_recovery.csv_boundary_alignment.waited_ms
+        << " csv_alignment_polls="
+        << final_recovery.csv_boundary_alignment.poll_count
+        << " csv_alignment_scanned_records="
+        << final_recovery.csv_boundary_alignment.scanned_records
+        << " csv_alignment_order_scanned_bytes="
+        << final_recovery.csv_boundary_alignment.order_scanned_bytes
+        << " csv_alignment_transaction_scanned_bytes="
+        << final_recovery.csv_boundary_alignment
+               .transaction_scanned_bytes
+        << " csv_alignment_records="
+        << final_recovery.csv_boundary_alignment.extension_records
+        << " csv_alignment_order_bytes="
+        << final_recovery.csv_boundary_alignment.order_extension_bytes
+        << " csv_alignment_transaction_bytes="
+        << final_recovery.csv_boundary_alignment
+               .transaction_extension_bytes
+        << " csv_alignment_pending_messages="
+        << final_recovery.csv_boundary_alignment.pending_messages
+        << " csv_alignment_pending_channels="
+        << final_recovery.csv_boundary_alignment.pending_channels
+        << " csv_alignment_order_mandatory_partial="
+        << (final_recovery.csv_boundary_alignment
+                    .order_mandatory_partial
+                ? "true"
+                : "false")
+        << " csv_alignment_transaction_mandatory_partial="
+        << (final_recovery.csv_boundary_alignment
+                    .transaction_mandatory_partial
+                ? "true"
+                : "false")
+        << " csv_alignment_representative_missing_channel="
+        << final_recovery.csv_boundary_alignment
+               .representative_missing_channel
+        << " csv_alignment_representative_missing_appl_seq="
+        << final_recovery.csv_boundary_alignment
+               .representative_missing_appl_seq
+        << " csv_order_initial_cut="
+        << final_recovery.csv_boundary_alignment.initial_order_cut
+        << " csv_order_sealed_cut="
+        << final_recovery.csv_boundary_alignment.sealed_order_cut
+        << " csv_order_available_end="
+        << final_recovery.csv_boundary_alignment.order_available_end
+        << " csv_transaction_initial_cut="
+        << final_recovery.csv_boundary_alignment
+               .initial_transaction_cut
+        << " csv_transaction_sealed_cut="
+        << final_recovery.csv_boundary_alignment
+               .sealed_transaction_cut
+        << " csv_transaction_available_end="
+        << final_recovery.csv_boundary_alignment
+               .transaction_available_end
         << " journal_suffix_publications="
         << final_recovery.journal_suffix_publications
         << " replay_throttle_events="

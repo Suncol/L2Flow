@@ -4,6 +4,7 @@
 
 #include "mdl_api.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -97,6 +98,7 @@ enum class StartupReplayErrorV1 : std::uint8_t {
     kSinkRejected,
     kResourceExhausted,
     kUnexpectedFailure,
+    kBoundaryAlignmentTimeout,
 };
 
 [[nodiscard]] std::string_view StartupReplayErrorNameV1(
@@ -108,13 +110,13 @@ struct StartupReplayConfigV1 final {
         StartupReplayMessageSetV1::kAll;
 
     // Each path is opened once and all reads stay on that retained descriptor.
-    // The initial fstat fixes its normal prefix. An incomplete header/data
-    // record or an initial cross-file root/child/native-sequence gap may take
-    // one later fstat on the same descriptor. Once that finite extension is
-    // selected, every complete row in it is consumed and validated; a record
-    // still lacking LF/CRLF at its end fails kIncompleteBoundary. Growth past
-    // the file's final selected prefix (initial, or the one later fstat) belongs
-    // to the live side of the closed handoff.
+    // The initial fstat fixes its normal prefix. Header and snapshot joins keep
+    // their legacy single bounded extension. Shenzhen 6.33/6.36 instead poll
+    // their retained descriptors under one fixed deadline and consume only the
+    // smallest complete-row prefixes needed to close the initial joint
+    // ApplSeqNum/partial-row obligations. A current fstat size is an available
+    // end, not a mandatory final cut; growth after the first closed joint
+    // prefix belongs to the live journal side of the handoff.
     std::uint64_t maximum_file_bytes =
         std::numeric_limits<std::uint64_t>::max();
     std::size_t maximum_record_bytes = 16U * 1024U * 1024U;
@@ -122,6 +124,62 @@ struct StartupReplayConfigV1 final {
     std::size_t maximum_message_bytes = 16U * 1024U * 1024U;
     std::size_t maximum_pending_messages = 2'000'000U;
     std::size_t maximum_pending_bytes = 512U * 1024U * 1024U;
+
+    // Zero performs one immediate Shenzhen boundary-alignment poll and then
+    // fails closed. Production online recovery normally supplies a positive
+    // timeout bounded by its overall warmup deadline. Progress/file growth
+    // never resets this hard deadline. These waits run only on the recovery
+    // thread; SDK callbacks and journal capture do not execute them.
+    std::uint64_t boundary_alignment_timeout_ms = 0U;
+    std::uint64_t boundary_alignment_initial_poll_ms = 2U;
+    std::uint64_t boundary_alignment_maximum_poll_ms = 20U;
+    std::size_t maximum_boundary_alignment_records = 2'000'000U;
+    std::uint64_t maximum_boundary_alignment_bytes =
+        512ULL * 1024ULL * 1024ULL;
+};
+
+enum class StartupReplayBoundaryAlignmentPhaseV1 : std::uint8_t {
+    kNotApplicable = 0U,
+    kInitialReplay,
+    kTailAligning,
+    kSealed,
+};
+
+[[nodiscard]] std::string_view StartupReplayBoundaryAlignmentPhaseNameV1(
+    StartupReplayBoundaryAlignmentPhaseV1 phase) noexcept;
+
+struct StartupReplayBoundaryAlignmentStatsV1 final {
+    StartupReplayBoundaryAlignmentPhaseV1 phase =
+        StartupReplayBoundaryAlignmentPhaseV1::kNotApplicable;
+    bool attempted = false;
+    bool sealed = false;
+    std::uint64_t waited_ms = 0U;
+    std::uint64_t poll_count = 0U;
+    // Scanned counters include complete provisional read-ahead records and
+    // repeated parsing of a growing partial row. Extension counters/cuts only
+    // include records selected into the sealed CSV prefix.
+    std::uint64_t scanned_records = 0U;
+    std::uint64_t order_scanned_bytes = 0U;
+    std::uint64_t transaction_scanned_bytes = 0U;
+    std::uint64_t extension_records = 0U;
+    std::uint64_t order_extension_bytes = 0U;
+    std::uint64_t transaction_extension_bytes = 0U;
+    std::uint64_t pending_messages = 0U;
+    std::uint64_t pending_channels = 0U;
+    std::uint64_t peak_pending_messages = 0U;
+    // ApplSeqNum values are channel-local and cannot be ordered globally.
+    // Use the lowest ChannelNo with pending messages as a stable diagnostic
+    // representative; this is not elapsed-time ordering across channels.
+    std::uint32_t representative_missing_channel = 0U;
+    std::uint64_t representative_missing_appl_seq = 0U;
+    std::uint64_t initial_order_cut = 0U;
+    std::uint64_t initial_transaction_cut = 0U;
+    std::uint64_t sealed_order_cut = 0U;
+    std::uint64_t sealed_transaction_cut = 0U;
+    std::uint64_t order_available_end = 0U;
+    std::uint64_t transaction_available_end = 0U;
+    bool order_mandatory_partial = false;
+    bool transaction_mandatory_partial = false;
 };
 
 struct StartupReplayPublicationV1 final {
@@ -145,6 +203,12 @@ struct StartupReplayPublicationV1 final {
     std::uint64_t csv_sequence = 0U;
     std::uint64_t provenance_flags = kStartupReplayProvenanceCsvV1;
     std::uint64_t market_notice_flags = 0U;
+};
+
+enum class StartupReplaySinkCallResultV1 : std::uint8_t {
+    kAccepted = 0U,
+    kRejected,
+    kDeadline,
 };
 
 class StartupReplaySinkV1 {
@@ -193,6 +257,35 @@ public:
         }
         return true;
     }
+
+    // Cold-path observation point called on Shenzhen phase transitions and
+    // immediately before each alignment fstat pair. It must not be used to
+    // infer a feeder barrier: the final replay result is authoritative. The
+    // default is a literal no-op.
+    virtual void ObserveBoundaryAlignment(
+        const StartupReplayBoundaryAlignmentStatsV1&) noexcept {}
+
+    // Deadline-aware cold-path variants used only while aligning a live CSV
+    // boundary. Implementations that can wait must honor the absolute steady
+    // deadline and return kDeadline without converting it into a sink failure.
+    // The defaults preserve source compatibility for nonblocking sinks.
+    [[nodiscard]] virtual StartupReplaySinkCallResultV1 PublishUntil(
+        const StartupReplayPublicationV1& publication,
+        std::chrono::steady_clock::time_point,
+        std::string* detail) noexcept {
+        return Publish(publication, detail)
+                   ? StartupReplaySinkCallResultV1::kAccepted
+                   : StartupReplaySinkCallResultV1::kRejected;
+    }
+
+    [[nodiscard]] virtual StartupReplaySinkCallResultV1
+    CooperativeCheckpointUntil(
+        std::chrono::steady_clock::time_point,
+        std::string* detail) noexcept {
+        return CooperativeCheckpoint(detail)
+                   ? StartupReplaySinkCallResultV1::kAccepted
+                   : StartupReplaySinkCallResultV1::kRejected;
+    }
 };
 
 struct StartupReplayCountsV1 final {
@@ -215,6 +308,7 @@ struct StartupReplayResultV1 final {
     std::filesystem::path error_file;
     std::uint64_t error_line = 0U;
     std::string detail;
+    StartupReplayBoundaryAlignmentStatsV1 boundary_alignment{};
 
     [[nodiscard]] bool ok() const noexcept {
         return error == StartupReplayErrorV1::kNone;

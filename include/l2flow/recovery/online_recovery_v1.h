@@ -168,6 +168,7 @@ struct OnlineRecoverySnapshotV1 final {
     std::uint64_t candidate_shadow_ingress_frontier = 0U;
     OnlineRecoveryPhaseV1 phase = OnlineRecoveryPhaseV1::kCreated;
     bool candidate_boundary_ready = false;
+    StartupReplayBoundaryAlignmentStatsV1 csv_boundary_alignment{};
 };
 
 struct OnlineRecoveryCandidateV1 final {
@@ -302,6 +303,17 @@ public:
         const l2flow::sdk::MessageKey& key,
         std::string* detail) noexcept override;
     [[nodiscard]] bool CooperativeCheckpoint(
+        std::string* detail) noexcept override;
+    void ObserveBoundaryAlignment(
+        const StartupReplayBoundaryAlignmentStatsV1& stats)
+        noexcept override;
+    [[nodiscard]] StartupReplaySinkCallResultV1 PublishUntil(
+        const StartupReplayPublicationV1& publication,
+        std::chrono::steady_clock::time_point deadline,
+        std::string* detail) noexcept override;
+    [[nodiscard]] StartupReplaySinkCallResultV1
+    CooperativeCheckpointUntil(
+        std::chrono::steady_clock::time_point deadline,
         std::string* detail) noexcept override;
     [[nodiscard]] bool Publish(
         const StartupReplayPublicationV1& publication,
