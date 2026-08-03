@@ -643,6 +643,9 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
             recovered.promotion_boundary_ready &&
             !recovered.promoted &&
             recovered.csv_publications == 1U &&
+            recovered.csv_publications_by_message.total() == 1U &&
+            recovered.csv_publications_by_message.shenzhen_transactions ==
+                1U &&
             recovered.journal_records_read == 2U &&
             recovered.journal_duplicates_suppressed == 1U &&
             recovered.journal_overlap_digests == 1U &&
@@ -716,6 +719,32 @@ void TestPromotionBoundaryAndTail(TestContext* test) {
                 market::IntradayInstrumentStoreQueryErrorV1::kNone &&
             final_row.record_count == 3U,
         "post-promotion authoritative Store continues on the journal suffix");
+}
+
+void TestPhaseNames(TestContext* test) {
+    using Phase = recovery::OnlineRecoveryPhaseV1;
+    test->Expect(
+        recovery::OnlineRecoveryPhaseNameV1(Phase::kCreated) ==
+                "created" &&
+            recovery::OnlineRecoveryPhaseNameV1(Phase::kCsvReplay) ==
+                "csv_replay" &&
+            recovery::OnlineRecoveryPhaseNameV1(
+                Phase::kCandidateCatchUp) == "candidate_catch_up" &&
+            recovery::OnlineRecoveryPhaseNameV1(Phase::kCandidateReady) ==
+                "candidate_ready" &&
+            recovery::OnlineRecoveryPhaseNameV1(
+                Phase::kPromotionFrozen) == "promotion_frozen" &&
+            recovery::OnlineRecoveryPhaseNameV1(Phase::kPromoted) ==
+                "promoted" &&
+            recovery::OnlineRecoveryPhaseNameV1(
+                Phase::kCleanShutdownTail) == "clean_shutdown_tail" &&
+            recovery::OnlineRecoveryPhaseNameV1(Phase::kEnded) ==
+                "ended" &&
+            recovery::OnlineRecoveryPhaseNameV1(Phase::kFailed) ==
+                "failed" &&
+            recovery::OnlineRecoveryPhaseNameV1(
+                static_cast<Phase>(255U)) == "unknown",
+        "online recovery phases have stable diagnostic names");
 }
 
 void TestPrePromotionCandidateCatchUpAndPhases(TestContext* test) {
@@ -2420,6 +2449,7 @@ void TestShanghaiDigestExcludesDecoderStatePhase(TestContext* test) {
 
 int main() {
     TestContext test;
+    TestPhaseNames(&test);
     TestPromotionBoundaryAndTail(&test);
     TestPrePromotionCandidateCatchUpAndPhases(&test);
     TestCsvAlignmentPhaseForwarding(&test);

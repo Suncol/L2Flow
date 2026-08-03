@@ -173,6 +173,31 @@ std::string_view OnlineRecoveryErrorNameV1(
     return "unknown";
 }
 
+std::string_view OnlineRecoveryPhaseNameV1(
+    OnlineRecoveryPhaseV1 phase) noexcept {
+    switch (phase) {
+        case OnlineRecoveryPhaseV1::kCreated:
+            return "created";
+        case OnlineRecoveryPhaseV1::kCsvReplay:
+            return "csv_replay";
+        case OnlineRecoveryPhaseV1::kCandidateCatchUp:
+            return "candidate_catch_up";
+        case OnlineRecoveryPhaseV1::kCandidateReady:
+            return "candidate_ready";
+        case OnlineRecoveryPhaseV1::kPromotionFrozen:
+            return "promotion_frozen";
+        case OnlineRecoveryPhaseV1::kPromoted:
+            return "promoted";
+        case OnlineRecoveryPhaseV1::kCleanShutdownTail:
+            return "clean_shutdown_tail";
+        case OnlineRecoveryPhaseV1::kEnded:
+            return "ended";
+        case OnlineRecoveryPhaseV1::kFailed:
+            return "failed";
+    }
+    return "unknown";
+}
+
 class OnlineRecoveryHandoffV1::Impl final {
 public:
     enum class HandoffPhase : std::uint8_t {
@@ -842,6 +867,30 @@ public:
             {
                 std::lock_guard<std::mutex> lock(snapshot_mutex_);
                 ++snapshot_.csv_publications;
+                switch (*tuple) {
+                    case 0U:
+                        ++snapshot_.csv_publications_by_message
+                              .shanghai_snapshots;
+                        break;
+                    case 1U:
+                        ++snapshot_.csv_publications_by_message
+                              .shanghai_ticks;
+                        break;
+                    case 2U:
+                        ++snapshot_.csv_publications_by_message
+                              .shenzhen_snapshots;
+                        break;
+                    case 3U:
+                        ++snapshot_.csv_publications_by_message
+                              .shenzhen_orders;
+                        break;
+                    case 4U:
+                        ++snapshot_.csv_publications_by_message
+                              .shenzhen_transactions;
+                        break;
+                    default:
+                        break;
+                }
                 if (ingress.error ==
                     runtime::RealtimePipelineIngressErrorV1::
                         kFilteredNonAShare) {

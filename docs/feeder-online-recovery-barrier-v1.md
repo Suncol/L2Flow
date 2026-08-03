@@ -13,6 +13,22 @@ side-channel ACK 伪装成已经实现的 barrier。
 超时则拒绝 promotion。它解决独立 current-EOF 把接缝持续向前推进的问题，但
 不证明超时缺项是永久丢失。
 
+### 1.1 当前实盘连接证据
+
+2026-08-03 本机部署的 `feeder_client -v` 报告版本 `213234`。实际
+`feeder_client.cfg` 将 TCP publisher 绑定到 `0.0.0.0:9112`；L2Flow 使用
+MDL SDK 从 `127.0.0.1:9112` 登录后，feeder 明确返回
+`4.101.4/4.101.24/6.101.28/6.101.33/6.101.36 subscribe ok`。同一配置的
+`msg_backup.BackupDir` 是 `msg_backup`、`Encoding` 是 5；当天
+`mdl_6_33_0.csv` 与 `mdl_6_36_0.csv` 在连接期间持续 append。
+
+配置中的 `msg_backup.WriteFileState` 当前为 `false`，但配套 17 页
+`feeder_client_doc.pdf` 没有定义该字段语义，而且上述 CSV 实际持续增长；因此
+不能把这个字段解释成“禁用 CSV writer”或任何 flush/barrier 能力。提供的 cfg、
+PDF、日志和二进制命令行也没有给出可互操作的 ordered-marker、writer ACK 或
+manifest 请求/响应合约。这里的证据只确认现有 SDK 行情连接和 append 文件
+路径，不能据此声称 feeder 已实现本文后续设计。
+
 ## 2. 因果顺序
 
 feeder 必须在一个能够证明所有边界前任务已经完成路由的有序点选择边界。

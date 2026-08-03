@@ -195,6 +195,7 @@ struct Options final {
     std::uint32_t
         intraday_recovery_certified_high_watermark_percent = 75U;
     std::uint32_t intraday_recovery_boundary_alignment_ms = 10'000U;
+    std::uint32_t intraday_recovery_progress_interval_seconds = 10U;
     std::uint32_t intraday_recovery_warmup_seconds = 30U * 60U;
     std::uint32_t intraday_recovery_backpressure_seconds = 30U;
     bool intraday_store_maximum_records_set = false;
@@ -280,6 +281,9 @@ void PrintUsage(std::ostream& output) {
         << "                                51..89, default 75 (pause is 90)\n"
         << "    --intraday-recovery-boundary-alignment-ms N\n"
         << "                                1..60000, default 10000\n"
+        << "    --intraday-recovery-progress-interval-seconds N\n"
+        << "                                1..3600, default 10; structured "
+           "cold-path progress log\n"
         << "Optional:\n"
         << "  --intraday-recovery-warmup-seconds N\n"
         << "                                1..86400, default 1800\n"
@@ -534,6 +538,8 @@ bool ParseOptions(
                 "--intraday-recovery-certified-high-watermark-percent" &&
             option !=
                 "--intraday-recovery-boundary-alignment-ms" &&
+            option !=
+                "--intraday-recovery-progress-interval-seconds" &&
             option != "--intraday-recovery-warmup-seconds" &&
             option != "--intraday-recovery-backpressure-seconds" &&
             option != "--kline-windows-ms" &&
@@ -799,6 +805,22 @@ bool ParseOptions(
                 *error =
                     "--intraday-recovery-boundary-alignment-ms must "
                     "be 1..60000";
+                return false;
+            }
+            parsed.intraday_recovery_online_tuning_set = true;
+        } else if (
+            option ==
+            "--intraday-recovery-progress-interval-seconds") {
+            if (!ParseU32(
+                    value,
+                    &parsed
+                         .intraday_recovery_progress_interval_seconds) ||
+                parsed.intraday_recovery_progress_interval_seconds == 0U ||
+                parsed.intraday_recovery_progress_interval_seconds >
+                    3'600U) {
+                *error =
+                    "--intraday-recovery-progress-interval-seconds must "
+                    "be 1..3600";
                 return false;
             }
             parsed.intraday_recovery_online_tuning_set = true;
@@ -1271,12 +1293,15 @@ void ReportFatalSnapshot(
 }
 
 bool EventAggregatorProbeErrorIsRetryable(
-    ipc::OrderEventDeltaControlClientErrorV1 error) noexcept {
+    ipc::OrderEventDeltaControlClientErrorV1 error,
+    int system_error) noexcept {
     using Error = ipc::OrderEventDeltaControlClientErrorV1;
     return error == Error::kConnectFailed ||
            error == Error::kTimeout ||
            error == Error::kTransportFailed ||
-           error == Error::kUnavailable;
+           error == Error::kUnavailable ||
+           (error == Error::kSocketPathInvalid &&
+            system_error == ENOENT);
 }
 
 ipc::OrderEventDeltaControlClientConfigV1
@@ -1413,7 +1438,8 @@ bool WaitForEventAggregatorReady(
         }
         last_error = probe_error;
         last_system_error = system_error;
-        if (!EventAggregatorProbeErrorIsRetryable(probe_error)) {
+        if (!EventAggregatorProbeErrorIsRetryable(
+                probe_error, system_error)) {
             *output_detail =
                 "READY probe failed: error=" +
                 std::string(
@@ -3457,6 +3483,18 @@ int RunOnlineRecovery(
         << " startup_lag_records="
         << post_start_health.preview_lag_records
         << '\n';
+
+    const auto recovery_progress_interval =
+        std::chrono::seconds(
+            options.intraday_recovery_progress_interval_seconds);
+    const auto recovery_progress_started =
+        std::chrono::steady_clock::now();
+    auto recovery_progress_last_sample =
+        recovery_progress_started;
+    auto recovery_progress_next_sample =
+        recovery_progress_started + recovery_progress_interval;
+    recovery::OnlineRecoverySnapshotV1
+        recovery_progress_last_snapshot = handoff->Snapshot();
     release_recovery_start();
 
     int exit_code = 0;
@@ -3496,6 +3534,225 @@ int RunOnlineRecovery(
             break;
         }
         if (!online_state.promoted.load(std::memory_order_acquire)) {
+            const auto progress_now =
+                std::chrono::steady_clock::now();
+            if (progress_now >= recovery_progress_next_sample) {
+                const recovery::OnlineRecoverySnapshotV1
+                    recovery_snapshot = handoff->Snapshot();
+                const runtime::RealtimePipelineLiveStatusV1
+                    preview_status = preview_pipeline->LiveStatus();
+                const runtime::RealtimePipelineLiveStatusV1
+                    shadow_status = shadow_pipeline->LiveStatus();
+                const auto sample_ms_count =
+                    std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        progress_now -
+                        recovery_progress_last_sample)
+                        .count();
+                const std::uint64_t sample_ms =
+                    sample_ms_count > 0
+                        ? static_cast<std::uint64_t>(sample_ms_count)
+                        : 1U;
+                const auto elapsed_ms_count =
+                    std::chrono::duration_cast<
+                        std::chrono::milliseconds>(
+                        progress_now - recovery_progress_started)
+                        .count();
+                const std::uint64_t elapsed_ms =
+                    elapsed_ms_count > 0
+                        ? static_cast<std::uint64_t>(elapsed_ms_count)
+                        : 0U;
+                const auto difference = [](
+                                            std::uint64_t current,
+                                            std::uint64_t previous) noexcept {
+                    return current >= previous
+                               ? current - previous
+                               : 0U;
+                };
+                const auto rate_per_second =
+                    [sample_ms, &difference](
+                        std::uint64_t current,
+                        std::uint64_t previous) noexcept {
+                        const std::uint64_t delta =
+                            difference(current, previous);
+                        if (delta >
+                            std::numeric_limits<std::uint64_t>::max() /
+                                1'000U) {
+                            return std::numeric_limits<std::uint64_t>::max();
+                        }
+                        return (delta * 1'000U) / sample_ms;
+                    };
+                const recovery::StartupReplayCountsV1& csv_counts =
+                    recovery_snapshot.csv_publications_by_message;
+                const recovery::StartupReplayCountsV1& prior_csv_counts =
+                    recovery_progress_last_snapshot
+                        .csv_publications_by_message;
+                const recovery::StartupReplayBoundaryAlignmentStatsV1&
+                    alignment =
+                        recovery_snapshot.csv_boundary_alignment;
+
+                ipc::RealtimeCertifiedServiceSnapshotV1
+                    certified_snapshot{};
+                std::uint64_t certified_pending = 0U;
+                if (certified_service != nullptr) {
+                    certified_snapshot = certified_service->Snapshot();
+                    const std::uint64_t maximum =
+                        std::numeric_limits<std::uint64_t>::max();
+                    const std::uint64_t certified_enqueued =
+                        certified_snapshot.enqueued_observations >
+                                maximum -
+                                    certified_snapshot
+                                        .enqueued_applied_records
+                            ? maximum
+                            : certified_snapshot.enqueued_observations +
+                                  certified_snapshot
+                                      .enqueued_applied_records;
+                    certified_pending = difference(
+                        certified_enqueued,
+                        certified_snapshot.processed_handoffs);
+                }
+
+                std::cerr
+                    << "mdl-production-router: online recovery progress: "
+                    << "schema=1"
+                    << " elapsed_ms=" << elapsed_ms
+                    << " warmup_budget_seconds="
+                    << options.intraday_recovery_warmup_seconds
+                    << " phase="
+                    << recovery::OnlineRecoveryPhaseNameV1(
+                           recovery_snapshot.phase)
+                    << " error="
+                    << recovery::OnlineRecoveryErrorNameV1(
+                           recovery_snapshot.error)
+                    << " csv_complete="
+                    << (recovery_snapshot.csv_complete ? "true" : "false")
+                    << " csv_publications="
+                    << recovery_snapshot.csv_publications
+                    << " csv_rate_records_per_second="
+                    << rate_per_second(
+                           recovery_snapshot.csv_publications,
+                           recovery_progress_last_snapshot
+                               .csv_publications)
+                    << " csv_shanghai_snapshots="
+                    << csv_counts.shanghai_snapshots
+                    << " csv_delta_shanghai_snapshots="
+                    << difference(
+                           csv_counts.shanghai_snapshots,
+                           prior_csv_counts.shanghai_snapshots)
+                    << " csv_shanghai_ticks="
+                    << csv_counts.shanghai_ticks
+                    << " csv_delta_shanghai_ticks="
+                    << difference(
+                           csv_counts.shanghai_ticks,
+                           prior_csv_counts.shanghai_ticks)
+                    << " csv_shenzhen_snapshots="
+                    << csv_counts.shenzhen_snapshots
+                    << " csv_delta_shenzhen_snapshots="
+                    << difference(
+                           csv_counts.shenzhen_snapshots,
+                           prior_csv_counts.shenzhen_snapshots)
+                    << " csv_shenzhen_orders="
+                    << csv_counts.shenzhen_orders
+                    << " csv_delta_shenzhen_orders="
+                    << difference(
+                           csv_counts.shenzhen_orders,
+                           prior_csv_counts.shenzhen_orders)
+                    << " csv_shenzhen_transactions="
+                    << csv_counts.shenzhen_transactions
+                    << " csv_delta_shenzhen_transactions="
+                    << difference(
+                           csv_counts.shenzhen_transactions,
+                           prior_csv_counts.shenzhen_transactions)
+                    << " csv_filtered="
+                    << recovery_snapshot.csv_filtered_publications
+                    << " csv_parser_checkpoints="
+                    << recovery_snapshot.csv_parser_checkpoint_events
+                    << " preview_accepted="
+                    << preview_status.processing_progress.accepted_sequence
+                    << " preview_applied="
+                    << preview_status.processing_progress.applied_sequence
+                    << " preview_lag="
+                    << preview_status.processing_progress
+                           .processing_lag_records()
+                    << " shadow_accepted="
+                    << shadow_status.processing_progress.accepted_sequence
+                    << " shadow_applied="
+                    << shadow_status.processing_progress.applied_sequence
+                    << " shadow_lag="
+                    << shadow_status.processing_progress
+                           .processing_lag_records()
+                    << " journal_accepted="
+                    << journal_snapshot.accepted_serial
+                    << " journal_committed="
+                    << journal_snapshot.committed_serial
+                    << " journal_consumed="
+                    << recovery_snapshot.last_journal_serial
+                    << " journal_durable_backlog="
+                    << difference(
+                           journal_snapshot.accepted_serial,
+                           journal_snapshot.committed_serial)
+                    << " journal_capture_backlog="
+                    << difference(
+                           journal_snapshot.accepted_serial,
+                           recovery_snapshot.last_journal_serial)
+                    << " candidate_ready="
+                    << (recovery_snapshot.candidate_boundary_ready
+                            ? "true"
+                            : "false")
+                    << " candidate_journal_frontier="
+                    << recovery_snapshot.candidate_journal_frontier
+                    << " candidate_shadow_frontier="
+                    << recovery_snapshot
+                           .candidate_shadow_ingress_frontier
+                    << " promotion_boundary_ready="
+                    << (recovery_snapshot.promotion_boundary_ready
+                            ? "true"
+                            : "false")
+                    << " alignment_phase="
+                    << recovery::
+                           StartupReplayBoundaryAlignmentPhaseNameV1(
+                               alignment.phase)
+                    << " alignment_attempted="
+                    << (alignment.attempted ? "true" : "false")
+                    << " alignment_sealed="
+                    << (alignment.sealed ? "true" : "false")
+                    << " alignment_wait_ms=" << alignment.waited_ms
+                    << " alignment_pending_messages="
+                    << alignment.pending_messages
+                    << " alignment_pending_channels="
+                    << alignment.pending_channels
+                    << " alignment_missing_channel="
+                    << alignment.representative_missing_channel
+                    << " alignment_missing_appl_seq="
+                    << alignment.representative_missing_appl_seq
+                    << " order_initial_cut="
+                    << alignment.initial_order_cut
+                    << " order_sealed_cut="
+                    << alignment.sealed_order_cut
+                    << " transaction_initial_cut="
+                    << alignment.initial_transaction_cut
+                    << " transaction_sealed_cut="
+                    << alignment.sealed_transaction_cut
+                    << " certified_enabled="
+                    << (certified_service != nullptr ? "true" : "false")
+                    << " certified_worker_running="
+                    << (certified_snapshot.worker_running
+                            ? "true"
+                            : "false")
+                    << " certified_pending=" << certified_pending
+                    << " certified_gap_open_channels="
+                    << certified_snapshot.gap_open_channel_count
+                    << " certified_catching_up_channels="
+                    << certified_snapshot.catching_up_channel_count
+                    << " certified_frozen_channels="
+                    << certified_snapshot.frozen_channel_count
+                    << '\n';
+
+                recovery_progress_last_snapshot = recovery_snapshot;
+                recovery_progress_last_sample = progress_now;
+                recovery_progress_next_sample =
+                    progress_now + recovery_progress_interval;
+            }
             continue;
         }
         const runtime::RealtimePipelineCutResultV1 cut =
@@ -3693,6 +3950,17 @@ int RunOnlineRecovery(
         << final_recovery.promotion_shadow_ingress_frontier
         << " csv_publications="
         << final_recovery.csv_publications
+        << " csv_shanghai_snapshots="
+        << final_recovery.csv_publications_by_message.shanghai_snapshots
+        << " csv_shanghai_ticks="
+        << final_recovery.csv_publications_by_message.shanghai_ticks
+        << " csv_shenzhen_snapshots="
+        << final_recovery.csv_publications_by_message.shenzhen_snapshots
+        << " csv_shenzhen_orders="
+        << final_recovery.csv_publications_by_message.shenzhen_orders
+        << " csv_shenzhen_transactions="
+        << final_recovery.csv_publications_by_message
+               .shenzhen_transactions
         << " csv_alignment_phase="
         << recovery::StartupReplayBoundaryAlignmentPhaseNameV1(
                final_recovery.csv_boundary_alignment.phase)

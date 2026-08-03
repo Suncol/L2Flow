@@ -60,6 +60,9 @@ enum class OnlineRecoveryPhaseV1 : std::uint8_t {
     kFailed,
 };
 
+[[nodiscard]] std::string_view OnlineRecoveryPhaseNameV1(
+    OnlineRecoveryPhaseV1 phase) noexcept;
+
 struct OnlineRecoveryConfigV1 final {
     std::shared_ptr<MdlLiveJournalV1> live_journal;
     std::shared_ptr<StartupReplaySourceV1> csv_replay_source;
@@ -135,6 +138,9 @@ struct OnlineRecoveryConfigV1 final {
 struct OnlineRecoverySnapshotV1 final {
     OnlineRecoveryErrorV1 error = OnlineRecoveryErrorV1::kNone;
     std::uint64_t csv_publications = 0U;
+    // Named counters let cold-path operators see which physical replay tuple
+    // is advancing without inferring progress from RSS or retained fd offsets.
+    StartupReplayCountsV1 csv_publications_by_message{};
     std::uint64_t csv_filtered_publications = 0U;
     std::uint64_t journal_records_read = 0U;
     std::uint64_t journal_duplicates_suppressed = 0U;

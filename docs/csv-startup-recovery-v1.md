@@ -601,7 +601,8 @@ build/mdl-production-router \
   --intraday-store-memory-gib 64 \
   --intraday-recovery-csv-dir /absolute/path/to/20260730 \
   --intraday-recovery-journal-dir /absolute/path/to/empty-journal \
-  --intraday-recovery-boundary-alignment-ms 10000
+  --intraday-recovery-boundary-alignment-ms 10000 \
+  --intraday-recovery-progress-interval-seconds 10
 ```
 
 总 warmup 和 shadow/replay 单条 admission 等待分别使用
@@ -610,6 +611,20 @@ build/mdl-production-router \
 深圳双文件接缝有界等待使用
 `--intraday-recovery-boundary-alignment-ms`（默认 10,000）；它不会因文件
 继续增长而延长，也不能超过总 warmup deadline。
+production 在 promotion 前按
+`--intraday-recovery-progress-interval-seconds`（默认 10，范围 1..3,600）输出
+一行 `online recovery progress` 结构化日志。日志包含 coordinator phase、五个
+物理 tuple 的累计与区间 publication、CSV parser checkpoint、preview/shadow
+accepted/applied/lag、journal accepted/committed/consumed/backlog、candidate
+frontier、深圳 alignment pending/cut，以及启用时的 CERTIFIED queue/channel
+状态。采样只读取现有冷路径快照，不在 SDK callback 或 CSV 每行路径打印日志。
+
+该日志刻意不输出“CSV 完成百分比”。reader 使用 retained descriptor 上的
+`pread()`，内核 fd position 不表示 parser cursor；活跃文件还会继续增长，且
+严格 `sealed_cut` 只有在联合连续前缀闭合后才成立。运行中可以据 phase、各
+tuple publication 增量与处理速率判断实际推进位置，但不能把文件当前大小、
+RSS 或经验吞吐换算成完整性百分比。`alignment_sealed=true` 也只证明 reader
+fallback 的本次接缝已闭合，不是 feeder ordered-marker/ACK/manifest 证明。
 CSV、candidate journal wait、applied wait、probe、cut 和 final commit 的所有
 可取消等待共享同一个 steady-clock absolute warmup deadline，candidate retry
 不会重置预算。这个 deadline 不是对任意用户 calculator 或 lifecycle syscall 的
