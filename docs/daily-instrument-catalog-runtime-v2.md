@@ -1,4 +1,4 @@
-# Daily Instrument Catalog Runtime V2.4
+# Daily Instrument Catalog Runtime V2.5
 
 ## Session contract
 
@@ -24,12 +24,12 @@ coverage declaration, ordered identities, metadata, and external IDs.
 Shanghai+Shenzhen A-share scope. It says nothing about other products,
 complete-from-open history, or data availability for each identity.
 
-Wire V2.4 retains `LIVE_PARTIAL` and the explicit coverage/recovery/full-day/
-CERTIFIED-prefix header flags introduced by V2.3, and adds process-start KLine
-coverage metadata and per-bar coverage flags while retaining the dense-catalog
-contract. Readers validate the exact supported minor and invalid state/flag
-combinations, so producer, C reader, and Python client must be upgraded
-together rather than treating V2.4 as an ignorable V2.3 extension.
+Wire V2.5 retains `LIVE_PARTIAL`, the explicit coverage/recovery/full-day/
+CERTIFIED-prefix header flags, and the V2.4 process-start KLine metadata. It
+adds a session-wide History coverage kind and process-start boundary that do
+not depend on KLine being enabled. Readers validate the exact supported minor
+and invalid state/flag combinations, so producer, C reader, and Python client
+must be upgraded together rather than treating V2.5 as an ignorable extension.
 
 ## Startup order
 
@@ -37,7 +37,7 @@ together rather than treating V2.4 as an ignorable V2.3 extension.
 load and validate strict premarket file
   -> classify A shares, sort, deduplicate, assign dense IDs, hash, freeze
   -> allocate dense runtime availability state and Store
-  -> create Wire V2.4 mapping
+  -> create Wire V2.5 mapping
   -> prepublish every BOUND_NO_DATA identity and exact key
   -> IPC ACTIVE
   -> order-event aggregator READY (when configured)
@@ -158,7 +158,7 @@ Reader selections are:
 
 The historical `BOUND` and `OBSERVED_ANY` names remain source aliases only;
 Wire V2.2+ readers validate the daily scope and reject legacy/incomplete
-catalogs. Wire V2.4 `LIVE_PARTIAL` changes coverage/query semantics, not this
+catalogs. Wire V2.5 `LIVE_PARTIAL` changes coverage/query semantics, not this
 immutable catalog rule: preview mappings also prepublish the complete daily
 identity table before their latest-value control plane starts.
 
@@ -183,9 +183,13 @@ and accepted/applied distance. Queue publication timestamps are sampled
 immediately before the irreversible accepted commit; all operations after
 commit are non-throwing atomic publication/notification.
 
-This version intentionally does not add Parquet/Arrow output or turn same-day
-vendor-CSV bootstrap into arbitrary-checkpoint replay, ring-overrun catch-up,
-or previous-process recovery. Online recovery has a session-local live WAL,
-but a new process requires an empty journal directory and does not resume old
+The core C++/Wire runtime intentionally does not publish Parquet or Arrow.
+The optional Python Polars layer can materialize owned DataFrames and export
+an atomic Parquet snapshot, but that export is not native History retention,
+automatic spill/eviction, or crash-durable storage. This version also does not
+turn same-day vendor-CSV bootstrap into arbitrary-checkpoint replay or
+previous-process recovery. Online recovery has a session-local live WAL, but
+a new process requires an empty journal directory and does not resume old
 segments. See `csv-startup-recovery-v1.md` for the distinction between the
-normal, online preview, and recovered shadow callback paths.
+normal, online preview, and recovered shadow callback paths, and
+`polars-live-history-v1.md` for the separate Python cache contract.

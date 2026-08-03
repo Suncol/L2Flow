@@ -18,7 +18,10 @@ inline constexpr std::array<std::uint8_t, 8U>
     kCertifiedOrderEventMagicV1{
         'L', '2', 'F', 'C', 'E', 'V', 'T', '1'};
 inline constexpr std::uint16_t kCertifiedOrderEventWireMajorV1 = 1U;
-inline constexpr std::uint16_t kCertifiedOrderEventWireMinorV1 = 1U;
+// V1.2 retains every mapping size/offset but requires derived row schema 2,
+// whose former reserved bytes carry explicit source-tick event identity.
+// Exact-minor readers fail closed on a V1.1 mapping.
+inline constexpr std::uint16_t kCertifiedOrderEventWireMinorV1 = 2U;
 inline constexpr std::uint32_t kCertifiedOrderEventEndianMarkerV1 =
     0x01020304U;
 inline constexpr std::uint32_t kCertifiedOrderEventHeaderBytesV1 =

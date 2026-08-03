@@ -60,10 +60,25 @@ static_assert(
     offsetof(l2flow_kline_coverage_info_v2, coverage_kind) == 16U);
 static_assert(
     offsetof(l2flow_kline_coverage_info_v2, reserved) == 24U);
+static_assert(sizeof(l2flow_history_coverage_info_v2) == 32U);
+static_assert(
+    offsetof(l2flow_history_coverage_info_v2, session_epoch) == 0U);
+static_assert(
+    offsetof(
+        l2flow_history_coverage_info_v2,
+        coverage_start_unix_ns) == 8U);
+static_assert(
+    offsetof(l2flow_history_coverage_info_v2, coverage_kind) == 16U);
+static_assert(
+    offsetof(l2flow_history_coverage_info_v2, reserved) == 24U);
 static_assert(L2FLOW_KLINE_COVERAGE_DISABLED_V2 == 0);
 static_assert(L2FLOW_KLINE_COVERAGE_FROM_OPEN_V2 == 1);
 static_assert(
     L2FLOW_KLINE_COVERAGE_PROCESS_START_PARTIAL_V2 == 2);
+static_assert(L2FLOW_HISTORY_COVERAGE_UNAVAILABLE_V2 == 0);
+static_assert(L2FLOW_HISTORY_COVERAGE_FROM_OPEN_V2 == 1);
+static_assert(
+    L2FLOW_HISTORY_COVERAGE_PROCESS_START_PARTIAL_V2 == 2);
 static_assert(
     static_cast<std::uint32_t>(
         L2FLOW_KLINE_PROCESS_START_PARTIAL_V2) ==
@@ -370,6 +385,14 @@ enum class KLineCoverageContractState : std::uint8_t {
     kProcessStartPartial,
 };
 
+enum class HistoryCoverageContractState : std::uint8_t {
+    kInvalid = 0U,
+    kUnavailable,
+    kFromOpen,
+    kProcessStartUnprepared,
+    kProcessStartPartial,
+};
+
 [[nodiscard]] KLineCoverageContractState
 EvaluateKLineCoverageContract(
     const RealtimeWireHeaderV2& header,
@@ -414,6 +437,60 @@ EvaluateKLineCoverageContract(
         return KLineCoverageContractState::kInvalid;
     }
     return KLineCoverageContractState::kProcessStartPartial;
+}
+
+[[nodiscard]] HistoryCoverageContractState
+EvaluateHistoryCoverageContract(
+    const RealtimeWireHeaderV2& header,
+    std::uint32_t state,
+    std::uint32_t flags,
+    std::uint32_t coverage_kind,
+    std::uint64_t coverage_start_unix_ns) noexcept {
+    if (!StateFlagsValid(state, flags) ||
+        header.reserved_history_coverage != 0U) {
+        return HistoryCoverageContractState::kInvalid;
+    }
+    const bool from_open =
+        (flags & l2flow::ipc::kRealtimeHeaderCoverageFromOpenV2) != 0U;
+    switch (static_cast<
+                l2flow::ipc::RealtimeHistoryTemporalCoverageV2>(
+        coverage_kind)) {
+        case l2flow::ipc::RealtimeHistoryTemporalCoverageV2::
+            kUnavailable:
+            return !from_open && coverage_start_unix_ns == 0U &&
+                           state != static_cast<std::uint32_t>(
+                                        RealtimeServerStateV2::kActive)
+                       ? HistoryCoverageContractState::kUnavailable
+                       : HistoryCoverageContractState::kInvalid;
+        case l2flow::ipc::RealtimeHistoryTemporalCoverageV2::
+            kFromOpen:
+            return from_open && coverage_start_unix_ns == 0U &&
+                           state != static_cast<std::uint32_t>(
+                                        RealtimeServerStateV2::
+                                            kLivePartial)
+                       ? HistoryCoverageContractState::kFromOpen
+                       : HistoryCoverageContractState::kInvalid;
+        case l2flow::ipc::RealtimeHistoryTemporalCoverageV2::
+            kProcessStartPartial:
+            break;
+        default:
+            return HistoryCoverageContractState::kInvalid;
+    }
+    if (from_open ||
+        state == static_cast<std::uint32_t>(
+                     RealtimeServerStateV2::kActive)) {
+        return HistoryCoverageContractState::kInvalid;
+    }
+    if (coverage_start_unix_ns == 0U) {
+        return HistoryCoverageContractState::kProcessStartUnprepared;
+    }
+    std::uint32_t boundary_trade_date = 0U;
+    if (!FixedUtc8TradeDateFromUnixNs(
+            coverage_start_unix_ns, &boundary_trade_date) ||
+        boundary_trade_date != header.trade_date) {
+        return HistoryCoverageContractState::kInvalid;
+    }
+    return HistoryCoverageContractState::kProcessStartPartial;
 }
 
 bool HealthyForRead(const RealtimeWireHeaderV2& header) noexcept {
@@ -1779,6 +1856,12 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
     const std::uint64_t initial_kline_coverage_start_unix_ns =
         Atomic(header->kline_coverage_start_unix_ns)
             .load(std::memory_order_acquire);
+    const std::uint32_t initial_history_coverage_kind =
+        Atomic(header->history_coverage_kind)
+            .load(std::memory_order_acquire);
+    const std::uint64_t initial_history_coverage_start_unix_ns =
+        Atomic(header->history_coverage_start_unix_ns)
+            .load(std::memory_order_acquire);
     const std::uint64_t capacity = header->capacity;
     const std::uint64_t window_count = header->window_count;
     const std::uint64_t maximum =
@@ -1845,6 +1928,13 @@ extern "C" int l2flow_shm_reader_open_fd_v2(
             initial_kline_generation,
             initial_kline_coverage_start_unix_ns) !=
             KLineCoverageContractState::kInvalid &&
+        EvaluateHistoryCoverageContract(
+            *header,
+            initial_state,
+            initial_flags,
+            initial_history_coverage_kind,
+            initial_history_coverage_start_unix_ns) !=
+            HistoryCoverageContractState::kInvalid &&
         ((header->window_count != 0U) ==
          ((initial_flags &
            l2flow::ipc::kRealtimeHeaderKLineEnabledV2) != 0U)) &&
@@ -2079,6 +2169,12 @@ extern "C" int l2flow_shm_reader_session_v2(
     const std::uint64_t coverage_start_unix_ns =
         Atomic(reader->header->kline_coverage_start_unix_ns)
             .load(std::memory_order_acquire);
+    const std::uint32_t history_coverage_kind =
+        Atomic(reader->header->history_coverage_kind)
+            .load(std::memory_order_acquire);
+    const std::uint64_t history_coverage_start_unix_ns =
+        Atomic(reader->header->history_coverage_start_unix_ns)
+            .load(std::memory_order_acquire);
     if (EvaluateKLineCoverageContract(
             *reader->header,
             result.server_state,
@@ -2086,6 +2182,13 @@ extern "C" int l2flow_shm_reader_session_v2(
             result.kline_generation,
             coverage_start_unix_ns) ==
             KLineCoverageContractState::kInvalid ||
+        EvaluateHistoryCoverageContract(
+            *reader->header,
+            result.server_state,
+            result.flags,
+            history_coverage_kind,
+            history_coverage_start_unix_ns) ==
+            HistoryCoverageContractState::kInvalid ||
         result.tick_contiguous_published_sequence >
             result.tick_highest_published_sequence) {
         return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
@@ -2190,6 +2293,75 @@ extern "C" int l2flow_shm_reader_kline_coverage_v2(
                 break;
             case KLineCoverageContractState::kInvalid:
             case KLineCoverageContractState::kProcessStartUnprepared:
+                return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
+        }
+        *output = result;
+        return L2FLOW_SHM_READER_OK_V2;
+    }
+    return L2FLOW_SHM_READER_INCONSISTENT_READ_V2;
+}
+
+extern "C" int l2flow_shm_reader_history_coverage_v2(
+    const l2flow_shm_reader_v2* reader,
+    l2flow_history_coverage_info_v2* output) {
+    if (reader == nullptr || output == nullptr) {
+        return L2FLOW_SHM_READER_INVALID_ARGUMENT_V2;
+    }
+    for (std::size_t attempt = 0U; attempt < kReadAttempts;
+         ++attempt) {
+        const std::uint32_t state_begin =
+            Atomic(reader->header->server_state)
+                .load(std::memory_order_acquire);
+        const std::uint32_t flags =
+            Atomic(reader->header->flags)
+                .load(std::memory_order_acquire);
+        const std::uint32_t coverage_kind =
+            Atomic(reader->header->history_coverage_kind)
+                .load(std::memory_order_acquire);
+        const std::uint64_t coverage_start_unix_ns =
+            Atomic(reader->header->history_coverage_start_unix_ns)
+                .load(std::memory_order_acquire);
+        const std::uint32_t state_end =
+            Atomic(reader->header->server_state)
+                .load(std::memory_order_acquire);
+        if (state_begin != state_end) {
+            continue;
+        }
+        const HistoryCoverageContractState coverage =
+            EvaluateHistoryCoverageContract(
+                *reader->header,
+                state_end,
+                flags,
+                coverage_kind,
+                coverage_start_unix_ns);
+        if (coverage == HistoryCoverageContractState::kInvalid) {
+            return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
+        }
+        if (coverage ==
+            HistoryCoverageContractState::
+                kProcessStartUnprepared) {
+            return L2FLOW_SHM_READER_UNAVAILABLE_V2;
+        }
+        l2flow_history_coverage_info_v2 result{};
+        result.session_epoch = reader->header->session_epoch;
+        result.coverage_start_unix_ns = coverage_start_unix_ns;
+        switch (coverage) {
+            case HistoryCoverageContractState::kUnavailable:
+                result.coverage_kind =
+                    L2FLOW_HISTORY_COVERAGE_UNAVAILABLE_V2;
+                break;
+            case HistoryCoverageContractState::kFromOpen:
+                result.coverage_kind =
+                    L2FLOW_HISTORY_COVERAGE_FROM_OPEN_V2;
+                break;
+            case HistoryCoverageContractState::
+                kProcessStartPartial:
+                result.coverage_kind =
+                    L2FLOW_HISTORY_COVERAGE_PROCESS_START_PARTIAL_V2;
+                break;
+            case HistoryCoverageContractState::kInvalid:
+            case HistoryCoverageContractState::
+                kProcessStartUnprepared:
                 return L2FLOW_SHM_READER_LAYOUT_INVALID_V2;
         }
         *output = result;

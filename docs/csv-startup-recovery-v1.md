@@ -470,7 +470,7 @@ CSV 错误可定位时包含文件和行号。
 | `record_coverage_complete` | 某个已发布 immutable generation/cursor 包含本进程在其 cut 范围内应有的全部 Store record | 载荷包含 SDK 的所有源字段；跨市场原始 callback 全序已恢复 |
 | `field_complete` | wire projection 是否无损保留 Store event 的所有字段 | record 数量或时间覆盖完整 |
 
-Wire V2.4 把服务状态与这些事实分开编码。健康 online preview 必须是
+Wire V2.5 把服务状态与这些事实分开编码。健康 online preview 必须是
 `LIVE_PARTIAL`，且 `coverage_from_open`、`startup_prefix_recovered`、
 `full_day_kline_valid`、`full_day_factor_valid`、
 `certified_prefix_valid` 全为 false。`KLINE_ENABLED` 只表示布局里有 KLine

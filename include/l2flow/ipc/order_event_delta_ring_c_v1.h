@@ -132,11 +132,25 @@ static_assert(
 
 // The descriptor must be O_RDONLY. Open duplicates it; ownership of the input
 // descriptor remains with the caller, and the returned reader owns only its
-// private duplicate. expected_session is copied, not retained.
+// private duplicate. expected_session is copied, not retained. The original
+// entry point always starts at event sequence one.
 L2FLOW_ORDER_EVENT_DELTA_API_V1 int
 l2flow_order_event_delta_reader_open_v1(
     int read_only_descriptor,
     const l2flow_order_event_delta_session_v1* expected_session,
+    l2flow_order_event_delta_reader_v1** output,
+    int* system_error_number);
+
+// Additive history-to-live attachment. start_event_sequence is the first
+// dense event sequence requested by this new reader and must be positive.
+// The start is fixed at construction: no operation can move a failed reader
+// to another sequence. The first read performs the normal retention check and
+// returns OVERRUN if this explicit history boundary is no longer retained.
+L2FLOW_ORDER_EVENT_DELTA_API_V1 int
+l2flow_order_event_delta_reader_open_at_v1(
+    int read_only_descriptor,
+    const l2flow_order_event_delta_session_v1* expected_session,
+    uint64_t start_event_sequence,
     l2flow_order_event_delta_reader_v1** output,
     int* system_error_number);
 
@@ -145,9 +159,10 @@ l2flow_order_event_delta_reader_close_v1(
     l2flow_order_event_delta_reader_v1* reader);
 
 // Serial-only and stateful. No expected cursor is accepted from the caller:
-// the reader begins at 1 and commits its own next cursor after each successful
-// call. capacity is a fixed uint64 ABI value and may be zero, in which case
-// rows may be NULL and the call acts as a non-consuming poll.
+// the reader begins at its construction sequence and commits its own next
+// cursor after each successful call. capacity is a fixed uint64 ABI value and
+// may be zero, in which case rows may be NULL and the call acts as a
+// non-consuming poll.
 //
 // One producer commit always contains every row caused by one source tick,
 // but a finite caller buffer may split that already-committed tick across

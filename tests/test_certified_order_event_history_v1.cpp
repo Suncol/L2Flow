@@ -422,6 +422,29 @@ bool DenseDerivedSequences(
     return true;
 }
 
+bool SourceTickOrdinalsCanonical(
+    std::span<const ipc::InstrumentDerivedEventV1> events) {
+    std::uint64_t current_tick = 0U;
+    std::uint32_t expected_ordinal = 0U;
+    for (const auto& event : events) {
+        const std::uint64_t tick =
+            SourceAnchor(event.payload).tick_stream_sequence;
+        if (tick == 0U ||
+            !event.source_tick_event_ordinal_valid) {
+            return false;
+        }
+        if (tick != current_tick) {
+            current_tick = tick;
+            expected_ordinal = 0U;
+        }
+        if (event.source_tick_event_ordinal != expected_ordinal) {
+            return false;
+        }
+        ++expected_ordinal;
+    }
+    return true;
+}
+
 std::optional<std::uint64_t> ResidentSetBytes() {
     std::ifstream statm("/proc/self/statm");
     std::uint64_t virtual_pages = 0U;
@@ -582,6 +605,10 @@ bool StableShanghaiEquivalent(
          ++index) {
         if (left[index].derived_event_sequence !=
                 right[index].derived_event_sequence ||
+            left[index].source_tick_event_ordinal !=
+                right[index].source_tick_event_ordinal ||
+            left[index].source_tick_event_ordinal_valid !=
+                right[index].source_tick_event_ordinal_valid ||
             StableShanghaiPayload(left[index].payload) !=
                 StableShanghaiPayload(
                     right[index].payload) ||
@@ -683,6 +710,8 @@ void TestShanghaiExternalRepair(bool* ok) {
         "clean and externally repaired Shanghai histories are structurally equivalent");
     *ok &= Expect(
         DenseDerivedSequences(repaired_snapshot.events()) &&
+            SourceTickOrdinalsCanonical(
+                repaired_snapshot.events()) &&
             repaired_generation.generation == 3U &&
             repaired_generation
                     .derived_event_sequence_exclusive ==
@@ -802,6 +831,12 @@ void TestShenzhenLifecycleAndImmutableGeneration(bool* ok) {
         "acquire Shenzhen trade generation");
     *ok &= Expect(
         trade_generation.events().size() == 3U &&
+            SourceTickOrdinalsCanonical(
+                trade_generation.events()) &&
+            trade_generation.events()[1U]
+                    .source_tick_event_ordinal == 0U &&
+            trade_generation.events()[2U]
+                    .source_tick_event_ordinal == 1U &&
             std::holds_alternative<
                 market::ShenzhenTradeEventV1>(
                 trade_generation.events()[1U].payload) &&
@@ -830,7 +865,10 @@ void TestShenzhenLifecycleAndImmutableGeneration(bool* ok) {
                 market::ShenzhenOrderRevisionEventV1>(
                 cancel_events[4U].payload) &&
             AppendedAnchorsEqual(cancel_events, 3U, cancel) &&
-            DenseDerivedSequences(cancel_events),
+            DenseDerivedSequences(cancel_events) &&
+            SourceTickOrdinalsCanonical(cancel_events) &&
+            cancel_events[3U].source_tick_event_ordinal == 0U &&
+            cancel_events[4U].source_tick_event_ordinal == 1U,
         "Shenzhen cancel appends lossless source event and revision");
     const auto* final_revision =
         cancel_events.size() != 5U

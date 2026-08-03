@@ -31,6 +31,28 @@ namespace {
 
 constexpr std::uint64_t kPageBytes = 4096U;
 constexpr std::size_t kStableCopyAttempts = 3U;
+// UINT64_MAX is reserved for the natural next cursor after the final
+// representable event.  Publishing an event at UINT64_MAX would make the
+// reader's serial cursor wrap to zero after a successful read.
+constexpr std::uint64_t kMaximumPublishedEventSequence =
+    std::numeric_limits<std::uint64_t>::max() - 1U;
+
+[[nodiscard]] constexpr bool EventSequenceBatchFits(
+    std::uint64_t published,
+    std::uint64_t event_count) noexcept {
+    return published <= kMaximumPublishedEventSequence &&
+           event_count <=
+               kMaximumPublishedEventSequence - published;
+}
+
+static_assert(EventSequenceBatchFits(
+    kMaximumPublishedEventSequence - 1U, 1U));
+static_assert(EventSequenceBatchFits(
+    kMaximumPublishedEventSequence, 0U));
+static_assert(!EventSequenceBatchFits(
+    kMaximumPublishedEventSequence, 1U));
+static_assert(!EventSequenceBatchFits(
+    std::numeric_limits<std::uint64_t>::max(), 0U));
 
 template <typename T>
 [[nodiscard]] std::atomic_ref<T> Atomic(T& value) noexcept {
@@ -313,7 +335,10 @@ bool OrderEventDeltaPayloadCanonicalV1(
         payload.instrument_id == 0U || payload.channel <= 0 ||
         payload.tick_stream_sequence !=
             expected_source_tick_sequence ||
-        payload.reserved0 != 0U || !AllZero(payload.reserved1) ||
+        payload.reserved1[0U] !=
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 ||
+        payload.reserved1[1U] != 0U ||
+        payload.reserved1[2U] != 0U ||
         (payload.market !=
              L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1 &&
          payload.market !=
@@ -629,7 +654,11 @@ public:
             return OrderEventDeltaPublishErrorV1::kSourceSequenceGap;
         }
         if (events.size() >
-            static_cast<std::size_t>(config_.ring_capacity)) {
+                static_cast<std::size_t>(config_.ring_capacity) ||
+            (!events.empty() &&
+             events.size() - 1U >
+                 static_cast<std::size_t>(
+                     std::numeric_limits<std::uint32_t>::max()))) {
             MarkFailed();
             return OrderEventDeltaPublishErrorV1::kBatchTooLarge;
         }
@@ -637,18 +666,20 @@ public:
         const std::uint64_t published =
             Atomic(header_->event_published_sequence)
                 .load(std::memory_order_acquire);
-        if (events.size() >
-            static_cast<std::size_t>(
-                std::numeric_limits<std::uint64_t>::max() -
-                published)) {
+        if (!EventSequenceBatchFits(
+                published,
+                static_cast<std::uint64_t>(events.size()))) {
             MarkFailed();
             return OrderEventDeltaPublishErrorV1::kSequenceExhausted;
         }
-        for (const OrderEventDeltaPayloadV1& event : events) {
+        for (std::size_t index = 0U; index < events.size(); ++index) {
+            const OrderEventDeltaPayloadV1& event = events[index];
             if (!OrderEventDeltaPayloadCanonicalV1(
                     event,
                     config_.trade_date,
-                    source_tick_sequence)) {
+                    source_tick_sequence) ||
+                event.reserved0 !=
+                    static_cast<std::uint32_t>(index)) {
                 return OrderEventDeltaPublishErrorV1::
                     kInvalidArgument;
             }
@@ -953,6 +984,9 @@ OrderEventDeltaRingProducerV1::state() const noexcept {
 
 class OrderEventDeltaRingReaderV1::Impl final {
 public:
+    explicit Impl(std::uint64_t start_event_sequence) noexcept
+        : next_sequence_(start_event_sequence) {}
+
     ~Impl() {
         if (mapping_ != MAP_FAILED) {
             static_cast<void>(::munmap(
@@ -1196,7 +1230,7 @@ private:
     const OrderEventDeltaSlotV1* slots_ = nullptr;
     OrderEventDeltaSessionV1 session_{};
     mutable bool failed_ = false;
-    mutable std::uint64_t next_sequence_ = 1U;
+    mutable std::uint64_t next_sequence_;
 };
 
 OrderEventDeltaRingReaderV1::OrderEventDeltaRingReaderV1(
@@ -1212,13 +1246,32 @@ OrderEventDeltaRingReaderV1::Open(
     const OrderEventDeltaSessionV1& expected_session,
     std::unique_ptr<OrderEventDeltaRingReaderV1>* output,
     int* system_error_number) noexcept {
+    return OpenAt(
+        read_only_descriptor,
+        expected_session,
+        1U,
+        output,
+        system_error_number);
+}
+
+OrderEventDeltaReaderOpenErrorV1
+OrderEventDeltaRingReaderV1::OpenAt(
+    int read_only_descriptor,
+    const OrderEventDeltaSessionV1& expected_session,
+    std::uint64_t start_event_sequence,
+    std::unique_ptr<OrderEventDeltaRingReaderV1>* output,
+    int* system_error_number) noexcept {
     SetSystemError(system_error_number, 0);
     if (output == nullptr) {
         return OrderEventDeltaReaderOpenErrorV1::kNullOutput;
     }
     output->reset();
+    if (start_event_sequence == 0U) {
+        return OrderEventDeltaReaderOpenErrorV1::kInvalidArgument;
+    }
     try {
-        auto impl = std::make_unique<Impl>();
+        auto impl =
+            std::make_unique<Impl>(start_event_sequence);
         const OrderEventDeltaReaderOpenErrorV1 error =
             impl->Initialize(
                 read_only_descriptor,

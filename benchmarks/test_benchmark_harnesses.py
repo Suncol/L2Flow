@@ -562,6 +562,19 @@ class StartupModeHarnessTests(unittest.TestCase):
 
 
 class LatencyHarnessTests(unittest.TestCase):
+    def test_bootstrap_median_delta_subtracts_baseline_once(self) -> None:
+        bounds = latency._bootstrap_upper_bounds(
+            [100.0, 100.0, 100.0],
+            [110.0, 110.0, 110.0],
+            confidence=0.95,
+            resamples=100,
+            seed=1,
+        )
+        self.assertEqual(bounds["median_delta_ns"], 10.0)
+        self.assertEqual(bounds["median_delta_upper_ns"], 10.0)
+        self.assertEqual(bounds["p95_delta_ns"], 10.0)
+        self.assertEqual(bounds["p95_delta_upper_ns"], 10.0)
+
     def _parse(self, text: str):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "latency.log"

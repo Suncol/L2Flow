@@ -30,6 +30,12 @@ using InstrumentDerivedEventPayloadV1 = std::variant<
 struct InstrumentDerivedEventV1 final {
     std::uint64_t derived_event_sequence = 0U;
     InstrumentDerivedEventPayloadV1 payload{};
+    // Stable only within the source tick identified by the payload anchor.
+    // This is the zero-based order in which the deterministic market core
+    // emitted this event for that tick. Product-local dense sequences are
+    // deliberately not used. Source-free Finalize rows keep valid=false.
+    std::uint32_t source_tick_event_ordinal = 0U;
+    bool source_tick_event_ordinal_valid = false;
 };
 
 // This checkpoint is valid only for the live

@@ -78,7 +78,8 @@ ipc::OrderEventDeltaPayloadV1 Order(
     std::uint64_t tick_sequence,
     std::int64_t order_id) {
     ipc::OrderEventDeltaPayloadV1 result{};
-    result.record_schema_version = 1U;
+    result.record_schema_version =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2;
     result.record_bytes = sizeof(result);
     result.trade_date = 20260730U;
     result.instrument_id = 1U;
@@ -95,6 +96,8 @@ ipc::OrderEventDeltaPayloadV1 Order(
     result.source_sequence = tick_sequence;
     result.ingress_sequence = tick_sequence;
     result.vendor_sequence_id = tick_sequence;
+    result.reserved1[0U] =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2;
     return result;
 }
 
@@ -132,6 +135,11 @@ void TestAbiAndArguments(bool* ok) {
             -1, nullptr, nullptr, nullptr) ==
             L2FLOW_ORDER_EVENT_DELTA_NULL_OUTPUT_V1,
         "C open null output classification");
+    *ok &= Expect(
+        l2flow_order_event_delta_reader_open_at_v1(
+            -1, nullptr, 1U, nullptr, nullptr) ==
+            L2FLOW_ORDER_EVENT_DELTA_NULL_OUTPUT_V1,
+        "C open-at null output classification");
 
     auto producer = Producer(4U, 1U, ok);
     if (producer == nullptr) {
@@ -151,6 +159,12 @@ void TestAbiAndArguments(bool* ok) {
             reader == nullptr,
         "C open rejects nonzero session reserve");
     session = CSession(producer->session());
+    *ok &= Expect(
+        l2flow_order_event_delta_reader_open_at_v1(
+            descriptor, &session, 0U, &reader, nullptr) ==
+                L2FLOW_ORDER_EVENT_DELTA_INVALID_ARGUMENT_V1 &&
+            reader == nullptr,
+        "C open-at rejects zero construction sequence");
     session.temporal_coverage = 0U;
     *ok &= Expect(
         l2flow_order_event_delta_reader_open_v1(
@@ -213,9 +227,9 @@ void TestReadAndOwnership(bool* ok) {
         producer->PublishSourceTick(1U, {}) ==
             ipc::OrderEventDeltaPublishErrorV1::kNone,
         "publish zero-event source tick for C poll");
-    const std::array<ipc::OrderEventDeltaPayloadV1, 2U> batch{
-        Order(2U, 101),
-        Order(2U, 102)};
+    std::array<ipc::OrderEventDeltaPayloadV1, 2U> batch{
+        Order(2U, 101), Order(2U, 102)};
+    batch[1U].reserved0 = 1U;
     *ok &= Expect(
         producer->PublishSourceTick(2U, batch) ==
                 ipc::OrderEventDeltaPublishErrorV1::kNone &&
@@ -301,6 +315,38 @@ void TestOverrunAndFailure(bool* ok) {
                 L2FLOW_ORDER_EVENT_DELTA_UNAVAILABLE_V1,
             "C reader remains fail-closed after overrun");
         l2flow_order_event_delta_reader_close_v1(reader);
+
+        descriptor = -1;
+        *ok &= Expect(
+            producer->DuplicateReadOnlyDescriptor(&descriptor) &&
+                descriptor >= 0,
+            "duplicate descriptor for C open-at recovery");
+        reader = nullptr;
+        const auto session = CSession(producer->session());
+        *ok &= Expect(
+            l2flow_order_event_delta_reader_open_at_v1(
+                descriptor,
+                &session,
+                2U,
+                &reader,
+                nullptr) == L2FLOW_ORDER_EVENT_DELTA_OK_V1 &&
+                reader != nullptr,
+            "C open-at accepts retained history boundary");
+        if (descriptor >= 0) {
+            static_cast<void>(::close(descriptor));
+        }
+        if (reader != nullptr) {
+            *ok &= Expect(
+                l2flow_order_event_delta_reader_read_v1(
+                    reader, rows.data(), rows.size(), &result) ==
+                        L2FLOW_ORDER_EVENT_DELTA_OK_V1 &&
+                    result.records_written == 2U &&
+                    result.next_sequence == 4U &&
+                    rows[0U].derived_event_sequence == 2U &&
+                    rows[1U].derived_event_sequence == 3U,
+                "C open-at resumes from the retained prefix");
+            l2flow_order_event_delta_reader_close_v1(reader);
+        }
     }
     {
         auto producer = Producer(4U, 60U, ok);

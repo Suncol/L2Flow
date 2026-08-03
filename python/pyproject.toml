@@ -9,5 +9,8 @@ description = "Daily-catalog read-only client for L2Flow Wire V2"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+polars = ["polars>=1.32,<2"]
+
 [tool.setuptools]
 packages = ["l2flow_realtime"]

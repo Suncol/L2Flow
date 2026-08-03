@@ -40,6 +40,8 @@ enum class CertifiedOrderEventReadResultV1 : std::uint8_t {
     kOutOfRange,
     kInconsistent,
     kCorrupt,
+    kEndOfStream,
+    kProducerFailed,
 };
 
 [[nodiscard]] std::string_view
@@ -122,9 +124,11 @@ public:
         std::uint64_t derived_event_sequence,
         CertifiedOrderEventEnvelopeV1* output) const noexcept;
 
-    // Serial cursor helper. expected_event_sequence is one-based; a
-    // successful zero-row result means no further row is visible at the
-    // captured coherent cut.
+    // Serial cursor helper. expected_event_sequence is one-based. The exact
+    // event_capacity + 1 cursor is the natural tail after a full journal:
+    // NOT_YET_PUBLISHED means the producer is still live, END_OF_STREAM means
+    // a clean STOPPED cut, and PRODUCER_FAILED means a frozen producer. Larger
+    // cursors remain OUT_OF_RANGE.
     [[nodiscard]] CertifiedOrderEventReadResultV1 Read(
         std::uint64_t expected_event_sequence,
         std::span<CertifiedOrderEventEnvelopeV1> output,

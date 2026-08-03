@@ -57,8 +57,7 @@ import platform
 import sys
 import threading
 import time
-from dataclasses import dataclass, fields
-from enum import IntEnum
+from dataclasses import dataclass
 from typing import Iterable, Optional
 
 
@@ -86,24 +85,6 @@ def _cpu_affinity_text() -> str:
     except (AttributeError, OSError):
         return "unavailable"
     return ",".join(str(cpu) for cpu in cpus) + f";count={len(cpus)}"
-
-
-def _polars_scalar(value: object) -> object:
-    if isinstance(value, IntEnum):
-        return int(value)
-    return value
-
-
-def _derived_polars_frame(polars, rows: tuple[object, ...]):
-    _require(bool(rows), "derived Polars input is empty")
-    columns = {
-        field.name: [
-            _polars_scalar(getattr(row, field.name)) for row in rows
-        ]
-        for field in fields(rows[0])
-        if not field.name.startswith("_")
-    }
-    return polars.DataFrame(columns, strict=True)
 
 
 def _raw_polars_frame(polars, frames: list[object]):
@@ -1948,6 +1929,7 @@ def _run_raw_polars_baseline(
 
 def _run_raw_polars_update(
     polars,
+    raw_event_batch_frame,
     raw_history,
     checkpoints: dict[int, object],
     *,
@@ -1985,8 +1967,12 @@ def _run_raw_polars_update(
             open_return_ns = _now_ns()
             for batch in cursor.batches():
                 batch_count += 1
-                columns = batch.materialize_all()
-                frames.append(polars.DataFrame(columns, strict=True))
+                frames.append(
+                    raw_event_batch_frame(
+                        batch,
+                        columns=raw_history.raw_event_columns,
+                    )
+                )
             checkpoint = cursor.verified_checkpoint
         frame = _raw_polars_frame(polars, frames)
         row_count = frame.height
@@ -2099,6 +2085,7 @@ def _run_raw_polars_update(
 
 def _run_derived_polars(
     polars,
+    derived_event_batch_frame,
     reader,
     derived_event_kind,
     revision_operation,
@@ -2110,17 +2097,16 @@ def _run_derived_polars(
     expected_order_id: int,
 ) -> None:
     start_ns = _now_ns()
-    rows: list[object] = []
+    frames: list[object] = []
     batch_count = 0
     with reader.read_all(
         expected_generation=expected_generation
     ) as cursor:
         for batch in cursor.batches():
             batch_count += 1
-            rows.extend(batch.materialize())
+            frames.append(derived_event_batch_frame(batch))
         checkpoint = cursor.verified_checkpoint
-    materialized = tuple(rows)
-    frame = _derived_polars_frame(polars, materialized)
+    frame = _raw_polars_frame(polars, frames)
     relevant = frame.filter(
         (
             (
@@ -2137,23 +2123,37 @@ def _run_derived_polars(
     sequence_values = relevant.get_column(
         "derived_event_sequence"
     ).to_list()
-    revisions = [
-        row
-        for row in materialized
-        if row.event_kind is derived_event_kind.ORDER_REVISION
-        and row.order_id == expected_order_id
-    ]
+    revisions = (
+        frame.filter(
+            (polars.col("event_kind")
+             == int(derived_event_kind.ORDER_REVISION))
+            & (polars.col("order_id") == expected_order_id)
+        )
+        .sort("revision")
+        .select(
+            "revision",
+            "operation",
+            "finality",
+            "remaining_quantity_valid",
+            "remaining_quantity",
+            "quality_flags",
+            "source_quality_flags",
+            "source_matched_quantity",
+            "observed_pre_add_trade_quantity",
+        )
+        .to_dicts()
+    )
     ready_ns = _now_ns()
     _require(
         frame.height == _EXPECTED_DERIVED_POLARS_TOTAL_RECORDS
         and relevant.height == expected_events,
         "derived Polars event count differs from expected: "
         f"frame={frame.height} relevant={relevant.height} "
-        f"kinds={','.join(str(int(row.event_kind)) for row in materialized)} "
+        f"kinds={','.join(str(value) for value in frame['event_kind'])} "
         "revisions="
         + ",".join(
-            f"{row.revision}:{row.operation}:{row.finality}:"
-            f"{row.remaining_quantity}:{row.native_event_sequence}"
+            f"{row['revision']}:{row['operation']}:{row['finality']}:"
+            f"{row['remaining_quantity']}"
             for row in revisions
         ),
     )
@@ -2169,24 +2169,26 @@ def _run_derived_polars(
         "derived Polars sequence is not dense",
     )
     _require(
-        [row.revision for row in revisions] == [1, 2, 3],
+        [row["revision"] for row in revisions] == [1, 2, 3],
         "derived order revision sequence is not 1,2,3",
     )
+    final_revision = revisions[-1]
     _require(
-        revisions[-1].operation == int(revision_operation.FINALIZE)
-        and revisions[-1].finality == int(order_finality.FINAL)
-        and revisions[-1].remaining_quantity_valid
-        and revisions[-1].remaining_quantity == 0,
+        final_revision["operation"]
+        == int(revision_operation.FINALIZE)
+        and final_revision["finality"] == int(order_finality.FINAL)
+        and final_revision["remaining_quantity_valid"]
+        and final_revision["remaining_quantity"] == 0,
         "derived order sequence does not end in a clean zero-balance "
         "finalization: "
-        f"operation={revisions[-1].operation} "
-        f"finality={revisions[-1].finality} "
-        f"remaining={revisions[-1].remaining_quantity} "
-        f"quality={revisions[-1].quality_flags} "
-        f"source_quality={revisions[-1].source_quality_flags} "
-        f"matched={revisions[-1].source_matched_quantity} "
+        f"operation={final_revision['operation']} "
+        f"finality={final_revision['finality']} "
+        f"remaining={final_revision['remaining_quantity']} "
+        f"quality={final_revision['quality_flags']} "
+        f"source_quality={final_revision['source_quality_flags']} "
+        f"matched={final_revision['source_matched_quantity']} "
         f"observed_pre_add="
-        f"{revisions[-1].observed_pre_add_trade_quantity}",
+        f"{final_revision['observed_pre_add_trade_quantity']}",
     )
     first_recv_ns, last_recv_ns = relevant.select(
         polars.col("recv_monotonic_ns").min().alias("first_recv"),
@@ -2221,8 +2223,10 @@ def _run_derived_polars(
         last_callback_to_polars_ns=ready_ns - last_recv_ns,
         elapsed_ns=ready_ns - start_ns,
         dataframe_estimated_bytes=frame.estimated_size(),
-        final_revision=revisions[-1].revision,
-        final_remaining_quantity=revisions[-1].remaining_quantity,
+        final_revision=final_revision["revision"],
+        final_remaining_quantity=final_revision[
+            "remaining_quantity"
+        ],
     )
     _emit(
         "DONE",
@@ -2280,6 +2284,10 @@ def main(argv: list[str]) -> int:
         InstrumentTickRollingStore,
         L2FlowClient,
         LatestStatus,
+    )
+    from l2flow_realtime.polars import (  # pylint: disable=import-outside-toplevel
+        derived_event_batch_frame,
+        raw_event_batch_frame,
     )
 
     checkpoints: dict[int, object] = {}
@@ -2563,6 +2571,7 @@ def main(argv: list[str]) -> int:
                     command_index += 1
                     _run_raw_polars_update(
                         pl,
+                        raw_event_batch_frame,
                         raw_history,
                         raw_polars_checkpoints,
                         command_index=command_index,
@@ -2610,6 +2619,7 @@ def main(argv: list[str]) -> int:
                     command_index += 1
                     _run_derived_polars(
                         pl,
+                        derived_event_batch_frame,
                         derived_readers[instrument_id],
                         InstrumentDerivedEventKind,
                         InstrumentOrderRevisionOperation,

@@ -274,13 +274,25 @@ template <typename SourceEvent>
     CertifiedOrderEventHistoryJournalStorageV1* storage,
     std::size_t* event_count,
     std::uint64_t* next_sequence) {
-    for (SourceEvent& source_event : *source) {
+    if (source == nullptr || storage == nullptr ||
+        event_count == nullptr || next_sequence == nullptr ||
+        (!source->empty() &&
+         source->size() - 1U >
+             static_cast<std::size_t>(
+                 std::numeric_limits<std::uint32_t>::max()))) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < source->size(); ++index) {
+        SourceEvent& source_event = (*source)[index];
         InstrumentDerivedEventV1* const destination =
             storage->ConstructNext(*event_count);
         if (destination == nullptr) {
             return false;
         }
         destination->derived_event_sequence = *next_sequence;
+        destination->source_tick_event_ordinal =
+            static_cast<std::uint32_t>(index);
+        destination->source_tick_event_ordinal_valid = true;
         std::visit(
             [&destination](auto& event) {
                 using Event =

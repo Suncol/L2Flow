@@ -23,6 +23,7 @@ sys.path.insert(0, str(REPOSITORY / "python"))
 from l2flow_realtime import (  # noqa: E402
     DeltaCheckpointUnverifiedError,
     HistoryWorkerClosedError,
+    HistoryCoverageInfo,
     InstrumentRawEventBatch,
     InstrumentRawEventHistoryReader,
     InstrumentRawEventLookupError,
@@ -32,6 +33,7 @@ from l2flow_realtime import (  # noqa: E402
     InstrumentTickDeltaResultBatch,
     L2FlowClient,
     ProtocolError,
+    TemporalCoverageKind,
     WireFormatError,
 )
 from l2flow_realtime._history_worker_protocol import (  # noqa: E402
@@ -523,6 +525,21 @@ class IsolatedDeltaWorkerTests(unittest.TestCase):
                     self.assertEqual(
                         batch.columns.materialized_column_count, 1
                     )
+                    owned = batch.copy_column_arrays(
+                        "ingress_sequence", "price_p6"
+                    )
+                    self.assertEqual(
+                        tuple(owned["ingress_sequence"]), (1, 2)
+                    )
+                    self.assertEqual(
+                        tuple(owned["price_p6"]),
+                        (101_000_000, 102_000_000),
+                    )
+                    # Bulk ownership is independent and does not populate the
+                    # tuple cache used by read_columns().
+                    self.assertEqual(
+                        batch.columns.materialized_column_count, 1
+                    )
                     with batch.borrow_column(
                         "ingress_sequence"
                     ) as ingress:
@@ -534,6 +551,8 @@ class IsolatedDeltaWorkerTests(unittest.TestCase):
                     with self.assertRaises(HistoryWorkerClosedError):
                         len(expired)
                     batch.close()
+                    owned["price_p6"][0] = 7
+                    self.assertEqual(owned["price_p6"][0], 7)
                     self.assertIsNone(cursor.read_batch())
                     checkpoint = cursor.verified_checkpoint
                     self.assertEqual(
@@ -647,6 +666,14 @@ class IsolatedDeltaWorkerTests(unittest.TestCase):
             def open_instrument_tick_delta_worker(self, **kwargs):
                 self.worker_open_args = kwargs
                 return self.worker
+
+            def history_coverage(self):
+                return HistoryCoverageInfo(
+                    run_id=RUN_ID,
+                    session_epoch=SESSION_EPOCH,
+                    trade_date=TRADE_DATE,
+                    coverage_kind=TemporalCoverageKind.FROM_OPEN,
+                )
 
         with _UnixDeltaServer(
             serve_next, connections=2
@@ -776,7 +803,14 @@ class IsolatedDeltaWorkerTests(unittest.TestCase):
                 pass
 
             with InstrumentRawEventHistoryReader(
-                NumericOnlyClient(), worker
+                NumericOnlyClient(),
+                worker,
+                history_coverage=HistoryCoverageInfo(
+                    run_id=RUN_ID,
+                    session_epoch=SESSION_EPOCH,
+                    trade_date=TRADE_DATE,
+                    coverage_kind=TemporalCoverageKind.FROM_OPEN,
+                ),
             ) as history:
                 worker_pid = history.worker_pid
                 canceled = history.read_all(

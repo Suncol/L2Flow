@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import fcntl
 import mmap
 import os
@@ -317,6 +318,48 @@ class InstrumentTickDeltaResultColumns(
     def materialize_all(self) -> dict[str, tuple[object, ...]]:
         return self.read_columns(*self._names)
 
+    def copy_arrays(
+        self, *names: str
+    ) -> dict[str, array.array]:
+        """Bulk-copy selected ring columns into owned native arrays.
+
+        Unlike :meth:`read_columns`, this path does not create one Python
+        integer per cell.  It is intended for Arrow/Polars adapters that need
+        independent ownership before the worker slot is released.  A fresh
+        array is returned on every call; callers may safely retain or mutate
+        it after this batch closes.
+        """
+
+        self._batch._require_open()
+        if not names:
+            raise ValueError("at least one result column is required")
+        if any(not isinstance(name, str) for name in names):
+            raise TypeError("result column names must be strings")
+        if len(set(names)) != len(names):
+            raise ValueError("result column names must be unique")
+        result: dict[str, array.array] = {}
+        for name in names:
+            if name not in self._names:
+                raise KeyError(name)
+            begin, end, spec = column_region(
+                self._batch._worker._layout,
+                self._batch.slot_index,
+                name,
+                self._batch.record_count,
+            )
+            raw = memoryview(self._batch._worker._mapping)[begin:end]
+            try:
+                owned = array.array(spec.format)
+                owned.frombytes(raw)
+            finally:
+                raw.release()
+            if len(owned) != self._batch.record_count:
+                raise WireFormatError(
+                    "owned result column length changed during copy"
+                )
+            result[name] = owned
+        return result
+
     def borrow(self, name: str) -> _BorrowedResultColumn:
         """Borrow zero-copy scalar access for a bounded ``with`` block.
 
@@ -456,6 +499,13 @@ class InstrumentTickDeltaResultBatch:
         self, *names: str
     ) -> dict[str, tuple[object, ...]]:
         return self.columns.read_columns(*names)
+
+    def copy_column_arrays(
+        self, *names: str
+    ) -> dict[str, array.array]:
+        """Bulk-copy selected columns without Python scalar materialization."""
+
+        return self.columns.copy_arrays(*names)
 
     def materialize_all(self) -> dict[str, tuple[object, ...]]:
         return self.columns.materialize_all()

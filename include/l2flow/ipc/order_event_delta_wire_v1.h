@@ -14,14 +14,15 @@ inline constexpr std::array<std::uint8_t, 8U>
     kOrderEventDeltaMagicV1{
         'L', '2', 'F', 'E', 'V', 'T', '1', '\0'};
 inline constexpr std::uint16_t kOrderEventDeltaWireMajorV1 = 1U;
-// V1.1 consumes the former 64-bit header reserved scalar as two semantic
-// fields. The header size and every pre-existing offset remain unchanged,
-// while exact-minor validation makes older readers fail closed.
-inline constexpr std::uint16_t kOrderEventDeltaWireMinorV1 = 1U;
+// V1.1 consumed the former 64-bit header reserved scalar as two semantic
+// fields. V1.2 carries record-schema-2 source-tick event identity in the
+// unchanged 320-byte payload. Exact-minor validation makes older readers fail
+// closed instead of interpreting the new semantic bytes as reserved.
+inline constexpr std::uint16_t kOrderEventDeltaWireMinorV1 = 2U;
 inline constexpr std::uint32_t kOrderEventDeltaEndianMarkerV1 =
     0x01020304U;
 inline constexpr std::uint32_t kOrderEventDeltaPayloadSchemaV1 =
-    1U;
+    L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2;
 inline constexpr std::uint64_t kOrderEventDeltaHeaderBytesV1 =
     4096U;
 inline constexpr std::uint64_t kOrderEventDeltaSlotBytesV1 = 384U;

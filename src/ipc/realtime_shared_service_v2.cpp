@@ -2135,38 +2135,69 @@ public:
             kRealtimeHeaderFullDayKLineValidV2 |
             kRealtimeHeaderFullDayFactorValidV2 |
             kRealtimeHeaderCertifiedPrefixValidV2;
-        if (header_ == nullptr || listener_fd_ < 0 ||
-            stop_event_fd_ < 0 || prefix_event_fd_ < 0 ||
-            control_thread_.joinable() ||
-            control_stop_requested_.load(std::memory_order_acquire) ||
-            (target_state != RealtimeServerStateV2::kActive &&
-             !live_partial) ||
-            (serve_process_start_history && !live_partial) ||
-            (Atomic(header_->flags).load(std::memory_order_acquire) &
-             kRealtimeHeaderCoverageLostV2) != 0U ||
-            (!live_partial &&
-             (Atomic(header_->flags).load(std::memory_order_acquire) &
-              kRealtimeHeaderCoverageFromOpenV2) == 0U) ||
-            (live_partial &&
-             (Atomic(header_->flags).load(std::memory_order_acquire) &
-              strong_flags) != 0U)) {
-            SetSystemError(system_error_number, EINVAL);
-            return false;
+        {
+            // Linearize the immutable History coverage contract with the
+            // INITIALIZING -> ACTIVE/LIVE_PARTIAL transition. In particular,
+            // a concurrent Start which loses this lifecycle race must return
+            // before it can overwrite the winning mode's kind or the matching
+            // process-local authorization bit.
+            const std::lock_guard<std::mutex> lifecycle_lock(
+                coverage_lifecycle_mutex_);
+            if (header_ == nullptr || listener_fd_ < 0 ||
+                stop_event_fd_ < 0 || prefix_event_fd_ < 0 ||
+                Atomic(header_->server_state)
+                        .load(std::memory_order_acquire) !=
+                    static_cast<std::uint32_t>(
+                        RealtimeServerStateV2::kInitializing) ||
+                control_thread_.joinable() ||
+                control_stop_requested_.load(
+                    std::memory_order_acquire) ||
+                (target_state != RealtimeServerStateV2::kActive &&
+                 !live_partial) ||
+                (serve_process_start_history && !live_partial)) {
+                SetSystemError(system_error_number, EINVAL);
+                return false;
+            }
+            const std::uint32_t flags =
+                Atomic(header_->flags).load(std::memory_order_acquire);
+            if ((flags & kRealtimeHeaderCoverageLostV2) != 0U ||
+                (!live_partial &&
+                 (flags & kRealtimeHeaderCoverageFromOpenV2) == 0U) ||
+                (live_partial && (flags & strong_flags) != 0U)) {
+                SetSystemError(system_error_number, EINVAL);
+                return false;
+            }
+
+            // Publish this cold contract before the server-state release. The
+            // process-start boundary itself remains zero until SDK Connect has
+            // completed and PrepareProcessStartHistoryCoverage publishes it.
+            Atomic(header_->history_coverage_kind)
+                .store(
+                    static_cast<std::uint32_t>(
+                        live_partial && serve_process_start_history
+                            ? RealtimeHistoryTemporalCoverageV2::
+                                  kProcessStartPartial
+                            : live_partial
+                                  ? RealtimeHistoryTemporalCoverageV2::
+                                        kUnavailable
+                                  : RealtimeHistoryTemporalCoverageV2::
+                                        kFromOpen),
+                    std::memory_order_relaxed);
+            serve_process_start_history_ =
+                serve_process_start_history;
+            std::uint32_t expected =
+                static_cast<std::uint32_t>(
+                    RealtimeServerStateV2::kInitializing);
+            if (!Atomic(header_->server_state)
+                     .compare_exchange_strong(
+                         expected,
+                         static_cast<std::uint32_t>(target_state),
+                         std::memory_order_release,
+                         std::memory_order_acquire)) {
+                SetSystemError(system_error_number, EINVAL);
+                return false;
+            }
         }
-        std::uint32_t expected =
-            static_cast<std::uint32_t>(
-                RealtimeServerStateV2::kInitializing);
-        if (!Atomic(header_->server_state)
-                 .compare_exchange_strong(
-                     expected,
-                     static_cast<std::uint32_t>(target_state),
-                     std::memory_order_release,
-                     std::memory_order_acquire)) {
-            SetSystemError(system_error_number, EINVAL);
-            return false;
-        }
-        serve_process_start_history_ =
-            serve_process_start_history;
         UpdateHeartbeatNow();
         if (failed()) {
             SetSystemError(system_error_number, EIO);
@@ -2198,7 +2229,7 @@ public:
         // A failed post-CAS recheck could not safely roll this immutable wire
         // field back after a reader had observed it.
         const std::lock_guard<std::mutex> lifecycle_lock(
-            kline_coverage_lifecycle_mutex_);
+            coverage_lifecycle_mutex_);
         if (Atomic(header_->server_state)
                     .load(std::memory_order_acquire) !=
                 static_cast<std::uint32_t>(
@@ -2232,6 +2263,61 @@ public:
         return expected == coverage_start_unix_ns &&
                Atomic(header_->kline_generation)
                        .load(std::memory_order_acquire) == 0U &&
+               Atomic(header_->server_state)
+                       .load(std::memory_order_acquire) ==
+                   static_cast<std::uint32_t>(
+                       RealtimeServerStateV2::kLivePartial);
+    }
+
+    [[nodiscard]] bool PrepareProcessStartHistoryCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept {
+        std::uint32_t boundary_trade_date = 0U;
+        if (header_ == nullptr || coverage_start_unix_ns == 0U ||
+            config_.coverage_from_open ||
+            !FixedUtc8TradeDateFromUnixNs(
+                coverage_start_unix_ns, &boundary_trade_date) ||
+            boundary_trade_date != config_.trade_date) {
+            return false;
+        }
+        // The same lifecycle lock orders the two independent immutable
+        // coverage boundaries against terminal/failure transitions.
+        const std::lock_guard<std::mutex> lifecycle_lock(
+            coverage_lifecycle_mutex_);
+        if (!serve_process_start_history_ ||
+            Atomic(header_->server_state)
+                    .load(std::memory_order_acquire) !=
+                static_cast<std::uint32_t>(
+                    RealtimeServerStateV2::kLivePartial) ||
+            Atomic(header_->history_coverage_kind)
+                    .load(std::memory_order_acquire) !=
+                static_cast<std::uint32_t>(
+                    RealtimeHistoryTemporalCoverageV2::
+                        kProcessStartPartial)) {
+            return false;
+        }
+        const std::uint32_t flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        constexpr std::uint32_t forbidden =
+            kRealtimeHeaderCoverageLostV2 |
+            kRealtimeHeaderCoverageFromOpenV2 |
+            kRealtimeHeaderStartupPrefixRecoveredV2 |
+            kRealtimeHeaderFullDayKLineValidV2 |
+            kRealtimeHeaderFullDayFactorValidV2 |
+            kRealtimeHeaderCertifiedPrefixValidV2;
+        if ((flags & forbidden) != 0U ||
+            header_->reserved_history_coverage != 0U) {
+            return false;
+        }
+        std::uint64_t expected = 0U;
+        if (Atomic(header_->history_coverage_start_unix_ns)
+                .compare_exchange_strong(
+                    expected,
+                    coverage_start_unix_ns,
+                    std::memory_order_release,
+                    std::memory_order_acquire)) {
+            return true;
+        }
+        return expected == coverage_start_unix_ns &&
                Atomic(header_->server_state)
                        .load(std::memory_order_acquire) ==
                    static_cast<std::uint32_t>(
@@ -2391,7 +2477,7 @@ public:
             return;
         }
         const std::lock_guard<std::mutex> lifecycle_lock(
-            kline_coverage_lifecycle_mutex_);
+            coverage_lifecycle_mutex_);
         Atomic(header_->flags)
             .fetch_or(
                 kRealtimeHeaderCoverageLostV2,
@@ -2802,7 +2888,7 @@ public:
             return;
         }
         const std::lock_guard<std::mutex> lifecycle_lock(
-            kline_coverage_lifecycle_mutex_);
+            coverage_lifecycle_mutex_);
         std::uint32_t current =
             Atomic(header_->server_state)
                 .load(std::memory_order_acquire);
@@ -3624,6 +3710,12 @@ private:
             &header_->catalog_digest,
             initial_catalog_digest_);
         header_->bound_count = header_->capacity;
+        header_->history_coverage_kind =
+            static_cast<std::uint32_t>(
+                config_.coverage_from_open
+                    ? RealtimeHistoryTemporalCoverageV2::kFromOpen
+                    : RealtimeHistoryTemporalCoverageV2::
+                          kUnavailable);
         header_->region_count =
             static_cast<std::uint32_t>(
                 kRealtimeWireRegionCountV2);
@@ -4217,9 +4309,23 @@ private:
             return false;
         }
         if (coverage_from_open) {
-            return StateHasFullPrefix(state);
+            return StateHasFullPrefix(state) &&
+                   Atomic(header_->history_coverage_kind)
+                           .load(std::memory_order_acquire) ==
+                       static_cast<std::uint32_t>(
+                           RealtimeHistoryTemporalCoverageV2::
+                               kFromOpen) &&
+                   Atomic(header_->history_coverage_start_unix_ns)
+                           .load(std::memory_order_acquire) == 0U;
         }
         return serve_process_start_history_ &&
+               Atomic(header_->history_coverage_kind)
+                       .load(std::memory_order_acquire) ==
+                   static_cast<std::uint32_t>(
+                       RealtimeHistoryTemporalCoverageV2::
+                           kProcessStartPartial) &&
+               Atomic(header_->history_coverage_start_unix_ns)
+                       .load(std::memory_order_acquire) != 0U &&
                (state ==
                     static_cast<std::uint32_t>(
                         RealtimeServerStateV2::kLivePartial) ||
@@ -5483,10 +5589,11 @@ private:
     bool socket_bound_ = false;
     std::atomic<bool> prefix_notification_pending_{false};
     std::atomic<bool> control_stop_requested_{false};
-    // Cold lifecycle-only serialization for the immutable process-start
-    // KLine boundary. It is deliberately separate from control_stop_mutex_:
-    // StopControl holds that mutex while it may call MarkCoverageLost().
-    std::mutex kline_coverage_lifecycle_mutex_;
+    // Cold lifecycle-only serialization for Start and the immutable
+    // process-start History/KLine boundaries. It is deliberately separate
+    // from control_stop_mutex_: StopControl holds that mutex while it may
+    // call MarkCoverageLost().
+    std::mutex coverage_lifecycle_mutex_;
     std::mutex control_stop_mutex_;
     std::thread control_thread_;
     std::vector<std::unique_ptr<ClientWorkerSlot>>
@@ -5565,6 +5672,14 @@ bool RealtimeSharedMarketServiceV2::
         std::uint64_t coverage_start_unix_ns) noexcept {
     return impl_ != nullptr &&
            impl_->PrepareProcessStartKLineCoverage(
+               coverage_start_unix_ns);
+}
+
+bool RealtimeSharedMarketServiceV2::
+    PrepareProcessStartHistoryCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept {
+    return impl_ != nullptr &&
+           impl_->PrepareProcessStartHistoryCoverage(
                coverage_start_unix_ns);
 }
 

@@ -310,6 +310,9 @@ public:
         header_->tick_contiguous_published_sequence = 1U;
         header_->kline_generation = 1U;
         header_->published_records = 3U;
+        header_->history_coverage_kind =
+            static_cast<std::uint32_t>(
+                ipc::RealtimeHistoryTemporalCoverageV2::kFromOpen);
         header_->region_count = layout.regions.size();
         header_->region_descriptor_bytes =
             sizeof(ipc::RealtimeWireRegionDescriptorV2);
@@ -680,6 +683,19 @@ bool TestSessionAndPointStates() {
             kline_coverage.reserved0 == 0U &&
             kline_coverage.reserved[0U] == 0U,
         "KLine coverage getter reports a from-open contract without a process-start boundary");
+
+    l2flow_history_coverage_info_v2 history_coverage{};
+    ok &= Expect(
+        l2flow_shm_reader_history_coverage_v2(
+            reader.get(), &history_coverage) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            history_coverage.session_epoch == 17U &&
+            history_coverage.coverage_start_unix_ns == 0U &&
+            history_coverage.coverage_kind ==
+                L2FLOW_HISTORY_COVERAGE_FROM_OPEN_V2 &&
+            history_coverage.reserved0 == 0U &&
+            history_coverage.reserved[0U] == 0U,
+        "History coverage getter is independent of the KLine contract");
 
     l2flow_shm_health_v2 health{};
     ok &= Expect(
@@ -1239,6 +1255,9 @@ bool TestHardLayoutAndSealRejection() {
         fixture.header()->flags =
             ipc::kRealtimeHeaderKLineEnabledV2;
         fixture.header()->kline_generation = 0U;
+        fixture.header()->history_coverage_kind =
+            static_cast<std::uint32_t>(
+                ipc::RealtimeHistoryTemporalCoverageV2::kUnavailable);
         ReaderHandle reader;
         ok &= Expect(
             l2flow_shm_reader_open_fd_v2(
@@ -1264,6 +1283,9 @@ bool TestHardLayoutAndSealRejection() {
         fixture.header()->kline_generation = 0U;
         fixture.header()->kline_coverage_start_unix_ns =
             kProcessStartCoverageUnixNs;
+        fixture.header()->history_coverage_kind =
+            static_cast<std::uint32_t>(
+                ipc::RealtimeHistoryTemporalCoverageV2::kUnavailable);
         ReaderHandle reader;
         ok &= Expect(
             l2flow_shm_reader_open_fd_v2(
@@ -1293,6 +1315,9 @@ bool TestHardLayoutAndSealRejection() {
             ipc::RealtimeServerStateV2::kLivePartial);
         fixture.header()->flags =
             ipc::kRealtimeHeaderKLineEnabledV2;
+        fixture.header()->history_coverage_kind =
+            static_cast<std::uint32_t>(
+                ipc::RealtimeHistoryTemporalCoverageV2::kUnavailable);
         ReaderHandle reader;
         ok &= Expect(
             l2flow_shm_reader_open_fd_v2(
@@ -1472,6 +1497,9 @@ bool TestKLineCoveragePayloadValidation() {
             ipc::kRealtimeHeaderKLineEnabledV2;
         fixture->header()->kline_coverage_start_unix_ns =
             kProcessStartCoverageUnixNs;
+        fixture->header()->history_coverage_kind =
+            static_cast<std::uint32_t>(
+                ipc::RealtimeHistoryTemporalCoverageV2::kUnavailable);
         ipc::RealtimeWireKLinePayloadV2 payload{};
         payload.generation = 1U;
         payload.trade_date = kTradeDate;

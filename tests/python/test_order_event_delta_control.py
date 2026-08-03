@@ -9,6 +9,7 @@ import fcntl
 import os
 import socket
 import struct
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -19,10 +20,13 @@ import l2flow_realtime
 from l2flow_realtime.client import L2FlowClient
 from l2flow_realtime.models import (
     CatalogScope,
+    HistoryCoverageInfo,
     ProtocolError,
     ServerState,
+    SessionIdentity,
     SessionInfo,
     StaleSessionError,
+    TemporalCoverageKind,
 )
 from l2flow_realtime.order_event_delta_control import (
     CONTROL_MAGIC,
@@ -82,10 +86,14 @@ class _FakeEventLibrary:
     def __init__(self, *, state=LiveOrderEventDeltaProducerState.ACTIVE):
         self.state = state
         self.opened_fd = None
+        self.opened_start_event_sequence = None
         self.open_calls = 0
         self.closed = False
         self.l2flow_order_event_delta_reader_open_v1 = _Function(
             self._open
+        )
+        self.l2flow_order_event_delta_reader_open_at_v1 = _Function(
+            self._open_at
         )
         self.l2flow_order_event_delta_reader_close_v1 = _Function(
             self._close
@@ -106,6 +114,7 @@ class _FakeEventLibrary:
     def _open(self, descriptor, session_pointer, output, system_error):
         self.open_calls += 1
         self.opened_fd = int(descriptor)
+        self.opened_start_event_sequence = 1
         session = session_pointer._obj
         if (
             bytes(session.run_id) != _EVENT_RUN_ID
@@ -128,6 +137,20 @@ class _FakeEventLibrary:
         output._obj.value = 0x1234
         system_error._obj.value = 0
         return 0
+
+    def _open_at(
+        self,
+        descriptor,
+        session_pointer,
+        start_event_sequence,
+        output,
+        system_error,
+    ):
+        result = self._open(
+            descriptor, session_pointer, output, system_error
+        )
+        self.opened_start_event_sequence = int(start_event_sequence)
+        return result
 
     def _close(self, _handle):
         self.closed = True
@@ -437,6 +460,14 @@ class _ClientNative:
     def session(self):
         return self.current
 
+    def history_coverage(self):
+        return HistoryCoverageInfo(
+            run_id=self.current.run_id,
+            session_epoch=self.current.session_epoch,
+            trade_date=self.current.trade_date,
+            coverage_kind=TemporalCoverageKind.FROM_OPEN,
+        )
+
     def close(self):
         self.closed = True
 
@@ -475,6 +506,15 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                         native_library=_FakeEventLibrary(),
                         timeout=timeout,
                     )
+        for start in (0, -1, True, 1 << 64):
+            with self.subTest(start_event_sequence=start):
+                with self.assertRaises(ValueError):
+                    open_live_order_events(
+                        "/unused/event-control.sock",
+                        expected_source_session=_source_session(),
+                        native_library=_FakeEventLibrary(),
+                        start_event_sequence=start,
+                    )
 
     def test_success_validates_request_peer_fd_and_snapshot(self):
         ring_fd = _sealed_read_only_memfd()
@@ -489,6 +529,7 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                 native_library=library,
                 timeout=1.0,
                 batch_records=31,
+                start_event_sequence=19,
                 request_id=1234,
                 _socket_factory=lambda *_arguments: channel,
             )
@@ -496,6 +537,14 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
             self.assertEqual(
                 reader.control_snapshot.source_session,
                 _source_session(),
+            )
+            self.assertEqual(
+                reader.source_session_identity,
+                SessionIdentity(_SOURCE_RUN_ID, _SOURCE_EPOCH),
+            )
+            self.assertNotEqual(
+                reader.source_session_identity,
+                reader.session.identity,
             )
             self.assertEqual(
                 reader.control_snapshot.event_session.run_id,
@@ -515,6 +564,8 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
                 reader.producer_state(),
                 LiveOrderEventDeltaProducerState.ACTIVE,
             )
+            self.assertEqual(reader.next_sequence, 19)
+            self.assertEqual(library.opened_start_event_sequence, 19)
 
             request = _REQUEST.unpack(captured["request"])
             self.assertEqual(request[0], CONTROL_MAGIC)
@@ -919,6 +970,8 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
             self.assertIsNone(arguments["native_library_path"])
             self.assertEqual(arguments["timeout"], 1.0)
             self.assertEqual(arguments["batch_records"], 17)
+            self.assertEqual(arguments["start_event_sequence"], 19)
+            self.assertTrue(arguments["history_coverage"].coverage_from_open)
             return connected
 
         with mock.patch(
@@ -927,10 +980,89 @@ class LiveOrderEventDeltaControlTests(unittest.TestCase):
             side_effect=connector,
         ):
             result = client.open_live_order_events(
-                "/event.sock", batch_records=17
+                "/event.sock",
+                batch_records=17,
+                start_event_sequence=19,
             )
         self.assertIs(result, connected)
         self.assertFalse(connected.closed)
+        client.close()
+
+    def test_client_partial_attach_ignores_unavailable_history_coverage(self):
+        native = _ClientNative()
+        native.current = replace(
+            native.current,
+            flags=0,
+            server_state=ServerState.LIVE_PARTIAL,
+        )
+        native.history_coverage = lambda: HistoryCoverageInfo(
+            run_id=native.current.run_id,
+            session_epoch=native.current.session_epoch,
+            trade_date=native.current.trade_date,
+            coverage_kind=TemporalCoverageKind.UNAVAILABLE,
+        )
+        client = L2FlowClient(native, stale_after_ns=None)
+        expected_source = (
+            LiveOrderEventDeltaSourceSession.from_session_info(
+                native.current
+            )
+        )
+        connected = _FakeConnectedReader(expected_source)
+
+        def connector(_path, **arguments):
+            self.assertEqual(
+                arguments["expected_source_session"], expected_source
+            )
+            self.assertIsNone(arguments["history_coverage"])
+            return connected
+
+        with mock.patch(
+            "l2flow_realtime.order_event_delta_control."
+            "open_live_order_events",
+            side_effect=connector,
+        ):
+            result = client.open_live_order_events("/event.sock")
+        self.assertIs(result, connected)
+        self.assertFalse(connected.closed)
+        client.close()
+
+    def test_client_helper_does_not_hold_latest_lock_during_connector(self):
+        native = _ClientNative()
+        client = L2FlowClient(native, stale_after_ns=None)
+        connected = _FakeConnectedReader(_source_session())
+
+        def connector(_path, **_arguments):
+            completed = threading.Event()
+            observed = []
+            failures = []
+
+            def read_session():
+                try:
+                    observed.append(client.session_info())
+                except BaseException as error:
+                    failures.append(error)
+                finally:
+                    completed.set()
+
+            worker = threading.Thread(target=read_session)
+            worker.start()
+            self.assertTrue(
+                completed.wait(1.0),
+                "latest-read lock remained held during control connect",
+            )
+            worker.join(1.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(observed, [native.current])
+            return connected
+
+        with mock.patch(
+            "l2flow_realtime.order_event_delta_control."
+            "open_live_order_events",
+            side_effect=connector,
+        ):
+            result = client.open_live_order_events("/event.sock")
+        self.assertIs(result, connected)
         client.close()
 
     def test_client_helper_closes_reader_if_trade_date_changes(self):

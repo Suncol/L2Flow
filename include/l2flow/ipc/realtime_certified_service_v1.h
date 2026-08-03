@@ -29,6 +29,8 @@ inline constexpr std::uint64_t
     kRealtimeCertifiedDefaultReorderSpanV1 = 1'048'576U;
 inline constexpr std::uint32_t
     kRealtimeCertifiedDefaultChannelCapacityV1 = 4096U;
+inline constexpr std::uint64_t
+    kRealtimeCertifiedDefaultTickHistoryCapacityV1 = 16'000'000U;
 
 // Minimal same-UID fd handoff protocol for the independent CERTIFIED
 // sidecar. It is deliberately not an extension of Realtime Control V2.
@@ -44,6 +46,8 @@ enum class RealtimeCertifiedControlOpcodeV1 : std::uint16_t {
     // Additive request. The original kGetSession response and descriptor
     // remain byte-for-byte unchanged.
     kGetEventHistory = 2U,
+    // Independent append-only canonical Tick history descriptor.
+    kGetTickHistory = 3U,
 };
 
 enum class RealtimeCertifiedControlStatusV1 : std::uint16_t {
@@ -81,6 +85,28 @@ struct RealtimeCertifiedControlResponseV1 final {
     std::array<std::uint8_t, 64U> reserved{};
 };
 static_assert(sizeof(RealtimeCertifiedControlResponseV1) == 128U);
+
+// Additive response used only by kGetTickHistory. The journal descriptor is
+// independently sealed/read-only and therefore does not change the original
+// GET_SESSION wire contract.
+struct RealtimeCertifiedTickHistoryControlResponseV1 final {
+    std::uint64_t magic = kRealtimeCertifiedControlResponseMagicV1;
+    std::uint16_t abi_major = kRealtimeCertifiedWireMajorV1;
+    std::uint16_t abi_minor = kRealtimeCertifiedWireMinorV1;
+    std::uint16_t status = 0U;
+    std::uint16_t response_bytes =
+        sizeof(RealtimeCertifiedTickHistoryControlResponseV1);
+    std::uint64_t nonce = 0U;
+    std::uint64_t mapping_bytes = 0U;
+    std::array<std::uint8_t, 16U> run_id{};
+    std::uint64_t session_epoch = 0U;
+    std::uint32_t trade_date = 0U;
+    std::uint32_t reserved0 = 0U;
+    std::uint64_t tick_capacity = 0U;
+    std::array<std::uint8_t, 56U> reserved{};
+};
+static_assert(
+    sizeof(RealtimeCertifiedTickHistoryControlResponseV1) == 128U);
 
 struct RealtimeCertifiedServiceConfigV1 final {
     l2flow::common::Identity128 run_id{};
@@ -149,6 +175,24 @@ struct RealtimeCertifiedServiceConfigV1 final {
     // default-false field preserves existing positional aggregate initializers
     // and ordinary live-from-open startup behavior.
     bool control_requires_prefix_commit = false;
+
+    // Append-only history is intentionally independent of the bounded hot
+    // ring. These fields are appended so existing positional aggregate
+    // initializers retain their original meaning. The full virtual mapping is
+    // fixed at Create, while backing is committed lazily by an independent
+    // history writer. The already-published bounded ring is that writer's
+    // retention buffer: a writer overrun fails only Tick History and never
+    // freezes FAST or the bounded CERTIFIED service.
+    std::uint64_t maximum_certified_ticks =
+        kRealtimeCertifiedDefaultTickHistoryCapacityV1;
+    // Zero derives the exact page-aligned mapping from the Tick capacity.
+    std::uint64_t maximum_certified_tick_mapping_bytes = 0U;
+    std::uint64_t certified_tick_lazy_commit_chunk_bytes =
+        64ULL * 1024ULL * 1024ULL;
+    // Empty reuses worker_cpu_set. Production therefore keeps the history
+    // writer on the Event/CERTIFIED cores without requiring a second option;
+    // tests and embedders may supply a stricter dedicated mask.
+    std::string tick_history_worker_cpu_set;
 };
 
 enum class RealtimeCertifiedServiceCreateErrorV1 : std::uint8_t {
@@ -166,6 +210,8 @@ enum class RealtimeCertifiedServiceCreateErrorV1 : std::uint8_t {
     kEventProjectorCreateFailed,
     kResourceExhausted,
     kUnexpectedFailure,
+    // Appended to preserve every existing numeric error value.
+    kTickJournalCreateFailed,
 };
 
 [[nodiscard]] std::string_view
@@ -195,6 +241,11 @@ struct RealtimeCertifiedServiceSnapshotV1 final {
     std::uint32_t frozen_channel_count = 0U;
     bool worker_running = false;
     bool globally_frozen_resource = false;
+    bool tick_history_writer_running = false;
+    bool tick_history_failed = false;
+    std::uint64_t tick_history_frontier = 0U;
+    std::uint64_t tick_history_lag = 0U;
+    std::uint64_t maximum_tick_history_lag = 0U;
     // False means the five bounded seqcount attempts all raced a writer. The
     // counter-only fields below remain current, but callers must not treat
     // the wire-derived state/frontiers as one coherent snapshot.
@@ -245,6 +296,8 @@ struct RealtimeCertifiedPrefixFenceResultV1 final {
     CertifiedOrderEventHistorySnapshotV1 event_history{};
     std::uint64_t event_journal_frontier = 0U;
     std::uint64_t event_published_sequence = 0U;
+    // Appended to preserve offsets of the existing fence result fields.
+    std::uint64_t tick_journal_frontier = 0U;
 
     [[nodiscard]] bool ready() const noexcept {
         return operation_error ==
@@ -383,6 +436,15 @@ public:
     [[nodiscard]] bool ReadControlCpuSetForTest(
         l2flow::common::LinuxCpuSetV1* output,
         int* system_error_number = nullptr) noexcept;
+    [[nodiscard]] bool ReadTickHistoryWorkerCpuSetForTest(
+        l2flow::common::LinuxCpuSetV1* output,
+        int* system_error_number = nullptr) noexcept;
+    // Deterministic retention-loss test hook for the asynchronous writer.
+    // It pauses only the auxiliary Tick-history thread; FAST and the bounded
+    // CERTIFIED worker continue to publish normally.
+    void SetTickHistoryWriterPausedForTest(bool paused) noexcept;
+    [[nodiscard]] bool TickHistoryWriterPauseReachedForTest()
+        const noexcept;
 
     // Legacy in-process mirror. It never returns the projector's physically
     // staged N generation while the public Tick header is still at N-1.

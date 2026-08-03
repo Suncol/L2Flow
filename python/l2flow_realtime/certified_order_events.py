@@ -14,20 +14,35 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Iterator, Union
+from typing import Iterator, Optional, Union
 
 from .instrument_derived_event_history import (
     InstrumentDerivedEvent,
     _DerivedEventRowC,
     _event_from_c,
 )
-from .models import L2FlowRealtimeError, SessionInfo, UnavailableError, WireFormatError
+from .models import (
+    EventUid,
+    HistoryCoverageInfo,
+    L2FlowRealtimeError,
+    SessionIdentity,
+    SessionInfo,
+    TemporalCoverageKind,
+    UnavailableError,
+    WireFormatError,
+)
 from .native import load_native_library
 
 
 _OPEN_OK = 0
 _READ_OK = 0
+_READ_NO_DATA = 1
+_READ_NOT_YET_PUBLISHED = 2
 _READ_OUT_OF_RANGE = 3
+_READ_INCONSISTENT = 4
+_READ_CORRUPT = 5
+_READ_END_OF_STREAM = 6
+_READ_PRODUCER_FAILED = 7
 _COVERAGE_FROM_OPEN = 1 << 0
 _STARTUP_PREFIX_RECOVERED = 1 << 1
 _KNOWN_COVERAGE_FLAGS = _COVERAGE_FROM_OPEN | _STARTUP_PREFIX_RECOVERED
@@ -145,6 +160,20 @@ class CertifiedOrderEventSession:
     def startup_prefix_recovered(self) -> bool:
         return bool(self.coverage_flags & _STARTUP_PREFIX_RECOVERED)
 
+    @property
+    def identity(self) -> SessionIdentity:
+        return SessionIdentity(self.run_id, self.session_epoch)
+
+    @property
+    def history_coverage(self) -> HistoryCoverageInfo:
+        return HistoryCoverageInfo(
+            run_id=self.run_id,
+            session_epoch=self.session_epoch,
+            trade_date=self.trade_date,
+            coverage_kind=TemporalCoverageKind.FROM_OPEN,
+            coverage_start_unix_ns=None,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class CertifiedOrderEventStatus:
@@ -190,6 +219,14 @@ class CertifiedOrderEvent:
     canonical_apply_sequence: int
     event: InstrumentDerivedEvent
 
+    @property
+    def source_tick_event_ordinal(self) -> Optional[int]:
+        return self.event.source_tick_event_ordinal
+
+    @property
+    def event_uid(self) -> Optional[EventUid]:
+        return self.event.event_uid
+
 
 class CertifiedOrderEventError(L2FlowRealtimeError):
     def __init__(
@@ -211,10 +248,34 @@ class CertifiedOrderEventError(L2FlowRealtimeError):
         super().__init__(detail)
 
 
+class CertifiedOrderEventProducerFailedError(UnavailableError):
+    """The CERTIFIED producer froze before this cursor could advance."""
+
+    def __init__(self, status: CertifiedOrderEventStatus) -> None:
+        self.status = status
+        super().__init__(
+            "CERTIFIED Event producer froze at coherent canonical frontier "
+            f"{status.coherent_canonical_apply_frontier}: "
+            f"{status.state.name}"
+        )
+
+
+class CertifiedOrderEventCapacityError(UnavailableError):
+    """The cursor is beyond the journal's one exact natural tail."""
+
+
 class CertifiedOrderEventBatch:
     """Owned contiguous 328-byte envelopes plus one coherent status cut."""
 
-    __slots__ = ("_rows", "_bytes", "_count", "next_event_sequence", "status")
+    __slots__ = (
+        "_rows",
+        "_bytes",
+        "_count",
+        "_session_identity",
+        "history_coverage",
+        "next_event_sequence",
+        "status",
+    )
 
     def __init__(
         self,
@@ -222,6 +283,9 @@ class CertifiedOrderEventBatch:
         count: int,
         next_event_sequence: int,
         status: CertifiedOrderEventStatus,
+        *,
+        session_identity: Optional[SessionIdentity] = None,
+        history_coverage: Optional[HistoryCoverageInfo] = None,
     ) -> None:
         self._rows = rows
         self._count = count
@@ -229,9 +293,53 @@ class CertifiedOrderEventBatch:
         self._bytes = byte_type.from_buffer(rows)
         self.next_event_sequence = next_event_sequence
         self.status = status
+        if session_identity is not None and not isinstance(
+            session_identity, SessionIdentity
+        ):
+            raise TypeError(
+                "session_identity must be SessionIdentity or None"
+            )
+        if history_coverage is not None and not isinstance(
+            history_coverage, HistoryCoverageInfo
+        ):
+            raise TypeError(
+                "history_coverage must be HistoryCoverageInfo or None"
+            )
+        if history_coverage is not None:
+            if session_identity is None:
+                session_identity = history_coverage.identity
+            elif (
+                session_identity.run_id != history_coverage.run_id
+                or session_identity.session_epoch
+                != history_coverage.session_epoch
+            ):
+                raise ValueError(
+                    "session_identity and history_coverage disagree"
+                )
+        self._session_identity = session_identity
+        self.history_coverage = history_coverage
 
     def __len__(self) -> int:
         return self._count
+
+    @property
+    def tail_idle(self) -> bool:
+        return (
+            not self
+            and self.status.state
+            not in (
+                CertifiedOrderEventState.FROZEN_CONFLICT,
+                CertifiedOrderEventState.FROZEN_RESOURCE,
+                CertifiedOrderEventState.STOPPED,
+            )
+        )
+
+    @property
+    def end_of_stream(self) -> bool:
+        return (
+            not self
+            and self.status.state is CertifiedOrderEventState.STOPPED
+        )
 
     @property
     def buffer(self) -> memoryview:
@@ -247,7 +355,10 @@ class CertifiedOrderEventBatch:
         row = self._rows[index]
         return CertifiedOrderEvent(
             canonical_apply_sequence=row.canonical_apply_sequence,
-            event=_event_from_c(row.event),
+            event=_event_from_c(
+                row.event,
+                session_identity=self._session_identity,
+            ),
         )
 
     def __iter__(self) -> Iterator[CertifiedOrderEvent]:
@@ -399,6 +510,8 @@ class CertifiedOrderEventReader:
         "_library",
         "_handle",
         "_session",
+        "_session_identity",
+        "_history_coverage",
         "_next_event_sequence",
         "_batch_records",
         "_lock",
@@ -417,6 +530,8 @@ class CertifiedOrderEventReader:
         self._library = library
         self._handle = handle
         self._session = session
+        self._session_identity = session.identity
+        self._history_coverage = session.history_coverage
         self._next_event_sequence = start_event_sequence
         self._batch_records = batch_records
         self._lock = threading.Lock()
@@ -501,7 +616,8 @@ class CertifiedOrderEventReader:
                 session.run_id != run_id
                 or session.session_epoch != session_epoch
                 or session.trade_date != trade_date
-                or start_event_sequence > session.event_capacity
+                or start_event_sequence
+                > min(_UINT64_MAX, session.event_capacity + 1)
             ):
                 raise WireFormatError(
                     "CERTIFIED event mapping has the wrong session or cursor"
@@ -520,6 +636,10 @@ class CertifiedOrderEventReader:
     @property
     def session(self) -> CertifiedOrderEventSession:
         return self._session
+
+    @property
+    def history_coverage(self) -> HistoryCoverageInfo:
+        return self._history_coverage
 
     @property
     def next_event_sequence(self) -> int:
@@ -561,7 +681,14 @@ class CertifiedOrderEventReader:
                 self._batch_records,
                 ctypes.byref(result),
             )
-            if code != _READ_OK:
+            if code == _READ_INCONSISTENT:
+                raise CertifiedOrderEventError("read", code)
+            if code in (_READ_OUT_OF_RANGE, _READ_CORRUPT):
+                if code == _READ_OUT_OF_RANGE:
+                    raise CertifiedOrderEventCapacityError(
+                        "CERTIFIED Event cursor exceeds fixed journal "
+                        "capacity"
+                    )
                 raise CertifiedOrderEventError("read", code)
             if (
                 result.result_schema_version != _RESULT_SCHEMA_VERSION
@@ -577,12 +704,54 @@ class CertifiedOrderEventReader:
                 raise WireFormatError(
                     "CERTIFIED event coverage changed after attachment"
                 )
+            if code == _READ_PRODUCER_FAILED:
+                if (
+                    result.records_written != 0
+                    or status.state
+                    not in (
+                        CertifiedOrderEventState.FROZEN_CONFLICT,
+                        CertifiedOrderEventState.FROZEN_RESOURCE,
+                    )
+                ):
+                    raise WireFormatError(
+                        "producer-failed CERTIFIED Event result lacks a "
+                        "frozen status"
+                    )
+                raise CertifiedOrderEventProducerFailedError(status)
+            if code not in (
+                _READ_OK,
+                _READ_NO_DATA,
+                _READ_NOT_YET_PUBLISHED,
+                _READ_END_OF_STREAM,
+            ):
+                raise CertifiedOrderEventError("read", code)
+            if code != _READ_OK and result.records_written != 0:
+                raise WireFormatError(
+                    "terminal/idle CERTIFIED Event read returned rows"
+                )
+            if (
+                code == _READ_END_OF_STREAM
+                and status.state is not CertifiedOrderEventState.STOPPED
+            ) or (
+                code in (_READ_NO_DATA, _READ_NOT_YET_PUBLISHED)
+                and status.state
+                in (
+                    CertifiedOrderEventState.FROZEN_CONFLICT,
+                    CertifiedOrderEventState.FROZEN_RESOURCE,
+                    CertifiedOrderEventState.STOPPED,
+                )
+            ):
+                raise WireFormatError(
+                    "CERTIFIED Event read result disagrees with lifecycle"
+                )
             self._next_event_sequence = result.next_event_sequence
             return CertifiedOrderEventBatch(
                 rows,
                 result.records_written,
                 result.next_event_sequence,
                 status,
+                session_identity=self._session_identity,
+                history_coverage=self._history_coverage,
             )
 
     def close(self) -> None:

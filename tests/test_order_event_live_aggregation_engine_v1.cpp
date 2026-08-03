@@ -447,13 +447,22 @@ void TestShenzhenMergedOrderThenTransaction(bool* ok) {
             read.consumed_source_tick_sequence == 2U &&
             rows[0U].event_kind ==
                 L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+            rows[0U].reserved0 == 0U &&
             rows[0U].native_event_sequence == 1'001 &&
             rows[1U].event_kind ==
                 L2FLOW_INSTRUMENT_DERIVED_EVENT_TRADE_V1 &&
+            rows[1U].reserved0 == 0U &&
             rows[1U].native_event_sequence == 1'002 &&
             rows[1U].trade_amount_valid == 0U &&
             rows[2U].event_kind ==
                 L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+            rows[2U].reserved0 == 1U &&
+            rows[0U].reserved1[0U] ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
+            rows[1U].reserved1[0U] ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
+            rows[2U].reserved1[0U] ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
             rows[2U].order_id == 1'001 &&
             rows[2U].revision == 2U &&
             rows[2U].remaining_quantity == 15,
@@ -549,7 +558,11 @@ void TestMixedDenseStreamAndState(bool* ok) {
                 rows[0U].tick_stream_sequence == 2U &&
                 rows[1U].tick_stream_sequence == 2U &&
                 rows[2U].tick_stream_sequence == 3U &&
-                rows[3U].tick_stream_sequence == 5U,
+                rows[3U].tick_stream_sequence == 5U &&
+                rows[0U].reserved0 == 0U &&
+                rows[1U].reserved0 == 1U &&
+                rows[2U].reserved0 == 0U &&
+                rows[3U].reserved0 == 0U,
             "delta event sequence is dense while source anchors are exact");
         *ok &= Expect(
             rows[1U].event_kind ==
@@ -779,6 +792,7 @@ void TestEndStatusIsOneAtomicSourceBatch(bool* ok) {
                 rows[4U].event_kind ==
                     L2FLOW_INSTRUMENT_DERIVED_EVENT_STATUS_V1 &&
                 rows[4U].tick_stream_sequence == 3U &&
+                rows[4U].reserved0 == 0U &&
                 rows[5U].operation ==
                     static_cast<std::uint8_t>(
                         market::ShanghaiOrderDeltaOperationV1::
@@ -788,7 +802,9 @@ void TestEndStatusIsOneAtomicSourceBatch(bool* ok) {
                         market::ShanghaiOrderDeltaOperationV1::
                             kFinalize) &&
                 rows[5U].tick_stream_sequence == 3U &&
-                rows[6U].tick_stream_sequence == 3U,
+                rows[6U].tick_stream_sequence == 3U &&
+                rows[5U].reserved0 == 1U &&
+                rows[6U].reserved0 == 2U,
             "ENDTR complete event batch becomes visible as one prefix");
     }
     {

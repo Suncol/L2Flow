@@ -113,6 +113,8 @@ ipc::OrderEventDeltaPayloadV1 OrderEvent(
     result.ingress_sequence = source_tick_sequence;
     result.tick_stream_sequence = source_tick_sequence;
     result.vendor_sequence_id = source_tick_sequence;
+    result.reserved1[0U] =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2;
     result.order_id = 100;
     result.revision = 1U;
     result.original_quantity = 500;
@@ -494,6 +496,43 @@ void TestLiveServer(
                 read.written == 1U && read.next_sequence == 2U &&
                 rows[0U].order_id == 100,
             "connected reader consumes live event");
+    }
+
+    std::unique_ptr<ipc::OrderEventDeltaRingReaderV1> reader_at;
+    snapshot = {};
+    *ok &= Expect(
+        ipc::OrderEventDeltaControlConnectAtV1(
+            ClientConfig(socket_path),
+            0U,
+            &snapshot,
+            &reader_at,
+            &system_error) ==
+                ipc::OrderEventDeltaControlClientErrorV1::
+                    kInvalidArgument &&
+            reader_at == nullptr &&
+            snapshot == ipc::OrderEventDeltaControlSnapshotV1{},
+        "ConnectAt rejects a zero construction sequence");
+
+    snapshot = {};
+    *ok &= Expect(
+        ipc::OrderEventDeltaControlConnectAtV1(
+            ClientConfig(socket_path),
+            2U,
+            &snapshot,
+            &reader_at,
+            &system_error) ==
+                ipc::OrderEventDeltaControlClientErrorV1::kNone &&
+            reader_at != nullptr && system_error == 0,
+        "ConnectAt carries an explicit history boundary");
+    if (reader_at != nullptr) {
+        std::array<ipc::OrderEventDeltaPayloadV1, 1U> rows{};
+        ipc::OrderEventDeltaReadResultV1 read{};
+        *ok &= Expect(
+            reader_at->Read(2U, rows, &read) ==
+                    ipc::OrderEventDeltaReadErrorV1::kNone &&
+                read.written == 0U && read.next_sequence == 2U &&
+                read.published_event_sequence == 1U,
+            "ConnectAt reader starts at the explicit future boundary");
     }
 
     auto wrong = ClientConfig(socket_path);

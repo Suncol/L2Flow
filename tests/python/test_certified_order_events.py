@@ -3,6 +3,8 @@ import gc
 import unittest
 
 from l2flow_realtime.certified_order_events import (
+    CertifiedOrderEventCapacityError,
+    CertifiedOrderEventProducerFailedError,
     CertifiedOrderEventReader,
     CertifiedOrderEventState,
     _EnvelopeC,
@@ -13,7 +15,7 @@ from l2flow_realtime.certified_order_events import (
 from l2flow_realtime.instrument_derived_event_history import (
     InstrumentDerivedEventKind,
 )
-from l2flow_realtime.models import Market
+from l2flow_realtime.models import Market, SessionIdentity, WireFormatError
 
 
 class _Function:
@@ -29,7 +31,9 @@ class _Function:
 class _FakeLibrary:
     def __init__(self):
         self.run_id = bytes(range(1, 17))
+        self.event_capacity = 8
         self.published = 2
+        self.state = CertifiedOrderEventState.CONTIGUOUS
         self.closed = False
         self.l2flow_certified_order_event_reader_open_v1 = _Function(
             self._open
@@ -68,17 +72,16 @@ class _FakeLibrary:
         value = output._obj
         value.run_id[:] = self.run_id
         value.session_epoch = 7
-        value.event_capacity = 8
+        value.event_capacity = self.event_capacity
         value.trade_date = 20260730
         value.coverage_flags = 3
         return 0
 
-    @staticmethod
-    def _fill_status(value, published):
+    def _fill_status(self, value, published):
         value.status_schema_version = 1
         value.status_bytes = ctypes.sizeof(_StatusC)
         value.coverage_flags = 3
-        value.certified_state = 3
+        value.certified_state = int(self.state)
         value.tick_publish_tag = 2
         value.tick_heartbeat_monotonic_ns = 100
         value.tick_canonical_apply_frontier = published
@@ -104,7 +107,7 @@ class _FakeLibrary:
     def _fill_row(row: _EnvelopeC, sequence: int):
         row.canonical_apply_sequence = sequence
         event = row.event
-        event.record_schema_version = 1
+        event.record_schema_version = 2
         event.record_bytes = ctypes.sizeof(event)
         event.derived_event_sequence = sequence
         event.trade_date = 20260730
@@ -117,6 +120,8 @@ class _FakeLibrary:
         event.source_sequence = sequence
         event.ingress_sequence = sequence
         event.tick_stream_sequence = sequence
+        event.reserved0 = 0
+        event.reserved1[0] = 1
 
     def _read(
         self,
@@ -139,7 +144,30 @@ class _FakeLibrary:
         result.records_written = count
         result.next_event_sequence = expected + count
         self._fill_status(result.status, self.published)
-        return 0
+        if count:
+            return 0
+        if expected > self.event_capacity:
+            if (
+                expected == self.event_capacity + 1
+                and self.published == self.event_capacity
+            ):
+                if self.state is CertifiedOrderEventState.STOPPED:
+                    return 6
+                if self.state in (
+                    CertifiedOrderEventState.FROZEN_CONFLICT,
+                    CertifiedOrderEventState.FROZEN_RESOURCE,
+                ):
+                    return 7
+                return 2
+            return 3
+        if self.state in (
+            CertifiedOrderEventState.FROZEN_CONFLICT,
+            CertifiedOrderEventState.FROZEN_RESOURCE,
+        ):
+            return 7
+        if self.state is CertifiedOrderEventState.STOPPED:
+            return 6
+        return 1 if self.published == 0 else 2
 
 
 class CertifiedOrderEventReaderTests(unittest.TestCase):
@@ -156,6 +184,10 @@ class CertifiedOrderEventReaderTests(unittest.TestCase):
 
         self.assertTrue(reader.session.coverage_from_open)
         self.assertTrue(reader.session.startup_prefix_recovered)
+        self.assertTrue(
+            reader.session.history_coverage.coverage_from_open
+        )
+        coverage = reader.history_coverage
         status = reader.status()
         self.assertEqual(status.state, CertifiedOrderEventState.CONTIGUOUS)
         self.assertEqual(status.tick_canonical_apply_frontier, 2)
@@ -174,6 +206,19 @@ class CertifiedOrderEventReaderTests(unittest.TestCase):
             [1, 2],
         )
         self.assertEqual(history.row(0).event.market, Market.SHANGHAI)
+        self.assertEqual(history.row(0).source_tick_event_ordinal, 0)
+        self.assertEqual(
+            history.row(0).event_uid.session_identity,
+            SessionIdentity(library.run_id, 7),
+        )
+        self.assertEqual(
+            history.row(0).event_uid.instrument_id, 11
+        )
+        self.assertEqual(
+            history.row(0).event_uid.tick_stream_sequence, 1
+        )
+        self.assertTrue(history.history_coverage.coverage_from_open)
+        self.assertIs(history.history_coverage, coverage)
         self.assertEqual(
             history.row(0).event.event_kind,
             InstrumentDerivedEventKind.TRADE,
@@ -209,6 +254,78 @@ class CertifiedOrderEventReaderTests(unittest.TestCase):
         del reader
         gc.collect()
         self.assertTrue(library.closed)
+
+    def test_exactly_full_natural_tail_preserves_lifecycle(self):
+        cases = (
+            (CertifiedOrderEventState.CONTIGUOUS, "idle"),
+            (CertifiedOrderEventState.STOPPED, "complete"),
+            (CertifiedOrderEventState.FROZEN_RESOURCE, "failed"),
+        )
+        for state, expected in cases:
+            with self.subTest(state=state):
+                library = _FakeLibrary()
+                library.event_capacity = 2
+                library.published = 2
+                library.state = state
+                reader = CertifiedOrderEventReader.connect(
+                    "/tmp/certified-events.sock",
+                    run_id=library.run_id,
+                    session_epoch=7,
+                    trade_date=20260730,
+                    start_event_sequence=3,
+                    native_library=library,
+                )
+                self.addCleanup(reader.close)
+                self.assertEqual(reader.next_event_sequence, 3)
+                if expected == "failed":
+                    with self.assertRaises(
+                        CertifiedOrderEventProducerFailedError
+                    ) as cm:
+                        reader.read_batch()
+                    self.assertIs(cm.exception.status.state, state)
+                    self.assertEqual(reader.next_event_sequence, 3)
+                    continue
+                batch = reader.read_batch()
+                self.assertEqual(len(batch), 0)
+                self.assertEqual(batch.next_event_sequence, 3)
+                self.assertEqual(reader.next_event_sequence, 3)
+                self.assertIs(batch.status.state, state)
+                self.assertEqual(batch.tail_idle, expected == "idle")
+                self.assertEqual(
+                    batch.end_of_stream, expected == "complete"
+                )
+
+    def test_attach_rejects_only_beyond_exact_natural_tail(self):
+        library = _FakeLibrary()
+        library.event_capacity = 2
+        library.published = 2
+        with self.assertRaises(WireFormatError):
+            CertifiedOrderEventReader.connect(
+                "/tmp/certified-events.sock",
+                run_id=library.run_id,
+                session_epoch=7,
+                trade_date=20260730,
+                start_event_sequence=4,
+                native_library=library,
+            )
+        self.assertTrue(library.closed)
+
+        # The native layer, not attach validation, decides whether capacity+1
+        # is a genuine full-journal tail or an invalid future seek.
+        sparse = _FakeLibrary()
+        sparse.event_capacity = 2
+        sparse.published = 1
+        reader = CertifiedOrderEventReader.connect(
+            "/tmp/certified-events.sock",
+            run_id=sparse.run_id,
+            session_epoch=7,
+            trade_date=20260730,
+            start_event_sequence=3,
+            native_library=sparse,
+        )
+        self.addCleanup(reader.close)
+        with self.assertRaises(CertifiedOrderEventCapacityError):
+            reader.read_batch()
 
 
 if __name__ == "__main__":

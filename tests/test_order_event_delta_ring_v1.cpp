@@ -93,6 +93,34 @@ std::unique_ptr<ipc::OrderEventDeltaRingReaderV1> Reader(
     return result;
 }
 
+std::unique_ptr<ipc::OrderEventDeltaRingReaderV1> ReaderAt(
+    const ipc::OrderEventDeltaRingProducerV1& producer,
+    std::uint64_t start_event_sequence,
+    bool* ok) {
+    int descriptor = -1;
+    int system_error = -1;
+    *ok &= Expect(
+        producer.DuplicateReadOnlyDescriptor(
+            &descriptor, &system_error) &&
+            descriptor >= 0 && system_error == 0,
+        "duplicate read-only descriptor for OpenAt");
+    std::unique_ptr<ipc::OrderEventDeltaRingReaderV1> result;
+    const auto error = ipc::OrderEventDeltaRingReaderV1::OpenAt(
+        descriptor,
+        producer.session(),
+        start_event_sequence,
+        &result,
+        &system_error);
+    if (descriptor >= 0) {
+        static_cast<void>(::close(descriptor));
+    }
+    *ok &= Expect(
+        error == ipc::OrderEventDeltaReaderOpenErrorV1::kNone &&
+            result != nullptr && system_error == 0,
+        "open event-delta reader at explicit sequence");
+    return result;
+}
+
 ipc::OrderEventDeltaPayloadV1 Base(
     std::uint64_t tick_sequence,
     std::uint8_t event_kind,
@@ -113,6 +141,8 @@ ipc::OrderEventDeltaPayloadV1 Base(
     result.ingress_sequence = tick_sequence;
     result.tick_stream_sequence = tick_sequence;
     result.vendor_sequence_id = tick_sequence;
+    result.reserved1[0U] =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2;
     return result;
 }
 
@@ -155,7 +185,9 @@ void TestAbiAndValidation(bool* ok) {
         sizeof(ipc::OrderEventDeltaPayloadV1) == 320U &&
             sizeof(ipc::OrderEventDeltaHeaderV1) == 4096U &&
             sizeof(ipc::OrderEventDeltaSlotV1) == 384U &&
-            ipc::kOrderEventDeltaWireMinorV1 == 1U &&
+            ipc::kOrderEventDeltaWireMinorV1 == 2U &&
+            ipc::kOrderEventDeltaPayloadSchemaV1 ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 &&
             offsetof(
                 ipc::OrderEventDeltaHeaderV1,
                 temporal_coverage) == 120U &&
@@ -174,6 +206,13 @@ void TestAbiAndValidation(bool* ok) {
         !ipc::OrderEventDeltaPayloadCanonicalV1(
             event, 20260730U, 1U),
         "nonzero event reserve rejected");
+    event = Order(1U, 42);
+    event.reserved1[0U] =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_INVALID_V2;
+    *ok &= Expect(
+        !ipc::OrderEventDeltaPayloadCanonicalV1(
+            event, 20260730U, 1U),
+        "source-backed row requires explicit ordinal validity");
     event = Trade(1U, 10);
     event.price_valid = 2U;
     *ok &= Expect(
@@ -245,6 +284,13 @@ void TestCreateAndOpenValidation(bool* ok) {
                 kSessionMismatch &&
             reader == nullptr,
         "reader rejects wrong session epoch");
+    *ok &= Expect(
+        ipc::OrderEventDeltaRingReaderV1::OpenAt(
+            descriptor, producer->session(), 0U, &reader) ==
+                ipc::OrderEventDeltaReaderOpenErrorV1::
+                    kInvalidArgument &&
+            reader == nullptr,
+        "reader rejects zero construction sequence");
     if (descriptor >= 0) {
         static_cast<void>(::close(descriptor));
     }
@@ -343,6 +389,7 @@ void TestBasicPublication(bool* ok) {
     std::array<ipc::OrderEventDeltaPayloadV1, 2U> batch{
         Order(2U, 100),
         Trade(2U, 25)};
+    batch[1U].reserved0 = 1U;
     batch[0U].derived_event_sequence = 999U;
     *ok &= Expect(
         producer->PublishSourceTick(2U, batch) ==
@@ -357,7 +404,13 @@ void TestBasicPublication(bool* ok) {
             rows[0U].derived_event_sequence == 1U &&
             rows[1U].derived_event_sequence == 2U &&
             rows[0U].tick_stream_sequence == 2U &&
-            rows[1U].tick_stream_sequence == 2U,
+            rows[1U].tick_stream_sequence == 2U &&
+            rows[0U].reserved0 == 0U &&
+            rows[1U].reserved0 == 1U &&
+            rows[0U].reserved1[0U] ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
+            rows[1U].reserved1[0U] ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2,
         "reader receives producer-assigned dense event sequence");
 
     auto invalid = Trade(3U, 10);
@@ -449,6 +502,23 @@ void TestOverrunFailClosed(bool* ok) {
                 ipc::OrderEventDeltaReadErrorV1::kOverrun,
             "new reader starts at one and detects retained-prefix loss");
     }
+
+    auto resumed = ReaderAt(*producer, 2U, ok);
+    if (resumed != nullptr) {
+        *ok &= Expect(
+            resumed->Read(1U, rows, &result) ==
+                    ipc::OrderEventDeltaReadErrorV1::
+                        kInvalidArgument &&
+                result.next_sequence == 2U,
+            "OpenAt cursor rejects a caller-selected sequence");
+        *ok &= Expect(
+            resumed->Read(2U, rows, &result) ==
+                    ipc::OrderEventDeltaReadErrorV1::kNone &&
+                result.written == 2U && result.next_sequence == 4U &&
+                rows[0U].derived_event_sequence == 2U &&
+                rows[1U].derived_event_sequence == 3U,
+            "OpenAt resumes from an explicit retained history boundary");
+    }
 }
 
 void TestSourceGapAndCapacityFailClosed(bool* ok) {
@@ -518,6 +588,7 @@ void TestSourceCursorAfterWholeBatch(bool* ok) {
             1U,
             static_cast<std::int64_t>(index + 1U),
             static_cast<std::uint32_t>(index + 1U)));
+        batch.back().reserved0 = static_cast<std::uint32_t>(index);
     }
 
     std::atomic<bool> started{false};

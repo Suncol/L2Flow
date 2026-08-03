@@ -34,7 +34,7 @@ enum l2flow_shm_reader_error_v2 {
     L2FLOW_SHM_READER_INCONSISTENT_READ_V2 = 8,
 };
 
-// Wire V2.4 server states. LIVE_PARTIAL permits point-in-time latest reads and
+// Wire V2.5 server states. LIVE_PARTIAL permits point-in-time latest reads and
 // an explicitly enabled standalone service may also publish immutable
 // process-start History/tick-delta generations. KLine is readable only when
 // explicitly enabled and always retains process-start coverage metadata; it
@@ -67,6 +67,12 @@ enum l2flow_kline_coverage_kind_v2 {
 enum l2flow_kline_coverage_flag_v2 {
     L2FLOW_KLINE_PROCESS_START_PARTIAL_V2 = 1U << 0U,
     L2FLOW_KLINE_NATURAL_WINDOW_LEFT_TRUNCATED_V2 = 1U << 1U,
+};
+
+enum l2flow_history_coverage_kind_v2 {
+    L2FLOW_HISTORY_COVERAGE_UNAVAILABLE_V2 = 0,
+    L2FLOW_HISTORY_COVERAGE_FROM_OPEN_V2 = 1,
+    L2FLOW_HISTORY_COVERAGE_PROCESS_START_PARTIAL_V2 = 2,
 };
 
 enum l2flow_instrument_status_v2 {
@@ -300,6 +306,18 @@ typedef struct l2flow_kline_coverage_info_v2 {
     uint64_t reserved[1];
 } l2flow_kline_coverage_info_v2;
 
+// Fixed additive ABI for session-wide History temporal coverage. This is not
+// inferred from KLine, because History remains available when KLine is
+// disabled. PROCESS_START_PARTIAL returns UNAVAILABLE until the nonzero
+// boundary has been prepared.
+typedef struct l2flow_history_coverage_info_v2 {
+    uint64_t session_epoch;
+    uint64_t coverage_start_unix_ns;
+    uint32_t coverage_kind;
+    uint32_t reserved0;
+    uint64_t reserved[1];
+} l2flow_history_coverage_info_v2;
+
 // A selection envelope and its ID array describe one stable structural cut.
 // The catalog/data-state identity and selected rows are validated together;
 // accepted/applied progress comes from one coherent status read taken after
@@ -329,7 +347,7 @@ typedef struct l2flow_selection_envelope_v2 {
     uint32_t reserved[2];
 } l2flow_selection_envelope_v2;
 
-// Maps fd read-only and accepts only the sealed Wire V2.4 layout. The caller
+// Maps fd read-only and accepts only the sealed Wire V2.5 layout. The caller
 // retains ownership of fd and may close it immediately after this function
 // returns.
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_open_fd_v2(
@@ -349,6 +367,9 @@ L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_health_v2(
 L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_kline_coverage_v2(
     const l2flow_shm_reader_v2* reader,
     l2flow_kline_coverage_info_v2* output);
+L2FLOW_SHM_READER_API_V2 int l2flow_shm_reader_history_coverage_v2(
+    const l2flow_shm_reader_v2* reader,
+    l2flow_history_coverage_info_v2* output);
 
 // Looks up instrument_id in O(1) as ordinal=instrument_id-1 and copies one
 // stable 128-byte row plus its exact opaque key bytes when bound. Required

@@ -206,13 +206,27 @@ public:
         std::unique_ptr<OrderEventDeltaRingReaderV1>* output,
         int* system_error_number = nullptr) noexcept;
 
-    // Serial-only and stateful. A new reader starts at sequence 1, and
-    // expected_sequence must equal the next_sequence returned by its preceding
-    // successful call. A successful zero-row read means the published event
-    // prefix has not reached expected_sequence. Overrun never changes
-    // next_sequence and is terminal for that live cursor. Reopening also
-    // starts at 1, so V1 cannot be used to skip lost history by selecting the
-    // current oldest slot.
+    // Additive catch-up attachment. start_event_sequence is the first dense
+    // event sequence the new cursor will request and must be positive. Open
+    // is exactly equivalent to OpenAt(..., 1, ...). The selected sequence is
+    // immutable after construction: callers cannot skip a failed cursor.
+    // Retention is checked by the first Read against one coherent published
+    // prefix; selecting an already-overwritten sequence therefore reports
+    // kOverrun and fail-closes the new reader normally.
+    [[nodiscard]] static OrderEventDeltaReaderOpenErrorV1 OpenAt(
+        int read_only_descriptor,
+        const OrderEventDeltaSessionV1& expected_session,
+        std::uint64_t start_event_sequence,
+        std::unique_ptr<OrderEventDeltaRingReaderV1>* output,
+        int* system_error_number = nullptr) noexcept;
+
+    // Serial-only and stateful. A reader begins at its construction sequence,
+    // and expected_sequence must equal the next_sequence returned by its
+    // preceding successful call. A successful zero-row read means the
+    // published event prefix has not reached expected_sequence. Overrun never
+    // changes next_sequence and is terminal for that live cursor. Recovery
+    // therefore requires a new OpenAt whose explicit boundary was established
+    // by a trusted history checkpoint; the reader never chooses a skip point.
     [[nodiscard]] OrderEventDeltaReadErrorV1 Read(
         std::uint64_t expected_sequence,
         std::span<OrderEventDeltaPayloadV1> output,

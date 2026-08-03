@@ -51,8 +51,9 @@ static_assert(
         ipc::CertifiedOrderEventReaderOpenErrorV1::kUnexpectedFailure) ==
     L2FLOW_CERTIFIED_ORDER_EVENT_OPEN_UNEXPECTED_FAILURE_V1);
 static_assert(
-    static_cast<int>(ipc::CertifiedOrderEventReadResultV1::kCorrupt) ==
-    L2FLOW_CERTIFIED_ORDER_EVENT_READ_CORRUPT_V1);
+    static_cast<int>(
+        ipc::CertifiedOrderEventReadResultV1::kProducerFailed) ==
+    L2FLOW_CERTIFIED_ORDER_EVENT_READ_PRODUCER_FAILED_V1);
 static_assert(
     static_cast<std::uint32_t>(
         ipc::RealtimeCertifiedStateV1::kStopped) ==
@@ -267,14 +268,14 @@ extern "C" int l2flow_certified_order_event_reader_read_v1(
         expected_event_sequence,
         native_output,
         &native_result);
-    if (read != ipc::CertifiedOrderEventReadResultV1::kOk) {
-        return static_cast<int>(read);
-    }
     result->records_written = native_result.written;
     result->next_event_sequence =
         native_result.next_event_sequence;
-    CopyStatus(native_result.status, &result->status);
-    return L2FLOW_CERTIFIED_ORDER_EVENT_READ_OK_V1;
+    if (native_result.status.tick.publish_tag != 0U &&
+        native_result.status.event_publish_tag != 0U) {
+        CopyStatus(native_result.status, &result->status);
+    }
+    return static_cast<int>(read);
 }
 
 extern "C" const char*
@@ -293,7 +294,8 @@ l2flow_certified_order_event_open_error_name_v1(int error) {
 extern "C" const char*
 l2flow_certified_order_event_read_result_name_v1(int result) {
     if (result < 0 ||
-        result > L2FLOW_CERTIFIED_ORDER_EVENT_READ_CORRUPT_V1) {
+        result >
+            L2FLOW_CERTIFIED_ORDER_EVENT_READ_PRODUCER_FAILED_V1) {
         return "unknown";
     }
     return ipc::CertifiedOrderEventReadResultNameV1(

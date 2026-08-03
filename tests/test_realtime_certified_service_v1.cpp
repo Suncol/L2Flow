@@ -3,6 +3,8 @@
 #include "l2flow/ipc/certified_order_event_reader_v1.h"
 #include "l2flow/ipc/realtime_certified_reader_v1.h"
 #include "l2flow/ipc/realtime_certified_service_v1.h"
+#include "l2flow/ipc/realtime_certified_tick_history_reader_c_v1.h"
+#include "l2flow/ipc/realtime_certified_tick_history_reader_v1.h"
 #include "l2flow/ipc/realtime_wire_projection_v2.h"
 #include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/instrument_runtime_state_v2.h"
@@ -12,6 +14,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -28,6 +31,7 @@
 #include <type_traits>
 #include <vector>
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -379,7 +383,10 @@ struct WorkerBarrierFixture final {
     std::string_view worker_cpu_set = {},
     std::string_view control_cpu_set = {},
     std::shared_ptr<const std::atomic<bool>> exposure_gate = nullptr,
-    bool control_requires_prefix_commit = false) {
+    bool control_requires_prefix_commit = false,
+    std::uint64_t maximum_certified_ticks = 1024U,
+    std::uint64_t certified_tick_ring_capacity = 64U,
+    std::uint64_t maximum_derived_events = 1024U) {
     if (test == nullptr || output == nullptr) {
         return false;
     }
@@ -402,7 +409,10 @@ struct WorkerBarrierFixture final {
     service_config.trade_date = 20260730U;
     service_config.daily_catalog = output->instrument.catalog;
     service_config.fast_sink = output->fast;
-    service_config.certified_tick_ring_capacity = 64U;
+    service_config.certified_tick_ring_capacity =
+        certified_tick_ring_capacity;
+    service_config.maximum_certified_ticks = maximum_certified_ticks;
+    service_config.certified_tick_lazy_commit_chunk_bytes = 4096U;
     service_config.channel_capacity = 8U;
     service_config.handoff_queue_capacity = 128U;
     service_config.maximum_pending_entries = 64U;
@@ -411,7 +421,7 @@ struct WorkerBarrierFixture final {
     service_config.maximum_reorder_span = 1024U;
     service_config.maximum_mapping_bytes = 8U * 1024U * 1024U;
     service_config.maximum_order_states = 128U;
-    service_config.maximum_derived_events = 1024U;
+    service_config.maximum_derived_events = maximum_derived_events;
     service_config.worker_cpu_set = std::string(worker_cpu_set);
     service_config.control_cpu_set = std::string(control_cpu_set);
     service_config.control_exposure_gate =
@@ -608,6 +618,70 @@ void RunCpuSetConfigurationValidationScenario(TestContext* test) {
                     kInvalidConfiguration &&
             service == nullptr && system_error == EINVAL,
         "service rejects an invalid control cpuset during Create");
+
+    auto invalid_history = fixture.service_config;
+    invalid_history.tick_history_worker_cpu_set = "2-1";
+    system_error = 0;
+    const auto history_error =
+        ipc::RealtimeCertifiedMarketServiceV1::Create(
+            invalid_history, &service, &system_error);
+    test->Expect(
+        history_error ==
+                ipc::RealtimeCertifiedServiceCreateErrorV1::
+                    kInvalidConfiguration &&
+            service == nullptr && system_error == EINVAL,
+        "service rejects an invalid Tick-history worker cpuset during Create");
+}
+
+void RunTickHistoryReaderPathErrnoScenario(TestContext* test) {
+    const std::filesystem::path regular_path =
+        std::filesystem::path("/tmp") /
+        ("l2flow-certified-tick-history-path-" +
+         std::to_string(static_cast<long long>(::getpid())) +
+         ".file");
+    const std::string native = regular_path.string();
+    static_cast<void>(::unlink(native.c_str()));
+    const int descriptor = ::open(
+        native.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+        S_IRUSR | S_IWUSR);
+    if (descriptor < 0) {
+        test->Expect(false, "create regular path for Tick-history errno test");
+        return;
+    }
+    static_cast<void>(::close(descriptor));
+
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 options{};
+    options.control_socket_path = regular_path;
+    options.expected_session.run_id[0U] = 0xA5U;
+    options.expected_session.session_epoch = 1U;
+    options.expected_session.trade_date = 20260730U;
+    std::unique_ptr<ipc::RealtimeCertifiedTickHistoryReaderV1> reader;
+    int system_error = -1;
+    errno = EDOM;
+    const auto regular_error =
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            options, &reader, &system_error);
+    test->Expect(
+        regular_error ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::
+                    kSocketPathUnsafe &&
+            reader == nullptr && system_error == ENOTSOCK,
+        "regular control path reports deterministic ENOTSOCK");
+
+    const bool removed = ::unlink(native.c_str()) == 0;
+    system_error = -1;
+    errno = EDOM;
+    const auto missing_error =
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            options, &reader, &system_error);
+    test->Expect(
+        removed &&
+            missing_error ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::
+                    kSocketPathUnsafe &&
+            reader == nullptr && system_error == ENOENT,
+        "missing control path preserves the failing lstat errno");
 }
 
 void RunConfiguredThreadAffinityScenario(TestContext* test) {
@@ -713,6 +787,14 @@ void RunConfiguredThreadAffinityScenario(TestContext* test) {
             &worker_actual, &system_error) &&
             system_error == 0 && worker_actual == requested,
         "StartWorker expands from FAST and returns after exact Event readback");
+
+    common::LinuxCpuSetV1 tick_history_actual{};
+    system_error = 0;
+    test->Expect(
+        fixture.service->ReadTickHistoryWorkerCpuSetForTest(
+            &tick_history_actual, &system_error) &&
+            system_error == 0 && tick_history_actual == requested,
+        "Tick-history writer inherits the pinned Event cpuset");
 
     system_error = 0;
     const bool control_started =
@@ -1510,6 +1592,426 @@ void RunControlExposureGateScenario(TestContext* test) {
     fixture.service->StopControl();
 }
 
+void RunTickHistoryCapacityFailOpenScenario(TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test,
+            "tick-history-capacity",
+            std::byte{0x5b},
+            &fixture,
+            true,
+            {},
+            {},
+            nullptr,
+            false,
+            1U)) {
+        return;
+    }
+    int system_error = 0;
+    test->Expect(
+        fixture.service->StartControl(&system_error),
+        "start ordinary control for Tick-history capacity test");
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    std::unique_ptr<ipc::RealtimeCertifiedTickHistoryReaderV1> reader;
+    test->Expect(
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            open, &reader, &system_error) ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            reader != nullptr && reader->session().tick_capacity == 1U,
+        "open one-row Tick history before publication");
+
+    test->Expect(
+        Inject(fixture.pipeline.get(), 1U, 51U).accepted(),
+        "first Tick reaches FAST before one-row journal append");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 1U &&
+                   snapshot.wire_snapshot_consistent &&
+                   snapshot.canonical_apply_frontier == 1U &&
+                   snapshot.tick_history_frontier == 1U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kContiguous;
+        }),
+        "first Tick commits to both bounded and append-only CERTIFIED views");
+    ipc::RealtimeCertifiedTickEnvelopeV1 row{};
+    test->Expect(
+        reader != nullptr &&
+            reader->ReadOne(1U, &row) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            row.payload.native_event_sequence == 1,
+        "one-row Tick history exposes its valid prefix");
+
+    test->Expect(
+        Inject(fixture.pipeline.get(), 2U, 52U).accepted(),
+        "capacity-exceeding Tick still returns success after FAST");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 2U &&
+                   fixture.fast->native(1U) == 2 &&
+                   snapshot.wire_snapshot_consistent &&
+                   !snapshot.globally_frozen_resource &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kContiguous &&
+                   snapshot.canonical_apply_frontier == 2U &&
+                   snapshot.tick_history_failed &&
+                   snapshot.tick_history_frontier == 1U;
+        }) &&
+            !fixture.fast->coverage_lost() &&
+            !fixture.pipeline->fatal(),
+        "journal capacity fails only History while bounded CERTIFIED remains live");
+    ipc::CertifiedTickJournalStatusV1 status{};
+    test->Expect(
+        reader != nullptr &&
+            reader->ReadStatus(&status) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            status.state ==
+                ipc::CertifiedTickJournalStateV1::kFailed &&
+            status.failure ==
+                ipc::CertifiedTickJournalAppendErrorV1::kTickCapacity &&
+            status.canonical_apply_frontier == 1U &&
+            reader->ReadOne(2U, &row) ==
+                ipc::CertifiedTickJournalReadResultV1::kProducerFailed &&
+            reader->ReadOne(1U, &row) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk,
+        "journal failure cause is explicit and its published prefix remains readable");
+    fixture.pipeline->StopAndDrain();
+    fixture.service->StopControl();
+}
+
+void RunTickHistoryCleanShutdownScenario(TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test,
+            "tick-history-clean-stop",
+            std::byte{0x5e},
+            &fixture,
+            true,
+            {},
+            {},
+            nullptr,
+            false,
+            8U,
+            4U,
+            1U)) {
+        return;
+    }
+    int system_error = 0;
+    test->Expect(
+        fixture.service->StartControl(&system_error),
+        "start control for clean Tick-history shutdown test");
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    std::unique_ptr<ipc::RealtimeCertifiedTickHistoryReaderV1> reader;
+    test->Expect(
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            open, &reader, &system_error) ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            reader != nullptr,
+        "open Tick history before a clean shutdown");
+
+    l2flow_certified_order_event_expected_session_v1
+        event_expected{};
+    std::memcpy(
+        event_expected.run_id,
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    event_expected.session_epoch =
+        fixture.service_config.session_epoch;
+    event_expected.trade_date =
+        fixture.service_config.trade_date;
+    l2flow_certified_order_event_reader_v1* event_reader = nullptr;
+    int event_open_system_error = 0;
+    l2flow_certified_order_event_session_v1 event_session{};
+    test->Expect(
+        l2flow_certified_order_event_reader_open_v1(
+            fixture.service_config.control_socket_path.c_str(),
+            &event_expected,
+            5'000U,
+            &event_reader,
+            &event_open_system_error) ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_OPEN_OK_V1 &&
+            event_reader != nullptr &&
+            event_open_system_error == 0 &&
+            l2flow_certified_order_event_reader_session_v1(
+                event_reader, &event_session) ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_READ_OK_V1 &&
+            event_session.event_capacity == 1U,
+        "open one-row C Event reader before a clean shutdown");
+    test->Expect(
+        InjectWithType(
+            fixture.pipeline.get(), 1U, 59U, "A").accepted() &&
+            WaitUntil([&] {
+                const auto snapshot = fixture.service->Snapshot();
+                l2flow_certified_order_event_status_v1
+                    event_status{};
+                return snapshot.wire_snapshot_consistent &&
+                       snapshot.canonical_apply_frontier == 1U &&
+                       snapshot.state ==
+                           ipc::RealtimeCertifiedStateV1::
+                               kContiguous &&
+                       event_reader != nullptr &&
+                       l2flow_certified_order_event_reader_status_v1(
+                           event_reader, &event_status) ==
+                           L2FLOW_CERTIFIED_ORDER_EVENT_READ_OK_V1 &&
+                       event_status.event_published_sequence == 1U &&
+                       event_status
+                               .coherent_canonical_apply_frontier == 1U;
+            }),
+        "publish one healthy Tick and fill the one-row Event journal before clean shutdown");
+
+    fixture.pipeline->StopAndDrain();
+    fixture.service->MarkStoppedClean();
+    ipc::CertifiedTickJournalStatusV1 status{};
+    ipc::RealtimeCertifiedTickEnvelopeV1 row{};
+    test->Expect(
+        reader != nullptr &&
+            reader->ReadStatus(&status) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            status.state ==
+                ipc::CertifiedTickJournalStateV1::kComplete &&
+            status.failure ==
+                ipc::CertifiedTickJournalAppendErrorV1::kNone &&
+            status.canonical_apply_frontier == 1U &&
+            reader->ReadOne(1U, &row) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            row.canonical_apply_sequence == 1U &&
+            reader->ReadOne(2U, &row) ==
+                ipc::CertifiedTickJournalReadResultV1::kEndOfStream,
+        "clean shutdown drains the final bounded Tick then publishes a complete dense History EOF");
+
+    std::array<l2flow_certified_order_event_envelope_v1, 1U>
+        event_rows{};
+    l2flow_certified_order_event_read_batch_result_v1
+        event_batch{};
+    const int event_tail_read =
+        l2flow_certified_order_event_reader_read_v1(
+            event_reader,
+            2U,
+            event_rows.data(),
+            event_rows.size(),
+            &event_batch);
+    test->Expect(
+        event_tail_read ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_READ_END_OF_STREAM_V1 &&
+            event_batch.result_schema_version == 1U &&
+            event_batch.result_bytes == sizeof(event_batch) &&
+            event_batch.records_written == 0U &&
+            event_batch.next_event_sequence == 2U &&
+            event_batch.status.status_schema_version == 1U &&
+            event_batch.status.status_bytes ==
+                sizeof(event_batch.status) &&
+            event_batch.status.certified_state ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_STATE_STOPPED_V1 &&
+            event_batch.status.tick_publish_tag != 0U &&
+            event_batch.status.event_publish_tag != 0U &&
+            event_batch.status.tick_canonical_apply_frontier == 1U &&
+            event_batch.status.event_canonical_apply_frontier == 1U &&
+            event_batch.status.event_published_sequence == 1U &&
+            event_batch.status.coherent_canonical_apply_frontier == 1U,
+        "C Event capacity-plus-one clean STOPPED return retains the complete coherent status cut");
+    l2flow_certified_order_event_reader_close_v1(event_reader);
+    event_reader = nullptr;
+    fixture.service->StopControl();
+}
+
+void RunTickHistoryIncompleteGapScenario(TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test,
+            "tick-history-incomplete-gap",
+            std::byte{0x5c},
+            &fixture)) {
+        return;
+    }
+    int system_error = 0;
+    test->Expect(
+        fixture.service->StartControl(&system_error),
+        "start ordinary control for incomplete Tick-history test");
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    std::unique_ptr<ipc::RealtimeCertifiedTickHistoryReaderV1> reader;
+    test->Expect(
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            open, &reader, &system_error) ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            reader != nullptr,
+        "open Tick history before an unresolved leading gap");
+
+    test->Expect(
+        Inject(fixture.pipeline.get(), 2U, 61U).accepted() &&
+            WaitUntil([&] {
+                const auto snapshot = fixture.service->Snapshot();
+                return snapshot.wire_snapshot_consistent &&
+                       snapshot.state ==
+                           ipc::RealtimeCertifiedStateV1::kGapOpen &&
+                       snapshot.canonical_apply_frontier == 0U;
+            }),
+        "leading native gap remains unresolved at shutdown");
+    fixture.pipeline->StopAndDrain();
+
+    ipc::CertifiedTickJournalStatusV1 status{};
+    ipc::RealtimeCertifiedTickEnvelopeV1 row{};
+    test->Expect(
+        reader != nullptr &&
+            reader->ReadStatus(&status) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            status.state ==
+                ipc::CertifiedTickJournalStateV1::kFailed &&
+            status.failure ==
+                ipc::CertifiedTickJournalAppendErrorV1::
+                    kIncompleteNativePrefix &&
+            status.canonical_apply_frontier == 0U &&
+            reader->ReadOne(1U, &row) ==
+                ipc::CertifiedTickJournalReadResultV1::
+                    kProducerFailed,
+        "unresolved gap publishes FAILED rather than a false complete EOF");
+    fixture.service->StopControl();
+}
+
+void RunTickHistoryRetentionLossFailOpenScenario(
+    TestContext* test) {
+    WorkerBarrierFixture fixture;
+    if (!BuildWorkerBarrierFixture(
+            test,
+            "tick-history-retention",
+            std::byte{0x5d},
+            &fixture,
+            true,
+            {},
+            {},
+            nullptr,
+            false,
+            8U,
+            2U)) {
+        return;
+    }
+    int system_error = 0;
+    test->Expect(
+        fixture.service->StartControl(&system_error),
+        "start control for deterministic Tick-history retention test");
+
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    std::unique_ptr<ipc::RealtimeCertifiedTickHistoryReaderV1> reader;
+    test->Expect(
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            open, &reader, &system_error) ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            reader != nullptr,
+        "open Tick history before forcing source-ring retention loss");
+
+    fixture.service->SetTickHistoryWriterPausedForTest(true);
+    const bool writer_paused = WaitUntil([&] {
+        return fixture.service->
+            TickHistoryWriterPauseReachedForTest();
+    });
+    test->Expect(
+        writer_paused,
+        "pause only the asynchronous Tick-history writer");
+
+    bool accepted = true;
+    for (std::uint64_t sequence = 1U; sequence <= 3U;
+         ++sequence) {
+        accepted =
+            Inject(
+                fixture.pipeline.get(),
+                sequence,
+                60U + sequence)
+                .accepted() &&
+            accepted;
+    }
+    test->Expect(
+        accepted &&
+            WaitUntil([&] {
+                const auto snapshot = fixture.service->Snapshot();
+                return fixture.fast->count() == 3U &&
+                       snapshot.wire_snapshot_consistent &&
+                       snapshot.state ==
+                           ipc::RealtimeCertifiedStateV1::
+                               kContiguous &&
+                       snapshot.canonical_apply_frontier == 3U &&
+                       snapshot.tick_history_frontier == 0U &&
+                       !snapshot.tick_history_failed;
+            }),
+        "FAST and bounded CERTIFIED overwrite a two-slot ring while History alone is paused");
+
+    fixture.service->SetTickHistoryWriterPausedForTest(false);
+    const bool history_failed = WaitUntil([&] {
+        return fixture.service->Snapshot().tick_history_failed;
+    });
+    ipc::CertifiedTickJournalStatusV1 status{};
+    test->Expect(
+        history_failed && reader != nullptr &&
+            reader->ReadStatus(&status) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            status.state ==
+                ipc::CertifiedTickJournalStateV1::kFailed &&
+            status.failure ==
+                ipc::CertifiedTickJournalAppendErrorV1::
+                    kSourceRetentionLost &&
+            status.canonical_apply_frontier == 0U,
+        "writer overrun fail-closes only Tick History with an exact retention-loss cause");
+
+    test->Expect(
+        Inject(fixture.pipeline.get(), 4U, 64U).accepted() &&
+            WaitUntil([&] {
+                const auto snapshot = fixture.service->Snapshot();
+                return fixture.fast->count() == 4U &&
+                       snapshot.wire_snapshot_consistent &&
+                       !snapshot.globally_frozen_resource &&
+                       snapshot.state ==
+                           ipc::RealtimeCertifiedStateV1::
+                               kContiguous &&
+                       snapshot.canonical_apply_frontier == 4U &&
+                       snapshot.tick_history_failed;
+            }) &&
+            !fixture.fast->coverage_lost() &&
+            !fixture.pipeline->fatal(),
+        "retention loss does not stop subsequent FAST or bounded CERTIFIED publication");
+
+    fixture.pipeline->StopAndDrain();
+    fixture.service->StopControl();
+}
+
 void RunRecoveryScenario(TestContext* test) {
     Fixture fixture{};
     test->Expect(BuildFixture(&fixture), "build catalog fixture");
@@ -1525,6 +2027,8 @@ void RunRecoveryScenario(TestContext* test) {
     service_config.daily_catalog = fixture.catalog;
     service_config.fast_sink = fast;
     service_config.certified_tick_ring_capacity = 64U;
+    service_config.maximum_certified_ticks = 1024U;
+    service_config.certified_tick_lazy_commit_chunk_bytes = 4096U;
     service_config.channel_capacity = 8U;
     service_config.handoff_queue_capacity = 128U;
     service_config.maximum_pending_entries = 64U;
@@ -1672,15 +2176,160 @@ void RunRecoveryScenario(TestContext* test) {
             "certified ring is native ordered after repair");
     }
 
+    ipc::RealtimeCertifiedPrefixFenceResultV1 promotion_fence{};
     test->Expect(
-        service->WaitForPrefixBarrier(5s, &system_error),
-        "commit certified prefix barrier before control activation");
+        service->WaitForPrefixBarrier(
+            5s, &promotion_fence, &system_error) &&
+            promotion_fence.ready() &&
+            promotion_fence.canonical_apply_frontier == 3U &&
+            promotion_fence.tick_journal_frontier == 3U &&
+            promotion_fence.event_journal_frontier == 3U,
+        "prefix barrier commits matching bounded Tick, Tick-history, and Event frontiers");
     test->Expect(
         service->StartControl(&system_error),
         "activate certified control after committed prefix barrier");
     test->Expect(
         !service->StartControl(&system_error),
         "certified control activation is one-shot");
+
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 tick_history_open{};
+    tick_history_open.control_socket_path =
+        service_config.control_socket_path;
+    std::memcpy(
+        tick_history_open.expected_session.run_id.data(),
+        service_config.run_id.data(),
+        service_config.run_id.size());
+    tick_history_open.expected_session.session_epoch =
+        service_config.session_epoch;
+    tick_history_open.expected_session.trade_date =
+        service_config.trade_date;
+    std::unique_ptr<ipc::RealtimeCertifiedTickHistoryReaderV1>
+        tick_history_reader;
+    test->Expect(
+        ipc::RealtimeCertifiedTickHistoryReaderV1::Open(
+            tick_history_open,
+            &tick_history_reader,
+            &system_error) ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            tick_history_reader != nullptr,
+        "open authenticated append-only Tick history descriptor");
+
+    l2flow_certified_tick_history_expected_session_v1
+        c_tick_history_expected{};
+    std::memcpy(
+        c_tick_history_expected.run_id,
+        service_config.run_id.data(),
+        service_config.run_id.size());
+    c_tick_history_expected.session_epoch =
+        service_config.session_epoch;
+    c_tick_history_expected.trade_date = service_config.trade_date;
+    l2flow_certified_tick_history_reader_v1* c_tick_history_reader =
+        nullptr;
+    test->Expect(
+        l2flow_certified_tick_history_reader_open_v1(
+            service_config.control_socket_path.c_str(),
+            &c_tick_history_expected,
+            1000U,
+            &c_tick_history_reader,
+            &system_error) ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_OPEN_OK_V1 &&
+            c_tick_history_reader != nullptr,
+        "open the stable C ABI Tick-history reader through the authenticated control path");
+    l2flow_certified_tick_history_session_v1 c_tick_session{};
+    l2flow_certified_tick_history_status_v1 c_tick_status{};
+    std::array<l2flow_certified_tick_history_slot_v1, 8U>
+        c_tick_rows{};
+    l2flow_certified_tick_history_read_batch_result_v1
+        c_tick_batch{};
+    ipc::RealtimeCertifiedTickSlotV1 c_native_slot{};
+    ipc::RealtimeCertifiedTickEnvelopeV1 c_decoded_tick{};
+    const bool c_prefix_valid =
+        c_tick_history_reader != nullptr &&
+        l2flow_certified_tick_history_reader_session_v1(
+            c_tick_history_reader, &c_tick_session) ==
+            L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
+        c_tick_session.session_epoch == service_config.session_epoch &&
+        c_tick_session.trade_date == service_config.trade_date &&
+        c_tick_session.tick_capacity == 1024U &&
+        c_tick_session.slot_bytes ==
+            L2FLOW_CERTIFIED_TICK_HISTORY_SLOT_BYTES_V1 &&
+        c_tick_session.coverage_kind ==
+            L2FLOW_CERTIFIED_TICK_HISTORY_COVERAGE_FROM_OPEN_V1 &&
+        c_tick_session.reserved_coverage == 0U &&
+        c_tick_session.coverage_start_unix_ns == 0U &&
+        l2flow_certified_tick_history_reader_status_v1(
+            c_tick_history_reader, &c_tick_status) ==
+            L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
+        c_tick_status.status_schema_version == 1U &&
+        c_tick_status.status_bytes == sizeof(c_tick_status) &&
+        c_tick_status.canonical_apply_frontier == 3U &&
+        c_tick_status.state ==
+            L2FLOW_CERTIFIED_TICK_HISTORY_STATE_ACTIVE_V1 &&
+        l2flow_certified_tick_history_reader_read_v1(
+            c_tick_history_reader,
+            1U,
+            c_tick_rows.data(),
+            c_tick_rows.size(),
+            &c_tick_batch) ==
+            L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
+        c_tick_batch.result_schema_version == 1U &&
+        c_tick_batch.result_bytes == sizeof(c_tick_batch) &&
+        c_tick_batch.records_written == 3U &&
+        c_tick_batch.next_canonical_apply_sequence == 4U;
+    if (c_prefix_valid) {
+        c_native_slot = std::bit_cast<
+            ipc::RealtimeCertifiedTickSlotV1>(c_tick_rows[1U]);
+    }
+    test->Expect(
+        c_prefix_valid &&
+            ipc::RealtimeCertifiedTickSlotDecodeV1(
+                c_native_slot, &c_decoded_tick) &&
+            c_decoded_tick.canonical_apply_sequence == 2U &&
+            c_decoded_tick.payload.native_event_sequence == 2,
+        "C ABI returns canonical 512-byte slots with a decodable repaired prefix");
+    test->Expect(
+        c_tick_history_reader != nullptr &&
+            l2flow_certified_tick_history_reader_read_v1(
+                c_tick_history_reader,
+                4U,
+                c_tick_rows.data(),
+                c_tick_rows.size(),
+                &c_tick_batch) ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_READ_NOT_YET_PUBLISHED_V1 &&
+            c_tick_batch.records_written == 0U &&
+            c_tick_batch.next_canonical_apply_sequence == 4U &&
+            c_tick_batch.status.canonical_apply_frontier == 3U,
+        "C ABI distinguishes the active tail and returns its coherent status cut");
+    ipc::CertifiedTickJournalStatusV1 tick_history_status{};
+    std::array<ipc::RealtimeCertifiedTickEnvelopeV1, 8U>
+        tick_history_rows{};
+    ipc::CertifiedTickJournalReadBatchV1 tick_history_batch{};
+    test->Expect(
+        tick_history_reader != nullptr &&
+            tick_history_reader->ReadStatus(&tick_history_status) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            tick_history_status.state ==
+                ipc::CertifiedTickJournalStateV1::kActive &&
+            tick_history_status.canonical_apply_frontier == 3U &&
+            tick_history_reader->Read(
+                1U,
+                tick_history_rows,
+                &tick_history_batch) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            tick_history_batch.written == 3U &&
+            tick_history_batch.next_canonical_apply_sequence == 4U &&
+            tick_history_rows[0U].payload.native_event_sequence == 1 &&
+            tick_history_rows[1U].payload.native_event_sequence == 2 &&
+            tick_history_rows[2U].payload.native_event_sequence == 3,
+        "Tick history drains the repaired prefix in dense canonical order");
+    ipc::RealtimeCertifiedTickEnvelopeV1 tick_history_tail{};
+    test->Expect(
+        tick_history_reader != nullptr &&
+            tick_history_reader->ReadOne(
+                4U, &tick_history_tail) ==
+                ipc::CertifiedTickJournalReadResultV1::
+                    kNotYetPublished,
+        "drained Tick history cursor waits at the live tail");
 
     l2flow_certified_order_event_expected_session_v1
         promotion_expected{};
@@ -1813,10 +2462,12 @@ void RunRecoveryScenario(TestContext* test) {
                  "inject native 5 after filtered marker");
     test->Expect(
         WaitUntil([&] {
+            const auto snapshot = service->Snapshot();
             return fast->count() == 4U &&
-                   service->Snapshot().canonical_apply_frontier == 4U;
+                   snapshot.canonical_apply_frontier == 4U &&
+                   snapshot.tick_history_frontier == 4U;
         }),
-        "filtered native position advances continuity without a tick");
+        "filtered native position advances continuity and History catches the resulting Tick");
 
     l2flow_certified_order_event_read_batch_result_v1
         promotion_tail_result{};
@@ -1865,6 +2516,26 @@ void RunRecoveryScenario(TestContext* test) {
     test->Expect(
         promotion_tail_valid,
         "post-promotion Event tail remains dense at the coherent frontier");
+    test->Expect(
+        tick_history_reader != nullptr &&
+            tick_history_reader->ReadOne(
+                4U, &tick_history_tail) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            tick_history_tail.canonical_apply_sequence == 4U &&
+            tick_history_tail.payload.native_event_sequence == 5,
+        "same Tick-history reader crosses promotion into the live tail");
+    test->Expect(
+        c_tick_history_reader != nullptr &&
+            l2flow_certified_tick_history_reader_read_v1(
+                c_tick_history_reader,
+                4U,
+                c_tick_rows.data(),
+                1U,
+                &c_tick_batch) ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
+            c_tick_batch.records_written == 1U &&
+            c_tick_batch.next_canonical_apply_sequence == 5U,
+        "the same C ABI reader crosses the recovered prefix into the live tail");
     l2flow_certified_order_event_reader_close_v1(
         promotion_reader);
     promotion_reader = nullptr;
@@ -1903,6 +2574,45 @@ void RunRecoveryScenario(TestContext* test) {
                    retained.payload.native_event_sequence == 5;
         }),
         "frozen CERTIFIED preserves last-good latest and FAST health");
+    test->Expect(
+        WaitUntil([&] {
+            return tick_history_reader != nullptr &&
+                   tick_history_reader->ReadStatus(
+                       &tick_history_status) ==
+                       ipc::CertifiedTickJournalReadResultV1::kOk &&
+                   tick_history_status.state ==
+                       ipc::CertifiedTickJournalStateV1::kFailed;
+        }) &&
+            tick_history_status.failure ==
+                ipc::CertifiedTickJournalAppendErrorV1::
+                    kUpstreamFailed &&
+            tick_history_status.canonical_apply_frontier == 4U &&
+            tick_history_reader->ReadOne(
+                5U, &tick_history_tail) ==
+                ipc::CertifiedTickJournalReadResultV1::
+                    kProducerFailed &&
+            tick_history_reader->ReadOne(
+                1U, &tick_history_tail) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk,
+        "terminal CERTIFIED conflict fail-closes only the Tick-history suffix and preserves its prefix");
+    test->Expect(
+        c_tick_history_reader != nullptr &&
+            l2flow_certified_tick_history_reader_status_v1(
+                c_tick_history_reader, &c_tick_status) ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
+            c_tick_status.state ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_STATE_FAILED_V1 &&
+            c_tick_status.failure ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_FAILURE_UPSTREAM_V1 &&
+            c_tick_status.canonical_apply_frontier == 4U &&
+            l2flow_certified_tick_history_reader_read_v1(
+                c_tick_history_reader,
+                5U,
+                c_tick_rows.data(),
+                1U,
+                &c_tick_batch) ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_READ_PRODUCER_FAILED_V1,
+        "C ABI reports the exact terminal failure while retaining its published prefix");
 
     ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
     open.control_socket_path = service_config.control_socket_path;
@@ -2007,6 +2717,10 @@ void RunRecoveryScenario(TestContext* test) {
             !events.events().empty(),
         "CERTIFIED Event/history advances through repaired prefix only");
 
+    l2flow_certified_tick_history_reader_close_v1(
+        c_tick_history_reader);
+    c_tick_history_reader = nullptr;
+
     pipeline->StopAndDrain();
     service->MarkStoppedClean();
     test->Expect(
@@ -2033,6 +2747,8 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
     service_config.daily_catalog = fixture.catalog;
     service_config.fast_sink = fast;
     service_config.certified_tick_ring_capacity = 8U;
+    service_config.maximum_certified_ticks = 8U;
+    service_config.certified_tick_lazy_commit_chunk_bytes = 4096U;
     service_config.channel_capacity = 2U;
     service_config.handoff_queue_capacity = 16U;
     service_config.maximum_pending_entries = 8U;
@@ -2120,6 +2836,34 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
                 ipc::CertifiedOrderEventReaderOpenErrorV1::kNone &&
             event_reader != nullptr,
         "open ordinary from-open Event reader before first data");
+
+    l2flow_certified_order_event_expected_session_v1
+        c_event_expected{};
+    std::memcpy(
+        c_event_expected.run_id,
+        service_config.run_id.data(),
+        service_config.run_id.size());
+    c_event_expected.session_epoch =
+        service_config.session_epoch;
+    c_event_expected.trade_date = service_config.trade_date;
+    l2flow_certified_order_event_reader_v1* c_event_reader = nullptr;
+    int c_event_open_system_error = 0;
+    l2flow_certified_order_event_session_v1 c_event_session{};
+    test->Expect(
+        l2flow_certified_order_event_reader_open_v1(
+            service_config.control_socket_path.c_str(),
+            &c_event_expected,
+            5'000U,
+            &c_event_reader,
+            &c_event_open_system_error) ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_OPEN_OK_V1 &&
+            c_event_reader != nullptr &&
+            c_event_open_system_error == 0 &&
+            l2flow_certified_order_event_reader_session_v1(
+                c_event_reader, &c_event_session) ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_READ_OK_V1 &&
+            c_event_session.event_capacity == 1U,
+        "open one-row C Event reader before first data");
     ipc::CertifiedOrderEventStatusSnapshotV1 initial_event_status{};
     std::array<ipc::CertifiedOrderEventEnvelopeV1, 4U>
         live_tail_rows{};
@@ -2196,6 +2940,37 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
             live_tail_rows[0U].event.derived_event_sequence == 1U,
         "same ordinary cursor reads the first live Event append");
 
+    std::array<l2flow_certified_order_event_envelope_v1, 1U>
+        c_tail_rows{};
+    l2flow_certified_order_event_read_batch_result_v1
+        c_active_tail{};
+    const int c_active_tail_read =
+        l2flow_certified_order_event_reader_read_v1(
+            c_event_reader,
+            2U,
+            c_tail_rows.data(),
+            c_tail_rows.size(),
+            &c_active_tail);
+    test->Expect(
+        c_active_tail_read ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_READ_NOT_YET_PUBLISHED_V1 &&
+            c_active_tail.result_schema_version == 1U &&
+            c_active_tail.result_bytes == sizeof(c_active_tail) &&
+            c_active_tail.records_written == 0U &&
+            c_active_tail.next_event_sequence == 2U &&
+            c_active_tail.status.status_schema_version == 1U &&
+            c_active_tail.status.status_bytes ==
+                sizeof(c_active_tail.status) &&
+            c_active_tail.status.certified_state ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_STATE_CONTIGUOUS_V1 &&
+            c_active_tail.status.tick_publish_tag != 0U &&
+            c_active_tail.status.event_publish_tag != 0U &&
+            c_active_tail.status.tick_canonical_apply_frontier == 1U &&
+            c_active_tail.status.event_canonical_apply_frontier == 1U &&
+            c_active_tail.status.event_published_sequence == 1U &&
+            c_active_tail.status.coherent_canonical_apply_frontier == 1U,
+        "C Event capacity-plus-one ACTIVE return retains the complete coherent status cut");
+
     ipc::RealtimeCertifiedTickEnvelopeV1 latest{};
     ipc::CertifiedOrderEventHistorySnapshotV1 events{};
     test->Expect(
@@ -2260,6 +3035,35 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
             retained_event.canonical_apply_sequence == 1U,
         "external reader retains matching last-good Tick/Event after freeze");
 
+    l2flow_certified_order_event_read_batch_result_v1
+        c_frozen_tail{};
+    const int c_frozen_tail_read =
+        l2flow_certified_order_event_reader_read_v1(
+            c_event_reader,
+            2U,
+            c_tail_rows.data(),
+            c_tail_rows.size(),
+            &c_frozen_tail);
+    test->Expect(
+        c_frozen_tail_read ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_READ_PRODUCER_FAILED_V1 &&
+            c_frozen_tail.result_schema_version == 1U &&
+            c_frozen_tail.result_bytes == sizeof(c_frozen_tail) &&
+            c_frozen_tail.records_written == 0U &&
+            c_frozen_tail.next_event_sequence == 2U &&
+            c_frozen_tail.status.status_schema_version == 1U &&
+            c_frozen_tail.status.status_bytes ==
+                sizeof(c_frozen_tail.status) &&
+            c_frozen_tail.status.certified_state ==
+                L2FLOW_CERTIFIED_ORDER_EVENT_STATE_FROZEN_RESOURCE_V1 &&
+            c_frozen_tail.status.tick_publish_tag != 0U &&
+            c_frozen_tail.status.event_publish_tag != 0U &&
+            c_frozen_tail.status.tick_canonical_apply_frontier == 1U &&
+            c_frozen_tail.status.event_canonical_apply_frontier == 1U &&
+            c_frozen_tail.status.event_published_sequence == 1U &&
+            c_frozen_tail.status.coherent_canonical_apply_frontier == 1U,
+        "C Event capacity-plus-one FROZEN return retains the complete coherent status cut");
+
     test->Expect(
         InjectWithType(pipeline.get(), 3U, 43U, "A").accepted(),
         "FAST remains writable after CERTIFIED freezes");
@@ -2279,6 +3083,8 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
         service->Snapshot().state ==
             ipc::RealtimeCertifiedStateV1::kFrozenResource,
         "clean-stop request does not erase terminal resource state");
+    l2flow_certified_order_event_reader_close_v1(c_event_reader);
+    c_event_reader = nullptr;
     service->StopControl();
 }
 
@@ -2288,6 +3094,7 @@ int main() {
     TestContext test;
     RunLinuxCpuSetParserScenario(&test);
     RunCpuSetConfigurationValidationScenario(&test);
+    RunTickHistoryReaderPathErrnoScenario(&test);
     RunConfiguredThreadAffinityScenario(&test);
     RunRepeatablePrefixProbeScenario(&test);
     RunSerialProbeHealthTransitionScenario(&test);
@@ -2301,6 +3108,10 @@ int main() {
     RunControlPreStartStateScenario(&test);
     RunControlFailureHealthScenario(&test);
     RunControlExposureGateScenario(&test);
+    RunTickHistoryCapacityFailOpenScenario(&test);
+    RunTickHistoryCleanShutdownScenario(&test);
+    RunTickHistoryIncompleteGapScenario(&test);
+    RunTickHistoryRetentionLossFailOpenScenario(&test);
     RunRecoveryScenario(&test);
     RunEventCapacityFailOpenScenario(&test);
     if (test.failures() != 0) {

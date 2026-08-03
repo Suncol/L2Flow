@@ -565,7 +565,9 @@ def open_live_order_events(
     native_library_path=None,
     timeout: float = 1.0,
     batch_records: int = 4096,
+    start_event_sequence: int = 1,
     request_id: Optional[int] = None,
+    history_coverage=None,
     _socket_factory=socket.socket,
 ) -> LiveOrderEventDeltaReader:
     """Connect, validate one event session, and map its O_RDONLY ring fd."""
@@ -584,6 +586,9 @@ def open_live_order_events(
         expected_source_session, request_id
     )
     LiveOrderEventDeltaReader._validate_batch_records(batch_records)
+    LiveOrderEventDeltaReader._validate_start_event_sequence(
+        start_event_sequence
+    )
     library = _resolve_native_library(
         native_library, native_library_path
     )
@@ -656,8 +661,10 @@ def open_live_order_events(
             descriptor,
             snapshot.event_session,
             batch_records=batch_records,
+            start_event_sequence=start_event_sequence,
             take_fd_ownership=False,
             _control_snapshot=snapshot,
+            history_coverage=history_coverage,
         )
         try:
             if (

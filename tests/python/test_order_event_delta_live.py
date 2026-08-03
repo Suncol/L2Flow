@@ -2,11 +2,17 @@ import ctypes
 import os
 import unittest
 
+from l2flow_realtime.models import (
+    HistoryCoverageInfo,
+    SessionIdentity,
+    TemporalCoverageKind,
+)
 from l2flow_realtime.order_event_delta_live import (
     LiveOrderEventDeltaOverrunError,
     LiveOrderEventDeltaProducerState,
     LiveOrderEventDeltaReader,
     LiveOrderEventDeltaSession,
+    LiveOrderEventDeltaTemporalCoverage,
     LiveOrderEventDeltaUnavailableError,
     LiveOrderEventDeltaWireError,
     _DerivedEventRowC,
@@ -27,11 +33,15 @@ class _Function:
 class _FakeLibrary:
     def __init__(self):
         self.cursor = 1
+        self.opened_start_event_sequence = None
         self.closed = False
         self.read_calls = 0
         self.mode = "normal"
         self.l2flow_order_event_delta_reader_open_v1 = _Function(
             self._open
+        )
+        self.l2flow_order_event_delta_reader_open_at_v1 = _Function(
+            self._open_at
         )
         self.l2flow_order_event_delta_reader_close_v1 = _Function(
             self._close
@@ -50,12 +60,26 @@ class _FakeLibrary:
         )
 
     def _open(self, _fd, session, output, system_error):
+        self.opened_start_event_sequence = 1
         native_session = session._obj
         if native_session.session_epoch != 7:
             return 7
         output._obj.value = 0x1234
         system_error._obj.value = 0
         return 0
+
+    def _open_at(
+        self,
+        fd,
+        session,
+        start_event_sequence,
+        output,
+        system_error,
+    ):
+        self.cursor = int(start_event_sequence)
+        result = self._open(fd, session, output, system_error)
+        self.opened_start_event_sequence = int(start_event_sequence)
+        return result
 
     def _close(self, _handle):
         self.closed = True
@@ -87,7 +111,7 @@ class _FakeLibrary:
 
     @staticmethod
     def _fill_row(row, sequence):
-        row.record_schema_version = 1
+        row.record_schema_version = 2
         row.record_bytes = ctypes.sizeof(_DerivedEventRowC)
         row.derived_event_sequence = sequence
         row.trade_date = 20260730
@@ -98,6 +122,8 @@ class _FakeLibrary:
         row.order_id = 10_000 + sequence
         row.revision = 1
         row.tick_stream_sequence = 2
+        row.reserved0 = sequence - 1
+        row.reserved1[0] = 1
 
     def _read(self, _handle, rows, capacity, output):
         self.read_calls += 1
@@ -170,6 +196,15 @@ def _session():
     )
 
 
+def _source_coverage():
+    return HistoryCoverageInfo(
+        run_id=b"S" * 16,
+        session_epoch=70,
+        trade_date=20260730,
+        coverage_kind=TemporalCoverageKind.FROM_OPEN,
+    )
+
+
 class LiveOrderEventDeltaTests(unittest.TestCase):
     def test_poll_batches_buffer_and_retained_fd(self):
         library = _FakeLibrary()
@@ -180,10 +215,15 @@ class LiveOrderEventDeltaTests(unittest.TestCase):
                 read_fd,
                 _session(),
                 batch_records=1,
+                history_coverage=_source_coverage(),
             )
             # Native open duplicates in production; default Python ownership
             # explicitly leaves the supplied descriptor with the caller.
             os.fstat(read_fd)
+            self.assertTrue(
+                reader.session.history_coverage.coverage_from_open
+            )
+            coverage = reader.history_coverage
 
             metadata = reader.poll()
             self.assertEqual(metadata.records_written, 0)
@@ -201,6 +241,20 @@ class LiveOrderEventDeltaTests(unittest.TestCase):
             self.assertFalse(first.drains_published_prefix)
             self.assertEqual(first.row(0).derived_event_sequence, 1)
             self.assertEqual(first.row(0).order_id, 10_001)
+            self.assertEqual(
+                first.event(0).source_tick_event_ordinal, 0
+            )
+            self.assertEqual(first.source_tick_event_ordinal(0), 0)
+            self.assertEqual(
+                first.event_uid(0).session_identity,
+                SessionIdentity(b"S" * 16, 70),
+            )
+            self.assertNotEqual(
+                first.event_uid(0).session_identity,
+                reader.session.identity,
+            )
+            self.assertTrue(first.history_coverage.coverage_from_open)
+            self.assertIs(first.history_coverage, coverage)
             self.assertEqual(reader.next_sequence, 2)
 
             batches = list(
@@ -209,6 +263,12 @@ class LiveOrderEventDeltaTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in batches], [1])
             self.assertTrue(batches[0].drains_published_prefix)
             self.assertEqual(batches[0].row(0).derived_event_sequence, 2)
+            self.assertEqual(
+                batches[0].source_tick_event_ordinal(0), 1
+            )
+            self.assertNotEqual(
+                first.event_uid(0), batches[0].event_uid(0)
+            )
             self.assertEqual(reader.next_sequence, 3)
             self.assertEqual(
                 reader.producer_state(),
@@ -234,6 +294,47 @@ class LiveOrderEventDeltaTests(unittest.TestCase):
             os.fstat(read_fd)
         reader.close()
         os.close(write_fd)
+
+    def test_unscoped_direct_fd_exposes_ordinal_without_inventing_uid(self):
+        library = _FakeLibrary()
+        read_fd, write_fd = os.pipe()
+        try:
+            reader = LiveOrderEventDeltaReader.open(
+                library, read_fd, _session(), batch_records=1
+            )
+            batch = reader.read_batch()
+            self.assertEqual(batch.source_tick_event_ordinal(0), 0)
+            self.assertIsNone(batch.event_uid(0))
+            self.assertIsNone(reader.source_session_identity)
+            reader.close()
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_explicit_positive_start_is_fixed_at_native_open(self):
+        library = _FakeLibrary()
+        read_fd, write_fd = os.pipe()
+        try:
+            reader = LiveOrderEventDeltaReader.open(
+                library,
+                read_fd,
+                _session(),
+                start_event_sequence=2,
+            )
+            self.assertEqual(library.opened_start_event_sequence, 2)
+            self.assertEqual(reader.next_sequence, 2)
+            polled = reader.poll()
+            self.assertEqual(polled.next_sequence, 2)
+            batch = reader.read_batch()
+            self.assertEqual(len(batch), 1)
+            self.assertEqual(
+                batch.row(0).derived_event_sequence, 2
+            )
+            self.assertEqual(reader.next_sequence, 3)
+            reader.close()
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
     def test_overrun_latches_python_reader(self):
         library = _FakeLibrary()
@@ -284,6 +385,20 @@ class LiveOrderEventDeltaTests(unittest.TestCase):
                     os.close(write_fd)
 
     def test_configuration_validation(self):
+        partial = LiveOrderEventDeltaSession(
+            run_id=bytes(range(1, 17)),
+            session_epoch=1,
+            trade_date=20260730,
+            ring_capacity=8,
+            total_mapping_bytes=8192,
+            temporal_coverage=(
+                LiveOrderEventDeltaTemporalCoverage.FROM_PROCESS_START
+            ),
+        )
+        self.assertTrue(partial.history_coverage.process_start_partial)
+        self.assertIsNone(
+            partial.history_coverage.coverage_start_unix_ns
+        )
         with self.assertRaises(ValueError):
             LiveOrderEventDeltaSession(
                 run_id=b"\0" * 16,
@@ -305,6 +420,15 @@ class LiveOrderEventDeltaTests(unittest.TestCase):
             LiveOrderEventDeltaReader.open(
                 library, -1, _session()
             )
+        for invalid_start in (0, -1, True, 1 << 64):
+            with self.subTest(start_event_sequence=invalid_start):
+                with self.assertRaises(ValueError):
+                    LiveOrderEventDeltaReader.open(
+                        library,
+                        0,
+                        _session(),
+                        start_event_sequence=invalid_start,
+                    )
 
 
 if __name__ == "__main__":

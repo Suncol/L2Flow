@@ -15,7 +15,7 @@ inline constexpr std::array<std::uint8_t, 8U> kRealtimeShmMagicV2{
 inline constexpr std::array<std::uint8_t, 8U> kRealtimeControlMagicV2{
     'L', '2', 'F', 'C', 'T', 'L', '2', '\0'};
 inline constexpr std::uint16_t kRealtimeWireMajorV2 = 2U;
-inline constexpr std::uint16_t kRealtimeWireMinorV2 = 4U;
+inline constexpr std::uint16_t kRealtimeWireMinorV2 = 5U;
 inline constexpr std::uint32_t kRealtimeLittleEndianMarkerV2 =
     0x01020304U;
 inline constexpr std::uint32_t kRealtimeDefaultInstrumentCapacityV2 =
@@ -61,6 +61,15 @@ enum RealtimeWireKLineCoverageFlagV2 : std::uint32_t {
     kRealtimeWireKLineNaturalWindowLeftTruncatedV2 = 1U << 1U,
 };
 
+// Temporal origin of the session-wide History products. This is deliberately
+// independent of KLine: a process-start History service has a meaningful
+// boundary even when no KLine window is configured.
+enum class RealtimeHistoryTemporalCoverageV2 : std::uint32_t {
+    kUnavailable = 0U,
+    kFromOpen = 1U,
+    kProcessStartPartial = 2U,
+};
+
 [[nodiscard]] constexpr bool RealtimeWireKLineCoverageFlagsValidV2(
     std::uint32_t flags) noexcept {
     constexpr std::uint32_t known =
@@ -73,7 +82,7 @@ enum RealtimeWireKLineCoverageFlagV2 : std::uint32_t {
              kRealtimeWireKLineProcessStartPartialV2) != 0U);
 }
 
-// V2.4 retains the immutable, declared daily Shanghai+Shenzhen A-share
+// V2.5 retains the immutable, declared daily Shanghai+Shenzhen A-share
 // catalog introduced by V2.2. It does not claim that every exchange security
 // is subscribed or that every catalog instrument has produced data.
 enum class RealtimeCatalogScopeV2 : std::uint32_t {
@@ -240,7 +249,14 @@ struct alignas(4096) RealtimeWireHeaderV2 final {
     std::array<RealtimeWireRegionDescriptorV2,
                kRealtimeWireRegionCountV2>
         regions{};
-    std::array<std::uint8_t, 3240U> reserved{};
+    // Session-wide History coverage. FROM_OPEN and UNAVAILABLE use a zero
+    // boundary. PROCESS_START_PARTIAL release-publishes one nonzero Unix-ns
+    // boundary after the live subscription is known active and never changes
+    // it afterward. Readers must treat a zero partial boundary as not ready.
+    std::uint64_t history_coverage_start_unix_ns = 0U;
+    std::uint32_t history_coverage_kind = 0U;
+    std::uint32_t reserved_history_coverage = 0U;
+    std::array<std::uint8_t, 3224U> reserved{};
 };
 static_assert(sizeof(RealtimeWireHeaderV2) == 4096U);
 static_assert(alignof(RealtimeWireHeaderV2) == 4096U);
@@ -270,7 +286,13 @@ static_assert(
     offsetof(
         RealtimeWireHeaderV2, kline_coverage_start_unix_ns) == 264U);
 static_assert(offsetof(RealtimeWireHeaderV2, regions) == 280U);
-static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 856U);
+static_assert(
+    offsetof(
+        RealtimeWireHeaderV2,
+        history_coverage_start_unix_ns) == 856U);
+static_assert(
+    offsetof(RealtimeWireHeaderV2, history_coverage_kind) == 864U);
+static_assert(offsetof(RealtimeWireHeaderV2, reserved) == 872U);
 
 // One physical ordinal slot. Instrument identity and key bytes are published
 // once and never changed or rebound within a session. Availability flags and

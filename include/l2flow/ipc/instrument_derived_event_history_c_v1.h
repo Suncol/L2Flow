@@ -57,6 +57,19 @@ enum l2flow_instrument_derived_event_kind_v1 {
     L2FLOW_INSTRUMENT_DERIVED_EVENT_STATUS_V1 = 4,
 };
 
+// Record schema 2 assigns semantic meaning to bytes which schema 1 required
+// to be zero, without changing the fixed 320-byte row layout. Old readers
+// must reject schema 2 rather than silently interpreting these bytes as
+// reserved. The enclosing C function ABI remains V1.
+enum l2flow_instrument_derived_event_row_schema_v1 {
+    L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 = 2,
+};
+
+enum l2flow_instrument_derived_event_identity_v1 {
+    L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_INVALID_V2 = 0,
+    L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 = 1,
+};
+
 // Cross-market meanings for fields which are present on the common flat row.
 // The numeric values intentionally match the Shanghai core enums; Shenzhen
 // source orders use SOURCE_EVENT/DIRECT/EXACT explicitly rather than leaving
@@ -131,6 +144,8 @@ typedef struct l2flow_instrument_derived_event_row_v1 {
     int64_t recv_realtime_ns;
     int64_t recv_monotonic_ns;
     uint32_t vendor_local_time_raw;
+    // Schema 2: zero-based source_tick_event_ordinal. It is meaningful only
+    // when reserved1[0] is VALID. Schema 1 required this scalar to be zero.
     uint32_t reserved0;
     uint64_t vendor_local_time_ns_since_midnight;
 
@@ -163,6 +178,9 @@ typedef struct l2flow_instrument_derived_event_row_v1 {
     uint8_t event_time_valid;
     uint8_t event_time_unix_ns_valid;
     uint8_t vendor_local_time_valid;
+    // Schema 2: [0] is source_tick_event_ordinal_valid; [1..2] remain zero.
+    // A source-free trading-day Finalize row has [0]==INVALID, reserved0==0,
+    // and tick_stream_sequence==0. It has no source-tick event UID.
     uint8_t reserved1[3];
 } l2flow_instrument_derived_event_row_v1;
 

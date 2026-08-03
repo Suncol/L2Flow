@@ -206,6 +206,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # sockets, memfd, Python, Arrow, or Polars.
     add_library(l2flow_ipc STATIC
         src/ipc/certified_order_event_journal_v1.cpp
+        src/ipc/certified_tick_journal_v1.cpp
         src/ipc/certified_order_event_reader_v1.cpp
         src/ipc/certified_order_event_history_v1.cpp
         src/ipc/certified_order_event_wire_v1.cpp
@@ -217,6 +218,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/ipc/order_event_wire_adapter_v2.cpp
         src/ipc/realtime_certified_reader_v1.cpp
         src/ipc/realtime_certified_service_v1.cpp
+        src/ipc/realtime_certified_tick_history_reader_v1.cpp
         src/ipc/realtime_shared_service_v2.cpp)
     add_library(L2Flow::ipc ALIAS l2flow_ipc)
     l2flow_configure_target(l2flow_ipc)
@@ -236,6 +238,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/ipc/certified_order_event_reader_c_v1.cpp
         src/ipc/instrument_derived_event_history_c_v1.cpp
         src/ipc/order_event_delta_ring_c_v1.cpp
+        src/ipc/realtime_certified_tick_history_reader_c_v1.cpp
         src/ipc/realtime_shm_reader_c_v2.cpp)
     l2flow_configure_target(l2flow_shm_reader)
     target_compile_definitions(l2flow_shm_reader PRIVATE _GNU_SOURCE)
@@ -444,6 +447,9 @@ if(L2FLOW_BUILD_TESTS)
         l2flow_add_test(test_certified_order_event_journal_v1
             tests/test_certified_order_event_journal_v1.cpp
             L2Flow::ipc)
+        l2flow_add_test(test_certified_tick_journal_v1
+            tests/test_certified_tick_journal_v1.cpp
+            L2Flow::ipc)
         l2flow_add_test(test_realtime_certified_service_v1
             tests/test_realtime_certified_service_v1.cpp
             L2Flow::ipc)
@@ -559,7 +565,7 @@ if(L2FLOW_BUILD_TESTS)
                 COMMAND
                     ${Python3_EXECUTABLE} -m unittest discover
                     -s tests/python
-                    -p "test_l2flow_*.py"
+                    -p "test_*.py"
                     -v)
             set_tests_properties(
                 test_l2flow_realtime_python

@@ -15,6 +15,7 @@ explicit-EOF-verified checkpoint to a newer immutable generation.
 
 from __future__ import annotations
 
+import array
 from typing import Iterator, Optional, Sequence, TYPE_CHECKING, Union
 
 from ._history_worker_protocol import ALL_RESULT_COLUMNS
@@ -27,6 +28,7 @@ from .history_worker import (
     InstrumentTickDeltaWorker,
 )
 from .models import (
+    HistoryCoverageInfo,
     InstrumentKey,
     InstrumentLookupStatus,
     L2FlowRealtimeError,
@@ -177,6 +179,13 @@ class InstrumentRawEventBatch:
         self, *names: str
     ) -> dict[str, tuple[object, ...]]:
         return self._batch.read_columns(*names)
+
+    def copy_column_arrays(
+        self, *names: str
+    ) -> dict[str, array.array]:
+        """Bulk-copy selected columns into independently owned C arrays."""
+
+        return self._batch.copy_column_arrays(*names)
 
     def materialize_all(self) -> dict[str, tuple[object, ...]]:
         return self._batch.materialize_all()
@@ -337,12 +346,14 @@ class InstrumentRawEventHistoryReader:
     ``worker_pid``; they do not create a child process per generation.
     """
 
-    __slots__ = ("_client", "_worker")
+    __slots__ = ("_client", "_worker", "_history_coverage")
 
     def __init__(
         self,
         client: "L2FlowClient",
         worker: InstrumentTickDeltaWorker,
+        *,
+        history_coverage: HistoryCoverageInfo,
     ) -> None:
         if not isinstance(worker, InstrumentTickDeltaWorker):
             raise TypeError(
@@ -350,6 +361,18 @@ class InstrumentRawEventHistoryReader:
             )
         self._client = client
         self._worker = worker
+        if not isinstance(history_coverage, HistoryCoverageInfo):
+            raise TypeError(
+                "history_coverage must be HistoryCoverageInfo"
+            )
+        if (
+            history_coverage.identity != worker.session_identity
+            or history_coverage.trade_date != worker.trade_date
+        ):
+            raise ValueError(
+                "history coverage belongs to another session"
+            )
+        self._history_coverage = history_coverage
 
     @property
     def closed(self) -> bool:
@@ -366,6 +389,10 @@ class InstrumentRawEventHistoryReader:
     @property
     def session_identity(self) -> SessionIdentity:
         return self._worker.session_identity
+
+    @property
+    def history_coverage(self) -> HistoryCoverageInfo:
+        return self._history_coverage
 
     @property
     def trade_date(self) -> int:

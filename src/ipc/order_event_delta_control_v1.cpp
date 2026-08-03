@@ -1733,8 +1733,24 @@ OrderEventDeltaControlConnectV1(
     OrderEventDeltaControlSnapshotV1* output_snapshot,
     std::unique_ptr<OrderEventDeltaRingReaderV1>* output_reader,
     int* system_error_number) noexcept {
+    return OrderEventDeltaControlConnectAtV1(
+        config,
+        1U,
+        output_snapshot,
+        output_reader,
+        system_error_number);
+}
+
+OrderEventDeltaControlClientErrorV1
+OrderEventDeltaControlConnectAtV1(
+    const OrderEventDeltaControlClientConfigV1& config,
+    std::uint64_t start_event_sequence,
+    OrderEventDeltaControlSnapshotV1* output_snapshot,
+    std::unique_ptr<OrderEventDeltaRingReaderV1>* output_reader,
+    int* system_error_number) noexcept {
     SetSystemError(system_error_number, 0);
-    if (output_snapshot == nullptr || output_reader == nullptr) {
+    if (start_event_sequence == 0U || output_snapshot == nullptr ||
+        output_reader == nullptr) {
         return OrderEventDeltaControlClientErrorV1::
             kInvalidArgument;
     }
@@ -1754,9 +1770,10 @@ OrderEventDeltaControlConnectV1(
     }
     std::unique_ptr<OrderEventDeltaRingReaderV1> reader;
     const OrderEventDeltaReaderOpenErrorV1 open_error =
-        OrderEventDeltaRingReaderV1::Open(
+        OrderEventDeltaRingReaderV1::OpenAt(
             descriptor,
             snapshot.event_session,
+            start_event_sequence,
             &reader,
             system_error_number);
     CloseDescriptor(&descriptor);

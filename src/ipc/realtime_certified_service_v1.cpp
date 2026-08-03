@@ -2,6 +2,7 @@
 
 #include "l2flow/ipc/certified_order_event_journal_v1.h"
 #include "l2flow/ipc/certified_order_event_history_v1.h"
+#include "l2flow/ipc/certified_tick_journal_v1.h"
 #include "l2flow/ipc/realtime_wire_projection_v2.h"
 #include "l2flow/control/quality_flags_v1.h"
 #include "l2flow/market/market_types_v1.h"
@@ -501,6 +502,9 @@ std::string_view RealtimeCertifiedServiceCreateErrorNameV1(
         case RealtimeCertifiedServiceCreateErrorV1::kRecoveryCreateFailed:
             return "recovery_create_failed";
         case RealtimeCertifiedServiceCreateErrorV1::
+            kTickJournalCreateFailed:
+            return "tick_journal_create_failed";
+        case RealtimeCertifiedServiceCreateErrorV1::
             kEventProjectorCreateFailed:
             return "event_projector_create_failed";
         case RealtimeCertifiedServiceCreateErrorV1::kResourceExhausted:
@@ -604,6 +608,13 @@ public:
             config_.certified_tick_ring_capacity == 0U ||
             config_.certified_tick_ring_capacity >
                 std::numeric_limits<std::uint32_t>::max() ||
+            config_.maximum_certified_ticks == 0U ||
+            (config_.maximum_certified_tick_mapping_bytes != 0U &&
+             config_.maximum_certified_tick_mapping_bytes <
+                 kCertifiedTickJournalHeaderBytesV1) ||
+            config_.certified_tick_lazy_commit_chunk_bytes < 4096U ||
+            config_.certified_tick_lazy_commit_chunk_bytes % 4096U !=
+                0U ||
             config_.channel_capacity == 0U ||
             !IsPowerOfTwo(config_.handoff_queue_capacity) ||
             config_.handoff_queue_capacity >
@@ -634,6 +645,11 @@ public:
 
         worker_cpu_set_.Clear();
         control_cpu_set_.Clear();
+        tick_history_worker_cpu_set_.Clear();
+        const std::string& tick_history_cpu_set =
+            config_.tick_history_worker_cpu_set.empty()
+                ? config_.worker_cpu_set
+                : config_.tick_history_worker_cpu_set;
         if ((!config_.worker_cpu_set.empty() &&
              common::ParseLinuxCpuSetV1(
                  config_.worker_cpu_set, &worker_cpu_set_) !=
@@ -641,6 +657,11 @@ public:
             (!config_.control_cpu_set.empty() &&
              common::ParseLinuxCpuSetV1(
                  config_.control_cpu_set, &control_cpu_set_) !=
+                 common::LinuxCpuSetParseErrorV1::kNone) ||
+            (!tick_history_cpu_set.empty() &&
+             common::ParseLinuxCpuSetV1(
+                 tick_history_cpu_set,
+                 &tick_history_worker_cpu_set_) !=
                  common::LinuxCpuSetParseErrorV1::kNone)) {
             SetSystemError(system_error_number, EINVAL);
             return RealtimeCertifiedServiceCreateErrorV1::
@@ -735,6 +756,53 @@ public:
             recovery_ == nullptr) {
             return RealtimeCertifiedServiceCreateErrorV1::
                 kRecoveryCreateFailed;
+        }
+
+        CertifiedTickJournalConfigV1 tick_journal_config{};
+        tick_journal_config.run_id = config_.run_id;
+        tick_journal_config.session_epoch = config_.session_epoch;
+        tick_journal_config.trade_date = config_.trade_date;
+        tick_journal_config.tick_capacity =
+            config_.maximum_certified_ticks;
+        tick_journal_config.maximum_mapping_bytes =
+            config_.maximum_certified_tick_mapping_bytes;
+        tick_journal_config.lazy_commit_chunk_bytes =
+            config_.certified_tick_lazy_commit_chunk_bytes;
+        const CertifiedTickJournalCreateErrorV1 tick_journal_error =
+            CertifiedTickJournalProducerV1::Create(
+                tick_journal_config,
+                &tick_journal_,
+                system_error_number);
+        if (tick_journal_error !=
+                CertifiedTickJournalCreateErrorV1::kNone ||
+            tick_journal_ == nullptr) {
+            switch (tick_journal_error) {
+                case CertifiedTickJournalCreateErrorV1::
+                    kInvalidConfiguration:
+                    return RealtimeCertifiedServiceCreateErrorV1::
+                        kInvalidConfiguration;
+                case CertifiedTickJournalCreateErrorV1::
+                    kLayoutOverflow:
+                    return RealtimeCertifiedServiceCreateErrorV1::
+                        kLayoutOverflow;
+                case CertifiedTickJournalCreateErrorV1::
+                    kResourceExhausted:
+                    return RealtimeCertifiedServiceCreateErrorV1::
+                        kResourceExhausted;
+                case CertifiedTickJournalCreateErrorV1::kNone:
+                case CertifiedTickJournalCreateErrorV1::kNullOutput:
+                case CertifiedTickJournalCreateErrorV1::
+                    kMappingCreateFailed:
+                case CertifiedTickJournalCreateErrorV1::
+                    kReadOnlyHandleFailed:
+                case CertifiedTickJournalCreateErrorV1::kSealFailed:
+                case CertifiedTickJournalCreateErrorV1::
+                    kUnexpectedFailure:
+                    return RealtimeCertifiedServiceCreateErrorV1::
+                        kTickJournalCreateFailed;
+            }
+            return RealtimeCertifiedServiceCreateErrorV1::
+                kTickJournalCreateFailed;
         }
 
         std::uint64_t event_slot_bytes = 0U;
@@ -955,6 +1023,78 @@ public:
                 expected, true, std::memory_order_acq_rel)) {
             return false;
         }
+        tick_history_stop_requested_.store(
+            false, std::memory_order_relaxed);
+        tick_history_affinity_system_error_.store(
+            0, std::memory_order_relaxed);
+        tick_history_startup_state_.store(
+            ThreadStartupStateV1::kStarting,
+            std::memory_order_release);
+        try {
+            tick_history_thread_ = std::thread([this]() noexcept {
+                int affinity_error = 0;
+                if (!ApplyOptionalCurrentThreadCpuSet(
+                        tick_history_worker_cpu_set_,
+                        &affinity_error)) {
+                    tick_history_affinity_system_error_.store(
+                        affinity_error, std::memory_order_relaxed);
+                    tick_history_failed_.store(
+                        true, std::memory_order_release);
+                    tick_history_startup_state_.store(
+                        ThreadStartupStateV1::kFailed,
+                        std::memory_order_release);
+                    tick_history_startup_state_.notify_all();
+                    return;
+                }
+                tick_history_writer_running_.store(
+                    true, std::memory_order_release);
+                tick_history_startup_state_.store(
+                    ThreadStartupStateV1::kReady,
+                    std::memory_order_release);
+                tick_history_startup_state_.notify_all();
+                TickHistoryWriterLoop();
+                tick_history_writer_running_.store(
+                    false, std::memory_order_release);
+            });
+        } catch (...) {
+            tick_history_affinity_system_error_.store(
+                EAGAIN, std::memory_order_relaxed);
+            tick_history_failed_.store(
+                true, std::memory_order_release);
+            tick_history_startup_state_.store(
+                ThreadStartupStateV1::kFailed,
+                std::memory_order_release);
+            tick_history_startup_state_.notify_all();
+        }
+        ThreadStartupStateV1 tick_history_startup =
+            tick_history_startup_state_.load(
+                std::memory_order_acquire);
+        while (tick_history_startup ==
+               ThreadStartupStateV1::kStarting) {
+            tick_history_startup_state_.wait(
+                tick_history_startup, std::memory_order_acquire);
+            tick_history_startup =
+                tick_history_startup_state_.load(
+                    std::memory_order_acquire);
+        }
+        if (tick_history_startup != ThreadStartupStateV1::kReady) {
+            tick_history_stop_requested_.store(
+                true, std::memory_order_release);
+            if (tick_history_thread_.joinable()) {
+                tick_history_thread_.join();
+            }
+            if (tick_journal_ != nullptr) {
+                static_cast<void>(
+                    tick_journal_->MarkUpstreamFailed());
+            }
+            const int affinity_error =
+                tick_history_affinity_system_error_.load(
+                    std::memory_order_relaxed);
+            SetSystemError(
+                system_error_number,
+                affinity_error == 0 ? EINVAL : affinity_error);
+            return false;
+        }
         worker_affinity_system_error_.store(
             0, std::memory_order_relaxed);
         worker_startup_state_.store(
@@ -1007,6 +1147,21 @@ public:
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
+        // The append-only journal must not advertise a clean empty stream
+        // when its owning CERTIFIED worker never became usable.  Serialize
+        // the terminal transition against the already-running asynchronous
+        // writer before asking that thread to exit.
+        {
+            const std::lock_guard<std::mutex> writer(
+                tick_history_writer_mutex_);
+            if (tick_journal_ != nullptr) {
+                static_cast<void>(
+                    tick_journal_->MarkUpstreamFailed());
+            }
+            tick_history_failed_.store(
+                true, std::memory_order_release);
+        }
+        StopTickHistoryWriter();
         const int affinity_error =
             worker_affinity_system_error_.load(
                 std::memory_order_relaxed);
@@ -1584,6 +1739,7 @@ public:
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
+        StopTickHistoryWriter();
         worker_running_.store(false, std::memory_order_release);
     }
 
@@ -1640,6 +1796,7 @@ public:
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
+        StopTickHistoryWriter();
         worker_running_.store(false, std::memory_order_release);
         PublishHeader(RealtimeCertifiedStateV1::kStopped);
     }
@@ -1680,6 +1837,7 @@ public:
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
+        StopTickHistoryWriter();
         if (control_thread_.joinable()) {
             control_thread_.join();
         }
@@ -1782,6 +1940,22 @@ public:
         result.globally_frozen_resource =
             globally_frozen_resource_.load(
                 std::memory_order_acquire);
+        result.tick_history_writer_running =
+            tick_history_writer_running_.load(
+                std::memory_order_acquire);
+        result.tick_history_failed =
+            tick_history_failed_.load(std::memory_order_acquire);
+        result.tick_history_frontier =
+            tick_history_frontier_.load(std::memory_order_acquire);
+        result.tick_history_lag =
+            result.canonical_apply_frontier >
+                    result.tick_history_frontier
+                ? result.canonical_apply_frontier -
+                      result.tick_history_frontier
+                : 0U;
+        result.maximum_tick_history_lag =
+            maximum_tick_history_lag_.load(
+                std::memory_order_relaxed);
         result.wire_snapshot_consistent = stable_snapshot;
         result.control_state =
             control_state_.load(std::memory_order_acquire);
@@ -1851,7 +2025,14 @@ public:
                     std::memory_order_acquire);
             if (processed_handoffs_.load(
                     std::memory_order_acquire) >= expected &&
-                (queue_ == nullptr || queue_->Empty())) {
+                (queue_ == nullptr || queue_->Empty()) &&
+                (tick_history_failed_.load(
+                     std::memory_order_acquire) ||
+                 header_ == nullptr ||
+                 tick_history_frontier_.load(
+                     std::memory_order_acquire) >=
+                     Atomic(header_->canonical_apply_frontier)
+                         .load(std::memory_order_acquire))) {
                 return true;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
@@ -1911,6 +2092,292 @@ public:
     }
 
 private:
+    enum class TickHistoryDrainResult : std::uint8_t {
+        kOk = 0U,
+        kJournalFailed,
+        kSourceRetentionLost,
+        kSourceReadFailed,
+    };
+
+    void UpdateMaximumTickHistoryLag(std::uint64_t lag) noexcept {
+        std::uint64_t maximum =
+            maximum_tick_history_lag_.load(std::memory_order_relaxed);
+        while (maximum < lag &&
+               !maximum_tick_history_lag_.compare_exchange_weak(
+                   maximum,
+                   lag,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    [[nodiscard]] TickHistoryDrainResult DrainTickHistoryThrough(
+        std::uint64_t requested_frontier) noexcept {
+        if (tick_journal_ == nullptr || header_ == nullptr ||
+            ring_ == nullptr) {
+            tick_history_failed_.store(
+                true, std::memory_order_release);
+            return TickHistoryDrainResult::kJournalFailed;
+        }
+        const std::lock_guard<std::mutex> writer(
+            tick_history_writer_mutex_);
+        CertifiedTickJournalStatusV1 status =
+            tick_journal_->status();
+        if (status.state == CertifiedTickJournalStateV1::kFailed) {
+            tick_history_failed_.store(
+                true, std::memory_order_release);
+            return TickHistoryDrainResult::kJournalFailed;
+        }
+        if (status.state == CertifiedTickJournalStateV1::kComplete) {
+            const bool covered =
+                status.canonical_apply_frontier >= requested_frontier;
+            if (!covered) {
+                tick_history_failed_.store(
+                    true, std::memory_order_release);
+            }
+            return covered ? TickHistoryDrainResult::kOk
+                           : TickHistoryDrainResult::kJournalFailed;
+        }
+
+        // Amortize journal status publication and lazy backing commits while
+        // catching up a recovery prefix.  This writer consumes only already
+        // published bounded-CERTIFIED slots on its isolated thread, so the
+        // larger cold-path batch does not add work to FAST or bounded
+        // CERTIFIED publication.  Keep the buffer small enough for the
+        // default pthread stack and for prompt stop/failure observation.
+        constexpr std::size_t batch_capacity = 1024U;
+        std::array<RealtimeCertifiedTickEnvelopeV1, batch_capacity>
+            batch{};
+        std::uint64_t next = status.canonical_apply_frontier + 1U;
+        while (next <= requested_frontier) {
+            const std::uint64_t visible =
+                Atomic(header_->canonical_apply_frontier)
+                    .load(std::memory_order_acquire);
+            const std::uint64_t ring_capacity =
+                header_->certified_ring_capacity;
+            const std::uint64_t oldest =
+                visible > ring_capacity
+                    ? visible - ring_capacity + 1U
+                    : 1U;
+            if (next < oldest) {
+                static_cast<void>(
+                    tick_journal_->MarkHistoryFailed(
+                        CertifiedTickJournalAppendErrorV1::
+                            kSourceRetentionLost));
+                tick_history_failed_.store(
+                    true, std::memory_order_release);
+                return TickHistoryDrainResult::kSourceRetentionLost;
+            }
+            const std::uint64_t remaining =
+                requested_frontier - next + 1U;
+            const std::uint64_t count64 = std::min(
+                remaining,
+                static_cast<std::uint64_t>(batch.size()));
+            const std::size_t count =
+                static_cast<std::size_t>(count64);
+            for (std::size_t offset = 0U; offset < count; ++offset) {
+                const std::uint64_t sequence =
+                    next + static_cast<std::uint64_t>(offset);
+                std::uint32_t ring_index = 0U;
+                const bool index_valid =
+                    RealtimeCertifiedRingSlotIndexV1(
+                    sequence,
+                    header_->certified_ring_capacity,
+                    &ring_index);
+                bool copied = false;
+                // At the exact retention edge the sole writer may already
+                // have made the slot odd for its replacement while the
+                // public header still describes the old frontier. Retry
+                // through that short seqcount window; after the new header
+                // commit the check below classifies it as retention loss.
+                bool retention_lost = false;
+                while (index_valid) {
+                    if (CopySlot(
+                            ring_[ring_index], &batch[offset]) &&
+                        batch[offset].canonical_apply_sequence ==
+                            sequence) {
+                        copied = true;
+                        break;
+                    }
+                    const std::uint64_t after =
+                        Atomic(header_->canonical_apply_frontier)
+                            .load(std::memory_order_acquire);
+                    const std::uint64_t after_oldest =
+                        after > ring_capacity
+                            ? after - ring_capacity + 1U
+                            : 1U;
+                    if (sequence < after_oldest) {
+                        retention_lost = true;
+                        break;
+                    }
+                    if (!worker_running_.load(
+                            std::memory_order_acquire) ||
+                        worker_stop_requested_.load(
+                            std::memory_order_acquire) ||
+                        globally_frozen_resource_.load(
+                            std::memory_order_acquire)) {
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+                if (!copied) {
+                    const auto failure =
+                        retention_lost
+                            ? CertifiedTickJournalAppendErrorV1::
+                                  kSourceRetentionLost
+                            : CertifiedTickJournalAppendErrorV1::
+                                  kSourceReadFailed;
+                    static_cast<void>(
+                        tick_journal_->MarkHistoryFailed(failure));
+                    tick_history_failed_.store(
+                        true, std::memory_order_release);
+                    return retention_lost
+                               ? TickHistoryDrainResult::
+                                     kSourceRetentionLost
+                               : TickHistoryDrainResult::
+                                     kSourceReadFailed;
+                }
+            }
+            const auto append = tick_journal_->Append(
+                std::span<const RealtimeCertifiedTickEnvelopeV1>(
+                    batch.data(), count));
+            if (append != CertifiedTickJournalAppendErrorV1::kNone) {
+                tick_history_failed_.store(
+                    true, std::memory_order_release);
+                return TickHistoryDrainResult::kJournalFailed;
+            }
+            next += count64;
+            tick_history_frontier_.store(
+                next - 1U, std::memory_order_release);
+        }
+        const std::uint64_t visible =
+            Atomic(header_->canonical_apply_frontier)
+                .load(std::memory_order_acquire);
+        const std::uint64_t frontier =
+            tick_history_frontier_.load(std::memory_order_acquire);
+        const std::uint64_t lag =
+            visible > frontier ? visible - frontier : 0U;
+        UpdateMaximumTickHistoryLag(lag);
+        return TickHistoryDrainResult::kOk;
+    }
+
+    void FinalizeTickHistoryWriter() noexcept {
+        if (tick_journal_ == nullptr || header_ == nullptr) {
+            tick_history_failed_.store(
+                true, std::memory_order_release);
+            return;
+        }
+        const std::uint64_t final_frontier =
+            Atomic(header_->canonical_apply_frontier)
+                .load(std::memory_order_acquire);
+        const TickHistoryDrainResult drain =
+            DrainTickHistoryThrough(final_frontier);
+        const auto state = static_cast<RealtimeCertifiedStateV1>(
+            Atomic(header_->aggregate_state)
+                .load(std::memory_order_acquire));
+        const bool complete_state =
+            state == RealtimeCertifiedStateV1::kNoData ||
+            state == RealtimeCertifiedStateV1::kContiguous;
+        const bool incomplete_native_prefix =
+            state == RealtimeCertifiedStateV1::kGapOpen ||
+            state == RealtimeCertifiedStateV1::kCatchingUp;
+        const bool complete =
+            drain == TickHistoryDrainResult::kOk && complete_state &&
+            tick_history_frontier_.load(std::memory_order_acquire) ==
+                final_frontier &&
+            !globally_frozen_resource_.load(
+                std::memory_order_acquire);
+        const std::lock_guard<std::mutex> writer(
+            tick_history_writer_mutex_);
+        if (complete) {
+            if (!tick_journal_->Stop()) {
+                tick_history_failed_.store(
+                    true, std::memory_order_release);
+            }
+            return;
+        }
+        if (drain == TickHistoryDrainResult::kOk &&
+            incomplete_native_prefix) {
+            static_cast<void>(tick_journal_->MarkHistoryFailed(
+                CertifiedTickJournalAppendErrorV1::
+                    kIncompleteNativePrefix));
+        } else if (drain == TickHistoryDrainResult::kOk) {
+            static_cast<void>(
+                tick_journal_->MarkUpstreamFailed());
+        }
+        tick_history_failed_.store(
+            true, std::memory_order_release);
+    }
+
+    void TickHistoryWriterLoop() noexcept {
+        try {
+            for (;;) {
+                if (tick_history_paused_for_test_.load(
+                        std::memory_order_acquire)) {
+                    tick_history_pause_reached_for_test_.store(
+                        true, std::memory_order_release);
+                    while (tick_history_paused_for_test_.load(
+                               std::memory_order_acquire) &&
+                           !tick_history_stop_requested_.load(
+                               std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                }
+                const std::uint64_t visible =
+                    Atomic(header_->canonical_apply_frontier)
+                        .load(std::memory_order_acquire);
+                const std::uint64_t frontier =
+                    tick_history_frontier_.load(
+                        std::memory_order_acquire);
+                const std::uint64_t lag =
+                    visible > frontier ? visible - frontier : 0U;
+                UpdateMaximumTickHistoryLag(lag);
+                if (DrainTickHistoryThrough(visible) !=
+                    TickHistoryDrainResult::kOk) {
+                    return;
+                }
+                const auto state =
+                    static_cast<RealtimeCertifiedStateV1>(
+                        Atomic(header_->aggregate_state)
+                            .load(std::memory_order_acquire));
+                if (tick_history_stop_requested_.load(
+                        std::memory_order_acquire) ||
+                    state ==
+                        RealtimeCertifiedStateV1::kFrozenConflict ||
+                    state ==
+                        RealtimeCertifiedStateV1::kFrozenResource) {
+                    FinalizeTickHistoryWriter();
+                    return;
+                }
+                if (visible == frontier) {
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(50));
+                }
+            }
+        } catch (...) {
+            const std::lock_guard<std::mutex> writer(
+                tick_history_writer_mutex_);
+            if (tick_journal_ != nullptr) {
+                static_cast<void>(
+                    tick_journal_->MarkHistoryFailed(
+                        CertifiedTickJournalAppendErrorV1::
+                            kSourceReadFailed));
+            }
+            tick_history_failed_.store(
+                true, std::memory_order_release);
+        }
+    }
+
+    void StopTickHistoryWriter() noexcept {
+        tick_history_stop_requested_.store(
+            true, std::memory_order_release);
+        if (tick_history_thread_.joinable()) {
+            tick_history_thread_.join();
+        }
+        tick_history_writer_running_.store(
+            false, std::memory_order_release);
+    }
+
     void AbortPendingPrefixCommitForWorkerStop() noexcept {
         auto pending = PrefixCommitPhase::kPending;
         if (prefix_commit_phase_.compare_exchange_strong(
@@ -1973,7 +2440,7 @@ private:
         RealtimeCertifiedPrefixFenceResultV1 result{};
         result.fence_id = fence_id;
         if (!header_committed || header_ == nullptr ||
-            event_journal_ == nullptr) {
+            tick_journal_ == nullptr || event_journal_ == nullptr) {
             result.operation_error =
                 RealtimeCertifiedPrefixFenceOperationErrorV1::
                     kInternalFailure;
@@ -2007,6 +2474,10 @@ private:
                 committed_event_generation_mutex_);
             result.event_history = committed_event_generation_;
         }
+        const CertifiedTickJournalStatusV1 tick_history_status =
+            tick_journal_->status();
+        result.tick_journal_frontier =
+            tick_history_status.canonical_apply_frontier;
         result.event_journal_frontier =
             event_journal_->canonical_apply_frontier();
         result.event_published_sequence =
@@ -2027,11 +2498,23 @@ private:
                 std::numeric_limits<std::uint64_t>::max() &&
             generation.derived_event_sequence_exclusive - 1U ==
                 static_cast<std::uint64_t>(generation.event_count);
+        const bool terminal_state =
+            result.state ==
+                RealtimeCertifiedStateV1::kFrozenConflict ||
+            result.state ==
+                RealtimeCertifiedStateV1::kFrozenResource ||
+            globally_frozen_resource_.load(
+                std::memory_order_acquire);
         if (result.header_publish_tag == 0U ||
             (result.header_publish_tag & 1U) != 0U ||
             !state_valid || !result.event_history.valid() ||
             generation.input_frontier.canonical_apply_sequence !=
                 result.canonical_apply_frontier ||
+            (!terminal_state &&
+             (result.tick_journal_frontier !=
+                  result.canonical_apply_frontier ||
+              tick_history_status.state !=
+                  CertifiedTickJournalStateV1::kActive)) ||
             result.event_journal_frontier !=
                 result.canonical_apply_frontier ||
             !event_count_valid ||
@@ -2154,10 +2637,30 @@ private:
                             std::this_thread::yield();
                         }
                     }
+                    // A prefix fence is a cold control operation. Let the
+                    // independent writer catch the exact public Tick cut here
+                    // so temporary asynchronous lag cannot make an otherwise
+                    // valid recovery probe/promotion fail. Ordinary Tick
+                    // publication never takes this mutex or waits for History.
+                    const std::uint64_t fence_frontier =
+                        Atomic(header_->canonical_apply_frontier)
+                            .load(std::memory_order_acquire);
+                    const bool terminal_barrier_state =
+                        barrier_state ==
+                            RealtimeCertifiedStateV1::kFrozenConflict ||
+                        barrier_state ==
+                            RealtimeCertifiedStateV1::kFrozenResource ||
+                        globally_frozen_resource_.load(
+                            std::memory_order_acquire);
+                    const bool tick_history_committed =
+                        header_committed &&
+                        (terminal_barrier_state ||
+                         DrainTickHistoryThrough(fence_frontier) ==
+                             TickHistoryDrainResult::kOk);
                     RealtimeCertifiedPrefixFenceResultV1 result =
                         CapturePrefixFenceResult(
                             completed_fence.barrier_id,
-                            header_committed);
+                            tick_history_committed);
                     if (completed_fence.kind ==
                         HandoffKind::kPrefixProbe) {
                         // Probe completion deliberately has no coverage or
@@ -2452,7 +2955,6 @@ private:
                 FreezeGlobalResource();
                 return;
             }
-
             // PollCertified returned the exact next ready token and this
             // serialized worker has not touched the coordinator since. Commit
             // therefore cannot fail for a valid ready token; check it anyway
@@ -2488,9 +2990,12 @@ private:
                 FreezeGlobalResource();
                 return;
             }
-            // Both slots were preflighted above and this is their sole writer,
-            // so readers cannot make either publish fail. The header frontier
-            // remains the external visibility gate until both stores finish.
+            // Both bounded slots were preflighted above and this is their sole
+            // writer, so readers cannot make either publish fail. The header
+            // frontier remains the external CERTIFIED visibility gate until
+            // both stores finish. The independent Tick History writer copies
+            // this already-published ring prefix later; History failure never
+            // delays or freezes bounded CERTIFIED publication.
             if (!PublishSlot(&ring_[ring_index], envelope) ||
                 !PublishSlot(
                     &latest_[payload.common.ordinal],
@@ -3259,6 +3764,36 @@ public:
                common::LinuxThreadAffinityErrorV1::kNone;
     }
 
+    [[nodiscard]] bool ReadTickHistoryWorkerCpuSetForTest(
+        common::LinuxCpuSetV1* output,
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (output == nullptr || !tick_history_thread_.joinable()) {
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        return common::ReadLinuxThreadAffinityV1(
+                   tick_history_thread_.native_handle(),
+                   output,
+                   system_error_number) ==
+               common::LinuxThreadAffinityErrorV1::kNone;
+    }
+
+    void SetTickHistoryWriterPausedForTest(bool paused) noexcept {
+        if (paused) {
+            tick_history_pause_reached_for_test_.store(
+                false, std::memory_order_release);
+        }
+        tick_history_paused_for_test_.store(
+            paused, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool TickHistoryWriterPauseReachedForTest()
+        const noexcept {
+        return tick_history_pause_reached_for_test_.load(
+            std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool ControlRunningConfirmed() noexcept {
         auto expected =
             RealtimeCertifiedServiceSnapshotV1::ControlState::
@@ -3315,6 +3850,13 @@ private:
         if (request_prefix_valid &&
             request.opcode == static_cast<std::uint16_t>(
                 RealtimeCertifiedControlOpcodeV1::
+                    kGetTickHistory)) {
+            HandleTickHistoryClient(client, request);
+            return;
+        }
+        if (request_prefix_valid &&
+            request.opcode == static_cast<std::uint16_t>(
+                RealtimeCertifiedControlOpcodeV1::
                     kGetEventHistory)) {
             HandleEventHistoryClient(client, request);
             return;
@@ -3361,6 +3903,66 @@ private:
         ancillary->cmsg_type = SCM_RIGHTS;
         ancillary->cmsg_len = CMSG_LEN(sizeof(int));
         std::memcpy(CMSG_DATA(ancillary), &descriptor, sizeof(int));
+        static_cast<void>(
+            ::sendmsg(client, &message, MSG_NOSIGNAL));
+        CloseDescriptor(&descriptor);
+    }
+
+    void HandleTickHistoryClient(
+        int client,
+        const RealtimeCertifiedControlRequestV1& request) noexcept {
+        RealtimeCertifiedTickHistoryControlResponseV1 response{};
+        response.nonce = request.nonce;
+        CopyIdentity(config_.run_id, &response.run_id);
+        response.session_epoch = config_.session_epoch;
+        response.trade_date = config_.trade_date;
+        if (tick_journal_ == nullptr) {
+            response.status = static_cast<std::uint16_t>(
+                RealtimeCertifiedControlStatusV1::kUnavailable);
+            static_cast<void>(::send(
+                client,
+                &response,
+                sizeof(response),
+                MSG_NOSIGNAL));
+            return;
+        }
+        const CertifiedTickJournalSessionV1 session =
+            tick_journal_->session();
+        response.mapping_bytes = session.total_mapping_bytes;
+        response.tick_capacity = session.tick_capacity;
+        int descriptor = -1;
+        if (!tick_journal_->DuplicateReadOnlyDescriptor(
+                &descriptor)) {
+            response.status = static_cast<std::uint16_t>(
+                RealtimeCertifiedControlStatusV1::kInternal);
+            static_cast<void>(::send(
+                client,
+                &response,
+                sizeof(response),
+                MSG_NOSIGNAL));
+            return;
+        }
+        response.status = static_cast<std::uint16_t>(
+            RealtimeCertifiedControlStatusV1::kOk);
+        std::array<std::byte, CMSG_SPACE(sizeof(int))> control{};
+        iovec vector{};
+        vector.iov_base = &response;
+        vector.iov_len = sizeof(response);
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1U;
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        cmsghdr* const ancillary = CMSG_FIRSTHDR(&message);
+        if (ancillary == nullptr) {
+            CloseDescriptor(&descriptor);
+            return;
+        }
+        ancillary->cmsg_level = SOL_SOCKET;
+        ancillary->cmsg_type = SCM_RIGHTS;
+        ancillary->cmsg_len = CMSG_LEN(sizeof(int));
+        std::memcpy(
+            CMSG_DATA(ancillary), &descriptor, sizeof(descriptor));
         static_cast<void>(
             ::sendmsg(client, &message, MSG_NOSIGNAL));
         CloseDescriptor(&descriptor);
@@ -3431,10 +4033,13 @@ private:
     RealtimeCertifiedServiceConfigV1 config_{};
     common::LinuxCpuSetV1 worker_cpu_set_{};
     common::LinuxCpuSetV1 control_cpu_set_{};
+    common::LinuxCpuSetV1 tick_history_worker_cpu_set_{};
     std::unique_ptr<BoundedMpmcQueue<HandoffEvent>> queue_;
     std::unique_ptr<
         realtime::NativeSequenceRecoveryCoordinatorV1>
         recovery_;
+    std::shared_ptr<CertifiedTickJournalProducerV1>
+        tick_journal_;
     std::shared_ptr<CertifiedOrderEventJournalProducerV1>
         event_journal_;
     std::unique_ptr<CertifiedOrderEventHistoryV1> event_history_;
@@ -3459,7 +4064,9 @@ private:
     ino_t socket_inode_ = 0;
     bool socket_bound_ = false;
     std::thread worker_thread_;
+    std::thread tick_history_thread_;
     std::thread control_thread_;
+    std::mutex tick_history_writer_mutex_;
     std::mutex control_lifecycle_mutex_;
     std::mutex prefix_call_mutex_;
 
@@ -3479,8 +4086,11 @@ private:
         ThreadStartupStateV1::kNotStarted};
     std::atomic<ThreadStartupStateV1> control_startup_state_{
         ThreadStartupStateV1::kNotStarted};
+    std::atomic<ThreadStartupStateV1> tick_history_startup_state_{
+        ThreadStartupStateV1::kNotStarted};
     std::atomic<int> worker_affinity_system_error_{0};
     std::atomic<int> control_affinity_system_error_{0};
+    std::atomic<int> tick_history_affinity_system_error_{0};
     std::atomic<RealtimeCertifiedServiceSnapshotV1::ControlState>
         control_state_{
             RealtimeCertifiedServiceSnapshotV1::ControlState::
@@ -3494,6 +4104,13 @@ private:
     std::atomic<bool> draining_{false};
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> worker_stop_requested_{false};
+    std::atomic<bool> tick_history_writer_running_{false};
+    std::atomic<bool> tick_history_stop_requested_{false};
+    std::atomic<bool> tick_history_failed_{false};
+    std::atomic<bool> tick_history_paused_for_test_{false};
+    std::atomic<bool> tick_history_pause_reached_for_test_{false};
+    std::atomic<std::uint64_t> tick_history_frontier_{0U};
+    std::atomic<std::uint64_t> maximum_tick_history_lag_{0U};
     std::atomic<bool> globally_frozen_resource_{false};
     std::atomic<std::uint64_t> next_prefix_fence_id_{0U};
     std::atomic<std::uint64_t> completed_prefix_fence_id_{0U};
@@ -3783,6 +4400,28 @@ bool RealtimeCertifiedMarketServiceV1::ReadControlCpuSetForTest(
     return impl_ != nullptr &&
            impl_->ReadControlCpuSetForTest(
                output, system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::
+    ReadTickHistoryWorkerCpuSetForTest(
+        common::LinuxCpuSetV1* output,
+        int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->ReadTickHistoryWorkerCpuSetForTest(
+               output, system_error_number);
+}
+
+void RealtimeCertifiedMarketServiceV1::
+    SetTickHistoryWriterPausedForTest(bool paused) noexcept {
+    if (impl_ != nullptr) {
+        impl_->SetTickHistoryWriterPausedForTest(paused);
+    }
+}
+
+bool RealtimeCertifiedMarketServiceV1::
+    TickHistoryWriterPauseReachedForTest() const noexcept {
+    return impl_ != nullptr &&
+           impl_->TickHistoryWriterPauseReachedForTest();
 }
 
 CertifiedOrderEventHistoryErrorV1

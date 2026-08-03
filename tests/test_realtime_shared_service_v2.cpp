@@ -1,6 +1,10 @@
 #include "l2flow/ipc/instrument_raw_event_history_v2.h"
+#include "l2flow/ipc/certified_order_event_history_v1.h"
 #include "l2flow/ipc/instrument_derived_event_history_c_v1.h"
 #include "l2flow/ipc/instrument_derived_event_history_v1.h"
+#include "l2flow/ipc/instrument_derived_event_wire_v1.h"
+#include "l2flow/ipc/order_event_delta_ring_v1.h"
+#include "l2flow/ipc/order_event_live_aggregation_engine_v1.h"
 #include "l2flow/ipc/realtime_history_wire_v2.h"
 #include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
 #include "l2flow/ipc/realtime_certified_service_v1.h"
@@ -3033,6 +3037,111 @@ bool DrainDerivedEventHistory(
     return ok;
 }
 
+bool CheckDerivedSourceTickIdentityAcrossPaths(
+    const ipc::RealtimeWireTickPayloadV2& source_tick,
+    std::span<const ipc::InstrumentDerivedEventV1> full_history,
+    const common::Identity128& run_id) {
+    if (source_tick.common.tick_stream_sequence != 1U ||
+        full_history.empty()) {
+        return false;
+    }
+
+    ipc::OrderEventDeltaRingConfigV1 ring_config{};
+    ring_config.run_id = run_id;
+    ring_config.session_epoch = kSessionEpoch + 1U;
+    ring_config.trade_date = kTradeDate;
+    ring_config.ring_capacity = 16U;
+    ring_config.maximum_mapping_bytes = 16ULL * 1024ULL * 1024ULL;
+    std::unique_ptr<ipc::OrderEventDeltaRingProducerV1> producer;
+    if (ipc::OrderEventDeltaRingProducerV1::Create(
+            ring_config, &producer) !=
+            ipc::OrderEventDeltaRingCreateErrorV1::kNone ||
+        producer == nullptr) {
+        return false;
+    }
+    std::unique_ptr<ipc::OrderEventLiveAggregationEngineV1> live;
+    if (ipc::OrderEventLiveAggregationEngineV1::Create(
+            {.maximum_shanghai_order_states = 100U,
+             .maximum_shenzhen_order_states = 100U},
+            producer.get(),
+            &live) != ipc::OrderEventLiveCreateErrorV1::kNone ||
+        live == nullptr) {
+        return false;
+    }
+    ipc::OrderEventLiveConsumeResultV1 live_result{};
+    if (live->Consume(source_tick, &live_result) !=
+            ipc::OrderEventLiveConsumeErrorV1::kNone ||
+        live_result.derived_event_count != full_history.size()) {
+        return false;
+    }
+
+    std::unique_ptr<ipc::CertifiedOrderEventHistoryV1> certified;
+    if (ipc::CertifiedOrderEventHistoryV1::Create(
+            {.trade_date = kTradeDate,
+             .maximum_shanghai_order_states = 100U,
+             .maximum_shenzhen_order_states = 100U,
+             .maximum_events = 16U,
+             .external_journal = {}},
+            &certified) !=
+            ipc::CertifiedOrderEventHistoryErrorV1::kNone ||
+        certified == nullptr ||
+        certified->AppendCertifiedTick(source_tick, 1U) !=
+            ipc::CertifiedOrderEventHistoryErrorV1::kNone) {
+        return false;
+    }
+    ipc::CertifiedOrderEventHistorySnapshotV1 certified_snapshot;
+    if (certified->AcquireGeneration(&certified_snapshot) !=
+            ipc::CertifiedOrderEventHistoryErrorV1::kNone ||
+        !certified_snapshot.valid() ||
+        certified_snapshot.events().size() != full_history.size()) {
+        return false;
+    }
+
+    int descriptor = -1;
+    if (!producer->DuplicateReadOnlyDescriptor(&descriptor) ||
+        descriptor < 0) {
+        return false;
+    }
+    std::unique_ptr<ipc::OrderEventDeltaRingReaderV1> reader;
+    const auto open_error = ipc::OrderEventDeltaRingReaderV1::Open(
+        descriptor, producer->session(), &reader);
+    static_cast<void>(::close(descriptor));
+    if (open_error !=
+            ipc::OrderEventDeltaReaderOpenErrorV1::kNone ||
+        reader == nullptr) {
+        return false;
+    }
+    std::vector<ipc::OrderEventDeltaPayloadV1> live_rows(
+        full_history.size());
+    ipc::OrderEventDeltaReadResultV1 read_result{};
+    if (reader->Read(1U, live_rows, &read_result) !=
+            ipc::OrderEventDeltaReadErrorV1::kNone ||
+        read_result.written != full_history.size()) {
+        return false;
+    }
+
+    const auto certified_events = certified_snapshot.events();
+    for (std::size_t index = 0U; index < full_history.size(); ++index) {
+        l2flow_instrument_derived_event_row_v1 full_row{};
+        l2flow_instrument_derived_event_row_v1 certified_row{};
+        if (!ipc::ProjectInstrumentDerivedEventWireV1(
+                full_history[index], &full_row) ||
+            !ipc::ProjectInstrumentDerivedEventWireV1(
+                certified_events[index], &certified_row) ||
+            std::memcmp(&full_row, &certified_row, sizeof(full_row)) != 0 ||
+            std::memcmp(
+                &full_row, &live_rows[index], sizeof(full_row)) != 0 ||
+            full_row.tick_stream_sequence !=
+                source_tick.common.tick_stream_sequence ||
+            full_row.reserved0 != static_cast<std::uint32_t>(index) ||
+            full_row.reserved1[0U] !=
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::size_t CountOpenFileDescriptors() {
     DIR* const directory = ::opendir("/proc/self/fd");
     if (directory == nullptr) {
@@ -3270,7 +3379,7 @@ bool TestLivePartialSemantics() {
                 transfer.fd.get(), reader.output()) ==
                     L2FLOW_SHM_READER_OK_V2 &&
                 reader.get() != nullptr,
-            "native reader accepts the V2.4 LIVE_PARTIAL state");
+            "native reader accepts the V2.5 LIVE_PARTIAL state");
     }
     transfer.fd.Reset();
     if (reader.get() == nullptr) {
@@ -3517,6 +3626,14 @@ bool TestStandaloneLivePartialProcessStartHistory() {
         standalone_service->StopControl();
         return false;
     }
+    ok &= Expect(
+        standalone_service->PrepareProcessStartHistoryCoverage(
+            kProcessStartKLineCoverageUnixNs) &&
+            standalone_service->PrepareProcessStartHistoryCoverage(
+                kProcessStartKLineCoverageUnixNs) &&
+            !standalone_service->PrepareProcessStartHistoryCoverage(
+                kProcessStartKLineCoverageUnixNs + 1U),
+        "publish one idempotent process-start History boundary");
 
     FakeSdkMessage snapshot(
         sdk::kProductionMessageKeysV1[2U],
@@ -4115,6 +4232,23 @@ bool TestServiceEndToEnd() {
             reader.get(), &session) ==
             L2FLOW_SHM_READER_OK_V2,
         "refresh shared-memory identity before native history");
+    ipc::RealtimeWireTickPayloadV2 first_source_tick{};
+    std::uint8_t first_source_status = 0xffU;
+    constexpr std::uint32_t first_source_instrument_id = 1U;
+    ok &= Expect(
+        l2flow_shm_reader_latest_ticks_v2(
+            reader.get(),
+            &first_source_instrument_id,
+            1U,
+            &first_source_tick,
+            sizeof(first_source_tick),
+            &first_source_status) == L2FLOW_SHM_READER_OK_V2 &&
+            first_source_status == L2FLOW_LATEST_AVAILABLE_V2 &&
+            first_source_tick.common.tick_stream_sequence == 1U &&
+            first_source_tick.common.event_kind ==
+                static_cast<std::uint8_t>(
+                    market::MarketEventKindV1::kShanghaiTick),
+        "capture the exact source Tick used by full/live/CERT identity test");
     ok &= CheckHistoryExpectedDailyCatalogIdentity(
         socket_path, session, 2U);
     ipc::InstrumentRawEventHistoryCheckpointV2 first_checkpoint{};
@@ -4195,14 +4329,16 @@ bool TestServiceEndToEnd() {
         for (const auto& row : derived_c_rows) {
             c_trade_seen =
                 c_trade_seen ||
-                (row.record_schema_version == 1U &&
+                (row.record_schema_version ==
+                     L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 &&
                  row.record_bytes == sizeof(row) &&
                  row.event_kind ==
                      L2FLOW_INSTRUMENT_DERIVED_EVENT_TRADE_V1 &&
                  row.quantity == 101);
             c_order_seen =
                 c_order_seen ||
-                (row.record_schema_version == 1U &&
+                (row.record_schema_version ==
+                     L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 &&
                  row.record_bytes == sizeof(row) &&
                  row.event_kind ==
                      L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
@@ -4215,6 +4351,15 @@ bool TestServiceEndToEnd() {
             c_trade_seen && c_order_seen,
             "derived C ABI flattens the full T source event and "
             "synthetic order revision");
+        ok &= Expect(
+            derived_c_rows[0U].reserved0 == 0U &&
+                derived_c_rows[1U].reserved0 == 1U &&
+                derived_c_rows[0U].reserved1[0U] ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
+                derived_c_rows[1U].reserved1[0U] ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2,
+            "derived C ABI assigns stable zero-based ordinals within one "
+            "source tick");
         ok &= Expect(
             l2flow_instrument_derived_event_history_verified_checkpoint_v1(
                 derived_c_history.get(),
@@ -4300,6 +4445,10 @@ bool TestServiceEndToEnd() {
     }
     ok &= Expect(
         first_derived_events.size() == 2U &&
+            first_derived_events[0U].source_tick_event_ordinal_valid &&
+            first_derived_events[0U].source_tick_event_ordinal == 0U &&
+            first_derived_events[1U].source_tick_event_ordinal_valid &&
+            first_derived_events[1U].source_tick_event_ordinal == 1U &&
             derived_trade != nullptr &&
             derived_trade->buy_order_id == 11'001 &&
             derived_trade->quantity == 101 &&
@@ -4317,6 +4466,11 @@ bool TestServiceEndToEnd() {
                     kBuyMaximumExecution &&
             !first_order_revision->order.apply_to_book,
         "full T emits trade plus provisional synthetic lower-bound order");
+    ok &= Expect(
+        CheckDerivedSourceTickIdentityAcrossPaths(
+            first_source_tick, first_derived_events, run_id),
+        "the same input has byte-identical full/live/CERT rows and "
+        "source-tick UID coordinates");
 
     ok &= Expect(
         Submit(runtime.get(), AddInput(2U, 4U, 2U)),
@@ -4440,6 +4594,8 @@ bool TestServiceEndToEnd() {
     }
     ok &= Expect(
         second_derived_events.size() == 1U &&
+            second_derived_events[0U].source_tick_event_ordinal_valid &&
+            second_derived_events[0U].source_tick_event_ordinal == 0U &&
             second_order_revision != nullptr &&
             second_order_revision->operation ==
                 market::ShanghaiOrderDeltaOperationV1::kUpdate &&
@@ -4487,6 +4643,11 @@ bool TestServiceEndToEnd() {
                     L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
                 derived_c_update_count == 1U &&
                 derived_c_update_eof == 0U &&
+                derived_c_update_rows[0].record_schema_version ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 &&
+                derived_c_update_rows[0].reserved0 == 0U &&
+                derived_c_update_rows[0].reserved1[0U] ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
                 derived_c_update_rows[0].event_kind ==
                     L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
                 derived_c_update_rows[0].operation ==
@@ -4553,6 +4714,12 @@ bool TestServiceEndToEnd() {
                 &derived_c_finalize_count) ==
                     L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_OK_V1 &&
                 derived_c_finalize_count == 1U &&
+                derived_c_finalize_rows[0].record_schema_version ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 &&
+                derived_c_finalize_rows[0].tick_stream_sequence == 0U &&
+                derived_c_finalize_rows[0].reserved0 == 0U &&
+                derived_c_finalize_rows[0].reserved1[0U] ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_INVALID_V2 &&
                 derived_c_finalize_rows[0].event_kind ==
                     L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
                 derived_c_finalize_rows[0].operation ==
@@ -4597,6 +4764,31 @@ bool TestServiceEndToEnd() {
                 sizeof(
                     empty_derived_checkpoint.raw_checkpoint)) == 0,
         "empty derived update advances no derived sequence/state");
+    std::vector<ipc::InstrumentDerivedEventV1>
+        derived_finalize_events;
+    if (derived_history != nullptr) {
+        ok &= Expect(
+            derived_history->FinalizeTradingDay(
+                &derived_finalize_events) ==
+                ipc::InstrumentDerivedEventHistoryErrorV1::kNone,
+            "derived C++ history finalizes at the explicit trading-day "
+            "boundary");
+    }
+    const auto* cpp_final_revision =
+        derived_finalize_events.size() == 1U
+            ? std::get_if<market::ShanghaiOrderRevisionEventV1>(
+                  &derived_finalize_events[0U].payload)
+            : nullptr;
+    ok &= Expect(
+        cpp_final_revision != nullptr &&
+            cpp_final_revision->operation ==
+                market::ShanghaiOrderDeltaOperationV1::kFinalize &&
+            !derived_finalize_events[0U]
+                 .source_tick_event_ordinal_valid &&
+            derived_finalize_events[0U].source_tick_event_ordinal == 0U &&
+            cpp_final_revision->source_anchor
+                    .tick_stream_sequence == 0U,
+        "source-free C++ Finalize has no source-tick UID");
     ok &= RunPythonDerivedHistorySmoke(socket_path, 3U);
     ipc::InstrumentRawEventHistoryCheckpointV2 empty_checkpoint{};
     const std::array<std::uint64_t, 0U> empty_sequences{};
@@ -4921,6 +5113,23 @@ bool TestStandaloneProcessStartPartialKLineService() {
                 kProcessStartKLineCoverageUnixNs),
         "same process-start KLine boundary is idempotent before publication");
     ok &= Expect(
+        service->PrepareProcessStartHistoryCoverage(
+            kProcessStartKLineCoverageUnixNs),
+        "prepare the independent process-start History boundary");
+    l2flow_history_coverage_info_v2 history_coverage{};
+    ok &= Expect(
+        l2flow_shm_reader_history_coverage_v2(
+            reader.get(), &history_coverage) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            history_coverage.session_epoch == partial_epoch &&
+            history_coverage.coverage_start_unix_ns ==
+                kProcessStartKLineCoverageUnixNs &&
+            history_coverage.coverage_kind ==
+                L2FLOW_HISTORY_COVERAGE_PROCESS_START_PARTIAL_V2 &&
+            history_coverage.reserved0 == 0U &&
+            history_coverage.reserved[0U] == 0U,
+        "History coverage does not depend on KLine metadata");
+    ok &= Expect(
         !service->PrepareProcessStartKLineCoverage(
             kProcessStartKLineCoverageUnixNs + 1U),
         "a different process-start KLine boundary is rejected");
@@ -5203,6 +5412,253 @@ bool TestStandaloneProcessStartPartialKLineService() {
         "terminal mapping retains the exact process-start KLine contract");
     service->StopControl();
     return ok && !runtime->fatal() && !service->failed();
+}
+
+enum class PartialStartRaceScheduleV2 : std::uint8_t {
+    kLatestOnlyFirst = 0U,
+    kProcessStartHistoryFirst,
+    kSimultaneous,
+};
+
+[[nodiscard]] bool ExercisePartialStartCoverageRace(
+    const DailyRuntimeFixture& fixture,
+    const std::filesystem::path& directory,
+    std::size_t case_index,
+    PartialStartRaceScheduleV2 schedule) {
+    if (!fixture || fixture.catalog == nullptr) {
+        return false;
+    }
+
+    const std::filesystem::path socket_path =
+        directory /
+        ("partial-start-race-" + std::to_string(case_index) +
+         ".sock");
+    ipc::RealtimeSharedServiceConfigV2 config{};
+    config.run_id = RunId(static_cast<std::uint8_t>(
+        0x90U + case_index));
+    config.session_epoch = fixture.catalog->session_epoch();
+    config.trade_date = kTradeDate;
+    config.daily_catalog = fixture.catalog;
+    config.coverage_from_open = false;
+    config.tick_ring_capacity = 4U;
+    config.key_arena_bytes = 128U;
+    config.maximum_mapping_bytes = 16U * 1024U * 1024U;
+    config.control_socket_path = socket_path;
+
+    std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> service;
+    int create_system_error = 0;
+    bool ok = Expect(
+        ipc::RealtimeSharedMarketServiceV2::Create(
+            config, &service, &create_system_error) ==
+                ipc::RealtimeSharedServiceCreateErrorV2::kNone &&
+            service != nullptr && create_system_error == 0,
+        "create partial Start lifecycle-race service");
+    if (service == nullptr) {
+        return false;
+    }
+
+    std::atomic<std::uint32_t> ready{0U};
+    std::atomic<bool> release{false};
+    std::atomic<bool> first_completed{false};
+    const auto await_release = [&ready, &release] {
+        ready.fetch_add(1U, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+    const auto await_first = [&first_completed] {
+        while (!first_completed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+
+    bool latest_only_started = false;
+    bool process_start_history_started = false;
+    int latest_only_system_error = -1;
+    int process_start_history_system_error = -1;
+    std::thread latest_only_thread([&] {
+        await_release();
+        if (schedule ==
+            PartialStartRaceScheduleV2::
+                kProcessStartHistoryFirst) {
+            await_first();
+        }
+        latest_only_started =
+            service->StartLivePartial(
+                &latest_only_system_error);
+        if (schedule ==
+            PartialStartRaceScheduleV2::kLatestOnlyFirst) {
+            first_completed.store(true, std::memory_order_release);
+        }
+    });
+    std::thread process_start_history_thread([&] {
+        await_release();
+        if (schedule ==
+            PartialStartRaceScheduleV2::kLatestOnlyFirst) {
+            await_first();
+        }
+        process_start_history_started =
+            service->StartLivePartialWithProcessStartHistory(
+                &process_start_history_system_error);
+        if (schedule ==
+            PartialStartRaceScheduleV2::
+                kProcessStartHistoryFirst) {
+            first_completed.store(true, std::memory_order_release);
+        }
+    });
+    while (ready.load(std::memory_order_acquire) != 2U) {
+        std::this_thread::yield();
+    }
+    release.store(true, std::memory_order_release);
+    latest_only_thread.join();
+    process_start_history_thread.join();
+
+    const bool exactly_one_started =
+        latest_only_started != process_start_history_started;
+    const bool errors_match_winner =
+        latest_only_started
+            ? latest_only_system_error == 0 &&
+                  process_start_history_system_error == EINVAL
+            : process_start_history_started &&
+                  process_start_history_system_error == 0 &&
+                  latest_only_system_error == EINVAL;
+    const bool ordered_winner_matches =
+        schedule == PartialStartRaceScheduleV2::kSimultaneous ||
+        (schedule ==
+             PartialStartRaceScheduleV2::kLatestOnlyFirst &&
+         latest_only_started) ||
+        (schedule == PartialStartRaceScheduleV2::
+                         kProcessStartHistoryFirst &&
+         process_start_history_started);
+    ok &= Expect(
+        exactly_one_started && errors_match_winner &&
+            ordered_winner_matches,
+        "exactly one partial Start wins its lifecycle transition");
+    if (!ok) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    SessionTransfer transfer = RequestSession(socket_path);
+    ReaderHandle reader;
+    if (transfer.fd.get() >= 0) {
+        ok &= Expect(
+            transfer.response.status ==
+                    static_cast<std::uint16_t>(
+                        ipc::RealtimeControlStatusV2::kOk) &&
+                l2flow_shm_reader_open_fd_v2(
+                    transfer.fd.get(), reader.output()) ==
+                    L2FLOW_SHM_READER_OK_V2 &&
+                reader.get() != nullptr,
+            "open mapping from the winning partial Start");
+    } else {
+        ok = false;
+    }
+    if (!ok || reader.get() == nullptr) {
+        service->MarkFailed();
+        service->StopControl();
+        return false;
+    }
+
+    l2flow_shm_session_info_v2 session{};
+    ok &= Expect(
+        l2flow_shm_reader_session_v2(reader.get(), &session) ==
+                L2FLOW_SHM_READER_OK_V2 &&
+            session.server_state == static_cast<std::uint32_t>(
+                                        ipc::RealtimeServerStateV2::
+                                            kLivePartial) &&
+            session.flags == 0U,
+        "winning partial Start publishes one valid LIVE_PARTIAL state");
+
+    l2flow_history_coverage_info_v2 coverage{};
+    const int unprepared_status =
+        l2flow_shm_reader_history_coverage_v2(
+            reader.get(), &coverage);
+    const bool unprepared_contract_matches =
+        process_start_history_started
+            ? unprepared_status ==
+                  L2FLOW_SHM_READER_UNAVAILABLE_V2
+            : unprepared_status == L2FLOW_SHM_READER_OK_V2 &&
+                  coverage.coverage_kind ==
+                      L2FLOW_HISTORY_COVERAGE_UNAVAILABLE_V2 &&
+                  coverage.coverage_start_unix_ns == 0U;
+    ok &= Expect(
+        unprepared_contract_matches,
+        "winning partial Start owns the unprepared History wire contract");
+
+    const bool history_prepared =
+        service->PrepareProcessStartHistoryCoverage(
+            kProcessStartKLineCoverageUnixNs);
+    ok &= Expect(
+        history_prepared == process_start_history_started,
+        "winning partial Start exclusively owns History boundary authorization");
+
+    coverage = {};
+    const int prepared_status =
+        l2flow_shm_reader_history_coverage_v2(
+            reader.get(), &coverage);
+    const bool final_contract_matches =
+        process_start_history_started
+            ? prepared_status == L2FLOW_SHM_READER_OK_V2 &&
+                  coverage.coverage_kind ==
+                      L2FLOW_HISTORY_COVERAGE_PROCESS_START_PARTIAL_V2 &&
+                  coverage.coverage_start_unix_ns ==
+                      kProcessStartKLineCoverageUnixNs
+            : prepared_status == L2FLOW_SHM_READER_OK_V2 &&
+                  coverage.coverage_kind ==
+                      L2FLOW_HISTORY_COVERAGE_UNAVAILABLE_V2 &&
+                  coverage.coverage_start_unix_ns == 0U;
+    ok &= Expect(
+        final_contract_matches,
+        "Start winner and final History wire contract remain identical");
+
+    service->MarkDraining();
+    ok &= Expect(
+        service->MarkStoppedClean(0U),
+        "partial Start lifecycle-race service stops cleanly");
+    service->StopControl();
+    return ok && !service->failed();
+}
+
+bool TestPartialStartCoverageLifecycleLinearization() {
+    ScopedTempDirectory temporary;
+    constexpr std::uint64_t race_epoch = kSessionEpoch + 104U;
+    const DailyRuntimeFixture fixture =
+        MakeManualDailyFixture(1U, race_epoch);
+    if (!Expect(
+            temporary.valid() && static_cast<bool>(fixture),
+            "create partial Start lifecycle-race fixture")) {
+        return false;
+    }
+
+    std::size_t case_index = 0U;
+    if (!ExercisePartialStartCoverageRace(
+            fixture,
+            temporary.path(),
+            case_index++,
+            PartialStartRaceScheduleV2::kLatestOnlyFirst) ||
+        !ExercisePartialStartCoverageRace(
+            fixture,
+            temporary.path(),
+            case_index++,
+            PartialStartRaceScheduleV2::
+                kProcessStartHistoryFirst)) {
+        return false;
+    }
+    constexpr std::size_t collision_rounds = 32U;
+    for (std::size_t round = 0U;
+         round < collision_rounds;
+         ++round) {
+        if (!ExercisePartialStartCoverageRace(
+                fixture,
+                temporary.path(),
+                case_index++,
+                PartialStartRaceScheduleV2::kSimultaneous)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 enum class ProcessStartKLineTerminalTransitionV2 : std::uint8_t {
@@ -7060,7 +7516,9 @@ enum class StartupBenchmarkScenarioV1 : std::uint8_t {
         return service->Start(system_error);
     }
     return service->StartLivePartialWithProcessStartHistory(
-        system_error);
+               system_error) &&
+           service->PrepareProcessStartHistoryCoverage(
+               kProcessStartKLineCoverageUnixNs);
 }
 
 enum class ThroughputWorkloadV1 : std::uint8_t {
@@ -10878,6 +11336,7 @@ int main(int argc, char** argv) {
         !TestPromotionExposureGate() ||
         !TestServiceEndToEnd() ||
         !TestStandaloneProcessStartPartialKLineService() ||
+        !TestPartialStartCoverageLifecycleLinearization() ||
         !TestProcessStartKLineLifecycleLinearization() ||
         !TestProcessingAdmissionPublishesWireLatest() ||
         !TestKeyArenaExhaustionIsFatal() ||

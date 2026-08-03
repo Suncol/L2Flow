@@ -11,6 +11,8 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -19,6 +21,9 @@ sys.path.insert(0, str(REPOSITORY / "python"))
 import l2flow_realtime
 from l2flow_realtime import (
     CatalogScope,
+    EventUid,
+    EventUidScope,
+    HistoryCoverageInfo,
     InstrumentKey,
     InstrumentLookupStatus,
     InstrumentStatus,
@@ -29,7 +34,9 @@ from l2flow_realtime import (
     LatestStatus,
     SelectionScope,
     ServerState,
+    SessionIdentity,
     SessionInfo,
+    TemporalCoverageKind,
     WireFormatError,
 )
 from l2flow_realtime import native
@@ -229,6 +236,194 @@ def kline_payload(
     )
 
 
+class TemporalCoverageAndEventUidTests(unittest.TestCase):
+    def test_history_coverage_keeps_partial_boundary_optional(self):
+        from_open = HistoryCoverageInfo(
+            run_id=RUN_ID,
+            session_epoch=SESSION_EPOCH,
+            trade_date=20260729,
+            coverage_kind=TemporalCoverageKind.FROM_OPEN,
+        )
+        self.assertTrue(from_open.available)
+        self.assertTrue(from_open.coverage_from_open)
+        self.assertFalse(from_open.process_start_partial)
+        self.assertEqual(
+            from_open.identity,
+            SessionIdentity(RUN_ID, SESSION_EPOCH),
+        )
+
+        unknown_partial = dataclasses.replace(
+            from_open,
+            coverage_kind=TemporalCoverageKind.PROCESS_START_PARTIAL,
+        )
+        self.assertTrue(unknown_partial.process_start_partial)
+        self.assertIsNone(unknown_partial.coverage_start_unix_ns)
+        exact_partial = dataclasses.replace(
+            unknown_partial,
+            coverage_start_unix_ns=1_700_000_000_000_000_000,
+        )
+        self.assertEqual(
+            exact_partial.coverage_start_unix_ns,
+            1_700_000_000_000_000_000,
+        )
+
+        unavailable = dataclasses.replace(
+            from_open,
+            coverage_kind=TemporalCoverageKind.UNAVAILABLE,
+        )
+        self.assertFalse(unavailable.available)
+        self.assertIs(
+            TemporalCoverageKind.FROM_MARKET_OPEN,
+            TemporalCoverageKind.FROM_OPEN,
+        )
+        self.assertIs(
+            TemporalCoverageKind.FROM_PROCESS_START,
+            TemporalCoverageKind.PROCESS_START_PARTIAL,
+        )
+
+        for kind, start in (
+            (TemporalCoverageKind.FROM_OPEN, 1),
+            (TemporalCoverageKind.UNAVAILABLE, 1),
+            (TemporalCoverageKind.PROCESS_START_PARTIAL, 0),
+        ):
+            with self.subTest(kind=kind, start=start):
+                with self.assertRaises(ValueError):
+                    dataclasses.replace(
+                        from_open,
+                        coverage_kind=kind,
+                        coverage_start_unix_ns=start,
+                    )
+
+    def test_event_uid_is_structural_and_scope_aware(self):
+        base = EventUid(
+            scope=EventUidScope.SESSION_SOURCE_TICK,
+            session_identity=SessionIdentity(RUN_ID, SESSION_EPOCH),
+            instrument_id=3,
+            tick_stream_sequence=91,
+            source_tick_event_ordinal=0,
+        )
+        self.assertEqual(len(bytes(base)), 48)
+        self.assertEqual(EventUid.from_wire(bytes(base)), base)
+        self.assertEqual(
+            EventUid.from_wire(bytes(base)).wire,
+            bytes(base),
+        )
+
+        variants = (
+            base,
+            dataclasses.replace(
+                base,
+                session_identity=SessionIdentity(
+                    b"S" * 16, SESSION_EPOCH
+                ),
+            ),
+            dataclasses.replace(
+                base,
+                session_identity=SessionIdentity(
+                    RUN_ID, SESSION_EPOCH + 1
+                ),
+            ),
+            dataclasses.replace(base, instrument_id=4),
+            dataclasses.replace(base, tick_stream_sequence=92),
+            dataclasses.replace(base, source_tick_event_ordinal=1),
+        )
+        self.assertEqual(len({bytes(value) for value in variants}), 6)
+
+        invalid_scope = bytearray(bytes(base))
+        invalid_scope[5] = 255
+        with self.assertRaises(ValueError):
+            EventUid.from_wire(bytes(invalid_scope))
+        invalid_reserved = bytearray(bytes(base))
+        invalid_reserved[7] = 1
+        with self.assertRaises(ValueError):
+            EventUid.from_wire(bytes(invalid_reserved))
+        for field, value in (
+            ("instrument_id", 0),
+            ("tick_stream_sequence", 0),
+            ("source_tick_event_ordinal", True),
+            ("source_tick_event_ordinal", 1 << 32),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(ValueError):
+                    dataclasses.replace(base, **{field: value})
+
+    def test_dense_event_sequence_is_not_an_event_uid_coordinate(self):
+        from l2flow_realtime.instrument_derived_event_history import (
+            InstrumentDerivedEventKind,
+            _DerivedEventRowC,
+            _event_from_c,
+        )
+
+        row = _DerivedEventRowC()
+        row.record_schema_version = 2
+        row.record_bytes = ctypes.sizeof(_DerivedEventRowC)
+        row.derived_event_sequence = 1
+        row.trade_date = 20260729
+        row.instrument_id = 3
+        row.market = 1
+        row.event_kind = int(InstrumentDerivedEventKind.TRADE)
+        row.tick_stream_sequence = 91
+        row.reserved0 = 0
+        row.reserved1[0] = 1
+        identity = SessionIdentity(RUN_ID, SESSION_EPOCH)
+
+        first = _event_from_c(
+            row,
+            session_identity=identity,
+        )
+        self.assertEqual(first.source_tick_event_ordinal, 0)
+        self.assertEqual(first.event_uid.session_identity, identity)
+        self.assertEqual(first.require_event_uid(), first.event_uid)
+
+        ordinal_without_session = _event_from_c(
+            row,
+        )
+        self.assertEqual(
+            ordinal_without_session.source_tick_event_ordinal, 0
+        )
+        self.assertIsNone(ordinal_without_session.event_uid)
+
+        row.derived_event_sequence = 999
+        same_source_event = _event_from_c(
+            row,
+            session_identity=identity,
+        )
+        row.reserved0 = 1
+        next_source_event = _event_from_c(
+            row,
+            session_identity=identity,
+        )
+        self.assertEqual(first.event_uid, same_source_event.event_uid)
+        self.assertNotEqual(first.event_uid, next_source_event.event_uid)
+        self.assertEqual(first.require_event_uid(), first.event_uid)
+        with self.assertRaises(ValueError):
+            dataclasses.replace(first, source_tick_event_ordinal=1)
+
+        row.reserved0 = 0
+        row.reserved1[0] = 0
+        row.tick_stream_sequence = 0
+        row.event_kind = int(
+            InstrumentDerivedEventKind.ORDER_REVISION
+        )
+        row.operation = 2
+        source_free_finalize = _event_from_c(
+            row, session_identity=identity
+        )
+        self.assertIsNone(
+            source_free_finalize.source_tick_event_ordinal
+        )
+        self.assertIsNone(source_free_finalize.event_uid)
+        with self.assertRaises(l2flow_realtime.UnavailableError):
+            source_free_finalize.require_event_uid()
+
+        row.event_kind = int(InstrumentDerivedEventKind.TRADE)
+        with self.assertRaises(l2flow_realtime.WireFormatError):
+            _event_from_c(row, session_identity=identity)
+        row.reserved1[0] = 2
+        with self.assertRaises(l2flow_realtime.WireFormatError):
+            _event_from_c(row, session_identity=identity)
+
+
 class FakeFunction:
     def __init__(self, callback):
         self.callback = callback
@@ -254,6 +449,12 @@ class FakeV2Library:
         self.kline_coverage_kind = KLineTemporalCoverage.FROM_OPEN
         self.kline_coverage_reserved0 = 0
         self.kline_coverage_reserved = 0
+        self.history_coverage_result = native.OK
+        self.history_coverage_session_epoch = SESSION_EPOCH
+        self.history_coverage_start_unix_ns = 0
+        self.history_coverage_kind = TemporalCoverageKind.FROM_OPEN
+        self.history_coverage_reserved0 = 0
+        self.history_coverage_reserved = 0
         self.kline_payload_coverage_flags = KLineCoverageFlag.NONE
         self.l2flow_shm_reader_open_fd_v2 = FakeFunction(self._open)
         self.l2flow_shm_reader_close_v2 = FakeFunction(
@@ -263,6 +464,9 @@ class FakeV2Library:
         self.l2flow_shm_reader_health_v2 = FakeFunction(self._health)
         self.l2flow_shm_reader_kline_coverage_v2 = FakeFunction(
             self._kline_coverage
+        )
+        self.l2flow_shm_reader_history_coverage_v2 = FakeFunction(
+            self._history_coverage
         )
         self.l2flow_shm_reader_instrument_v2 = FakeFunction(
             self._instrument
@@ -353,6 +557,21 @@ class FakeV2Library:
         result.coverage_kind = int(self.kline_coverage_kind)
         result.reserved0 = self.kline_coverage_reserved0
         result.reserved[0] = self.kline_coverage_reserved
+        return native.OK
+
+    def _history_coverage(self, _handle, output):
+        if self.history_coverage_result != native.OK:
+            return self.history_coverage_result
+        result = ctypes.cast(
+            output, ctypes.POINTER(native._HistoryCoverageInfoC)
+        ).contents
+        result.session_epoch = self.history_coverage_session_epoch
+        result.coverage_start_unix_ns = (
+            self.history_coverage_start_unix_ns
+        )
+        result.coverage_kind = int(self.history_coverage_kind)
+        result.reserved0 = self.history_coverage_reserved0
+        result.reserved[0] = self.history_coverage_reserved
         return native.OK
 
     def _instrument(
@@ -632,6 +851,15 @@ class AbiContractTests(unittest.TestCase):
             native._KLineCoverageInfoC.coverage_kind.offset,
             16,
         )
+        self.assertEqual(ctypes.sizeof(native._HistoryCoverageInfoC), 32)
+        self.assertEqual(
+            native._HistoryCoverageInfoC.coverage_start_unix_ns.offset,
+            8,
+        )
+        self.assertEqual(
+            native._HistoryCoverageInfoC.coverage_kind.offset,
+            16,
+        )
 
         library = FakeV2Library()
         native._bind_library(library)
@@ -640,7 +868,7 @@ class AbiContractTests(unittest.TestCase):
             for name, value in vars(library).items()
             if name.startswith("l2flow_shm_reader_")
         ]
-        self.assertEqual(len(functions), 12)
+        self.assertEqual(len(functions), 13)
         self.assertTrue(all(function.argtypes for function in functions))
         self.assertTrue(
             all(
@@ -655,7 +883,7 @@ class AbiContractTests(unittest.TestCase):
         magic, major, minor = struct.unpack_from("<8sHH", request)
         self.assertEqual(magic, CONTROL_MAGIC)
         self.assertEqual((major, minor), (WIRE_MAJOR, WIRE_MINOR))
-        self.assertEqual((major, minor), (2, 4))
+        self.assertEqual((major, minor), (2, 5))
 
     def test_v24_live_partial_and_kline_coverage(self):
         self.assertEqual(int(ServerState.LIVE_PARTIAL), 6)
@@ -881,6 +1109,42 @@ class NativeReaderTests(unittest.TestCase):
         with self.assertRaises(l2flow_realtime.UnavailableError):
             self.reader.kline_coverage()
 
+    def test_history_coverage_getter_is_independent_of_kline(self):
+        coverage = self.reader.history_coverage()
+        self.assertEqual(coverage.session_epoch, SESSION_EPOCH)
+        self.assertIs(
+            coverage.coverage_kind,
+            TemporalCoverageKind.FROM_OPEN,
+        )
+        self.assertIsNone(coverage.coverage_start_unix_ns)
+
+        self.library.history_coverage_kind = (
+            TemporalCoverageKind.PROCESS_START_PARTIAL
+        )
+        self.library.history_coverage_start_unix_ns = 123
+        self.library.kline_coverage_kind = KLineTemporalCoverage.DISABLED
+        partial = self.reader.history_coverage()
+        self.assertEqual(partial.coverage_start_unix_ns, 123)
+        self.assertIs(
+            partial.coverage_kind,
+            TemporalCoverageKind.PROCESS_START_PARTIAL,
+        )
+
+    def test_history_coverage_getter_rejects_noncanonical_results(self):
+        self.library.history_coverage_reserved0 = 1
+        with self.assertRaises(WireFormatError):
+            self.reader.history_coverage()
+        self.library.history_coverage_reserved0 = 0
+        self.library.history_coverage_kind = 99
+        with self.assertRaises(WireFormatError):
+            self.reader.history_coverage()
+        self.library.history_coverage_kind = (
+            TemporalCoverageKind.PROCESS_START_PARTIAL
+        )
+        self.library.history_coverage_start_unix_ns = 0
+        with self.assertRaises(WireFormatError):
+            self.reader.history_coverage()
+
     def test_instrument_two_pass_and_semantic_statuses(self):
         available = self.reader.instrument(1)
         self.assertIs(available.status, InstrumentStatus.AVAILABLE)
@@ -1021,6 +1285,126 @@ class NativeReaderTests(unittest.TestCase):
 
 
 class ClientHotPathTests(unittest.TestCase):
+    def test_independent_background_reader_uses_another_client(self):
+        library = FakeV2Library()
+        reader = native.NativeReader.open_fd(9, library=library)
+        client = L2FlowClient(
+            reader,
+            stale_after_ns=None,
+            control_socket_path="/tmp/l2flow-test.sock",
+        )
+        independent = SimpleNamespace(
+            session_info=lambda: session_info(),
+            close=mock.Mock(),
+        )
+        try:
+            with mock.patch.object(
+                L2FlowClient,
+                "connect",
+                return_value=independent,
+            ) as connect:
+                self.assertIs(
+                    client._open_independent_read_client(), independent
+                )
+            self.assertEqual(connect.call_count, 1)
+            self.assertEqual(
+                connect.call_args.args, ("/tmp/l2flow-test.sock",)
+            )
+            self.assertIn("_native_factory", connect.call_args.kwargs)
+            independent.close.assert_not_called()
+        finally:
+            client.close()
+
+    def test_independent_background_reader_rejects_session_change(self):
+        library = FakeV2Library()
+        reader = native.NativeReader.open_fd(9, library=library)
+        client = L2FlowClient(
+            reader,
+            stale_after_ns=None,
+            control_socket_path="/tmp/l2flow-test.sock",
+        )
+        independent = SimpleNamespace(
+            session_info=lambda: session_info(
+                run_id=b"S" * 16,
+            ),
+            close=mock.Mock(),
+        )
+        try:
+            with mock.patch.object(
+                L2FlowClient,
+                "connect",
+                return_value=independent,
+            ):
+                with self.assertRaises(
+                    l2flow_realtime.StaleSessionError
+                ):
+                    client._open_independent_read_client()
+            independent.close.assert_called_once_with()
+        finally:
+            client.close()
+
+    def test_independent_background_reader_rejects_catalog_change(self):
+        for overrides in (
+            {"catalog_digest": b"D" * 32},
+            {"catalog_version": 8},
+        ):
+            with self.subTest(overrides=overrides):
+                library = FakeV2Library()
+                reader = native.NativeReader.open_fd(9, library=library)
+                client = L2FlowClient(
+                    reader,
+                    stale_after_ns=None,
+                    control_socket_path="/tmp/l2flow-test.sock",
+                )
+                independent = SimpleNamespace(
+                    session_info=lambda: session_info(**overrides),
+                    close=mock.Mock(),
+                )
+                try:
+                    with mock.patch.object(
+                        L2FlowClient,
+                        "connect",
+                        return_value=independent,
+                    ):
+                        with self.assertRaises(
+                            l2flow_realtime.StaleSessionError
+                        ):
+                            client._open_independent_read_client()
+                    independent.close.assert_called_once_with()
+                finally:
+                    client.close()
+
+    def test_client_exposes_exact_history_coverage(self):
+        library = FakeV2Library()
+        reader = native.NativeReader.open_fd(9, library=library)
+        try:
+            client = L2FlowClient(reader, stale_after_ns=None)
+            from_open = client.history_coverage()
+            self.assertEqual(from_open.run_id, RUN_ID)
+            self.assertEqual(from_open.trade_date, 20260729)
+            self.assertTrue(from_open.coverage_from_open)
+            self.assertIsNone(from_open.coverage_start_unix_ns)
+
+            library.session_server_state = ServerState.LIVE_PARTIAL
+            library.session_flags = 0
+            library.history_coverage_kind = (
+                TemporalCoverageKind.PROCESS_START_PARTIAL
+            )
+            library.history_coverage_start_unix_ns = 456
+            partial = client.history_coverage()
+            self.assertTrue(partial.process_start_partial)
+            self.assertEqual(partial.coverage_start_unix_ns, 456)
+
+            library.history_coverage_kind = (
+                TemporalCoverageKind.FROM_OPEN
+            )
+            library.history_coverage_start_unix_ns = 0
+            with self.assertRaises(WireFormatError):
+                client.history_coverage()
+            client.close()
+        finally:
+            reader.close()
+
     def test_client_exposes_identity_checked_kline_coverage(self):
         library = FakeV2Library()
         reader = native.NativeReader.open_fd(9, library=library)

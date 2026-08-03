@@ -369,6 +369,10 @@ public:
         if (events.size() >
                 std::numeric_limits<std::uint64_t>::max() -
                     published_event_sequence_ ||
+            (!events.empty() &&
+             events.size() - 1U >
+                 static_cast<std::size_t>(
+                     std::numeric_limits<std::uint32_t>::max())) ||
             static_cast<std::uint64_t>(events.size()) >
                 config_.event_capacity -
                     published_event_sequence_) {
@@ -433,7 +437,10 @@ public:
             auto& row = inline_projection
                             ? inline_rows[index]
                             : scratch;
-            if (!ProjectInstrumentDerivedEventWireV1(
+            if (!events[index].source_tick_event_ordinal_valid ||
+                events[index].source_tick_event_ordinal !=
+                    static_cast<std::uint32_t>(index) ||
+                !ProjectInstrumentDerivedEventWireV1(
                     events[index], &row) ||
                 !CertifiedOrderEventRowCanonicalV1(
                     row, config_.trade_date, sequence)) {

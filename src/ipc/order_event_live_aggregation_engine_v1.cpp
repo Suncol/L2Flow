@@ -403,14 +403,25 @@ template <typename EventVariant>
     std::uint32_t trade_date,
     std::uint64_t source_tick_sequence,
     std::vector<OrderEventDeltaPayloadV1>* output) {
+    if (output == nullptr ||
+        (!events.empty() &&
+         events.size() - 1U >
+             static_cast<std::size_t>(
+                 std::numeric_limits<std::uint32_t>::max()))) {
+        return false;
+    }
     output->reserve(output->size() + events.size());
-    for (const auto& event : events) {
+    for (std::size_t index = 0U; index < events.size(); ++index) {
+        const auto& event = events[index];
         OrderEventDeltaPayloadV1 row{};
         std::visit(
             [&row](const auto& value) {
                 Project(value, &row);
             },
             event);
+        row.reserved0 = static_cast<std::uint32_t>(index);
+        row.reserved1[0U] =
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2;
         if (!OrderEventDeltaPayloadCanonicalV1(
                 row, trade_date, source_tick_sequence)) {
             return false;

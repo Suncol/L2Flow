@@ -194,6 +194,20 @@ int l2flow_order_event_delta_reader_open_v1(
     const l2flow_order_event_delta_session_v1* expected_session,
     l2flow_order_event_delta_reader_v1** output,
     int* system_error_number) {
+    return l2flow_order_event_delta_reader_open_at_v1(
+        read_only_descriptor,
+        expected_session,
+        1U,
+        output,
+        system_error_number);
+}
+
+int l2flow_order_event_delta_reader_open_at_v1(
+    int read_only_descriptor,
+    const l2flow_order_event_delta_session_v1* expected_session,
+    std::uint64_t start_event_sequence,
+    l2flow_order_event_delta_reader_v1** output,
+    int* system_error_number) {
     if (system_error_number != nullptr) {
         *system_error_number = 0;
     }
@@ -201,16 +215,18 @@ int l2flow_order_event_delta_reader_open_v1(
         return L2FLOW_ORDER_EVENT_DELTA_NULL_OUTPUT_V1;
     }
     *output = nullptr;
-    if (expected_session == nullptr ||
+    if (start_event_sequence == 0U || expected_session == nullptr ||
         !CanonicalSession(*expected_session)) {
         return L2FLOW_ORDER_EVENT_DELTA_INVALID_ARGUMENT_V1;
     }
     try {
         auto holder =
             std::make_unique<l2flow_order_event_delta_reader_v1>();
-        const auto error = ipc::OrderEventDeltaRingReaderV1::Open(
+        holder->next_sequence = start_event_sequence;
+        const auto error = ipc::OrderEventDeltaRingReaderV1::OpenAt(
             read_only_descriptor,
             FromCSession(*expected_session),
+            start_event_sequence,
             &holder->reader,
             system_error_number);
         if (error !=

@@ -78,6 +78,20 @@ from .certified_order_events import (
     CertifiedOrderEventStatus,
     open_certified_order_events,
 )
+from .certified_tick_history import (
+    CertifiedTick,
+    CertifiedTickHistoryBatch,
+    CertifiedTickHistoryCapacityError,
+    CertifiedTickHistoryError,
+    CertifiedTickHistoryFailure,
+    CertifiedTickHistoryProducerFailedError,
+    CertifiedTickHistoryReader,
+    CertifiedTickHistorySession,
+    CertifiedTickHistoryState,
+    CertifiedTickHistoryStatus,
+    open_certified_tick_history,
+)
+from .fast_tick_live import FastTickBatch, FastTickStreamReader
 from .instrument_delta import (
     DeltaCheckpointUnverifiedError,
     InstrumentTickDeltaBaseKind,
@@ -107,6 +121,9 @@ from .models import (
     ClientClosedError,
     CommonRecord,
     DecimalValue,
+    EventUid,
+    EventUidScope,
+    HistoryCoverageInfo,
     InconsistentReadError,
     Instrument,
     InstrumentKey,
@@ -134,6 +151,7 @@ from .models import (
     SessionInfo,
     Side,
     StaleSessionError,
+    TemporalCoverageKind,
     TickAction,
     TickOverrunError,
     TickProjectionFlag,
@@ -145,6 +163,14 @@ from .models import (
 
 def connect(control_socket_path, **kwargs) -> L2FlowClient:
     return L2FlowClient.connect(control_socket_path, **kwargs)
+
+
+def as_polars(client: L2FlowClient):
+    """Create the optional Polars facade without importing it on core paths."""
+
+    from .polars import as_polars as _as_polars
+
+    return _as_polars(client)
 
 
 __all__ = [
@@ -159,11 +185,26 @@ __all__ = [
     "CertifiedOrderEventSession",
     "CertifiedOrderEventState",
     "CertifiedOrderEventStatus",
+    "CertifiedTick",
+    "CertifiedTickHistoryBatch",
+    "CertifiedTickHistoryCapacityError",
+    "CertifiedTickHistoryError",
+    "CertifiedTickHistoryFailure",
+    "CertifiedTickHistoryProducerFailedError",
+    "CertifiedTickHistoryReader",
+    "CertifiedTickHistorySession",
+    "CertifiedTickHistoryState",
+    "CertifiedTickHistoryStatus",
     "ClientClosedError",
     "CommonRecord",
     "DEFAULT_STALE_AFTER_NS",
     "DEFAULT_INSTRUMENT_RAW_EVENT_COLUMNS",
     "DecimalValue",
+    "EventUid",
+    "EventUidScope",
+    "FastTickBatch",
+    "FastTickStreamReader",
+    "HistoryCoverageInfo",
     "InconsistentReadError",
     "Instrument",
     "InstrumentDerivedEvent",
@@ -256,6 +297,7 @@ __all__ = [
     "SessionInfo",
     "Side",
     "StaleSessionError",
+    "TemporalCoverageKind",
     "StreamCheckpointMismatchError",
     "StreamInternalFailureError",
     "StreamNotFoundError",
@@ -266,7 +308,9 @@ __all__ = [
     "TradingPhase",
     "UnavailableError",
     "WireFormatError",
+    "as_polars",
     "connect",
     "open_live_order_events",
     "open_certified_order_events",
+    "open_certified_tick_history",
 ]

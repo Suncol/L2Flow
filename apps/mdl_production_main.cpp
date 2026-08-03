@@ -1928,13 +1928,15 @@ int RunLivePartial(
     // only after it returns avoids claiming coverage for time during which the
     // subscription was not yet proven active. Any synchronous Connect callback
     // that already reached KLine is conservatively before this boundary.
-    std::uint64_t kline_coverage_start_unix_ns = 0U;
-    if (!kline_windows.empty() &&
-        (!CurrentRealtimeNs(&kline_coverage_start_unix_ns) ||
+    std::uint64_t process_start_coverage_unix_ns = 0U;
+    if (!CurrentRealtimeNs(&process_start_coverage_unix_ns) ||
+        !ipc_service->PrepareProcessStartHistoryCoverage(
+            process_start_coverage_unix_ns) ||
+        (!kline_windows.empty() &&
          !ipc_service->PrepareProcessStartKLineCoverage(
-             kline_coverage_start_unix_ns))) {
+             process_start_coverage_unix_ns))) {
         std::cerr
-            << "mdl-production-router: standalone LIVE_PARTIAL KLine "
+            << "mdl-production-router: standalone LIVE_PARTIAL "
                "coverage preparation failed\n";
         pipeline->StopAndDrain();
         ipc_service->MarkFailed();
@@ -1961,7 +1963,7 @@ int RunLivePartial(
                 ? "PROCESS_START_PARTIAL"
                 : "DISABLED")
         << " coverage_start_unix_ns="
-        << kline_coverage_start_unix_ns
+        << process_start_coverage_unix_ns
         << " full_day_factor_valid=false"
         << " certified_prefix_valid=false"
         << " event_socket=" << options.event_aggregator_socket
@@ -2383,8 +2385,17 @@ int RunOnlineRecovery(
         certified_config.maximum_order_states = maximum_order_states;
         certified_config.maximum_derived_events =
             maximum_order_states * 4U;
+        // The Store bound covers every applied record and is therefore a
+        // conservative upper bound for the Tick-only canonical journal. Do
+        // not silently fall back to the library's smaller convenience
+        // default: exhausting Tick History must not freeze an otherwise
+        // correctly sized recovered session.
+        certified_config.maximum_certified_ticks =
+            options.intraday_store_maximum_records;
         certified_config.worker_cpu_set = options.event_cpu_set;
         certified_config.control_cpu_set = options.event_cpu_set;
+        certified_config.tick_history_worker_cpu_set =
+            options.event_cpu_set;
         certified_config.control_exposure_gate =
             online_exposure_gate;
         // This worker is built before the recovered prefix exists.  A
@@ -3113,6 +3124,11 @@ int RunOnlineRecovery(
                         committed_prefix.state == probed_prefix.state &&
                         committed_prefix.canonical_apply_frontier ==
                             probed_prefix.canonical_apply_frontier &&
+                        committed_prefix.tick_journal_frontier ==
+                            committed_prefix
+                                .canonical_apply_frontier &&
+                        committed_prefix.tick_journal_frontier ==
+                            probed_prefix.tick_journal_frontier &&
                         committed_prefix.correction_epoch ==
                             probed_prefix.correction_epoch &&
                         committed_prefix.event_journal_frontier ==
@@ -4032,9 +4048,13 @@ int Run(const Options& options) {
                 maximum_order_states;
             certified_config.maximum_derived_events =
                 maximum_derived_events;
+            certified_config.maximum_certified_ticks =
+                options.intraday_store_maximum_records;
             certified_config.worker_cpu_set =
                 options.event_cpu_set;
             certified_config.control_cpu_set =
+                options.event_cpu_set;
+            certified_config.tick_history_worker_cpu_set =
                 options.event_cpu_set;
             certified_config.control_socket_path =
                 options.certified_ipc_socket;

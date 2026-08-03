@@ -74,7 +74,8 @@ template <typename SourceVariant>
 [[nodiscard]] bool AppendMarketEvents(
     SourceVariant* source,
     std::uint64_t* next_sequence,
-    std::vector<InstrumentDerivedEventV1>* output) {
+    std::vector<InstrumentDerivedEventV1>* output,
+    bool source_tick_identity_valid) {
     if (source == nullptr || next_sequence == nullptr ||
         output == nullptr) {
         return false;
@@ -84,10 +85,23 @@ template <typename SourceVariant>
             *next_sequence) {
         return false;
     }
+    if (source_tick_identity_valid && !source->empty() &&
+        source->size() - 1U >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
     output->reserve(output->size() + source->size());
-    for (auto& source_event : *source) {
+    for (std::size_t index = 0U; index < source->size(); ++index) {
+        auto& source_event = (*source)[index];
         InstrumentDerivedEventV1 event{};
         event.derived_event_sequence = *next_sequence;
+        event.source_tick_event_ordinal =
+            source_tick_identity_valid
+                ? static_cast<std::uint32_t>(index)
+                : 0U;
+        event.source_tick_event_ordinal_valid =
+            source_tick_identity_valid;
         std::visit(
             [&event](auto& value) {
                 using Event = std::decay_t<decltype(value)>;
@@ -326,7 +340,10 @@ public:
                         kAggregationError;
                 }
                 if (!AppendMarketEvents(
-                        &shanghai_events_, &next_sequence_, output)) {
+                        &shanghai_events_,
+                        &next_sequence_,
+                        output,
+                        false)) {
                     FailClose();
                     return InstrumentDerivedEventHistoryErrorV1::
                         kResourceExhausted;
@@ -342,7 +359,10 @@ public:
                         kAggregationError;
                 }
                 if (!AppendMarketEvents(
-                        &shenzhen_events_, &next_sequence_, output)) {
+                        &shenzhen_events_,
+                        &next_sequence_,
+                        output,
+                        false)) {
                     FailClose();
                     return InstrumentDerivedEventHistoryErrorV1::
                         kResourceExhausted;
@@ -492,7 +512,10 @@ private:
                     kAggregationError;
             }
             return AppendMarketEvents(
-                       &shanghai_events_, &next_sequence_, output)
+                       &shanghai_events_,
+                       &next_sequence_,
+                       output,
+                       true)
                        ? InstrumentDerivedEventHistoryErrorV1::kNone
                        : InstrumentDerivedEventHistoryErrorV1::
                              kResourceExhausted;
@@ -514,7 +537,10 @@ private:
                 kAggregationError;
         }
         return AppendMarketEvents(
-                   &shenzhen_events_, &next_sequence_, output)
+                   &shenzhen_events_,
+                   &next_sequence_,
+                   output,
+                   true)
                    ? InstrumentDerivedEventHistoryErrorV1::kNone
                    : InstrumentDerivedEventHistoryErrorV1::
                          kResourceExhausted;

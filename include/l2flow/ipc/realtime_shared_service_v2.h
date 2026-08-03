@@ -124,7 +124,7 @@ enum class RealtimeSharedServiceCreateErrorV2 : std::uint8_t {
 RealtimeSharedServiceCreateErrorNameV2(
     RealtimeSharedServiceCreateErrorV2 error) noexcept;
 
-// Wire V2.4 service. History and delta readers bind to one immutable daily
+// Wire V2.5 service. History and delta readers bind to one immutable daily
 // catalog generation and never enter the live callback/decoder path.
 class RealtimeSharedMarketServiceV2 final
     : public l2flow::market::RealtimeAppliedRecordSinkV1,
@@ -169,6 +169,11 @@ public:
     // another service mode, or an already published KLine generation is
     // rejected.
     [[nodiscard]] bool PrepareProcessStartKLineCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept;
+    // Publishes the conservative session-wide process-start boundary after
+    // SDK Connect has completed. This is required for standalone partial
+    // History even when KLine is disabled. It is a one-time idempotent write.
+    [[nodiscard]] bool PrepareProcessStartHistoryCoverage(
         std::uint64_t coverage_start_unix_ns) noexcept;
 
     // Online recovery calls this only after the CERTIFIED Tick/Event prefix

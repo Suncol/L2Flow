@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import Optional
@@ -9,6 +10,9 @@ from typing import Optional
 
 _UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
+_EVENT_UID_MAGIC = b"L2EU"
+_EVENT_UID_VERSION = 1
+_EVENT_UID_WIRE = struct.Struct(">4sBBH16sQIQI")
 
 
 class L2FlowRealtimeError(RuntimeError):
@@ -125,8 +129,30 @@ class KLineTemporalCoverage(IntEnum):
     PROCESS_START_PARTIAL = 2
 
 
+class TemporalCoverageKind(IntEnum):
+    """Temporal origin of a history/event product.
+
+    The aliases retain the terminology used by the live event-delta API while
+    the canonical names match the shared history coverage ABI.
+    """
+
+    UNAVAILABLE = 0
+    FROM_OPEN = 1
+    PROCESS_START_PARTIAL = 2
+
+    DISABLED = UNAVAILABLE
+    FROM_MARKET_OPEN = FROM_OPEN
+    FROM_PROCESS_START = PROCESS_START_PARTIAL
+
+
+class EventUidScope(IntEnum):
+    """Domain encoded into :class:`EventUid`."""
+
+    SESSION_SOURCE_TICK = 1
+
+
 class KLineCoverageFlag(IntFlag):
-    """Per-bar Wire V2.4 KLine coverage qualifiers."""
+    """Per-bar Wire V2.5 KLine coverage qualifiers."""
 
     NONE = 0
     PROCESS_START_PARTIAL = 1 << 0
@@ -271,6 +297,159 @@ class SessionIdentity:
         if not any(self.run_id):
             raise ValueError("run_id must be nonzero")
         _uint64(self.session_epoch, "session_epoch", nonzero=True)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryCoverageInfo:
+    """Session-scoped temporal coverage for a history/event product.
+
+    ``coverage_start_unix_ns`` is deliberately independent of KLine window
+    coverage. A process-start product may leave it as ``None`` when its exact
+    first-event boundary is not present in that product's own ABI.
+    """
+
+    run_id: bytes
+    session_epoch: int
+    trade_date: int
+    coverage_kind: TemporalCoverageKind
+    coverage_start_unix_ns: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        _digest(self.run_id, 16, "run_id")
+        if not any(self.run_id):
+            raise ValueError("run_id must be nonzero")
+        _uint64(self.session_epoch, "session_epoch", nonzero=True)
+        _uint32(self.trade_date, "trade_date", nonzero=True)
+        try:
+            coverage_kind = TemporalCoverageKind(self.coverage_kind)
+        except (TypeError, ValueError) as error:
+            raise ValueError("coverage_kind is invalid") from error
+        if self.coverage_start_unix_ns is not None:
+            _uint64(
+                self.coverage_start_unix_ns,
+                "coverage_start_unix_ns",
+                nonzero=True,
+            )
+            if (
+                coverage_kind
+                is not TemporalCoverageKind.PROCESS_START_PARTIAL
+            ):
+                raise ValueError(
+                    "only PROCESS_START_PARTIAL may carry a coverage start"
+                )
+        object.__setattr__(self, "coverage_kind", coverage_kind)
+
+    @property
+    def identity(self) -> SessionIdentity:
+        return SessionIdentity(self.run_id, self.session_epoch)
+
+    @property
+    def available(self) -> bool:
+        return self.coverage_kind is not TemporalCoverageKind.UNAVAILABLE
+
+    @property
+    def coverage_from_open(self) -> bool:
+        return self.coverage_kind is TemporalCoverageKind.FROM_OPEN
+
+    @property
+    def process_start_partial(self) -> bool:
+        return (
+            self.coverage_kind
+            is TemporalCoverageKind.PROCESS_START_PARTIAL
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EventUid:
+    """Collision-free identity of one event emitted by one source tick.
+
+    Dense product-local event sequences are intentionally absent. The final
+    coordinate is a zero-based ordinal in the deterministic emission order of
+    one source tick. Consequently an event UID must not be constructed until
+    the producer supplies that ordinal explicitly.
+
+    Source-free trading-day finalization rows have an all-zero anchor and are
+    outside this scope; they remain UID-unavailable unless a separately
+    versioned boundary-event identity domain is introduced.
+
+    ``bytes(uid)`` is a fixed 48-byte, network-order structural encoding, not
+    a hash. Equality therefore has no hash-collision semantics.
+    """
+
+    scope: EventUidScope
+    session_identity: SessionIdentity
+    instrument_id: int
+    tick_stream_sequence: int
+    source_tick_event_ordinal: int
+
+    def __post_init__(self) -> None:
+        try:
+            scope = EventUidScope(self.scope)
+        except (TypeError, ValueError) as error:
+            raise ValueError("event UID scope is invalid") from error
+        if not isinstance(self.session_identity, SessionIdentity):
+            raise TypeError("session_identity must be SessionIdentity")
+        _uint32(self.instrument_id, "instrument_id", nonzero=True)
+        _uint64(
+            self.tick_stream_sequence,
+            "tick_stream_sequence",
+            nonzero=True,
+        )
+        _uint32(
+            self.source_tick_event_ordinal,
+            "source_tick_event_ordinal",
+        )
+        object.__setattr__(self, "scope", scope)
+
+    @property
+    def wire(self) -> bytes:
+        return _EVENT_UID_WIRE.pack(
+            _EVENT_UID_MAGIC,
+            _EVENT_UID_VERSION,
+            int(self.scope),
+            0,
+            self.session_identity.run_id,
+            self.session_identity.session_epoch,
+            self.instrument_id,
+            self.tick_stream_sequence,
+            self.source_tick_event_ordinal,
+        )
+
+    def __bytes__(self) -> bytes:
+        return self.wire
+
+    @classmethod
+    def from_wire(cls, value: bytes) -> "EventUid":
+        if not isinstance(value, bytes):
+            raise TypeError("event UID wire value must be exact bytes")
+        if len(value) != _EVENT_UID_WIRE.size:
+            raise ValueError(
+                f"event UID wire value must contain {_EVENT_UID_WIRE.size} bytes"
+            )
+        (
+            magic,
+            version,
+            scope,
+            reserved,
+            run_id,
+            session_epoch,
+            instrument_id,
+            tick_stream_sequence,
+            source_tick_event_ordinal,
+        ) = _EVENT_UID_WIRE.unpack(value)
+        if (
+            magic != _EVENT_UID_MAGIC
+            or version != _EVENT_UID_VERSION
+            or reserved != 0
+        ):
+            raise ValueError("event UID wire header is invalid")
+        return cls(
+            scope=EventUidScope(scope),
+            session_identity=SessionIdentity(run_id, session_epoch),
+            instrument_id=instrument_id,
+            tick_stream_sequence=tick_stream_sequence,
+            source_tick_event_ordinal=source_tick_event_ordinal,
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -185,4 +185,15 @@ OrderEventDeltaControlConnectV1(
     std::unique_ptr<OrderEventDeltaRingReaderV1>* output_reader,
     int* system_error_number = nullptr) noexcept;
 
+// Identical authenticated control attachment with an explicit positive live
+// event boundary established by a trusted history checkpoint. ConnectV1 is
+// exactly equivalent to ConnectAtV1(..., 1, ...).
+[[nodiscard]] OrderEventDeltaControlClientErrorV1
+OrderEventDeltaControlConnectAtV1(
+    const OrderEventDeltaControlClientConfigV1& config,
+    std::uint64_t start_event_sequence,
+    OrderEventDeltaControlSnapshotV1* output_snapshot,
+    std::unique_ptr<OrderEventDeltaRingReaderV1>* output_reader,
+    int* system_error_number = nullptr) noexcept;
+
 }  // namespace l2flow::ipc

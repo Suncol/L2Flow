@@ -1,5 +1,6 @@
 #include "l2flow/ipc/certified_order_event_journal_v1.h"
 #include "l2flow/ipc/certified_order_event_reader_v1.h"
+#include "l2flow/ipc/instrument_derived_event_wire_v1.h"
 #include "l2flow/ipc/realtime_certified_wire_v1.h"
 
 #include <array>
@@ -14,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <variant>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -73,7 +75,9 @@ public:
     }
 
     [[nodiscard]] bool Create(
-        std::uint64_t canonical_frontier) noexcept {
+        std::uint64_t canonical_frontier,
+        ipc::RealtimeCertifiedStateV1 state =
+            ipc::RealtimeCertifiedStateV1::kStopped) noexcept {
         constexpr std::uint32_t latest_capacity = 1U;
         constexpr std::uint32_t ring_capacity = 1U;
         constexpr std::uint32_t channel_capacity = 1U;
@@ -142,8 +146,20 @@ public:
         header_->observed_native_message_count =
             canonical_frontier;
         header_->certified_tick_count = canonical_frontier;
-        header_->aggregate_state = static_cast<std::uint32_t>(
-            ipc::RealtimeCertifiedStateV1::kStopped);
+        header_->aggregate_state =
+            static_cast<std::uint32_t>(state);
+        if (state ==
+            ipc::RealtimeCertifiedStateV1::kContiguous) {
+            header_->channel_state_count = 1U;
+        } else if (
+            state ==
+            ipc::RealtimeCertifiedStateV1::kFrozenConflict) {
+            header_->conflicting_duplicate_count = 1U;
+        } else if (
+            state ==
+            ipc::RealtimeCertifiedStateV1::kFrozenResource) {
+            header_->resource_exhaustion_count = 1U;
+        }
         if (!ipc::RealtimeCertifiedHeaderCanonicalV1(*header_)) {
             return false;
         }
@@ -225,6 +241,8 @@ JournalConfig(
     trade.quantity = 100;
     ipc::InstrumentDerivedEventV1 result{};
     result.derived_event_sequence = sequence;
+    result.source_tick_event_ordinal = 0U;
+    result.source_tick_event_ordinal_valid = true;
     result.payload = trade;
     return result;
 }
@@ -249,6 +267,8 @@ JournalConfig(
     trade.quantity = 100;
     ipc::InstrumentDerivedEventV1 result{};
     result.derived_event_sequence = sequence;
+    result.source_tick_event_ordinal = 0U;
+    result.source_tick_event_ordinal_valid = true;
     result.payload = trade;
     return result;
 }
@@ -351,8 +371,15 @@ bool TestLazyCommitAndCoherentCut() {
         reader->ReadEvent(1U, &envelope) ==
                 ipc::CertifiedOrderEventReadResultV1::kOk &&
             envelope.canonical_apply_sequence == 1U &&
-            envelope.event.derived_event_sequence == 1U,
-        "read first coherent Event row");
+            envelope.event.derived_event_sequence == 1U &&
+            envelope.event.record_schema_version ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 &&
+            envelope.event.reserved0 == 0U &&
+            envelope.event.reserved1[0U] ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 &&
+            envelope.event.reserved1[1U] == 0U &&
+            envelope.event.reserved1[2U] == 0U,
+        "read first coherent Event row with source-tick identity");
 
     auto second = ShanghaiTrade(2U);
     ok &= Expect(
@@ -429,6 +456,79 @@ bool TestShenzhenChannelZero() {
                 L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHENZHEN_V1 &&
             envelope.event.channel == 0,
         "wire validator preserves Shenzhen channel-zero asymmetry");
+    return ok;
+}
+
+bool TestRejectsNonCanonicalSourceTickIdentity() {
+    bool ok = true;
+    auto source_free_trade = ShanghaiTrade(1U);
+    auto* const trade = std::get_if<market::ShanghaiTradeEventV1>(
+        &source_free_trade.payload);
+    if (trade != nullptr) {
+        trade->source_anchor.tick_stream_sequence = 0U;
+    }
+    source_free_trade.source_tick_event_ordinal_valid = false;
+    l2flow_instrument_derived_event_row_v1 projected{};
+    ok &= Expect(
+        trade != nullptr &&
+            !ipc::ProjectInstrumentDerivedEventWireV1(
+                source_free_trade, &projected) &&
+            projected.record_schema_version == 0U,
+        "only a source-free Finalize row may omit source-tick identity");
+
+    TickStatusFixture tick;
+    ok &= Expect(
+        tick.Create(0U),
+        "create identity-validation Tick frontier fixture");
+    if (!ok) {
+        return false;
+    }
+    std::shared_ptr<ipc::CertifiedOrderEventJournalProducerV1> journal;
+    ok &= Expect(
+        ipc::CertifiedOrderEventJournalProducerV1::Create(
+            JournalConfig(tick.expected_session(), 4U), &journal) ==
+                ipc::CertifiedOrderEventJournalCreateErrorV1::kNone &&
+            journal != nullptr,
+        "create identity-validation Event journal");
+    if (journal == nullptr) {
+        return false;
+    }
+
+    auto invalid = ShanghaiTrade(1U);
+    invalid.source_tick_event_ordinal_valid = false;
+    ok &= Expect(
+        journal->PublishCanonicalTick(
+            1U, 0U, 0U, std::span(&invalid, 1U)) ==
+            ipc::CertifiedOrderEventJournalPublishErrorV1::
+                kProjectionError &&
+            journal->published_event_sequence() == 0U &&
+            journal->failed(),
+        "CERT rejects a source-backed Event without a valid ordinal "
+        "before publication");
+
+    std::shared_ptr<ipc::CertifiedOrderEventJournalProducerV1>
+        second_journal;
+    ok &= Expect(
+        ipc::CertifiedOrderEventJournalProducerV1::Create(
+            JournalConfig(tick.expected_session(), 4U),
+            &second_journal) ==
+                ipc::CertifiedOrderEventJournalCreateErrorV1::kNone &&
+            second_journal != nullptr,
+        "create second identity-validation Event journal");
+    if (second_journal == nullptr) {
+        return false;
+    }
+    invalid = ShanghaiTrade(1U);
+    invalid.source_tick_event_ordinal = 1U;
+    ok &= Expect(
+        second_journal->PublishCanonicalTick(
+            1U, 0U, 0U, std::span(&invalid, 1U)) ==
+            ipc::CertifiedOrderEventJournalPublishErrorV1::
+                kProjectionError &&
+            second_journal->published_event_sequence() == 0U &&
+            second_journal->failed(),
+        "CERT rejects an ordinal that is not the core output-vector index "
+        "before publication");
     return ok;
 }
 
@@ -555,13 +655,97 @@ bool TestConcurrentPublicationNeverTears() {
     return ok;
 }
 
+bool TestFullCapacityNaturalTailLifecycle() {
+    struct Case final {
+        ipc::RealtimeCertifiedStateV1 state;
+        ipc::CertifiedOrderEventReadResultV1 expected;
+        std::string_view label;
+    };
+    constexpr std::array<Case, 3U> cases{{
+        {ipc::RealtimeCertifiedStateV1::kContiguous,
+         ipc::CertifiedOrderEventReadResultV1::kNotYetPublished,
+         "ACTIVE full-capacity tail remains temporarily unavailable"},
+        {ipc::RealtimeCertifiedStateV1::kStopped,
+         ipc::CertifiedOrderEventReadResultV1::kEndOfStream,
+         "clean STOPPED full-capacity tail reports end-of-stream"},
+        {ipc::RealtimeCertifiedStateV1::kFrozenResource,
+         ipc::CertifiedOrderEventReadResultV1::kProducerFailed,
+         "frozen full-capacity tail fails closed"},
+    }};
+
+    bool ok = true;
+    for (const auto& test : cases) {
+        TickStatusFixture tick;
+        ok &= Expect(
+            tick.Create(1U, test.state),
+            "create exact-capacity Tick lifecycle fixture");
+        if (!ok) {
+            return false;
+        }
+        std::shared_ptr<
+            ipc::CertifiedOrderEventJournalProducerV1>
+            journal;
+        ok &= Expect(
+            ipc::CertifiedOrderEventJournalProducerV1::Create(
+                JournalConfig(tick.expected_session(), 2U),
+                &journal) ==
+                    ipc::CertifiedOrderEventJournalCreateErrorV1::
+                        kNone &&
+                journal != nullptr,
+            "create exact-capacity Event journal");
+        if (journal == nullptr) {
+            return false;
+        }
+        std::array<ipc::InstrumentDerivedEventV1, 2U> events{
+            ShanghaiTrade(1U), ShanghaiTrade(2U)};
+        events[1U].source_tick_event_ordinal = 1U;
+        ok &= Expect(
+            journal->PublishCanonicalTick(
+                1U, 0U, 0U, events) ==
+                ipc::CertifiedOrderEventJournalPublishErrorV1::
+                    kNone,
+            "fill every Event journal slot at one coherent Tick cut");
+
+        std::unique_ptr<ipc::CertifiedOrderEventReaderV1> reader;
+        ok &= Expect(
+            OpenCombined(tick, journal, &reader),
+            "open exact-capacity combined Event reader");
+        if (reader == nullptr) {
+            return false;
+        }
+        std::array<ipc::CertifiedOrderEventEnvelopeV1, 1U> rows{};
+        ipc::CertifiedOrderEventReadBatchResultV1 batch{};
+        ipc::CertifiedOrderEventEnvelopeV1 row{};
+        const bool lifecycle_visible =
+            reader->Read(3U, rows, &batch) == test.expected &&
+            batch.written == 0U &&
+            batch.next_event_sequence == 3U &&
+            batch.status.tick.state == test.state &&
+            batch.status.event_published_sequence == 2U &&
+            batch.status.coherent_canonical_apply_frontier == 1U &&
+            reader->ReadEvent(3U, &row) == test.expected;
+        ok &= Expect(lifecycle_visible, test.label);
+
+        batch = {};
+        ok &= Expect(
+            reader->Read(4U, rows, &batch) ==
+                    ipc::CertifiedOrderEventReadResultV1::kOutOfRange &&
+                batch.written == 0U &&
+                batch.next_event_sequence == 4U,
+            "natural Event tail exception is limited to capacity plus one");
+    }
+    return ok;
+}
+
 }  // namespace
 
 int main() {
     bool ok = true;
     ok &= TestLazyCommitAndCoherentCut();
     ok &= TestShenzhenChannelZero();
+    ok &= TestRejectsNonCanonicalSourceTickIdentity();
     ok &= TestConcurrentPublicationNeverTears();
+    ok &= TestFullCapacityNaturalTailLifecycle();
     if (ok) {
         std::cout << "PASS: certified order Event journal v1\n";
         return 0;

@@ -30,6 +30,7 @@ from .models import (
     SelectionScope,
     ServerState,
     SessionInfo,
+    TemporalCoverageKind,
     TickOverrunError,
     UnavailableError,
     WireFormatError,
@@ -138,10 +139,21 @@ class _KLineCoverageInfoC(ctypes.Structure):
     ]
 
 
+class _HistoryCoverageInfoC(ctypes.Structure):
+    _fields_ = [
+        ("session_epoch", ctypes.c_uint64),
+        ("coverage_start_unix_ns", ctypes.c_uint64),
+        ("coverage_kind", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint64 * 1),
+    ]
+
+
 assert ctypes.sizeof(_SessionInfoC) == 240
 assert ctypes.sizeof(_SelectionEnvelopeC) == 144
 assert ctypes.sizeof(_HealthC) == 32
 assert ctypes.sizeof(_KLineCoverageInfoC) == 32
+assert ctypes.sizeof(_HistoryCoverageInfoC) == 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +161,13 @@ class NativeTickRead:
     payloads: tuple[bytes, ...]
     next_sequence: int
     observed_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class NativeHistoryCoverage:
+    session_epoch: int
+    coverage_kind: TemporalCoverageKind
+    coverage_start_unix_ns: Optional[int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +272,11 @@ def _bind_library(library) -> None:
         ctypes.POINTER(_KLineCoverageInfoC),
     ]
     library.l2flow_shm_reader_kline_coverage_v2.restype = ctypes.c_int
+    library.l2flow_shm_reader_history_coverage_v2.argtypes = [
+        handle,
+        ctypes.POINTER(_HistoryCoverageInfoC),
+    ]
+    library.l2flow_shm_reader_history_coverage_v2.restype = ctypes.c_int
     library.l2flow_shm_reader_instrument_v2.argtypes = [
         handle,
         ctypes.c_uint32,
@@ -475,6 +499,44 @@ def _kline_coverage_from_c(
         ) from error
 
 
+def _history_coverage_from_c(
+    value: _HistoryCoverageInfoC,
+) -> NativeHistoryCoverage:
+    if value.reserved0 != 0 or any(value.reserved):
+        raise WireFormatError(
+            "History coverage C result reserved fields are nonzero"
+        )
+    if value.session_epoch == 0:
+        raise WireFormatError(
+            "History coverage C result has zero session_epoch"
+        )
+    try:
+        coverage_kind = TemporalCoverageKind(value.coverage_kind)
+    except ValueError as error:
+        raise WireFormatError(
+            "History coverage C result has an unknown coverage kind"
+        ) from error
+    if coverage_kind is TemporalCoverageKind.PROCESS_START_PARTIAL:
+        if value.coverage_start_unix_ns == 0:
+            raise WireFormatError(
+                "process-start History coverage has a zero boundary"
+            )
+        coverage_start_unix_ns: Optional[int] = (
+            value.coverage_start_unix_ns
+        )
+    else:
+        if value.coverage_start_unix_ns != 0:
+            raise WireFormatError(
+                "non-partial History coverage has a nonzero boundary"
+            )
+        coverage_start_unix_ns = None
+    return NativeHistoryCoverage(
+        session_epoch=value.session_epoch,
+        coverage_kind=coverage_kind,
+        coverage_start_unix_ns=coverage_start_unix_ns,
+    )
+
+
 class NativeReader:
     """One read-only Wire V2 mapping; close waits for in-flight methods."""
 
@@ -615,6 +677,25 @@ class NativeReader:
             )
             _raise_native("kline_coverage_v2", code)
             result = _kline_coverage_from_c(output)
+            if (
+                self._session_epoch is not None
+                and result.session_epoch != self._session_epoch
+            ):
+                raise WireFormatError(
+                    "mapped session_epoch changed in place"
+                )
+            self._session_epoch = result.session_epoch
+            return result
+
+    def history_coverage(self) -> NativeHistoryCoverage:
+        with self._lock:
+            self._require_open()
+            output = _HistoryCoverageInfoC()
+            code = self._library.l2flow_shm_reader_history_coverage_v2(
+                self._handle, ctypes.byref(output)
+            )
+            _raise_native("history_coverage_v2", code)
+            result = _history_coverage_from_c(output)
             if (
                 self._session_epoch is not None
                 and result.session_epoch != self._session_epoch

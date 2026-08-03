@@ -24,7 +24,8 @@ ipc::OrderEventDeltaPayloadV1 Order(
     std::uint64_t tick_sequence,
     std::int64_t order_id) {
     ipc::OrderEventDeltaPayloadV1 result{};
-    result.record_schema_version = 1U;
+    result.record_schema_version =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2;
     result.record_bytes = sizeof(result);
     result.trade_date = 20260730U;
     result.instrument_id = 1U;
@@ -45,6 +46,8 @@ ipc::OrderEventDeltaPayloadV1 Order(
     result.source_sequence = tick_sequence;
     result.ingress_sequence = tick_sequence;
     result.vendor_sequence_id = tick_sequence;
+    result.reserved1[0U] =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2;
     return result;
 }
 
@@ -89,9 +92,9 @@ int main(int argc, char** argv) {
         std::cerr << "failed to create probe producer\n";
         return 1;
     }
-    const std::array<ipc::OrderEventDeltaPayloadV1, 2U> events{
-        Order(2U, 7001),
-        Order(2U, 7002)};
+    std::array<ipc::OrderEventDeltaPayloadV1, 2U> events{
+        Order(2U, 7001), Order(2U, 7002)};
+    events[1U].reserved0 = 1U;
     if (producer->PublishSourceTick(2U, events) !=
             ipc::OrderEventDeltaPublishErrorV1::kNone ||
         !producer->UpdateHeartbeat(777'777U) ||

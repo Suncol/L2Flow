@@ -98,6 +98,12 @@ struct EventStatus final {
     std::uint64_t committed_mapping_bytes = 0U;
 };
 
+[[nodiscard]] bool ProducerFrozen(
+    RealtimeCertifiedStateV1 state) noexcept {
+    return state == RealtimeCertifiedStateV1::kFrozenConflict ||
+           state == RealtimeCertifiedStateV1::kFrozenResource;
+}
+
 [[nodiscard]] StableCopyResult CopyEventStatus(
     const CertifiedOrderEventHeaderV1& header,
     EventStatus* output) noexcept {
@@ -745,8 +751,7 @@ public:
     [[nodiscard]] CertifiedOrderEventReadResultV1 ReadEvent(
         std::uint64_t sequence,
         CertifiedOrderEventEnvelopeV1* output) const noexcept {
-        if (output == nullptr || sequence == 0U ||
-            sequence > event_capacity_) {
+        if (output == nullptr || sequence == 0U) {
             return CertifiedOrderEventReadResultV1::kOutOfRange;
         }
         for (std::size_t attempt = 0U; attempt < kReadAttempts;
@@ -756,6 +761,10 @@ public:
             if (status_result !=
                 CertifiedOrderEventReadResultV1::kOk) {
                 return status_result;
+            }
+            if (sequence > event_capacity_) {
+                return ReadBeyondCapacity(
+                    sequence, status, nullptr);
             }
             if (sequence > status.event_published_sequence) {
                 return status.event_published_sequence == 0U
@@ -790,8 +799,7 @@ public:
         std::uint64_t expected,
         std::span<CertifiedOrderEventEnvelopeV1> output,
         CertifiedOrderEventReadBatchResultV1* result) const noexcept {
-        if (result == nullptr || expected == 0U ||
-            expected > event_capacity_) {
+        if (result == nullptr || expected == 0U) {
             return CertifiedOrderEventReadResultV1::kOutOfRange;
         }
         *result = {};
@@ -799,6 +807,10 @@ public:
         const auto status_result = ReadStatus(&result->status);
         if (status_result != CertifiedOrderEventReadResultV1::kOk) {
             return status_result;
+        }
+        if (expected > event_capacity_) {
+            return ReadBeyondCapacity(
+                expected, result->status, result);
         }
         std::uint64_t sequence = expected;
         while (result->written < output.size() &&
@@ -830,6 +842,54 @@ public:
         return CertifiedOrderEventReadResultV1::kOk;
     }
 
+private:
+    [[nodiscard]] CertifiedOrderEventReadResultV1
+    ReadBeyondCapacity(
+        std::uint64_t sequence,
+        const CertifiedOrderEventStatusSnapshotV1& status,
+        CertifiedOrderEventReadBatchResultV1* result) const noexcept {
+        // event_capacity + 1 is the natural dense cursor only after every
+        // physical Event slot has been published and the final slot is at or
+        // below the coherent Tick/Event cut. `sequence > event_capacity_`
+        // makes sequence - 1 safe even when the capacity is UINT64_MAX.
+        if (sequence - 1U != event_capacity_ ||
+            status.event_published_sequence != event_capacity_) {
+            return CertifiedOrderEventReadResultV1::kOutOfRange;
+        }
+        CertifiedOrderEventEnvelopeV1 final_event{};
+        const StableCopyResult copied =
+            CopySlot(event_slots_[event_capacity_ - 1U], &final_event);
+        if (copied == StableCopyResult::kInconsistent ||
+            copied == StableCopyResult::kNeverPublished) {
+            return CertifiedOrderEventReadResultV1::kInconsistent;
+        }
+        if (copied != StableCopyResult::kCopied ||
+            !CertifiedOrderEventEnvelopeCanonicalV1(
+                final_event, session_.trade_date, event_capacity_)) {
+            return CertifiedOrderEventReadResultV1::kCorrupt;
+        }
+        const bool coherent =
+            final_event.canonical_apply_sequence <=
+            status.coherent_canonical_apply_frontier;
+        if (ProducerFrozen(status.tick.state)) {
+            return CertifiedOrderEventReadResultV1::kProducerFailed;
+        }
+        if (status.tick.state ==
+            RealtimeCertifiedStateV1::kStopped) {
+            return coherent
+                       ? CertifiedOrderEventReadResultV1::kEndOfStream
+                       : CertifiedOrderEventReadResultV1::kCorrupt;
+        }
+        if (!coherent) {
+            return CertifiedOrderEventReadResultV1::kNotYetPublished;
+        }
+        if (result != nullptr) {
+            result->next_event_sequence = sequence;
+        }
+        return CertifiedOrderEventReadResultV1::kNotYetPublished;
+    }
+
+public:
     std::unique_ptr<RealtimeCertifiedReaderV1> tick_;
     void* event_mapping_ = MAP_FAILED;
     std::size_t event_mapping_bytes_ = 0U;
@@ -909,6 +969,10 @@ std::string_view CertifiedOrderEventReadResultNameV1(
             return "inconsistent";
         case CertifiedOrderEventReadResultV1::kCorrupt:
             return "corrupt";
+        case CertifiedOrderEventReadResultV1::kEndOfStream:
+            return "end_of_stream";
+        case CertifiedOrderEventReadResultV1::kProducerFailed:
+            return "producer_failed";
     }
     return "unknown";
 }

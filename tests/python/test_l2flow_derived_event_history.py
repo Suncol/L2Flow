@@ -1,7 +1,13 @@
 import ctypes
 import unittest
 
-from l2flow_realtime import Market, UnavailableError
+from l2flow_realtime import (
+    HistoryCoverageInfo,
+    Market,
+    SessionIdentity,
+    TemporalCoverageKind,
+    UnavailableError,
+)
 from l2flow_realtime.instrument_derived_event_history import (
     InstrumentDerivedEventHistoryReader,
     InstrumentDerivedEventKind,
@@ -52,7 +58,7 @@ class _FakeDerivedLibrary:
         return 0
 
     def _fill(self, row, sequence, kind):
-        row.record_schema_version = 1
+        row.record_schema_version = 2
         row.record_bytes = ctypes.sizeof(_DerivedEventRowC)
         row.derived_event_sequence = sequence
         row.trade_date = _target_checkpoint().trade_date
@@ -64,6 +70,8 @@ class _FakeDerivedLibrary:
         row.source_sequence = sequence
         row.ingress_sequence = sequence
         row.tick_stream_sequence = sequence
+        row.reserved0 = 0
+        row.reserved1[0] = 1
 
     def l2flow_instrument_derived_event_history_read_v1(
         self, _handle, rows, capacity, count, eof
@@ -161,6 +169,7 @@ class _FakeDerivedLibrary:
 
 
 def _reader(library):
+    session = session_info()
     return InstrumentDerivedEventHistoryReader(
         object(),
         library,
@@ -168,6 +177,12 @@ def _reader(library):
         instrument_id=1,
         market=Market.SHANGHAI,
         page_records=1,
+        history_coverage=HistoryCoverageInfo(
+            run_id=session.run_id,
+            session_epoch=session.session_epoch,
+            trade_date=session.trade_date,
+            coverage_kind=TemporalCoverageKind.FROM_OPEN,
+        ),
     )
 
 
@@ -208,6 +223,14 @@ class DerivedEventHistoryTests(unittest.TestCase):
                 InstrumentDerivedEventKind.ORDER_REVISION,
             )
             self.assertEqual(rows[1].original_quantity, 101)
+            self.assertEqual(rows[0].source_tick_event_ordinal, 0)
+            self.assertEqual(
+                rows[0].event_uid.session_identity,
+                SessionIdentity(
+                    session_info().run_id,
+                    session_info().session_epoch,
+                ),
+            )
             first = full.verified_checkpoint
         # First data call reports BUFFER_TOO_SMALL, then the same native page
         # is retried, then a separate EOF is consumed.
@@ -221,6 +244,8 @@ class DerivedEventHistoryTests(unittest.TestCase):
             order = batches[0].row(0)
             self.assertEqual(order.revision, 2)
             self.assertEqual(order.original_quantity, 151)
+            self.assertEqual(order.source_tick_event_ordinal, 0)
+            self.assertIsNotNone(order.event_uid)
             self.assertEqual(
                 order.observed_pre_add_trade_quantity, 101
             )

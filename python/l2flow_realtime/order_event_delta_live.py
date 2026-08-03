@@ -1,10 +1,11 @@
 """Low-latency, fail-closed reader for the live order-event delta ring.
 
-The native reader owns the stateful sequence cursor.  This module deliberately
-does not expose an API for selecting or skipping to an arbitrary sequence:
-every reader starts at one, and overrun is terminal.  It provides no history
-catch-up, WAL, crash recovery, or Parquet writing.  Direct-fd attachment lives
-here; the validated process control connector is
+The native reader owns the stateful sequence cursor.  A new reader may start
+at one or at one explicit positive event sequence established by a trusted
+history checkpoint; the cursor cannot be repositioned after construction and
+overrun remains terminal.  This module provides no history catch-up, WAL,
+crash recovery, or Parquet writing.  Direct-fd attachment lives here; the
+validated process control connector is
 ``order_event_delta_control.open_live_order_events``.
 
 One native producer commit contains all rows caused by a source tick, but a
@@ -23,7 +24,17 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Iterator, Optional
 
-from .instrument_derived_event_history import _DerivedEventRowC
+from .instrument_derived_event_history import (
+    InstrumentDerivedEvent,
+    _DerivedEventRowC,
+    _event_from_c,
+)
+from .models import (
+    EventUid,
+    HistoryCoverageInfo,
+    SessionIdentity,
+    TemporalCoverageKind,
+)
 
 
 if TYPE_CHECKING:
@@ -172,6 +183,28 @@ class LiveOrderEventDeltaSession:
         )
         object.__setattr__(self, "stream_quality", stream_quality)
 
+    @property
+    def identity(self) -> SessionIdentity:
+        return SessionIdentity(self.run_id, self.session_epoch)
+
+    @property
+    def history_coverage(self) -> HistoryCoverageInfo:
+        """Event-history coverage without borrowing a KLine boundary."""
+
+        return HistoryCoverageInfo(
+            run_id=self.run_id,
+            session_epoch=self.session_epoch,
+            trade_date=self.trade_date,
+            coverage_kind=(
+                TemporalCoverageKind.FROM_OPEN
+                if self.temporal_coverage
+                is LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+                else TemporalCoverageKind.PROCESS_START_PARTIAL
+            ),
+            # The live session V1 ABI has no Unix process-start boundary.
+            coverage_start_unix_ns=None,
+        )
+
     def _to_c(self) -> _LiveSessionC:
         result = _LiveSessionC()
         for index, value in enumerate(self.run_id):
@@ -280,18 +313,50 @@ class LiveOrderEventDeltaBatch:
     inspection and returns a copied ctypes row.
     """
 
-    __slots__ = ("_rows", "_bytes", "metadata")
+    __slots__ = (
+        "_rows",
+        "_bytes",
+        "_session_identity",
+        "history_coverage",
+        "metadata",
+    )
 
     def __init__(
         self,
         rows,
         metadata: LiveOrderEventDeltaReadMetadata,
+        *,
+        session_identity: Optional[SessionIdentity] = None,
+        history_coverage: Optional[HistoryCoverageInfo] = None,
     ) -> None:
         self._rows = rows
         byte_count = metadata.records_written * _ROW_BYTES
         byte_array_type = ctypes.c_uint8 * (len(rows) * _ROW_BYTES)
         self._bytes = byte_array_type.from_buffer(rows)
         self.metadata = metadata
+        if session_identity is not None and not isinstance(
+            session_identity, SessionIdentity
+        ):
+            raise TypeError(
+                "session_identity must be SessionIdentity or None"
+            )
+        if history_coverage is not None and not isinstance(
+            history_coverage, HistoryCoverageInfo
+        ):
+            raise TypeError(
+                "history_coverage must be HistoryCoverageInfo or None"
+            )
+        if history_coverage is not None:
+            if session_identity is not None and (
+                session_identity.run_id != history_coverage.run_id
+                or session_identity.session_epoch
+                != history_coverage.session_epoch
+            ):
+                raise ValueError(
+                    "session_identity and history_coverage disagree"
+                )
+        self._session_identity = session_identity
+        self.history_coverage = history_coverage
         if byte_count > len(self._bytes):
             raise ValueError("record count exceeds owned native buffer")
 
@@ -330,6 +395,20 @@ class LiveOrderEventDeltaBatch:
             index * _ROW_BYTES,
         )
 
+    def event(self, index: int) -> InstrumentDerivedEvent:
+        """Materialize a typed schema-2 event for cold-path inspection."""
+
+        return _event_from_c(
+            self.row(index),
+            session_identity=self._session_identity,
+        )
+
+    def event_uid(self, index: int) -> Optional[EventUid]:
+        return self.event(index).event_uid
+
+    def source_tick_event_ordinal(self, index: int) -> Optional[int]:
+        return self.event(index).source_tick_event_ordinal
+
 
 def _bind_library(library) -> None:
     if getattr(library, "_l2flow_order_event_delta_bound_v1", False):
@@ -356,6 +435,18 @@ def _bind_library(library) -> None:
         ctypes.POINTER(ctypes.c_int),
     ]
     open_.restype = ctypes.c_int
+    open_at = getattr(
+        library, "l2flow_order_event_delta_reader_open_at_v1", None
+    )
+    if open_at is not None:
+        open_at.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(_LiveSessionC),
+            ctypes.c_uint64,
+            ctypes.POINTER(handle),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        open_at.restype = ctypes.c_int
     close.argtypes = [handle]
     close.restype = None
     read.argtypes = [
@@ -395,6 +486,8 @@ class LiveOrderEventDeltaReader:
         "_library",
         "_handle",
         "_session",
+        "_source_session_identity",
+        "_history_coverage",
         "_batch_records",
         "_next_sequence",
         "_failed",
@@ -408,15 +501,63 @@ class LiveOrderEventDeltaReader:
         handle: ctypes.c_void_p,
         session: LiveOrderEventDeltaSession,
         batch_records: int,
+        start_event_sequence: int,
         control_snapshot: Optional[
             "LiveOrderEventDeltaControlSnapshot"
         ] = None,
+        history_coverage: Optional[HistoryCoverageInfo] = None,
     ) -> None:
         self._library = library
         self._handle = handle
         self._session = session
+        expected_coverage_kind = (
+            TemporalCoverageKind.FROM_OPEN
+            if session.temporal_coverage
+            is LiveOrderEventDeltaTemporalCoverage.FROM_MARKET_OPEN
+            else TemporalCoverageKind.PROCESS_START_PARTIAL
+        )
+        history_coverage_supplied = history_coverage is not None
+        source_session_identity: Optional[SessionIdentity] = None
+        if control_snapshot is not None:
+            source = control_snapshot.source_session
+            source_session_identity = SessionIdentity(
+                source.run_id, source.session_epoch
+            )
+        if history_coverage is None:
+            if source_session_identity is None:
+                # A direct-fd attachment has only the event-ring identity.
+                # It can expose the native ordinal, but must not pretend that
+                # the ring's random run ID is the source Tick session.
+                history_coverage = session.history_coverage
+            else:
+                history_coverage = HistoryCoverageInfo(
+                    run_id=source_session_identity.run_id,
+                    session_epoch=source_session_identity.session_epoch,
+                    trade_date=session.trade_date,
+                    coverage_kind=expected_coverage_kind,
+                )
+        if (
+            not isinstance(history_coverage, HistoryCoverageInfo)
+            or history_coverage.trade_date != session.trade_date
+            or history_coverage.coverage_kind
+            is not expected_coverage_kind
+        ):
+            raise ValueError(
+                "history coverage is incompatible with the source stream"
+            )
+        if source_session_identity is None:
+            # An explicitly supplied coverage object is the only source
+            # identity available to a direct-fd attachment.
+            if history_coverage_supplied:
+                source_session_identity = history_coverage.identity
+        elif history_coverage.identity != source_session_identity:
+            raise ValueError(
+                "history coverage belongs to another source session"
+            )
+        self._source_session_identity = source_session_identity
+        self._history_coverage = history_coverage
         self._batch_records = batch_records
-        self._next_sequence = 1
+        self._next_sequence = start_event_sequence
         self._failed = False
         self._lock = threading.RLock()
         self._control_snapshot = control_snapshot
@@ -429,10 +570,12 @@ class LiveOrderEventDeltaReader:
         session: LiveOrderEventDeltaSession,
         *,
         batch_records: int = _DEFAULT_BATCH_RECORDS,
+        start_event_sequence: int = 1,
         take_fd_ownership: bool = False,
         _control_snapshot: Optional[
             "LiveOrderEventDeltaControlSnapshot"
         ] = None,
+        history_coverage: Optional[HistoryCoverageInfo] = None,
     ) -> "LiveOrderEventDeltaReader":
         if (
             not isinstance(fd, int)
@@ -443,6 +586,7 @@ class LiveOrderEventDeltaReader:
         if not isinstance(session, LiveOrderEventDeltaSession):
             raise TypeError("session must be LiveOrderEventDeltaSession")
         cls._validate_batch_records(batch_records)
+        cls._validate_start_event_sequence(start_event_sequence)
         _bind_library(library)
         native_session = session._to_c()
         handle = ctypes.c_void_p()
@@ -450,13 +594,32 @@ class LiveOrderEventDeltaReader:
         code: Optional[int] = None
         close_error: Optional[OSError] = None
         try:
-            code = int(
-                library.l2flow_order_event_delta_reader_open_v1(
-                    fd,
-                    ctypes.byref(native_session),
-                    ctypes.byref(handle),
-                    ctypes.byref(system_error),
+            open_function = (
+                library.l2flow_order_event_delta_reader_open_v1
+                if start_event_sequence == 1
+                else getattr(
+                    library,
+                    "l2flow_order_event_delta_reader_open_at_v1",
+                    None,
                 )
+            )
+            if open_function is None:
+                raise LiveOrderEventDeltaUnavailableError(
+                    "open_at",
+                    _UNAVAILABLE,
+                    native_name="missing_C_ABI_symbol",
+                )
+            open_arguments = [
+                fd,
+                ctypes.byref(native_session),
+            ]
+            if start_event_sequence != 1:
+                open_arguments.append(start_event_sequence)
+            open_arguments.extend(
+                (ctypes.byref(handle), ctypes.byref(system_error))
+            )
+            code = int(
+                open_function(*open_arguments)
             )
         finally:
             if take_fd_ownership:
@@ -488,7 +651,9 @@ class LiveOrderEventDeltaReader:
             handle,
             session,
             batch_records,
+            start_event_sequence,
             control_snapshot=_control_snapshot,
+            history_coverage=history_coverage,
         )
 
     @classmethod
@@ -514,9 +679,31 @@ class LiveOrderEventDeltaReader:
                 f"batch_records must be in [1, {_MAX_BATCH_RECORDS}]"
             )
 
+    @staticmethod
+    def _validate_start_event_sequence(value: int) -> None:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            or value > _UINT64_MAX
+        ):
+            raise ValueError(
+                "start_event_sequence must be a positive uint64"
+            )
+
     @property
     def session(self) -> LiveOrderEventDeltaSession:
         return self._session
+
+    @property
+    def history_coverage(self) -> HistoryCoverageInfo:
+        return self._history_coverage
+
+    @property
+    def source_session_identity(self) -> Optional[SessionIdentity]:
+        """Identity used by EventUid, unavailable for unscoped direct fd."""
+
+        return self._source_session_identity
 
     @property
     def control_snapshot(
@@ -649,7 +836,12 @@ class LiveOrderEventDeltaReader:
         )
         self._validate_batch_records(capacity)
         rows, metadata = self._read_native(capacity)
-        return LiveOrderEventDeltaBatch(rows, metadata)
+        return LiveOrderEventDeltaBatch(
+            rows,
+            metadata,
+            session_identity=self._source_session_identity,
+            history_coverage=self._history_coverage,
+        )
 
     def read_available(
         self,

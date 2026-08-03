@@ -7,7 +7,7 @@ strict premarket daily A-share catalog
   -> exact-key sort/deduplicate
   -> dense session-local IDs
   -> Store/runtime/IPC preallocation
-  -> Wire V2.4 ACTIVE
+  -> Wire V2.5 ACTIVE
 
 single-threaded vendor SDK callback
   -> inspect and exact-key extraction
@@ -46,7 +46,7 @@ ownership during an active farm interval.
 Before SDK Connect, production must load an absolute, regular, non-symlink
 catalog file that declares the configured trade date, a positive source
 version, complete Shanghai+Shenzhen subscription coverage, and exact opaque
-`SecurityID`/`SecurityIDSource` bytes. Wire V2.4 exposes:
+`SecurityID`/`SecurityIDSource` bytes. Wire V2.5 exposes:
 
 ```text
 catalog_scope             = DECLARED_DAILY_A_SHARE
@@ -77,14 +77,15 @@ configured Shanghai+Shenzhen A-share subscription scope complete. It does not
 claim complete exchange-wide products, complete-from-open history, or that
 every catalog member has received data.
 
-Wire minor 4 retains `LIVE_PARTIAL` and the explicit from-open,
-startup-recovered, full-day KLine/Factor, and CERTIFIED-prefix flags introduced
-by minor 3. It adds process-start KLine coverage metadata and per-bar coverage
-flags. The C header exports stable numeric enums and the Python model exposes
-the same state/flags, but readers still validate the exact supported wire
-minor. Deploy the producer, native reader library, and Python package together;
-a V2.3 reader must reject a V2.4 mapping instead of silently interpreting the
-new KLine metadata.
+Wire minor 5 retains `LIVE_PARTIAL`, the explicit from-open,
+startup-recovered, full-day KLine/Factor, and CERTIFIED-prefix flags, and the
+minor-4 process-start KLine metadata. It adds session-wide History temporal
+coverage independently of KLine, including the conservative post-connect
+boundary for explicitly enabled process-start partial History. The C header
+exports stable numeric enums and the Python model exposes the same contract,
+but readers still validate the exact supported wire minor. Deploy the
+producer, native reader library, and Python package together; an older reader
+must reject a V2.5 mapping instead of silently interpreting the new fields.
 
 ## Latency-sensitive path
 
@@ -398,15 +399,20 @@ succeed. A failed or partial recovery is therefore never exposed as a
 queryable complete session. Only the explicitly partial preview is available
 during online rebuild.
 
-The default-on CERTIFIED sidecar starts only its projection worker during
-recovery. Its default-on worker is part of online promotion: terminal handoff
-health or barrier/
-control failure aborts promotion, and recovered FAST is exposed only after the
-barrier. The same worker builds the append-only canonical full-day Event
-journal while replaying; `kGetEventHistory` becomes queryable only after the
-barrier and supports one History-to-live-tail cursor. Disabling native-gap
-recovery explicitly removes that canonical Event service and leaves
-`certified_prefix_valid=false`.
+The default-on CERTIFIED sidecar starts its projection worker and an
+independent Tick-history writer on the configured Event CPU set during
+recovery. The projection worker is part of online promotion: terminal handoff
+health or barrier/control failure aborts promotion, and recovered FAST is
+exposed only after the barrier. It builds the append-only canonical full-day
+Event journal while replaying; `kGetEventHistory` becomes queryable only after
+the barrier and supports one History-to-live-tail cursor. The Tick-history
+writer batch-copies only already-public bounded CERTIFIED slots into its
+append-only journal. Its allocation, `fallocate`, and 512-byte journal stores
+do not run before bounded CERTIFIED publication; retention/capacity/I/O loss
+fails only Tick History and preserves FAST plus bounded CERTIFIED. An explicit
+recovery fence waits for the matching Tick-history frontier on that cold
+control path. Disabling native-gap recovery explicitly removes these
+canonical services and leaves `certified_prefix_valid=false`.
 
 CSV recovery cannot be combined with the legacy
 `--event-aggregator-socket` in this version. The external event-delta process
@@ -636,6 +642,17 @@ It returns source trades/cancels/status plus revisioned order snapshots; it is
 not the raw Wire API above. A generation boundary never finalizes orders, so
 T-to-A transitions remain continuous across updates. See
 [`docs/instrument-derived-event-history-api.md`](docs/instrument-derived-event-history-api.md).
+
+The direct Polars layer adds fixed-schema `DataFrame`/pinned `LazyFrame`
+snapshots, immutable chunk manifests, silent background History-to-tail
+refresh, strict temporal coverage, and fail-closed reconciliation for FAST
+Tick/Event and CERTIFIED Tick/Event products. Returned frames are immutable
+snapshots; asking the live handle for its next snapshot observes newly
+committed chunks. Product identities are never merged across FAST and
+CERTIFIED. See
+[`docs/polars-live-history-v1.md`](docs/polars-live-history-v1.md) for the
+supported API matrix, partial/from-open rules, stable Event UID, promotion,
+spill, and resource limits.
 
 The standalone `mdl-order-event-aggregator` consumes every record in the
 dense global tick ring and publishes a fail-closed event-delta memfd ring. It

@@ -18,11 +18,15 @@ from typing import Iterator, Optional, TYPE_CHECKING, Union
 from ._history_worker_protocol import MAX_RESULT_BATCH_RECORDS
 from .checkpoint import CHECKPOINT_BYTES, InstrumentTickDeltaCheckpoint
 from .models import (
+    EventUid,
+    EventUidScope,
+    HistoryCoverageInfo,
     InstrumentKey,
     InstrumentLookupStatus,
     InstrumentStatus,
     L2FlowRealtimeError,
     Market,
+    SessionIdentity,
     SessionInfo,
     UnavailableError,
     WireFormatError,
@@ -38,6 +42,7 @@ _OK = 0
 _INVALID_STATE = 3
 _BUFFER_TOO_SMALL = 10
 _DERIVED_CHECKPOINT_BYTES = CHECKPOINT_BYTES + 32
+_DERIVED_EVENT_ROW_SCHEMA_VERSION = 2
 _UINT64_MAX = (1 << 64) - 1
 _SIZE_T_MAX = ctypes.c_size_t(-1).value
 
@@ -255,14 +260,70 @@ class InstrumentDerivedEvent:
     event_time_valid: bool
     event_time_unix_ns_valid: bool
     vendor_local_time_valid: bool
+    source_tick_event_ordinal: Optional[int] = None
+    event_uid: Optional[EventUid] = None
+
+    def __post_init__(self) -> None:
+        ordinal = self.source_tick_event_ordinal
+        if (
+            ordinal is not None
+            and (
+                not isinstance(ordinal, int)
+                or isinstance(ordinal, bool)
+                or ordinal < 0
+                or ordinal > (1 << 32) - 1
+            )
+        ):
+            raise ValueError(
+                "source_tick_event_ordinal must be a uint32 or None"
+            )
+        uid = self.event_uid
+        if uid is None:
+            return
+        if not isinstance(uid, EventUid):
+            raise TypeError("event_uid must be EventUid or None")
+        if ordinal is None:
+            raise ValueError(
+                "event_uid requires source_tick_event_ordinal"
+            )
+        if (
+            uid.scope is not EventUidScope.SESSION_SOURCE_TICK
+            or uid.instrument_id != self.instrument_id
+            or uid.tick_stream_sequence != self.tick_stream_sequence
+            or uid.source_tick_event_ordinal != ordinal
+        ):
+            raise ValueError(
+                "event_uid coordinates do not match the derived event"
+            )
+
+    def require_event_uid(self) -> EventUid:
+        """Return the stable UID or fail when the native ordinal is absent."""
+
+        if self.event_uid is None:
+            raise UnavailableError(
+                "event_uid requires a native source_tick_event_ordinal"
+            )
+        return self.event_uid
 
 
-def _event_from_c(row: _DerivedEventRowC) -> InstrumentDerivedEvent:
+def _event_from_c(
+    row: _DerivedEventRowC,
+    *,
+    session_identity: Optional[SessionIdentity] = None,
+) -> InstrumentDerivedEvent:
+    """Materialize one schema-2 row without inventing UID coordinates."""
+
     if (
-        row.record_schema_version != 1
+        session_identity is not None
+        and not isinstance(session_identity, SessionIdentity)
+    ):
+        raise TypeError("session_identity must be SessionIdentity or None")
+    if (
+        row.record_schema_version != _DERIVED_EVENT_ROW_SCHEMA_VERSION
         or row.record_bytes != ctypes.sizeof(_DerivedEventRowC)
-        or row.reserved0
-        or any(row.reserved1)
+        or row.reserved1[0] not in (0, 1)
+        or row.reserved1[1]
+        or row.reserved1[2]
     ):
         raise WireFormatError("invalid derived event row header/reserved data")
     boolean_fields = (
@@ -290,6 +351,36 @@ def _event_from_c(row: _DerivedEventRowC) -> InstrumentDerivedEvent:
         kind = InstrumentDerivedEventKind(row.event_kind)
     except ValueError as error:
         raise WireFormatError("invalid derived event enum") from error
+
+    ordinal_valid = bool(row.reserved1[0])
+    if ordinal_valid:
+        if row.tick_stream_sequence == 0:
+            raise WireFormatError(
+                "source-backed derived event has a zero source tick"
+            )
+        source_tick_event_ordinal: Optional[int] = int(row.reserved0)
+    else:
+        if (
+            row.reserved0 != 0
+            or row.tick_stream_sequence != 0
+            or kind is not InstrumentDerivedEventKind.ORDER_REVISION
+            or row.operation != int(InstrumentOrderRevisionOperation.FINALIZE)
+        ):
+            raise WireFormatError(
+                "only source-free FINALIZE may omit source-tick identity"
+            )
+        source_tick_event_ordinal = None
+    event_uid = (
+        None
+        if session_identity is None or source_tick_event_ordinal is None
+        else EventUid(
+            scope=EventUidScope.SESSION_SOURCE_TICK,
+            session_identity=session_identity,
+            instrument_id=row.instrument_id,
+            tick_stream_sequence=row.tick_stream_sequence,
+            source_tick_event_ordinal=source_tick_event_ordinal,
+        )
+    )
     return InstrumentDerivedEvent(
         derived_event_sequence=row.derived_event_sequence,
         trade_date=row.trade_date,
@@ -372,24 +463,66 @@ def _event_from_c(row: _DerivedEventRowC) -> InstrumentDerivedEvent:
         vendor_local_time_valid=bool(
             row.vendor_local_time_valid
         ),
+        source_tick_event_ordinal=source_tick_event_ordinal,
+        event_uid=event_uid,
     )
 
 
 class InstrumentDerivedEventBatch:
     """One owned native result page, materialized lazily into Python rows."""
 
-    __slots__ = ("_rows", "_record_count")
+    __slots__ = (
+        "_rows",
+        "_record_count",
+        "_session_identity",
+        "history_coverage",
+    )
 
-    def __init__(self, rows, record_count: int) -> None:
+    def __init__(
+        self,
+        rows,
+        record_count: int,
+        *,
+        session_identity: Optional[SessionIdentity] = None,
+        history_coverage: Optional[HistoryCoverageInfo] = None,
+    ) -> None:
+        if session_identity is not None and not isinstance(
+            session_identity, SessionIdentity
+        ):
+            raise TypeError(
+                "session_identity must be SessionIdentity or None"
+            )
+        if history_coverage is not None and not isinstance(
+            history_coverage, HistoryCoverageInfo
+        ):
+            raise TypeError(
+                "history_coverage must be HistoryCoverageInfo or None"
+            )
+        if history_coverage is not None:
+            if session_identity is None:
+                session_identity = history_coverage.identity
+            elif (
+                session_identity.run_id != history_coverage.run_id
+                or session_identity.session_epoch
+                != history_coverage.session_epoch
+            ):
+                raise ValueError(
+                    "session_identity and history_coverage disagree"
+                )
         self._rows = rows
         self._record_count = record_count
+        self._session_identity = session_identity
+        self.history_coverage = history_coverage
 
     def __len__(self) -> int:
         return self._record_count
 
     def __iter__(self) -> Iterator[InstrumentDerivedEvent]:
         for index in range(self._record_count):
-            yield _event_from_c(self._rows[index])
+            yield _event_from_c(
+                self._rows[index],
+                session_identity=self._session_identity,
+            )
 
     def row(self, index: int) -> InstrumentDerivedEvent:
         if not isinstance(index, int) or isinstance(index, bool):
@@ -398,7 +531,10 @@ class InstrumentDerivedEventBatch:
             index += self._record_count
         if index < 0 or index >= self._record_count:
             raise IndexError(index)
-        return _event_from_c(self._rows[index])
+        return _event_from_c(
+            self._rows[index],
+            session_identity=self._session_identity,
+        )
 
     def materialize(self) -> tuple[InstrumentDerivedEvent, ...]:
         return tuple(self)
@@ -680,6 +816,8 @@ class InstrumentDerivedEventHistoryReader:
         "_market",
         "_page_records",
         "_event_capacity",
+        "_history_coverage",
+        "_session_identity",
         "_active_cursor",
         "_closed",
     )
@@ -693,6 +831,7 @@ class InstrumentDerivedEventHistoryReader:
         instrument_id: int,
         market: Market,
         page_records: int,
+        history_coverage: Optional[HistoryCoverageInfo] = None,
     ) -> None:
         self._client = client
         self._library = library
@@ -701,6 +840,18 @@ class InstrumentDerivedEventHistoryReader:
         self._market = market
         self._page_records = page_records
         self._event_capacity = max(3, page_records * 3)
+        if history_coverage is not None and not isinstance(
+            history_coverage, HistoryCoverageInfo
+        ):
+            raise TypeError(
+                "history_coverage must be HistoryCoverageInfo or None"
+            )
+        self._history_coverage = history_coverage
+        self._session_identity = (
+            None
+            if history_coverage is None
+            else history_coverage.identity
+        )
         self._active_cursor: Optional[
             InstrumentDerivedEventReadCursor
         ] = None
@@ -717,6 +868,12 @@ class InstrumentDerivedEventHistoryReader:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def history_coverage(self) -> Optional[HistoryCoverageInfo]:
+        """Coverage of this history reader, if its opener supplied identity."""
+
+        return self._history_coverage
 
     def _require_available(self) -> None:
         if self._closed:
@@ -827,7 +984,12 @@ class InstrumentDerivedEventHistoryReader:
                     "derived EOF returned nonempty records"
                 )
             return (
-                InstrumentDerivedEventBatch(rows, count.value),
+                InstrumentDerivedEventBatch(
+                    rows,
+                    count.value,
+                    session_identity=self._session_identity,
+                    history_coverage=self._history_coverage,
+                ),
                 bool(eof.value),
             )
 
@@ -880,7 +1042,10 @@ class InstrumentDerivedEventHistoryReader:
                     "derived finalize count exceeds result capacity"
                 )
             return InstrumentDerivedEventBatch(
-                rows, count.value
+                rows,
+                count.value,
+                session_identity=self._session_identity,
+                history_coverage=self._history_coverage,
             ).materialize()
 
     def close(self) -> None:
@@ -963,6 +1128,7 @@ def _open_instrument_derived_event_history(
 
     with client._lock:
         session = client._checked_session()
+        history_coverage = client.history_coverage()
         path = client._control_socket_path
         if path is None:
             raise UnavailableError(
@@ -1001,6 +1167,7 @@ def _open_instrument_derived_event_history(
             instrument_id=instrument_id,
             market=market,
             page_records=page_records,
+            history_coverage=history_coverage,
         )
     except BaseException:
         library.l2flow_instrument_derived_event_history_session_close_v1(

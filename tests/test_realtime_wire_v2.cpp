@@ -14,7 +14,7 @@ namespace {
 namespace ipc = l2flow::ipc;
 
 static_assert(ipc::kRealtimeWireMajorV2 == 2U);
-static_assert(ipc::kRealtimeWireMinorV2 == 4U);
+static_assert(ipc::kRealtimeWireMinorV2 == 5U);
 static_assert(
     ipc::kRealtimeShmMagicV2 ==
     std::array<std::uint8_t, 8U>{
@@ -58,6 +58,14 @@ static_assert(
     offsetof(
         ipc::RealtimeWireHeaderV2,
         kline_coverage_start_unix_ns) == 264U);
+static_assert(
+    offsetof(
+        ipc::RealtimeWireHeaderV2,
+        history_coverage_start_unix_ns) == 856U);
+static_assert(
+    offsetof(
+        ipc::RealtimeWireHeaderV2,
+        history_coverage_kind) == 864U);
 
 static_assert(sizeof(ipc::RealtimeWireInstrumentV2) == 128U);
 static_assert(alignof(ipc::RealtimeWireInstrumentV2) == 64U);

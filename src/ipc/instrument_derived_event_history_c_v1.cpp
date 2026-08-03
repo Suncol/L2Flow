@@ -366,11 +366,12 @@ void Flatten(
     CopyAnchor(source.source_anchor, output);
 }
 
-void Flatten(
+[[nodiscard]] bool Flatten(
     const InstrumentDerivedEventV1& source,
     l2flow_instrument_derived_event_row_v1* output) noexcept {
     *output = {};
-    output->record_schema_version = 1U;
+    output->record_schema_version =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2;
     output->record_bytes = sizeof(*output);
     output->derived_event_sequence =
         source.derived_event_sequence;
@@ -379,6 +380,27 @@ void Flatten(
             Flatten(event, output);
         },
         source.payload);
+    const bool has_source_tick =
+        output->tick_stream_sequence != 0U;
+    const bool source_free_finalize =
+        !has_source_tick &&
+        output->event_kind ==
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+        output->operation == static_cast<std::uint8_t>(
+            l2flow::market::ShanghaiOrderDeltaOperationV1::kFinalize);
+    if (source.source_tick_event_ordinal_valid != has_source_tick ||
+        (!source.source_tick_event_ordinal_valid &&
+         (source.source_tick_event_ordinal != 0U ||
+          !source_free_finalize))) {
+        *output = {};
+        return false;
+    }
+    output->reserved0 = source.source_tick_event_ordinal;
+    output->reserved1[0U] =
+        source.source_tick_event_ordinal_valid
+            ? L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2
+            : L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_INVALID_V2;
+    return true;
 }
 
 }  // namespace
@@ -510,7 +532,11 @@ int l2flow_instrument_derived_event_history_read_v1(
         return L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_BUFFER_TOO_SMALL_V1;
     }
     for (std::size_t index = 0U; index < required; ++index) {
-        Flatten(session->pending_page.events[index], &rows[index]);
+        if (!Flatten(
+                session->pending_page.events[index],
+                &rows[index])) {
+            return L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_WIRE_PROJECTION_ERROR_V1;
+        }
     }
     *eof = session->pending_page.eof ? 1U : 0U;
     session->pending_page.events.clear();
@@ -572,7 +598,11 @@ int l2flow_instrument_derived_event_history_finalize_v1(
         return L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_BUFFER_TOO_SMALL_V1;
     }
     for (std::size_t index = 0U; index < required; ++index) {
-        Flatten(session->pending_finalization[index], &rows[index]);
+        if (!Flatten(
+                session->pending_finalization[index],
+                &rows[index])) {
+            return L2FLOW_INSTRUMENT_DERIVED_EVENT_HISTORY_WIRE_PROJECTION_ERROR_V1;
+        }
     }
     session->pending_finalization.clear();
     session->pending_finalization_valid = false;

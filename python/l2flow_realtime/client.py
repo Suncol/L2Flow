@@ -19,6 +19,7 @@ from .models import (
     Instrument,
     InstrumentKey,
     InstrumentLookupResult,
+    HistoryCoverageInfo,
     KLineCoverageInfo,
     LatestKLine,
     LatestSnapshot,
@@ -28,6 +29,7 @@ from .models import (
     ServerState,
     SessionIdentity,
     StaleSessionError,
+    TemporalCoverageKind,
     UnavailableError,
     WireFormatError,
 )
@@ -35,6 +37,7 @@ from .native import MAX_BATCH_RECORDS, NativeReader
 
 
 if TYPE_CHECKING:
+    from .fast_tick_live import FastTickStreamReader
     from .history import HistoryCursor
     from .history_worker import InstrumentTickDeltaWorker
     from .instrument_derived_event_history import (
@@ -44,6 +47,7 @@ if TYPE_CHECKING:
     from .instrument_delta import InstrumentTickDeltaSession
     from .order_event_delta_live import LiveOrderEventDeltaReader
     from .certified_order_events import CertifiedOrderEventReader
+    from .certified_tick_history import CertifiedTickHistoryReader
 
 
 DEFAULT_STALE_AFTER_NS = 3_000_000_000
@@ -286,11 +290,107 @@ class L2FlowClient:
                 )
             return coverage
 
+    def history_coverage(self) -> HistoryCoverageInfo:
+        """Return the session-wide History origin and exact partial start."""
+
+        with self._lock:
+            before = self._checked_session()
+            native_coverage = self._native.history_coverage()
+            after = self._checked_session()
+            if (
+                native_coverage.session_epoch
+                != self._identity.session_epoch
+                or before.identity != after.identity
+            ):
+                raise StaleSessionError(
+                    "mapped realtime session changed during History "
+                    "coverage read"
+                )
+            kind = native_coverage.coverage_kind
+            if (
+                after.coverage_from_open
+                != (kind is TemporalCoverageKind.FROM_OPEN)
+            ):
+                raise WireFormatError(
+                    "History coverage kind disagrees with session flags"
+                )
+            return HistoryCoverageInfo(
+                run_id=after.run_id,
+                session_epoch=after.session_epoch,
+                trade_date=after.trade_date,
+                coverage_kind=kind,
+                coverage_start_unix_ns=(
+                    native_coverage.coverage_start_unix_ns
+                ),
+            )
+
     def close(self) -> None:
         with self._lock:
             if not self._closed:
                 self._native.close()
                 self._closed = True
+
+    def _open_independent_read_client(self) -> "L2FlowClient":
+        """Open another mapping/lock domain for an opt-in background reader.
+
+        The control exchange is deliberately outside this client's lock.  A
+        complete identity check on both sides of the exchange prevents a
+        background consumer from silently crossing a promotion or restart.
+        This helper performs no work unless an optional consumer explicitly
+        asks for an independent reader.
+        """
+
+        with self._lock:
+            before = self._checked_session()
+            path = self._control_socket_path
+            if path is None:
+                raise UnavailableError(
+                    "an independent read client requires a client opened "
+                    "through the Wire V2 control socket"
+                )
+            library = getattr(self._native, "_library", None)
+            if library is None:
+                raise UnavailableError(
+                    "the native reader library is unavailable"
+                )
+            identity = before.identity
+            timeout = self._control_timeout
+            stale_after_ns = self._stale_after_ns
+
+        independent = L2FlowClient.connect(
+            path,
+            timeout=timeout,
+            stale_after_ns=stale_after_ns,
+            _native_factory=lambda fd: NativeReader.open_fd(
+                fd, library=library
+            ),
+        )
+        try:
+            independent_session = independent.session_info()
+            with self._lock:
+                after = self._checked_session()
+            if (
+                after.identity != identity
+                or independent_session.identity != identity
+                or independent_session.trade_date != before.trade_date
+                or independent_session.catalog_digest
+                != before.catalog_digest
+                or independent_session.catalog_scope
+                != before.catalog_scope
+                or independent_session.catalog_version
+                != before.catalog_version
+                or after.catalog_digest != before.catalog_digest
+                or after.catalog_scope != before.catalog_scope
+                or after.catalog_version != before.catalog_version
+            ):
+                raise StaleSessionError(
+                    "realtime session or daily catalog changed while opening "
+                    "an independent read mapping"
+                )
+            return independent
+        except BaseException:
+            independent.close()
+            raise
 
     def __enter__(self) -> "L2FlowClient":
         with self._lock:
@@ -400,6 +500,44 @@ class L2FlowClient:
             self._validate_latest(results, ids, LatestTick)
             return results
 
+    def _read_fast_ticks(self, expected_sequence: int, maximum_records: int):
+        """Package-private serialized access to the global FAST tick ring."""
+
+        with self._lock:
+            self._require_open()
+            result = self._native.ticks(
+                expected_sequence, maximum_records
+            )
+            self._maybe_check_health()
+            return result
+
+    def open_fast_tick_stream(
+        self,
+        expected_sequence: Optional[int] = None,
+        *,
+        batch_records: int = 4096,
+    ) -> "FastTickStreamReader":
+        """Open the optional bounded FAST tick tail.
+
+        When ``expected_sequence`` is omitted the cursor starts immediately
+        after the current contiguous prefix.  Supplying an immutable History
+        checkpoint's ``tick_stream_sequence_exclusive`` enables an exact
+        history-to-tail handoff.  Ring overrun is intentionally reported; a
+        complete-history consumer must repair it through full/delta History.
+        """
+
+        from .fast_tick_live import FastTickStreamReader
+
+        if expected_sequence is None:
+            return FastTickStreamReader.after_latest(
+                self, batch_records=batch_records
+            )
+        return FastTickStreamReader(
+            self,
+            expected_sequence,
+            batch_records=batch_records,
+        )
+
     def latest_kline(
         self, instrument_id: int, window_id: int
     ) -> LatestKLine:
@@ -438,6 +576,7 @@ class L2FlowClient:
         native_library_path=None,
         timeout=_USE_CLIENT_CONTROL_TIMEOUT,
         batch_records: int = 4096,
+        start_event_sequence: int = 1,
         _socket_factory=None,
     ) -> "LiveOrderEventDeltaReader":
         """Attach to the live derived-event ring for this source session.
@@ -460,6 +599,12 @@ class L2FlowClient:
             )
         with self._lock:
             session = self._checked_session()
+            candidate_history_coverage = self.history_coverage()
+            history_coverage = (
+                candidate_history_coverage
+                if candidate_history_coverage.available
+                else None
+            )
             expected_source = (
                 LiveOrderEventDeltaSourceSession.from_session_info(
                     session
@@ -494,6 +639,8 @@ class L2FlowClient:
             native_library_path=native_library_path,
             timeout=effective_timeout,
             batch_records=batch_records,
+            start_event_sequence=start_event_sequence,
+            history_coverage=history_coverage,
             **connector_arguments,
         )
         try:
@@ -589,6 +736,90 @@ class L2FlowClient:
                 ):
                     raise UnavailableError(
                         "FAST no longer advertises a valid CERTIFIED prefix"
+                    )
+            return reader
+        except BaseException:
+            reader.close()
+            raise
+
+    def open_certified_tick_history(
+        self,
+        certified_control_socket_path,
+        *,
+        native_library=None,
+        native_library_path=None,
+        timeout=_USE_CLIENT_CONTROL_TIMEOUT,
+        start_canonical_apply_sequence: int = 1,
+        batch_records: int = 4096,
+    ) -> "CertifiedTickHistoryReader":
+        """Open the dense full-day CERTIFIED Tick history-to-tail cursor.
+
+        This attaches to the independent append-only journal.  It performs no
+        FAST ring read and adds no work to the FAST callback.  The cursor is
+        exposed only while the source session still advertises a verified
+        from-open CERTIFIED prefix.
+        """
+
+        from .certified_tick_history import open_certified_tick_history
+
+        if native_library is not None and native_library_path is not None:
+            raise ValueError(
+                "native_library and native_library_path are mutually "
+                "exclusive"
+            )
+        with self._lock:
+            session = self._checked_session()
+            coverage = self.history_coverage()
+            if (
+                not session.coverage_from_open
+                or not session.certified_prefix_valid
+                or not coverage.coverage_from_open
+            ):
+                raise UnavailableError(
+                    "FAST does not advertise a valid from-open CERTIFIED prefix"
+                )
+            effective_timeout = (
+                self._control_timeout
+                if timeout is _USE_CLIENT_CONTROL_TIMEOUT
+                else timeout
+            )
+            effective_library = native_library
+            if (
+                effective_library is None
+                and native_library_path is None
+            ):
+                effective_library = getattr(
+                    self._native, "_library", None
+                )
+                if effective_library is None:
+                    raise UnavailableError(
+                        "a CERTIFIED Tick native library or path is required"
+                    )
+
+        reader = open_certified_tick_history(
+            certified_control_socket_path,
+            expected_session=session,
+            history_coverage=coverage,
+            native_library=effective_library,
+            native_library_path=native_library_path,
+            timeout=effective_timeout,
+            start_canonical_apply_sequence=(
+                start_canonical_apply_sequence
+            ),
+            batch_records=batch_records,
+        )
+        try:
+            with self._lock:
+                current = self._checked_session()
+                current_coverage = self.history_coverage()
+                if (
+                    current.identity != session.identity
+                    or not current.coverage_from_open
+                    or not current.certified_prefix_valid
+                    or current_coverage != coverage
+                ):
+                    raise StaleSessionError(
+                        "FAST session changed while opening CERTIFIED Tick history"
                     )
             return reader
         except BaseException:
@@ -790,13 +1021,18 @@ class L2FlowClient:
             InstrumentRawEventHistoryReader,
         )
 
+        coverage = self.history_coverage()
         worker = self.open_instrument_tick_delta_worker(
             result_columns=raw_event_columns,
             ring_slots=ring_slots,
             result_batch_records=batch_capacity,
         )
         try:
-            return InstrumentRawEventHistoryReader(self, worker)
+            return InstrumentRawEventHistoryReader(
+                self,
+                worker,
+                history_coverage=coverage,
+            )
         except BaseException:
             worker.close()
             raise

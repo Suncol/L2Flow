@@ -288,7 +288,8 @@ bool ProjectInstrumentDerivedEventWireV1(
         return false;
     }
     *output = {};
-    output->record_schema_version = 1U;
+    output->record_schema_version =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2;
     output->record_bytes = sizeof(*output);
     output->derived_event_sequence =
         source.derived_event_sequence;
@@ -297,6 +298,26 @@ bool ProjectInstrumentDerivedEventWireV1(
             Flatten(event, output);
         },
         source.payload);
+    const bool has_source_tick =
+        output->tick_stream_sequence != 0U;
+    const bool source_free_finalize =
+        !has_source_tick &&
+        output->event_kind ==
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 &&
+        output->operation == static_cast<std::uint8_t>(
+            market::ShanghaiOrderDeltaOperationV1::kFinalize);
+    if (source.source_tick_event_ordinal_valid != has_source_tick ||
+        (!source.source_tick_event_ordinal_valid &&
+         (source.source_tick_event_ordinal != 0U ||
+          !source_free_finalize))) {
+        *output = {};
+        return false;
+    }
+    output->reserved0 = source.source_tick_event_ordinal;
+    output->reserved1[0U] =
+        source.source_tick_event_ordinal_valid
+            ? L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2
+            : L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_INVALID_V2;
     return true;
 }
 

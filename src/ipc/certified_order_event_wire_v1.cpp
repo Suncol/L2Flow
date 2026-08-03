@@ -105,7 +105,8 @@ bool CertifiedOrderEventRowCanonicalV1(
     std::uint64_t expected_derived_event_sequence) noexcept {
     if (!ValidTradeDate(expected_trade_date) ||
         expected_derived_event_sequence == 0U ||
-        row.record_schema_version != 1U ||
+        row.record_schema_version !=
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2 ||
         row.record_bytes != sizeof(row) ||
         row.derived_event_sequence !=
             expected_derived_event_sequence ||
@@ -122,11 +123,10 @@ bool CertifiedOrderEventRowCanonicalV1(
         row.tick_stream_sequence ==
             std::numeric_limits<std::uint64_t>::max() ||
         row.tick_stream_sequence > row.ingress_sequence ||
-        row.reserved0 != 0U ||
-        !std::all_of(
-            std::begin(row.reserved1),
-            std::end(row.reserved1),
-            [](std::uint8_t value) { return value == 0U; }) ||
+        row.reserved1[0U] !=
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 ||
+        row.reserved1[1U] != 0U ||
+        row.reserved1[2U] != 0U ||
         (row.market !=
              L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1 &&
          row.market !=
