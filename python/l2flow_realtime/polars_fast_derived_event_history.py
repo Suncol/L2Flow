@@ -339,6 +339,7 @@ class PolarsFastDerivedEventHistory:
         self._thread: Optional[threading.Thread] = None
         self._stop = False
         self._last_error: Optional[BaseException] = None
+        self._live_stale_error: Optional[BaseException] = None
         self._refresh_requested = 0
         self._refresh_completed = 0
         self._stream = None
@@ -369,6 +370,13 @@ class PolarsFastDerivedEventHistory:
     def last_error(self) -> Optional[BaseException]:
         with self._condition:
             return self._last_error
+
+    @property
+    def live_stale_error(self) -> Optional[BaseException]:
+        """Current transient live-tail outage, if the cache is stale."""
+
+        with self._condition:
+            return self._live_stale_error
 
     @property
     def history_coverage(self) -> HistoryCoverageInfo:
@@ -1065,6 +1073,69 @@ class PolarsFastDerivedEventHistory:
                         timeout=self._durable_refresh_interval or 0.01
                     )
 
+    def _reconnect_live_stream(self, initial_error: BaseException) -> bool:
+        """Reconnect at the exact last validated live cursor.
+
+        The committed manifest remains readable in REFRESHING state.  A new
+        stream is accepted only through _validate_stream, which pins both the
+        source identity and the Event-ring identity.  No cursor is advanced
+        while the control plane is unavailable.
+        """
+
+        requested = self._tail_scanned_event_sequence
+        if requested is None:
+            raise PolarsHistoryNotReadyError(
+                "live Event outage occurred before cursor initialization"
+            )
+        stream = self._stream
+        if stream is not None:
+            stream.close()
+        self._stream = None
+        with self._condition:
+            self._live_stale_error = initial_error
+            self._condition.notify_all()
+        self._manifest.mark_refreshing()
+
+        while True:
+            with self._condition:
+                if self._stop:
+                    return False
+            candidate = None
+            try:
+                candidate = self._open_stream(requested)
+                with self._condition:
+                    if self._stop:
+                        candidate.close()
+                        return False
+                batch = candidate.read_batch()
+                # Validation and publication happen before this reader becomes
+                # the active stream. Any identity/cursor mismatch fails closed.
+                self._publish_live_batch(batch)
+                self._stream = candidate
+                candidate = None
+                self._manifest.finish_refresh()
+                with self._condition:
+                    self._live_stale_error = None
+                    self._condition.notify_all()
+                return True
+            except (
+                UnavailableError,
+                LiveOrderEventDeltaUnavailableError,
+            ) as error:
+                if candidate is not None:
+                    candidate.close()
+                with self._condition:
+                    self._live_stale_error = error
+                    if self._stop:
+                        return False
+                    self._condition.wait(
+                        timeout=self._durable_refresh_interval or 0.05
+                    )
+            except BaseException:
+                if candidate is not None:
+                    candidate.close()
+                raise
+
     def _fail(self, error: BaseException) -> None:
         with self._condition:
             self._last_error = error
@@ -1118,6 +1189,11 @@ class PolarsFastDerivedEventHistory:
                     batch = stream.read_batch()
                 except LiveOrderEventDeltaOverrunError as error:
                     self._repair_overrun(error)
+                    last_refresh = time.monotonic()
+                    continue
+                except LiveOrderEventDeltaUnavailableError as error:
+                    if not self._reconnect_live_stream(error):
+                        return
                     last_refresh = time.monotonic()
                     continue
                 if len(batch):

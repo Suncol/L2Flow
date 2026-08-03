@@ -1,4 +1,5 @@
 #include "mdl_order_event_aggregator_cli_v1.h"
+#include "order_event_failure_diagnostic_v1.h"
 
 #include "l2flow/ipc/order_event_delta_control_v1.h"
 #include "l2flow/ipc/order_event_delta_ring_v1.h"
@@ -984,12 +985,11 @@ enum class BatchResult : std::uint8_t {
         if (consume_error !=
                 ipc::OrderEventLiveConsumeErrorV1::kNone ||
             result.source_tick_sequence != expected_tick) {
-            *error =
-                "live aggregation failed at source tick " +
-                std::to_string(expected_tick) + ": " +
-                std::string(
-                    ipc::OrderEventLiveConsumeErrorNameV1(
-                        consume_error));
+            *error = app::FormatOrderEventFailureDiagnosticV1(
+                app::CaptureOrderEventFailureDiagnosticV1(
+                    consume_error, result, *engine),
+                (*buffer)[index],
+                expected_tick);
             return BatchResult::kFailed;
         }
     }

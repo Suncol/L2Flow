@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import time
 from types import SimpleNamespace
 
 from l2flow_realtime._generation import (
@@ -25,9 +26,11 @@ from l2flow_realtime.models import (
     Market,
     SessionIdentity,
     TemporalCoverageKind,
+    UnavailableError,
 )
 from l2flow_realtime.order_event_delta_live import (
     LiveOrderEventDeltaOverrunError,
+    LiveOrderEventDeltaUnavailableError,
 )
 from l2flow_realtime.polars import (
     PolarsClient,
@@ -365,8 +368,191 @@ class Client:
             ) from error
 
 
+class RecoveringClient:
+    def __init__(self, initial, session_coverage) -> None:
+        self._initial = initial
+        self._coverage = session_coverage
+        self.replacement = None
+        self.open_calls = []
+
+    def open_live_order_events(
+        self,
+        path,
+        *,
+        start_event_sequence,
+        **kwargs,
+    ):
+        self.open_calls.append(
+            (path, start_event_sequence, dict(kwargs))
+        )
+        if self._initial is not None:
+            result = self._initial
+            self._initial = None
+            return result
+        if self.replacement is None:
+            raise UnavailableError("Event control socket is unavailable")
+        result = self.replacement
+        self.replacement = None
+        return result
+
+
 @unittest.skipUnless(polars_available(), "Polars is not installed")
 class PolarsFastDerivedEventHistoryTests(unittest.TestCase):
+    def test_live_outage_retains_last_good_and_reconnects_exact_cursor(self):
+        session_coverage = coverage()
+        checkpoint = derived_checkpoint(1, 2, 1)
+        history = HistoryReader(
+            HistoryCursor((), checkpoint), (), session_coverage
+        )
+        unavailable = LiveOrderEventDeltaUnavailableError(
+            "read", 7, native_name="producer_failed"
+        )
+        initial = LiveReader(
+            1,
+            (LiveBatch((), 1), unavailable),
+            session_coverage,
+            published=0,
+            capacity=8,
+        )
+        client = RecoveringClient(initial, session_coverage)
+        cache = PolarsFastDerivedEventHistory(
+            client,
+            history,
+            "/events.sock",
+            tail_poll_interval=0.001,
+            durable_refresh_interval=None,
+        )
+        self.addCleanup(cache.close)
+        cache.wait_ready(1.0)
+
+        deadline = time.monotonic() + 1.0
+        while (
+            cache.state is not PolarsHistoryState.REFRESHING
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        self.assertEqual(cache.state, PolarsHistoryState.REFRESHING)
+        self.assertIsNotNone(cache.live_stale_error)
+        # REFRESHING retains the immutable commit for ordinary reads; callers
+        # can inspect live_stale_error to distinguish it from a current tail.
+        stale = cache.latest_snapshot()
+        self.assertEqual(stale.row_count, 0)
+        self.assertIsNone(cache.last_error)
+        self.assertTrue(
+            all(call[1] == 1 for call in client.open_calls),
+            "an outage must not move the requested live cursor",
+        )
+
+        client.replacement = LiveReader(
+            1,
+            (LiveBatch((), 1),),
+            session_coverage,
+            published=0,
+            capacity=8,
+        )
+        # Wake the bounded retry immediately rather than depending on its
+        # fallback interval.
+        with cache._condition:
+            cache._condition.notify_all()
+        deadline = time.monotonic() + 1.0
+        while (
+            cache.state is not PolarsHistoryState.READY
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        self.assertEqual(cache.state, PolarsHistoryState.READY)
+        self.assertIsNone(cache.live_stale_error)
+        self.assertTrue(all(call[1] == 1 for call in client.open_calls))
+
+    def test_live_reconnect_rejects_replacement_event_session(self):
+        session_coverage = coverage()
+        checkpoint = derived_checkpoint(1, 2, 1)
+        history = HistoryReader(
+            HistoryCursor((), checkpoint), (), session_coverage
+        )
+        initial = LiveReader(
+            1,
+            (
+                LiveBatch((), 1),
+                LiveOrderEventDeltaUnavailableError(
+                    "read", 7, native_name="producer_failed"
+                ),
+            ),
+            session_coverage,
+            published=0,
+            capacity=8,
+        )
+        client = RecoveringClient(initial, session_coverage)
+        replacement = LiveReader(
+            1,
+            (LiveBatch((), 1),),
+            session_coverage,
+            published=0,
+            capacity=8,
+            event_identity=SessionIdentity(b"R" * 16, 18),
+        )
+        client.replacement = replacement
+        cache = PolarsFastDerivedEventHistory(
+            client,
+            history,
+            "/events.sock",
+            tail_poll_interval=0.001,
+            durable_refresh_interval=None,
+        )
+        self.addCleanup(cache.close)
+        cache.wait_ready(1.0)
+
+        deadline = time.monotonic() + 1.0
+        while (
+            cache.state is not PolarsHistoryState.FAILED
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        self.assertEqual(cache.state, PolarsHistoryState.FAILED)
+        self.assertIsInstance(cache.last_error, PolarsHistoryCoverageError)
+        self.assertTrue(replacement.closed)
+        self.assertEqual(cache.latest_snapshot(allow_stale=True).row_count, 0)
+        with self.assertRaises(PolarsHistoryRefreshError):
+            cache.latest_snapshot()
+
+    def test_close_interrupts_persistent_live_reconnect(self):
+        session_coverage = coverage()
+        checkpoint = derived_checkpoint(1, 2, 1)
+        history = HistoryReader(
+            HistoryCursor((), checkpoint), (), session_coverage
+        )
+        initial = LiveReader(
+            1,
+            (
+                LiveBatch((), 1),
+                LiveOrderEventDeltaUnavailableError(
+                    "read", 7, native_name="producer_failed"
+                ),
+            ),
+            session_coverage,
+            published=0,
+            capacity=8,
+        )
+        cache = PolarsFastDerivedEventHistory(
+            RecoveringClient(initial, session_coverage),
+            history,
+            "/events.sock",
+            tail_poll_interval=0.001,
+            durable_refresh_interval=None,
+        )
+        cache.wait_ready(1.0)
+        deadline = time.monotonic() + 1.0
+        while (
+            cache.state is not PolarsHistoryState.REFRESHING
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        self.assertEqual(cache.state, PolarsHistoryState.REFRESHING)
+        begin = time.monotonic()
+        cache.close()
+        self.assertLess(time.monotonic() - begin, 0.5)
+        self.assertEqual(cache.state, PolarsHistoryState.CLOSED)
+
     def test_uid_reconciliation_replaces_overlap_without_using_event_sequence(self):
         import polars as pl
 

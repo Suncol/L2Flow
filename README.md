@@ -243,10 +243,12 @@ startup mode:
   without CSV recovery and without claiming coverage from market open.
 
 The standalone partial mode uses `--ipc-socket` for FAST and derives
-`<ipc-socket>.events` for a managed Event sidecar by default. It starts the
-FAST control plane first so the sidecar can attach at local tick sequence 1,
-waits for an exact process-start READY at the zero-prefix origin, and only then
-connects the real SDK. FAST serves GET_SESSION plus latest snapshot/tick reads
+`<ipc-socket>.events` for the router-owned Partial Event V2 stable broker by
+default. Before SDK Connect, the router starts FAST IPC, samples a local
+process-owned Event capture boundary, starts the in-process native-sequence
+reorder worker, and gives the broker its initial read-only V2 journal mapping.
+No second feeder client or Event sidecar is started. FAST serves GET_SESSION
+plus latest snapshot/tick reads
 with `server_state=LIVE_PARTIAL`. Each periodic generation
 cut also exposes the complete retained single-instrument History from this
 process's start and tick generation delta; before the first cut those opens are
@@ -263,16 +265,48 @@ full-day validity. The public IPC surface remains latest-KLine only; it does
 not expose a partial KLine history cursor.
 `startup_prefix_recovered`, both full-day validity flags, and
 `certified_prefix_valid` remain false for the whole run.
-The Event stream is explicitly `FROM_PROCESS_START` and
-`LOCAL_TICK_STREAM_CONTIGUOUS`; it does not claim startup-prefix or native-gap
-recovery. After READY, the router probes Event control identity, heartbeat,
-monotonic consumption, source-ring retention, and forward progress once per
-generation interval. A managed child exit or any managed/external health
-failure is reported as degraded but does not stop or block FAST. Managed
-children additionally arm Linux parent-death signaling and use bounded
-TERM/KILL reaping, so a router crash or shutdown cannot intentionally leave an
-unsupervised Event process running. The mode creates no startup buffer, live
-journal, CSV source, shadow pipeline, or CERTIFIED sidecar. It also configures
+The V2 Event stream is explicitly `PROCESS_START` with
+`BOUNDED_REORDERED_PARTIAL` ordering. Native completeness is not proven: the
+current feeder path exposes no authoritative ordered marker, writer ACK, or
+manifest barrier. Shanghai is reordered within `(Channel, BizIndex)` and
+Shenzhen 6.33/6.36 within their shared `(ChannelNo, ApplSeqNum)` domain. A
+known gap is never skipped on timeout; the short
+`--event-origin-discovery-ms` horizon only seals the first bounded
+process-start origin. `--event-aggregator-ring-records` is the V2 append-only
+Event capacity and `--event-order-state-capacity` is the power-of-two state
+table capacity. The router validates the exact header, aligned dual channel
+banks, Event slots, and order-state slots against the per-mapping
+`--ipc-max-mapping-mib` ceiling before loading the catalog or SDK. The defaults
+(1,048,576 Event slots, 1,048,576 order-state slots, 256 affected-channel rows
+per bank) require
+1,275,138,048 bytes for the Event mapping, below the default 2,048 MiB ceiling.
+This is a row-capacity bound, not a duration or throughput guarantee. At
+400,000 derived Event rows/s, 1,048,576 append-only slots retain only about
+2.62 seconds; 60 seconds at that derived-row rate alone requires at least
+24,000,000 Event slots and a correspondingly higher mapping ceiling. A source
+message may emit zero, one, or several derived rows, so production capacity
+must use the measured source-to-Event expansion ratio and required retention
+horizon rather than the source-message rate alone.
+
+`REORDERING` and `CATCHING_UP` are nonfatal Event states. Coordinator
+per-channel pending/span/conflict/correction faults are exposed in channel
+health without blocking unaffected channels or FAST. Handoff-queue,
+global-pending/channel-table, projector-state, Event-journal, mapping, or
+publication capacity failures instead freeze the whole Event worker. That
+global freeze marks the stable broker stale, but the socket continues serving
+its last-good read-only Event prefix and order-state cut; FAST latest, tick
+ring, and partial History continue. The V2.1 broker protocol returns the pinned
+journal descriptor plus an independent
+read-only lifecycle descriptor. An already attached reader therefore observes
+worker restart, failure, clean stop, heartbeat expiry, and publication identity
+replacement without reconnecting. A same-identity failure keeps the broker-held
+last-good mapping readable; a generation or correction change returns
+`FULL_REPLACEMENT_REQUIRED` before copied rows or cursors are exposed. This
+last-good mapping is a memfd retained only for the router process lifetime, not
+disk-persistent recovery state. The old
+`--event-aggregator-executable` partial-sidecar path is rejected. The mode
+creates no startup buffer, live journal, CSV source, shadow pipeline, or
+CERTIFIED sidecar. It also configures
 `factor_generation_enabled=false`, so
 periodic Store generations remain publishable for History/delta without
 creating or invoking the C++ generation Factor engine. A CERTIFIED socket and
@@ -282,6 +316,29 @@ mode for a mid-session launch that deliberately does not recover the
 market-open prefix; using
 `--intraday-store-from-open` in that situation remains an invalid operator
 assertion.
+
+Within one correction epoch, a broker generation replacement is accepted only
+when the old published Event prefix is byte-for-byte continuous. The broker
+does not independently replay that prefix or compare every materialized
+open-addressed order-state slot; order-state continuity therefore also relies
+on the same-UID/exact-worker-PID trust boundary. The journal's dual commit cut
+still prevents readers from observing a partially published state update, but
+it is not a lineage proof for an untrusted replacement producer.
+The immediately following correction epoch is instead a full replacement:
+derived Event counts and all process-local frontiers may change, so the broker
+does not impose an unproved monotonic-frontier rule across that boundary.
+Ordinary generation adoption cannot cross that boundary. The explicit local
+supervisor promotion API accepts only a stable `CONTIGUOUS` or
+`STOPPED_CLEAN` candidate with no stale/error/pending/affected-channel state;
+the caller remains responsible for retained-input replay, local catch-up, and
+quiescing the candidate writer. The current production router does not build or
+promote such corrected candidates automatically: it has no Event-worker shadow
+rebuild, retained replay, or projector checkpoint replay. The gate therefore
+does not prove feeder completeness or add an ordered marker, writer ACK, or
+manifest barrier.
+Existing descriptors remain pinned to their old readable mapping; saved cursors
+must reattach from the replacement's process-start prefix and are never moved
+across the correction implicitly.
 
 This opt-in applies only to standalone `--intraday-live-partial`. The separate
 `LIVE_PARTIAL` socket used while CSV online recovery is running remains

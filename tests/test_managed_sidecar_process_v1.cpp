@@ -56,7 +56,17 @@ int main(int argc, char** argv) {
 
     using l2flow::apps::ManagedSidecarProcessErrorV1;
     using l2flow::apps::ManagedSidecarProcessV1;
+    using l2flow::apps::ManagedSidecarWaitStatusDescriptionV1;
     Test test;
+
+    test.Expect(
+        ManagedSidecarWaitStatusDescriptionV1(-1) ==
+            "status_unavailable",
+        "missing wait status is not reported as a successful exit");
+    test.Expect(
+        ManagedSidecarWaitStatusDescriptionV1(7 << 8) ==
+            "exited exit_code=7",
+        "normal child exit status is decoded");
 
     std::unique_ptr<ManagedSidecarProcessV1> child;
     int system_error = 0;
@@ -89,6 +99,10 @@ int main(int argc, char** argv) {
             WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 7 &&
             child->pid() == -1,
         "wait and preserve exact child exit status");
+    test.Expect(
+        ManagedSidecarWaitStatusDescriptionV1(wait_status) ==
+            "exited exit_code=7",
+        "reaped child exit diagnostic retains the exit code");
     child.reset();
 
     const std::vector<std::string> wait_arguments{"--child-wait"};
@@ -142,6 +156,13 @@ int main(int argc, char** argv) {
             stop_elapsed < std::chrono::seconds(2),
         "TERM timeout falls back to exact-child SIGKILL without an "
         "unbounded wait");
+    const std::string killed_description =
+        ManagedSidecarWaitStatusDescriptionV1(wait_status);
+    test.Expect(
+        killed_description.find("signaled signal=") == 0U &&
+            killed_description.find(std::to_string(SIGKILL)) !=
+                std::string::npos,
+        "signaled child diagnostic retains the terminating signal");
     child.reset();
 
     if (test.failures() != 0) {

@@ -114,7 +114,7 @@ constexpr std::uint64_t kOrderConflictMask =
 [[nodiscard]] bool ValidInput(
     const ShenzhenOrderEventInputV1& input) noexcept {
     if (!ValidTradeDate(input.trade_date) ||
-        input.instrument_id == 0U || input.channel == 0U ||
+        input.instrument_id == 0U ||
         !ValidAnchor(input.anchor) ||
         !input.quantity_valid || input.quantity <= 0) {
         return false;
@@ -1021,8 +1021,7 @@ ShenzhenOrderEventProjectorV1::GetOrder(
     }
     *output = {};
     if (impl_ == nullptr || !ValidTradeDate(key.trade_date) ||
-        key.instrument_id == 0U || key.channel == 0U ||
-        key.order_id <= 0) {
+        key.instrument_id == 0U || key.order_id <= 0) {
         return ShenzhenOrderProjectorQueryErrorV1::kInvalidKey;
     }
     const auto found = impl_->orders.find(key);

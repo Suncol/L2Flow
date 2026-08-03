@@ -1,4 +1,5 @@
 #include "../apps/mdl_order_event_aggregator_cli_v1.h"
+#include "../apps/order_event_failure_diagnostic_v1.h"
 
 #include <array>
 #include <cstdint>
@@ -247,6 +248,53 @@ void TestInvalidInputs(bool* ok) {
     }
 }
 
+void TestFailureDiagnostic(bool* ok) {
+    app::OrderEventFailureDiagnosticV1 diagnostic{};
+    diagnostic.consume_error =
+        ipc::OrderEventLiveConsumeErrorV1::kCoreAggregationFailed;
+    diagnostic.last_shenzhen_core =
+        l2flow::market::ShenzhenOrderProjectorConsumeErrorV1::
+            kOutOfOrderInput;
+    diagnostic.consume_result_source_tick = 0U;
+    diagnostic.engine_last_consumed_source_tick = 4U;
+    diagnostic.engine_failed = true;
+
+    ipc::RealtimeWireTickPayloadV2 record{};
+    record.common.tick_stream_sequence = 5U;
+    record.common.source_sequence = 101U;
+    record.common.ingress_sequence = 105U;
+    record.common.source_stream_id = 9U;
+    record.common.market = 2U;
+    record.common.event_kind = 5U;
+    record.common.source_slot = 3U;
+    record.common.trade_date = 20260730U;
+    record.common.instrument_id = 42U;
+    record.channel = 2012;
+    record.native_event_sequence = 49'309'108;
+    record.source_raw_code_1 = 33;
+    record.source_raw_code_2 = 36;
+
+    const std::string text =
+        app::FormatOrderEventFailureDiagnosticV1(
+            diagnostic, record, 5U);
+    *ok &= Expect(
+        text.find("expected_source_tick=5") != std::string::npos &&
+            text.find("record_tick_stream_sequence=5") !=
+                std::string::npos &&
+            text.find("record_channel=2012") != std::string::npos &&
+            text.find("record_native_event_sequence=49309108") !=
+                std::string::npos &&
+            text.find("consume_error=core_aggregation_failed") !=
+                std::string::npos &&
+            text.find("last_shenzhen_core=out_of_order_input") !=
+                std::string::npos &&
+            text.find("engine_last_consumed_source_tick=4") !=
+                std::string::npos &&
+            text.find("engine_failed=true") != std::string::npos,
+        "fatal diagnostics retain exact outer, core, native, and source "
+        "anchors");
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +303,7 @@ int main() {
     TestProcessStartAndZeroPoll(&ok);
     TestHelpIsPure(&ok);
     TestInvalidInputs(&ok);
+    TestFailureDiagnostic(&ok);
     if (!ok) {
         return 1;
     }

@@ -90,10 +90,10 @@ public:
             value.empty()
                 ? 0U
                 : static_cast<std::uint32_t>(start - descriptor));
-        const auto characters =
-            std::span<const char>(value.data(), value.size());
-        const auto encoded = std::as_bytes(characters);
-        bytes_.insert(bytes_.end(), encoded.begin(), encoded.end());
+        bytes_.resize(start + value.size(), std::byte{0U});
+        if (!value.empty()) {
+            std::memcpy(bytes_.data() + start, value.data(), value.size());
+        }
     }
 
     [[nodiscard]] std::vector<std::byte> Take() && {

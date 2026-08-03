@@ -52,8 +52,12 @@ History 与 tick generation delta；`coverage_from_open` 及全部强完整性 f
 live coverage boundary。只有已 materialize 的 bar 严格满足
 `window_start < boundary < window_end` 时才标记为 left-truncated；无成交窗口
 不会合成所谓“首根 bar”。`full_day_kline_valid` 始终为 false。partial
-仍默认启动独立的 process-start Event sidecar，且不作全日或 native-gap 完整性
-声明。盘中启动却使用
+使用进程内 Partial Event V2 worker 和 router-owned 稳定 broker，不启动独立
+Event sidecar，也不创建第二个 feeder client。其公开契约固定为
+`PROCESS_START + BOUNDED_REORDERED_PARTIAL`，
+`native_completeness_proven=false`；Event worker freeze 后 broker 只在 router
+生命周期内保留 last-good O_RDONLY memfd，不提供磁盘持久化或自动重建。
+盘中启动却使用
 `--intraday-store-from-open` 仍是错误的事实声明；该参数只适用于本进程确实
 从首条相关市场消息前开始接收并持续健康的会话。
 

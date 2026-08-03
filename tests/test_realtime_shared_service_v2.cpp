@@ -40,6 +40,7 @@
 #include <sched.h>
 #include <sstream>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -152,8 +153,13 @@ public:
                       start - descriptor));
         const auto encoded =
             std::as_bytes(std::span(value));
-        bytes_.insert(
-            bytes_.end(), encoded.begin(), encoded.end());
+        if (encoded.size() > bytes_.max_size() - start) {
+            throw std::length_error("pipeline wire body is too large");
+        }
+        bytes_.reserve(start + encoded.size());
+        for (const std::byte item : encoded) {
+            bytes_.push_back(item);
+        }
     }
 
     [[nodiscard]] std::vector<std::byte> Take() && {

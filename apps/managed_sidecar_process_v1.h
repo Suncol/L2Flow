@@ -23,6 +23,11 @@ enum class ManagedSidecarProcessErrorV1 : unsigned char {
 [[nodiscard]] std::string_view ManagedSidecarProcessErrorNameV1(
     ManagedSidecarProcessErrorV1 error) noexcept;
 
+// Decodes the raw waitpid status without treating ECHILD/no-status (-1) as a
+// successful exit. Intended for failure and lifecycle logs only.
+[[nodiscard]] std::string ManagedSidecarWaitStatusDescriptionV1(
+    int wait_status);
+
 // Owns exactly one child created with posix_spawn.  Destruction sends SIGTERM
 // only to that exact positive PID and reaps it; it never targets a process
 // group or an unresolved identifier.

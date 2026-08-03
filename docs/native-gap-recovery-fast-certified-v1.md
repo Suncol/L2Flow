@@ -69,13 +69,15 @@ shadow Pipeline，闭合 handoff 后发布 recovered FAST/CERTIFIED 前缀。任
 从开盘完整的 CERTIFIED 前缀。
 
 不同 channel 之间没有文档定义的交易所总序。本实现的
-`canonical_apply_sequence` 只是本进程对多个已就绪 channel 的确定性发布
-次序，不声明它是交易所跨 channel 顺序。
+`canonical_apply_sequence` 只是本进程对当前已就绪 channel 的串行发布次序；
+ready 集合受 decoder/handoff 调度影响，因此它既不是交易所跨 channel 顺序，
+也不承诺另一进程 replay 会得到相同的跨 channel 编号。
 
-两份表都把深圳 6.33/6.36 的 `ApplSeqNum` 描述为同一 `ChannelNo` 下唯一
-连续，本实现因此把两类逐笔消息合并到一个 domain。文档没有另列一句
-“跨 6.33/6.36 共用计数器”；上线前仍应使用供应商确认或同时包含两类消息
-的真实 replay 样本验证这个生产假设，不能用只含单一 tuple 的样本替代。
+深圳 6.33/6.36 都携带 `ChannelNo,ApplSeqNum`，本机 feeder 的真实 CSV 样本
+也观察到两类消息在同一 channel 上按相邻序号交错，因此本实现把它们合并到
+一个 domain。但通联文档没有另列一句“跨 6.33/6.36 共用计数器”；单日样本
+也不是所有会话的完整性证明。上线契约仍应由供应商确认并用同时包含两类消息
+的 replay 验证，不能用只含单一 tuple 的样本替代。
 
 ## 3. 正常路径：把额外工作限制为常数、无等待的旁路
 

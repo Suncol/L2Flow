@@ -640,7 +640,7 @@ struct LocalTimeProjection final {
 
 [[nodiscard]] bool ShenzhenEventContractValid(
     const RealtimeWireTickPayloadV2& payload) noexcept {
-    if (payload.channel <= 0 ||
+    if (payload.channel < 0 ||
         payload.channel >
             std::numeric_limits<std::uint32_t>::max() ||
         payload.native_event_sequence <= 0 ||

@@ -156,6 +156,22 @@ template <typename Unsigned>
                NativeSequenceRecoveryRecordClassV1::kFiltered;
 }
 
+[[nodiscard]] bool IsValidCoverageMode(
+    NativeSequenceRecoveryCoverageModeV1 mode) noexcept {
+    return mode ==
+               NativeSequenceRecoveryCoverageModeV1::kExplicitOrigin ||
+           mode == NativeSequenceRecoveryCoverageModeV1::
+                       kProcessStartPartial;
+}
+
+[[nodiscard]] bool IsValidOriginProof(
+    NativeSequenceRecoveryOriginProofV1 proof) noexcept {
+    return proof ==
+               NativeSequenceRecoveryOriginProofV1::kBoundedPartial ||
+           proof ==
+               NativeSequenceRecoveryOriginProofV1::kNativeOrderProven;
+}
+
 [[nodiscard]] std::uint64_t Mix64(std::uint64_t value) noexcept {
     value ^= value >> 30U;
     value *= UINT64_C(0xbf58476d1ce4e5b9);
@@ -386,6 +402,9 @@ std::string_view NativeSequenceRecoveryObserveDispositionNameV1(
         case NativeSequenceRecoveryObserveDispositionV1::kBeforeOrigin:
             return "before_origin";
         case NativeSequenceRecoveryObserveDispositionV1::
+            kCorrectionRequired:
+            return "correction_required";
+        case NativeSequenceRecoveryObserveDispositionV1::
             kPayloadConflict:
             return "payload_conflict";
         case NativeSequenceRecoveryObserveDispositionV1::kChannelFrozen:
@@ -409,6 +428,9 @@ std::string_view NativeSequenceRecoveryApplyDispositionNameV1(
             kDuplicateOutsideRetention:
             return "duplicate_outside_retention";
         case NativeSequenceRecoveryApplyDispositionV1::
+            kCorrectionRequired:
+            return "correction_required";
+        case NativeSequenceRecoveryApplyDispositionV1::
             kPayloadConflict:
             return "payload_conflict";
         case NativeSequenceRecoveryApplyDispositionV1::
@@ -422,13 +444,60 @@ std::string_view NativeSequenceRecoveryApplyDispositionNameV1(
     return "unknown";
 }
 
+std::string_view NativeSequenceRecoveryCoverageModeNameV1(
+    NativeSequenceRecoveryCoverageModeV1 mode) noexcept {
+    switch (mode) {
+        case NativeSequenceRecoveryCoverageModeV1::kExplicitOrigin:
+            return "explicit_origin";
+        case NativeSequenceRecoveryCoverageModeV1::
+            kProcessStartPartial:
+            return "process_start_partial";
+    }
+    return "unknown";
+}
+
+std::string_view NativeSequenceRecoveryOriginProofNameV1(
+    NativeSequenceRecoveryOriginProofV1 proof) noexcept {
+    switch (proof) {
+        case NativeSequenceRecoveryOriginProofV1::kNone:
+            return "none";
+        case NativeSequenceRecoveryOriginProofV1::kBoundedPartial:
+            return "bounded_partial";
+        case NativeSequenceRecoveryOriginProofV1::kNativeOrderProven:
+            return "native_order_proven";
+    }
+    return "unknown";
+}
+
+std::string_view NativeSequenceRecoverySealDispositionNameV1(
+    NativeSequenceRecoverySealDispositionV1 disposition) noexcept {
+    switch (disposition) {
+        case NativeSequenceRecoverySealDispositionV1::kSealed:
+            return "sealed";
+        case NativeSequenceRecoverySealDispositionV1::kAlreadySealed:
+            return "already_sealed";
+        case NativeSequenceRecoverySealDispositionV1::
+            kOriginExcludesStaged:
+            return "origin_excludes_staged";
+        case NativeSequenceRecoverySealDispositionV1::kChannelFrozen:
+            return "channel_frozen";
+        case NativeSequenceRecoverySealDispositionV1::kChannelCapacity:
+            return "channel_capacity";
+    }
+    return "unknown";
+}
+
 class NativeSequenceRecoveryCoordinatorV1::Impl final {
 public:
     struct Channel final {
         bool occupied = false;
         bool initialized = false;
+        bool origin_sealed = false;
+        bool correction_required = false;
         bool frozen = false;
         NativeSequenceChannelV1 domain{};
+        NativeSequenceRecoveryOriginProofV1 origin_proof =
+            NativeSequenceRecoveryOriginProofV1::kNone;
         NativeSequenceRecoveryFreezeReasonV1 freeze_reason =
             NativeSequenceRecoveryFreezeReasonV1::kNone;
         std::uint64_t origin_sequence = 0U;
@@ -442,6 +511,8 @@ public:
         std::uint64_t duplicate_outside_retention = 0U;
         std::uint64_t conflicts = 0U;
         std::uint64_t filtered_sequences_certified = 0U;
+        std::uint64_t correction_sequence = 0U;
+        std::uint64_t correction_arrivals = 0U;
         // Number of unique observed positions in
         // (observed_contiguous_sequence, highest_observed_sequence].
         // Maintaining this incrementally keeps gap status O(1), including
@@ -537,16 +608,21 @@ public:
                 channel = Channel{};
                 channel.occupied = true;
                 channel.domain = domain;
-                const std::uint64_t checkpoint =
-                    config_.trusted_checkpoint_sequence != 0U
-                        ? config_.trusted_checkpoint_sequence
-                        : config_.expected_origin_sequence - 1U;
-                channel.initialized = true;
-                channel.origin_sequence =
-                    config_.expected_origin_sequence;
-                channel.certified_sequence = checkpoint;
-                channel.observed_contiguous_sequence = checkpoint;
-                channel.highest_observed_sequence = checkpoint;
+                if (config_.coverage_mode ==
+                    NativeSequenceRecoveryCoverageModeV1::
+                        kExplicitOrigin) {
+                    const std::uint64_t checkpoint =
+                        config_.trusted_checkpoint_sequence != 0U
+                            ? config_.trusted_checkpoint_sequence
+                            : config_.expected_origin_sequence - 1U;
+                    channel.initialized = true;
+                    channel.origin_sealed = true;
+                    channel.origin_sequence =
+                        config_.expected_origin_sequence;
+                    channel.certified_sequence = checkpoint;
+                    channel.observed_contiguous_sequence = checkpoint;
+                    channel.highest_observed_sequence = checkpoint;
+                }
                 occupied_channel_slots_[channel_count_] =
                     static_cast<std::uint32_t>(slot);
                 ++channel_count_;
@@ -573,8 +649,9 @@ public:
             return NativeSequenceRecoveryChannelStateV1::
                 kFrozenResource;
         }
-        if (!channel.initialized) {
-            return NativeSequenceRecoveryChannelStateV1::kHealthy;
+        if (!channel.origin_sealed || channel.correction_required ||
+            !channel.initialized) {
+            return NativeSequenceRecoveryChannelStateV1::kRepairing;
         }
         if (channel.observed_contiguous_sequence <
             channel.highest_observed_sequence) {
@@ -853,10 +930,88 @@ public:
         }
     }
 
+    void MarkCorrectionRequired(
+        Channel& channel,
+        std::uint64_t sequence) noexcept {
+        if (!channel.correction_required) {
+            channel.correction_required = true;
+            ++correction_required_channel_count_;
+            channel.correction_sequence = sequence;
+        } else if (sequence < channel.correction_sequence) {
+            channel.correction_sequence = sequence;
+        }
+        IncrementCounter(&channel.correction_arrivals);
+    }
+
+    [[nodiscard]] std::uint64_t MinimumStagedSequence(
+        std::uint32_t channel_slot) const noexcept {
+        std::uint64_t minimum = 0U;
+        for (const Entry& entry : entries_) {
+            if (!entry.occupied || entry.channel_slot != channel_slot) {
+                continue;
+            }
+            if (minimum == 0U || entry.sequence < minimum) {
+                minimum = entry.sequence;
+            }
+        }
+        return minimum;
+    }
+
+    // Rebuilds the dense observed prefix from a caller-supplied baseline.
+    // This is used only when a partial channel is sealed or a rarer startup
+    // late-lower observation moves its provisional minimum. The steady-state
+    // Observe path remains O(1).
+    void RecomputeObservedPrefix(
+        std::uint32_t channel_slot,
+        std::uint64_t baseline_sequence) noexcept {
+        Channel& channel = channels_[channel_slot];
+        channel.observed_contiguous_sequence = baseline_sequence;
+        channel.highest_observed_sequence = baseline_sequence;
+        channel.observed_above_contiguous = 0U;
+
+        for (const Entry& entry : entries_) {
+            if (entry.occupied && entry.sequence_observed &&
+                entry.channel_slot == channel_slot &&
+                entry.sequence > channel.highest_observed_sequence) {
+                channel.highest_observed_sequence = entry.sequence;
+            }
+        }
+        while (channel.observed_contiguous_sequence <
+               channel.highest_observed_sequence) {
+            const std::uint64_t next =
+                channel.observed_contiguous_sequence + 1U;
+            const std::uint32_t entry_index =
+                FindEntry(channel_slot, next);
+            if (entry_index == kInvalidIndex ||
+                !entries_[entry_index].sequence_observed) {
+                break;
+            }
+            ++channel.observed_contiguous_sequence;
+        }
+        for (const Entry& entry : entries_) {
+            if (entry.occupied && entry.sequence_observed &&
+                entry.channel_slot == channel_slot &&
+                entry.sequence >
+                    channel.observed_contiguous_sequence) {
+                ++channel.observed_above_contiguous;
+            }
+        }
+    }
+
     [[nodiscard]] bool SequenceFitsWindow(
         const Channel& channel,
         std::uint64_t sequence) const noexcept {
-        if (!channel.initialized ||
+        if (!channel.initialized) {
+            return true;
+        }
+        if (!channel.origin_sealed) {
+            const std::uint64_t low =
+                std::min(channel.origin_sequence, sequence);
+            const std::uint64_t high =
+                std::max(channel.highest_observed_sequence, sequence);
+            return high - low <= config_.maximum_reorder_span;
+        }
+        if (
             sequence <= channel.certified_sequence) {
             return true;
         }
@@ -905,6 +1060,14 @@ public:
             channel.certified_sequence = entry.sequence - 1U;
             channel.observed_contiguous_sequence = entry.sequence;
             channel.highest_observed_sequence = entry.sequence;
+            return true;
+        }
+        if (!channel.origin_sealed &&
+            entry.sequence < channel.origin_sequence) {
+            channel.origin_sequence = entry.sequence;
+            channel.certified_sequence = entry.sequence - 1U;
+            RecomputeObservedPrefix(
+                channel_slot, channel.certified_sequence);
             return true;
         }
         if (entry.sequence > channel.highest_observed_sequence) {
@@ -966,6 +1129,12 @@ public:
             channel.observed_contiguous_sequence;
         output->highest_observed_sequence =
             channel.highest_observed_sequence;
+        output->origin_proof = channel.origin_proof;
+        output->origin_sealed = channel.origin_sealed;
+        output->correction_required =
+            channel.correction_required;
+        output->correction_sequence =
+            channel.correction_sequence;
     }
 
     void FillApplyResult(
@@ -976,6 +1145,12 @@ public:
         output->disposition = disposition;
         output->channel_state = ChannelState(channel);
         output->freeze_reason = channel.freeze_reason;
+        output->origin_proof = channel.origin_proof;
+        output->origin_sealed = channel.origin_sealed;
+        output->correction_required =
+            channel.correction_required;
+        output->correction_sequence =
+            channel.correction_sequence;
         if (entry != nullptr) {
             output->canonical_applied_cookie =
                 entry->applied_cookie;
@@ -1204,6 +1379,7 @@ public:
     std::size_t canonical_payload_bytes_ = 0U;
     std::uint64_t channel_capacity_failures_ = 0U;
     std::uint64_t invalid_observations_ = 0U;
+    std::size_t correction_required_channel_count_ = 0U;
 };
 
 NativeSequenceRecoveryCoordinatorV1::
@@ -1234,6 +1410,12 @@ NativeSequenceRecoveryCoordinatorV1::Create(
         (config.trusted_checkpoint_sequence != 0U &&
          config.trusted_checkpoint_sequence <
              config.expected_origin_sequence - 1U);
+    const bool invalid_partial_baseline =
+        config.coverage_mode ==
+            NativeSequenceRecoveryCoverageModeV1::
+                kProcessStartPartial &&
+        (config.expected_origin_sequence != 1U ||
+         config.trusted_checkpoint_sequence != 0U);
     if (config.maximum_channels == 0U ||
         config.maximum_pending_entries == 0U ||
         config.maximum_pending_entries_per_channel == 0U ||
@@ -1244,7 +1426,9 @@ NativeSequenceRecoveryCoordinatorV1::Create(
         config.maximum_canonical_payload_bytes_per_entry >
             config.maximum_total_canonical_payload_bytes ||
         config.maximum_reorder_span == 0U ||
+        !IsValidCoverageMode(config.coverage_mode) ||
         invalid_explicit_baseline ||
+        invalid_partial_baseline ||
         config.certified_duplicate_retention_entries >
             std::numeric_limits<std::size_t>::max() -
                 config.maximum_pending_entries) {
@@ -1290,6 +1474,121 @@ NativeSequenceRecoveryCoordinatorV1::Create(
             kResourceExhausted;
     }
     return NativeSequenceRecoveryCreateErrorV1::kNone;
+}
+
+NativeSequenceRecoverySealErrorV1
+NativeSequenceRecoveryCoordinatorV1::SealBoundedOrigin(
+    const NativeSequenceChannelV1& domain,
+    std::uint64_t origin_sequence,
+    NativeSequenceRecoverySealResultV1* output) noexcept {
+    return SealPartialOrigin(
+        domain,
+        origin_sequence,
+        NativeSequenceRecoveryOriginProofV1::kBoundedPartial,
+        output);
+}
+
+NativeSequenceRecoverySealErrorV1
+NativeSequenceRecoveryCoordinatorV1::SealProvenOrigin(
+    const NativeSequenceChannelV1& domain,
+    std::uint64_t origin_sequence,
+    NativeSequenceRecoverySealResultV1* output) noexcept {
+    return SealPartialOrigin(
+        domain,
+        origin_sequence,
+        NativeSequenceRecoveryOriginProofV1::kNativeOrderProven,
+        output);
+}
+
+NativeSequenceRecoverySealErrorV1
+NativeSequenceRecoveryCoordinatorV1::SealPartialOrigin(
+    const NativeSequenceChannelV1& domain,
+    std::uint64_t origin_sequence,
+    NativeSequenceRecoveryOriginProofV1 proof,
+    NativeSequenceRecoverySealResultV1* output) noexcept {
+    if (output == nullptr) {
+        return NativeSequenceRecoverySealErrorV1::kNullOutput;
+    }
+    *output = NativeSequenceRecoverySealResultV1{};
+    constexpr std::uint64_t maximum_native_sequence =
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max());
+    const NativeSequenceDescriptorV1 origin_descriptor{
+        domain, origin_sequence};
+    if (!IsValidDescriptor(origin_descriptor) ||
+        !IsValidOriginProof(proof) ||
+        origin_sequence > maximum_native_sequence) {
+        return NativeSequenceRecoverySealErrorV1::kInvalidInput;
+    }
+    if (impl_->config_.coverage_mode !=
+        NativeSequenceRecoveryCoverageModeV1::
+            kProcessStartPartial) {
+        return NativeSequenceRecoverySealErrorV1::kWrongCoverageMode;
+    }
+
+    const std::uint32_t channel_slot =
+        impl_->FindOrCreateChannel(domain);
+    if (channel_slot == kInvalidIndex) {
+        output->disposition =
+            NativeSequenceRecoverySealDispositionV1::
+                kChannelCapacity;
+        return NativeSequenceRecoverySealErrorV1::kNone;
+    }
+    Impl::Channel& channel = impl_->channels_[channel_slot];
+    const auto fill_result = [&channel, output](
+                                 NativeSequenceRecoverySealDispositionV1
+                                     disposition) noexcept {
+        output->disposition = disposition;
+        output->origin_proof = channel.origin_proof;
+        output->origin_sequence = channel.origin_sequence;
+        output->certified_sequence = channel.certified_sequence;
+        output->observed_contiguous_sequence =
+            channel.observed_contiguous_sequence;
+        output->highest_observed_sequence =
+            channel.highest_observed_sequence;
+    };
+    if (channel.frozen || channel.correction_required) {
+        fill_result(
+            NativeSequenceRecoverySealDispositionV1::kChannelFrozen);
+        return NativeSequenceRecoverySealErrorV1::kNone;
+    }
+    if (channel.origin_sealed) {
+        fill_result(
+            NativeSequenceRecoverySealDispositionV1::kAlreadySealed);
+        return NativeSequenceRecoverySealErrorV1::kNone;
+    }
+
+    const std::uint64_t minimum_staged =
+        impl_->MinimumStagedSequence(channel_slot);
+    if (minimum_staged != 0U && origin_sequence > minimum_staged) {
+        fill_result(
+            NativeSequenceRecoverySealDispositionV1::
+                kOriginExcludesStaged);
+        return NativeSequenceRecoverySealErrorV1::kNone;
+    }
+
+    channel.initialized = true;
+    channel.origin_sealed = true;
+    channel.origin_proof = proof;
+    channel.origin_sequence = origin_sequence;
+    channel.certified_sequence = origin_sequence - 1U;
+    impl_->RecomputeObservedPrefix(
+        channel_slot, channel.certified_sequence);
+    if (channel.highest_observed_sequence >
+            channel.certified_sequence &&
+        channel.highest_observed_sequence -
+                channel.certified_sequence >
+            impl_->config_.maximum_reorder_span) {
+        impl_->FreezeChannel(
+            channel_slot,
+            NativeSequenceRecoveryFreezeReasonV1::
+                kReorderWindowExceeded);
+        fill_result(
+            NativeSequenceRecoverySealDispositionV1::kChannelFrozen);
+        return NativeSequenceRecoverySealErrorV1::kNone;
+    }
+    fill_result(NativeSequenceRecoverySealDispositionV1::kSealed);
+    return NativeSequenceRecoverySealErrorV1::kNone;
 }
 
 NativeSequenceRecoveryObserveErrorV1
@@ -1350,17 +1649,79 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
             return NativeSequenceRecoveryObserveErrorV1::kNone;
         }
 
+        if (channel.correction_required) {
+            NativeSequenceRecoveryTokenV1 token{};
+            if (!entry.sequence_observed) {
+                entry.sequence_observed = true;
+                ++entry.observe_calls;
+                IncrementCounter(&channel.unique_sequences);
+                if (record_class ==
+                    NativeSequenceRecoveryRecordClassV1::kTarget) {
+                    token = impl_->TokenFor(existing_index);
+                }
+            } else {
+                if (entry.observe_calls ==
+                    std::numeric_limits<std::uint64_t>::max()) {
+                    impl_->FreezeChannel(
+                        channel_slot,
+                        NativeSequenceRecoveryFreezeReasonV1::
+                            kInternalInvariant);
+                    impl_->FillObserveResult(
+                        channel,
+                        NativeSequenceRecoveryObserveDispositionV1::
+                            kResourceFrozen,
+                        NativeSequenceRecoveryTokenV1{},
+                        output);
+                    return NativeSequenceRecoveryObserveErrorV1::kNone;
+                }
+                ++entry.observe_calls;
+                IncrementCounter(&channel.duplicate_arrivals);
+            }
+            impl_->FillObserveResult(
+                channel,
+                NativeSequenceRecoveryObserveDispositionV1::
+                    kCorrectionRequired,
+                token,
+                output);
+            return NativeSequenceRecoveryObserveErrorV1::kNone;
+        }
+
         if (!entry.sequence_observed) {
             if (channel.initialized &&
                 descriptor.sequence < channel.origin_sequence) {
-                impl_->ReleaseEntry(existing_index);
-                impl_->FillObserveResult(
-                    channel,
-                    NativeSequenceRecoveryObserveDispositionV1::
-                        kBeforeOrigin,
-                    NativeSequenceRecoveryTokenV1{},
-                    output);
-                return NativeSequenceRecoveryObserveErrorV1::kNone;
+                if (impl_->config_.coverage_mode ==
+                        NativeSequenceRecoveryCoverageModeV1::
+                            kProcessStartPartial &&
+                    channel.origin_sealed) {
+                    entry.sequence_observed = true;
+                    ++entry.observe_calls;
+                    IncrementCounter(&channel.unique_sequences);
+                    impl_->MarkCorrectionRequired(
+                        channel, descriptor.sequence);
+                    const NativeSequenceRecoveryTokenV1 token =
+                        record_class ==
+                                NativeSequenceRecoveryRecordClassV1::
+                                    kTarget
+                            ? impl_->TokenFor(existing_index)
+                            : NativeSequenceRecoveryTokenV1{};
+                    impl_->FillObserveResult(
+                        channel,
+                        NativeSequenceRecoveryObserveDispositionV1::
+                            kCorrectionRequired,
+                        token,
+                        output);
+                    return NativeSequenceRecoveryObserveErrorV1::kNone;
+                }
+                if (channel.origin_sealed) {
+                    impl_->ReleaseEntry(existing_index);
+                    impl_->FillObserveResult(
+                        channel,
+                        NativeSequenceRecoveryObserveDispositionV1::
+                            kBeforeOrigin,
+                        NativeSequenceRecoveryTokenV1{},
+                        output);
+                    return NativeSequenceRecoveryObserveErrorV1::kNone;
+                }
             }
             if (!impl_->SequenceFitsWindow(
                     channel, descriptor.sequence)) {
@@ -1377,8 +1738,12 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
                 return NativeSequenceRecoveryObserveErrorV1::kNone;
             }
             const auto disposition =
-                impl_->ClassifyNewObservedSequence(
-                    channel, descriptor.sequence);
+                !channel.origin_sealed && channel.initialized &&
+                        descriptor.sequence < channel.origin_sequence
+                    ? NativeSequenceRecoveryObserveDispositionV1::
+                          kBackfill
+                    : impl_->ClassifyNewObservedSequence(
+                          channel, descriptor.sequence);
             if (!impl_->RegisterObservedSequence(
                     channel_slot, existing_index)) {
                 impl_->FillObserveResult(
@@ -1449,17 +1814,78 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
         return NativeSequenceRecoveryObserveErrorV1::kNone;
     }
 
-    if (channel.initialized &&
-        descriptor.sequence < channel.origin_sequence) {
+    if (channel.correction_required) {
+        impl_->MarkCorrectionRequired(channel, descriptor.sequence);
         impl_->FillObserveResult(
             channel,
             NativeSequenceRecoveryObserveDispositionV1::
-                kBeforeOrigin,
+                kCorrectionRequired,
             NativeSequenceRecoveryTokenV1{},
             output);
         return NativeSequenceRecoveryObserveErrorV1::kNone;
     }
+
     if (channel.initialized &&
+        descriptor.sequence < channel.origin_sequence) {
+        if (impl_->config_.coverage_mode ==
+                NativeSequenceRecoveryCoverageModeV1::
+                    kProcessStartPartial &&
+            channel.origin_sealed) {
+            if (!impl_->HasEntryCapacity(channel)) {
+                impl_->MarkCorrectionRequired(
+                    channel, descriptor.sequence);
+                impl_->FillObserveResult(
+                    channel,
+                    NativeSequenceRecoveryObserveDispositionV1::
+                        kCorrectionRequired,
+                    NativeSequenceRecoveryTokenV1{},
+                    output);
+                return NativeSequenceRecoveryObserveErrorV1::kNone;
+            }
+            const std::uint32_t correction_index =
+                impl_->AllocateEntry(
+                    channel_slot,
+                    descriptor.sequence,
+                    message_key,
+                    record_class);
+            if (correction_index != kInvalidIndex) {
+                Impl::Entry& correction_entry =
+                    impl_->entries_[correction_index];
+                correction_entry.sequence_observed = true;
+                ++correction_entry.observe_calls;
+                IncrementCounter(&channel.unique_sequences);
+            }
+            impl_->MarkCorrectionRequired(
+                channel, descriptor.sequence);
+            const NativeSequenceRecoveryTokenV1 token =
+                correction_index != kInvalidIndex &&
+                        record_class ==
+                            NativeSequenceRecoveryRecordClassV1::kTarget
+                    ? impl_->TokenFor(correction_index)
+                    : NativeSequenceRecoveryTokenV1{};
+            impl_->FillObserveResult(
+                channel,
+                NativeSequenceRecoveryObserveDispositionV1::
+                    kCorrectionRequired,
+                token,
+                output);
+            return NativeSequenceRecoveryObserveErrorV1::kNone;
+        }
+        if (!channel.origin_sealed) {
+            // Startup discovery deliberately allows a late-lower native key.
+            // It is staged below and can only become publishable after an
+            // explicit bounded or proven seal.
+        } else {
+            impl_->FillObserveResult(
+                channel,
+                NativeSequenceRecoveryObserveDispositionV1::
+                    kBeforeOrigin,
+                NativeSequenceRecoveryTokenV1{},
+                output);
+            return NativeSequenceRecoveryObserveErrorV1::kNone;
+        }
+    }
+    if (channel.initialized && channel.origin_sealed &&
         descriptor.sequence <= channel.certified_sequence) {
         IncrementCounter(
             &channel.duplicate_outside_retention);
@@ -1500,8 +1926,11 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
     }
 
     const auto disposition =
-        impl_->ClassifyNewObservedSequence(
-            channel, descriptor.sequence);
+        !channel.origin_sealed && channel.initialized &&
+                descriptor.sequence < channel.origin_sequence
+            ? NativeSequenceRecoveryObserveDispositionV1::kBackfill
+            : impl_->ClassifyNewObservedSequence(
+                  channel, descriptor.sequence);
     const std::uint32_t entry_index = impl_->AllocateEntry(
         channel_slot,
         descriptor.sequence,
@@ -1579,8 +2008,49 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
 
     std::uint32_t entry_index =
         impl_->FindEntry(channel_slot, descriptor.sequence);
+    if (channel.correction_required && entry_index == kInvalidIndex) {
+        impl_->FillApplyResult(
+            channel,
+            nullptr,
+            NativeSequenceRecoveryApplyDispositionV1::
+                kCorrectionRequired,
+            output);
+        return NativeSequenceRecoveryApplyErrorV1::kNone;
+    }
     if (entry_index == kInvalidIndex) {
+        if (channel.initialized && channel.origin_sealed &&
+            impl_->config_.coverage_mode ==
+                NativeSequenceRecoveryCoverageModeV1::
+                    kProcessStartPartial &&
+            descriptor.sequence < channel.origin_sequence) {
+            impl_->MarkCorrectionRequired(
+                channel, descriptor.sequence);
+            if (!impl_->HasEntryCapacity(channel)) {
+                impl_->FillApplyResult(
+                    channel,
+                    nullptr,
+                    NativeSequenceRecoveryApplyDispositionV1::
+                        kCorrectionRequired,
+                    output);
+                return NativeSequenceRecoveryApplyErrorV1::kNone;
+            }
+            entry_index = impl_->AllocateEntry(
+                channel_slot,
+                descriptor.sequence,
+                message_key,
+                NativeSequenceRecoveryRecordClassV1::kTarget);
+            if (entry_index == kInvalidIndex) {
+                impl_->FillApplyResult(
+                    channel,
+                    nullptr,
+                    NativeSequenceRecoveryApplyDispositionV1::
+                        kCorrectionRequired,
+                    output);
+                return NativeSequenceRecoveryApplyErrorV1::kNone;
+            }
+        }
         if (channel.initialized &&
+            entry_index == kInvalidIndex &&
             descriptor.sequence <= channel.certified_sequence) {
             IncrementCounter(
                 &channel.duplicate_outside_retention);
@@ -1597,6 +2067,7 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
             return NativeSequenceRecoveryApplyErrorV1::kNone;
         }
         if (channel.initialized &&
+            entry_index == kInvalidIndex &&
             descriptor.sequence < channel.origin_sequence) {
             impl_->FillApplyResult(
                 channel,
@@ -1606,7 +2077,8 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
                 output);
             return NativeSequenceRecoveryApplyErrorV1::kNone;
         }
-        if (!impl_->SequenceFitsWindow(
+        if (entry_index == kInvalidIndex &&
+            !impl_->SequenceFitsWindow(
                 channel, descriptor.sequence)) {
             impl_->FreezeChannel(
                 channel_slot,
@@ -1620,7 +2092,8 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
                 output);
             return NativeSequenceRecoveryApplyErrorV1::kNone;
         }
-        if (!impl_->HasEntryCapacity(channel)) {
+        if (entry_index == kInvalidIndex &&
+            !impl_->HasEntryCapacity(channel)) {
             const auto reason =
                 impl_->EntryCapacityReason(channel);
             impl_->FreezeChannel(channel_slot, reason);
@@ -1632,33 +2105,48 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
                 output);
             return NativeSequenceRecoveryApplyErrorV1::kNone;
         }
-        entry_index = impl_->AllocateEntry(
-            channel_slot,
-            descriptor.sequence,
-            message_key,
-            NativeSequenceRecoveryRecordClassV1::kTarget);
         if (entry_index == kInvalidIndex) {
-            impl_->FreezeChannel(
+            entry_index = impl_->AllocateEntry(
                 channel_slot,
-                NativeSequenceRecoveryFreezeReasonV1::
-                    kPendingEntryCapacity);
-            impl_->FillApplyResult(
-                channel,
-                nullptr,
-                NativeSequenceRecoveryApplyDispositionV1::
-                    kResourceFrozen,
-                output);
-            return NativeSequenceRecoveryApplyErrorV1::kNone;
+                descriptor.sequence,
+                message_key,
+                NativeSequenceRecoveryRecordClassV1::kTarget);
+            if (entry_index == kInvalidIndex) {
+                impl_->FreezeChannel(
+                    channel_slot,
+                    NativeSequenceRecoveryFreezeReasonV1::
+                        kPendingEntryCapacity);
+                impl_->FillApplyResult(
+                    channel,
+                    nullptr,
+                    NativeSequenceRecoveryApplyDispositionV1::
+                        kResourceFrozen,
+                    output);
+                return NativeSequenceRecoveryApplyErrorV1::kNone;
+            }
         }
     }
 
-    return impl_->StoreApplication(
+    const NativeSequenceRecoveryApplyErrorV1 error =
+        impl_->StoreApplication(
         channel_slot,
         entry_index,
         message_key,
         canonical_payload,
         applied_cookie,
         output);
+    if (error == NativeSequenceRecoveryApplyErrorV1::kNone &&
+        channel.correction_required &&
+        (output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::kApplied ||
+         output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::
+                 kExactDuplicate)) {
+        output->disposition =
+            NativeSequenceRecoveryApplyDispositionV1::
+                kCorrectionRequired;
+    }
+    return error;
 }
 
 NativeSequenceRecoveryApplyErrorV1
@@ -1709,13 +2197,26 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
             channel.domain, message_key)) {
         return NativeSequenceRecoveryApplyErrorV1::kInvalidInput;
     }
-    return impl_->StoreApplication(
+    const NativeSequenceRecoveryApplyErrorV1 error =
+        impl_->StoreApplication(
         token.channel_slot,
         token.entry_index,
         message_key,
         canonical_payload,
         applied_cookie,
         output);
+    if (error == NativeSequenceRecoveryApplyErrorV1::kNone &&
+        channel.correction_required &&
+        (output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::kApplied ||
+         output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::
+                 kExactDuplicate)) {
+        output->disposition =
+            NativeSequenceRecoveryApplyDispositionV1::
+                kCorrectionRequired;
+    }
+    return error;
 }
 
 NativeSequenceRecoveryPollErrorV1
@@ -1743,7 +2244,8 @@ NativeSequenceRecoveryCoordinatorV1::PollCertified(
         }
         Impl::Channel& channel = impl_->channels_[slot];
         if (!channel.occupied || channel.frozen ||
-            !channel.initialized) {
+            !channel.initialized || !channel.origin_sealed ||
+            channel.correction_required) {
             continue;
         }
 
@@ -1824,6 +2326,13 @@ NativeSequenceRecoveryCoordinatorV1::CommitCertified(
     if (channel.frozen) {
         return NativeSequenceRecoveryCommitErrorV1::kChannelFrozen;
     }
+    if (!channel.origin_sealed) {
+        return NativeSequenceRecoveryCommitErrorV1::kOriginUnsealed;
+    }
+    if (channel.correction_required) {
+        return NativeSequenceRecoveryCommitErrorV1::
+            kCorrectionRequired;
+    }
     Impl::Entry& entry = impl_->entries_[token.entry_index];
     if (!entry.occupied ||
         entry.channel_slot != token.channel_slot ||
@@ -1899,7 +2408,13 @@ bool NativeSequenceRecoveryCoordinatorV1::ChannelSnapshot(
         channel.filtered_sequences_certified;
     output->pending_entries = channel.pending_entries;
     output->coverage_from_sequence_one =
-        channel.initialized && channel.origin_sequence == 1U;
+        channel.initialized && channel.origin_sealed &&
+        channel.origin_sequence == 1U;
+    output->origin_proof = channel.origin_proof;
+    output->origin_sealed = channel.origin_sealed;
+    output->correction_required = channel.correction_required;
+    output->correction_sequence = channel.correction_sequence;
+    output->correction_arrivals = channel.correction_arrivals;
 
     if (channel.initialized &&
         channel.highest_observed_sequence >
@@ -1934,6 +2449,19 @@ NativeSequenceRecoveryCoordinatorV1::Snapshot() const noexcept {
         impl_->channel_capacity_failures_;
     output.invalid_observations =
         impl_->invalid_observations_;
+    output.correction_required_channel_count =
+        impl_->correction_required_channel_count_;
+    for (std::size_t index = 0U;
+         index < impl_->channel_count_;
+         ++index) {
+        const std::uint32_t slot =
+            impl_->occupied_channel_slots_[index];
+        if (slot < impl_->channels_.size() &&
+            impl_->channels_[slot].occupied &&
+            !impl_->channels_[slot].origin_sealed) {
+            ++output.unsealed_channel_count;
+        }
+    }
     return output;
 }
 

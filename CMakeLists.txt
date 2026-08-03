@@ -216,8 +216,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/ipc/order_event_delta_ring_v1.cpp
         src/ipc/order_event_live_aggregation_engine_v1.cpp
         src/ipc/order_event_wire_adapter_v2.cpp
+        src/ipc/partial_order_event_control_v2.cpp
+        src/ipc/partial_order_event_journal_v2.cpp
+        src/ipc/partial_order_event_reader_v2.cpp
+        src/ipc/partial_order_event_wire_v2.cpp
         src/ipc/realtime_certified_reader_v1.cpp
         src/ipc/realtime_certified_service_v1.cpp
+        src/ipc/realtime_partial_order_event_service_v2.cpp
         src/ipc/realtime_certified_tick_history_reader_v1.cpp
         src/ipc/realtime_shared_service_v2.cpp)
     add_library(L2Flow::ipc ALIAS l2flow_ipc)
@@ -238,6 +243,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/ipc/certified_order_event_reader_c_v1.cpp
         src/ipc/instrument_derived_event_history_c_v1.cpp
         src/ipc/order_event_delta_ring_c_v1.cpp
+        src/ipc/partial_order_event_reader_c_v2.cpp
         src/ipc/realtime_certified_tick_history_reader_c_v1.cpp
         src/ipc/realtime_shm_reader_c_v2.cpp)
     l2flow_configure_target(l2flow_shm_reader)
@@ -262,8 +268,8 @@ endif()
 
 add_executable(mdl_production_router
     apps/event_cpu_partition_v1.cpp
-    apps/managed_sidecar_process_v1.cpp
-    apps/mdl_production_main.cpp)
+    apps/mdl_production_main.cpp
+    apps/partial_event_stable_broker_v2.cpp)
 l2flow_configure_target(mdl_production_router)
 target_link_libraries(mdl_production_router PRIVATE L2Flow::realtime)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -388,6 +394,9 @@ if(L2FLOW_BUILD_TESTS)
     l2flow_add_test(test_native_sequence_recovery
         tests/test_native_sequence_recovery_v1.cpp
         L2Flow::realtime_ingress)
+    l2flow_add_test(test_partial_native_sequence_reorder
+        tests/test_partial_native_sequence_reorder_v1.cpp
+        L2Flow::realtime_ingress)
     l2flow_add_test(test_owned_ingress_message_pool
         tests/test_owned_ingress_message_pool_v1.cpp
         L2Flow::realtime_ingress)
@@ -447,6 +456,30 @@ if(L2FLOW_BUILD_TESTS)
         l2flow_add_test(test_certified_order_event_journal_v1
             tests/test_certified_order_event_journal_v1.cpp
             L2Flow::ipc)
+        l2flow_add_test(test_partial_order_event_journal_v2
+            tests/test_partial_order_event_journal_v2.cpp
+            L2Flow::ipc)
+        add_executable(test_partial_event_stable_broker_v2
+            apps/partial_event_stable_broker_v2.cpp
+            tests/test_partial_event_stable_broker_v2.cpp)
+        l2flow_configure_target(test_partial_event_stable_broker_v2)
+        target_compile_definitions(
+            test_partial_event_stable_broker_v2 PRIVATE _GNU_SOURCE)
+        target_link_libraries(
+            test_partial_event_stable_broker_v2 PRIVATE L2Flow::ipc)
+        add_test(NAME test_partial_event_stable_broker_v2
+            COMMAND test_partial_event_stable_broker_v2)
+        add_executable(test_partial_order_event_reader_c_v2
+            apps/partial_event_stable_broker_v2.cpp
+            tests/test_partial_order_event_reader_c_v2.cpp)
+        l2flow_configure_target(test_partial_order_event_reader_c_v2)
+        target_compile_definitions(
+            test_partial_order_event_reader_c_v2 PRIVATE _GNU_SOURCE)
+        target_link_libraries(
+            test_partial_order_event_reader_c_v2
+            PRIVATE L2Flow::ipc l2flow_shm_reader)
+        add_test(NAME test_partial_order_event_reader_c_v2
+            COMMAND test_partial_order_event_reader_c_v2)
         l2flow_add_test(test_certified_tick_journal_v1
             tests/test_certified_tick_journal_v1.cpp
             L2Flow::ipc)
@@ -454,6 +487,17 @@ if(L2FLOW_BUILD_TESTS)
             tests/test_realtime_certified_service_v1.cpp
             L2Flow::ipc)
         target_link_libraries(test_realtime_certified_service_v1
+            PRIVATE L2Flow::realtime l2flow_shm_reader)
+        l2flow_add_test(test_realtime_partial_order_event_service_v2
+            tests/test_realtime_partial_order_event_service_v2.cpp
+            L2Flow::ipc)
+        target_sources(test_realtime_partial_order_event_service_v2
+            PRIVATE apps/partial_event_stable_broker_v2.cpp)
+        target_compile_definitions(
+            test_realtime_partial_order_event_service_v2
+            PRIVATE _GNU_SOURCE)
+        target_link_libraries(
+            test_realtime_partial_order_event_service_v2
             PRIVATE L2Flow::realtime l2flow_shm_reader)
         # Explicit, bounded latency probe. It is intentionally not registered
         # with ctest because stable measurements require operator-selected CPU
@@ -463,6 +507,29 @@ if(L2FLOW_BUILD_TESTS)
         l2flow_configure_target(benchmark_realtime_certified_v1)
         target_link_libraries(benchmark_realtime_certified_v1
             PRIVATE L2Flow::ipc L2Flow::realtime)
+        # Partial Event journal writer microbenchmark. It is intentionally
+        # opt-in because syscall/throughput measurements require fixed CPU and
+        # machine conditions rather than a CTest pass/fail threshold.
+        add_executable(benchmark_partial_order_event_journal_v2
+            tests/benchmark_partial_order_event_journal_v2.cpp)
+        l2flow_configure_target(benchmark_partial_order_event_journal_v2)
+        target_link_libraries(benchmark_partial_order_event_journal_v2
+            PRIVATE L2Flow::ipc)
+        # Synthetic SDK-disabled full-path Partial Event probe. It reports
+        # latency, reorder catch-up, queue pressure, and fail-isolation data
+        # without imposing machine-specific CTest performance thresholds.
+        add_executable(benchmark_realtime_partial_order_event_service_v2
+            tests/benchmark_realtime_partial_order_event_service_v2.cpp)
+        l2flow_configure_target(
+            benchmark_realtime_partial_order_event_service_v2)
+        target_link_libraries(
+            benchmark_realtime_partial_order_event_service_v2
+            PRIVATE L2Flow::ipc L2Flow::realtime)
+        # This mode exercises only deterministic summary mathematics. It does
+        # not run or judge the machine-dependent performance workload.
+        add_test(NAME test_realtime_partial_event_statistics_v2
+            COMMAND benchmark_realtime_partial_order_event_service_v2
+                --self-test)
         # Online recovery FAST-isolation A/B probe. Like the CERTIFIED probe,
         # it is deliberately opt-in: latency verdicts require fixed affinity,
         # storage placement, and repeated/interleaved operator runs rather

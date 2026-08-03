@@ -132,17 +132,26 @@ SELL -> min(fill_price)
 
 ### 输入顺序契约
 
-两份通联文档说明同一 `ChannelNo` 下 `ApplSeqNum` 唯一连续，但没有说明
-SDK 对 6.33 与 6.36 两个消息族的跨回调调度细节。本版本因此不把任意多线程
-callback 到达顺序冒充交易所顺序，支持的生产契约是：上游已经按
-`(ChannelNo, ApplSeqNum)` 合并交付 6.33/6.36。
+6.33 与 6.36 都携带 `ChannelNo,ApplSeqNum`。本机 feeder 的真实 CSV 保存样本
+还观察到同一 channel 上 6.33 的 480、6.36 的 481、随后 6.33 的 482/483
+交错出现；这支持两类逐笔消息使用共享 native domain，但单份样本既不是所有
+交易日的完整性证明，也没有说明 SDK 的跨消息族 callback 调度顺序。因此不能
+把 callback 到达顺序冒充交易所顺序。这里需要区分两条实现路径：V1 独立聚合器本身没有
+6.33/6.36 跨消息族重排器，其输入契约仍要求上游已经按
+`(ChannelNo, ApplSeqNum)` 合并交付；production `--intraday-live-partial`
+使用的 Partial Event V2 则不依赖这个回调有序假设，而是在 Event worker 内把
+6.33/6.36 放进共享 `(ChannelNo, ApplSeqNum)` domain 做有界重排。
 
-物理 SDK 路径创建 `multithread_callback=false` 的 Subscriber，并强制
+V1 物理 SDK 路径创建 `multithread_callback=false` 的 Subscriber，并强制
 `io_threads=1`；同一 source lane 再保持 capture 顺序。projector 对每个 channel
 检查 `ApplSeqNum` 严格递增，发现跨消息族倒序会在修改订单状态前 fail-close，
-不会静默错算。上线前仍应使用 feeder CSV 做 6.33/6.36 联合单调性验证；若实际
-厂商回调不满足该契约，必须改用 6.53 或在采集层增加正式归并，不能只扩大
-event ring 或放宽检查。本阶段不实现这种 catch-up/恢复路径。
+不会静默错算。该限制不能通过扩大 event ring 或放宽递增检查来绕过。
+
+Partial Event V2 的重排只建立 `PROCESS_START + BOUNDED_REORDERED_PARTIAL`
+契约：已知 gap 不会因 timeout 被跳过，晚于 origin seal 的更小序号会进入
+correction pending 并保留 last-good cut。它不证明启动前 prefix、丢失记录或
+native completeness；当前 feeder 路径没有 authoritative ordered marker、
+writer ACK 或 manifest barrier。
 
 ### 6.33 委托
 
@@ -298,21 +307,73 @@ event/source session 都传递同一 temporal coverage 和
 `tick_stream_sequence` 稠密；它不声称启动前数据或 vendor-native gap 已回补。
 沪深 native `BizIndex/ApplSeqNum` 的非递增保护仍独立 fail-close。
 
-`--intraday-live-partial` 默认由 router 派生 `<ipc-socket>.events` 并管理该
-进程；显式 `--event-aggregator-socket` 则保留给外部 supervisor。受管模式在
-SDK connect 前等待 process-start READY，因此不会丢失第一条 callback。Event
-进程运行期失败只降级 Event，不反向停止或阻塞 FAST。router 每个 generation
-周期检查 control identity、heartbeat、消费进度与 source-ring lag；受管进程还
-用 `PR_SET_PDEATHSIG` 绑定精确父 PID，并以有界 TERM/KILL 流程回收。外部模式
-同样接受运行期健康检查，但进程生命周期仍由外部 supervisor 负责。
+上述 V1 独立聚合器不再用于 `--intraday-live-partial`。partial 模式默认由
+router 派生 `<ipc-socket>.events`，并在 SDK Connect 前依次创建 FAST IPC、
+进程内 Partial Event V2 worker 和稳定 broker；显式
+`--event-aggregator-socket` 只改变 broker 路径，不会切换成外部进程，也不会
+创建第二个 feeder client。`--event-aggregator-executable` 在 partial 模式被
+明确拒绝。
+
+Partial Event V2 的 temporal coverage 固定为 `PROCESS_START`，ordering quality
+固定为 `BOUNDED_REORDERED_PARTIAL`。当前 L2Flow feeder 接入路径没有暴露可供
+本仓库验证的 ordered marker、writer ACK 或 manifest barrier，因此 native completeness
+始终是 not proven，不能将 bounded process-start origin 写成 from-open 或
+native complete。上海只在 `(Channel, BizIndex)` 域内重排；深圳 6.33/6.36
+共享 `(ChannelNo, ApplSeqNum)` 域。已知缺口不会因 timeout 被跳过；
+`--event-origin-discovery-ms` 只用于首次 bounded origin seal。
+
+broker 在 router 生命周期内持续持有公开 socket 和 last-good O_RDONLY journal
+fd。`REORDERING`、`CATCHING_UP` 以及 coordinator 内单 channel 的
+gap/correction/conflict 不会触发 FAST/pipeline 退出，未受影响 channel 可继续
+前进。handoff queue、全局 pending/channel table、投影 state、Event journal、
+mapping 或 publication capacity 失败则会冻结整个 Event worker；broker 标记
+stale，但新 attach 仍可取得 last-good Event prefix、订单状态 cut 和 partial
+Event History，FAST latest、tick ring 与 partial History 继续可用。
+公开 broker 协议同时传递固定 generation 的 journal fd 和独立只读 lifecycle
+fd；已 attach reader 无需重连即可看到 worker restarting/failure、clean stop、
+heartbeat expiry 与 generation/correction replacement。同 identity 故障保留
+last-good 数据可读；identity 改变则在复制 row 或推进 cursor 前返回
+`FULL_REPLACEMENT_REQUIRED`。last-good 只是 router 生命周期内由 broker 持有的
+memfd，不是磁盘持久化恢复点。
+这不是 worker 自动重建承诺：没有 retained replay/checkpoint 时只能安全保留
+last-good mapping。
+
+V2 Event journal 是 append-only 固定容量，不是自动滚动或持久化 history。
+默认 1,048,576 个 Event slots 在每秒 400,000 个“派生 Event row”的负载下只覆盖
+约 2.62 秒；60 秒同速率至少需要 24,000,000 个 slots，并同步提高 mapping
+ceiling。一个 source message 可能产生零个、一个或多个派生 row，因此不能把
+source message/s 直接当成 Event row/s，必须用目标机实测展开率配置容量。
+
+同一 correction epoch 内替换 generation 时，broker 会逐字验证旧 Event prefix
+连续，但当前不会独立 replay 该 prefix 或逐槽比较整个 materialized order-state
+table。订单状态连续性还依赖 same-UID/exact-worker-PID 的生产者信任边界；journal
+的双 commit cut 只能保证 reader 看不到半次提交，不能替代不受信生产者的
+lineage proof。
+
+`correction_epoch + 1` 是 full replacement，不是 append-only 续写。纠正后的
+订单引用和状态可能改变单个输入产生的 Event row 数，三个 process-local frontier
+也没有 feeder manifest 可证明为旧代的超集，因此 broker 不跨 correction epoch
+强制它们单调。旧 client fd 仍固定在旧 mapping 并保持可读；保存的 cursor 必须
+从新代 process-start prefix 重新 attach，不能静默跨代继续。
+
+普通 `AdoptGeneration` 不能跨 correction epoch。显式本地 supervisor promotion
+只接受 `correction_epoch + 1` 且已经是健康 `CONTIGUOUS` 或
+`STOPPED_CLEAN`、无 stale/error/pending/affected channel 的稳定 cut。调用方仍须
+先完成 retained-input replay、本地 live catch-up 并 quiesce candidate writer；
+broker 只能核验这个本地 cut，不能证明 feeder completeness。当前 production
+不会自动创建 shadow Event worker、retained replay 或 projector checkpoint replay，
+也不会自动调用该 promotion API。因此这只是为未来 corrected generation 提供的
+显式本地切换 gate，不是已实现的自动恢复，更不是 feeder ordered marker、writer
+ACK 或 manifest barrier。
 
 可选 `--event-cpu-set LIST` 会把启动允许的逻辑 CPU 严格分成
 `Event=LIST` 与 `FAST=allowed-LIST`；两者均经内核 exact readback，FAST 补集
 必须非空。缺省不执行 affinity syscall。该集合关系不等价于物理核、SMT、
 NUMA 或 IRQ 隔离，拓扑选择仍由部署方负责。
 
-生产 router 的 `--event-aggregator-socket` 是可选兼容开关；配置后则是强制
-启动门槛。router 在创建 SDK pipeline 之前等待同一
+对于非 partial 的 V1 外部聚合器兼容路径，生产 router 的
+`--event-aggregator-socket` 是可选开关；配置后则是强制启动门槛。router 在
+创建 SDK pipeline 之前等待同一
 `source run_id/session_epoch/trade_date` 及完整冻结 daily-catalog identity
 （digest、generation、version、scope、coverage、capacity/bound count）的
 READY，并额外要求
@@ -346,8 +407,8 @@ Python 控制面再次校验 source identity、协议保留字段、same-UID pee
 Python 对象；`.row(i)` 只用于冷路径检查。
 
 实时可见性不等待 immutable generation。进程在有数据时连续 drain；只有空读
-才按 `--poll-ms` 等待。正值按对应毫秒休眠；`0` 执行 scheduler yield，供受管
-partial sidecar 的低延迟默认值使用，不增加固定毫秒级等待。
+才按 `--poll-ms` 等待。正值按对应毫秒休眠；`0` 执行 scheduler yield，供独立
+V1 聚合器诊断使用，不增加固定毫秒级等待。production partial V2 不读取该参数。
 instrument full/update 历史接口则仍受 generation 周期约束，两者用途不能混淆。
 
 容量至少同时满足：

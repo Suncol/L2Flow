@@ -466,6 +466,17 @@ bool TestShenzhenProjection() {
             projected.quantity == 20 &&
             projected.primary_order_id == 1'001,
         "valid Shenzhen 6.33 limit order projects");
+    {
+        auto channel_zero_order = ShenzhenLimitOrder();
+        channel_zero_order.channel = 0;
+        ok &= Expect(
+            ipc::ProjectShenzhenOrderEventInputFromWireV2(
+                channel_zero_order, &projected) ==
+                    ipc::WireOrderEventProjectionResultV2::
+                        kProjected &&
+                projected.channel == 0U,
+            "Shenzhen 6.33 permits ChannelNo zero");
+    }
     ok &= Expect(
         ipc::ProjectShanghaiOrderEventInputFromWireV2(
             order, nullptr) ==
@@ -498,6 +509,17 @@ bool TestShenzhenProjection() {
     }
 
     {
+        auto negative_channel_order = ShenzhenLimitOrder();
+        negative_channel_order.channel = -1;
+        ok &= Expect(
+            ipc::ProjectShenzhenOrderEventInputFromWireV2(
+                negative_channel_order, &projected) ==
+                ipc::WireOrderEventProjectionResultV2::
+                    kInvalidEventContract,
+            "Shenzhen 6.33 rejects a negative Wire channel");
+    }
+
+    {
         const auto trade = ShenzhenTrade();
         ok &= Expect(
             ipc::ProjectShenzhenOrderEventInputFromWireV2(
@@ -511,6 +533,19 @@ bool TestShenzhenProjection() {
                 !projected.side_valid &&
                 !projected.order_type_valid,
             "valid Shenzhen 6.36 trade projects without aggressor");
+    }
+    {
+        auto channel_zero_trade = ShenzhenTrade();
+        channel_zero_trade.channel = 0;
+        ok &= Expect(
+            ipc::ProjectShenzhenOrderEventInputFromWireV2(
+                channel_zero_trade, &projected) ==
+                    ipc::WireOrderEventProjectionResultV2::
+                        kProjected &&
+                projected.channel == 0U &&
+                projected.action ==
+                    market::TickActionV1::kTrade,
+            "Shenzhen 6.36 permits ChannelNo zero");
     }
     {
         auto trade = ShenzhenTrade();

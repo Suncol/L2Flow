@@ -250,6 +250,63 @@ void TestDirectOrders(bool* ok) {
         "market input rejects a fabricated valid price");
 }
 
+void TestChannelZero(bool* ok) {
+    auto projector = Projector(ok);
+    if (projector == nullptr) {
+        return;
+    }
+    std::vector<market::ShenzhenOrderEventV1> events;
+    *ok &= Expect(
+        projector->Consume(
+            Order(
+                101,
+                market::SideV1::kBuy,
+                market::OrderTypeV1::kLimit,
+                100,
+                1U,
+                0U),
+            &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::
+                    kNone &&
+            events.size() == 1U,
+        "consume Shenzhen order on ChannelNo zero");
+    const auto* order =
+        events.empty() ? nullptr : Revision(events.front());
+    *ok &= Expect(
+        order != nullptr && order->order.key.channel == 0U,
+        "ChannelNo zero remains part of the order key");
+
+    *ok &= Expect(
+        projector->Consume(
+            Trade(102, 101, 0, 25, 1U, 0U), &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::
+                    kNone &&
+            events.size() == 2U,
+        "consume Shenzhen transaction on ChannelNo zero");
+    const auto* trade =
+        events.empty()
+            ? nullptr
+            : std::get_if<market::ShenzhenTradeEventV1>(
+                  &events.front());
+    const auto* revision =
+        events.size() < 2U ? nullptr : Revision(events[1U]);
+    *ok &= Expect(
+        trade != nullptr && trade->channel == 0U &&
+            revision != nullptr &&
+            revision->order.key.channel == 0U &&
+            revision->order.remaining_quantity == 75,
+        "ChannelNo-zero transaction updates its ChannelNo-zero order");
+
+    market::ShenzhenOrderSnapshotV1 snapshot{};
+    *ok &= Expect(
+        projector->GetOrder(
+            {20260730U, 1U, 0U, 101}, &snapshot) ==
+                market::ShenzhenOrderProjectorQueryErrorV1::kNone &&
+            snapshot.key.channel == 0U &&
+            snapshot.remaining_quantity == 75,
+        "query Shenzhen order state on ChannelNo zero");
+}
+
 void TestTradeUpdatesAndMissingReferences(bool* ok) {
     auto projector = Projector(ok);
     if (projector == nullptr) {
@@ -758,7 +815,7 @@ void TestDecodedProjection(bool* ok) {
     decoded_order.common.vendor_local_time.valid = true;
     decoded_order.common.vendor_local_time
         .nanoseconds_since_midnight = 34'200'002'000'000U;
-    decoded_order.channel = 12U;
+    decoded_order.channel = 0U;
     decoded_order.application_sequence = 800;
     decoded_order.fields.action = market::TickActionV1::kAdd;
     decoded_order.fields.side = market::SideV1::kBuy;
@@ -785,6 +842,7 @@ void TestDecodedProjection(bool* ok) {
                 market::ShenzhenOrderEventProjectionV1::
                     kProjected &&
             projected.primary_order_id == 800 &&
+            projected.channel == 0U &&
             projected.anchor.native_event_sequence == 800 &&
             projected.anchor.source_sequence == 123U &&
             projected.anchor.ingress_sequence == 321U &&
@@ -795,7 +853,7 @@ void TestDecodedProjection(bool* ok) {
             projected.anchor.vendor_local_time_valid &&
             !projected.price_valid &&
             projected.price_p6 == 0,
-        "decoded adapter preserves sequence/time anchors and suppresses invalid market price");
+        "decoded ChannelNo-zero order preserves sequence/time anchors and suppresses invalid market price");
 
     market::ShenzhenTransactionV1 ambiguous{};
     ambiguous.common.kind =
@@ -829,7 +887,7 @@ void TestDecodedProjection(bool* ok) {
     zero_reference_trade.common.origin.trade_date = 20260730U;
     zero_reference_trade.common.origin.source_sequence = 2U;
     zero_reference_trade.common.instrument_id = 1U;
-    zero_reference_trade.channel = 7U;
+    zero_reference_trade.channel = 0U;
     zero_reference_trade.application_sequence = 802;
     zero_reference_trade.fields.action =
         market::TickActionV1::kTrade;
@@ -849,9 +907,10 @@ void TestDecodedProjection(bool* ok) {
             event, 2U, 2U, &projected) ==
                 market::ShenzhenOrderEventProjectionV1::
                     kProjected &&
+            projected.channel == 0U &&
             projected.buy_order_id == 0 &&
             projected.sell_order_id == 22,
-        "decoded adapter accepts documented zero 6.36 order reference");
+        "decoded adapter accepts ChannelNo zero and documented zero 6.36 order reference");
 
     zero_reference_trade.fields.validity_bitmap |=
         market::kTickBuyOrderIdValidV1;
@@ -992,6 +1051,7 @@ void TestCanonicalOrdering(bool* ok) {
 int main() {
     bool ok = true;
     TestDirectOrders(&ok);
+    TestChannelZero(&ok);
     TestTradeUpdatesAndMissingReferences(&ok);
     TestCancelCardinalityAndState(&ok);
     TestBorrowLendReferenceCompatibility(&ok);

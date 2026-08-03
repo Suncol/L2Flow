@@ -58,9 +58,21 @@ run_case(
     --help)
 
 run_case(
-    help_lists_zero_latency_event_poll
+    help_lists_partial_v2_origin_horizon
     0
-    "0..1000, default 0; 0 yields"
+    "--event-origin-discovery-ms N"
+    --help)
+
+run_case(
+    help_lists_partial_v2_order_state_capacity
+    0
+    "partial V2 power-of-two order-state"
+    --help)
+
+run_case(
+    help_defines_legacy_ring_as_partial_append_only_capacity
+    0
+    "partial V2 append-only Event"
     --help)
 
 run_case(
@@ -163,9 +175,9 @@ run_case(
     --event-aggregator-socket /tmp/l2flow-cli-events.sock)
 
 run_case(
-    partial_accepts_zero_event_poll
-    1
-    "--trade-date must equal the current"
+    partial_rejects_removed_event_poll
+    2
+    "removed from production router"
     ${base}
     --intraday-live-partial
     --event-aggregator-poll-ms 0)
@@ -187,29 +199,93 @@ run_case(
     --event-cpu-set "8, 9")
 
 run_case(
-    partial_external_event_cannot_claim_managed_affinity
-    2
-    "cannot pin an externally supervised partial Event process"
+    partial_explicit_socket_accepts_in_process_event_affinity
+    1
+    "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
     --event-aggregator-socket /tmp/l2flow-cli-events.sock
     --event-cpu-set 8)
 
 run_case(
-    partial_rejects_relative_event_executable
+    partial_rejects_removed_event_executable
     2
-    "--event-aggregator-executable must be an absolute path"
+    "--event-aggregator-executable is removed"
     ${base}
     --intraday-live-partial
     --event-aggregator-executable relative-event-aggregator)
 
 run_case(
-    from_open_rejects_partial_event_executable
+    from_open_rejects_removed_event_executable
     2
-    "--event-aggregator-executable is only used by --intraday-live-partial"
+    "--event-aggregator-executable is removed"
     ${base}
     --intraday-store-from-open
     --event-aggregator-executable /tmp/mdl-order-event-aggregator)
+
+run_case(
+    partial_accepts_v2_origin_horizon
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --event-origin-discovery-ms 25)
+
+run_case(
+    partial_rejects_zero_v2_origin_horizon
+    2
+    "--event-origin-discovery-ms must be 1..600000"
+    ${base}
+    --intraday-live-partial
+    --event-origin-discovery-ms 0)
+
+run_case(
+    partial_accepts_power_of_two_order_state_capacity
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --event-order-state-capacity 1048576)
+
+run_case(
+    partial_rejects_non_power_of_two_order_state_capacity
+    2
+    "--event-order-state-capacity must be a power of two"
+    ${base}
+    --intraday-live-partial
+    --event-order-state-capacity 1000000)
+
+run_case(
+    partial_rejects_event_mapping_above_ceiling
+    2
+    "partial V2 Event journal layout exceeds --ipc-max-mapping-mib"
+    ${base}
+    --intraday-live-partial
+    --event-order-state-capacity 4194304)
+
+run_case(
+    from_open_rejects_partial_v2_tuning
+    2
+    "require --intraday-live-partial"
+    ${base}
+    --intraday-store-from-open
+    --event-origin-discovery-ms 25)
+
+run_case(
+    from_open_rejects_partial_v2_event_capacity
+    2
+    "requires --intraday-live-partial"
+    ${base}
+    --intraday-store-from-open
+    --event-aggregator-ring-records 1048576)
+
+run_case(
+    partial_rejects_removed_event_ready_timeout
+    2
+    "partial V2 Event broker starts synchronously"
+    ${base}
+    --intraday-live-partial
+    --event-aggregator-ready-timeout-ms 1000)
 
 run_case(
     from_open_external_event_cannot_claim_router_affinity

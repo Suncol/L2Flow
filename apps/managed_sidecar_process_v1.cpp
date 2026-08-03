@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <csignal>
 #include <new>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -32,6 +33,37 @@ std::string_view ManagedSidecarProcessErrorNameV1(
             return "unexpected_failure";
     }
     return "unknown";
+}
+
+std::string ManagedSidecarWaitStatusDescriptionV1(int wait_status) {
+    if (wait_status < 0) {
+        return "status_unavailable";
+    }
+    if (WIFEXITED(wait_status)) {
+        return "exited exit_code=" +
+               std::to_string(WEXITSTATUS(wait_status));
+    }
+    if (WIFSIGNALED(wait_status)) {
+        std::string result =
+            "signaled signal=" +
+            std::to_string(WTERMSIG(wait_status));
+#ifdef WCOREDUMP
+        result += WCOREDUMP(wait_status) != 0
+                      ? " core_dumped=true"
+                      : " core_dumped=false";
+#endif
+        return result;
+    }
+    if (WIFSTOPPED(wait_status)) {
+        return "stopped signal=" +
+               std::to_string(WSTOPSIG(wait_status));
+    }
+#ifdef WIFCONTINUED
+    if (WIFCONTINUED(wait_status)) {
+        return "continued";
+    }
+#endif
+    return "unknown raw=" + std::to_string(wait_status);
 }
 
 ManagedSidecarProcessV1::ManagedSidecarProcessV1(pid_t pid) noexcept

@@ -75,7 +75,31 @@ enum class NativeSequenceRecoveryRecordClassV1 : std::uint8_t {
     kFiltered,
 };
 
+// The default explicit-origin mode preserves the original FROM_OPEN contract.
+// Process-start partial mode stages records without publishing them until the
+// caller explicitly seals a per-channel origin. The coordinator never derives
+// that proof from elapsed time or from the first arrival.
+enum class NativeSequenceRecoveryCoverageModeV1 : std::uint8_t {
+    kExplicitOrigin = 0U,
+    kProcessStartPartial,
+};
+
+enum class NativeSequenceRecoveryOriginProofV1 : std::uint8_t {
+    // Also used by the legacy explicit-origin/FROM_OPEN mode. That mode keeps
+    // its existing contract but is not relabeled as a partial ordering proof.
+    kNone = 0U,
+    // The caller has deliberately selected a bounded process-start origin but
+    // does not claim an upstream native watermark. A later record below the
+    // sealed origin requires a correction generation.
+    kBoundedPartial,
+    // The caller asserts that an upstream native ordering proof/watermark makes
+    // the supplied origin complete for this channel and capture epoch.
+    kNativeOrderProven,
+};
+
 struct NativeSequenceRecoveryConfigV1 final {
+    NativeSequenceRecoveryCoverageModeV1 coverage_mode =
+        NativeSequenceRecoveryCoverageModeV1::kExplicitOrigin;
     std::size_t maximum_channels = 0U;
     // Unique native keys retained before certification. Applied-before-
     // observed keys count against the same bound.
@@ -111,6 +135,35 @@ struct NativeSequenceRecoveryConfigV1 final {
     // it as authoritative and begins waiting at checkpoint + 1.
     //
     std::uint64_t trusted_checkpoint_sequence = 0U;
+};
+
+enum class NativeSequenceRecoverySealDispositionV1 : std::uint8_t {
+    kSealed = 0U,
+    kAlreadySealed,
+    // The requested origin would exclude a position already staged by either
+    // Observe or MarkTargetApplied. The channel remains unsealed so the caller
+    // can retry with a lower, defensible origin.
+    kOriginExcludesStaged,
+    kChannelFrozen,
+    kChannelCapacity,
+};
+
+enum class NativeSequenceRecoverySealErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kNullOutput,
+    kInvalidInput,
+    kWrongCoverageMode,
+};
+
+struct NativeSequenceRecoverySealResultV1 final {
+    NativeSequenceRecoverySealDispositionV1 disposition =
+        NativeSequenceRecoverySealDispositionV1::kSealed;
+    NativeSequenceRecoveryOriginProofV1 origin_proof =
+        NativeSequenceRecoveryOriginProofV1::kNone;
+    std::uint64_t origin_sequence = 0U;
+    std::uint64_t certified_sequence = 0U;
+    std::uint64_t observed_contiguous_sequence = 0U;
+    std::uint64_t highest_observed_sequence = 0U;
 };
 
 enum class NativeSequenceRecoveryCreateErrorV1 : std::uint8_t {
@@ -180,6 +233,11 @@ enum class NativeSequenceRecoveryObserveDispositionV1 :
     // The sequence precedes this process's first observed sequence for the
     // channel. It is outside this coordinator epoch's declared coverage.
     kBeforeOrigin,
+    // A process-start partial channel observed a position below its sealed
+    // origin. Its already committed prefix remains readable, but no later
+    // position from this channel may commit until a shadow rebuild publishes a
+    // corrected generation.
+    kCorrectionRequired,
     kPayloadConflict,
     kChannelFrozen,
     kResourceFrozen,
@@ -203,6 +261,11 @@ struct NativeSequenceRecoveryObserveResultV1 final {
     std::uint64_t certified_sequence = 0U;
     std::uint64_t observed_contiguous_sequence = 0U;
     std::uint64_t highest_observed_sequence = 0U;
+    NativeSequenceRecoveryOriginProofV1 origin_proof =
+        NativeSequenceRecoveryOriginProofV1::kNone;
+    bool origin_sealed = false;
+    bool correction_required = false;
+    std::uint64_t correction_sequence = 0U;
 
     [[nodiscard]] bool target_token_available() const noexcept {
         return token.valid();
@@ -225,6 +288,7 @@ enum class NativeSequenceRecoveryApplyDispositionV1 :
     kApplied = 0U,
     kExactDuplicate,
     kDuplicateOutsideRetention,
+    kCorrectionRequired,
     kPayloadConflict,
     kResourceFrozen,
     kChannelFrozen,
@@ -243,6 +307,11 @@ struct NativeSequenceRecoveryApplyResultV1 final {
     std::uint64_t canonical_applied_cookie = 0U;
     std::uint64_t observed_arrivals = 0U;
     std::uint64_t applied_arrivals = 0U;
+    NativeSequenceRecoveryOriginProofV1 origin_proof =
+        NativeSequenceRecoveryOriginProofV1::kNone;
+    bool origin_sealed = false;
+    bool correction_required = false;
+    std::uint64_t correction_sequence = 0U;
 };
 
 enum class NativeSequenceRecoveryPollErrorV1 : std::uint8_t {
@@ -270,6 +339,8 @@ enum class NativeSequenceRecoveryCommitErrorV1 : std::uint8_t {
     kNotApplied,
     kWrongRecordClass,
     kChannelFrozen,
+    kOriginUnsealed,
+    kCorrectionRequired,
 };
 
 struct NativeSequenceRecoveryChannelSnapshotV1 final {
@@ -295,6 +366,12 @@ struct NativeSequenceRecoveryChannelSnapshotV1 final {
     std::size_t pending_entries = 0U;
     std::uint64_t missing_sequences = 0U;
     bool coverage_from_sequence_one = false;
+    NativeSequenceRecoveryOriginProofV1 origin_proof =
+        NativeSequenceRecoveryOriginProofV1::kNone;
+    bool origin_sealed = false;
+    bool correction_required = false;
+    std::uint64_t correction_sequence = 0U;
+    std::uint64_t correction_arrivals = 0U;
 };
 
 struct NativeSequenceRecoverySnapshotV1 final {
@@ -306,6 +383,8 @@ struct NativeSequenceRecoverySnapshotV1 final {
     std::size_t canonical_payload_bytes = 0U;
     std::uint64_t channel_capacity_failures = 0U;
     std::uint64_t invalid_observations = 0U;
+    std::size_t unsealed_channel_count = 0U;
+    std::size_t correction_required_channel_count = 0U;
 };
 
 [[nodiscard]] std::string_view
@@ -323,6 +402,12 @@ NativeSequenceRecoveryObserveDispositionNameV1(
 [[nodiscard]] std::string_view
 NativeSequenceRecoveryApplyDispositionNameV1(
     NativeSequenceRecoveryApplyDispositionV1 disposition) noexcept;
+[[nodiscard]] std::string_view NativeSequenceRecoveryCoverageModeNameV1(
+    NativeSequenceRecoveryCoverageModeV1 mode) noexcept;
+[[nodiscard]] std::string_view NativeSequenceRecoveryOriginProofNameV1(
+    NativeSequenceRecoveryOriginProofV1 proof) noexcept;
+[[nodiscard]] std::string_view NativeSequenceRecoverySealDispositionNameV1(
+    NativeSequenceRecoverySealDispositionV1 disposition) noexcept;
 
 // A single-thread coordinator. All methods except Create/destruction must be
 // called by one serialized owner. Construction preallocates its channel table,
@@ -353,6 +438,20 @@ public:
         const l2flow::sdk::MessageKey& message_key,
         NativeSequenceRecoveryRecordClassV1 record_class,
         NativeSequenceRecoveryObserveResultV1* output) noexcept;
+
+    // These methods are valid only in kProcessStartPartial mode. Both are
+    // explicit caller assertions; neither consults a clock or guesses from an
+    // arrival horizon. Before a successful seal, PollCertified never exposes
+    // work from the channel. Sealing is per native channel, so Shenzhen 6.33
+    // and 6.36 share the same sealed (ChannelNo, ApplSeqNum) domain.
+    [[nodiscard]] NativeSequenceRecoverySealErrorV1 SealBoundedOrigin(
+        const NativeSequenceChannelV1& domain,
+        std::uint64_t origin_sequence,
+        NativeSequenceRecoverySealResultV1* output) noexcept;
+    [[nodiscard]] NativeSequenceRecoverySealErrorV1 SealProvenOrigin(
+        const NativeSequenceChannelV1& domain,
+        std::uint64_t origin_sequence,
+        NativeSequenceRecoverySealResultV1* output) noexcept;
 
     // This key-based join may run before or after Observe. For every target
     // arrival the integration calls Observe once and MarkTargetApplied once;
@@ -404,6 +503,11 @@ private:
     class Impl;
     explicit NativeSequenceRecoveryCoordinatorV1(
         std::unique_ptr<Impl> impl) noexcept;
+    [[nodiscard]] NativeSequenceRecoverySealErrorV1 SealPartialOrigin(
+        const NativeSequenceChannelV1& domain,
+        std::uint64_t origin_sequence,
+        NativeSequenceRecoveryOriginProofV1 proof,
+        NativeSequenceRecoverySealResultV1* output) noexcept;
     std::unique_ptr<Impl> impl_;
 };
 

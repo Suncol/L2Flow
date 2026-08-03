@@ -234,12 +234,21 @@ generation delta。它不创建 journal/shadow，也不宣称 `coverage_from_ope
 在 SDK Connect 成功后立即采样保守 live coverage boundary。只有已发布 bar
 严格满足 `window_start < boundary < window_end` 时才标记为 left-truncated；
 无成交窗口不合成 bar，且 session 不宣称
-`full_day_kline_valid`；CERTIFIED 仍不可用。router 默认在 SDK connect 前启动
-并等待独立的 process-start Event sidecar READY；其本地 tick 流完整，但不声明启动前数据或
-native gap 已回补。router 低频检查该 sidecar 的 control、heartbeat 和消费
-进度；受管进程还绑定父进程死亡信号并使用有界回收。CSV online recovery 的
-partial preview 使用独立的 latest-only 启动策略，即使内部存在 Store
-generation 也不会开放 History/delta。
+`full_day_kline_valid`；CERTIFIED 仍不可用。router 在 SDK connect 前创建
+进程内 Partial Event V2 worker 与稳定 Event broker，不再启动独立 Event
+sidecar，也不会创建第二个 feeder client。上海按 `(Channel, BizIndex)` domain
+重排，深圳 6.33/6.36 按共享 `(ChannelNo, ApplSeqNum)` domain 重排；公开契约
+固定为 `PROCESS_START + BOUNDED_REORDERED_PARTIAL`，且
+`native_completeness_proven=false`。Event worker 发生单 channel correction 时
+保留该 channel 的 last-good cut，其他 channel 与 FAST 可继续；发生 Event
+全局 freeze 时 broker socket 仍可下发 router 生命周期内持有的 last-good
+O_RDONLY memfd。该 memfd 不是磁盘持久化，也不代表 worker 已自动重建。
+订单状态的物理槽分页在每次调用内与返回的 status cut 一致，但分页 checkpoint
+不绑定 `commit_sequence` 或 order-state frontier；因此生产者仍在发布时，多页
+结果不是同一个全表快照。Event worker 冻结或停止、mapping 不再写入后，才可用
+同一 cursor 稳定枚举完整表。
+CSV online recovery 的 partial preview 使用独立的 latest-only 启动策略，即使
+内部存在 Store generation 也不会开放 History/delta。
 
 ```mermaid
 sequenceDiagram
@@ -2103,10 +2112,14 @@ ConsumeAndCommitRolling(cursor, rolling_store, factor):
    generation/CERTIFIED Tick+Event barrier 后发布独立 recovered session；
 3. standalone partial：不做 recovery、不宣称 from-open，但周期发布
    process-start Store generation，开放单标的 complete-history 与 tick-delta；
-   默认受管 Event sidecar 从本进程 tick sequence 1 发布 process-start delta；
+   进程内 Partial Event V2 worker 按沪深各自 native domain 有界重排并通过稳定
+   broker 发布 Event、派生订单状态与 Event History；Event 全局失败后 broker
+   仍提供 router 生命周期内的 last-good O_RDONLY memfd；
    可选发布自然交易时间窗口的 process-start partial latest KLine，但不开放
    KLine history 或 full-day 声明；CERTIFIED 禁用，并通过
    `factor_generation_enabled=false` 不创建或调用 generation Factor engine；
+   Event 契约仅为 `PROCESS_START + BOUNDED_REORDERED_PARTIAL`，不证明 native
+   completeness，也没有自动 worker rebuild/checkpoint replay；
 4. Wire V2 查询：latest/ring、complete-history V2 和 generation-bound
    tick-delta V2 使用同一 daily-catalog/session identity，并以显式
    unavailable、EOF、overrun 或 checkpoint mismatch fail closed。
