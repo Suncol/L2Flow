@@ -1,9 +1,11 @@
 #include "l2flow/market/shenzhen_order_event_projector_v1.h"
 
+#include "fixed_order_state_table_v1.h"
+
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
-#include <map>
 #include <new>
 #include <tuple>
 #include <utility>
@@ -182,6 +184,23 @@ struct OrderState final {
     bool finalization_emitted = false;
 };
 
+struct OrderStateKeyAccessor final {
+    [[nodiscard]] ShenzhenOrderKeyV1& operator()(
+        OrderState& state) const noexcept {
+        return state.snapshot.key;
+    }
+
+    [[nodiscard]] const ShenzhenOrderKeyV1& operator()(
+        const OrderState& state) const noexcept {
+        return state.snapshot.key;
+    }
+};
+
+using OrderStateTable = internal::FixedOrderStateTableV1<
+    ShenzhenOrderKeyV1,
+    OrderState,
+    OrderStateKeyAccessor>;
+
 void RefreshFinality(OrderState* state) noexcept {
     if (state == nullptr) {
         return;
@@ -319,16 +338,67 @@ void IncrementRevision(OrderState* state) noexcept {
     return ShenzhenOrderDeltaOperationV1::kUpdate;
 }
 
-[[nodiscard]] ShenzhenOrderRevisionEventV1 RevisionEvent(
+void AppendRevisionEvent(
+    std::vector<ShenzhenOrderEventV1>* output,
     ShenzhenOrderDeltaOperationV1 operation,
     const ShenzhenEventSourceAnchorV1& anchor,
-    const OrderState& state) noexcept {
-    ShenzhenOrderRevisionEventV1 event{};
-    event.operation = operation;
-    event.source_anchor = anchor;
-    event.order = state.snapshot;
-    return event;
+    const OrderState& state) {
+    output->emplace_back(
+        std::in_place_type<ShenzhenOrderRevisionEventV1>,
+        operation,
+        anchor,
+        state.snapshot);
 }
+
+class ShenzhenEventEmitter final {
+public:
+    ShenzhenEventEmitter(
+        std::vector<ShenzhenOrderEventV1>* output,
+        const ShenzhenOrderEventSinkV1* sink) noexcept
+        : output_(output), sink_(sink) {}
+
+    [[nodiscard]] bool AppendRevision(
+        ShenzhenOrderDeltaOperationV1 operation,
+        const ShenzhenEventSourceAnchorV1& anchor,
+        const OrderState& state) {
+        if (output_ != nullptr) {
+            AppendRevisionEvent(output_, operation, anchor, state);
+            return true;
+        }
+        return sink_ != nullptr &&
+               sink_->append_revision(
+                   sink_->context,
+                   operation,
+                   anchor,
+                   state.snapshot);
+    }
+
+    [[nodiscard]] bool AppendTrade(
+        const ShenzhenTradeEventV1& event) {
+        if (output_ != nullptr) {
+            output_->emplace_back(
+                std::in_place_type<ShenzhenTradeEventV1>, event);
+            return true;
+        }
+        return sink_ != nullptr &&
+               sink_->append_trade(sink_->context, event);
+    }
+
+    [[nodiscard]] bool AppendCancel(
+        const ShenzhenCancelEventV1& event) {
+        if (output_ != nullptr) {
+            output_->emplace_back(
+                std::in_place_type<ShenzhenCancelEventV1>, event);
+            return true;
+        }
+        return sink_ != nullptr &&
+               sink_->append_cancel(sink_->context, event);
+    }
+
+private:
+    std::vector<ShenzhenOrderEventV1>* output_ = nullptr;
+    const ShenzhenOrderEventSinkV1* sink_ = nullptr;
+};
 
 void FillAnchor(
     const DecodedMarketCommonV1& common,
@@ -360,6 +430,120 @@ void FillAnchor(
         common.exchange_time.unix_nanoseconds_valid;
     output->vendor_local_time_valid =
         common.vendor_local_time.valid;
+}
+
+[[nodiscard]] ShenzhenOrderEventProjectionV1 ProjectOrderInput(
+    const ShenzhenOrderV1& order,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence,
+    ShenzhenOrderEventInputV1* output) noexcept {
+    const DecodedMarketCommonV1& common = order.common;
+    if (common.kind != MarketEventKindV1::kShenzhenOrder ||
+        common.market != MarketV1::kShenzhen ||
+        order.fields.action != TickActionV1::kAdd ||
+        order.fields.quantity.scale != 0U ||
+        (order.fields.validity_bitmap &
+         kTickPrimaryOrderIdValidV1) == 0U) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    ShenzhenOrderEventInputV1 projected{};
+    projected.trade_date = common.origin.trade_date;
+    projected.instrument_id = common.instrument_id;
+    projected.channel = order.channel;
+    FillAnchor(
+        common,
+        order.application_sequence,
+        ingress_sequence,
+        tick_stream_sequence,
+        &projected.anchor);
+    projected.action = TickActionV1::kAdd;
+    projected.side = order.fields.side;
+    projected.order_type = order.fields.order_type;
+    projected.quantity = order.fields.quantity.raw;
+    projected.primary_order_id = order.fields.primary_order_id;
+    projected.quantity_valid =
+        (order.fields.validity_bitmap & kTickQuantityValidV1) != 0U &&
+        order.fields.quantity.valid;
+    projected.side_valid =
+        (order.fields.validity_bitmap & kTickSideValidV1) != 0U;
+    projected.order_type_valid =
+        (order.fields.validity_bitmap & kTickOrderTypeValidV1) != 0U;
+    projected.price_valid =
+        (order.fields.validity_bitmap & kTickPriceValidV1) != 0U &&
+        order.fields.price.valid;
+    projected.price_p6 = projected.price_valid
+                             ? order.fields.price.normalized_p6
+                             : 0;
+    projected.source_quality_flags = common.quality_flags;
+    projected.source_market_notices = common.market_notices;
+    if (!ValidInput(projected)) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    *output = projected;
+    return ShenzhenOrderEventProjectionV1::kProjected;
+}
+
+[[nodiscard]] ShenzhenOrderEventProjectionV1 ProjectTransactionInput(
+    const ShenzhenTransactionV1& transaction,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence,
+    ShenzhenOrderEventInputV1* output) noexcept {
+    const DecodedMarketCommonV1& common = transaction.common;
+    if (common.kind != MarketEventKindV1::kShenzhenTransaction ||
+        common.market != MarketV1::kShenzhen ||
+        transaction.fields.quantity.scale != 0U) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    ShenzhenOrderEventInputV1 projected{};
+    projected.trade_date = common.origin.trade_date;
+    projected.instrument_id = common.instrument_id;
+    projected.channel = transaction.channel;
+    FillAnchor(
+        common,
+        transaction.application_sequence,
+        ingress_sequence,
+        tick_stream_sequence,
+        &projected.anchor);
+    projected.action = transaction.fields.action;
+    projected.side = transaction.fields.side;
+    projected.order_type = OrderTypeV1::kUnknown;
+    projected.quantity = transaction.fields.quantity.raw;
+    projected.primary_order_id = transaction.fields.primary_order_id;
+    projected.buy_order_id = transaction.fields.buy_order_id;
+    projected.sell_order_id = transaction.fields.sell_order_id;
+    projected.quantity_valid =
+        (transaction.fields.validity_bitmap & kTickQuantityValidV1) != 0U &&
+        transaction.fields.quantity.valid;
+    projected.side_valid =
+        (transaction.fields.validity_bitmap & kTickSideValidV1) != 0U;
+    projected.price_valid =
+        (transaction.fields.validity_bitmap & kTickPriceValidV1) != 0U &&
+        transaction.fields.price.valid;
+    projected.price_p6 = projected.price_valid
+                             ? transaction.fields.price.normalized_p6
+                             : 0;
+    projected.source_quality_flags = common.quality_flags;
+    projected.source_market_notices = common.market_notices;
+    const std::uint32_t validity = transaction.fields.validity_bitmap;
+    if (projected.action == TickActionV1::kTrade) {
+        // 6.36 defines zero as "no corresponding order" independently for
+        // both references. Keep owning and stored-view projection identical.
+        const bool has_buy = projected.buy_order_id > 0;
+        const bool has_sell = projected.sell_order_id > 0;
+        if (((validity & kTickBuyOrderIdValidV1) != 0U) != has_buy ||
+            ((validity & kTickSellOrderIdValidV1) != 0U) != has_sell) {
+            return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+        }
+    }
+    if (projected.action == TickActionV1::kCancel &&
+        (validity & kTickPrimaryOrderIdValidV1) == 0U) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    if (!ValidInput(projected)) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    *output = projected;
+    return ShenzhenOrderEventProjectionV1::kProjected;
 }
 
 }  // namespace
@@ -397,154 +581,74 @@ ProjectShenzhenOrderEventInputV1(
     if (const auto* order =
             std::get_if<ShenzhenOrderV1>(&event);
         order != nullptr) {
-        const DecodedMarketCommonV1& common = order->common;
-        if (common.kind !=
-                MarketEventKindV1::kShenzhenOrder ||
-            common.market != MarketV1::kShenzhen ||
-            order->fields.action != TickActionV1::kAdd ||
-            order->fields.quantity.scale != 0U ||
-            (order->fields.validity_bitmap &
-             kTickPrimaryOrderIdValidV1) == 0U) {
-            return ShenzhenOrderEventProjectionV1::kInvalidEvent;
-        }
-        ShenzhenOrderEventInputV1 projected{};
-        projected.trade_date = common.origin.trade_date;
-        projected.instrument_id = common.instrument_id;
-        projected.channel = order->channel;
-        FillAnchor(
-            common,
-            order->application_sequence,
-            ingress_sequence,
-            tick_stream_sequence,
-            &projected.anchor);
-        projected.action = TickActionV1::kAdd;
-        projected.side = order->fields.side;
-        projected.order_type = order->fields.order_type;
-        projected.quantity = order->fields.quantity.raw;
-        projected.primary_order_id =
-            order->fields.primary_order_id;
-        projected.quantity_valid =
-            (order->fields.validity_bitmap &
-             kTickQuantityValidV1) != 0U &&
-            order->fields.quantity.valid;
-        projected.side_valid =
-            (order->fields.validity_bitmap &
-             kTickSideValidV1) != 0U;
-        projected.order_type_valid =
-            (order->fields.validity_bitmap &
-             kTickOrderTypeValidV1) != 0U;
-        projected.price_valid =
-            (order->fields.validity_bitmap &
-             kTickPriceValidV1) != 0U &&
-            order->fields.price.valid;
-        projected.price_p6 =
-            projected.price_valid
-                ? order->fields.price.normalized_p6
-                : 0;
-        projected.source_quality_flags =
-            common.quality_flags;
-        projected.source_market_notices =
-            common.market_notices;
-        if (!ValidInput(projected)) {
-            return ShenzhenOrderEventProjectionV1::kInvalidEvent;
-        }
-        *output = projected;
-        return ShenzhenOrderEventProjectionV1::kProjected;
+        return ProjectOrderInput(
+            *order, ingress_sequence, tick_stream_sequence, output);
     }
 
     if (const auto* transaction =
             std::get_if<ShenzhenTransactionV1>(&event);
         transaction != nullptr) {
-        const DecodedMarketCommonV1& common =
-            transaction->common;
-        if (common.kind !=
-                MarketEventKindV1::kShenzhenTransaction ||
-            common.market != MarketV1::kShenzhen ||
-            transaction->fields.quantity.scale != 0U) {
-            return ShenzhenOrderEventProjectionV1::kInvalidEvent;
-        }
-        ShenzhenOrderEventInputV1 projected{};
-        projected.trade_date = common.origin.trade_date;
-        projected.instrument_id = common.instrument_id;
-        projected.channel = transaction->channel;
-        FillAnchor(
-            common,
-            transaction->application_sequence,
+        return ProjectTransactionInput(
+            *transaction,
             ingress_sequence,
             tick_stream_sequence,
-            &projected.anchor);
-        projected.action = transaction->fields.action;
-        projected.side = transaction->fields.side;
-        projected.order_type = OrderTypeV1::kUnknown;
-        projected.quantity =
-            transaction->fields.quantity.raw;
-        projected.primary_order_id =
-            transaction->fields.primary_order_id;
-        projected.buy_order_id =
-            transaction->fields.buy_order_id;
-        projected.sell_order_id =
-            transaction->fields.sell_order_id;
-        projected.quantity_valid =
-            (transaction->fields.validity_bitmap &
-             kTickQuantityValidV1) != 0U &&
-            transaction->fields.quantity.valid;
-        projected.side_valid =
-            (transaction->fields.validity_bitmap &
-             kTickSideValidV1) != 0U;
-        projected.price_valid =
-            (transaction->fields.validity_bitmap &
-             kTickPriceValidV1) != 0U &&
-            transaction->fields.price.valid;
-        projected.price_p6 =
-            projected.price_valid
-                ? transaction->fields.price.normalized_p6
-                : 0;
-        projected.source_quality_flags =
-            common.quality_flags;
-        projected.source_market_notices =
-            common.market_notices;
-        const std::uint32_t validity =
-            transaction->fields.validity_bitmap;
-        if (projected.action == TickActionV1::kTrade) {
-            // 6.36 defines zero as "no corresponding order" independently
-            // for BidApplSeqNum and OfferApplSeqNum. The decoder therefore
-            // publishes an ID-valid bit exactly when the retained reference
-            // is positive; requiring both bits would reject a documented
-            // source value. Keep this decoded-event adapter identical to the
-            // strict Wire V2 adapter.
-            const bool has_buy = projected.buy_order_id > 0;
-            const bool has_sell = projected.sell_order_id > 0;
-            if (((validity & kTickBuyOrderIdValidV1) != 0U) !=
-                    has_buy ||
-                ((validity & kTickSellOrderIdValidV1) != 0U) !=
-                    has_sell) {
-                return ShenzhenOrderEventProjectionV1::kInvalidEvent;
-            }
-        }
-        if (projected.action == TickActionV1::kCancel &&
-            (validity &
-             kTickPrimaryOrderIdValidV1) == 0U) {
-            return ShenzhenOrderEventProjectionV1::kInvalidEvent;
-        }
-        if (!ValidInput(projected)) {
-            return ShenzhenOrderEventProjectionV1::kInvalidEvent;
-        }
-        *output = projected;
-        return ShenzhenOrderEventProjectionV1::kProjected;
+            output);
     }
 
+    return ShenzhenOrderEventProjectionV1::kNotShenzhenEvent;
+}
+
+ShenzhenOrderEventProjectionV1
+ProjectShenzhenOrderEventInputV1(
+    const StoredMarketEventViewV1& event,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence,
+    ShenzhenOrderEventInputV1* output) noexcept {
+    if (output == nullptr) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    *output = {};
+    if (ingress_sequence == 0U || tick_stream_sequence == 0U) {
+        return ShenzhenOrderEventProjectionV1::kInvalidEvent;
+    }
+    if (const auto* order =
+            std::get_if<const ShenzhenOrderV1*>(&event);
+        order != nullptr) {
+        return *order == nullptr
+                   ? ShenzhenOrderEventProjectionV1::kInvalidEvent
+                   : ProjectOrderInput(
+                         **order,
+                         ingress_sequence,
+                         tick_stream_sequence,
+                         output);
+    }
+    if (const auto* transaction =
+            std::get_if<const ShenzhenTransactionV1*>(&event);
+        transaction != nullptr) {
+        return *transaction == nullptr
+                   ? ShenzhenOrderEventProjectionV1::kInvalidEvent
+                   : ProjectTransactionInput(
+                         **transaction,
+                         ingress_sequence,
+                         tick_stream_sequence,
+                         output);
+    }
     return ShenzhenOrderEventProjectionV1::kNotShenzhenEvent;
 }
 
 class ShenzhenOrderEventProjectorV1::Impl final {
 public:
     explicit Impl(
-        ShenzhenOrderEventProjectorConfigV1 config_value) noexcept
-        : config(std::move(config_value)) {}
+        ShenzhenOrderEventProjectorConfigV1 config_value)
+        : config(std::move(config_value)),
+          orders(config.maximum_order_states) {
+        last_native_sequence_by_channel.reserve(
+            config.maximum_order_states);
+    }
 
     ShenzhenOrderEventProjectorConfigV1 config{};
-    std::map<ShenzhenOrderKeyV1, OrderState> orders;
-    std::map<std::uint32_t, std::int64_t>
+    OrderStateTable orders;
+    std::vector<std::pair<std::uint32_t, std::int64_t>>
         last_native_sequence_by_channel;
     std::uint64_t last_ordering_sequence = 0U;
     bool finalized = false;
@@ -662,6 +766,30 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
         return ShenzhenOrderProjectorConsumeErrorV1::kNullOutput;
     }
     output->clear();
+    return ConsumeCanonicalImpl(
+        input, canonical_apply_sequence, output, nullptr);
+}
+
+ShenzhenOrderProjectorConsumeErrorV1
+ShenzhenOrderEventProjectorV1::ConsumeCanonicalToSink(
+    const ShenzhenOrderEventInputV1& input,
+    std::uint64_t canonical_apply_sequence,
+    const ShenzhenOrderEventSinkV1& sink) noexcept {
+    if (sink.append_revision == nullptr ||
+        sink.append_trade == nullptr ||
+        sink.append_cancel == nullptr) {
+        return ShenzhenOrderProjectorConsumeErrorV1::kNullOutput;
+    }
+    return ConsumeCanonicalImpl(
+        input, canonical_apply_sequence, nullptr, &sink);
+}
+
+ShenzhenOrderProjectorConsumeErrorV1
+ShenzhenOrderEventProjectorV1::ConsumeCanonicalImpl(
+    const ShenzhenOrderEventInputV1& input,
+    std::uint64_t canonical_apply_sequence,
+    std::vector<ShenzhenOrderEventV1>* output,
+    const ShenzhenOrderEventSinkV1* sink) noexcept {
     if (impl_ == nullptr) {
         return ShenzhenOrderProjectorConsumeErrorV1::kFailed;
     }
@@ -683,10 +811,19 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
     }
 
     try {
-        auto [channel_position, channel_inserted] =
-            impl_->last_native_sequence_by_channel.try_emplace(
+        auto channel_position = std::find_if(
+            impl_->last_native_sequence_by_channel.begin(),
+            impl_->last_native_sequence_by_channel.end(),
+            [&input](const auto& entry) noexcept {
+                return entry.first == input.channel;
+            });
+        if (channel_position ==
+            impl_->last_native_sequence_by_channel.end()) {
+            impl_->last_native_sequence_by_channel.emplace_back(
                 input.channel, 0);
-        static_cast<void>(channel_inserted);
+            channel_position = std::prev(
+                impl_->last_native_sequence_by_channel.end());
+        }
         if ((impl_->last_ordering_sequence != 0U &&
              canonical_apply_sequence <=
                  impl_->last_ordering_sequence) ||
@@ -696,7 +833,17 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
             return ShenzhenOrderProjectorConsumeErrorV1::
                 kOutOfOrderInput;
         }
-        output->reserve(3U);
+        if (output != nullptr) {
+            output->reserve(3U);
+        }
+        ShenzhenEventEmitter emitter(output, sink);
+        const auto fail_emission = [&]() noexcept {
+            impl_->failed = true;
+            if (output != nullptr) {
+                output->clear();
+            }
+            return ShenzhenOrderProjectorConsumeErrorV1::kFailed;
+        };
         ShenzhenOrderProjectorConsumeErrorV1 result =
             ShenzhenOrderProjectorConsumeErrorV1::kNone;
         if (input.action == TickActionV1::kAdd) {
@@ -705,24 +852,24 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
                 input.instrument_id,
                 input.channel,
                 input.primary_order_id};
-            const auto existing = impl_->orders.find(key);
-            if (existing == impl_->orders.end()) {
-                if (impl_->orders.size() >=
-                    impl_->config.maximum_order_states) {
-                    return ShenzhenOrderProjectorConsumeErrorV1::
-                        kOrderCapacity;
-                }
-                OrderState state{};
-                state.snapshot.key = key;
+            auto inserted = impl_->orders.FindOrEmplaceDefault(key);
+            if (inserted.state == nullptr) {
+                return impl_->orders.size() >=
+                               impl_->config.maximum_order_states
+                           ? ShenzhenOrderProjectorConsumeErrorV1::
+                                 kOrderCapacity
+                           : ShenzhenOrderProjectorConsumeErrorV1::
+                                 kFailed;
+            }
+            if (inserted.inserted) {
+                OrderState& state = *inserted.state;
                 state.snapshot.side = input.side;
                 state.snapshot.order_type = input.order_type;
                 state.snapshot.price_p6 =
                     input.price_valid ? input.price_p6 : 0;
                 state.snapshot.price_valid = input.price_valid;
-                state.snapshot.original_quantity =
-                    input.quantity;
-                state.snapshot.remaining_quantity =
-                    input.quantity;
+                state.snapshot.original_quantity = input.quantity;
+                state.snapshot.remaining_quantity = input.quantity;
                 state.snapshot.remaining_quantity_valid = true;
                 state.snapshot.first_anchor = input.anchor;
                 state.snapshot.last_anchor = input.anchor;
@@ -731,20 +878,16 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
                     input.source_quality_flags;
                 state.snapshot.source_market_notices =
                     input.source_market_notices;
-                const auto [iterator, inserted] =
-                    impl_->orders.emplace(key, state);
-                if (!inserted) {
-                    return ShenzhenOrderProjectorConsumeErrorV1::
-                        kFailed;
+                if (!emitter.AppendRevision(
+                        ShenzhenOrderDeltaOperationV1::kInsert,
+                        input.anchor,
+                        state)) {
+                    return fail_emission();
                 }
-                output->emplace_back(RevisionEvent(
-                    ShenzhenOrderDeltaOperationV1::kInsert,
-                    input.anchor,
-                    iterator->second));
                 result =
                     ShenzhenOrderProjectorConsumeErrorV1::kNone;
             } else {
-                OrderState& state = existing->second;
+                OrderState& state = *inserted.state;
                 state.snapshot.quality_flags |=
                     ShenzhenEventQualityBitV1(
                         ShenzhenEventQualityFlagV1::
@@ -765,10 +908,12 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
                 MarkMutation(input, &state);
                 IncrementRevision(&state);
                 RefreshFinality(&state);
-                output->emplace_back(RevisionEvent(
-                    ShenzhenOrderDeltaOperationV1::kUpdate,
-                    input.anchor,
-                    state));
+                if (!emitter.AppendRevision(
+                        ShenzhenOrderDeltaOperationV1::kUpdate,
+                        input.anchor,
+                        state)) {
+                    return fail_emission();
+                }
             }
         } else if (input.action == TickActionV1::kTrade) {
             const ShenzhenOrderKeyV1 buy_key{
@@ -784,14 +929,14 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
             const bool ambiguous_references =
                 input.buy_order_id > 0 &&
                 input.buy_order_id == input.sell_order_id;
-            auto buy = ambiguous_references ||
-                               input.buy_order_id == 0
-                           ? impl_->orders.end()
-                           : impl_->orders.find(buy_key);
-            auto sell = ambiguous_references ||
-                                input.sell_order_id == 0
-                            ? impl_->orders.end()
-                            : impl_->orders.find(sell_key);
+            OrderState* const buy =
+                ambiguous_references || input.buy_order_id == 0
+                    ? nullptr
+                    : impl_->orders.Find(buy_key);
+            OrderState* const sell =
+                ambiguous_references || input.sell_order_id == 0
+                    ? nullptr
+                    : impl_->orders.Find(sell_key);
 
             ShenzhenTradeEventV1 trade{};
             trade.trade_date = input.trade_date;
@@ -814,14 +959,14 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
                     ShenzhenEventQualityBitV1(
                         ShenzhenEventQualityFlagV1::
                             kAmbiguousTradeOrderReferences);
-            } else if (buy == impl_->orders.end()) {
+            } else if (buy == nullptr) {
                 trade.quality_flags |=
                     ShenzhenEventQualityBitV1(
                         ShenzhenEventQualityFlagV1::
                             kUnknownBuyOrderReference);
             }
             if (!ambiguous_references &&
-                sell == impl_->orders.end()) {
+                sell == nullptr) {
                 trade.quality_flags |=
                     ShenzhenEventQualityBitV1(
                         ShenzhenEventQualityFlagV1::
@@ -836,35 +981,40 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
             };
             std::array<Updated, 2U> updates{};
             std::size_t update_count = 0U;
-            if (buy != impl_->orders.end()) {
+            if (buy != nullptr) {
                 trade.quality_flags |= ApplyQuantityReduction(
-                    input, SideV1::kBuy, true, &buy->second);
+                    input, SideV1::kBuy, true, buy);
                 updates[update_count++] = {
                     buy_key,
-                    &buy->second,
-                    MutationOperation(&buy->second)};
+                    buy,
+                    MutationOperation(buy)};
             }
-            if (sell != impl_->orders.end()) {
+            if (sell != nullptr) {
                 trade.quality_flags |= ApplyQuantityReduction(
-                    input, SideV1::kSell, true, &sell->second);
+                    input, SideV1::kSell, true, sell);
                 updates[update_count++] = {
                     sell_key,
-                    &sell->second,
-                    MutationOperation(&sell->second)};
+                    sell,
+                    MutationOperation(sell)};
             }
             if (update_count == 2U &&
                 updates[1U].key < updates[0U].key) {
                 std::swap(updates[0U], updates[1U]);
             }
 
-            output->emplace_back(trade);
+            if (!emitter.AppendTrade(trade)) {
+                return fail_emission();
+            }
+
             for (std::size_t index = 0U;
                  index < update_count;
                  ++index) {
-                output->emplace_back(RevisionEvent(
-                    updates[index].operation,
-                    input.anchor,
-                    *updates[index].state));
+                if (!emitter.AppendRevision(
+                        updates[index].operation,
+                        input.anchor,
+                        *updates[index].state)) {
+                    return fail_emission();
+                }
             }
         } else {
             const ShenzhenOrderKeyV1 key{
@@ -872,38 +1022,43 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
                 input.instrument_id,
                 input.channel,
                 input.primary_order_id};
-            const auto existing = impl_->orders.find(key);
+            OrderState* const existing = impl_->orders.Find(key);
             ShenzhenCancelEventV1 cancel{};
             cancel.key = key;
             cancel.source_anchor = input.anchor;
             cancel.side =
-                existing == impl_->orders.end()
+                existing == nullptr
                     ? input.side
-                    : existing->second.snapshot.side;
+                    : existing->snapshot.side;
             cancel.side_from_order =
-                existing != impl_->orders.end();
+                existing != nullptr;
             cancel.quantity = input.quantity;
             cancel.referenced_order_found =
-                existing != impl_->orders.end();
+                existing != nullptr;
             cancel.source_quality_flags =
                 input.source_quality_flags;
             cancel.source_market_notices =
                 input.source_market_notices;
-            if (existing == impl_->orders.end()) {
+            if (existing == nullptr) {
                 cancel.quality_flags |=
                     ShenzhenEventQualityBitV1(
                         ShenzhenEventQualityFlagV1::
                             kUnknownCancelOrderReference);
-                output->emplace_back(cancel);
             } else {
-                OrderState& state = existing->second;
+                OrderState& state = *existing;
                 cancel.quality_flags |= ApplyQuantityReduction(
                     input, input.side, false, &state);
-                output->emplace_back(cancel);
-                output->emplace_back(RevisionEvent(
-                    MutationOperation(&state),
-                    input.anchor,
-                    state));
+                const ShenzhenOrderDeltaOperationV1 operation =
+                    MutationOperation(&state);
+                if (!emitter.AppendCancel(cancel) ||
+                    !emitter.AppendRevision(
+                        operation, input.anchor, state)) {
+                    return fail_emission();
+                }
+            }
+            if (existing == nullptr &&
+                !emitter.AppendCancel(cancel)) {
+                return fail_emission();
             }
         }
         if (result == ShenzhenOrderProjectorConsumeErrorV1::kNone) {
@@ -914,12 +1069,16 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
         }
         return result;
     } catch (const std::bad_alloc&) {
-        output->clear();
+        if (output != nullptr) {
+            output->clear();
+        }
         impl_->failed = true;
         return ShenzhenOrderProjectorConsumeErrorV1::
             kResourceExhausted;
     } catch (...) {
-        output->clear();
+        if (output != nullptr) {
+            output->clear();
+        }
         impl_->failed = true;
         return ShenzhenOrderProjectorConsumeErrorV1::kFailed;
     }
@@ -975,8 +1134,10 @@ ShenzhenOrderEventProjectorV1::Finalize(
 
     try {
         output->reserve(impl_->orders.size());
-        for (auto& [key, state] : impl_->orders) {
-            static_cast<void>(key);
+        const auto sorted = impl_->orders.SortedIndices(
+            [](const OrderState&) noexcept { return true; });
+        for (const std::uint32_t index : sorted) {
+            OrderState& state = impl_->orders.At(index);
             if (state.finalization_emitted) {
                 continue;
             }
@@ -993,10 +1154,11 @@ ShenzhenOrderEventProjectorV1::Finalize(
             IncrementRevision(&state);
             RefreshFinality(&state);
             state.finalization_emitted = true;
-            output->emplace_back(RevisionEvent(
+            AppendRevisionEvent(
+                output,
                 ShenzhenOrderDeltaOperationV1::kFinalize,
                 source_anchor,
-                state));
+                state);
         }
         impl_->finalized = true;
         return ShenzhenOrderProjectorConsumeErrorV1::kNone;
@@ -1024,11 +1186,11 @@ ShenzhenOrderEventProjectorV1::GetOrder(
         key.instrument_id == 0U || key.order_id <= 0) {
         return ShenzhenOrderProjectorQueryErrorV1::kInvalidKey;
     }
-    const auto found = impl_->orders.find(key);
-    if (found == impl_->orders.end()) {
+    const OrderState* const found = impl_->orders.Find(key);
+    if (found == nullptr) {
         return ShenzhenOrderProjectorQueryErrorV1::kNotFound;
     }
-    *output = found->second.snapshot;
+    *output = found->snapshot;
     return ShenzhenOrderProjectorQueryErrorV1::kNone;
 }
 

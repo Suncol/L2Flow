@@ -210,6 +210,9 @@ def _parse_throughput_log(
     workload: str,
     generation_interval_ms: int,
     requested_affinity: frozenset[int],
+    sink: str = "fast",
+    allow_capacity_failure: bool = False,
+    process_returncode: int = 0,
 ) -> dict[str, object]:
     lines = path.read_text(encoding="utf-8").splitlines()
     if any(line.startswith("FAIL:") for line in lines):
@@ -228,7 +231,7 @@ def _parse_throughput_log(
         "scenario": scenario,
         "server_state": expected_state,
         "workload": workload,
-        "sink": "fast",
+        "sink": sink,
     }
     for key, expected in expected_text.items():
         if env.get(key) != expected or result.get(key) != expected:
@@ -245,6 +248,8 @@ def _parse_throughput_log(
         "store_segment_kib": segment_kib,
         "coverage_from_open": expected_coverage,
         "online_recovery": 0,
+        "partial_event_v2": int(scenario == "live_partial_no_recovery"),
+        "certified_event_v1": int(sink == "fast_certified"),
         "generation_interval_ms": generation_interval_ms,
         "factor_generation_enabled": expected_coverage,
     }
@@ -265,6 +270,8 @@ def _parse_throughput_log(
             decoder_queue - max(1, decoder_queue // 4),
         ),
         "tick_ring_capacity": 262_144,
+        "certified_handoff_queue_capacity": 4_194_304,
+        "partial_event_handoff_queue_capacity": 262_144,
     }
     for key, expected in expected_env_only.items():
         if _unsigned(env, key) != expected:
@@ -282,15 +289,12 @@ def _parse_throughput_log(
     if _reported_cpu_set(env.get("affinity", "")) != requested_affinity:
         raise ValueError(f"{path}: CPU affinity differs from request")
 
-    required_ones = (
-        "target_met",
+    full_path_pass = _unsigned(result, "target_met") == 1
+    common_required_ones = (
         "process_survived",
         "accepting_before_drain",
-        "steady_state_met",
-        "complete_prefix",
-        "stopped_clean",
         "certified_idle",
-        "certified_healthy",
+        "partial_event_idle",
         "final_cut_published",
         "generation_sequence_valid",
         "history_endpoint_valid",
@@ -300,7 +304,7 @@ def _parse_throughput_log(
         "history_source_counts_valid",
         "history_lossless",
     )
-    required_zeros = (
+    common_required_zeros = (
         "fatal_during_offer",
         "fatal_final",
         "message_patch_failed",
@@ -309,7 +313,6 @@ def _parse_throughput_log(
         "store_failed_appends",
         "store_coverage_lost",
         "decoder_full_count",
-        "service_failed",
         "periodic_generation_failed",
         "periodic_cut_error",
         "periodic_generation_error",
@@ -319,21 +322,191 @@ def _parse_throughput_log(
         "history_duplicate_ingress",
         "history_out_of_range_ingress",
         "history_invalid_source_slots",
-        "certified_dropped",
-        "certified_frozen_channels",
-        "certified_global_frozen",
+        "partial_event_queue_depth",
+        "partial_event_journal_failed",
+        "partial_event_history_failed",
     )
-    for key in required_ones:
+    for key in common_required_ones:
         if _unsigned(result, key) != 1:
             raise ValueError(f"{path}: {key} is not one")
-    for key in required_zeros:
+    for key in common_required_zeros:
         if _unsigned(result, key) != 0:
             raise ValueError(f"{path}: {key} is not zero")
+    if full_path_pass:
+        if process_returncode != 0:
+            raise ValueError(f"{path}: passing result exited nonzero")
+        for key in (
+            "steady_state_met",
+            "pipeline_steady_state_met",
+            "event_steady_state_met",
+            "complete_prefix",
+            "stopped_clean",
+            "certified_healthy",
+            "partial_event_healthy",
+        ):
+            if _unsigned(result, key) != 1:
+                raise ValueError(f"{path}: passing {key} is not one")
+        for key in (
+            "service_failed",
+            "certified_dropped",
+            "certified_frozen_channels",
+            "certified_global_frozen",
+            "certified_resource_exhaustions",
+            "certified_pending",
+            "certified_tick_history_failed",
+            "certified_tick_history_lag",
+            "partial_event_last_error",
+            "partial_event_dropped",
+            "partial_event_pending",
+            "partial_event_global_frozen",
+        ):
+            if _unsigned(result, key) != 0:
+                raise ValueError(f"{path}: passing {key} is not zero")
+    else:
+        if not allow_capacity_failure:
+            raise ValueError(f"{path}: target_met is zero")
+        if process_returncode != 1:
+            raise ValueError(f"{path}: unexpected capacity-failure process")
+        if scenario == "live_partial_no_recovery" and sink == "fast":
+            expected_failure_fields = {
+                "complete_prefix": 0,
+                "stopped_clean": 0,
+                "service_failed": 1,
+                "certified_healthy": 1,
+                "partial_event_healthy": 0,
+                "partial_event_state": 6,
+                "partial_event_last_error": 3,
+                "partial_event_global_frozen": 1,
+            }
+            for key, expected in expected_failure_fields.items():
+                if _unsigned(result, key) != expected:
+                    raise ValueError(
+                        f"{path}: partial capacity failure {key} differs"
+                    )
+            if _unsigned(result, "partial_event_dropped") == 0:
+                raise ValueError(
+                    f"{path}: partial capacity failure dropped no handoff"
+                )
+        elif scenario == "from_open" and sink == "fast_certified":
+            certified_healthy = _unsigned(result, "certified_healthy") == 1
+            if certified_healthy:
+                expected_steady_failure = {
+                    "complete_prefix": 1,
+                    "stopped_clean": 1,
+                    "service_failed": 0,
+                    "pipeline_steady_state_met": 1,
+                    "event_steady_state_met": 0,
+                }
+                for key, expected in expected_steady_failure.items():
+                    if _unsigned(result, key) != expected:
+                        raise ValueError(
+                            f"{path}: Certified steady-state failure "
+                            f"{key} differs"
+                        )
+            else:
+                if _unsigned(result, "complete_prefix") != 0 or _unsigned(
+                    result, "service_failed"
+                ) != 1:
+                    raise ValueError(
+                        f"{path}: Certified resource failure did not fail closed"
+                    )
+                certified_failure_evidence = (
+                    _unsigned(result, "certified_dropped")
+                    + _unsigned(result, "certified_frozen_channels")
+                    + _unsigned(result, "certified_global_frozen")
+                    + _unsigned(result, "certified_resource_exhaustions")
+                    + _unsigned(result, "certified_tick_history_failed")
+                    + int(
+                        _unsigned(
+                            result, "certified_event_generation_valid"
+                        )
+                        == 0
+                    )
+                )
+                if certified_failure_evidence == 0:
+                    raise ValueError(
+                        f"{path}: Certified resource failure has no evidence"
+                    )
+        elif scenario == "from_open" and sink == "fast":
+            expected_steady_failure = {
+                "complete_prefix": 1,
+                "stopped_clean": 1,
+                "service_failed": 0,
+                "certified_healthy": 1,
+                "partial_event_healthy": 1,
+                "pipeline_steady_state_met": 0,
+                "event_steady_state_met": 1,
+            }
+            for key, expected in expected_steady_failure.items():
+                if _unsigned(result, key) != expected:
+                    raise ValueError(
+                        f"{path}: FAST steady-state failure {key} differs"
+                    )
+        else:
+            raise ValueError(f"{path}: unsupported capacity-failure topology")
     if (
         _unsigned(result, "final_factor_generation_present")
         != expected_coverage
     ):
         raise ValueError(f"{path}: final Factor-generation contract differs")
+    expected_event = int(scenario == "live_partial_no_recovery")
+    expected_certified = int(sink == "fast_certified")
+    expected_event_applied = sum(
+        _expected_tuple_counts(workload, expected_planned)[index]
+        for index in (1, 3, 4)
+    )
+    if full_path_pass:
+        if _unsigned(result, "partial_event_state") != (
+            9 if expected_event else 1
+        ):
+            raise ValueError(f"{path}: partial Event final state differs")
+        if _unsigned(result, "partial_event_applied_records") != (
+            expected_event_applied if expected_event else 0
+        ):
+            raise ValueError(f"{path}: partial Event applied count differs")
+    if _unsigned(result, "partial_event_processed") != _unsigned(
+        result, "partial_event_enqueued"
+    ):
+        raise ValueError(f"{path}: partial Event handoffs do not close")
+    if full_path_pass:
+        certified_exact = {
+            "certified_observed_native": (
+                expected_event_applied if expected_certified else 0
+            ),
+            "certified_tick_count": (
+                expected_event_applied if expected_certified else 0
+            ),
+            "certified_enqueued_observations": (
+                expected_event_applied if expected_certified else 0
+            ),
+            "certified_enqueued_applied": (
+                expected_event_applied if expected_certified else 0
+            ),
+            "certified_processed": (
+                expected_event_applied * 2 if expected_certified else 0
+            ),
+            "certified_wire_snapshot_consistent": expected_certified,
+            "certified_event_input_frontier": (
+                expected_event_applied if expected_certified else 0
+            ),
+        }
+        for key, expected in certified_exact.items():
+            if _unsigned(result, key) != expected:
+                raise ValueError(f"{path}: {key} differs from Event oracle")
+        if _unsigned(result, "certified_event_generation_valid") != 1:
+            raise ValueError(f"{path}: Certified Event generation is invalid")
+        certified_event_count = _unsigned(result, "certified_event_count")
+        if bool(certified_event_count) != bool(expected_certified):
+            raise ValueError(
+                f"{path}: Certified derived Event count enablement differs"
+            )
+        if expected_certified and workload == "five_tuple_uniform":
+            expected_derived_events = expected_planned * 4 // 5
+            if certified_event_count != expected_derived_events:
+                raise ValueError(
+                    f"{path}: Certified derived Event count differs from "
+                    "the independent five-tuple oracle"
+                )
 
     for key in (
         "invoked_callbacks",
@@ -381,8 +554,12 @@ def _parse_throughput_log(
     history_ready_elapsed_ns = _unsigned(
         result, "history_ready_elapsed_ns"
     )
+    full_path_ready_elapsed_ns = _unsigned(
+        result, "full_path_ready_elapsed_ns"
+    )
     reported_offered_rps = _float(result, "achieved_offered_rps")
     reported_history_ready_rps = _float(result, "history_ready_rps")
+    reported_full_path_ready_rps = _float(result, "full_path_ready_rps")
     achieved_offered_rps = _validate_reported_rate(
         path,
         label="achieved_offered_rps",
@@ -397,6 +574,13 @@ def _parse_throughput_log(
         numerator=expected_planned,
         elapsed_ns=history_ready_elapsed_ns,
     )
+    full_path_ready_rps = _validate_reported_rate(
+        path,
+        label="full_path_ready_rps",
+        reported=reported_full_path_ready_rps,
+        numerator=invoked,
+        elapsed_ns=full_path_ready_elapsed_ns,
+    )
     recomputed_target_met = (
         invoked == expected_planned
         and achieved_offered_rps
@@ -405,6 +589,7 @@ def _parse_throughput_log(
         and _unsigned(result, "decoder_full_count") == 0
         and _unsigned(result, "message_patch_failed") == 0
         and _unsigned(result, "steady_state_met") == 1
+        and _unsigned(result, "event_steady_state_met") == 1
     )
     if _unsigned(result, "target_met") != int(recomputed_target_met):
         raise ValueError(f"{path}: target_met differs from its integer oracle")
@@ -420,8 +605,11 @@ def _parse_throughput_log(
             "reported_achieved_offered_rps": reported_offered_rps,
             "history_ready_rps": history_ready_rps,
             "reported_history_ready_rps": reported_history_ready_rps,
+            "full_path_ready_rps": full_path_ready_rps,
+            "reported_full_path_ready_rps": reported_full_path_ready_rps,
             "producer_elapsed_ns": producer_elapsed_ns,
             "history_ready_elapsed_ns": history_ready_elapsed_ns,
+            "full_path_ready_elapsed_ns": full_path_ready_elapsed_ns,
             "backlog_before_drain": _unsigned(result, "backlog_before_drain"),
             "final_drain_and_cut_elapsed_ns": _unsigned(
                 result, "final_drain_and_cut_elapsed_ns"
@@ -430,6 +618,25 @@ def _parse_throughput_log(
                 result, "history_integrity_validation_elapsed_ns"
             ),
             "periodic_generation_cuts": periodic_cuts,
+            "full_path_pass": full_path_pass,
+            "failure_class": (
+                "none"
+                if full_path_pass
+                else (
+                    "partial_event_handoff_queue_resource_exhausted"
+                    if scenario == "live_partial_no_recovery"
+                    else (
+                        (
+                            "fast_history_steady_state_backlog"
+                            if sink == "fast"
+                            else "certified_event_steady_state_backlog"
+                        )
+                        if _unsigned(result, "certified_healthy") == 1
+                        else "certified_event_resource_exhausted"
+                    )
+                )
+            ),
+            "process_returncode": process_returncode,
         }
     )
     return row
@@ -510,6 +717,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--cpu-list", default="8-15")
     parser.add_argument(
+        "--scenarios",
+        nargs="+",
+        choices=SCENARIOS,
+        default=list(SCENARIOS),
+    )
+    parser.add_argument(
         "--rates", type=int, nargs="+", default=[50_000, 100_000, 200_000, 300_000, 500_000]
     )
     parser.add_argument("--throughput-duration-ms", type=int, default=2_000)
@@ -522,8 +735,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--store-queue", type=int, default=32_768)
     parser.add_argument("--segment-kib", type=int, default=64)
     parser.add_argument("--workload", default="five_tuple_uniform")
+    parser.add_argument(
+        "--sink",
+        choices=("fast", "fast_certified"),
+        default="fast",
+    )
     parser.add_argument("--generation-interval-ms", type=int, default=1_000)
     parser.add_argument("--timeout-seconds", type=int, default=240)
+    parser.add_argument(
+        "--record-capacity-failures",
+        action="store_true",
+        help=(
+            "retain rigorously classified FAST/Event steady-state or "
+            "resource-capacity failures as measured outcomes"
+        ),
+    )
     return parser
 
 
@@ -536,7 +762,6 @@ def main() -> int:
     positive = (
         args.throughput_duration_ms,
         args.throughput_repeats,
-        args.latency_repeats,
         args.instruments_per_market,
         args.store_workers,
         args.decoder_queue,
@@ -549,6 +774,13 @@ def main() -> int:
         raise SystemExit("rates, durations, repeats, capacities, and timeout must be positive")
     if args.parallel_workers < 0:
         raise SystemExit("parallel worker count cannot be negative")
+    if args.latency_repeats < 0:
+        raise SystemExit("latency repeat count cannot be negative")
+    if (
+        args.sink == "fast_certified"
+        and "live_partial_no_recovery" in args.scenarios
+    ):
+        raise SystemExit("fast_certified is only valid with from_open")
     affinity = _requested_cpu_set(args.cpu_list)
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(output_dir.iterdir()):
@@ -561,12 +793,12 @@ def main() -> int:
     throughput_rows: list[dict[str, object]] = []
     for rate_index, rate in enumerate(args.rates):
         for repeat in range(1, args.throughput_repeats + 1):
-            order = list(SCENARIOS)
+            order = list(args.scenarios)
             if (rate_index + repeat) % 2 == 0:
                 order.reverse()
             for scenario in order:
                 log_path = output_dir / (
-                    f"throughput_{rate}_{scenario}_run{repeat}.log"
+                    f"throughput_{rate}_{scenario}_{args.sink}_run{repeat}.log"
                 )
                 command = [
                     "taskset",
@@ -584,7 +816,7 @@ def main() -> int:
                     str(args.store_queue),
                     str(args.segment_kib),
                     args.workload,
-                    "fast",
+                    args.sink,
                     scenario,
                     str(args.generation_interval_ms),
                 ]
@@ -599,7 +831,10 @@ def main() -> int:
                     completed.stdout + completed.stderr,
                     encoding="utf-8",
                 )
-                if completed.returncode != 0:
+                if completed.returncode != 0 and not (
+                    args.record_capacity_failures
+                    and completed.returncode == 1
+                ):
                     raise ValueError(
                         f"throughput trial exited {completed.returncode}: {log_path}"
                     )
@@ -617,19 +852,25 @@ def main() -> int:
                     workload=args.workload,
                     generation_interval_ms=args.generation_interval_ms,
                     requested_affinity=affinity,
+                    sink=args.sink,
+                    allow_capacity_failure=args.record_capacity_failures,
+                    process_returncode=completed.returncode,
                 )
                 row.update({"repeat": repeat, "log": log_path.name})
                 throughput_rows.append(row)
                 print(
                     f"throughput scenario={scenario} rate={rate} repeat={repeat} "
                     f"offered={row['achieved_offered_rps']:.3f} "
-                    f"history_ready={row['history_ready_rps']:.3f} lossless=1"
+                    f"history_ready={row['history_ready_rps']:.3f} "
+                    f"full_path_ready={row['full_path_ready_rps']:.3f} "
+                    f"event_backlog={row['event_backlog_before_drain']} "
+                    f"full_path_pass={int(bool(row['full_path_pass']))}"
                 )
 
     parse_latency_log = _load_latency_parser()
     latency_rows: list[dict[str, object]] = []
     for repeat in range(1, args.latency_repeats + 1):
-        order = list(SCENARIOS)
+        order = list(args.scenarios)
         if repeat % 2 == 0:
             order.reverse()
         for scenario in order:
@@ -683,21 +924,24 @@ def main() -> int:
     if _sha256(binary) != binary_sha256:
         raise ValueError("benchmark binary changed during the campaign")
     stable_latency_provenance: dict[str, str] = {}
-    for key in (
-        "meta_python_executable_sha256",
-        "meta_native_library_sha256",
-        "meta_probe_sha256",
-        "meta_python_version",
-        "meta_python_implementation",
-        "meta_polars_version",
-    ):
-        values = {str(row[key]) for row in latency_rows}
-        if len(values) != 1:
-            raise ValueError(f"latency provenance changed during campaign: {key}")
-        stable_latency_provenance[key.removeprefix("meta_")] = values.pop()
+    if latency_rows:
+        for key in (
+            "meta_python_executable_sha256",
+            "meta_native_library_sha256",
+            "meta_probe_sha256",
+            "meta_python_version",
+            "meta_python_implementation",
+            "meta_polars_version",
+        ):
+            values = {str(row[key]) for row in latency_rows}
+            if len(values) != 1:
+                raise ValueError(
+                    f"latency provenance changed during campaign: {key}"
+                )
+            stable_latency_provenance[key.removeprefix("meta_")] = values.pop()
 
     throughput_summary: list[dict[str, object]] = []
-    for scenario in SCENARIOS:
+    for scenario in args.scenarios:
         for rate in args.rates:
             rows = [
                 row
@@ -708,20 +952,35 @@ def main() -> int:
                 raise ValueError("incomplete throughput group")
             offered = [float(row["achieved_offered_rps"]) for row in rows]
             ready = [float(row["history_ready_rps"]) for row in rows]
+            full_ready = [float(row["full_path_ready_rps"]) for row in rows]
             throughput_summary.append(
                 {
                     "scenario": scenario,
+                    "sink": args.sink,
                     "target_rps": rate,
                     "n": len(rows),
                     "planned_callbacks_per_run": rows[0]["planned_callbacks"],
-                    "lossless_runs": len(rows),
-                    "target_met_runs": len(rows),
+                    "fast_history_lossless_runs": len(rows),
+                    "full_path_pass_runs": sum(
+                        int(bool(row["full_path_pass"])) for row in rows
+                    ),
                     "offered_rps_p50": statistics.median(offered),
                     "offered_rps_min": min(offered),
                     "history_ready_rps_p50": statistics.median(ready),
                     "history_ready_rps_min": min(ready),
+                    "full_path_ready_rps_p50": statistics.median(full_ready),
+                    "full_path_ready_rps_min": min(full_ready),
                     "backlog_at_offer_end_max": max(
                         int(row["backlog_before_drain"]) for row in rows
+                    ),
+                    "event_backlog_at_offer_end_max": max(
+                        int(row["event_backlog_before_drain"]) for row in rows
+                    ),
+                    "event_sampled_high_water_max": max(
+                        int(row["event_sampled_high_water"]) for row in rows
+                    ),
+                    "event_steady_state_pass_runs": sum(
+                        int(row["event_steady_state_met"]) for row in rows
                     ),
                     "final_pipeline_drain_and_generation_cut_p95_ms": _percentile_r7(
                         [
@@ -764,14 +1023,15 @@ def main() -> int:
         "order_strict_last_to_publication_ns",
         "order_publication_to_polars_ns",
     )
-    for scenario in SCENARIOS:
-        rows = [row for row in latency_rows if row["scenario"] == scenario]
-        if len(rows) != args.latency_repeats:
-            raise ValueError("incomplete latency group")
-        latency_summary[scenario] = {
-            metric: _distribution([float(row[metric]) for row in rows])
-            for metric in latency_metrics
-        }
+    if args.latency_repeats > 0:
+        for scenario in args.scenarios:
+            rows = [row for row in latency_rows if row["scenario"] == scenario]
+            if len(rows) != args.latency_repeats:
+                raise ValueError("incomplete latency group")
+            latency_summary[scenario] = {
+                metric: _distribution([float(row[metric]) for row in rows])
+                for metric in latency_metrics
+            }
 
     provenance = {
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -781,7 +1041,7 @@ def main() -> int:
         "host": platform.node(),
         "platform": platform.platform(),
         "cpu_list": args.cpu_list,
-        "scenarios": list(SCENARIOS),
+        "scenarios": list(args.scenarios),
         "rates": args.rates,
         "throughput_duration_ms": args.throughput_duration_ms,
         "throughput_repeats": args.throughput_repeats,
@@ -793,7 +1053,7 @@ def main() -> int:
         "store_queue": args.store_queue,
         "segment_kib": args.segment_kib,
         "workload": args.workload,
-        "sink": "fast",
+        "sink": args.sink,
         "generation_interval_ms": args.generation_interval_ms,
         "throughput_metric": "paced serialized callback offer rate",
         "throughput_pacing": (
@@ -808,9 +1068,20 @@ def main() -> int:
             "planned records divided by pacing-epoch through final immutable "
             "generation publication duration"
         ),
+        "full_path_ready_metric": (
+            "invoked callbacks divided by pacing-epoch through FAST/History "
+            "drain and Event worker idle duration"
+        ),
+        "event_steady_state_metric": (
+            "Event handoff backlog sampled at 25/50/75/100 percent and at "
+            "offer end; final backlog must be within one millisecond of the "
+            "target input rate (minimum 1024) and not grow beyond that "
+            "allowance relative to the 50 percent sample"
+        ),
         "latency_visibility": "forced generation cut, warm worker/connection",
         "throughput_and_latency_workloads": "separate fresh processes",
         "latency_sample_independence": "one sample-zero per fresh process",
+        "capacity_failures_recorded": args.record_capacity_failures,
     }
     report = {
         "provenance": provenance,

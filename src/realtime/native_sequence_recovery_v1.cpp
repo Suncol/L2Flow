@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace l2flow::realtime {
 namespace {
 
@@ -489,6 +491,11 @@ std::string_view NativeSequenceRecoverySealDispositionNameV1(
 
 class NativeSequenceRecoveryCoordinatorV1::Impl final {
 public:
+    struct EntryReference final {
+        std::uint32_t entry_index = kInvalidIndex;
+        std::uint32_t generation = 0U;
+    };
+
     struct Channel final {
         bool occupied = false;
         bool initialized = false;
@@ -504,6 +511,20 @@ public:
         std::uint64_t certified_sequence = 0U;
         std::uint64_t observed_contiguous_sequence = 0U;
         std::uint64_t highest_observed_sequence = 0U;
+        // Minimum key ever allocated for this channel. Before a partial
+        // origin is sealed no Entry can be released on a healthy channel, so
+        // this is also the exact minimum staged key used by SealPartialOrigin.
+        std::uint64_t minimum_allocated_sequence = 0U;
+        // Monotonic high-water mark across both Observe-first and
+        // applied-before-observed allocations. A sequence above this value
+        // cannot already exist in the entry hash table.
+        std::uint64_t highest_allocated_sequence = 0U;
+        EntryReference highest_allocated_entry{};
+        // A validated hint for certified_sequence + 1. The hash remains the
+        // authority when retention eviction or gap repair invalidates it.
+        EntryReference next_certified_entry{};
+        std::uint64_t last_applied_sequence = 0U;
+        EntryReference last_applied_entry{};
         std::uint64_t unique_sequences = 0U;
         std::uint64_t duplicate_arrivals = 0U;
         std::uint64_t exact_duplicate_applications = 0U;
@@ -529,7 +550,9 @@ public:
         std::uint32_t generation = 0U;
         std::uint32_t free_next = kInvalidIndex;
         std::uint32_t hash_next = kInvalidIndex;
+        std::uint32_t hash_bucket = kInvalidIndex;
         std::uint32_t channel_slot = kInvalidIndex;
+        EntryReference next_sequence_entry{};
         std::uint64_t sequence = 0U;
         l2flow::sdk::MessageKey message_key{};
         NativeSequenceRecoveryRecordClassV1 record_class =
@@ -537,20 +560,25 @@ public:
         std::uint64_t observe_calls = 0U;
         std::uint64_t apply_calls = 0U;
         std::uint64_t applied_cookie = 0U;
-        std::vector<std::byte> canonical_payload;
-    };
-
-    struct RetentionReference final {
-        std::uint32_t entry_index = kInvalidIndex;
-        std::uint32_t generation = 0U;
+        std::size_t canonical_payload_arena_size = 0U;
     };
 
     Impl(
         NativeSequenceRecoveryConfigV1 config,
         std::size_t channel_table_capacity,
         std::size_t entry_bucket_capacity,
-        std::size_t entry_capacity)
+        std::size_t entry_capacity,
+        std::size_t canonical_payload_arena_bytes)
         : config_(config),
+          canonical_payload_arena_(
+              canonical_payload_arena_bytes == 0U
+                  ? nullptr
+                  : new std::byte[canonical_payload_arena_bytes]),
+          canonical_payload_arena_bytes_(canonical_payload_arena_bytes),
+          canonical_payloads_(
+              config.preallocate_canonical_payload_arena
+                  ? 0U
+                  : entry_capacity),
           channels_(channel_table_capacity),
           entry_buckets_(entry_bucket_capacity, kInvalidIndex),
           entries_(entry_capacity),
@@ -567,10 +595,33 @@ public:
         if (!entries_.empty()) {
             free_entry_head_ = 0U;
         }
+        if (canonical_payload_arena_ != nullptr &&
+            canonical_payload_arena_bytes_ != 0U) {
+            const long system_page_size = ::sysconf(_SC_PAGESIZE);
+            const std::size_t page_size = system_page_size > 0
+                                              ? static_cast<std::size_t>(
+                                                    system_page_size)
+                                              : 4096U;
+            volatile std::byte* const arena =
+                canonical_payload_arena_.get();
+            for (std::size_t offset = 0U;
+                 offset < canonical_payload_arena_bytes_;
+                 offset += page_size) {
+                arena[offset] = std::byte{0U};
+            }
+            arena[canonical_payload_arena_bytes_ - 1U] =
+                std::byte{0U};
+        }
     }
 
     [[nodiscard]] std::uint32_t FindChannel(
         const NativeSequenceChannelV1& domain) const noexcept {
+        if (last_channel_slot_ < channels_.size()) {
+            const Channel& cached = channels_[last_channel_slot_];
+            if (cached.occupied && cached.domain == domain) {
+                return last_channel_slot_;
+            }
+        }
         const std::size_t mask = channels_.size() - 1U;
         std::size_t slot = static_cast<std::size_t>(
             Mix64(
@@ -592,6 +643,12 @@ public:
 
     [[nodiscard]] std::uint32_t FindOrCreateChannel(
         const NativeSequenceChannelV1& domain) noexcept {
+        if (last_channel_slot_ < channels_.size()) {
+            const Channel& cached = channels_[last_channel_slot_];
+            if (cached.occupied && cached.domain == domain) {
+                return last_channel_slot_;
+            }
+        }
         const std::size_t mask = channels_.size() - 1U;
         std::size_t slot = static_cast<std::size_t>(
             Mix64(
@@ -626,9 +683,11 @@ public:
                 occupied_channel_slots_[channel_count_] =
                     static_cast<std::uint32_t>(slot);
                 ++channel_count_;
+                last_channel_slot_ = static_cast<std::uint32_t>(slot);
                 return static_cast<std::uint32_t>(slot);
             }
             if (channel.domain == domain) {
+                last_channel_slot_ = static_cast<std::uint32_t>(slot);
                 return static_cast<std::uint32_t>(slot);
             }
             slot = (slot + 1U) & mask;
@@ -683,6 +742,94 @@ public:
         return kInvalidIndex;
     }
 
+    [[nodiscard]] std::uint32_t ResolveEntryReference(
+        const EntryReference& reference,
+        std::uint32_t channel_slot,
+        std::uint64_t sequence) const noexcept {
+        if (reference.entry_index >= entries_.size()) {
+            return kInvalidIndex;
+        }
+        const Entry& entry = entries_[reference.entry_index];
+        return entry.occupied &&
+                       entry.generation == reference.generation &&
+                       entry.channel_slot == channel_slot &&
+                       entry.sequence == sequence
+                   ? reference.entry_index
+                   : kInvalidIndex;
+    }
+
+    [[nodiscard]] std::uint32_t FindEntryWithHighWaterHint(
+        std::uint32_t channel_slot,
+        std::uint64_t sequence) const noexcept {
+        const Channel& channel = channels_[channel_slot];
+        if (sequence > channel.highest_allocated_sequence) {
+            return kInvalidIndex;
+        }
+        if (sequence == channel.highest_allocated_sequence) {
+            const std::uint32_t hinted = ResolveEntryReference(
+                channel.highest_allocated_entry,
+                channel_slot,
+                sequence);
+            if (hinted != kInvalidIndex) {
+                return hinted;
+            }
+        }
+        return FindEntry(channel_slot, sequence);
+    }
+
+    [[nodiscard]] std::uint32_t FindEntryForApplication(
+        std::uint32_t channel_slot,
+        std::uint64_t sequence) const noexcept {
+        const Channel& channel = channels_[channel_slot];
+        if (sequence > channel.highest_allocated_sequence) {
+            return kInvalidIndex;
+        }
+        if (sequence == channel.highest_allocated_sequence) {
+            const std::uint32_t highest = ResolveEntryReference(
+                channel.highest_allocated_entry,
+                channel_slot,
+                sequence);
+            if (highest != kInvalidIndex) {
+                return highest;
+            }
+        }
+        if (channel.last_applied_sequence != 0U &&
+            channel.last_applied_sequence !=
+                std::numeric_limits<std::uint64_t>::max() &&
+            sequence == channel.last_applied_sequence + 1U) {
+            const std::uint32_t previous = ResolveEntryReference(
+                channel.last_applied_entry,
+                channel_slot,
+                channel.last_applied_sequence);
+            if (previous != kInvalidIndex) {
+                const std::uint32_t next = ResolveEntryReference(
+                    entries_[previous].next_sequence_entry,
+                    channel_slot,
+                    sequence);
+                if (next != kInvalidIndex) {
+                    return next;
+                }
+            }
+        }
+        return FindEntry(channel_slot, sequence);
+    }
+
+    void RememberAppliedEntry(
+        std::uint32_t channel_slot,
+        std::uint32_t entry_index) noexcept {
+        if (entry_index >= entries_.size()) {
+            return;
+        }
+        const Entry& entry = entries_[entry_index];
+        if (!entry.occupied || entry.channel_slot != channel_slot) {
+            return;
+        }
+        Channel& channel = channels_[channel_slot];
+        channel.last_applied_sequence = entry.sequence;
+        channel.last_applied_entry =
+            EntryReference{entry_index, entry.generation};
+    }
+
     [[nodiscard]] std::size_t EntryBucket(
         std::uint32_t channel_slot,
         std::uint64_t sequence) const noexcept {
@@ -698,6 +845,7 @@ public:
         Entry& entry = entries_[entry_index];
         const std::size_t bucket =
             EntryBucket(entry.channel_slot, entry.sequence);
+        entry.hash_bucket = static_cast<std::uint32_t>(bucket);
         entry.hash_next = entry_buckets_[bucket];
         entry_buckets_[bucket] = entry_index;
     }
@@ -705,8 +853,11 @@ public:
     [[nodiscard]] bool RemoveEntryFromHash(
         std::uint32_t entry_index) noexcept {
         Entry& entry = entries_[entry_index];
-        const std::size_t bucket =
-            EntryBucket(entry.channel_slot, entry.sequence);
+        if (entry.hash_bucket == kInvalidIndex ||
+            entry.hash_bucket >= entry_buckets_.size()) {
+            return false;
+        }
+        const std::size_t bucket = entry.hash_bucket;
         std::uint32_t* link = &entry_buckets_[bucket];
         std::size_t traversed = 0U;
         while (*link != kInvalidIndex &&
@@ -737,7 +888,10 @@ public:
         if (generation == 0U) {
             generation = 1U;
         }
-        entry = Entry{};
+        // Constructor initialization and ReleaseEntry both leave free-list
+        // entries fully reset. Do not clear the same Entry again on every
+        // retention-slot reuse; only detach its free-list link.
+        entry.free_next = kInvalidIndex;
         entry.occupied = true;
         entry.pending = true;
         entry.generation = generation;
@@ -748,8 +902,119 @@ public:
         InsertEntryIntoHash(index);
 
         ++pending_entries_;
-        ++channels_[channel_slot].pending_entries;
+        Channel& channel = channels_[channel_slot];
+        ++channel.pending_entries;
+        if (!channel.origin_sealed &&
+            (channel.minimum_allocated_sequence == 0U ||
+             sequence < channel.minimum_allocated_sequence)) {
+            channel.minimum_allocated_sequence = sequence;
+        }
+        const EntryReference new_reference{index, generation};
+        if (sequence > channel.highest_allocated_sequence) {
+            const std::uint64_t old_highest =
+                channel.highest_allocated_sequence;
+            if (old_highest != 0U &&
+                sequence - old_highest == 1U) {
+                const std::uint32_t previous_index =
+                    ResolveEntryReference(
+                        channel.highest_allocated_entry,
+                        channel_slot,
+                        old_highest);
+                if (previous_index != kInvalidIndex) {
+                    entries_[previous_index].next_sequence_entry =
+                        new_reference;
+                }
+            }
+            channel.highest_allocated_sequence = sequence;
+            channel.highest_allocated_entry = new_reference;
+        }
+        if (channel.certified_sequence !=
+                std::numeric_limits<std::uint64_t>::max() &&
+            sequence == channel.certified_sequence + 1U) {
+            channel.next_certified_entry = new_reference;
+        }
         return index;
+    }
+
+    [[nodiscard]] std::size_t CanonicalPayloadSize(
+        std::uint32_t entry_index) const noexcept {
+        if (entry_index >= entries_.size()) {
+            return 0U;
+        }
+        const Entry& entry = entries_[entry_index];
+        return config_.preallocate_canonical_payload_arena
+                   ? entry.canonical_payload_arena_size
+                   : canonical_payloads_[entry_index].size();
+    }
+
+    [[nodiscard]] std::span<const std::byte> CanonicalPayload(
+        std::uint32_t entry_index) const noexcept {
+        if (entry_index >= entries_.size()) {
+            return {};
+        }
+        const Entry& entry = entries_[entry_index];
+        if (!config_.preallocate_canonical_payload_arena) {
+            return canonical_payloads_[entry_index];
+        }
+        const std::size_t arena_offset =
+            static_cast<std::size_t>(entry_index) *
+            config_.maximum_canonical_payload_bytes_per_entry;
+        if (canonical_payload_arena_ == nullptr ||
+            arena_offset > canonical_payload_arena_bytes_ ||
+            entry.canonical_payload_arena_size >
+                canonical_payload_arena_bytes_ -
+                    arena_offset) {
+            return {};
+        }
+        return {
+            canonical_payload_arena_.get() + arena_offset,
+            entry.canonical_payload_arena_size};
+    }
+
+    [[nodiscard]] NativeSequenceRecoveryFreezeReasonV1
+    StoreCanonicalPayload(
+        std::uint32_t entry_index,
+        std::span<const std::byte> canonical_payload) noexcept {
+        if (entry_index >= entries_.size()) {
+            return NativeSequenceRecoveryFreezeReasonV1::
+                kInternalInvariant;
+        }
+        Entry& entry = entries_[entry_index];
+        if (!config_.preallocate_canonical_payload_arena) {
+            try {
+                canonical_payloads_[entry_index].assign(
+                    canonical_payload.begin(), canonical_payload.end());
+                return NativeSequenceRecoveryFreezeReasonV1::kNone;
+            } catch (const std::bad_alloc&) {
+                return NativeSequenceRecoveryFreezeReasonV1::
+                    kPayloadCapacity;
+            } catch (...) {
+                return NativeSequenceRecoveryFreezeReasonV1::
+                    kInternalInvariant;
+            }
+        }
+        if (canonical_payload_arena_ == nullptr ||
+            canonical_payload.size() >
+                config_.maximum_canonical_payload_bytes_per_entry) {
+            return NativeSequenceRecoveryFreezeReasonV1::
+                kInternalInvariant;
+        }
+        const std::size_t arena_offset =
+            static_cast<std::size_t>(entry_index) *
+            config_.maximum_canonical_payload_bytes_per_entry;
+        if (arena_offset > canonical_payload_arena_bytes_ ||
+            canonical_payload.size() >
+                canonical_payload_arena_bytes_ -
+                    arena_offset) {
+            return NativeSequenceRecoveryFreezeReasonV1::
+                kInternalInvariant;
+        }
+        std::copy(
+            canonical_payload.begin(),
+            canonical_payload.end(),
+            canonical_payload_arena_.get() + arena_offset);
+        entry.canonical_payload_arena_size = canonical_payload.size();
+        return NativeSequenceRecoveryFreezeReasonV1::kNone;
     }
 
     void ReleaseEntry(std::uint32_t entry_index) noexcept {
@@ -770,16 +1035,20 @@ public:
         if (entry.retained && retained_entries_ > 0U) {
             --retained_entries_;
         }
-        if (entry.canonical_payload.size() <=
-            canonical_payload_bytes_) {
+        const std::size_t canonical_payload_size =
+            CanonicalPayloadSize(entry_index);
+        if (canonical_payload_size <= canonical_payload_bytes_) {
             canonical_payload_bytes_ -=
-                entry.canonical_payload.size();
+                canonical_payload_size;
         } else {
             canonical_payload_bytes_ = 0U;
         }
         const std::uint32_t generation = entry.generation;
         static_cast<void>(RemoveEntryFromHash(entry_index));
-        std::vector<std::byte>().swap(entry.canonical_payload);
+        if (!config_.preallocate_canonical_payload_arena) {
+            std::vector<std::byte>().swap(
+                canonical_payloads_[entry_index]);
+        }
         entry = Entry{};
         entry.generation = generation;
         entry.free_next = free_entry_head_;
@@ -787,7 +1056,7 @@ public:
     }
 
     [[nodiscard]] bool ReferenceIsLiveRetained(
-        const RetentionReference& reference) const noexcept {
+        const EntryReference& reference) const noexcept {
         if (reference.entry_index >= entries_.size()) {
             return false;
         }
@@ -835,24 +1104,28 @@ public:
         return false;
     }
 
-    [[nodiscard]] RetentionReference PopRetentionFront() noexcept {
-        RetentionReference output{};
+    [[nodiscard]] EntryReference PopRetentionFront() noexcept {
+        EntryReference output{};
         if (retention_queue_count_ == 0U) {
             return output;
         }
         output = retention_queue_[retention_queue_head_];
-        retention_queue_head_ =
-            (retention_queue_head_ + 1U) %
-            retention_queue_.size();
+        ++retention_queue_head_;
+        if (retention_queue_head_ == retention_queue_.size()) {
+            retention_queue_head_ = 0U;
+        }
         --retention_queue_count_;
         return output;
     }
 
     void PushRetentionBack(
-        RetentionReference reference) noexcept {
+        EntryReference reference) noexcept {
+        const std::size_t tail_room =
+            retention_queue_.size() - retention_queue_head_;
         const std::size_t position =
-            (retention_queue_head_ + retention_queue_count_) %
-            retention_queue_.size();
+            retention_queue_count_ >= tail_room
+                ? retention_queue_count_ - tail_room
+                : retention_queue_head_ + retention_queue_count_;
         retention_queue_[position] = reference;
         ++retention_queue_count_;
     }
@@ -865,7 +1138,7 @@ public:
         for (std::size_t attempt = 0U;
              attempt < attempts;
              ++attempt) {
-            const RetentionReference reference =
+            const EntryReference reference =
                 PopRetentionFront();
             if (!ReferenceIsLiveRetained(reference)) {
                 return true;
@@ -909,7 +1182,7 @@ public:
         entry.retained = true;
         ++retained_entries_;
         PushRetentionBack(
-            RetentionReference{entry_index, entry.generation});
+            EntryReference{entry_index, entry.generation});
     }
 
     void FreezeChannel(
@@ -941,20 +1214,6 @@ public:
             channel.correction_sequence = sequence;
         }
         IncrementCounter(&channel.correction_arrivals);
-    }
-
-    [[nodiscard]] std::uint64_t MinimumStagedSequence(
-        std::uint32_t channel_slot) const noexcept {
-        std::uint64_t minimum = 0U;
-        for (const Entry& entry : entries_) {
-            if (!entry.occupied || entry.channel_slot != channel_slot) {
-                continue;
-            }
-            if (minimum == 0U || entry.sequence < minimum) {
-                minimum = entry.sequence;
-            }
-        }
-        return minimum;
     }
 
     // Rebuilds the dense observed prefix from a caller-supplied baseline.
@@ -1058,6 +1317,8 @@ public:
             channel.initialized = true;
             channel.origin_sequence = entry.sequence;
             channel.certified_sequence = entry.sequence - 1U;
+            channel.next_certified_entry =
+                EntryReference{entry_index, entry.generation};
             channel.observed_contiguous_sequence = entry.sequence;
             channel.highest_observed_sequence = entry.sequence;
             return true;
@@ -1066,6 +1327,8 @@ public:
             entry.sequence < channel.origin_sequence) {
             channel.origin_sequence = entry.sequence;
             channel.certified_sequence = entry.sequence - 1U;
+            channel.next_certified_entry =
+                EntryReference{entry_index, entry.generation};
             RecomputeObservedPrefix(
                 channel_slot, channel.certified_sequence);
             return true;
@@ -1242,27 +1505,13 @@ public:
                     output);
                 return NativeSequenceRecoveryApplyErrorV1::kNone;
             }
-            try {
-                entry.canonical_payload.assign(
-                    canonical_payload.begin(),
-                    canonical_payload.end());
-            } catch (const std::bad_alloc&) {
+            const NativeSequenceRecoveryFreezeReasonV1 store_failure =
+                StoreCanonicalPayload(entry_index, canonical_payload);
+            if (store_failure !=
+                NativeSequenceRecoveryFreezeReasonV1::kNone) {
                 FreezeChannel(
                     channel_slot,
-                    NativeSequenceRecoveryFreezeReasonV1::
-                        kPayloadCapacity);
-                FillApplyResult(
-                    channel,
-                    nullptr,
-                    NativeSequenceRecoveryApplyDispositionV1::
-                        kResourceFrozen,
-                    output);
-                return NativeSequenceRecoveryApplyErrorV1::kNone;
-            } catch (...) {
-                FreezeChannel(
-                    channel_slot,
-                    NativeSequenceRecoveryFreezeReasonV1::
-                        kInternalInvariant);
+                    store_failure);
                 FillApplyResult(
                     channel,
                     nullptr,
@@ -1304,12 +1553,12 @@ public:
             return NativeSequenceRecoveryApplyErrorV1::kNone;
         }
 
+        const auto stored_payload = CanonicalPayload(entry_index);
         const bool exact =
-            entry.canonical_payload.size() ==
-                canonical_payload.size() &&
+            stored_payload.size() == canonical_payload.size() &&
             std::equal(
-                entry.canonical_payload.begin(),
-                entry.canonical_payload.end(),
+                stored_payload.begin(),
+                stored_payload.end(),
                 canonical_payload.begin());
         if (!exact) {
             IncrementCounter(&channel.conflicts);
@@ -1360,14 +1609,18 @@ public:
     }
 
     NativeSequenceRecoveryConfigV1 config_{};
+    std::unique_ptr<std::byte[]> canonical_payload_arena_;
+    std::size_t canonical_payload_arena_bytes_ = 0U;
+    std::vector<std::vector<std::byte>> canonical_payloads_;
     std::vector<Channel> channels_;
     std::vector<std::uint32_t> entry_buckets_;
     std::vector<Entry> entries_;
-    std::vector<RetentionReference> retention_queue_;
+    std::vector<EntryReference> retention_queue_;
     // Dense list of occupied open-addressing slots. Polling readiness over
     // actual channels, rather than the capacity-sized hash table, keeps the
     // normal one/few-channel cost independent of maximum_channels.
     std::vector<std::uint32_t> occupied_channel_slots_;
+    std::uint32_t last_channel_slot_ = kInvalidIndex;
     std::uint32_t free_entry_head_ = kInvalidIndex;
     std::size_t retention_queue_head_ = 0U;
     std::size_t retention_queue_count_ = 0U;
@@ -1446,6 +1699,23 @@ NativeSequenceRecoveryCoordinatorV1::Create(
         return NativeSequenceRecoveryCreateErrorV1::
             kInvalidConfiguration;
     }
+    std::size_t canonical_payload_arena_bytes = 0U;
+    if (config.preallocate_canonical_payload_arena) {
+        if (config.maximum_canonical_payload_bytes_per_entry >
+                std::numeric_limits<std::size_t>::max() /
+                    entry_capacity) {
+            return NativeSequenceRecoveryCreateErrorV1::
+                kInvalidConfiguration;
+        }
+        canonical_payload_arena_bytes =
+            entry_capacity *
+            config.maximum_canonical_payload_bytes_per_entry;
+        if (canonical_payload_arena_bytes >
+            config.maximum_total_canonical_payload_bytes) {
+            return NativeSequenceRecoveryCreateErrorV1::
+                kInvalidConfiguration;
+        }
+    }
     std::size_t channel_table_capacity = 0U;
     std::size_t entry_bucket_capacity = 0U;
     if (!ComputeTableCapacity(
@@ -1463,7 +1733,8 @@ NativeSequenceRecoveryCoordinatorV1::Create(
             config,
             channel_table_capacity,
             entry_bucket_capacity,
-            entry_capacity);
+            entry_capacity,
+            canonical_payload_arena_bytes);
         auto coordinator =
             std::unique_ptr<NativeSequenceRecoveryCoordinatorV1>(
                 new NativeSequenceRecoveryCoordinatorV1(
@@ -1559,7 +1830,7 @@ NativeSequenceRecoveryCoordinatorV1::SealPartialOrigin(
     }
 
     const std::uint64_t minimum_staged =
-        impl_->MinimumStagedSequence(channel_slot);
+        channel.minimum_allocated_sequence;
     if (minimum_staged != 0U && origin_sequence > minimum_staged) {
         fill_result(
             NativeSequenceRecoverySealDispositionV1::
@@ -1567,13 +1838,37 @@ NativeSequenceRecoveryCoordinatorV1::SealPartialOrigin(
         return NativeSequenceRecoverySealErrorV1::kNone;
     }
 
+    const bool had_observed_prefix = channel.initialized;
+    const std::uint64_t previous_origin_sequence =
+        channel.origin_sequence;
+    const bool observed_prefix_matches_origin =
+        had_observed_prefix &&
+        previous_origin_sequence == origin_sequence &&
+        channel.certified_sequence == origin_sequence - 1U;
     channel.initialized = true;
     channel.origin_sealed = true;
     channel.origin_proof = proof;
     channel.origin_sequence = origin_sequence;
     channel.certified_sequence = origin_sequence - 1U;
-    impl_->RecomputeObservedPrefix(
-        channel_slot, channel.certified_sequence);
+    if (!observed_prefix_matches_origin) {
+        channel.next_certified_entry = Impl::EntryReference{};
+        if (!had_observed_prefix) {
+            // An applied-only or empty channel has no observed positions to
+            // scan. Anchor its observation frontier immediately before the
+            // sealed origin; later Observe calls advance it normally.
+            channel.observed_contiguous_sequence =
+                channel.certified_sequence;
+            channel.highest_observed_sequence =
+                channel.certified_sequence;
+            channel.observed_above_contiguous = 0U;
+        } else {
+            // A caller-selected origin below the provisional observed origin
+            // changes the prefix anchor. This is rare and retains the full
+            // recomputation for correctness.
+            impl_->RecomputeObservedPrefix(
+                channel_slot, channel.certified_sequence);
+        }
+    }
     if (channel.highest_observed_sequence >
             channel.certified_sequence &&
         channel.highest_observed_sequence -
@@ -1630,7 +1925,8 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
     }
 
     const std::uint32_t existing_index =
-        impl_->FindEntry(channel_slot, descriptor.sequence);
+        impl_->FindEntryWithHighWaterHint(
+            channel_slot, descriptor.sequence);
     if (existing_index != kInvalidIndex) {
         Impl::Entry& entry = impl_->entries_[existing_index];
         if (!(entry.message_key == message_key) ||
@@ -2007,7 +2303,8 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
     }
 
     std::uint32_t entry_index =
-        impl_->FindEntry(channel_slot, descriptor.sequence);
+        impl_->FindEntryForApplication(
+            channel_slot, descriptor.sequence);
     if (channel.correction_required && entry_index == kInvalidIndex) {
         impl_->FillApplyResult(
             channel,
@@ -2136,6 +2433,13 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
         applied_cookie,
         output);
     if (error == NativeSequenceRecoveryApplyErrorV1::kNone &&
+        (output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::kApplied ||
+         output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::kExactDuplicate)) {
+        impl_->RememberAppliedEntry(channel_slot, entry_index);
+    }
+    if (error == NativeSequenceRecoveryApplyErrorV1::kNone &&
         channel.correction_required &&
         (output->disposition ==
              NativeSequenceRecoveryApplyDispositionV1::kApplied ||
@@ -2206,6 +2510,14 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
         applied_cookie,
         output);
     if (error == NativeSequenceRecoveryApplyErrorV1::kNone &&
+        (output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::kApplied ||
+         output->disposition ==
+             NativeSequenceRecoveryApplyDispositionV1::kExactDuplicate)) {
+        impl_->RememberAppliedEntry(
+            token.channel_slot, token.entry_index);
+    }
+    if (error == NativeSequenceRecoveryApplyErrorV1::kNone &&
         channel.correction_required &&
         (output->disposition ==
              NativeSequenceRecoveryApplyDispositionV1::kApplied ||
@@ -2230,12 +2542,18 @@ NativeSequenceRecoveryCoordinatorV1::PollCertified(
     if (channel_count == 0U) {
         return NativeSequenceRecoveryPollErrorV1::kNotReady;
     }
+    const auto advance_cursor = [channel_count](
+                                    std::size_t cursor) noexcept {
+        ++cursor;
+        return cursor == channel_count ? 0U : cursor;
+    };
     for (std::size_t inspected = 0U;
          inspected < channel_count;
          ++inspected) {
-        const std::size_t dense_index =
-            (impl_->poll_cursor_ + inspected) %
-            channel_count;
+        std::size_t dense_index = impl_->poll_cursor_ + inspected;
+        if (dense_index >= channel_count) {
+            dense_index -= channel_count;
+        }
         const std::uint32_t slot =
             impl_->occupied_channel_slots_[dense_index];
         if (slot == kInvalidIndex ||
@@ -2258,10 +2576,22 @@ NativeSequenceRecoveryCoordinatorV1::PollCertified(
                     next_sequence)) {
                 break;
             }
-            const std::uint32_t entry_index =
-                impl_->FindEntry(
+            std::uint32_t entry_index =
+                impl_->ResolveEntryReference(
+                    channel.next_certified_entry,
                     slot,
                     next_sequence);
+            if (entry_index == kInvalidIndex) {
+                entry_index = impl_->FindEntryWithHighWaterHint(
+                    slot, next_sequence);
+                if (entry_index != kInvalidIndex) {
+                    const Impl::Entry& found =
+                        impl_->entries_[entry_index];
+                    channel.next_certified_entry =
+                        Impl::EntryReference{
+                            entry_index, found.generation};
+                }
+            }
             if (entry_index == kInvalidIndex) {
                 impl_->FreezeChannel(
                     slot,
@@ -2285,8 +2615,7 @@ NativeSequenceRecoveryCoordinatorV1::PollCertified(
                 output->message_key = entry.message_key;
                 output->record_class =
                     NativeSequenceRecoveryRecordClassV1::kFiltered;
-                impl_->poll_cursor_ =
-                    (dense_index + 1U) % channel_count;
+                impl_->poll_cursor_ = advance_cursor(dense_index);
                 return NativeSequenceRecoveryPollErrorV1::kNone;
             }
             if (entry.observe_calls == 0U ||
@@ -2300,13 +2629,13 @@ NativeSequenceRecoveryCoordinatorV1::PollCertified(
             output->record_class =
                 NativeSequenceRecoveryRecordClassV1::kTarget;
             output->applied_cookie = entry.applied_cookie;
-            impl_->poll_cursor_ =
-                (dense_index + 1U) % channel_count;
+            output->canonical_payload =
+                impl_->CanonicalPayload(entry_index);
+            impl_->poll_cursor_ = advance_cursor(dense_index);
             return NativeSequenceRecoveryPollErrorV1::kNone;
         }
     }
-    impl_->poll_cursor_ =
-        (impl_->poll_cursor_ + 1U) % channel_count;
+    impl_->poll_cursor_ = advance_cursor(impl_->poll_cursor_);
     return NativeSequenceRecoveryPollErrorV1::kNotReady;
 }
 
@@ -2349,24 +2678,25 @@ NativeSequenceRecoveryCoordinatorV1::CommitCertified(
     }
     if (entry.record_class ==
         NativeSequenceRecoveryRecordClassV1::kFiltered) {
-        channel.certified_sequence = entry.sequence;
         IncrementCounter(
             &channel.filtered_sequences_certified);
-        impl_->FinishPendingAndRetain(token.entry_index);
-        return NativeSequenceRecoveryCommitErrorV1::kNone;
+    } else {
+        if (entry.record_class !=
+            NativeSequenceRecoveryRecordClassV1::kTarget) {
+            return NativeSequenceRecoveryCommitErrorV1::
+                kWrongRecordClass;
+        }
+        if (impl_->HasBlockingDuplicateVerification(
+                token.channel_slot, entry.sequence)) {
+            return NativeSequenceRecoveryCommitErrorV1::kNotApplied;
+        }
+        if (entry.apply_calls < entry.observe_calls) {
+            return NativeSequenceRecoveryCommitErrorV1::kNotApplied;
+        }
     }
-    if (entry.record_class !=
-        NativeSequenceRecoveryRecordClassV1::kTarget) {
-        return NativeSequenceRecoveryCommitErrorV1::
-            kWrongRecordClass;
-    }
-    if (impl_->HasBlockingDuplicateVerification(
-            token.channel_slot, entry.sequence)) {
-        return NativeSequenceRecoveryCommitErrorV1::kNotApplied;
-    }
-    if (entry.apply_calls < entry.observe_calls) {
-        return NativeSequenceRecoveryCommitErrorV1::kNotApplied;
-    }
+    // FinishPendingAndRetain may release and reset entry immediately. Copy
+    // the successor hint before advancing the frontier.
+    channel.next_certified_entry = entry.next_sequence_entry;
     channel.certified_sequence = entry.sequence;
     impl_->FinishPendingAndRetain(token.entry_index);
     return NativeSequenceRecoveryCommitErrorV1::kNone;

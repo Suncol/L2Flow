@@ -1,5 +1,7 @@
 #include "l2flow/market/shanghai_order_event_aggregator_v1.h"
 
+#include "fixed_order_state_table_v1.h"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -172,6 +174,23 @@ struct OrderState final {
     bool terminal = false;
     bool finalization_emitted = false;
 };
+
+struct OrderStateKeyAccessor final {
+    [[nodiscard]] ShanghaiOrderKeyV1& operator()(
+        OrderState& state) const noexcept {
+        return state.snapshot.key;
+    }
+
+    [[nodiscard]] const ShanghaiOrderKeyV1& operator()(
+        const OrderState& state) const noexcept {
+        return state.snapshot.key;
+    }
+};
+
+using OrderStateTable = internal::FixedOrderStateTableV1<
+    ShanghaiOrderKeyV1,
+    OrderState,
+    OrderStateKeyAccessor>;
 
 [[nodiscard]] bool HasConflict(const OrderState& state) noexcept {
     return (state.snapshot.quality_flags &
@@ -596,8 +615,9 @@ ShanghaiOrderEventProjectionV1 ProjectShanghaiOrderEventInputV1(
 class ShanghaiOrderEventAggregatorV1::Impl final {
 public:
     explicit Impl(
-        ShanghaiOrderEventAggregatorConfigV1 config) noexcept
-        : config_(config) {}
+        ShanghaiOrderEventAggregatorConfigV1 config)
+        : config_(config),
+          orders_(config.maximum_order_states) {}
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 Consume(
         const ShanghaiOrderEventInputV1& input,
@@ -681,8 +701,10 @@ public:
                 kInvalidInput;
         }
         output->reserve(orders_.size());
-        for (auto& [key, state] : orders_) {
-            static_cast<void>(key);
+        const auto sorted = orders_.SortedIndices(
+            [](const OrderState&) noexcept { return true; });
+        for (const std::uint32_t index : sorted) {
+            OrderState& state = orders_.At(index);
             const ShanghaiOrderAggregatorConsumeErrorV1 error =
                 FinalizeState(source_anchor, &state, output);
             if (error !=
@@ -706,11 +728,11 @@ public:
             key.order_id <= 0) {
             return ShanghaiOrderAggregatorQueryErrorV1::kInvalidKey;
         }
-        const auto found = orders_.find(key);
-        if (found == orders_.end()) {
+        const OrderState* const found = orders_.Find(key);
+        if (found == nullptr) {
             return ShanghaiOrderAggregatorQueryErrorV1::kNotFound;
         }
-        *output = found->second.snapshot;
+        *output = found->snapshot;
         return ShanghaiOrderAggregatorQueryErrorV1::kNone;
     }
 
@@ -746,9 +768,8 @@ private:
         const ShanghaiOrderEventInputV1& input) {
         OrderState initial{};
         InitializeState(key, side, side_source, input, &initial);
-        const auto [position, inserted] =
-            orders_.emplace(key, std::move(initial));
-        return inserted ? &position->second : nullptr;
+        const auto result = orders_.Insert(key, std::move(initial));
+        return result.inserted ? result.state : nullptr;
     }
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 EmitRevision(
@@ -790,8 +811,8 @@ private:
             input.instrument_id,
             input.channel,
             input.primary_order_id};
-        auto found = orders_.find(key);
-        if (found == orders_.end()) {
+        OrderState* found = orders_.Find(key);
+        if (found == nullptr) {
             const ShanghaiOrderAggregatorConsumeErrorV1 capacity =
                 EnsureCapacity();
             if (capacity !=
@@ -812,18 +833,17 @@ private:
                 kNumericOverflow;
         }
         output->reserve(1U);
-        if (found == orders_.end()) {
-            OrderState* inserted = InsertState(
+        if (found == nullptr) {
+            found = InsertState(
                 key,
                 input.side,
                 ShanghaiOrderSideSourceV1::kSourceAddFlag,
                 input);
-            if (inserted == nullptr) {
+            if (found == nullptr) {
                 return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
             }
-            found = orders_.find(key);
         }
-        OrderState& state = found->second;
+        OrderState& state = *found;
         if (state.snapshot.add_seen) {
             state.snapshot.quality_flags |=
                 ShanghaiOrderQualityBitV1(
@@ -994,9 +1014,9 @@ private:
 
         std::size_t required_new_states = 0U;
         for (Reference& reference : references) {
-            auto found = orders_.find(reference.key);
-            if (found != orders_.end()) {
-                reference.state = &found->second;
+            OrderState* const found = orders_.Find(reference.key);
+            if (found != nullptr) {
+                reference.state = found;
                 if (!CanApplyTrade(
                         *reference.state,
                         input.quantity,
@@ -1087,13 +1107,13 @@ private:
             input.instrument_id,
             input.channel,
             input.primary_order_id};
-        auto found = orders_.find(key);
-        if (found != orders_.end() &&
-            !CanApplyCancel(found->second, input.quantity)) {
+        OrderState* const found = orders_.Find(key);
+        if (found != nullptr &&
+            !CanApplyCancel(*found, input.quantity)) {
             return ShanghaiOrderAggregatorConsumeErrorV1::
                 kNumericOverflow;
         }
-        output->reserve(found == orders_.end() ? 1U : 2U);
+        output->reserve(found == nullptr ? 1U : 2U);
         ShanghaiCancelEventV1 cancel{};
         cancel.key = key;
         cancel.source_anchor = input.anchor;
@@ -1103,17 +1123,17 @@ private:
                               : TradingPhaseV1::kUnknown;
         cancel.quantity = input.quantity;
         cancel.referenced_order_found =
-            found != orders_.end();
+            found != nullptr;
         cancel.source_quality_flags =
             input.source_quality_flags;
         cancel.source_market_notices =
             input.source_market_notices;
         output->emplace_back(std::move(cancel));
-        if (found == orders_.end()) {
+        if (found == nullptr) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
         }
-        ApplyCancel(input, &found->second);
-        return EmitRevision(input.anchor, &found->second, output);
+        ApplyCancel(input, found);
+        return EmitRevision(input.anchor, found, output);
     }
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeStatus(
@@ -1147,14 +1167,17 @@ private:
             input.phase != TradingPhaseV1::kEnd) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
         }
-        for (auto& [key, state] : orders_) {
-            if (SameInstrument(key, input)) {
-                const ShanghaiOrderAggregatorConsumeErrorV1 error =
-                    FinalizeState(input.anchor, &state, output);
-                if (error !=
-                    ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
-                    return error;
-                }
+        const auto sorted = orders_.SortedIndices(
+            [&input](const OrderState& state) noexcept {
+                return SameInstrument(state.snapshot.key, input);
+            });
+        for (const std::uint32_t index : sorted) {
+            OrderState& state = orders_.At(index);
+            const ShanghaiOrderAggregatorConsumeErrorV1 error =
+                FinalizeState(input.anchor, &state, output);
+            if (error !=
+                ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
+                return error;
             }
         }
         return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
@@ -1181,7 +1204,7 @@ private:
     }
 
     ShanghaiOrderEventAggregatorConfigV1 config_{};
-    std::map<ShanghaiOrderKeyV1, OrderState> orders_;
+    OrderStateTable orders_;
     std::map<std::int32_t, std::int64_t>
         last_native_sequence_by_channel_;
     std::uint64_t last_ordering_sequence_ = 0U;

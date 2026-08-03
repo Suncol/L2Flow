@@ -136,7 +136,8 @@ def _latency_log(workers: int = 8) -> str:
             "HISTORY_ENV capacity=12000 bound_instruments=12000 "
             "snapshot_fill=11997 worker_count=4 tick_ring_capacity=262144 "
             "scenario=from_open server_state=ACTIVE coverage_from_open=1 "
-            "online_recovery=0 factor_generation_enabled=1 "
+            "online_recovery=0 partial_event_v2=0 "
+            "factor_generation_enabled=1 "
             "generation_visibility=forced_cut "
             "requested_page_records=4096 price_repeats=20 "
             "all_column_repeats=10 raw_polars_records=4096 "
@@ -148,6 +149,10 @@ def _latency_log(workers: int = 8) -> str:
             f"enabled={1 if workers else 0} configured_workers={workers} "
             f"reported_workers={workers} "
             "scenario=from_open coverage_from_open=1 online_recovery=0 "
+            "partial_event_v2=0 partial_event_healthy=1 "
+            "partial_event_state=1 partial_event_applied_records=0 "
+            "partial_event_observed_native=0 partial_event_enqueued=0 "
+            "partial_event_processed=0 partial_event_dropped=0 "
             "factor_generation_enabled=1 final_factor_generation_present=1 "
             f"inline_messages={12345 if workers else 0} "
             "farm_messages=0 active_parse_workers=0 "
@@ -201,7 +206,8 @@ def _latency_log(workers: int = 8) -> str:
     ) + "\n"
 
 
-def _startup_throughput_log() -> str:
+def _startup_throughput_log(sink: str = "fast") -> str:
+    certified = sink == "fast_certified"
     common: dict[str, object] = {
         "target_rps": 100,
         "duration_ms": 1_000,
@@ -210,10 +216,12 @@ def _startup_throughput_log() -> str:
         "server_state": "ACTIVE",
         "coverage_from_open": 1,
         "online_recovery": 0,
+        "partial_event_v2": 0,
+        "certified_event_v1": int(certified),
         "factor_generation_enabled": 1,
         "generation_interval_ms": 1_000,
         "workload": "five_tuple_uniform",
-        "sink": "fast",
+        "sink": sink,
         "instruments_per_market": 256,
         "parallel_decoder_workers": 0,
         "decoder_queue_capacity_per_source": 65_536,
@@ -230,6 +238,8 @@ def _startup_throughput_log() -> str:
         "parallel_farm_activation_configured": 8_192,
         "parallel_farm_activation_effective": 8_192,
         "tick_ring_capacity": 262_144,
+        "certified_handoff_queue_capacity": 4_194_304,
+        "partial_event_handoff_queue_capacity": 262_144,
         "pacing": "absolute_deadline_one_based_no_batch_wait",
         "clock": "CLOCK_MONOTONIC",
         "affinity": "0,1;count=2",
@@ -242,6 +252,8 @@ def _startup_throughput_log() -> str:
         "achieved_offered_rps": "100.000",
         "history_ready_elapsed_ns": 1_000_000_000,
         "history_ready_rps": "100.000",
+        "full_path_ready_elapsed_ns": 1_000_000_000,
+        "full_path_ready_rps": "100.000",
         "accepted": 100,
         "decoded": 100,
         "applied": 100,
@@ -262,18 +274,52 @@ def _startup_throughput_log() -> str:
         "final_generation": 2,
         "final_factor_generation_present": 1,
         "backlog_before_drain": 0,
+        "event_backlog_before_drain": 0,
+        "event_backlog_q25": 0,
+        "event_backlog_q50": 0,
+        "event_backlog_q75": 0,
+        "event_backlog_q100": 0,
+        "event_sampled_high_water": 0,
         "final_drain_and_cut_elapsed_ns": 1_000,
         "history_integrity_validation_elapsed_ns": 2_000,
+        "partial_event_state": 1,
+        "partial_event_applied_records": 0,
+        "partial_event_observed_native": 0,
+        "partial_event_enqueued": 0,
+        "partial_event_processed": 0,
+        "partial_event_queue_high_water": 0,
+        "partial_event_reorder_high_water": 0,
+        "certified_handoff_queue_capacity": 4_194_304,
+        "partial_event_handoff_queue_capacity": 262_144,
+        "certified_queue_depth_before_drain": 0,
+        "certified_wire_snapshot_consistent": int(certified),
+        "certified_observed_native": 60 if certified else 0,
+        "certified_tick_count": 60 if certified else 0,
+        "certified_enqueued_observations": 60 if certified else 0,
+        "certified_enqueued_applied": 60 if certified else 0,
+        "certified_processed": 120 if certified else 0,
+        "certified_resource_exhaustions": 0,
+        "certified_pending": 0,
+        "certified_tick_history_failed": 0,
+        "certified_tick_history_lag": 0,
+        "certified_event_generation_error": 0,
+        "certified_event_generation_valid": 1,
+        "certified_event_input_frontier": 60 if certified else 0,
+        "certified_event_count": 80 if certified else 0,
     }
     for key in (
         "target_met",
         "process_survived",
         "accepting_before_drain",
         "steady_state_met",
+        "pipeline_steady_state_met",
+        "event_steady_state_met",
         "complete_prefix",
         "stopped_clean",
         "certified_idle",
         "certified_healthy",
+        "partial_event_idle",
+        "partial_event_healthy",
         "final_cut_published",
         "generation_sequence_valid",
         "history_endpoint_valid",
@@ -306,6 +352,13 @@ def _startup_throughput_log() -> str:
         "certified_dropped",
         "certified_frozen_channels",
         "certified_global_frozen",
+        "partial_event_last_error",
+        "partial_event_dropped",
+        "partial_event_queue_depth",
+        "partial_event_pending",
+        "partial_event_global_frozen",
+        "partial_event_journal_failed",
+        "partial_event_history_failed",
     ):
         result[key] = 0
 
@@ -485,7 +538,14 @@ class MatrixHarnessTests(unittest.TestCase):
 
 
 class StartupModeHarnessTests(unittest.TestCase):
-    def _parse(self, text: str):
+    def _parse(
+        self,
+        text: str,
+        *,
+        sink: str = "fast",
+        allow_capacity_failure: bool = False,
+        process_returncode: int = 0,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "throughput.log"
             path.write_text(text, encoding="utf-8")
@@ -503,12 +563,43 @@ class StartupModeHarnessTests(unittest.TestCase):
                 workload="five_tuple_uniform",
                 generation_interval_ms=1_000,
                 requested_affinity=frozenset((0, 1)),
+                sink=sink,
+                allow_capacity_failure=allow_capacity_failure,
+                process_returncode=process_returncode,
             )
 
     def test_exact_throughput_contract_parses(self) -> None:
         row = self._parse(_startup_throughput_log())
         self.assertEqual(row["achieved_offered_rps"], 100.0)
         self.assertEqual(row["history_ready_rps"], 100.0)
+
+    def test_certified_event_contract_parses(self) -> None:
+        row = self._parse(
+            _startup_throughput_log("fast_certified"),
+            sink="fast_certified",
+        )
+        self.assertTrue(row["full_path_pass"])
+        self.assertEqual(row["certified_event_count"], "80")
+
+    def test_lossless_fast_steady_state_failure_is_classified(self) -> None:
+        failed = _startup_throughput_log()
+        for before, after in (
+            (" target_met=1 ", " target_met=0 "),
+            (" steady_state_met=1 ", " steady_state_met=0 "),
+            (
+                " pipeline_steady_state_met=1 ",
+                " pipeline_steady_state_met=0 ",
+            ),
+        ):
+            failed = failed.replace(before, after)
+        row = self._parse(
+            failed,
+            allow_capacity_failure=True,
+            process_returncode=1,
+        )
+        self.assertEqual(
+            row["failure_class"], "fast_history_steady_state_backlog"
+        )
 
     def test_missing_expected_environment_field_fails_closed(self) -> None:
         malformed = _startup_throughput_log().replace(

@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -109,21 +110,28 @@ UnpackPublishedError(std::uint64_t packed) noexcept {
         static_cast<std::uint32_t>(packed));
 }
 
-[[nodiscard]] bool IncrementSaturating(
-    std::atomic<std::uint64_t>* value) noexcept {
+[[nodiscard]] bool AddSaturating(
+    std::atomic<std::uint64_t>* value,
+    std::uint64_t increment) noexcept {
     std::uint64_t current = value->load(std::memory_order_relaxed);
     for (;;) {
-        if (current == std::numeric_limits<std::uint64_t>::max()) {
+        if (increment >
+            std::numeric_limits<std::uint64_t>::max() - current) {
             return false;
         }
         if (value->compare_exchange_weak(
                 current,
-                current + 1U,
+                current + increment,
                 std::memory_order_release,
                 std::memory_order_relaxed)) {
             return true;
         }
     }
+}
+
+[[nodiscard]] bool IncrementSaturating(
+    std::atomic<std::uint64_t>* value) noexcept {
+    return AddSaturating(value, 1U);
 }
 
 void StoreMaximum(
@@ -175,40 +183,185 @@ void StoreMaximum(
                : sdk::MessageKey{6U, 101U, 36U};
 }
 
-[[nodiscard]] RealtimeWireTickPayloadV2 CanonicalBusinessPayload(
-    const RealtimeWireTickPayloadV2& payload) noexcept {
-    RealtimeWireTickPayloadV2 result = payload;
-    result.common.source_sequence = 0U;
-    result.common.ingress_sequence = 0U;
-    result.common.tick_stream_sequence = 0U;
-    result.common.vendor_sequence_id = 0U;
-    result.common.recv_realtime_ns = 0;
-    result.common.recv_monotonic_ns = 0;
-    result.common.vendor_local_time_raw = 0U;
-    result.common.source_stream_id = 0U;
-    result.common.source_slot = 0U;
-    result.common.quality_flags &=
+void CanonicalizeBusinessPayload(
+    RealtimeWireTickPayloadV2* payload) noexcept {
+    payload->common.source_sequence = 0U;
+    payload->common.ingress_sequence = 0U;
+    payload->common.tick_stream_sequence = 0U;
+    payload->common.vendor_sequence_id = 0U;
+    payload->common.recv_realtime_ns = 0;
+    payload->common.recv_monotonic_ns = 0;
+    payload->common.vendor_local_time_raw = 0U;
+    payload->common.source_stream_id = 0U;
+    payload->common.source_slot = 0U;
+    payload->common.quality_flags &=
         ~l2flow::control::QualityBit(
             l2flow::control::QualityFlagV1::kNullValuePresent);
-    result.common.market_notices &=
+    payload->common.market_notices &=
         ~market::MarketNoticeBitV1(
             market::MarketNoticeV1::kVendorLocalTimeInvalid);
-    return result;
 }
 
-enum class HandoffKind : std::uint8_t {
-    kObservation = 1U,
-    kApplied = 2U,
-};
+[[nodiscard]] const market::DecodedMarketCommonV1* StoredCommon(
+    const market::RealtimeHistoryRecordV1& record) noexcept {
+    return std::visit(
+        [](const auto* event) noexcept
+            -> const market::DecodedMarketCommonV1* {
+            return event == nullptr ? nullptr : &event->common;
+        },
+        record.event());
+}
 
-struct Handoff final {
-    HandoffKind kind = HandoffKind::kObservation;
-    std::array<std::uint8_t, 7U> reserved{};
-    realtime::NativeSequenceObservationV1 observation{};
+[[nodiscard]] bool RestoreArrivalMetadata(
+    const market::RealtimeHistoryRecordV1& record,
+    RealtimeWireTickPayloadV2* payload) noexcept {
+    constexpr std::uint64_t null_value_mask =
+        l2flow::control::QualityBit(
+            l2flow::control::QualityFlagV1::kNullValuePresent);
+    constexpr std::uint64_t vendor_time_mask =
+        market::MarketNoticeBitV1(
+            market::MarketNoticeV1::kVendorLocalTimeInvalid);
+    if (payload == nullptr) {
+        return false;
+    }
+    const market::DecodedMarketCommonV1* const common =
+        StoredCommon(record);
+    if (common == nullptr ||
+        common->instrument_id != record.instrument_id() ||
+        !market::IsTickEventKindV1(record.kind()) ||
+        payload->common.instrument_id != record.instrument_id() ||
+        common->ordinal !=
+            static_cast<std::size_t>(payload->common.ordinal) ||
+        common->kind != record.kind() ||
+        payload->common.event_kind !=
+            static_cast<std::uint8_t>(record.kind()) ||
+        common->origin.source_stream_id !=
+            record.source_stream_id() ||
+        common->origin.source_sequence !=
+            record.source_sequence() ||
+        (payload->common.quality_flags & ~null_value_mask) !=
+            (common->quality_flags & ~null_value_mask) ||
+        (payload->common.market_notices & ~vendor_time_mask) !=
+            (common->market_notices & ~vendor_time_mask)) {
+        return false;
+    }
+    payload->common.source_sequence = record.source_sequence();
+    payload->common.ingress_sequence = record.ingress_sequence();
+    payload->common.tick_stream_sequence =
+        record.tick_stream_sequence();
+    payload->common.vendor_sequence_id =
+        common->origin.vendor_sequence_id;
+    payload->common.recv_realtime_ns = record.recv_realtime_ns();
+    payload->common.recv_monotonic_ns = record.recv_monotonic_ns();
+    payload->common.quality_flags |=
+        common->quality_flags & null_value_mask;
+    payload->common.market_notices |=
+        common->market_notices & vendor_time_mask;
+    payload->common.source_stream_id = record.source_stream_id();
+    payload->common.vendor_local_time_raw =
+        common->origin.vendor_local_time_raw;
+    payload->common.source_slot = record.source_slot();
+    return true;
+}
+
+struct AppliedHandoff final {
     std::size_t ordinal = 0U;
     const market::RealtimeHistoryRecordV1* record = nullptr;
 };
-static_assert(std::is_trivially_copyable_v<Handoff>);
+static_assert(std::is_trivially_copyable_v<AppliedHandoff>);
+static_assert(std::is_trivially_copyable_v<
+              realtime::NativeSequenceObservationV1>);
+
+// Native observations have exactly one producer: the serialized SDK
+// admission path. Keep that lane SPSC so the callback does not pay for an
+// MPMC reservation and a second per-cell synchronization protocol.
+template <typename Value>
+class BoundedSpscQueue final {
+public:
+    explicit BoundedSpscQueue(std::size_t capacity)
+        : capacity_(capacity),
+          mask_(capacity - 1U),
+          cells_(std::make_unique<Value[]>(capacity)) {}
+
+    BoundedSpscQueue(const BoundedSpscQueue&) = delete;
+    BoundedSpscQueue& operator=(const BoundedSpscQueue&) = delete;
+
+    [[nodiscard]] bool TryPush(const Value& value) noexcept {
+        const std::size_t position =
+            enqueue_position_.load(std::memory_order_relaxed);
+        if (position - cached_dequeue_position_ >= capacity_) {
+            cached_dequeue_position_ =
+                dequeue_position_.load(std::memory_order_acquire);
+            if (position - cached_dequeue_position_ >= capacity_) {
+                return false;
+            }
+        }
+        cells_[position & mask_] = value;
+        // The worker's sleep handshake samples this position with seq_cst.
+        // Preserve that total-order edge while removing the MPMC CAS/cell
+        // sequence from the serialized producer.
+        enqueue_position_.store(
+            position + 1U, std::memory_order_seq_cst);
+        return true;
+    }
+
+    [[nodiscard]] bool TryPop(Value* output) noexcept {
+        if (output == nullptr) {
+            return false;
+        }
+        const std::size_t position =
+            dequeue_position_.load(std::memory_order_relaxed);
+        if (position == cached_enqueue_position_) {
+            cached_enqueue_position_ =
+                enqueue_position_.load(std::memory_order_acquire);
+            if (position == cached_enqueue_position_) {
+                return false;
+            }
+        }
+        *output = cells_[position & mask_];
+        dequeue_position_.store(
+            position + 1U, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return dequeue_position_.load(std::memory_order_acquire) ==
+               enqueue_position_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool EmptyForWait() const noexcept {
+        const std::size_t dequeue =
+            dequeue_position_.load(std::memory_order_relaxed);
+        const std::size_t enqueue =
+            enqueue_position_.load(std::memory_order_seq_cst);
+        return dequeue == enqueue;
+    }
+
+    [[nodiscard]] std::size_t Depth() const noexcept {
+        const std::size_t dequeue =
+            dequeue_position_.load(std::memory_order_acquire);
+        const std::size_t enqueue =
+            enqueue_position_.load(std::memory_order_acquire);
+        return enqueue - dequeue;
+    }
+
+    [[nodiscard]] std::size_t EnqueuePosition() const noexcept {
+        return enqueue_position_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::size_t DequeuePosition() const noexcept {
+        return dequeue_position_.load(std::memory_order_acquire);
+    }
+
+private:
+    const std::size_t capacity_;
+    const std::size_t mask_;
+    std::unique_ptr<Value[]> cells_;
+    alignas(64) std::atomic<std::size_t> enqueue_position_{0U};
+    std::size_t cached_dequeue_position_ = 0U;
+    alignas(64) std::atomic<std::size_t> dequeue_position_{0U};
+    std::size_t cached_enqueue_position_ = 0U;
+};
 
 template <typename Value>
 class BoundedMpmcQueue final {
@@ -226,13 +379,7 @@ public:
     BoundedMpmcQueue(const BoundedMpmcQueue&) = delete;
     BoundedMpmcQueue& operator=(const BoundedMpmcQueue&) = delete;
 
-    [[nodiscard]] bool TryPush(
-        const Value& value,
-        std::size_t* reserved_depth) noexcept {
-        if (reserved_depth == nullptr) {
-            return false;
-        }
-        *reserved_depth = 0U;
+    [[nodiscard]] bool TryPush(const Value& value) noexcept {
         std::size_t position =
             enqueue_position_.load(std::memory_order_relaxed);
         for (;;) {
@@ -246,14 +393,8 @@ public:
                 if (enqueue_position_.compare_exchange_weak(
                         position,
                         position + 1U,
-                        std::memory_order_relaxed,
+                        std::memory_order_seq_cst,
                         std::memory_order_relaxed)) {
-                    // The consumer cannot cross this unpublished reservation.
-                    // Unsigned subtraction remains valid across position wrap
-                    // because live depth is bounded by capacity_.
-                    *reserved_depth =
-                        position + 1U -
-                        dequeue_position_.load(std::memory_order_acquire);
                     cell.value = value;
                     cell.sequence.store(
                         position + 1U, std::memory_order_release);
@@ -272,39 +413,51 @@ public:
         if (output == nullptr) {
             return false;
         }
-        std::size_t position =
+        const std::size_t position =
             dequeue_position_.load(std::memory_order_relaxed);
-        for (;;) {
-            Cell& cell = cells_[position & mask_];
-            const std::size_t sequence =
-                cell.sequence.load(std::memory_order_acquire);
-            const std::intptr_t difference =
-                static_cast<std::intptr_t>(sequence) -
-                static_cast<std::intptr_t>(position + 1U);
-            if (difference == 0) {
-                if (dequeue_position_.compare_exchange_weak(
-                        position,
-                        position + 1U,
-                        std::memory_order_relaxed,
-                        std::memory_order_relaxed)) {
-                    *output = cell.value;
-                    cell.sequence.store(
-                        position + capacity_,
-                        std::memory_order_release);
-                    return true;
-                }
-            } else if (difference < 0) {
-                return false;
-            } else {
-                position = dequeue_position_.load(
-                    std::memory_order_relaxed);
-            }
+        Cell& cell = cells_[position & mask_];
+        const std::size_t sequence =
+            cell.sequence.load(std::memory_order_acquire);
+        const std::intptr_t difference =
+            static_cast<std::intptr_t>(sequence) -
+            static_cast<std::intptr_t>(position + 1U);
+        if (difference != 0) {
+            return false;
         }
+        // This queue has one Event consumer. Avoiding a redundant CAS here
+        // removes one contended read-modify-write from every handoff while
+        // retaining the per-cell release that gates producer reuse.
+        *output = cell.value;
+        cell.sequence.store(
+            position + capacity_, std::memory_order_release);
+        dequeue_position_.store(
+            position + 1U, std::memory_order_release);
+        return true;
     }
 
     [[nodiscard]] bool Empty() const noexcept {
         return dequeue_position_.load(std::memory_order_acquire) ==
                enqueue_position_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool EmptyForWait() const noexcept {
+        const std::size_t dequeue =
+            dequeue_position_.load(std::memory_order_relaxed);
+        const std::size_t enqueue =
+            enqueue_position_.load(std::memory_order_seq_cst);
+        return dequeue == enqueue;
+    }
+
+    [[nodiscard]] std::size_t Depth() const noexcept {
+        const std::size_t dequeue =
+            dequeue_position_.load(std::memory_order_acquire);
+        const std::size_t enqueue =
+            enqueue_position_.load(std::memory_order_acquire);
+        // Unsigned subtraction remains valid across position wrap because
+        // live depth is bounded by capacity_. A producer reservation that has
+        // not published its cell may be included, which is conservative for
+        // this diagnostic high-water sample.
+        return enqueue - dequeue;
     }
 
     [[nodiscard]] std::size_t EnqueuePosition() const noexcept {
@@ -316,7 +469,7 @@ public:
     }
 
 private:
-    struct Cell final {
+    struct alignas(64) Cell final {
         std::atomic<std::size_t> sequence{0U};
         Value value{};
     };
@@ -339,6 +492,22 @@ enum class WorkerStartupState : std::uint8_t {
 
 class RealtimePartialOrderEventServiceV2::Impl final {
 private:
+    static constexpr std::size_t kCanonicalBatchSize = 2'048U;
+    // Bound the interval in which the worker is not checking its input lanes.
+    // Journal slices still accumulate across turns to kCanonicalBatchSize, so
+    // this responsiveness quantum does not give up commit batching.
+    static constexpr std::size_t kCanonicalDrainQuantum = 512U;
+    // A target tick contributes one observation and one applied handoff.
+    static constexpr std::size_t kHandoffBatchSize =
+        kCanonicalDrainQuantum * 2U;
+    static constexpr std::uint64_t kMaximumOrdinaryEventsPerTick = 3U;
+    // Full 500-625k/s target streams reach the size bound first. The age
+    // bound prevents a sparse target tail from being hidden indefinitely by
+    // sustained filtered traffic without adding another worker or timer.
+    static constexpr std::uint64_t kCanonicalBatchMaximumAgeNs =
+        4'000'000U;
+    static constexpr std::uint64_t kStatusPublishMaximumAgeNs = 4'000'000U;
+
     struct ChannelRuntime final {
         realtime::NativeSequenceChannelV1 domain{};
         realtime::NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
@@ -346,6 +515,7 @@ private:
         std::uint64_t first_seen_monotonic_ns = 0U;
         std::uint64_t affected_since_monotonic_ns = 0U;
         bool active = false;
+        bool snapshot_dirty = false;
     };
 
     enum class OutputBoundResult : std::uint8_t {
@@ -447,6 +617,7 @@ public:
         }
         recovery_config.maximum_total_canonical_payload_bytes =
             static_cast<std::size_t>(payload_bytes);
+        recovery_config.preallocate_canonical_payload_arena = true;
         recovery_config.maximum_reorder_span =
             config_.maximum_reorder_span;
         recovery_config.expected_origin_sequence = 1U;
@@ -465,6 +636,8 @@ public:
         history_config.maximum_shenzhen_order_states =
             config_.maximum_shenzhen_order_states;
         history_config.maximum_events = config_.maximum_derived_events;
+        history_config.preallocate_event_storage = true;
+        history_config.publish_process_snapshots = false;
         if (CertifiedOrderEventHistoryV1::Create(
                 history_config, &history_) !=
                 CertifiedOrderEventHistoryErrorV1::kNone ||
@@ -489,8 +662,54 @@ public:
         journal_config.affected_channel_capacity =
             config_.channel_capacity;
         journal_config.order_state_capacity = config_.order_state_capacity;
-        journal_config.maximum_order_state_updates_per_commit =
-            config_.maximum_order_state_updates_per_commit;
+        // This service promises that the Event worker never grows journal
+        // backing. Populate the randomly accessed order-state pages before
+        // the worker starts so first-touch faults cannot become steady-state
+        // latency on the publication path.
+        journal_config.prefault_order_state_pages = true;
+        journal_config.prefault_event_pages = true;
+        std::uint64_t ordinary_batch_events = 0U;
+        const std::uint64_t maximum_single_tick_state_updates =
+            config_.maximum_order_state_updates_per_commit == 0U
+                ? static_cast<std::uint64_t>(
+                      config_.maximum_shanghai_order_states)
+                : static_cast<std::uint64_t>(
+                      config_.maximum_order_state_updates_per_commit);
+        std::uint64_t maximum_single_tick_events = 0U;
+        if (!CheckedMultiply(
+                kMaximumOrdinaryEventsPerTick,
+                static_cast<std::uint64_t>(kCanonicalBatchSize),
+                &ordinary_batch_events) ||
+            !CheckedAdd(
+                maximum_single_tick_state_updates,
+                1U,
+                &maximum_single_tick_events)) {
+            return RealtimePartialOrderEventServiceCreateErrorV2::
+                kInvalidConfiguration;
+        }
+        maximum_events_per_journal_commit_ = std::min(
+            config_.event_journal_capacity,
+            std::max(ordinary_batch_events, maximum_single_tick_events));
+        if (maximum_events_per_journal_commit_ == 0U) {
+            return RealtimePartialOrderEventServiceCreateErrorV2::
+                kInvalidConfiguration;
+        }
+        journal_config.maximum_events_per_commit =
+            maximum_events_per_journal_commit_;
+        if (config_.maximum_order_state_updates_per_commit != 0U) {
+            std::uint64_t batch_state_updates = 0U;
+            if (!CheckedMultiply(
+                    config_.maximum_order_state_updates_per_commit,
+                    static_cast<std::uint64_t>(kCanonicalBatchSize),
+                    &batch_state_updates)) {
+                return RealtimePartialOrderEventServiceCreateErrorV2::
+                    kInvalidConfiguration;
+            }
+            journal_config.maximum_order_state_updates_per_commit =
+                std::min(
+                    batch_state_updates,
+                    config_.order_state_capacity);
+        }
         journal_config.maximum_mapping_bytes =
             config_.maximum_mapping_bytes;
         journal_config.lazy_commit_chunk_bytes =
@@ -502,11 +721,21 @@ public:
             return RealtimePartialOrderEventServiceCreateErrorV2::
                 kJournalCreateFailed;
         }
+        if (journal_->PreallocateBacking(system_error_number) !=
+            PartialOrderEventJournalPublishErrorV2::kNone) {
+            return RealtimePartialOrderEventServiceCreateErrorV2::
+                kJournalCreateFailed;
+        }
 
         try {
-            queue_ = std::make_unique<BoundedMpmcQueue<Handoff>>(
-                static_cast<std::size_t>(
-                    config_.handoff_queue_capacity));
+            const auto handoff_capacity = static_cast<std::size_t>(
+                config_.handoff_queue_capacity);
+            observation_queue_ = std::make_unique<BoundedSpscQueue<
+                realtime::NativeSequenceObservationV1>>(
+                handoff_capacity);
+            applied_queue_ =
+                std::make_unique<BoundedMpmcQueue<AppliedHandoff>>(
+                    handoff_capacity);
             channels_.resize(config_.channel_capacity);
             std::size_t index_capacity = 1U;
             while (index_capacity <
@@ -522,6 +751,7 @@ public:
                 index_capacity,
                 std::numeric_limits<std::uint32_t>::max());
             affected_channels_.reserve(config_.channel_capacity);
+            canonical_batch_slices_.reserve(kCanonicalBatchSize);
         } catch (const std::bad_alloc&) {
             return RealtimePartialOrderEventServiceCreateErrorV2::
                 kResourceExhausted;
@@ -534,7 +764,8 @@ public:
         SetSystemError(system_error_number, 0);
         if (worker_startup_.load(std::memory_order_acquire) !=
                 WorkerStartupState::kNotStarted ||
-            worker_thread_.joinable() || queue_ == nullptr) {
+            worker_thread_.joinable() || observation_queue_ == nullptr ||
+            applied_queue_ == nullptr) {
             SetSystemError(system_error_number, EINVAL);
             return false;
         }
@@ -604,21 +835,19 @@ public:
             globally_frozen_.load(std::memory_order_acquire)) {
             return true;
         }
-        Handoff handoff{};
-        handoff.kind = HandoffKind::kApplied;
+        AppliedHandoff handoff{};
         handoff.ordinal = ordinal;
         handoff.record = &record;
-        std::size_t reserved_depth = 0U;
-        if (!queue_->TryPush(handoff, &reserved_depth)) {
+        if (!applied_queue_->TryPush(handoff)) {
+            StoreMaximum(
+                &handoff_queue_high_water_,
+                CombinedQueueDepth());
             static_cast<void>(IncrementSaturating(&dropped_handoffs_));
             RequestGlobalFailure(
                 PartialOrderEventLastErrorV2::kResourceExhausted);
             return true;
         }
-        static_cast<void>(IncrementSaturating(&enqueued_handoffs_));
-        UpdateHandoffQueueHighWater(reserved_depth);
-        static_cast<void>(IncrementSaturating(&applied_records_));
-        WakeWorker();
+        WakeWorkerAfterEnqueue();
         return true;
     }
 
@@ -635,20 +864,16 @@ public:
             globally_frozen_.load(std::memory_order_acquire)) {
             return;
         }
-        Handoff handoff{};
-        handoff.kind = HandoffKind::kObservation;
-        handoff.observation = observation;
-        std::size_t reserved_depth = 0U;
-        if (!queue_->TryPush(handoff, &reserved_depth)) {
+        if (!observation_queue_->TryPush(observation)) {
+            StoreMaximum(
+                &handoff_queue_high_water_,
+                CombinedQueueDepth());
             static_cast<void>(IncrementSaturating(&dropped_handoffs_));
             RequestGlobalFailure(
                 PartialOrderEventLastErrorV2::kResourceExhausted);
             return;
         }
-        static_cast<void>(IncrementSaturating(&enqueued_handoffs_));
-        UpdateHandoffQueueHighWater(reserved_depth);
-        static_cast<void>(IncrementSaturating(&observed_native_messages_));
-        WakeWorker();
+        WakeWorkerAfterEnqueue();
     }
 
     void MarkNativeSequenceObservationFailure(
@@ -687,7 +912,7 @@ public:
         // the worker. Status-only publication is still safe here: it neither
         // polls the coordinator nor dereferences a borrowed Store record.
         status_dirty_.store(true, std::memory_order_release);
-        PublishStatusIfDirty();
+        PublishStatusIfDirty(true);
     }
 
     void QuiesceRecordReferences() noexcept {
@@ -742,23 +967,40 @@ public:
             published_event_frontier_.load(std::memory_order_acquire);
         result.captured_source_frontier =
             captured_source_frontier_.load(std::memory_order_acquire);
-        result.observed_native_messages =
-            observed_native_messages_.load(std::memory_order_acquire);
-        result.applied_records =
-            applied_records_.load(std::memory_order_acquire);
+        static_assert(sizeof(std::size_t) <= sizeof(std::uint64_t));
+        const std::uint64_t enqueued_observations =
+            static_cast<std::uint64_t>(
+                observation_queue_->EnqueuePosition());
+        const std::uint64_t enqueued_applied =
+            static_cast<std::uint64_t>(
+                applied_queue_->EnqueuePosition());
+        result.observed_native_messages = enqueued_observations;
+        result.applied_records = enqueued_applied;
         result.enqueued_handoffs =
-            enqueued_handoffs_.load(std::memory_order_acquire);
+            enqueued_observations <=
+                    std::numeric_limits<std::uint64_t>::max() -
+                        enqueued_applied
+                ? enqueued_observations + enqueued_applied
+                : std::numeric_limits<std::uint64_t>::max();
         result.processed_handoffs =
             processed_handoffs_.load(std::memory_order_acquire);
         result.dropped_handoffs =
             dropped_handoffs_.load(std::memory_order_acquire);
-        result.handoff_queue_depth = result.enqueued_handoffs >=
-                                             result.processed_handoffs
-                                         ? result.enqueued_handoffs -
-                                               result.processed_handoffs
-                                         : 0U;
+        // processed_handoffs_ advances once per worker batch. Use the queue
+        // cursors for instantaneous depth so already-popped in-flight work is
+        // not reported as backlog for up to kHandoffBatchSize records.
+        result.handoff_queue_depth = CombinedQueueDepth();
         result.handoff_queue_high_water =
             handoff_queue_high_water_.load(std::memory_order_acquire);
+        result.journal_canonical_commits =
+            journal_canonical_commits_.load(std::memory_order_acquire);
+        result.journal_status_commits =
+            journal_status_commits_.load(std::memory_order_acquire);
+        result.journal_published_slices =
+            journal_published_slices_.load(std::memory_order_acquire);
+        result.journal_maximum_batch_slices =
+            journal_maximum_batch_slices_.load(
+                std::memory_order_acquire);
         result.reorder_high_water =
             reorder_high_water_.load(std::memory_order_acquire);
         result.pending_entries =
@@ -799,6 +1041,13 @@ public:
                    : journal_->session();
     }
 
+    [[nodiscard]] PartialOrderEventJournalResourceSnapshotV2
+    JournalResourceSnapshot() const noexcept {
+        return journal_ == nullptr
+                   ? PartialOrderEventJournalResourceSnapshotV2{}
+                   : journal_->ResourceSnapshot();
+    }
+
     [[nodiscard]] bool WaitUntilIdleForTest(
         std::chrono::milliseconds timeout) const noexcept {
         if (timeout < std::chrono::milliseconds::zero()) {
@@ -806,12 +1055,10 @@ public:
         }
         const auto deadline = Clock::now() + timeout;
         for (;;) {
-            if (queue_ != nullptr && queue_->Empty() &&
+            if (observation_queue_ != nullptr &&
+                applied_queue_ != nullptr && QueuesEmpty() &&
                 processed_handoffs_.load(std::memory_order_acquire) >=
-                    enqueued_handoffs_.load(std::memory_order_acquire) &&
-                !status_dirty_.load(std::memory_order_acquire) &&
-                !journal_publication_in_progress_.load(
-                    std::memory_order_acquire) &&
+                    EnqueuedHandoffCount() &&
                 !status_dirty_.load(std::memory_order_acquire) &&
                 !journal_publication_in_progress_.load(
                     std::memory_order_acquire)) {
@@ -855,10 +1102,43 @@ public:
     }
 
 private:
-    void UpdateHandoffQueueHighWater(std::size_t reserved_depth) noexcept {
-        StoreMaximum(
-            &handoff_queue_high_water_,
-            static_cast<std::uint64_t>(reserved_depth));
+    [[nodiscard]] bool QueuesEmpty() const noexcept {
+        return observation_queue_->Empty() && applied_queue_->Empty();
+    }
+
+    [[nodiscard]] bool QueuesEmptyForWait() const noexcept {
+        return observation_queue_->EmptyForWait() &&
+               applied_queue_->EmptyForWait();
+    }
+
+    [[nodiscard]] std::uint64_t EnqueuedHandoffCount() const noexcept {
+        const std::uint64_t observations = static_cast<std::uint64_t>(
+            observation_queue_->EnqueuePosition());
+        const std::uint64_t applied = static_cast<std::uint64_t>(
+            applied_queue_->EnqueuePosition());
+        return observations <=
+                       std::numeric_limits<std::uint64_t>::max() - applied
+                   ? observations + applied
+                   : std::numeric_limits<std::uint64_t>::max();
+    }
+
+    [[nodiscard]] std::uint64_t CombinedQueueDepth() const noexcept {
+        const std::uint64_t observations = static_cast<std::uint64_t>(
+            observation_queue_->Depth());
+        const std::uint64_t applied = static_cast<std::uint64_t>(
+            applied_queue_->Depth());
+        return observations + applied;
+    }
+
+    [[nodiscard]] bool SealBarrierReached() const noexcept {
+        return observation_queue_->DequeuePosition() >=
+                   observation_seal_barrier_target_ &&
+               applied_queue_->DequeuePosition() >=
+                   applied_seal_barrier_target_;
+    }
+
+    void UpdateHandoffQueueHighWater(std::uint64_t depth) noexcept {
+        StoreMaximum(&handoff_queue_high_water_, depth);
     }
 
     void JoinWorker() noexcept {
@@ -870,7 +1150,27 @@ private:
     }
 
     void WakeWorker() noexcept {
-        wake_epoch_.fetch_add(1U, std::memory_order_release);
+        if (!worker_waiting_.exchange(
+                false, std::memory_order_seq_cst)) {
+            return;
+        }
+        NotifyWaitingWorker();
+    }
+
+    void WakeWorkerAfterEnqueue() noexcept {
+        if (!worker_waiting_.load(std::memory_order_seq_cst) ||
+            !worker_waiting_.exchange(
+                false, std::memory_order_seq_cst)) {
+            return;
+        }
+        NotifyWaitingWorker();
+    }
+
+    void NotifyWaitingWorker() noexcept {
+        {
+            const std::lock_guard<std::mutex> lock(wake_mutex_);
+            wake_epoch_.fetch_add(1U, std::memory_order_release);
+        }
         wake_cv_.notify_one();
     }
 
@@ -945,8 +1245,7 @@ private:
     }
 
     [[nodiscard]] ChannelRuntime* EnsureChannel(
-        const realtime::NativeSequenceDescriptorV1& descriptor,
-        std::uint64_t now_ns) noexcept {
+        const realtime::NativeSequenceDescriptorV1& descriptor) noexcept {
         if (descriptor.sequence == 0U ||
             descriptor.sequence >=
                 static_cast<std::uint64_t>(
@@ -963,6 +1262,18 @@ private:
                 PartialOrderEventLastErrorV2::kProjectionFailure);
             return nullptr;
         }
+        if (last_channel_index_ < channel_count_) {
+            ChannelRuntime& cached = channels_[last_channel_index_];
+            if (cached.domain == descriptor.domain) {
+                cached.candidate_origin =
+                    cached.candidate_origin == 0U
+                        ? descriptor.sequence
+                        : std::min(
+                              cached.candidate_origin,
+                              descriptor.sequence);
+                return &cached;
+            }
+        }
         const std::size_t mask = channel_index_.size() - 1U;
         std::size_t slot = static_cast<std::size_t>(
             ChannelHash(descriptor.domain)) & mask;
@@ -976,6 +1287,12 @@ private:
                             kResourceExhausted);
                     return nullptr;
                 }
+                std::uint64_t now_ns = 0U;
+                if (!ReadMonotonicNs(&now_ns)) {
+                    RequestGlobalFailure(
+                        PartialOrderEventLastErrorV2::kWorkerExited);
+                    return nullptr;
+                }
                 ChannelRuntime& runtime = channels_[channel_count_];
                 runtime = {};
                 runtime.active = true;
@@ -985,12 +1302,14 @@ private:
                 runtime.first_seen_monotonic_ns = now_ns;
                 channel_index_[slot] =
                     static_cast<std::uint32_t>(channel_count_);
+                last_channel_index_ = channel_count_;
                 ++channel_count_;
                 status_dirty_.store(true, std::memory_order_release);
                 return &runtime;
             }
             ChannelRuntime& runtime = channels_[index];
             if (runtime.domain == descriptor.domain) {
+                last_channel_index_ = index;
                 runtime.candidate_origin =
                     runtime.candidate_origin == 0U
                         ? descriptor.sequence
@@ -1006,28 +1325,45 @@ private:
         return nullptr;
     }
 
-    void UpdateChannel(ChannelRuntime* runtime) noexcept {
-        if (runtime == nullptr || recovery_ == nullptr ||
-            !recovery_->ChannelSnapshot(
-                runtime->domain, &runtime->snapshot)) {
+    void MarkChannelDirty(ChannelRuntime* runtime) noexcept {
+        if (runtime == nullptr) {
             RequestGlobalFailure(
                 PartialOrderEventLastErrorV2::
                     kPublicationInvariant);
             return;
         }
-        status_dirty_.store(true, std::memory_order_release);
+        runtime->snapshot_dirty = true;
+        if (!status_dirty_.load(std::memory_order_relaxed)) {
+            status_dirty_.store(true, std::memory_order_release);
+        }
+    }
+
+    void RefreshDirtyChannels() noexcept {
+        if (recovery_ == nullptr) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return;
+        }
+        for (std::size_t index = 0U; index < channel_count_; ++index) {
+            ChannelRuntime& runtime = channels_[index];
+            if (!runtime.snapshot_dirty) {
+                continue;
+            }
+            if (!recovery_->ChannelSnapshot(
+                    runtime.domain, &runtime.snapshot)) {
+                RequestGlobalFailure(
+                    PartialOrderEventLastErrorV2::
+                        kPublicationInvariant);
+                return;
+            }
+            runtime.snapshot_dirty = false;
+        }
     }
 
     void HandleObservation(
         const realtime::NativeSequenceObservationV1& observation) noexcept {
-        std::uint64_t now_ns = 0U;
-        if (!ReadMonotonicNs(&now_ns)) {
-            RequestGlobalFailure(
-                PartialOrderEventLastErrorV2::kWorkerExited);
-            return;
-        }
         ChannelRuntime* runtime =
-            EnsureChannel(observation.descriptor, now_ns);
+            EnsureChannel(observation.descriptor);
         if (runtime == nullptr) {
             return;
         }
@@ -1049,7 +1385,7 @@ private:
                 PartialOrderEventLastErrorV2::kResourceExhausted);
             return;
         }
-        UpdateChannel(runtime);
+        MarkChannelDirty(runtime);
     }
 
     void HandleApplied(
@@ -1069,32 +1405,25 @@ private:
                 PartialOrderEventLastErrorV2::kProjectionFailure);
             return;
         }
-        captured_source_frontier_.store(
-            std::max(
-                captured_source_frontier_.load(
-                    std::memory_order_relaxed),
-                payload.common.ingress_sequence),
-            std::memory_order_release);
+        captured_source_frontier_local_ = std::max(
+            captured_source_frontier_local_,
+            payload.common.ingress_sequence);
         const auto descriptor = DescriptorFromPayload(payload);
-        std::uint64_t now_ns = 0U;
-        if (!ReadMonotonicNs(&now_ns)) {
-            RequestGlobalFailure(
-                PartialOrderEventLastErrorV2::kWorkerExited);
-            return;
-        }
-        ChannelRuntime* runtime = EnsureChannel(descriptor, now_ns);
+        ChannelRuntime* runtime = EnsureChannel(descriptor);
         if (runtime == nullptr) {
             return;
         }
-        const auto canonical = CanonicalBusinessPayload(payload);
+        const sdk::MessageKey message_key =
+            MessageKeyFromPayload(payload);
+        CanonicalizeBusinessPayload(&payload);
         static_assert(sizeof(std::uintptr_t) <= sizeof(std::uint64_t));
         const std::uint64_t cookie = static_cast<std::uint64_t>(
             reinterpret_cast<std::uintptr_t>(record));
         realtime::NativeSequenceRecoveryApplyResultV1 result{};
         const auto error = recovery_->MarkTargetApplied(
             descriptor,
-            MessageKeyFromPayload(payload),
-            std::as_bytes(std::span(&canonical, 1U)),
+            message_key,
+            std::as_bytes(std::span(&payload, 1U)),
             cookie,
             &result);
         if (error != realtime::NativeSequenceRecoveryApplyErrorV1::kNone &&
@@ -1112,13 +1441,17 @@ private:
                 PartialOrderEventLastErrorV2::kResourceExhausted);
             return;
         }
-        UpdateChannel(runtime);
+        MarkChannelDirty(runtime);
     }
 
     [[nodiscard]] ChannelRuntime* FindChannel(
         const realtime::NativeSequenceChannelV1& domain) noexcept {
         if (channel_index_.empty()) {
             return nullptr;
+        }
+        if (last_channel_index_ < channel_count_ &&
+            channels_[last_channel_index_].domain == domain) {
+            return &channels_[last_channel_index_];
         }
         const std::size_t mask = channel_index_.size() - 1U;
         std::size_t slot =
@@ -1130,6 +1463,7 @@ private:
                 return nullptr;
             }
             if (channels_[index].domain == domain) {
+                last_channel_index_ = index;
                 return &channels_[index];
             }
             slot = (slot + 1U) & mask;
@@ -1165,7 +1499,7 @@ private:
                         kPublicationInvariant);
                 return;
             }
-            UpdateChannel(&runtime);
+            MarkChannelDirty(&runtime);
         }
     }
 
@@ -1233,7 +1567,7 @@ private:
 
     [[nodiscard]] PartialOrderEventLastErrorV2 MapHistoryFailure(
         CertifiedOrderEventHistoryErrorV1 error,
-        const RealtimeWireTickPayloadV2& payload) const noexcept {
+        market::MarketEventKindV1 kind) const noexcept {
         switch (error) {
             case CertifiedOrderEventHistoryErrorV1::kNone:
                 return PartialOrderEventLastErrorV2::kNone;
@@ -1257,8 +1591,6 @@ private:
                 break;
         }
 
-        const auto kind = static_cast<market::MarketEventKindV1>(
-            payload.common.event_kind);
         if (kind == market::MarketEventKindV1::kShanghaiTick) {
             switch (history_->last_shanghai_error()) {
                 case market::ShanghaiOrderAggregatorConsumeErrorV1::
@@ -1319,15 +1651,118 @@ private:
         return PartialOrderEventLastErrorV2::kProjectionFailure;
     }
 
-    void DrainCanonical() noexcept {
-        while (!globally_frozen_.load(std::memory_order_acquire)) {
+    void AbandonCanonicalBatch() noexcept {
+        canonical_batch_slices_.clear();
+        canonical_batch_event_begin_ = nullptr;
+        canonical_batch_event_count_ = 0U;
+        canonical_batch_started_monotonic_ns_ = 0U;
+        journal_publication_in_progress_.store(
+            false, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool FlushCanonicalBatch() noexcept {
+        if (canonical_batch_slices_.empty()) {
+            return true;
+        }
+        std::uint64_t expected_event_frontier = 0U;
+        if ((canonical_batch_event_count_ != 0U &&
+             canonical_batch_event_begin_ == nullptr) ||
+            !CheckedAdd(
+                published_event_frontier_.load(
+                    std::memory_order_relaxed),
+                static_cast<std::uint64_t>(
+                    canonical_batch_event_count_),
+                &expected_event_frontier) ||
+            history_generation_.event_count !=
+                expected_event_frontier) {
+            AbandonCanonicalBatch();
+            FreezeFromWorker(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return false;
+        }
+
+        static_cast<void>(
+            status_dirty_.exchange(false, std::memory_order_acq_rel));
+        BuildStatusAndChannels();
+        PauseBeforeJournalPublicationForTest();
+        const std::span<const l2flow_instrument_derived_event_row_v1> events =
+            canonical_batch_event_count_ == 0U
+                ? std::span<const l2flow_instrument_derived_event_row_v1>{}
+                : std::span<const l2flow_instrument_derived_event_row_v1>{
+                      canonical_batch_event_begin_,
+                      canonical_batch_event_count_};
+        if (journal_->PublishCanonicalBatchProjected(
+                canonical_batch_slices_,
+                current_status_,
+                events,
+                affected_channels_) !=
+            PartialOrderEventJournalPublishErrorV2::kNone) {
+            journal_failed_.store(true, std::memory_order_release);
+            AbandonCanonicalBatch();
+            FreezeFromWorker(
+                PartialOrderEventLastErrorV2::kPublicationFailure);
+            return false;
+        }
+
+        const std::uint64_t published_slices =
+            static_cast<std::uint64_t>(canonical_batch_slices_.size());
+        static_cast<void>(
+            IncrementSaturating(&journal_canonical_commits_));
+        static_cast<void>(AddSaturating(
+            &journal_published_slices_, published_slices));
+        StoreMaximum(
+            &journal_maximum_batch_slices_, published_slices);
+
+        canonical_apply_frontier_.store(
+            canonical_batch_slices_.back()
+                .canonical_apply_sequence,
+            std::memory_order_release);
+        published_event_frontier_.store(
+            static_cast<std::uint64_t>(
+                history_generation_.event_count),
+            std::memory_order_release);
+        std::uint64_t published_ns = 0U;
+        if (ReadMonotonicNs(&published_ns)) {
+            last_journal_publication_monotonic_ns_ = published_ns;
+        }
+        AbandonCanonicalBatch();
+        return true;
+    }
+
+    [[nodiscard]] bool CanonicalBatchAgeExpired(
+        std::uint64_t now_ns) const noexcept {
+        return canonical_batch_started_monotonic_ns_ == 0U ||
+               now_ns < canonical_batch_started_monotonic_ns_ ||
+               now_ns - canonical_batch_started_monotonic_ns_ >=
+                   kCanonicalBatchMaximumAgeNs;
+    }
+
+    void DrainCanonical(std::size_t maximum_records) noexcept {
+        canonical_drain_quantum_exhausted_ = false;
+        std::size_t drained_records = 0U;
+        while (drained_records < maximum_records &&
+               !globally_frozen_.load(std::memory_order_acquire)) {
             realtime::NativeSequenceCertifiedReadyV1 ready{};
             const auto poll = recovery_->PollCertified(&ready);
             if (poll ==
                 realtime::NativeSequenceRecoveryPollErrorV1::kNotReady) {
+                if (!canonical_batch_slices_.empty()) {
+                    std::uint64_t now_ns = 0U;
+                    if (!ReadMonotonicNs(&now_ns)) {
+                        AbandonCanonicalBatch();
+                        RequestGlobalFailure(
+                            PartialOrderEventLastErrorV2::kWorkerExited);
+                        return;
+                    }
+                    if (CanonicalBatchAgeExpired(now_ns) ||
+                        stop_requested_.load(std::memory_order_acquire)) {
+                        static_cast<void>(FlushCanonicalBatch());
+                    }
+                }
                 return;
             }
             if (poll != realtime::NativeSequenceRecoveryPollErrorV1::kNone) {
+                AbandonCanonicalBatch();
                 RequestGlobalFailure(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
@@ -1335,6 +1770,7 @@ private:
             }
             ChannelRuntime* runtime = FindChannel(ready.descriptor.domain);
             if (runtime == nullptr) {
+                AbandonCanonicalBatch();
                 RequestGlobalFailure(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
@@ -1344,16 +1780,19 @@ private:
                 realtime::NativeSequenceRecoveryRecordClassV1::kFiltered) {
                 if (recovery_->CommitCertified(ready.token) !=
                     realtime::NativeSequenceRecoveryCommitErrorV1::kNone) {
+                    AbandonCanonicalBatch();
                     RequestGlobalFailure(
                         PartialOrderEventLastErrorV2::
                             kPublicationInvariant);
                     return;
                 }
-                UpdateChannel(runtime);
+                MarkChannelDirty(runtime);
+                ++drained_records;
                 continue;
             }
             if (ready.record_class !=
                 realtime::NativeSequenceRecoveryRecordClassV1::kTarget) {
+                AbandonCanonicalBatch();
                 RequestGlobalFailure(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
@@ -1364,138 +1803,268 @@ private:
             const auto* record = reinterpret_cast<
                 const market::RealtimeHistoryRecordV1*>(pointer);
             if (record == nullptr || record->instrument_id() == 0U) {
+                AbandonCanonicalBatch();
                 RequestGlobalFailure(
                     PartialOrderEventLastErrorV2::kProjectionFailure);
                 return;
             }
             RealtimeWireTickPayloadV2 payload{};
-            const std::size_t ordinal = static_cast<std::size_t>(
-                record->instrument_id() - 1U);
-            if (!ProjectRealtimeWireTickPayloadV2(
-                    *record, ordinal, &payload) ||
-                !RealtimeCertifiedTickPayloadCanonicalV1(payload) ||
-                DescriptorFromPayload(payload) != ready.descriptor ||
-                !(MessageKeyFromPayload(payload) == ready.message_key)) {
+            if (ready.canonical_payload.size() != sizeof(payload)) {
+                AbandonCanonicalBatch();
                 RequestGlobalFailure(
                     PartialOrderEventLastErrorV2::kProjectionFailure);
                 return;
             }
+            market::ShenzhenOrderEventInputV1 shenzhen_input{};
+            const auto event_kind = record->kind();
+            const bool shenzhen_prepared =
+                event_kind == market::MarketEventKindV1::kShenzhenOrder ||
+                event_kind ==
+                    market::MarketEventKindV1::kShenzhenTransaction;
+            if (shenzhen_prepared) {
+                const sdk::MessageKey expected_key =
+                    event_kind ==
+                            market::MarketEventKindV1::kShenzhenOrder
+                        ? sdk::MessageKey{6U, 101U, 33U}
+                        : sdk::MessageKey{6U, 101U, 36U};
+                const auto stored_event = record->event();
+                if (market::ProjectShenzhenOrderEventInputV1(
+                        stored_event,
+                        record->ingress_sequence(),
+                        record->tick_stream_sequence(),
+                        &shenzhen_input) !=
+                        market::ShenzhenOrderEventProjectionV1::kProjected ||
+                    shenzhen_input.instrument_id !=
+                        record->instrument_id() ||
+                    shenzhen_input.anchor.native_event_sequence <= 0 ||
+                    static_cast<std::uint64_t>(
+                        shenzhen_input.anchor.native_event_sequence) !=
+                        ready.descriptor.sequence ||
+                    shenzhen_input.channel !=
+                        ready.descriptor.domain.channel ||
+                    ready.descriptor.domain.market !=
+                        realtime::NativeSequenceMarketV1::kShenzhen ||
+                    !(expected_key == ready.message_key)) {
+                    AbandonCanonicalBatch();
+                    RequestGlobalFailure(
+                        PartialOrderEventLastErrorV2::kProjectionFailure);
+                    return;
+                }
+            } else {
+                static_assert(
+                    std::is_trivially_copyable_v<
+                        RealtimeWireTickPayloadV2>);
+                std::memcpy(
+                    &payload,
+                    ready.canonical_payload.data(),
+                    sizeof(payload));
+                if (!RestoreArrivalMetadata(*record, &payload) ||
+                    !RealtimeCertifiedTickPayloadCanonicalV1(payload) ||
+                    DescriptorFromPayload(payload) != ready.descriptor ||
+                    !(MessageKeyFromPayload(payload) == ready.message_key)) {
+                    AbandonCanonicalBatch();
+                    RequestGlobalFailure(
+                        PartialOrderEventLastErrorV2::kProjectionFailure);
+                    return;
+                }
+            }
             const std::uint64_t current_events =
-                published_event_frontier_.load(
-                    std::memory_order_relaxed);
-            CertifiedOrderEventHistorySnapshotV1 prior_generation{};
-            if (history_->AcquireGeneration(&prior_generation) !=
-                    CertifiedOrderEventHistoryErrorV1::kNone ||
-                !prior_generation.valid() ||
-                prior_generation.events().size() != current_events) {
+                static_cast<std::uint64_t>(
+                    history_generation_.event_count);
+            std::uint64_t expected_staged_events = 0U;
+            if (!CheckedAdd(
+                    published_event_frontier_.load(
+                        std::memory_order_relaxed),
+                    static_cast<std::uint64_t>(
+                        canonical_batch_event_count_),
+                    &expected_staged_events) ||
+                current_events != expected_staged_events) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
                 return;
             }
             std::uint64_t maximum_output = 0U;
-            const OutputBoundResult output_bound =
-                MaximumOutputForPayload(
+            OutputBoundResult output_bound = OutputBoundResult::kOk;
+            if (shenzhen_prepared) {
+                switch (shenzhen_input.action) {
+                    case market::TickActionV1::kAdd:
+                        maximum_output = 1U;
+                        break;
+                    case market::TickActionV1::kCancel:
+                        maximum_output = 2U;
+                        break;
+                    case market::TickActionV1::kTrade:
+                        maximum_output = 3U;
+                        break;
+                    case market::TickActionV1::kStatus:
+                    case market::TickActionV1::kUnknown:
+                        output_bound =
+                            OutputBoundResult::kProjectionFailure;
+                        break;
+                }
+            } else {
+                output_bound = MaximumOutputForPayload(
                     payload,
-                    prior_generation.generation()
-                        .shanghai_order_state_count,
+                    history_generation_.shanghai_order_state_count,
                     &maximum_output);
+            }
             if (output_bound ==
                 OutputBoundResult::kProjectionFailure) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::kProjectionFailure);
                 return;
             }
             if (output_bound ==
                     OutputBoundResult::kResourceExhausted ||
-                maximum_output == 0U) {
+                maximum_output == 0U ||
+                maximum_output > maximum_events_per_journal_commit_) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::kResourceExhausted);
+                return;
+            }
+            if (maximum_output >
+                    maximum_events_per_journal_commit_ -
+                        static_cast<std::uint64_t>(
+                            canonical_batch_event_count_) &&
+                !FlushCanonicalBatch()) {
                 return;
             }
             std::uint64_t writable_events = 0U;
             if (!CheckedAdd(
                     current_events, maximum_output, &writable_events) ||
                 writable_events < current_events) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::kResourceExhausted);
                 return;
             }
-            if (journal_->EnsureEventWritable(writable_events) !=
-                PartialOrderEventJournalPublishErrorV2::kNone) {
-                journal_failed_.store(true, std::memory_order_release);
+            if (writable_events > config_.event_journal_capacity) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::kResourceExhausted);
                 return;
             }
             const std::uint64_t current_canonical =
-                canonical_apply_frontier_.load(
-                    std::memory_order_relaxed);
-            if (current_canonical ==
-                std::numeric_limits<std::uint64_t>::max()) {
+                history_generation_.input_frontier
+                    .canonical_apply_sequence;
+            std::uint64_t expected_staged_canonical = 0U;
+            if (!CheckedAdd(
+                    canonical_apply_frontier_.load(
+                        std::memory_order_relaxed),
+                    static_cast<std::uint64_t>(
+                        canonical_batch_slices_.size()),
+                    &expected_staged_canonical) ||
+                current_canonical != expected_staged_canonical ||
+                current_canonical >=
+                    std::numeric_limits<std::uint64_t>::max() / 2U) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
                 return;
             }
             const std::uint64_t next = current_canonical + 1U;
+            if (canonical_batch_slices_.empty()) {
+                if (!ReadMonotonicNs(
+                        &canonical_batch_started_monotonic_ns_)) {
+                    AbandonCanonicalBatch();
+                    FreezeFromWorker(
+                        PartialOrderEventLastErrorV2::kWorkerExited);
+                    return;
+                }
+                journal_publication_in_progress_.store(
+                    true, std::memory_order_release);
+            }
             if (recovery_->CommitCertified(ready.token) !=
                 realtime::NativeSequenceRecoveryCommitErrorV1::kNone) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
                 return;
             }
+            CertifiedOrderEventHistoryAppendResultV1 append_result{};
             const CertifiedOrderEventHistoryErrorV1 history_error =
-                history_->AppendCertifiedTick(payload, next);
+                shenzhen_prepared
+                    ? history_->AppendCertifiedTick(
+                          shenzhen_input, next, &append_result)
+                    : history_->AppendCertifiedTick(
+                          payload, next, &append_result);
             if (history_error !=
                 CertifiedOrderEventHistoryErrorV1::kNone) {
-                FreezeFromWorker(MapHistoryFailure(history_error, payload));
+                AbandonCanonicalBatch();
+                FreezeFromWorker(
+                    MapHistoryFailure(history_error, event_kind));
                 return;
             }
-            CertifiedOrderEventHistorySnapshotV1 generation{};
-            if (history_->AcquireGeneration(&generation) !=
-                    CertifiedOrderEventHistoryErrorV1::kNone ||
-                !generation.valid() ||
-                generation.generation()
+            if (append_result.generation
                         .input_frontier.canonical_apply_sequence != next ||
-                generation.events().size() < current_events) {
+                append_result.generation.event_count < current_events ||
+                !append_result.appended_events.empty() ||
+                append_result.appended_wire_events.size() !=
+                    append_result.generation.event_count - current_events) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
                     PartialOrderEventLastErrorV2::
                         kPublicationInvariant);
                 return;
             }
-            UpdateChannel(runtime);
-            const auto all_events = generation.events();
-            const auto new_events = all_events.subspan(
-                static_cast<std::size_t>(current_events));
-            journal_publication_in_progress_.store(
-                true, std::memory_order_release);
-            static_cast<void>(
-                status_dirty_.exchange(false, std::memory_order_acq_rel));
-            BuildStatusAndChannels();
-            PauseBeforeJournalPublicationForTest();
-            if (journal_->PublishCanonicalTick(
-                    next,
-                    current_status_,
-                    new_events,
-                    affected_channels_) !=
-                    PartialOrderEventJournalPublishErrorV2::kNone) {
-                journal_failed_.store(true, std::memory_order_release);
-                journal_publication_in_progress_.store(
-                    false, std::memory_order_release);
+            history_generation_ = append_result.generation;
+            MarkChannelDirty(runtime);
+            if (!append_result.appended_wire_events.empty()) {
+                const l2flow_instrument_derived_event_row_v1* const
+                    append_begin =
+                        append_result.appended_wire_events.data();
+                if (canonical_batch_event_begin_ == nullptr) {
+                    canonical_batch_event_begin_ = append_begin;
+                } else if (
+                    canonical_batch_event_begin_ +
+                            canonical_batch_event_count_ !=
+                        append_begin) {
+                    AbandonCanonicalBatch();
+                    FreezeFromWorker(
+                        PartialOrderEventLastErrorV2::
+                            kPublicationInvariant);
+                    return;
+                }
+            }
+            if (append_result.appended_wire_events.size() >
+                std::numeric_limits<std::size_t>::max() -
+                    canonical_batch_event_count_) {
+                AbandonCanonicalBatch();
                 FreezeFromWorker(
-                    PartialOrderEventLastErrorV2::
-                        kPublicationFailure);
+                    PartialOrderEventLastErrorV2::kResourceExhausted);
                 return;
             }
-            canonical_apply_frontier_.store(
-                next, std::memory_order_release);
-            published_event_frontier_.store(
-                static_cast<std::uint64_t>(all_events.size()),
-                std::memory_order_release);
-            journal_publication_in_progress_.store(
-                false, std::memory_order_release);
+            canonical_batch_event_count_ +=
+                append_result.appended_wire_events.size();
+            canonical_batch_slices_.push_back({
+                next, append_result.appended_wire_events.size()});
+            ++drained_records;
+            if (canonical_batch_slices_.size() ==
+                    kCanonicalBatchSize &&
+                !FlushCanonicalBatch()) {
+                return;
+            }
+        }
+        canonical_drain_quantum_exhausted_ =
+            drained_records == maximum_records &&
+            maximum_records !=
+                std::numeric_limits<std::size_t>::max();
+        if (canonical_drain_quantum_exhausted_ &&
+            !canonical_batch_slices_.empty()) {
+            std::uint64_t now_ns = 0U;
+            if (!ReadMonotonicNs(&now_ns)) {
+                AbandonCanonicalBatch();
+                RequestGlobalFailure(
+                    PartialOrderEventLastErrorV2::kWorkerExited);
+            } else if (CanonicalBatchAgeExpired(now_ns)) {
+                static_cast<void>(FlushCanonicalBatch());
+            }
         }
     }
 
@@ -1505,7 +2074,7 @@ private:
         accepting_.store(false, std::memory_order_release);
         status_dirty_.store(true, std::memory_order_release);
         NotifyFailure();
-        PublishStatusIfDirty();
+        PublishStatusIfDirty(true);
     }
 
     [[nodiscard]] static bool HealthLess(
@@ -1517,6 +2086,7 @@ private:
     }
 
     void BuildStatusAndChannels() noexcept {
+        RefreshDirtyChannels();
         affected_channels_.clear();
         std::uint64_t total_pending = 0U;
         std::uint32_t unsealed = 0U;
@@ -1752,9 +2322,35 @@ private:
             current_status_.state, current_status_.last_error);
     }
 
-    void PublishStatusIfDirty() noexcept {
+    void PublishStatusIfDirty(bool force = false) noexcept {
         if (journal_ == nullptr || journal_->failed() ||
             !status_dirty_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (!force) {
+            std::uint64_t now_ns = 0U;
+            if (!ReadMonotonicNs(&now_ns)) {
+                RequestGlobalFailure(
+                    PartialOrderEventLastErrorV2::kWorkerExited);
+                return;
+            }
+            if (last_journal_publication_monotonic_ns_ != 0U &&
+                now_ns >= last_journal_publication_monotonic_ns_ &&
+                now_ns - last_journal_publication_monotonic_ns_ <
+                    kStatusPublishMaximumAgeNs) {
+                return;
+            }
+        }
+        if (!canonical_batch_slices_.empty()) {
+            // A canonical commit already carries the latest status. During a
+            // sustained stream, let size-bounded batches fill instead of
+            // turning the status freshness timer into a smaller commit timer.
+            // Terminal publication remains forced and the idle-tail deadline
+            // still bounds publication once both handoff lanes drain.
+            if (!force && !QueuesEmpty()) {
+                return;
+            }
+            static_cast<void>(FlushCanonicalBatch());
             return;
         }
         journal_publication_in_progress_.store(
@@ -1774,6 +2370,13 @@ private:
                 PartialOrderEventLastErrorV2::kPublicationFailure);
             accepting_.store(false, std::memory_order_release);
             NotifyFailure();
+        } else {
+            static_cast<void>(IncrementSaturating(
+                &journal_status_commits_));
+            std::uint64_t published_ns = 0U;
+            if (ReadMonotonicNs(&published_ns)) {
+                last_journal_publication_monotonic_ns_ = published_ns;
+            }
         }
         journal_publication_in_progress_.store(
             false, std::memory_order_release);
@@ -1800,6 +2403,103 @@ private:
         return result;
     }
 
+    [[nodiscard]] std::uint64_t NextStatusDeadlineNs() const noexcept {
+        if (!status_dirty_.load(std::memory_order_acquire) ||
+            journal_failed_.load(std::memory_order_acquire)) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        if (last_journal_publication_monotonic_ns_ == 0U) {
+            return 0U;
+        }
+        if (last_journal_publication_monotonic_ns_ >
+            std::numeric_limits<std::uint64_t>::max() -
+                kStatusPublishMaximumAgeNs) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        return last_journal_publication_monotonic_ns_ +
+               kStatusPublishMaximumAgeNs;
+    }
+
+    [[nodiscard]] std::uint64_t
+    NextCanonicalBatchDeadlineNs() const noexcept {
+        if (canonical_batch_slices_.empty() ||
+            canonical_batch_started_monotonic_ns_ == 0U) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        if (canonical_batch_started_monotonic_ns_ >
+            std::numeric_limits<std::uint64_t>::max() -
+                kCanonicalBatchMaximumAgeNs) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        return canonical_batch_started_monotonic_ns_ +
+               kCanonicalBatchMaximumAgeNs;
+    }
+
+    [[nodiscard]] std::size_t DrainHandoffBatch() noexcept {
+        constexpr std::size_t kLaneBatchSize =
+            kHandoffBatchSize / 2U;
+        std::size_t batch = 0U;
+        std::size_t observations = 0U;
+        std::size_t applied = 0U;
+        const auto pop_observation = [this, &batch, &observations]() {
+            if (seal_barrier_active_ &&
+                observation_queue_->DequeuePosition() >=
+                    observation_seal_barrier_target_) {
+                return false;
+            }
+            realtime::NativeSequenceObservationV1 observation{};
+            if (!observation_queue_->TryPop(&observation)) {
+                return false;
+            }
+            if (!globally_frozen_.load(std::memory_order_acquire)) {
+                HandleObservation(observation);
+            }
+            ++batch;
+            ++observations;
+            return true;
+        };
+        const auto pop_applied = [this, &batch, &applied]() {
+            if (seal_barrier_active_ &&
+                applied_queue_->DequeuePosition() >=
+                    applied_seal_barrier_target_) {
+                return false;
+            }
+            AppliedHandoff handoff{};
+            if (!applied_queue_->TryPop(&handoff)) {
+                return false;
+            }
+            if (!globally_frozen_.load(std::memory_order_acquire)) {
+                HandleApplied(handoff.ordinal, handoff.record);
+            }
+            ++batch;
+            ++applied;
+            return true;
+        };
+
+        // Give both producer classes an equal bounded share. Recovery's join
+        // contract permits either side to arrive first, so this removes the
+        // producer CAS hotspot without inventing cross-lane ordering.
+        while (batch < kHandoffBatchSize) {
+            bool progressed = false;
+            if (observations < kLaneBatchSize) {
+                progressed = pop_observation();
+                if (seal_barrier_active_ && SealBarrierReached()) {
+                    return batch;
+                }
+            }
+            if (applied < kLaneBatchSize) {
+                progressed = pop_applied() || progressed;
+                if (seal_barrier_active_ && SealBarrierReached()) {
+                    return batch;
+                }
+            }
+            if (!progressed) {
+                break;
+            }
+        }
+        return batch;
+    }
+
     void WorkerLoop() noexcept {
         try {
             for (;;) {
@@ -1814,38 +2514,25 @@ private:
                         std::this_thread::yield();
                     }
                 }
-                std::size_t batch = 0U;
-                Handoff handoff{};
-                while (batch < 1024U && queue_->TryPop(&handoff)) {
-                    if (!globally_frozen_.load(
-                            std::memory_order_acquire)) {
-                        if (handoff.kind == HandoffKind::kObservation) {
-                            HandleObservation(handoff.observation);
-                        } else if (handoff.kind == HandoffKind::kApplied) {
-                            HandleApplied(handoff.ordinal, handoff.record);
-                        } else {
-                            RequestGlobalFailure(
-                                PartialOrderEventLastErrorV2::
-                                    kPublicationInvariant);
-                        }
-                    }
-                    static_cast<void>(
-                        IncrementSaturating(&processed_handoffs_));
-                    ++batch;
-                    if (seal_barrier_active_ &&
-                        queue_->DequeuePosition() >=
-                            seal_barrier_target_) {
-                        break;
-                    }
+                UpdateHandoffQueueHighWater(CombinedQueueDepth());
+                const std::size_t batch = DrainHandoffBatch();
+                if (batch != 0U) {
+                    static_cast<void>(AddSaturating(
+                        &processed_handoffs_,
+                        static_cast<std::uint64_t>(batch)));
+                    captured_source_frontier_.store(
+                        captured_source_frontier_local_,
+                        std::memory_order_release);
                 }
 
-                const bool queue_empty = queue_->Empty();
+                const bool queue_empty = QueuesEmpty();
                 std::uint64_t now_ns = 0U;
                 if (!ReadMonotonicNs(&now_ns)) {
                     RequestGlobalFailure(
                         PartialOrderEventLastErrorV2::kWorkerExited);
                 }
                 if (!globally_frozen_.load(std::memory_order_acquire)) {
+                    RefreshDirtyChannels();
                     const bool force_seal =
                         clean_stop_requested_.load(
                             std::memory_order_acquire) &&
@@ -1861,18 +2548,19 @@ private:
                                 std::numeric_limits<
                                     std::uint64_t>::max() &&
                             now_ns >= deadline) {
-                            // This queue-position fence consumes no handoff
-                            // capacity. Every producer reservation before the
-                            // acquire snapshot is processed before sealing;
-                            // later traffic cannot postpone the bounded cut.
-                            seal_barrier_target_ =
-                                queue_->EnqueuePosition();
+                            // These queue-position fences consume no handoff
+                            // capacity. Every reservation before both acquire
+                            // snapshots is processed before sealing; later
+                            // traffic cannot postpone the bounded cut.
+                            observation_seal_barrier_target_ =
+                                observation_queue_->EnqueuePosition();
+                            applied_seal_barrier_target_ =
+                                applied_queue_->EnqueuePosition();
                             seal_barrier_monotonic_ns_ = now_ns;
                             seal_barrier_active_ = true;
                         }
                         if (seal_barrier_active_ &&
-                            queue_->DequeuePosition() >=
-                                seal_barrier_target_) {
+                            SealBarrierReached()) {
                             SealOrigins(
                                 seal_barrier_monotonic_ns_, false);
                             seal_barrier_active_ = false;
@@ -1881,12 +2569,25 @@ private:
                     // Already sealed channels must advance on every bounded
                     // batch. A busy unrelated lane cannot hold their ready
                     // canonical prefix until the entire global queue empties.
-                    DrainCanonical();
+                    DrainCanonical(
+                        stop_requested_.load(
+                            std::memory_order_acquire) &&
+                                queue_empty
+                            ? std::numeric_limits<std::size_t>::max()
+                            : kCanonicalDrainQuantum);
                 }
-                PublishStatusIfDirty();
+                const bool stop_when_empty =
+                    stop_requested_.load(std::memory_order_acquire) &&
+                    queue_empty;
+                const bool force_status =
+                    globally_frozen_.load(std::memory_order_acquire) ||
+                    stop_when_empty;
+                if (force_status || !canonical_drain_quantum_exhausted_ ||
+                    canonical_batch_slices_.empty()) {
+                    PublishStatusIfDirty(force_status);
+                }
 
-                if (stop_requested_.load(std::memory_order_acquire) &&
-                    queue_->Empty()) {
+                if (stop_when_empty) {
                     if (!clean_stop_requested_.load(
                             std::memory_order_acquire) &&
                         !globally_frozen_.load(
@@ -1894,27 +2595,31 @@ private:
                         draining_.store(true, std::memory_order_release);
                         status_dirty_.store(
                             true, std::memory_order_release);
-                        PublishStatusIfDirty();
+                        PublishStatusIfDirty(true);
                     }
                     return;
                 }
-                if (!queue_->Empty()) {
+                if (!QueuesEmpty() ||
+                    canonical_drain_quantum_exhausted_) {
                     continue;
                 }
 
+                std::unique_lock<std::mutex> lock(wake_mutex_);
+                static_cast<void>(worker_waiting_.exchange(
+                    true, std::memory_order_seq_cst));
                 const std::uint64_t observed_wake =
                     wake_epoch_.load(std::memory_order_acquire);
-                std::unique_lock<std::mutex> lock(wake_mutex_);
-                const std::uint64_t deadline = NextSealDeadlineNs();
+                const std::uint64_t deadline = std::min(
+                    NextCanonicalBatchDeadlineNs(),
+                    std::min(
+                        NextSealDeadlineNs(),
+                        NextStatusDeadlineNs()));
                 const auto predicate = [this, observed_wake]() noexcept {
                     return wake_epoch_.load(std::memory_order_acquire) !=
                                observed_wake ||
                            stop_requested_.load(
                                std::memory_order_acquire) ||
-                           (status_dirty_.load(std::memory_order_acquire) &&
-                            !journal_failed_.load(
-                                std::memory_order_acquire)) ||
-                           !queue_->Empty();
+                           !QueuesEmptyForWait();
                 };
                 if (deadline ==
                     std::numeric_limits<std::uint64_t>::max()) {
@@ -1932,11 +2637,12 @@ private:
                             std::chrono::nanoseconds(wait_ns),
                             predicate));
                 }
+                worker_waiting_.store(false, std::memory_order_seq_cst);
             }
         } catch (...) {
             RequestGlobalFailure(
                 PartialOrderEventLastErrorV2::kWorkerExited);
-            PublishStatusIfDirty();
+            PublishStatusIfDirty(true);
         }
     }
 
@@ -1945,15 +2651,31 @@ private:
         recovery_;
     std::unique_ptr<CertifiedOrderEventHistoryV1> history_;
     std::shared_ptr<PartialOrderEventJournalProducerV2> journal_;
-    std::unique_ptr<BoundedMpmcQueue<Handoff>> queue_;
+    std::unique_ptr<BoundedSpscQueue<
+        realtime::NativeSequenceObservationV1>> observation_queue_;
+    std::unique_ptr<BoundedMpmcQueue<AppliedHandoff>> applied_queue_;
     std::vector<ChannelRuntime> channels_;
     std::vector<std::uint32_t> channel_index_;
     std::vector<PartialOrderEventChannelHealthV2> affected_channels_;
     std::size_t channel_count_ = 0U;
-    std::size_t seal_barrier_target_ = 0U;
+    std::size_t last_channel_index_ =
+        std::numeric_limits<std::size_t>::max();
+    std::size_t observation_seal_barrier_target_ = 0U;
+    std::size_t applied_seal_barrier_target_ = 0U;
     std::uint64_t seal_barrier_monotonic_ns_ = 0U;
     bool seal_barrier_active_ = false;
     PartialOrderEventStatusUpdateV2 current_status_{};
+    CertifiedOrderEventHistoryGenerationV1 history_generation_{};
+    std::uint64_t captured_source_frontier_local_ = 0U;
+    std::vector<PartialOrderEventCanonicalSliceV2>
+        canonical_batch_slices_;
+    const l2flow_instrument_derived_event_row_v1*
+        canonical_batch_event_begin_ = nullptr;
+    std::size_t canonical_batch_event_count_ = 0U;
+    bool canonical_drain_quantum_exhausted_ = false;
+    std::uint64_t canonical_batch_started_monotonic_ns_ = 0U;
+    std::uint64_t last_journal_publication_monotonic_ns_ = 0U;
+    std::uint64_t maximum_events_per_journal_commit_ = 0U;
 
     common::LinuxCpuSetV1 worker_cpu_set_{};
     std::thread worker_thread_;
@@ -1961,17 +2683,20 @@ private:
     std::mutex wake_mutex_;
     std::condition_variable wake_cv_;
     std::atomic<std::uint64_t> wake_epoch_{0U};
+    // Producers read this on every successful handoff. Keep worker sleep/wake
+    // writes off the lifecycle/admission cache line used by the same paths.
+    alignas(64) std::atomic<bool> worker_waiting_{false};
     std::atomic<WorkerStartupState> worker_startup_{
         WorkerStartupState::kNotStarted};
     std::atomic<int> worker_affinity_error_{0};
     std::atomic<bool> worker_running_{false};
-    std::atomic<bool> accepting_{false};
+    alignas(64) std::atomic<bool> accepting_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> clean_stop_requested_{false};
     std::atomic<bool> draining_{false};
     std::atomic<bool> globally_frozen_{false};
     std::atomic<bool> journal_failed_{false};
-    std::atomic<bool> status_dirty_{false};
+    alignas(64) std::atomic<bool> status_dirty_{false};
     std::atomic<bool> journal_publication_in_progress_{false};
     std::atomic<bool> failure_notification_sent_{false};
     std::atomic<bool> worker_paused_for_test_{false};
@@ -1988,12 +2713,15 @@ private:
     std::atomic<std::uint64_t> canonical_apply_frontier_{0U};
     std::atomic<std::uint64_t> published_event_frontier_{0U};
     std::atomic<std::uint64_t> captured_source_frontier_{0U};
-    std::atomic<std::uint64_t> observed_native_messages_{0U};
-    std::atomic<std::uint64_t> applied_records_{0U};
-    std::atomic<std::uint64_t> enqueued_handoffs_{0U};
-    std::atomic<std::uint64_t> processed_handoffs_{0U};
+    alignas(64) std::atomic<std::uint64_t> processed_handoffs_{0U};
     std::atomic<std::uint64_t> dropped_handoffs_{0U};
-    std::atomic<std::uint64_t> handoff_queue_high_water_{0U};
+    alignas(64) std::atomic<std::uint64_t>
+        handoff_queue_high_water_{0U};
+    alignas(64) std::atomic<std::uint64_t>
+        journal_canonical_commits_{0U};
+    std::atomic<std::uint64_t> journal_status_commits_{0U};
+    std::atomic<std::uint64_t> journal_published_slices_{0U};
+    std::atomic<std::uint64_t> journal_maximum_batch_slices_{0U};
     std::atomic<std::uint64_t> reorder_high_water_{0U};
     std::atomic<std::uint64_t> pending_entries_{0U};
     std::atomic<std::uint32_t> channel_count_snapshot_{0U};
@@ -2145,6 +2873,14 @@ PartialOrderEventJournalSessionV2
 RealtimePartialOrderEventServiceV2::session() const noexcept {
     return impl_ == nullptr ? PartialOrderEventJournalSessionV2{}
                             : impl_->session();
+}
+
+PartialOrderEventJournalResourceSnapshotV2
+RealtimePartialOrderEventServiceV2::JournalResourceSnapshot()
+    const noexcept {
+    return impl_ == nullptr
+               ? PartialOrderEventJournalResourceSnapshotV2{}
+               : impl_->JournalResourceSnapshot();
 }
 
 bool RealtimePartialOrderEventServiceV2::WaitUntilIdleForTest(

@@ -1,12 +1,13 @@
 #include "l2flow/ipc/certified_order_event_history_v1.h"
 
 #include "l2flow/ipc/certified_order_event_journal_v1.h"
+#include "l2flow/ipc/instrument_derived_event_wire_v1.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <iterator>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -165,8 +166,24 @@ struct CertifiedOrderEventHistoryJournalStorageV1 final {
         return true;
     }
 
-    [[nodiscard]] InstrumentDerivedEventV1*
-    ConstructNext(std::size_t index) noexcept {
+    [[nodiscard]] bool PrefaultWritable() noexcept {
+        if (!valid() || committed_bytes_ != reserved_bytes_) {
+            return false;
+        }
+#if defined(MADV_POPULATE_WRITE)
+        return ::madvise(
+                   mapping_, committed_bytes_, MADV_POPULATE_WRITE) == 0;
+#else
+        return false;
+#endif
+    }
+
+    template <typename Event>
+    [[nodiscard]] InstrumentDerivedEventV1* ConstructNext(
+        std::size_t index,
+        std::uint64_t derived_event_sequence,
+        std::uint32_t source_tick_event_ordinal,
+        Event&& payload) noexcept {
         if (index != constructed_count ||
             index >= capacity ||
             (index + 1U) *
@@ -175,7 +192,16 @@ struct CertifiedOrderEventHistoryJournalStorageV1 final {
             return nullptr;
         }
         InstrumentDerivedEventV1* const event =
-            std::construct_at(Slot(index));
+            Slot(index);
+        using Payload = std::decay_t<Event>;
+        static_assert(std::is_nothrow_move_constructible_v<Payload>);
+        ::new (static_cast<void*>(event)) InstrumentDerivedEventV1{
+            derived_event_sequence,
+            InstrumentDerivedEventPayloadV1(
+                std::in_place_type<Payload>,
+                std::forward<Event>(payload)),
+            source_tick_event_ordinal,
+            true};
         ++constructed_count;
         return event;
     }
@@ -253,6 +279,10 @@ static_assert(
             sizeof(InstrumentDerivedEventV1)) {
         return false;
     }
+    if (!config.publish_process_snapshots &&
+        config.external_journal != nullptr) {
+        return false;
+    }
     if (config.maximum_events >
         static_cast<std::size_t>(
             std::numeric_limits<std::ptrdiff_t>::max()) /
@@ -284,26 +314,142 @@ template <typename SourceEvent>
     }
     for (std::size_t index = 0U; index < source->size(); ++index) {
         SourceEvent& source_event = (*source)[index];
-        InstrumentDerivedEventV1* const destination =
-            storage->ConstructNext(*event_count);
-        if (destination == nullptr) {
-            return false;
-        }
-        destination->derived_event_sequence = *next_sequence;
-        destination->source_tick_event_ordinal =
-            static_cast<std::uint32_t>(index);
-        destination->source_tick_event_ordinal_valid = true;
+        InstrumentDerivedEventV1* destination = nullptr;
         std::visit(
-            [&destination](auto& event) {
-                using Event =
-                    std::decay_t<decltype(event)>;
-                destination->payload.template emplace<Event>(
+            [&](auto& event) noexcept {
+                destination = storage->ConstructNext(
+                    *event_count,
+                    *next_sequence,
+                    static_cast<std::uint32_t>(index),
                     std::move(event));
             },
             source_event);
+        if (destination == nullptr) {
+            return false;
+        }
         ++(*event_count);
         ++(*next_sequence);
     }
+    return true;
+}
+
+template <typename SourceEvent>
+[[nodiscard]] bool AppendProjectedEvents(
+    const std::vector<SourceEvent>* source,
+    std::vector<l2flow_instrument_derived_event_row_v1>* storage,
+    std::size_t* event_count,
+    std::uint64_t* next_sequence) noexcept {
+    if (source == nullptr || storage == nullptr ||
+        event_count == nullptr || next_sequence == nullptr ||
+        *event_count > storage->size() ||
+        source->size() > storage->size() - *event_count ||
+        (!source->empty() &&
+         source->size() - 1U >
+             static_cast<std::size_t>(
+                 std::numeric_limits<std::uint32_t>::max()))) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < source->size(); ++index) {
+        if (!ProjectInstrumentDerivedEventWireV1(
+                *next_sequence,
+                static_cast<std::uint32_t>(index),
+                (*source)[index],
+                &(*storage)[*event_count])) {
+            return false;
+        }
+        ++(*event_count);
+        ++(*next_sequence);
+    }
+    return true;
+}
+
+struct ShenzhenWireAppendContext final {
+    l2flow_instrument_derived_event_row_v1* next = nullptr;
+    l2flow_instrument_derived_event_row_v1* end = nullptr;
+    std::size_t appended = 0U;
+    std::uint64_t sequence = 0U;
+    std::uint32_t ordinal = 0U;
+};
+
+[[nodiscard]] bool NextShenzhenWireDestination(
+    ShenzhenWireAppendContext* context,
+    l2flow_instrument_derived_event_row_v1** output,
+    std::uint64_t* sequence,
+    std::uint32_t* ordinal) noexcept {
+    if (context == nullptr || output == nullptr || sequence == nullptr ||
+        ordinal == nullptr || context->next == nullptr ||
+        context->next == context->end || context->sequence == 0U) {
+        return false;
+    }
+    *output = context->next;
+    *sequence = context->sequence;
+    *ordinal = context->ordinal;
+    return true;
+}
+
+void CommitShenzhenWireDestination(
+    ShenzhenWireAppendContext* context) noexcept {
+    ++context->next;
+    ++context->appended;
+    ++context->sequence;
+    ++context->ordinal;
+}
+
+[[nodiscard]] bool AppendShenzhenRevisionWire(
+    void* opaque,
+    market::ShenzhenOrderDeltaOperationV1 operation,
+    const market::ShenzhenEventSourceAnchorV1& source_anchor,
+    const market::ShenzhenOrderSnapshotV1& order) noexcept {
+    auto* context = static_cast<ShenzhenWireAppendContext*>(opaque);
+    l2flow_instrument_derived_event_row_v1* output = nullptr;
+    std::uint64_t sequence = 0U;
+    std::uint32_t ordinal = 0U;
+    if (!NextShenzhenWireDestination(
+            context, &output, &sequence, &ordinal) ||
+        !ProjectInstrumentDerivedEventWireV1(
+            sequence,
+            ordinal,
+            operation,
+            source_anchor,
+            order,
+            output)) {
+        return false;
+    }
+    CommitShenzhenWireDestination(context);
+    return true;
+}
+
+[[nodiscard]] bool AppendShenzhenTradeWire(
+    void* opaque,
+    const market::ShenzhenTradeEventV1& event) noexcept {
+    auto* context = static_cast<ShenzhenWireAppendContext*>(opaque);
+    l2flow_instrument_derived_event_row_v1* output = nullptr;
+    std::uint64_t sequence = 0U;
+    std::uint32_t ordinal = 0U;
+    if (!NextShenzhenWireDestination(
+            context, &output, &sequence, &ordinal) ||
+        !ProjectInstrumentDerivedEventWireV1(
+            sequence, ordinal, event, output)) {
+        return false;
+    }
+    CommitShenzhenWireDestination(context);
+    return true;
+}
+
+[[nodiscard]] bool AppendShenzhenCancelWire(
+    void* opaque,
+    const market::ShenzhenCancelEventV1& event) noexcept {
+    auto* context = static_cast<ShenzhenWireAppendContext*>(opaque);
+    l2flow_instrument_derived_event_row_v1* output = nullptr;
+    std::uint64_t sequence = 0U;
+    std::uint32_t ordinal = 0U;
+    if (!NextShenzhenWireDestination(
+            context, &output, &sequence, &ordinal) ||
+        !ProjectInstrumentDerivedEventWireV1(
+            sequence, ordinal, event, output)) {
+        return false;
+    }
+    CommitShenzhenWireDestination(context);
     return true;
 }
 
@@ -377,23 +523,47 @@ public:
                              kAggregationError;
         }
 
-        storage_ = std::make_shared<
-            CertifiedOrderEventHistoryJournalStorageV1>(
-            config_.maximum_events);
-        if (!storage_->valid()) {
-            storage_.reset();
-            shenzhen_.reset();
-            shanghai_.reset();
-            return CertifiedOrderEventHistoryErrorV1::
-                kResourceExhausted;
+        shanghai_native_by_channel_.reserve(
+            config_.maximum_shanghai_order_states);
+        shenzhen_native_by_channel_.reserve(
+            config_.maximum_shenzhen_order_states);
+        if (config_.publish_process_snapshots) {
+            shenzhen_events_.reserve(3U);
+            storage_ = std::make_shared<
+                CertifiedOrderEventHistoryJournalStorageV1>(
+                config_.maximum_events);
+            if (!storage_->valid()) {
+                storage_.reset();
+                shenzhen_.reset();
+                shanghai_.reset();
+                return CertifiedOrderEventHistoryErrorV1::
+                    kResourceExhausted;
+            }
+            if (config_.preallocate_event_storage &&
+                (!storage_->EnsureWritable(config_.maximum_events) ||
+                 !storage_->PrefaultWritable())) {
+                storage_.reset();
+                shenzhen_.reset();
+                shanghai_.reset();
+                return CertifiedOrderEventHistoryErrorV1::
+                    kResourceExhausted;
+            }
+        } else {
+            wire_events_.resize(config_.maximum_events);
         }
         return CertifiedOrderEventHistoryErrorV1::kNone;
     }
 
-    [[nodiscard]] CertifiedOrderEventHistoryErrorV1 Consume(
-        const RealtimeWireTickPayloadV2& input,
-        std::uint64_t canonical_apply_sequence) noexcept {
-        if (failed_.load(std::memory_order_acquire)) {
+    template <typename ConsumeFunction>
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1 ConsumePrepared(
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryAppendResultV1* output,
+        ConsumeFunction&& consume) noexcept {
+        if (output == nullptr) {
+            return CertifiedOrderEventHistoryErrorV1::kNullOutput;
+        }
+        *output = {};
+        if (failed_local_) {
             return CertifiedOrderEventHistoryErrorV1::kFailed;
         }
         if (canonical_apply_sequence == 0U ||
@@ -413,7 +583,43 @@ public:
                     kEventCapacity);
         }
 
+        const std::size_t event_begin = event_count_;
+        CertifiedOrderEventHistoryErrorV1 result =
+            CertifiedOrderEventHistoryErrorV1::kFailed;
         try {
+            result = std::forward<ConsumeFunction>(consume)();
+        } catch (const std::bad_alloc&) {
+            result = Fail(
+                CertifiedOrderEventHistoryErrorV1::
+                    kResourceExhausted);
+        } catch (...) {
+            result = Fail(
+                CertifiedOrderEventHistoryErrorV1::kFailed);
+        }
+        if (result != CertifiedOrderEventHistoryErrorV1::kNone) {
+            return result;
+        }
+        output->generation = writer_generation_;
+        if (config_.publish_process_snapshots) {
+            output->appended_events = {
+                storage_->events() + event_begin,
+                event_count_ - event_begin};
+        } else {
+            output->appended_wire_events = {
+                wire_events_.data() + event_begin,
+                event_count_ - event_begin};
+        }
+        return CertifiedOrderEventHistoryErrorV1::kNone;
+    }
+
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1 Consume(
+        const RealtimeWireTickPayloadV2& input,
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryAppendResultV1* output) noexcept {
+        return ConsumePrepared(
+            canonical_apply_sequence,
+            output,
+            [this, &input, canonical_apply_sequence]() {
             const auto kind =
                 static_cast<market::MarketEventKindV1>(
                     input.common.event_kind);
@@ -431,19 +637,31 @@ public:
                     input, canonical_apply_sequence);
             }
             last_wire_projection_ =
-                WireOrderEventProjectionResultV2::
-                    kNotTargetEvent;
+                WireOrderEventProjectionResultV2::kNotTargetEvent;
             return Fail(
                 CertifiedOrderEventHistoryErrorV1::
                     kWireProjectionError);
-        } catch (const std::bad_alloc&) {
-            return Fail(
-                CertifiedOrderEventHistoryErrorV1::
-                    kResourceExhausted);
-        } catch (...) {
-            return Fail(
-                CertifiedOrderEventHistoryErrorV1::kFailed);
-        }
+            });
+    }
+
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1 Consume(
+        const market::ShenzhenOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryAppendResultV1* output) noexcept {
+        return ConsumePrepared(
+            canonical_apply_sequence,
+            output,
+            [this, &input, canonical_apply_sequence]() {
+                last_wire_projection_ =
+                    WireOrderEventProjectionResultV2::kProjected;
+                if (input.trade_date != config_.trade_date) {
+                    return Fail(
+                        CertifiedOrderEventHistoryErrorV1::
+                            kWireProjectionError);
+                }
+                return ConsumeProjectedShenzhen(
+                    input, canonical_apply_sequence);
+            });
     }
 
     [[nodiscard]] std::shared_ptr<
@@ -564,8 +782,8 @@ private:
                 CertifiedOrderEventHistoryErrorV1::
                     kEventCapacity);
         }
-        if (!storage_->EnsureWritable(
-                event_count_ + maximum_output)) {
+        if (storage_ != nullptr &&
+            !storage_->EnsureWritable(event_count_ + maximum_output)) {
             return Fail(
                 CertifiedOrderEventHistoryErrorV1::
                     kResourceExhausted);
@@ -607,11 +825,18 @@ private:
                     kEventCapacity);
         }
 
-        if (!AppendLosslessEvents(
-                &shanghai_events_,
-                storage_.get(),
-                &event_count_,
-                &next_derived_event_sequence_)) {
+        const bool appended = config_.publish_process_snapshots
+                                  ? AppendLosslessEvents(
+                                        &shanghai_events_,
+                                        storage_.get(),
+                                        &event_count_,
+                                        &next_derived_event_sequence_)
+                                  : AppendProjectedEvents(
+                                        &shanghai_events_,
+                                        &wire_events_,
+                                        &event_count_,
+                                        &next_derived_event_sequence_);
+        if (!appended) {
             return Fail(
                 CertifiedOrderEventHistoryErrorV1::
                     kEventCapacity);
@@ -657,6 +882,14 @@ private:
                 CertifiedOrderEventHistoryErrorV1::
                     kWireProjectionError);
         }
+        return ConsumeProjectedShenzhen(
+            input, canonical_apply_sequence);
+    }
+
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1
+    ConsumeProjectedShenzhen(
+        const market::ShenzhenOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence) {
 
         std::int64_t* native_frontier = nullptr;
         if (!CheckNativeMonotonic(
@@ -694,8 +927,8 @@ private:
                 CertifiedOrderEventHistoryErrorV1::
                     kEventCapacity);
         }
-        if (!storage_->EnsureWritable(
-                event_count_ + maximum_output)) {
+        if (storage_ != nullptr &&
+            !storage_->EnsureWritable(event_count_ + maximum_output)) {
             return Fail(
                 CertifiedOrderEventHistoryErrorV1::
                     kResourceExhausted);
@@ -714,12 +947,37 @@ private:
         }
 
         const std::size_t event_begin = event_count_;
-        shenzhen_events_.clear();
-        last_shenzhen_error_ =
-            shenzhen_->ConsumeCanonical(
-                input,
-                canonical_apply_sequence,
-                &shenzhen_events_);
+        std::size_t appended_count = 0U;
+        ShenzhenWireAppendContext wire_context{};
+        if (config_.publish_process_snapshots) {
+            shenzhen_events_.clear();
+            last_shenzhen_error_ =
+                shenzhen_->ConsumeCanonical(
+                    input,
+                    canonical_apply_sequence,
+                    &shenzhen_events_);
+            appended_count = shenzhen_events_.size();
+        } else {
+            if (maximum_output - 1U >
+                static_cast<std::size_t>(
+                    std::numeric_limits<std::uint64_t>::max() -
+                    next_derived_event_sequence_)) {
+                return Fail(
+                    CertifiedOrderEventHistoryErrorV1::kEventCapacity);
+            }
+            wire_context.next = wire_events_.data() + event_begin;
+            wire_context.end = wire_context.next + maximum_output;
+            wire_context.sequence = next_derived_event_sequence_;
+            const market::ShenzhenOrderEventSinkV1 sink{
+                &wire_context,
+                &AppendShenzhenRevisionWire,
+                &AppendShenzhenTradeWire,
+                &AppendShenzhenCancelWire};
+            last_shenzhen_error_ =
+                shenzhen_->ConsumeCanonicalToSink(
+                    input, canonical_apply_sequence, sink);
+            appended_count = wire_context.appended;
+        }
         if (last_shenzhen_error_ !=
             market::ShenzhenOrderProjectorConsumeErrorV1::
                 kNone) {
@@ -727,21 +985,35 @@ private:
                 CertifiedOrderEventHistoryErrorV1::
                     kAggregationError);
         }
-        if (shenzhen_events_.size() > maximum_output ||
+        if (appended_count > maximum_output ||
             !RemainingCapacity(
                 event_count_,
-                shenzhen_events_.size(),
+                appended_count,
                 config_.maximum_events)) {
             return Fail(
                 CertifiedOrderEventHistoryErrorV1::
                     kEventCapacity);
         }
 
-        if (!AppendLosslessEvents(
+        bool appended = true;
+        if (config_.publish_process_snapshots) {
+            appended = AppendLosslessEvents(
                 &shenzhen_events_,
                 storage_.get(),
                 &event_count_,
-                &next_derived_event_sequence_)) {
+                &next_derived_event_sequence_);
+        } else if (
+            appended_count >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint64_t>::max() -
+                next_derived_event_sequence_)) {
+            appended = false;
+        } else {
+            event_count_ += appended_count;
+            next_derived_event_sequence_ +=
+                static_cast<std::uint64_t>(appended_count);
+        }
+        if (!appended) {
             return Fail(
                 CertifiedOrderEventHistoryErrorV1::
                     kEventCapacity);
@@ -778,10 +1050,16 @@ private:
         std::int64_t channel,
         std::int64_t native_sequence,
         std::int64_t** output) {
-        auto [position, inserted] =
-            frontiers->try_emplace(channel, 0);
-        if (!inserted &&
-            native_sequence <= position->second) {
+        auto position = std::find_if(
+            frontiers->begin(),
+            frontiers->end(),
+            [channel](const auto& entry) noexcept {
+                return entry.first == channel;
+            });
+        if (position == frontiers->end()) {
+            frontiers->emplace_back(channel, 0);
+            position = std::prev(frontiers->end());
+        } else if (native_sequence <= position->second) {
             return false;
         }
         *output = &position->second;
@@ -818,19 +1096,17 @@ private:
             shanghai_->order_count();
         publication.shenzhen_order_state_count =
             shenzhen_->order_count();
-        {
-            const std::lock_guard<std::mutex> lock(
-                publication_mutex_);
+        writer_generation_ = publication;
+        if (config_.publish_process_snapshots) {
+            const std::lock_guard<std::mutex> lock(publication_mutex_);
             visible_generation_ = publication;
         }
-        last_error_.store(
-            CertifiedOrderEventHistoryErrorV1::kNone,
-            std::memory_order_release);
         return CertifiedOrderEventHistoryErrorV1::kNone;
     }
 
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1 Fail(
         CertifiedOrderEventHistoryErrorV1 error) noexcept {
+        failed_local_ = true;
         last_error_.store(error, std::memory_order_release);
         failed_.store(true, std::memory_order_release);
         return error;
@@ -844,9 +1120,11 @@ private:
     std::shared_ptr<
         CertifiedOrderEventHistoryJournalStorageV1>
         storage_;
-    std::map<std::int64_t, std::int64_t>
+    std::vector<l2flow_instrument_derived_event_row_v1>
+        wire_events_;
+    std::vector<std::pair<std::int64_t, std::int64_t>>
         shanghai_native_by_channel_;
-    std::map<std::int64_t, std::int64_t>
+    std::vector<std::pair<std::int64_t, std::int64_t>>
         shenzhen_native_by_channel_;
     std::vector<market::ShanghaiOrderEventV1>
         shanghai_events_;
@@ -860,11 +1138,17 @@ private:
     // never covers projection or journal construction.
     mutable std::mutex publication_mutex_;
     CertifiedOrderEventHistoryGenerationV1
+        writer_generation_{};
+    CertifiedOrderEventHistoryGenerationV1
         visible_generation_{};
     std::atomic<CertifiedOrderEventHistoryErrorV1>
         last_error_{
             CertifiedOrderEventHistoryErrorV1::kNone};
     std::atomic<bool> failed_{false};
+    // All mutation is single-writer. Keep the public atomic for concurrent
+    // readers, but do not bounce it through the cache hierarchy on every
+    // successful append.
+    bool failed_local_ = false;
     WireOrderEventProjectionResultV2
         last_wire_projection_ =
             WireOrderEventProjectionResultV2::kProjected;
@@ -984,10 +1268,41 @@ CertifiedOrderEventHistoryErrorV1
 CertifiedOrderEventHistoryV1::AppendCertifiedTick(
     const RealtimeWireTickPayloadV2& input,
     std::uint64_t canonical_apply_sequence) noexcept {
+    CertifiedOrderEventHistoryAppendResultV1 ignored{};
     return impl_ == nullptr
                ? CertifiedOrderEventHistoryErrorV1::kFailed
                : impl_->Consume(
-                     input, canonical_apply_sequence);
+                     input, canonical_apply_sequence, &ignored);
+}
+
+CertifiedOrderEventHistoryErrorV1
+CertifiedOrderEventHistoryV1::AppendCertifiedTick(
+    const RealtimeWireTickPayloadV2& input,
+    std::uint64_t canonical_apply_sequence,
+    CertifiedOrderEventHistoryAppendResultV1* output) noexcept {
+    if (output == nullptr) {
+        return CertifiedOrderEventHistoryErrorV1::kNullOutput;
+    }
+    *output = {};
+    return impl_ == nullptr
+               ? CertifiedOrderEventHistoryErrorV1::kFailed
+               : impl_->Consume(
+                     input, canonical_apply_sequence, output);
+}
+
+CertifiedOrderEventHistoryErrorV1
+CertifiedOrderEventHistoryV1::AppendCertifiedTick(
+    const market::ShenzhenOrderEventInputV1& input,
+    std::uint64_t canonical_apply_sequence,
+    CertifiedOrderEventHistoryAppendResultV1* output) noexcept {
+    if (output == nullptr) {
+        return CertifiedOrderEventHistoryErrorV1::kNullOutput;
+    }
+    *output = {};
+    return impl_ == nullptr
+               ? CertifiedOrderEventHistoryErrorV1::kFailed
+               : impl_->Consume(
+                     input, canonical_apply_sequence, output);
 }
 
 CertifiedOrderEventHistoryErrorV1

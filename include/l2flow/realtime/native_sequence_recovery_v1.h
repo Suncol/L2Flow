@@ -115,6 +115,13 @@ struct NativeSequenceRecoveryConfigV1 final {
     // affected CERTIFIED channel and never rejects FAST.
     std::size_t maximum_canonical_payload_bytes_per_entry = 0U;
     std::size_t maximum_total_canonical_payload_bytes = 0U;
+    // When enabled, Create reserves and write-prefaults one fixed canonical-
+    // payload slot for every pending or retained Entry in a single arena. This
+    // removes payload heap allocation and first-touch faults from
+    // MarkTargetApplied and Entry reuse. The mode is explicit and disabled by
+    // default; enabling it requires the total payload bound to cover
+    // maximum_canonical_payload_bytes_per_entry for every Entry.
+    bool preallocate_canonical_payload_arena = false;
     // Bounds sequence - certified_frontier for an established channel. A
     // breach freezes only that channel's CERTIFIED state.
     std::uint64_t maximum_reorder_span = 0U;
@@ -330,6 +337,12 @@ struct NativeSequenceCertifiedReadyV1 final {
     // neither dereferences nor assigns ordering semantics to it. It is zero
     // for an output-free filtered position.
     std::uint64_t applied_cookie = 0U;
+    // Borrowed canonical bytes supplied by the first successful
+    // MarkTargetApplied call. They are empty for a filtered position and
+    // remain valid only until the next non-const coordinator operation. A
+    // caller that commits this token must copy any bytes it still needs before
+    // CommitCertified.
+    std::span<const std::byte> canonical_payload{};
 };
 
 enum class NativeSequenceRecoveryCommitErrorV1 : std::uint8_t {
@@ -411,9 +424,10 @@ NativeSequenceRecoveryApplyDispositionNameV1(
 
 // A single-thread coordinator. All methods except Create/destruction must be
 // called by one serialized owner. Construction preallocates its channel table,
-// native-key table, entry pool, and retention index. Canonical payload storage
-// is allocated only by MarkTargetApplied on the worker/CERTIFIED side and is
-// bounded by the configuration. No observation or application result
+// native-key table, entry pool, and retention index. By default canonical
+// payload storage is allocated only by MarkTargetApplied on the
+// worker/CERTIFIED side. The explicit arena mode instead allocates its complete
+// bounded storage during Create. No observation or application result
 // authorizes the caller to reject, stop, or mark coverage-lost on FAST:
 // conflict and resource outcomes freeze only the affected CERTIFIED channel.
 class NativeSequenceRecoveryCoordinatorV1 final {

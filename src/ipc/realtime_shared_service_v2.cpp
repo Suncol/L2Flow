@@ -828,7 +828,8 @@ bool ProjectTick(
         record.tick_stream_sequence() == 0U) {
         return false;
     }
-    RealtimeWireTickPayloadV2 projected{};
+    *output = RealtimeWireTickPayloadV2{};
+    RealtimeWireTickPayloadV2& projected = *output;
     std::uint32_t projected_flags = 0U;
     const bool ok = std::visit(
         [&](const auto* event) noexcept -> bool {
@@ -926,7 +927,6 @@ bool ProjectTick(
         return false;
     }
     projected.projection_flags = projected_flags;
-    *output = projected;
     return true;
 }
 

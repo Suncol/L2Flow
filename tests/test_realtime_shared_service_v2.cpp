@@ -7,6 +7,7 @@
 #include "l2flow/ipc/order_event_live_aggregation_engine_v1.h"
 #include "l2flow/ipc/realtime_history_wire_v2.h"
 #include "l2flow/ipc/realtime_instrument_tick_delta_wire_v2.h"
+#include "l2flow/ipc/realtime_partial_order_event_service_v2.h"
 #include "l2flow/ipc/realtime_certified_service_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/ipc/realtime_shm_reader_c_v2.h"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -7555,6 +7557,7 @@ struct ThroughputBenchmarkConfigV1 final {
     StartupBenchmarkScenarioV1 scenario =
         StartupBenchmarkScenarioV1::kFromOpen;
     std::chrono::milliseconds generation_interval{0};
+    std::string partial_event_worker_cpu_set;
 };
 
 [[nodiscard]] std::string_view ThroughputWorkloadNameV1(
@@ -7878,11 +7881,12 @@ bool RunThroughputProfileBenchmark(
     const ThroughputBenchmarkConfigV1& benchmark) {
     constexpr std::uint64_t kTickRingCapacity = 262'144U;
     constexpr std::uint64_t kCertifiedQueueCapacity = 4'194'304U;
+    constexpr std::uint64_t kPartialEventQueueCapacity = 262'144U;
     constexpr std::uint64_t kMaximumTargetRate = 1'000'000U;
-    constexpr std::uint64_t kMaximumDurationMs = 10'000U;
-    constexpr std::uint64_t kMaximumPlannedCallbacks = 5'000'000U;
+    constexpr std::uint64_t kMaximumDurationMs = 300'000U;
+    constexpr std::uint64_t kMaximumPlannedCallbacks = 150'000'000U;
     constexpr std::uint64_t kMaximumAccountedBytes =
-        32ULL * 1024ULL * 1024ULL * 1024ULL;
+        128ULL * 1024ULL * 1024ULL * 1024ULL;
     const std::uint64_t duration_ms =
         static_cast<std::uint64_t>(benchmark.duration.count());
     const bool factor_generation_enabled =
@@ -7912,6 +7916,20 @@ bool RunThroughputProfileBenchmark(
         benchmark.target_rate * duration_ms / 1'000U;
     if (planned == 0U || planned > kMaximumPlannedCallbacks) {
         std::cerr << "throughput profile callback count out of range\n";
+        return false;
+    }
+    const bool extended_partial_event_soak =
+        benchmark.scenario ==
+            StartupBenchmarkScenarioV1::kLivePartialNoRecovery &&
+        benchmark.workload ==
+            ThroughputWorkloadV1::kHotShenzhenTickSource;
+    if (benchmark.scenario ==
+            StartupBenchmarkScenarioV1::kLivePartialNoRecovery &&
+        planned > 5'000'000U && !extended_partial_event_soak) {
+        std::cerr
+            << "partial Event throughput profile is bounded to "
+               "5,000,000 callbacks outside the hot Shenzhen "
+               "tick soak\n";
         return false;
     }
     if (benchmark.decoder_queue_capacity_per_source >
@@ -7944,10 +7962,23 @@ bool RunThroughputProfileBenchmark(
                 ? 1
                 : 0)
         << " online_recovery=0"
+        << " partial_event_v2="
+        << (benchmark.scenario ==
+                    StartupBenchmarkScenarioV1::kLivePartialNoRecovery
+                ? 1
+                : 0)
+        << " certified_event_v1="
+        << (benchmark.sink == ThroughputSinkV1::kFastAndCertified
+                ? 1
+                : 0)
         << " factor_generation_enabled="
         << (factor_generation_enabled ? 1 : 0)
         << " generation_interval_ms="
         << benchmark.generation_interval.count()
+        << " partial_event_worker_cpu_set="
+        << (benchmark.partial_event_worker_cpu_set.empty()
+                ? "none"
+                : benchmark.partial_event_worker_cpu_set)
         << " native_sequence_base="
         << (benchmark.scenario ==
                     StartupBenchmarkScenarioV1::kFromOpen
@@ -7976,7 +8007,13 @@ bool RunThroughputProfileBenchmark(
         << benchmark.store_queue_capacity_per_source_worker
         << " store_worker_count=" << benchmark.store_worker_count
         << " store_segment_kib=" << benchmark.segment_kib
+        << " store_maximum_session_accounted_bytes="
+        << kMaximumAccountedBytes
         << " tick_ring_capacity=" << kTickRingCapacity
+        << " certified_handoff_queue_capacity="
+        << kCertifiedQueueCapacity
+        << " partial_event_handoff_queue_capacity="
+        << kPartialEventQueueCapacity
         << " sink=" << ThroughputSinkNameV1(benchmark.sink)
         << " pacing=absolute_deadline_one_based_no_batch_wait"
         << " clock=CLOCK_MONOTONIC"
@@ -8086,6 +8123,160 @@ bool RunThroughputProfileBenchmark(
         }
     }
 
+    const bool partial_event_v2_enabled =
+        benchmark.scenario ==
+        StartupBenchmarkScenarioV1::kLivePartialNoRecovery;
+    std::shared_ptr<ipc::RealtimePartialOrderEventServiceV2>
+        partial_event_service;
+    UniqueFd partial_event_journal_fd;
+    std::uint64_t partial_event_backing_size_at_start = 0U;
+    std::uint64_t partial_event_backing_size_last = 0U;
+    std::uint64_t partial_event_backing_blocks_at_start = 0U;
+    std::uint64_t partial_event_backing_blocks_last = 0U;
+    ipc::PartialOrderEventJournalResourceSnapshotV2
+        partial_event_resources_at_start{};
+    ipc::PartialOrderEventJournalResourceSnapshotV2
+        partial_event_resources_at_stop{};
+    if (partial_event_v2_enabled) {
+        const std::uint64_t hot_order_count =
+            extended_partial_event_soak ? (planned + 1U) / 2U : planned;
+        const std::uint64_t derived_event_capacity =
+            extended_partial_event_soak
+                ? planned + planned / 2U + 1'048'576U
+                : planned * 4U;
+        const std::uint64_t order_state_capacity = std::bit_ceil(
+            std::max(std::uint64_t{262'144U}, hot_order_count));
+        ipc::RealtimePartialOrderEventServiceConfigV2 event_config{};
+        event_config.run_id = run_id;
+        event_config.session_epoch = 82U;
+        event_config.trade_date = kTradeDate;
+        event_config.coverage_start_unix_ns =
+            kProcessStartKLineCoverageUnixNs;
+        event_config.fast_sink = service;
+        event_config.channel_capacity = 256U;
+        event_config.handoff_queue_capacity =
+            kPartialEventQueueCapacity;
+        event_config.maximum_pending_entries = 262'144U;
+        event_config.maximum_pending_entries_per_channel = 262'144U;
+        event_config.duplicate_retention_entries = 262'144U;
+        event_config.maximum_reorder_span = 1'048'576U;
+        event_config.discovery_horizon =
+            std::chrono::milliseconds(25);
+        event_config.maximum_shanghai_order_states =
+            static_cast<std::size_t>(
+                extended_partial_event_soak ? 1U : planned);
+        event_config.maximum_shenzhen_order_states =
+            static_cast<std::size_t>(hot_order_count);
+        event_config.maximum_derived_events =
+            static_cast<std::size_t>(derived_event_capacity);
+        event_config.event_journal_capacity = derived_event_capacity;
+        event_config.order_state_capacity = order_state_capacity;
+        event_config.maximum_order_state_updates_per_commit = 3U;
+        event_config.maximum_mapping_bytes =
+            256ULL * 1024ULL * 1024ULL * 1024ULL;
+        event_config.worker_cpu_set =
+            benchmark.partial_event_worker_cpu_set;
+        const auto event_error =
+            ipc::RealtimePartialOrderEventServiceV2::Create(
+                std::move(event_config),
+                &partial_event_service,
+                &system_error);
+        if (event_error !=
+                ipc::RealtimePartialOrderEventServiceCreateErrorV2::kNone ||
+            partial_event_service == nullptr) {
+            std::cerr
+                << "throughput partial Event V2 create error="
+                << ipc::RealtimePartialOrderEventServiceCreateErrorNameV2(
+                       event_error)
+                << " system_error=" << system_error << '\n';
+        }
+        if (!Expect(
+                event_error ==
+                        ipc::RealtimePartialOrderEventServiceCreateErrorV2::
+                            kNone &&
+                    partial_event_service != nullptr &&
+                    partial_event_service->StartWorker(&system_error) &&
+                    system_error == 0,
+                "create/start throughput partial Event V2 service")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        int journal_fd = -1;
+        struct stat journal_stat {};
+        const bool journal_backing_ready =
+            partial_event_service->DuplicateReadOnlyDescriptor(
+                &journal_fd, &system_error);
+        partial_event_journal_fd.Reset(journal_fd);
+        if (!Expect(
+                journal_backing_ready &&
+                    partial_event_journal_fd.get() >= 0 &&
+                    ::fstat(
+                        partial_event_journal_fd.get(),
+                        &journal_stat) == 0 &&
+                    journal_stat.st_size > 0 &&
+                    journal_stat.st_blocks >= 0,
+                "snapshot preallocated partial Event journal backing")) {
+            partial_event_service->Stop();
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        partial_event_backing_size_at_start =
+            static_cast<std::uint64_t>(journal_stat.st_size);
+        partial_event_backing_size_last =
+            partial_event_backing_size_at_start;
+        partial_event_backing_blocks_at_start =
+            static_cast<std::uint64_t>(journal_stat.st_blocks);
+        partial_event_backing_blocks_last =
+            partial_event_backing_blocks_at_start;
+        partial_event_resources_at_start =
+            partial_event_service->JournalResourceSnapshot();
+        if (!Expect(
+                partial_event_resources_at_start.fully_preallocated &&
+                    partial_event_resources_at_start
+                            .committed_event_region_bytes != 0U &&
+                    partial_event_resources_at_start
+                            .order_state_backed_bytes != 0U &&
+                    partial_event_resources_at_start
+                            .event_prefaulted_bytes +
+                            ipc::kPartialOrderEventHeaderBytesV2 ==
+                        partial_event_resources_at_start
+                            .committed_event_region_bytes &&
+                    partial_event_resources_at_start
+                            .order_state_prefaulted_bytes ==
+                        partial_event_resources_at_start
+                            .order_state_backed_bytes,
+                "partial Event backing is fully allocated and prefaulted before admission")) {
+            partial_event_service->Stop();
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
+    bool partial_event_backing_stable = true;
+    const auto sample_partial_event_backing = [&]() noexcept {
+        if (partial_event_service == nullptr) {
+            return true;
+        }
+        struct stat journal_stat {};
+        if (partial_event_journal_fd.get() < 0 ||
+            ::fstat(
+                partial_event_journal_fd.get(),
+                &journal_stat) != 0 ||
+            journal_stat.st_size < 0 || journal_stat.st_blocks < 0) {
+            return false;
+        }
+        partial_event_backing_size_last =
+            static_cast<std::uint64_t>(journal_stat.st_size);
+        partial_event_backing_blocks_last =
+            static_cast<std::uint64_t>(journal_stat.st_blocks);
+        return partial_event_backing_size_last ==
+                   partial_event_backing_size_at_start &&
+               partial_event_backing_blocks_last ==
+                   partial_event_backing_blocks_at_start;
+    };
+
     auto sdk_state = std::make_shared<LatencySdkState>();
     auto sdk_factory =
         std::make_shared<LatencySdkFactory>(sdk_state);
@@ -8118,13 +8309,20 @@ bool RunThroughputProfileBenchmark(
     pipeline_config.factor_generation_enabled =
         factor_generation_enabled;
     pipeline_config.applied_record_sink =
-        certified_service != nullptr
+        partial_event_service != nullptr
+            ? std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  partial_event_service)
+            : certified_service != nullptr
             ? std::static_pointer_cast<
                   market::RealtimeAppliedRecordSinkV1>(
                   certified_service)
             : std::static_pointer_cast<
                   market::RealtimeAppliedRecordSinkV1>(service);
-    if (certified_service != nullptr) {
+    if (partial_event_service != nullptr) {
+        pipeline_config.native_sequence_observation_sink =
+            partial_event_service;
+    } else if (certified_service != nullptr) {
         pipeline_config.native_sequence_observation_sink =
             certified_service;
     }
@@ -8181,6 +8379,12 @@ bool RunThroughputProfileBenchmark(
 
     std::array<std::uint64_t, 5U> offered_by_tuple{};
     std::array<std::uint64_t, 4U> backlog_at_quarter{};
+    std::array<std::uint64_t, 4U> event_backlog_at_quarter{};
+    std::array<std::uint64_t, 4U> backlog_sample_ns_at_quarter{};
+    std::array<bool, 4U> partial_event_health_at_quarter{
+        true, true, true, true};
+    bool partial_event_quarter_health_sticky = true;
+    std::uint64_t expected_target_source_frontier = 0U;
     const std::uint64_t native_sequence_base =
         benchmark.scenario ==
                 StartupBenchmarkScenarioV1::kFromOpen
@@ -8374,24 +8578,62 @@ bool RunThroughputProfileBenchmark(
             if (remaining_ns > 100'000U) {
                 std::this_thread::sleep_for(std::chrono::nanoseconds(
                     remaining_ns - 50'000U));
-            } else {
-                std::this_thread::yield();
             }
+            // A yield is longer than the complete offer interval at the
+            // 625k/s acceptance rate and turns the generator into the
+            // bottleneck. For the final 100 us, poll the monotonic clock.
         }
         handler->OnMessage(nullptr, message);
         ++invoked;
         ++offered_by_tuple[tuple];
+        if (tuple == 1U || tuple == 3U || tuple == 4U) {
+            expected_target_source_frontier = invoked;
+        }
         while (next_quarter < backlog_at_quarter.size() &&
                invoked * 4U >=
                    planned *
                        static_cast<std::uint64_t>(next_quarter + 1U)) {
             const auto sample = pipeline->Snapshot();
+            backlog_sample_ns_at_quarter[next_quarter] =
+                MonotonicNowNs();
             backlog_at_quarter[next_quarter] =
                 sample.accepted_messages >=
                         sample.processing_progress.applied_sequence
                     ? sample.accepted_messages -
                           sample.processing_progress.applied_sequence
                     : 0U;
+            if (certified_service != nullptr) {
+                const auto event_sample =
+                    certified_service->Snapshot();
+                const std::uint64_t enqueued =
+                    event_sample.enqueued_observations +
+                    event_sample.enqueued_applied_records;
+                event_backlog_at_quarter[next_quarter] =
+                    enqueued >= event_sample.processed_handoffs
+                        ? enqueued - event_sample.processed_handoffs
+                        : 0U;
+            } else if (partial_event_service != nullptr) {
+                const auto event_sample =
+                    partial_event_service->Snapshot();
+                event_backlog_at_quarter[next_quarter] =
+                    event_sample.handoff_queue_depth;
+                const bool quarter_healthy =
+                    event_sample.last_error ==
+                        ipc::PartialOrderEventLastErrorV2::kNone &&
+                    !event_sample.globally_frozen &&
+                    !event_sample.journal_failed &&
+                    !event_sample.history_failed &&
+                    event_sample.dropped_handoffs == 0U &&
+                    event_sample.frozen_channel_count == 0U;
+                partial_event_health_at_quarter[next_quarter] =
+                    quarter_healthy;
+                partial_event_quarter_health_sticky =
+                    quarter_healthy &&
+                    partial_event_quarter_health_sticky;
+                partial_event_backing_stable =
+                    sample_partial_event_backing() &&
+                    partial_event_backing_stable;
+            }
             ++next_quarter;
         }
         if ((invoked & 255U) == 0U && pipeline->fatal()) {
@@ -8410,8 +8652,25 @@ bool RunThroughputProfileBenchmark(
         before_drain.accepted_messages >= applied_before_drain
             ? before_drain.accepted_messages - applied_before_drain
             : 0U;
+    ipc::RealtimeCertifiedServiceSnapshotV1
+        certified_before_drain{};
+    ipc::RealtimePartialOrderEventServiceSnapshotV2
+        partial_event_before_drain{};
+    if (certified_service != nullptr) {
+        certified_before_drain = certified_service->Snapshot();
+    }
+    if (partial_event_service != nullptr) {
+        partial_event_before_drain =
+            partial_event_service->Snapshot();
+        partial_event_backing_stable =
+            sample_partial_event_backing() &&
+            partial_event_backing_stable;
+    }
     if (certified_service != nullptr) {
         certified_service->MarkDraining();
+    }
+    if (partial_event_service != nullptr) {
+        partial_event_service->MarkDraining();
     }
     const std::uint64_t drain_start_ns = MonotonicNowNs();
     const runtime::RealtimePipelineCutResultV1 final_cut =
@@ -8428,6 +8687,54 @@ bool RunThroughputProfileBenchmark(
             std::chrono::seconds(60));
         certified_service->MarkStoppedClean();
         certified_snapshot = certified_service->Snapshot();
+    }
+    bool partial_event_idle = true;
+    ipc::RealtimePartialOrderEventServiceSnapshotV2
+        partial_event_snapshot{};
+    if (partial_event_service != nullptr) {
+        partial_event_idle =
+            partial_event_service->WaitUntilIdleForTest(
+                std::chrono::seconds(60));
+        partial_event_service->MarkStoppedClean();
+        partial_event_snapshot = partial_event_service->Snapshot();
+        partial_event_backing_stable =
+            sample_partial_event_backing() &&
+            partial_event_backing_stable;
+        partial_event_service->Stop();
+        partial_event_resources_at_stop =
+            partial_event_service->JournalResourceSnapshot();
+    }
+    const bool partial_event_resource_counters_stable =
+        partial_event_service == nullptr ||
+        partial_event_resources_at_stop ==
+            partial_event_resources_at_start;
+    const std::uint64_t full_path_ready_ns = MonotonicNowNs();
+
+    ipc::CertifiedOrderEventHistorySnapshotV1
+        certified_event_generation{};
+    ipc::CertifiedOrderEventHistoryErrorV1
+        certified_event_generation_error =
+            ipc::CertifiedOrderEventHistoryErrorV1::kNone;
+    bool certified_event_generation_valid =
+        certified_service == nullptr;
+    if (certified_service != nullptr) {
+        certified_event_generation_error =
+            certified_service->AcquireEventGeneration(
+                &certified_event_generation);
+        const auto generation =
+            certified_event_generation.generation();
+        certified_event_generation_valid =
+            certified_event_generation_error ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            certified_event_generation.valid() &&
+            generation.event_count ==
+                certified_event_generation.events().size() &&
+            generation.derived_event_sequence_exclusive ==
+                static_cast<std::uint64_t>(
+                    generation.event_count) +
+                    1U &&
+            generation.input_frontier.canonical_apply_sequence ==
+                certified_snapshot.canonical_apply_frontier;
     }
 
     const std::array<std::uint64_t, 4U> expected_source_records{{
@@ -8534,6 +8841,10 @@ bool RunThroughputProfileBenchmark(
         drain_complete_ns >= start_ns
             ? drain_complete_ns - start_ns
             : 0U;
+    const std::uint64_t full_path_ready_elapsed_ns =
+        full_path_ready_ns >= start_ns
+            ? full_path_ready_ns - start_ns
+            : 0U;
     const double achieved_offered_rps =
         producer_elapsed_ns == 0U
             ? 0.0
@@ -8544,6 +8855,11 @@ bool RunThroughputProfileBenchmark(
             ? 0.0
             : static_cast<double>(planned) * 1'000'000'000.0 /
                   static_cast<double>(history_ready_elapsed_ns);
+    const double full_path_ready_rps =
+        full_path_ready_elapsed_ns == 0U
+            ? 0.0
+            : static_cast<double>(invoked) * 1'000'000'000.0 /
+                  static_cast<double>(full_path_ready_elapsed_ns);
     const std::uint64_t published_periodic_generations =
         periodic_generation_cuts.load(std::memory_order_acquire);
     const bool periodic_failed =
@@ -8562,15 +8878,70 @@ bool RunThroughputProfileBenchmark(
          duration_ms < static_cast<std::uint64_t>(
                            benchmark.generation_interval.count()) ||
          published_periodic_generations != 0U);
+    const std::uint64_t expected_target_messages =
+        offered_by_tuple[1U] + offered_by_tuple[3U] +
+        offered_by_tuple[4U];
+    const std::uint64_t expected_derived_events =
+        offered_by_tuple[1U] + offered_by_tuple[3U] +
+        offered_by_tuple[4U] * 2U;
     const bool certified_healthy =
         certified_service == nullptr ||
         (certified_idle &&
+         certified_snapshot.wire_snapshot_consistent &&
          !certified_snapshot.globally_frozen_resource &&
          certified_snapshot.frozen_channel_count == 0U &&
+         certified_snapshot.gap_open_channel_count == 0U &&
+         certified_snapshot.catching_up_channel_count == 0U &&
+         certified_snapshot.resource_exhaustion_count == 0U &&
+         certified_snapshot.pending_token_count == 0U &&
+         !certified_snapshot.tick_history_failed &&
+         certified_snapshot.tick_history_lag == 0U &&
+         certified_snapshot.observed_native_message_count ==
+             expected_target_messages &&
+         certified_snapshot.certified_tick_count ==
+             expected_target_messages &&
+         certified_snapshot.enqueued_observations ==
+             expected_target_messages &&
+         certified_snapshot.enqueued_applied_records ==
+             expected_target_messages &&
          certified_snapshot.dropped_handoffs == 0U &&
          certified_snapshot.processed_handoffs ==
              certified_snapshot.enqueued_observations +
-                 certified_snapshot.enqueued_applied_records);
+                 certified_snapshot.enqueued_applied_records &&
+         certified_event_generation_valid);
+    const bool partial_event_healthy =
+        partial_event_service == nullptr ||
+        (partial_event_idle &&
+         partial_event_snapshot.state ==
+             ipc::PartialOrderEventServiceStateV2::kStoppedClean &&
+         partial_event_snapshot.last_error ==
+             ipc::PartialOrderEventLastErrorV2::kNone &&
+         !partial_event_snapshot.globally_frozen &&
+         !partial_event_snapshot.journal_failed &&
+         !partial_event_snapshot.history_failed &&
+         partial_event_snapshot.frozen_channel_count == 0U &&
+         partial_event_snapshot.applied_records ==
+             expected_target_messages &&
+         partial_event_snapshot.observed_native_messages ==
+             expected_target_messages &&
+         partial_event_snapshot.enqueued_handoffs ==
+             expected_target_messages * 2U &&
+         partial_event_snapshot.processed_handoffs ==
+             partial_event_snapshot.enqueued_handoffs &&
+         partial_event_snapshot.dropped_handoffs == 0U &&
+         partial_event_snapshot.handoff_queue_depth == 0U &&
+         partial_event_snapshot.pending_entries == 0U &&
+         partial_event_snapshot.canonical_apply_frontier ==
+             expected_target_messages &&
+         partial_event_snapshot.published_event_frontier ==
+             expected_derived_events &&
+         partial_event_snapshot.captured_source_frontier ==
+             expected_target_source_frontier &&
+         partial_event_snapshot.journal_published_slices ==
+             expected_target_messages &&
+         partial_event_quarter_health_sticky &&
+         partial_event_backing_stable &&
+         partial_event_resource_counters_stable);
     const bool complete_prefix =
         !final.fatal && !periodic_failed && generation_sequence_valid &&
         invoked == planned && final.accepted_messages == planned &&
@@ -8581,6 +8952,7 @@ bool RunThroughputProfileBenchmark(
         final.store.failed_appends == 0U &&
         !final.store.coverage_lost && !service->failed() &&
         history_validation.passed && certified_healthy &&
+        partial_event_healthy &&
         ((benchmark.parallel_decoder_worker_count == 0U &&
           !final.parallel_decoder.enabled) ||
          (final.parallel_decoder.enabled &&
@@ -8599,10 +8971,74 @@ bool RunThroughputProfileBenchmark(
     const std::uint64_t steady_state_backlog_budget = std::max(
         std::uint64_t{1'024U},
         (benchmark.target_rate + 999U) / 1'000U);
-    const bool steady_state_met =
+    const std::uint64_t certified_enqueued_before_drain =
+        certified_before_drain.enqueued_observations +
+        certified_before_drain.enqueued_applied_records;
+    const std::uint64_t certified_backlog_before_drain =
+        certified_enqueued_before_drain >=
+                certified_before_drain.processed_handoffs
+            ? certified_enqueued_before_drain -
+                  certified_before_drain.processed_handoffs
+            : 0U;
+    const std::uint64_t event_backlog_before_drain =
+        certified_service != nullptr
+            ? certified_backlog_before_drain
+            : (partial_event_service != nullptr
+                   ? partial_event_before_drain.handoff_queue_depth
+                   : 0U);
+    const std::uint64_t event_sampled_high_water = std::max(
+        event_backlog_before_drain,
+        *std::max_element(
+            event_backlog_at_quarter.begin(),
+            event_backlog_at_quarter.end()));
+    const std::uint64_t steady_state_window_elapsed_ns =
+        backlog_sample_ns_at_quarter[3U] >=
+                backlog_sample_ns_at_quarter[1U]
+            ? backlog_sample_ns_at_quarter[3U] -
+                  backlog_sample_ns_at_quarter[1U]
+            : 0U;
+    const long double pipeline_backlog_slope_rps =
+        steady_state_window_elapsed_ns == 0U
+            ? 0.0L
+            : (static_cast<long double>(backlog_at_quarter[3U]) -
+               static_cast<long double>(backlog_at_quarter[1U])) *
+                  1'000'000'000.0L /
+                  static_cast<long double>(
+                      steady_state_window_elapsed_ns);
+    const long double event_backlog_slope_rps =
+        steady_state_window_elapsed_ns == 0U
+            ? 0.0L
+            : (static_cast<long double>(
+                   event_backlog_at_quarter[3U]) -
+               static_cast<long double>(
+                   event_backlog_at_quarter[1U])) *
+                  1'000'000'000.0L /
+                  static_cast<long double>(
+                      steady_state_window_elapsed_ns);
+    const long double steady_state_backlog_slope_budget_rps =
+        steady_state_window_elapsed_ns == 0U
+            ? 0.0L
+            : static_cast<long double>(steady_state_backlog_budget) *
+                  1'000'000'000.0L /
+                  static_cast<long double>(
+                      steady_state_window_elapsed_ns);
+    const bool pipeline_steady_state_met =
+        next_quarter == backlog_at_quarter.size() &&
+        steady_state_window_elapsed_ns != 0U &&
         backlog_before_drain <= steady_state_backlog_budget &&
-        backlog_at_quarter[3U] <=
-            backlog_at_quarter[1U] + steady_state_backlog_budget;
+        pipeline_backlog_slope_rps <=
+            steady_state_backlog_slope_budget_rps;
+    const bool event_steady_state_met =
+        (certified_service == nullptr &&
+         partial_event_service == nullptr) ||
+        (next_quarter == event_backlog_at_quarter.size() &&
+         steady_state_window_elapsed_ns != 0U &&
+         event_backlog_before_drain <=
+             steady_state_backlog_budget &&
+         event_backlog_slope_rps <=
+             steady_state_backlog_slope_budget_rps);
+    const bool steady_state_met =
+        pipeline_steady_state_met && event_steady_state_met;
     const bool target_met =
         invoked == planned && complete_prefix &&
         achieved_offered_rps >=
@@ -8628,6 +9064,33 @@ bool RunThroughputProfileBenchmark(
     std::ostringstream history_ready_text;
     history_ready_text << std::fixed << std::setprecision(3)
                        << history_ready_rps;
+    std::ostringstream full_path_ready_text;
+    full_path_ready_text << std::fixed << std::setprecision(3)
+                         << full_path_ready_rps;
+    std::ostringstream pipeline_backlog_slope_text;
+    pipeline_backlog_slope_text
+        << std::fixed << std::setprecision(3)
+        << static_cast<double>(pipeline_backlog_slope_rps);
+    std::ostringstream event_backlog_slope_text;
+    event_backlog_slope_text
+        << std::fixed << std::setprecision(3)
+        << static_cast<double>(event_backlog_slope_rps);
+    std::ostringstream backlog_slope_budget_text;
+    backlog_slope_budget_text
+        << std::fixed << std::setprecision(3)
+        << static_cast<double>(
+               steady_state_backlog_slope_budget_rps);
+    const double partial_event_average_batch =
+        partial_event_snapshot.journal_canonical_commits == 0U
+            ? 0.0
+            : static_cast<double>(
+                  partial_event_snapshot.journal_published_slices) /
+                  static_cast<double>(
+                      partial_event_snapshot.journal_canonical_commits);
+    std::ostringstream partial_event_average_batch_text;
+    partial_event_average_batch_text
+        << std::fixed << std::setprecision(3)
+        << partial_event_average_batch;
     std::cout
         << "THROUGHPUT_RESULT target_rps=" << benchmark.target_rate
         << " duration_ms=" << duration_ms
@@ -8643,6 +9106,10 @@ bool RunThroughputProfileBenchmark(
                 ? 1
                 : 0)
         << " online_recovery=0"
+        << " partial_event_v2="
+        << (partial_event_v2_enabled ? 1 : 0)
+        << " certified_event_v1="
+        << (certified_service != nullptr ? 1 : 0)
         << " factor_generation_enabled="
         << (factor_generation_enabled ? 1 : 0)
         << " workload=" << ThroughputWorkloadNameV1(benchmark.workload)
@@ -8668,6 +9135,10 @@ bool RunThroughputProfileBenchmark(
         << " history_ready_elapsed_ns="
         << history_ready_elapsed_ns
         << " history_ready_rps=" << history_ready_text.str()
+        << " full_path_ready_elapsed_ns="
+        << full_path_ready_elapsed_ns
+        << " full_path_ready_rps="
+        << full_path_ready_text.str()
         << " target_met=" << (target_met ? 1 : 0)
         << " process_survived=1"
         << " fatal_during_offer=" << (fatal_during_offer ? 1 : 0)
@@ -8686,6 +9157,19 @@ bool RunThroughputProfileBenchmark(
         << " backlog_before_drain=" << backlog_before_drain
         << " steady_state_backlog_budget="
         << steady_state_backlog_budget
+        << " steady_state_window=q50_q100"
+        << " steady_state_window_elapsed_ns="
+        << steady_state_window_elapsed_ns
+        << " steady_state_backlog_slope_budget_rps="
+        << backlog_slope_budget_text.str()
+        << " pipeline_backlog_slope_rps="
+        << pipeline_backlog_slope_text.str()
+        << " event_backlog_slope_rps="
+        << event_backlog_slope_text.str()
+        << " pipeline_steady_state_met="
+        << (pipeline_steady_state_met ? 1 : 0)
+        << " event_steady_state_met="
+        << (event_steady_state_met ? 1 : 0)
         << " steady_state_met=" << (steady_state_met ? 1 : 0)
         << " applied="
         << final.processing_progress.applied_sequence
@@ -8693,6 +9177,10 @@ bool RunThroughputProfileBenchmark(
         << " store_appended_before_drain="
         << before_drain.store.appended_records
         << " store_failed_appends=" << final.store.failed_appends
+        << " store_accounted_record_bytes="
+        << final.store.accounted_record_bytes
+        << " store_maximum_session_accounted_bytes="
+        << final.store.maximum_session_accounted_bytes
         << " store_coverage_lost="
         << (final.store.coverage_lost ? 1 : 0)
         << " decoder_depth_before_drain="
@@ -8747,6 +9235,24 @@ bool RunThroughputProfileBenchmark(
         << " backlog_q50=" << backlog_at_quarter[1U]
         << " backlog_q75=" << backlog_at_quarter[2U]
         << " backlog_q100=" << backlog_at_quarter[3U]
+        << " event_backlog_before_drain="
+        << event_backlog_before_drain
+        << " event_backlog_q25="
+        << event_backlog_at_quarter[0U]
+        << " event_backlog_q50="
+        << event_backlog_at_quarter[1U]
+        << " event_backlog_q75="
+        << event_backlog_at_quarter[2U]
+        << " event_backlog_q100="
+        << event_backlog_at_quarter[3U]
+        << " event_sampled_high_water="
+        << event_sampled_high_water
+        << " expected_target_messages="
+        << expected_target_messages
+        << " expected_derived_events="
+        << expected_derived_events
+        << " expected_target_source_frontier="
+        << expected_target_source_frontier
         << " tuple0_offered=" << offered_by_tuple[0U]
         << " tuple1_offered=" << offered_by_tuple[1U]
         << " tuple2_offered=" << offered_by_tuple[2U]
@@ -8754,6 +9260,10 @@ bool RunThroughputProfileBenchmark(
         << " tuple4_offered=" << offered_by_tuple[4U]
         << " generation_interval_ms="
         << benchmark.generation_interval.count()
+        << " partial_event_worker_cpu_set="
+        << (benchmark.partial_event_worker_cpu_set.empty()
+                ? "none"
+                : benchmark.partial_event_worker_cpu_set)
         << " periodic_generation_cuts="
         << published_periodic_generations
         << " periodic_generation_failed="
@@ -8821,6 +9331,18 @@ bool RunThroughputProfileBenchmark(
         << final_drain_and_cut_elapsed_ns
         << " certified_idle=" << (certified_idle ? 1 : 0)
         << " certified_healthy=" << (certified_healthy ? 1 : 0)
+        << " certified_handoff_queue_capacity="
+        << kCertifiedQueueCapacity
+        << " partial_event_handoff_queue_capacity="
+        << kPartialEventQueueCapacity
+        << " certified_queue_depth_before_drain="
+        << certified_backlog_before_drain
+        << " certified_wire_snapshot_consistent="
+        << (certified_snapshot.wire_snapshot_consistent ? 1 : 0)
+        << " certified_observed_native="
+        << certified_snapshot.observed_native_message_count
+        << " certified_tick_count="
+        << certified_snapshot.certified_tick_count
         << " certified_enqueued_observations="
         << certified_snapshot.enqueued_observations
         << " certified_enqueued_applied="
@@ -8833,6 +9355,130 @@ bool RunThroughputProfileBenchmark(
         << certified_snapshot.frozen_channel_count
         << " certified_global_frozen="
         << (certified_snapshot.globally_frozen_resource ? 1 : 0)
+        << " certified_resource_exhaustions="
+        << certified_snapshot.resource_exhaustion_count
+        << " certified_pending="
+        << certified_snapshot.pending_token_count
+        << " certified_tick_history_failed="
+        << (certified_snapshot.tick_history_failed ? 1 : 0)
+        << " certified_tick_history_lag="
+        << certified_snapshot.tick_history_lag
+        << " certified_event_generation_error="
+        << static_cast<std::uint32_t>(
+               certified_event_generation_error)
+        << " certified_event_generation_valid="
+        << (certified_event_generation_valid ? 1 : 0)
+        << " certified_event_input_frontier="
+        << certified_event_generation.generation()
+               .input_frontier.canonical_apply_sequence
+        << " certified_event_count="
+        << certified_event_generation.generation().event_count
+        << " partial_event_idle="
+        << (partial_event_idle ? 1 : 0)
+        << " partial_event_healthy="
+        << (partial_event_healthy ? 1 : 0)
+        << " partial_event_quarter_health_sticky="
+        << (partial_event_quarter_health_sticky ? 1 : 0)
+        << " partial_event_health_q25="
+        << (partial_event_health_at_quarter[0U] ? 1 : 0)
+        << " partial_event_health_q50="
+        << (partial_event_health_at_quarter[1U] ? 1 : 0)
+        << " partial_event_health_q75="
+        << (partial_event_health_at_quarter[2U] ? 1 : 0)
+        << " partial_event_health_q100="
+        << (partial_event_health_at_quarter[3U] ? 1 : 0)
+        << " partial_event_processed_before_drain="
+        << partial_event_before_drain.processed_handoffs
+        << " partial_event_canonical_frontier_before_drain="
+        << partial_event_before_drain.canonical_apply_frontier
+        << " partial_event_published_frontier_before_drain="
+        << partial_event_before_drain.published_event_frontier
+        << " partial_event_captured_source_frontier_before_drain="
+        << partial_event_before_drain.captured_source_frontier
+        << " partial_event_journal_commits_before_drain="
+        << partial_event_before_drain.journal_canonical_commits
+        << " partial_event_journal_slices_before_drain="
+        << partial_event_before_drain.journal_published_slices
+        << " partial_event_pending_before_drain="
+        << partial_event_before_drain.pending_entries
+        << " partial_event_dropped_before_drain="
+        << partial_event_before_drain.dropped_handoffs
+        << " partial_event_frozen_channels_before_drain="
+        << partial_event_before_drain.frozen_channel_count
+        << " partial_event_backing_stable="
+        << (partial_event_backing_stable ? 1 : 0)
+        << " partial_event_backing_size_at_start="
+        << partial_event_backing_size_at_start
+        << " partial_event_backing_size_last="
+        << partial_event_backing_size_last
+        << " partial_event_backing_blocks_at_start="
+        << partial_event_backing_blocks_at_start
+        << " partial_event_backing_blocks_last="
+        << partial_event_backing_blocks_last
+        << " partial_event_resource_counters_stable="
+        << (partial_event_resource_counters_stable ? 1 : 0)
+        << " partial_event_fully_preallocated="
+        << (partial_event_resources_at_start.fully_preallocated ? 1 : 0)
+        << " partial_event_event_backing_allocation_calls="
+        << partial_event_resources_at_stop
+               .event_backing_allocation_calls
+        << " partial_event_order_backing_allocation_calls="
+        << partial_event_resources_at_stop
+               .order_state_backing_allocation_calls
+        << " partial_event_event_prefaulted_bytes="
+        << partial_event_resources_at_stop.event_prefaulted_bytes
+        << " partial_event_order_prefaulted_bytes="
+        << partial_event_resources_at_stop
+               .order_state_prefaulted_bytes
+        << " partial_event_state="
+        << static_cast<std::uint32_t>(partial_event_snapshot.state)
+        << " partial_event_last_error="
+        << static_cast<std::uint32_t>(
+               partial_event_snapshot.last_error)
+        << " partial_event_canonical_frontier="
+        << partial_event_snapshot.canonical_apply_frontier
+        << " partial_event_published_frontier="
+        << partial_event_snapshot.published_event_frontier
+        << " partial_event_captured_source_frontier="
+        << partial_event_snapshot.captured_source_frontier
+        << " partial_event_observed_native="
+        << partial_event_snapshot.observed_native_messages
+        << " partial_event_applied_records="
+        << partial_event_snapshot.applied_records
+        << " partial_event_enqueued="
+        << partial_event_snapshot.enqueued_handoffs
+        << " partial_event_processed="
+        << partial_event_snapshot.processed_handoffs
+        << " partial_event_dropped="
+        << partial_event_snapshot.dropped_handoffs
+        << " partial_event_queue_depth="
+        << partial_event_snapshot.handoff_queue_depth
+        << " partial_event_queue_high_water="
+        << partial_event_snapshot.handoff_queue_high_water
+        << " partial_event_journal_canonical_commits="
+        << partial_event_snapshot.journal_canonical_commits
+        << " partial_event_journal_status_commits="
+        << partial_event_snapshot.journal_status_commits
+        << " partial_event_journal_published_slices="
+        << partial_event_snapshot.journal_published_slices
+        << " partial_event_journal_maximum_batch_slices="
+        << partial_event_snapshot.journal_maximum_batch_slices
+        << " partial_event_journal_average_batch_slices="
+        << partial_event_average_batch_text.str()
+        << " partial_event_pending="
+        << partial_event_snapshot.pending_entries
+        << " partial_event_reorder_high_water="
+        << partial_event_snapshot.reorder_high_water
+        << " partial_event_gap_channels="
+        << partial_event_snapshot.gap_channel_count
+        << " partial_event_frozen_channels="
+        << partial_event_snapshot.frozen_channel_count
+        << " partial_event_global_frozen="
+        << (partial_event_snapshot.globally_frozen ? 1 : 0)
+        << " partial_event_journal_failed="
+        << (partial_event_snapshot.journal_failed ? 1 : 0)
+        << " partial_event_history_failed="
+        << (partial_event_snapshot.history_failed ? 1 : 0)
         << '\n';
     return target_met && complete_prefix && stopped_clean;
 }
@@ -8995,9 +9641,9 @@ bool RunThroughputStabilityBenchmark(
             if (remaining_ns > 100'000U) {
                 std::this_thread::sleep_for(std::chrono::nanoseconds(
                     remaining_ns - 50'000U));
-            } else {
-                std::this_thread::yield();
             }
+            // Keep sub-100 us pacing in-process. sched_yield() can hand the
+            // producer away for several target intervals at high rates.
         }
         handler->OnMessage(nullptr, &message);
         ++invoked;
@@ -9127,6 +9773,9 @@ bool RunHistoryLatencyBenchmark(
     constexpr std::size_t kAllColumnRepeats = 10U;
     const bool factor_generation_enabled =
         scenario == StartupBenchmarkScenarioV1::kFromOpen;
+    const bool partial_event_v2_enabled =
+        scenario ==
+        StartupBenchmarkScenarioV1::kLivePartialNoRecovery;
 
     std::cout
         << "HISTORY_ENV capacity=" << kCapacity
@@ -9138,6 +9787,8 @@ bool RunHistoryLatencyBenchmark(
         << " coverage_from_open="
         << (StartupBenchmarkCoverageFromOpenV1(scenario) ? 1 : 0)
         << " online_recovery=0"
+        << " partial_event_v2="
+        << (partial_event_v2_enabled ? 1 : 0)
         << " factor_generation_enabled="
         << (factor_generation_enabled ? 1 : 0)
         << " generation_visibility=forced_cut"
@@ -9219,6 +9870,63 @@ bool RunHistoryLatencyBenchmark(
 
     auto timed_applied = std::make_shared<TimedAppliedSink>(
         service, kMaximumSequence);
+    std::shared_ptr<ipc::RealtimePartialOrderEventServiceV2>
+        partial_event_service;
+    if (partial_event_v2_enabled) {
+        ipc::RealtimePartialOrderEventServiceConfigV2 event_config{};
+        event_config.run_id = run_id;
+        event_config.session_epoch = 67U;
+        event_config.trade_date = kTradeDate;
+        event_config.coverage_start_unix_ns =
+            kProcessStartKLineCoverageUnixNs;
+        event_config.fast_sink = timed_applied;
+        event_config.channel_capacity = 256U;
+        event_config.handoff_queue_capacity = 262'144U;
+        event_config.maximum_pending_entries = 262'144U;
+        event_config.maximum_pending_entries_per_channel = 16'384U;
+        event_config.duplicate_retention_entries = 262'144U;
+        event_config.maximum_reorder_span = 1'048'576U;
+        event_config.discovery_horizon =
+            std::chrono::milliseconds(25);
+        event_config.maximum_shanghai_order_states =
+            kMaximumSequence;
+        event_config.maximum_shenzhen_order_states =
+            kMaximumSequence;
+        event_config.maximum_derived_events =
+            kMaximumSequence * 4U;
+        event_config.event_journal_capacity =
+            kMaximumSequence * 4U;
+        event_config.order_state_capacity = 262'144U;
+        event_config.maximum_order_state_updates_per_commit = 3U;
+        event_config.maximum_mapping_bytes =
+            8ULL * 1024ULL * 1024ULL * 1024ULL;
+        const auto event_error =
+            ipc::RealtimePartialOrderEventServiceV2::Create(
+                std::move(event_config),
+                &partial_event_service,
+                &system_error);
+        if (event_error !=
+                ipc::RealtimePartialOrderEventServiceCreateErrorV2::kNone ||
+            partial_event_service == nullptr) {
+            std::cerr
+                << "history partial Event V2 create error="
+                << ipc::RealtimePartialOrderEventServiceCreateErrorNameV2(
+                       event_error)
+                << " system_error=" << system_error << '\n';
+        }
+        if (!Expect(
+                event_error ==
+                        ipc::RealtimePartialOrderEventServiceCreateErrorV2::
+                            kNone &&
+                    partial_event_service != nullptr &&
+                    partial_event_service->StartWorker(&system_error) &&
+                    system_error == 0,
+                "create/start history partial Event V2 service")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
     auto sdk_state = std::make_shared<LatencySdkState>();
     auto sdk_factory =
         std::make_shared<LatencySdkFactory>(sdk_state);
@@ -9249,7 +9957,17 @@ bool RunHistoryLatencyBenchmark(
         StartupBenchmarkCoverageFromOpenV1(scenario);
     pipeline_config.factor_generation_enabled =
         factor_generation_enabled;
-    pipeline_config.applied_record_sink = timed_applied;
+    pipeline_config.applied_record_sink =
+        partial_event_service != nullptr
+            ? std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  partial_event_service)
+            : std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(timed_applied);
+    if (partial_event_service != nullptr) {
+        pipeline_config.native_sequence_observation_sink =
+            partial_event_service;
+    }
     pipeline_config.processing_progress_sink = service;
     pipeline_config.store_generation_sink = service;
     pipeline_config.sdk.enabled = true;
@@ -9804,20 +10522,20 @@ bool RunHistoryLatencyBenchmark(
     const std::array<std::vector<std::byte>, 4U> derived_bodies{{
         PipelineShanghaiStatusBody(
             "600002",
-            polars_native_sequence_base + 4'096U,
+            polars_native_sequence_base + 4'097U,
             "TRADE"),
         PipelineShanghaiTickBody(
             "600002",
-            polars_native_sequence_base + 4'097U,
+            polars_native_sequence_base + 4'098U,
             101U),
         PipelineShanghaiAddBody(
             "600002",
-            polars_native_sequence_base + 4'098U,
+            polars_native_sequence_base + 4'099U,
             50U,
             101U),
         PipelineShanghaiTickBody(
             "600002",
-            polars_native_sequence_base + 4'099U,
+            polars_native_sequence_base + 4'100U,
             50U),
     }};
     for (std::size_t index = 0U;
@@ -9939,8 +10657,39 @@ bool RunHistoryLatencyBenchmark(
         }
         std::cout << "PYTHON_" << response << '\n';
 
+        if (partial_event_service != nullptr) {
+            partial_event_service->MarkDraining();
+        }
         pipeline->StopAndDrain();
         const auto final = pipeline->Snapshot();
+        ipc::RealtimePartialOrderEventServiceSnapshotV2
+            partial_event_snapshot{};
+        bool partial_event_idle = true;
+        if (partial_event_service != nullptr) {
+            partial_event_idle =
+                partial_event_service->WaitUntilIdleForTest(
+                    std::chrono::seconds(60));
+            partial_event_service->MarkStoppedClean();
+            partial_event_snapshot =
+                partial_event_service->Snapshot();
+            partial_event_service->Stop();
+        }
+        const bool partial_event_healthy =
+            partial_event_service == nullptr ||
+            (partial_event_idle &&
+             partial_event_snapshot.state ==
+                 ipc::PartialOrderEventServiceStateV2::kStoppedClean &&
+             partial_event_snapshot.last_error ==
+                 ipc::PartialOrderEventLastErrorV2::kNone &&
+             !partial_event_snapshot.globally_frozen &&
+             !partial_event_snapshot.journal_failed &&
+             !partial_event_snapshot.history_failed &&
+             partial_event_snapshot.applied_records != 0U &&
+             partial_event_snapshot.processed_handoffs ==
+                 partial_event_snapshot.enqueued_handoffs &&
+             partial_event_snapshot.dropped_handoffs == 0U &&
+             partial_event_snapshot.handoff_queue_depth == 0U &&
+             partial_event_snapshot.pending_entries == 0U);
         std::uint64_t parallel_inline_messages = 0U;
         std::uint64_t parallel_farm_messages = 0U;
         std::size_t parallel_active_workers = 0U;
@@ -9964,6 +10713,27 @@ bool RunHistoryLatencyBenchmark(
             << " coverage_from_open="
             << (StartupBenchmarkCoverageFromOpenV1(scenario) ? 1 : 0)
             << " online_recovery=0"
+            << " partial_event_v2="
+            << (partial_event_v2_enabled ? 1 : 0)
+            << " partial_event_healthy="
+            << (partial_event_healthy ? 1 : 0)
+            << " partial_event_state="
+            << static_cast<std::uint32_t>(
+                   partial_event_snapshot.state)
+            << " partial_event_applied_records="
+            << partial_event_snapshot.applied_records
+            << " partial_event_observed_native="
+            << partial_event_snapshot.observed_native_messages
+            << " partial_event_enqueued="
+            << partial_event_snapshot.enqueued_handoffs
+            << " partial_event_processed="
+            << partial_event_snapshot.processed_handoffs
+            << " partial_event_dropped="
+            << partial_event_snapshot.dropped_handoffs
+            << " partial_event_queue_high_water="
+            << partial_event_snapshot.handoff_queue_high_water
+            << " partial_event_reorder_high_water="
+            << partial_event_snapshot.reorder_high_water
             << " factor_generation_enabled="
             << (factor_generation_enabled ? 1 : 0)
             << " final_factor_generation_present="
@@ -10000,7 +10770,8 @@ bool RunHistoryLatencyBenchmark(
                 next_sequence - 1U &&
             derived_polars_cut.store_generation->coverage_from_open() ==
                 StartupBenchmarkCoverageFromOpenV1(scenario) &&
-            !service->failed() && !history_stages.failed();
+            !service->failed() && !history_stages.failed() &&
+            partial_event_healthy;
         service->MarkDraining();
         const bool stopped =
             service->MarkStoppedClean(final.tick_stream_sequence);
@@ -11111,7 +11882,7 @@ int main(int argc, char** argv) {
         }
         return false;
     };
-    if ((argc == 13 || argc == 14 || argc == 15) &&
+    if ((argc == 13 || argc == 14 || argc == 15 || argc == 16) &&
         std::string_view(argv[1]) ==
             "--throughput-profile-benchmark") {
         std::array<std::uint64_t, 8U> numeric{};
@@ -11201,7 +11972,7 @@ int main(int argc, char** argv) {
             std::cerr << "invalid throughput startup scenario\n";
             return 2;
         }
-        if (argc == 15) {
+        if (argc >= 15) {
             std::uint64_t generation_interval_ms = 0U;
             if (!parse_unsigned(
                     argv[14], &generation_interval_ms) ||
@@ -11219,6 +11990,9 @@ int main(int argc, char** argv) {
                 std::chrono::milliseconds(
                     static_cast<std::chrono::milliseconds::rep>(
                         generation_interval_ms));
+        }
+        if (argc == 16) {
+            config.partial_event_worker_cpu_set = argv[15];
         }
         return RunThroughputProfileBenchmark(config) ? 0 : 1;
     }
@@ -11332,7 +12106,7 @@ int main(int argc, char** argv) {
                "PARALLEL_DECODER_WORKERS IDLE_INLINE "
                "DECODER_QUEUE STORE_QUEUE "
                "SEGMENT_KIB WORKLOAD SINK [SCENARIO "
-               "GENERATION_INTERVAL_MS]]\n"
+               "GENERATION_INTERVAL_MS [EVENT_WORKER_CPU_SET]]]\n"
                "  SCENARIO: from_open|live_partial_no_recovery\n";
         return 2;
     }

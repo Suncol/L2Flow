@@ -41,6 +41,9 @@ struct RealtimePartialOrderEventServiceConfigV2 final {
     void* failure_notifier_context = nullptr;
 
     std::uint32_t channel_capacity = 256U;
+    // Capacity of each preallocated observation/applied handoff lane. Keeping
+    // the serialized admission lane separate prevents Store publishers from
+    // contending on the callback's enqueue position.
     std::uint64_t handoff_queue_capacity = 262'144U;
     std::uint64_t maximum_pending_entries = 262'144U;
     std::uint64_t maximum_pending_entries_per_channel = 16'384U;
@@ -102,7 +105,13 @@ struct RealtimePartialOrderEventServiceSnapshotV2 final {
     std::uint64_t processed_handoffs = 0U;
     std::uint64_t dropped_handoffs = 0U;
     std::uint64_t handoff_queue_depth = 0U;
+    // Sampled by the Event worker at bounded batch boundaries. Exact current
+    // backlog is handoff_queue_depth; this value is diagnostic only.
     std::uint64_t handoff_queue_high_water = 0U;
+    std::uint64_t journal_canonical_commits = 0U;
+    std::uint64_t journal_status_commits = 0U;
+    std::uint64_t journal_published_slices = 0U;
+    std::uint64_t journal_maximum_batch_slices = 0U;
     std::uint64_t reorder_high_water = 0U;
     std::uint64_t pending_entries = 0U;
     std::uint32_t channel_count = 0U;
@@ -169,6 +178,10 @@ public:
         int* system_error_number = nullptr) const noexcept;
     [[nodiscard]] PartialOrderEventJournalSessionV2 session()
         const noexcept;
+    // Read before admission or after Stop/MarkStoppedClean when proving that
+    // the Event worker performed no backing allocation on its hot path.
+    [[nodiscard]] PartialOrderEventJournalResourceSnapshotV2
+    JournalResourceSnapshot() const noexcept;
     // Test-only drain fence for work already admitted when this call observes
     // the queue. It includes an in-progress journal commit, but it does not wait
     // for a future process-local discovery-horizon deadline.

@@ -121,6 +121,16 @@ ProjectShenzhenOrderEventInputV1(
     std::uint64_t tick_stream_sequence,
     ShenzhenOrderEventInputV1* output) noexcept;
 
+// Store records expose borrowed concrete-event pointers. Projecting that view
+// directly avoids rebuilding an IPC wire envelope only to decode it again on
+// the ordered Event path.
+[[nodiscard]] ShenzhenOrderEventProjectionV1
+ProjectShenzhenOrderEventInputV1(
+    const StoredMarketEventViewV1& event,
+    std::uint64_t ingress_sequence,
+    std::uint64_t tick_stream_sequence,
+    ShenzhenOrderEventInputV1* output) noexcept;
+
 struct ShenzhenOrderSnapshotV1 final {
     ShenzhenOrderKeyV1 key{};
     SideV1 side = SideV1::kUnknown;
@@ -195,6 +205,25 @@ using ShenzhenOrderEventV1 = std::variant<
     ShenzhenOrderRevisionEventV1,
     ShenzhenTradeEventV1,
     ShenzhenCancelEventV1>;
+
+// Synchronous allocation-free output used by an owner-private projection
+// path. Callbacks must consume their arguments before returning and must not
+// re-enter the projector. Returning false fail-closes the projector because
+// order state may already have been mutated for the current input.
+struct ShenzhenOrderEventSinkV1 final {
+    void* context = nullptr;
+    bool (*append_revision)(
+        void* context,
+        ShenzhenOrderDeltaOperationV1 operation,
+        const ShenzhenEventSourceAnchorV1& source_anchor,
+        const ShenzhenOrderSnapshotV1& order) noexcept = nullptr;
+    bool (*append_trade)(
+        void* context,
+        const ShenzhenTradeEventV1& event) noexcept = nullptr;
+    bool (*append_cancel)(
+        void* context,
+        const ShenzhenCancelEventV1& event) noexcept = nullptr;
+};
 
 struct ShenzhenOrderEventProjectorConfigV1 final {
     std::uint32_t trade_date = 0U;
@@ -280,6 +309,12 @@ public:
         std::uint64_t canonical_apply_sequence,
         std::vector<ShenzhenOrderEventV1>* output) noexcept;
 
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1
+    ConsumeCanonicalToSink(
+        const ShenzhenOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence,
+        const ShenzhenOrderEventSinkV1& sink) noexcept;
+
     [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1 ConsumeDecoded(
         const DecodedMarketEventV1& event,
         std::uint64_t ingress_sequence,
@@ -302,6 +337,12 @@ public:
         const noexcept;
 
 private:
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1
+    ConsumeCanonicalImpl(
+        const ShenzhenOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence,
+        std::vector<ShenzhenOrderEventV1>* output,
+        const ShenzhenOrderEventSinkV1* sink) noexcept;
     class Impl;
     explicit ShenzhenOrderEventProjectorV1(
         std::unique_ptr<Impl> impl) noexcept;

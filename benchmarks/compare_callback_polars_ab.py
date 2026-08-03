@@ -243,6 +243,9 @@ def _parse_latency_log(
                 f"unsupported expected startup scenario: {expected_scenario}"
             )
         expected_state, expected_coverage = expected_contract
+        expected_partial_event = int(
+            expected_scenario == "live_partial_no_recovery"
+        )
         if history_env.get("scenario") != expected_scenario:
             raise ValueError(f"{path}: HISTORY_ENV scenario differs")
         if history_env.get("server_state") != expected_state:
@@ -251,6 +254,11 @@ def _parse_latency_log(
             raise ValueError(f"{path}: HISTORY_ENV coverage differs")
         if _unsigned(history_env, "online_recovery") != 0:
             raise ValueError(f"{path}: benchmark unexpectedly used recovery")
+        if (
+            _unsigned(history_env, "partial_event_v2")
+            != expected_partial_event
+        ):
+            raise ValueError(f"{path}: HISTORY_ENV partial Event differs")
         if (
             _unsigned(history_env, "factor_generation_enabled")
             != expected_coverage
@@ -268,6 +276,30 @@ def _parse_latency_log(
             raise ValueError(f"{path}: topology coverage differs")
         if _unsigned(topology, "online_recovery") != 0:
             raise ValueError(f"{path}: topology unexpectedly used recovery")
+        if (
+            _unsigned(topology, "partial_event_v2")
+            != expected_partial_event
+            or _unsigned(topology, "partial_event_healthy") != 1
+        ):
+            raise ValueError(f"{path}: topology partial Event differs")
+        if _unsigned(topology, "partial_event_state") != (
+            9 if expected_partial_event else 1
+        ):
+            raise ValueError(f"{path}: partial Event final state differs")
+        if _unsigned(topology, "partial_event_dropped") != 0:
+            raise ValueError(f"{path}: partial Event dropped handoffs")
+        if _unsigned(topology, "partial_event_processed") != _unsigned(
+            topology, "partial_event_enqueued"
+        ):
+            raise ValueError(f"{path}: partial Event handoffs do not close")
+        expected_event_applied = 4_100 if expected_partial_event else 0
+        if (
+            _unsigned(topology, "partial_event_applied_records")
+            != expected_event_applied
+            or _unsigned(topology, "partial_event_observed_native")
+            != expected_event_applied
+        ):
+            raise ValueError(f"{path}: partial Event cardinality differs")
         if (
             _unsigned(topology, "factor_generation_enabled")
             != expected_coverage

@@ -1,6 +1,7 @@
 #include "l2flow/ipc/instrument_derived_event_wire_v1.h"
 
 #include <cstdint>
+#include <utility>
 #include <variant>
 
 namespace l2flow::ipc {
@@ -171,10 +172,11 @@ void Flatten(
     CopyAnchor(source.source_anchor, output);
 }
 
-void Flatten(
-    const market::ShenzhenOrderRevisionEventV1& source,
+void FlattenShenzhenRevision(
+    market::ShenzhenOrderDeltaOperationV1 operation,
+    const market::ShenzhenEventSourceAnchorV1& source_anchor,
+    const market::ShenzhenOrderSnapshotV1& order,
     l2flow_instrument_derived_event_row_v1* output) noexcept {
-    const auto& order = source.order;
     output->market =
         L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHENZHEN_V1;
     output->event_kind =
@@ -184,7 +186,7 @@ void Flatten(
     output->channel = order.key.channel;
     output->order_id = order.key.order_id;
     output->operation =
-        static_cast<std::uint8_t>(source.operation);
+        static_cast<std::uint8_t>(operation);
     output->finality =
         static_cast<std::uint8_t>(order.finality);
     output->side = static_cast<std::uint8_t>(order.side);
@@ -223,7 +225,14 @@ void Flatten(
         order.source_market_notices;
     output->add_seen = 1U;
     output->apply_to_book = 1U;
-    CopyAnchor(source.source_anchor, output);
+    CopyAnchor(source_anchor, output);
+}
+
+void Flatten(
+    const market::ShenzhenOrderRevisionEventV1& source,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    FlattenShenzhenRevision(
+        source.operation, source.source_anchor, source.order, output);
 }
 
 void Flatten(
@@ -279,6 +288,50 @@ void Flatten(
     CopyAnchor(source.source_anchor, output);
 }
 
+template <typename Project>
+[[nodiscard]] bool ProjectSourceTickEventWith(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    l2flow_instrument_derived_event_row_v1* output,
+    Project&& project) noexcept {
+    if (output == nullptr || derived_event_sequence == 0U) {
+        return false;
+    }
+    *output = {};
+    output->record_schema_version =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_ROW_SCHEMA_V2;
+    output->record_bytes = sizeof(*output);
+    output->derived_event_sequence = derived_event_sequence;
+    std::forward<Project>(project)(output);
+    if (output->tick_stream_sequence == 0U) {
+        *output = {};
+        return false;
+    }
+    output->reserved0 = source_tick_event_ordinal;
+    output->reserved1[0U] =
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2;
+    return true;
+}
+
+template <typename EventVariant>
+[[nodiscard]] bool ProjectSourceTickEvent(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    const EventVariant& source,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    return ProjectSourceTickEventWith(
+        derived_event_sequence,
+        source_tick_event_ordinal,
+        output,
+        [&source](l2flow_instrument_derived_event_row_v1* row) noexcept {
+            std::visit(
+                [row](const auto& event) noexcept {
+                    Flatten(event, row);
+                },
+                source);
+        });
+}
+
 }  // namespace
 
 bool ProjectInstrumentDerivedEventWireV1(
@@ -319,6 +372,76 @@ bool ProjectInstrumentDerivedEventWireV1(
             ? L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2
             : L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_INVALID_V2;
     return true;
+}
+
+bool ProjectInstrumentDerivedEventWireV1(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    const market::ShanghaiOrderEventV1& source,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    return ProjectSourceTickEvent(
+        derived_event_sequence,
+        source_tick_event_ordinal,
+        source,
+        output);
+}
+
+bool ProjectInstrumentDerivedEventWireV1(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    const market::ShenzhenOrderEventV1& source,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    return ProjectSourceTickEvent(
+        derived_event_sequence,
+        source_tick_event_ordinal,
+        source,
+        output);
+}
+
+bool ProjectInstrumentDerivedEventWireV1(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    market::ShenzhenOrderDeltaOperationV1 operation,
+    const market::ShenzhenEventSourceAnchorV1& source_anchor,
+    const market::ShenzhenOrderSnapshotV1& order,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    return ProjectSourceTickEventWith(
+        derived_event_sequence,
+        source_tick_event_ordinal,
+        output,
+        [operation, &source_anchor, &order](
+            l2flow_instrument_derived_event_row_v1* row) noexcept {
+            FlattenShenzhenRevision(
+                operation, source_anchor, order, row);
+        });
+}
+
+bool ProjectInstrumentDerivedEventWireV1(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    const market::ShenzhenTradeEventV1& source,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    return ProjectSourceTickEventWith(
+        derived_event_sequence,
+        source_tick_event_ordinal,
+        output,
+        [&source](l2flow_instrument_derived_event_row_v1* row) noexcept {
+            Flatten(source, row);
+        });
+}
+
+bool ProjectInstrumentDerivedEventWireV1(
+    std::uint64_t derived_event_sequence,
+    std::uint32_t source_tick_event_ordinal,
+    const market::ShenzhenCancelEventV1& source,
+    l2flow_instrument_derived_event_row_v1* output) noexcept {
+    return ProjectSourceTickEventWith(
+        derived_event_sequence,
+        source_tick_event_ordinal,
+        output,
+        [&source](l2flow_instrument_derived_event_row_v1* row) noexcept {
+            Flatten(source, row);
+        });
 }
 
 }  // namespace l2flow::ipc

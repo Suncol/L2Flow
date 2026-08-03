@@ -537,6 +537,8 @@ if(L2FLOW_BUILD_TESTS)
         add_executable(benchmark_online_recovery_fast_v1
             tests/benchmark_online_recovery_fast_v1.cpp)
         l2flow_configure_target(benchmark_online_recovery_fast_v1)
+        target_compile_definitions(
+            benchmark_online_recovery_fast_v1 PRIVATE _GNU_SOURCE)
         target_link_libraries(benchmark_online_recovery_fast_v1
             PRIVATE L2Flow::ipc L2Flow::realtime l2flow_shm_reader)
         l2flow_add_test(test_certified_order_event_history_v1
@@ -627,6 +629,13 @@ if(L2FLOW_BUILD_TESTS)
                     L2FLOW_V2_PYTHON_DERIVED_HISTORY_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/derived_event_history_probe.py"
                     L2FLOW_V2_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python"
                     L2FLOW_V2_PYTHON_READER_LIBRARY="$<TARGET_FILE:l2flow_shm_reader>")
+            target_compile_definitions(
+                benchmark_online_recovery_fast_v1
+                PRIVATE
+                    L2FLOW_ONLINE_RECOVERY_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+                    L2FLOW_ONLINE_RECOVERY_POLARS_SCRIPT="${CMAKE_CURRENT_SOURCE_DIR}/tests/python/online_recovery_polars_probe.py"
+                    L2FLOW_ONLINE_RECOVERY_PYTHON_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/python"
+                    L2FLOW_ONLINE_RECOVERY_READER_LIBRARY="$<TARGET_FILE:l2flow_shm_reader>")
             add_test(
                 NAME test_l2flow_realtime_python
                 COMMAND

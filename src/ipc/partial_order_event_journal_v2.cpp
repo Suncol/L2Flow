@@ -308,6 +308,12 @@ public:
             config_.maximum_order_state_updates_per_commit == 0U
                 ? config_.order_state_capacity
                 : config_.maximum_order_state_updates_per_commit;
+        maximum_events_per_commit_ =
+            config_.maximum_events_per_commit == 0U
+                ? config_.event_capacity
+                : config_.maximum_events_per_commit;
+        compact_state_planning_ =
+            maximum_state_updates_per_commit_ <= 4'096U;
         if (maximum_state_updates_per_commit_ >
                 config_.order_state_capacity ||
             maximum_state_updates_per_commit_ >
@@ -316,9 +322,14 @@ public:
             maximum_state_updates_per_commit_ >
                 static_cast<std::uint64_t>(
                     state_plans_.max_size()) ||
-            config_.order_state_capacity >
+            maximum_events_per_commit_ > config_.event_capacity ||
+            maximum_events_per_commit_ >
                 static_cast<std::uint64_t>(
-                    state_plan_slots_.max_size())) {
+                    projected_rows_.max_size()) ||
+            (!compact_state_planning_ &&
+             config_.order_state_capacity >
+                static_cast<std::uint64_t>(
+                    state_plan_slots_.max_size()))) {
             return PartialOrderEventJournalCreateErrorV2::
                 kInvalidConfiguration;
         }
@@ -344,10 +355,20 @@ public:
              63U) /
             64U;
         try {
+            projected_rows_.reserve(
+                static_cast<std::size_t>(
+                    maximum_events_per_commit_));
             state_plans_.reserve(static_cast<std::size_t>(
                 maximum_state_updates_per_commit_));
-            state_plan_slots_.resize(
-                static_cast<std::size_t>(config_.order_state_capacity));
+            const std::size_t state_plan_slot_count =
+                compact_state_planning_
+                    ? std::bit_ceil(
+                          static_cast<std::size_t>(
+                              maximum_state_updates_per_commit_) *
+                          2U)
+                    : static_cast<std::size_t>(
+                          config_.order_state_capacity);
+            state_plan_slots_.resize(state_plan_slot_count);
             order_state_backing_words_.assign(backing_word_count, 0U);
             order_state_planning_words_.assign(backing_word_count, 0U);
             const std::uint64_t maximum_planned_chunks = std::min(
@@ -537,6 +558,117 @@ public:
     }
 
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    PreallocateBacking(int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (failed_ || commit_sequence_ != 1U ||
+            canonical_apply_frontier_ != 0U ||
+            published_event_frontier_ != 0U) {
+            return PartialOrderEventJournalPublishErrorV2::
+                kInvalidArgument;
+        }
+        if (fully_preallocated_) {
+            return PartialOrderEventJournalPublishErrorV2::kNone;
+        }
+
+        if (committed_event_region_bytes_ < channel_bank_offsets_[0U]) {
+            if (!AllocateBacking(
+                    memfd_,
+                    committed_event_region_bytes_,
+                    channel_bank_offsets_[0U] -
+                        committed_event_region_bytes_,
+                    system_error_number)) {
+                last_system_error_ =
+                    system_error_number == nullptr
+                        ? errno
+                        : *system_error_number;
+                return PartialOrderEventJournalPublishErrorV2::
+                    kBackingCommitFailed;
+            }
+            ++event_backing_allocation_calls_;
+            committed_event_region_bytes_ = channel_bank_offsets_[0U];
+        }
+
+        if (order_state_backed_chunks_ <
+            order_state_backing_chunk_count_) {
+            if (!AllocateBacking(
+                    memfd_,
+                    order_states_offset_,
+                    order_state_region_bytes_,
+                    system_error_number)) {
+                last_system_error_ =
+                    system_error_number == nullptr
+                        ? errno
+                        : *system_error_number;
+                return PartialOrderEventJournalPublishErrorV2::
+                    kBackingCommitFailed;
+            }
+            std::fill(
+                order_state_backing_words_.begin(),
+                order_state_backing_words_.end(),
+                std::numeric_limits<std::uint64_t>::max());
+            const std::uint64_t remainder =
+                order_state_backing_chunk_count_ % 64U;
+            if (remainder != 0U) {
+                order_state_backing_words_.back() =
+                    (1ULL << remainder) - 1U;
+            }
+            order_state_backed_bytes_ = order_state_region_bytes_;
+            order_state_backed_chunks_ =
+                order_state_backing_chunk_count_;
+            ++order_state_backing_allocation_calls_;
+        }
+        if (config_.prefault_event_pages) {
+            ++event_prefault_attempts_;
+#if defined(MADV_POPULATE_WRITE)
+            const std::uint64_t event_region_bytes =
+                channel_bank_offsets_[0U] -
+                kPartialOrderEventHeaderBytesV2;
+            if (::madvise(
+                    static_cast<std::byte*>(mapping_) +
+                        kPartialOrderEventHeaderBytesV2,
+                    static_cast<std::size_t>(event_region_bytes),
+                    MADV_POPULATE_WRITE) != 0) {
+                const int advice_error = errno;
+                last_system_error_ = advice_error;
+                SetSystemError(system_error_number, advice_error);
+                return PartialOrderEventJournalPublishErrorV2::
+                    kBackingCommitFailed;
+            }
+            event_prefaulted_bytes_ = event_region_bytes;
+#else
+            last_system_error_ = ENOTSUP;
+            SetSystemError(system_error_number, ENOTSUP);
+            return PartialOrderEventJournalPublishErrorV2::
+                kBackingCommitFailed;
+#endif
+        }
+        if (config_.prefault_order_state_pages) {
+            ++order_state_prefault_attempts_;
+#if defined(MADV_POPULATE_WRITE)
+            if (::madvise(
+                    static_cast<std::byte*>(mapping_) +
+                        order_states_offset_,
+                    static_cast<std::size_t>(order_state_region_bytes_),
+                    MADV_POPULATE_WRITE) != 0) {
+                const int advice_error = errno;
+                last_system_error_ = advice_error;
+                SetSystemError(system_error_number, advice_error);
+                return PartialOrderEventJournalPublishErrorV2::
+                    kBackingCommitFailed;
+            }
+            order_state_prefaulted_bytes_ = order_state_region_bytes_;
+#else
+            last_system_error_ = ENOTSUP;
+            SetSystemError(system_error_number, ENOTSUP);
+            return PartialOrderEventJournalPublishErrorV2::
+                kBackingCommitFailed;
+#endif
+        }
+        fully_preallocated_ = true;
+        return PartialOrderEventJournalPublishErrorV2::kNone;
+    }
+
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
     EnsureEventWritable(std::uint64_t required_event_count) noexcept {
         if (failed_) {
             return PartialOrderEventJournalPublishErrorV2::kFailed;
@@ -544,6 +676,9 @@ public:
         if (required_event_count > config_.event_capacity) {
             return PartialOrderEventJournalPublishErrorV2::
                 kEventCapacity;
+        }
+        if (fully_preallocated_) {
+            return PartialOrderEventJournalPublishErrorV2::kNone;
         }
         using namespace partial_order_event_wire_v2_detail;
         std::uint64_t slot_bytes = 0U;
@@ -585,6 +720,7 @@ public:
             return PartialOrderEventJournalPublishErrorV2::
                 kBackingCommitFailed;
         }
+        ++event_backing_allocation_calls_;
         committed_event_region_bytes_ = target;
         return PartialOrderEventJournalPublishErrorV2::kNone;
     }
@@ -596,18 +732,50 @@ public:
         std::span<const InstrumentDerivedEventV1> events,
         std::span<const PartialOrderEventChannelHealthV2>
             affected_channels) noexcept {
-        if (canonical_apply_sequence == 0U ||
-            canonical_apply_sequence >
-                std::numeric_limits<std::uint64_t>::max() / 2U ||
-            canonical_apply_frontier_ ==
-                std::numeric_limits<std::uint64_t>::max() ||
-            canonical_apply_sequence != canonical_apply_frontier_ + 1U) {
+        const PartialOrderEventCanonicalSliceV2 slice{
+            canonical_apply_sequence, events.size()};
+        return PublishCanonicalBatch(
+            std::span{&slice, std::size_t{1U}},
+            status,
+            events,
+            affected_channels);
+    }
+
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    PublishCanonicalBatch(
+        std::span<const PartialOrderEventCanonicalSliceV2> slices,
+        const PartialOrderEventStatusUpdateV2& status,
+        std::span<const InstrumentDerivedEventV1> events,
+        std::span<const PartialOrderEventChannelHealthV2>
+            affected_channels) noexcept {
+        if (slices.empty()) {
             return PartialOrderEventJournalPublishErrorV2::
-                kCanonicalSequence;
+                kInvalidArgument;
         }
         return Commit(
-            canonical_apply_sequence,
+            slices,
             status,
+            events,
+            {},
+            affected_channels,
+            true);
+    }
+
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    PublishCanonicalBatchProjected(
+        std::span<const PartialOrderEventCanonicalSliceV2> slices,
+        const PartialOrderEventStatusUpdateV2& status,
+        std::span<const l2flow_instrument_derived_event_row_v1> events,
+        std::span<const PartialOrderEventChannelHealthV2>
+            affected_channels) noexcept {
+        if (slices.empty()) {
+            return PartialOrderEventJournalPublishErrorV2::
+                kInvalidArgument;
+        }
+        return Commit(
+            slices,
+            status,
+            {},
             events,
             affected_channels,
             true);
@@ -618,8 +786,9 @@ public:
         std::span<const PartialOrderEventChannelHealthV2>
             affected_channels) noexcept {
         return Commit(
-            canonical_apply_frontier_,
+            {},
             status,
+            {},
             {},
             affected_channels,
             false);
@@ -682,7 +851,13 @@ public:
             committed_event_region_bytes_,
             order_state_backed_bytes_,
             order_state_backed_chunks_,
-            order_state_backing_allocation_calls_};
+            order_state_backing_allocation_calls_,
+            event_backing_allocation_calls_,
+            event_prefault_attempts_,
+            event_prefaulted_bytes_,
+            order_state_prefault_attempts_,
+            order_state_prefaulted_bytes_,
+            fully_preallocated_};
     }
 
     [[nodiscard]] bool failed() const noexcept { return failed_; }
@@ -697,6 +872,7 @@ private:
         OrderKey key{};
         std::uint64_t slot_index = 0U;
         std::size_t event_index = 0U;
+        std::uint64_t canonical_apply_sequence = 0U;
         std::uint64_t expected_version_tag = 0U;
         std::uint32_t version_index = 0U;
         bool new_key = false;
@@ -704,16 +880,26 @@ private:
 
     struct StatePlanSlot final {
         std::uint64_t epoch = 0U;
+        std::uint64_t order_slot_index = 0U;
         std::uint64_t plan_index = 0U;
     };
 
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2 Commit(
-        std::uint64_t new_canonical_frontier,
+        std::span<const PartialOrderEventCanonicalSliceV2> slices,
         const PartialOrderEventStatusUpdateV2& status,
         std::span<const InstrumentDerivedEventV1> events,
+        std::span<const l2flow_instrument_derived_event_row_v1>
+            projected_events,
         std::span<const PartialOrderEventChannelHealthV2>
             affected_channels,
         bool advances_canonical) noexcept {
+        if (!events.empty() && !projected_events.empty()) {
+            return PartialOrderEventJournalPublishErrorV2::
+                kInvalidArgument;
+        }
+        const std::size_t event_count = projected_events.empty()
+                                            ? events.size()
+                                            : projected_events.size();
         if (failed_) {
             return PartialOrderEventJournalPublishErrorV2::kFailed;
         }
@@ -728,9 +914,47 @@ private:
              (status.stale ||
               status.last_error !=
                   PartialOrderEventLastErrorV2::kNone)) ||
-            (!advances_canonical && !events.empty())) {
+            (advances_canonical != !slices.empty()) ||
+            (!advances_canonical && event_count != 0U)) {
             return PartialOrderEventJournalPublishErrorV2::
                 kInvalidArgument;
+        }
+
+        std::uint64_t new_canonical_frontier = canonical_apply_frontier_;
+        std::uint64_t sliced_event_count = 0U;
+        if (advances_canonical) {
+            std::uint64_t expected_sequence = canonical_apply_frontier_;
+            for (const PartialOrderEventCanonicalSliceV2& slice : slices) {
+                if (expected_sequence ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    slice.canonical_apply_sequence == 0U ||
+                    slice.canonical_apply_sequence >
+                        std::numeric_limits<std::uint64_t>::max() / 2U ||
+                    slice.canonical_apply_sequence !=
+                        expected_sequence + 1U) {
+                    return PartialOrderEventJournalPublishErrorV2::
+                        kCanonicalSequence;
+                }
+                if ((slice.event_count != 0U &&
+                     slice.event_count - 1U >
+                         static_cast<std::size_t>(
+                             std::numeric_limits<std::uint32_t>::max())) ||
+                    static_cast<std::uint64_t>(slice.event_count) >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            sliced_event_count) {
+                    return PartialOrderEventJournalPublishErrorV2::
+                        kInvalidArgument;
+                }
+                sliced_event_count +=
+                    static_cast<std::uint64_t>(slice.event_count);
+                expected_sequence = slice.canonical_apply_sequence;
+            }
+            new_canonical_frontier = expected_sequence;
+            if (sliced_event_count !=
+                static_cast<std::uint64_t>(event_count)) {
+                return PartialOrderEventJournalPublishErrorV2::
+                    kInvalidArgument;
+            }
         }
         if (commit_sequence_ >=
             std::numeric_limits<std::uint64_t>::max() / 2U) {
@@ -742,14 +966,12 @@ private:
             return PartialOrderEventJournalPublishErrorV2::
                 kChannelCapacity;
         }
-        if (events.size() >
+        if (event_count >
                 std::numeric_limits<std::uint64_t>::max() -
                     published_event_frontier_ ||
-            (!events.empty() &&
-             events.size() - 1U >
-                 static_cast<std::size_t>(
-                     std::numeric_limits<std::uint32_t>::max())) ||
-            static_cast<std::uint64_t>(events.size()) >
+            static_cast<std::uint64_t>(event_count) >
+                maximum_events_per_commit_ ||
+            static_cast<std::uint64_t>(event_count) >
                 config_.event_capacity - published_event_frontier_) {
             return PartialOrderEventJournalPublishErrorV2::
                 kEventCapacity;
@@ -797,7 +1019,7 @@ private:
 
         const std::uint64_t new_event_frontier =
             published_event_frontier_ +
-            static_cast<std::uint64_t>(events.size());
+            static_cast<std::uint64_t>(event_count);
         const auto writable = EnsureEventWritable(new_event_frontier);
         if (writable != PartialOrderEventJournalPublishErrorV2::kNone) {
             return writable;
@@ -805,51 +1027,73 @@ private:
 
         state_plans_.clear();
         BeginStatePlanEpoch();
-        constexpr std::size_t kInlineProjectionRows = 3U;
-        std::array<
-            l2flow_instrument_derived_event_row_v1,
-            kInlineProjectionRows>
-            inline_rows{};
-        const bool inline_projection = events.size() <= inline_rows.size();
-        for (std::size_t index = 0U; index < events.size(); ++index) {
-            const std::uint64_t sequence =
-                published_event_frontier_ +
-                static_cast<std::uint64_t>(index) + 1U;
-            PartialOrderEventSlotV2& event_slot =
-                event_slots_[sequence - 1U];
-            if (Atomic(event_slot.publish_tag)
-                        .load(std::memory_order_acquire) != 0U ||
-                !partial_order_event_wire_v2_detail::AllZero(
-                    event_slot.reserved)) {
-                return PartialOrderEventJournalPublishErrorV2::
-                    kPublicationInvariant;
-            }
-            l2flow_instrument_derived_event_row_v1 scratch{};
-            auto& row = inline_projection ? inline_rows[index] : scratch;
-            if (!events[index].source_tick_event_ordinal_valid ||
-                events[index].source_tick_event_ordinal !=
-                    static_cast<std::uint32_t>(index) ||
-                !ProjectInstrumentDerivedEventWireV1(
-                    events[index], &row) ||
-                !CertifiedOrderEventRowCanonicalV1(
-                    row, config_.trade_date, sequence)) {
-                return PartialOrderEventJournalPublishErrorV2::
-                    kProjectionError;
-            }
-            if (row.event_kind ==
-                L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1) {
-                const OrderKey key{
-                    row.market,
-                    row.instrument_id,
-                    row.channel,
-                    row.order_id};
-                const auto plan_result = PlanStateUpdate(key, index);
-                if (plan_result !=
-                    PartialOrderEventJournalPublishErrorV2::kNone) {
-                    return plan_result;
+        if (events.size() > projected_rows_.capacity()) {
+            return PartialOrderEventJournalPublishErrorV2::kEventCapacity;
+        }
+        projected_rows_.resize(events.size());
+        std::size_t event_index = 0U;
+        for (const PartialOrderEventCanonicalSliceV2& slice : slices) {
+            for (std::size_t ordinal = 0U;
+                 ordinal < slice.event_count;
+                 ++ordinal) {
+                const std::uint64_t sequence =
+                    published_event_frontier_ +
+                    static_cast<std::uint64_t>(event_index) + 1U;
+                const l2flow_instrument_derived_event_row_v1* row = nullptr;
+                if (projected_events.empty()) {
+                    l2flow_instrument_derived_event_row_v1* const
+                        projected_row = &projected_rows_[event_index];
+                    row = projected_row;
+                    if (!events[event_index]
+                             .source_tick_event_ordinal_valid ||
+                        events[event_index].source_tick_event_ordinal !=
+                            static_cast<std::uint32_t>(ordinal) ||
+                        !ProjectInstrumentDerivedEventWireV1(
+                            events[event_index], projected_row)) {
+                        return PartialOrderEventJournalPublishErrorV2::
+                            kProjectionError;
+                    }
+                } else {
+                    row = &projected_events[event_index];
+                    if (row->reserved1[0U] !=
+                            L2FLOW_INSTRUMENT_DERIVED_EVENT_SOURCE_TICK_ORDINAL_VALID_V2 ||
+                        row->reserved0 !=
+                            static_cast<std::uint32_t>(ordinal)) {
+                        return PartialOrderEventJournalPublishErrorV2::
+                            kProjectionError;
+                    }
                 }
+                if (
+                    !CertifiedOrderEventRowCanonicalV1(
+                        *row, config_.trade_date, sequence)) {
+                    return PartialOrderEventJournalPublishErrorV2::
+                        kProjectionError;
+                }
+                if (row->event_kind ==
+                    L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1) {
+                    const OrderKey key{
+                        row->market,
+                        row->instrument_id,
+                        row->channel,
+                        row->order_id};
+                    const auto plan_result = PlanStateUpdate(
+                        key,
+                        event_index,
+                        slice.canonical_apply_sequence);
+                    if (plan_result !=
+                        PartialOrderEventJournalPublishErrorV2::kNone) {
+                        return plan_result;
+                    }
+                }
+                ++event_index;
             }
         }
+        const std::span<const l2flow_instrument_derived_event_row_v1>
+            commit_rows = projected_events.empty()
+                              ? std::span<const l2flow_instrument_derived_event_row_v1>{
+                                    projected_rows_.data(),
+                                    projected_rows_.size()}
+                              : projected_events;
 
         const auto backing_error = EnsureOrderStateBacking();
         if (backing_error !=
@@ -911,17 +1155,12 @@ private:
             PartialOrderEventOrderStateSlotV2& state_slot =
                 order_state_slots_[plan.slot_index];
             if (plan.new_key) {
-                std::uint64_t expected = 0U;
-                if (!Atomic(state_slot.key_publish_tag)
-                         .compare_exchange_strong(
-                             expected,
-                             1U,
-                             std::memory_order_acq_rel,
-                             std::memory_order_acquire)) {
-                    return FailTerminal(
-                        PartialOrderEventJournalPublishErrorV2::
-                            kPublicationInvariant);
-                }
+                // Planning observed this slot empty and reserved it for this
+                // plan epoch. This producer is the sole writer; readers treat
+                // the odd tag as uncommitted, so a release store is sufficient
+                // to claim the key without a second random slot load or RMW.
+                Atomic(state_slot.key_publish_tag)
+                    .store(1U, std::memory_order_release);
                 std::atomic_thread_fence(std::memory_order_release);
                 if (TripFailpoint(
                         PartialOrderEventCommitFailpointV2::
@@ -929,16 +1168,10 @@ private:
                     return PartialOrderEventJournalPublishErrorV2::
                         kInjectedFailure;
                 }
-                Atomic(state_slot.market)
-                    .store(plan.key.market, std::memory_order_relaxed);
-                Atomic(state_slot.instrument_id)
-                    .store(
-                        plan.key.instrument_id,
-                        std::memory_order_relaxed);
-                Atomic(state_slot.channel)
-                    .store(plan.key.channel, std::memory_order_relaxed);
-                Atomic(state_slot.order_id)
-                    .store(plan.key.order_id, std::memory_order_relaxed);
+                state_slot.market = plan.key.market;
+                state_slot.instrument_id = plan.key.instrument_id;
+                state_slot.channel = plan.key.channel;
+                state_slot.order_id = plan.key.order_id;
                 Atomic(state_slot.key_publish_tag)
                     .store(2U, std::memory_order_release);
                 if (plan.key.market ==
@@ -950,41 +1183,25 @@ private:
             }
             PartialOrderEventOrderStateVersionV2& version =
                 state_slot.versions[plan.version_index];
-            l2flow_instrument_derived_event_row_v1 projected{};
             const l2flow_instrument_derived_event_row_v1* state_row =
-                nullptr;
-            if (inline_projection) {
-                state_row = &inline_rows[plan.event_index];
-            } else {
-                const std::uint64_t state_event_sequence =
-                    published_event_frontier_ +
-                    static_cast<std::uint64_t>(plan.event_index) + 1U;
-                if (!ProjectInstrumentDerivedEventWireV1(
-                        events[plan.event_index], &projected) ||
-                    !CertifiedOrderEventRowCanonicalV1(
-                        projected,
-                        config_.trade_date,
-                        state_event_sequence) ||
-                    projected.event_kind !=
-                        L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1) {
-                    return FailTerminal(
-                        PartialOrderEventJournalPublishErrorV2::
-                            kProjectionError);
-                }
-                state_row = &projected;
+                &commit_rows[plan.event_index];
+            if (state_row->event_kind !=
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1) {
+                return FailTerminal(
+                    PartialOrderEventJournalPublishErrorV2::
+                        kProjectionError);
             }
-            std::uint64_t expected_version_tag =
-                plan.expected_version_tag;
-            if (!Atomic(version.publish_tag)
-                     .compare_exchange_strong(
-                         expected_version_tag,
-                         new_canonical_frontier * 2U - 1U,
-                         std::memory_order_acq_rel,
-                         std::memory_order_acquire)) {
+            if (Atomic(version.publish_tag)
+                    .load(std::memory_order_acquire) !=
+                plan.expected_version_tag) {
                 return FailTerminal(
                     PartialOrderEventJournalPublishErrorV2::
                         kPublicationInvariant);
             }
+            Atomic(version.publish_tag)
+                .store(
+                    plan.canonical_apply_sequence * 2U - 1U,
+                    std::memory_order_release);
             std::atomic_thread_fence(std::memory_order_release);
             if (TripFailpoint(
                     PartialOrderEventCommitFailpointV2::
@@ -992,75 +1209,50 @@ private:
                 return PartialOrderEventJournalPublishErrorV2::
                     kInjectedFailure;
             }
+            std::array<std::uint64_t, 40U> state_words{};
+            std::memcpy(
+                state_words.data(), state_row, sizeof(*state_row));
             Atomic(version.canonical_apply_sequence)
                 .store(
-                    new_canonical_frontier,
+                    plan.canonical_apply_sequence,
                     std::memory_order_relaxed);
-            std::array<std::uint64_t, 40U> words{};
-            std::memcpy(
-                words.data(), state_row, sizeof(*state_row));
-            for (std::size_t word = 0U; word < words.size(); ++word) {
+            for (std::size_t word = 0U;
+                 word < state_words.size();
+                 ++word) {
                 Atomic(version.payload_words[word])
-                    .store(words[word], std::memory_order_relaxed);
+                    .store(state_words[word], std::memory_order_relaxed);
             }
             Atomic(version.publish_tag)
                 .store(
-                    new_canonical_frontier * 2U,
+                    plan.canonical_apply_sequence * 2U,
                     std::memory_order_release);
         }
 
-        for (std::size_t index = 0U; index < events.size(); ++index) {
-            const std::uint64_t sequence =
-                published_event_frontier_ +
-                static_cast<std::uint64_t>(index) + 1U;
-            PartialOrderEventSlotV2& event_slot =
-                event_slots_[sequence - 1U];
-            std::uint64_t expected = 0U;
-            if (!Atomic(event_slot.publish_tag)
-                     .compare_exchange_strong(
-                         expected,
-                         1U,
-                         std::memory_order_acq_rel,
-                         std::memory_order_acquire)) {
-                return FailTerminal(
-                        PartialOrderEventJournalPublishErrorV2::
-                            kPublicationInvariant);
+        event_index = 0U;
+        for (const PartialOrderEventCanonicalSliceV2& slice : slices) {
+            for (std::size_t ordinal = 0U;
+                 ordinal < slice.event_count;
+                 ++ordinal) {
+                const std::uint64_t sequence =
+                    published_event_frontier_ +
+                    static_cast<std::uint64_t>(event_index) + 1U;
+                PartialOrderEventSlotV2& event_slot =
+                    event_slots_[sequence - 1U];
+                const l2flow_instrument_derived_event_row_v1& row =
+                    commit_rows[event_index];
+                // Event slots are append-only and remain beyond the stable
+                // cut until this complete batch is published. No conforming
+                // reader can access this slot yet, so no odd-tag invalidation
+                // or writer-side RMW is required. The final release tag makes
+                // the complete ordinary payload copy visible before the cut.
+                event_slot.canonical_apply_sequence =
+                    slice.canonical_apply_sequence;
+                std::memcpy(
+                    event_slot.payload_words.data(), &row, sizeof(row));
+                Atomic(event_slot.publish_tag)
+                    .store(2U, std::memory_order_release);
+                ++event_index;
             }
-            std::atomic_thread_fence(std::memory_order_release);
-        }
-        for (std::size_t index = 0U; index < events.size(); ++index) {
-            const std::uint64_t sequence =
-                published_event_frontier_ +
-                static_cast<std::uint64_t>(index) + 1U;
-            PartialOrderEventSlotV2& event_slot =
-                event_slots_[sequence - 1U];
-            l2flow_instrument_derived_event_row_v1 scratch{};
-            const l2flow_instrument_derived_event_row_v1* row = nullptr;
-            if (inline_projection) {
-                row = &inline_rows[index];
-            } else {
-                if (!ProjectInstrumentDerivedEventWireV1(
-                        events[index], &scratch) ||
-                    !CertifiedOrderEventRowCanonicalV1(
-                        scratch, config_.trade_date, sequence)) {
-                    return FailTerminal(
-                        PartialOrderEventJournalPublishErrorV2::
-                            kProjectionError);
-                }
-                row = &scratch;
-            }
-            Atomic(event_slot.canonical_apply_sequence)
-                .store(
-                    new_canonical_frontier,
-                    std::memory_order_relaxed);
-            std::array<std::uint64_t, 40U> words{};
-            std::memcpy(words.data(), row, sizeof(*row));
-            for (std::size_t word = 0U; word < words.size(); ++word) {
-                Atomic(event_slot.payload_words[word])
-                    .store(words[word], std::memory_order_relaxed);
-            }
-            Atomic(event_slot.publish_tag)
-                .store(2U, std::memory_order_release);
         }
         if (TripFailpoint(
                 PartialOrderEventCommitFailpointV2::
@@ -1121,6 +1313,9 @@ private:
 
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2
     EnsureOrderStateBacking() noexcept {
+        if (fully_preallocated_) {
+            return PartialOrderEventJournalPublishErrorV2::kNone;
+        }
         order_state_chunk_plans_.clear();
         const auto clear_planning = [this]() noexcept {
             for (const std::uint64_t chunk : order_state_chunk_plans_) {
@@ -1255,26 +1450,63 @@ private:
         ++state_plan_epoch_;
     }
 
+    [[nodiscard]] StatePlanSlot* FindStatePlanSlot(
+        std::uint64_t order_slot_index) noexcept {
+        if (!compact_state_planning_) {
+            return &state_plan_slots_[
+                static_cast<std::size_t>(order_slot_index)];
+        }
+        const std::size_t mask = state_plan_slots_.size() - 1U;
+        std::size_t bucket =
+            static_cast<std::size_t>(Mix64(order_slot_index)) & mask;
+        for (std::size_t probe = 0U;
+             probe < state_plan_slots_.size();
+             ++probe) {
+            StatePlanSlot& slot = state_plan_slots_[bucket];
+            if (slot.epoch != state_plan_epoch_ ||
+                slot.order_slot_index == order_slot_index) {
+                return &slot;
+            }
+            bucket = (bucket + 1U) & mask;
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2 PlanStateUpdate(
         const OrderKey& key,
-        std::size_t event_index) noexcept {
+        std::size_t event_index,
+        std::uint64_t canonical_apply_sequence) noexcept {
+        if (!state_plans_.empty() && state_plans_.back().key == key) {
+            state_plans_.back().event_index = event_index;
+            state_plans_.back().canonical_apply_sequence =
+                canonical_apply_sequence;
+            return PartialOrderEventJournalPublishErrorV2::kNone;
+        }
         const std::uint64_t mask = config_.order_state_capacity - 1U;
         const std::uint64_t start = HashOrderKey(key) & mask;
         for (std::uint64_t probe = 0U;
              probe < config_.order_state_capacity;
              ++probe) {
             const std::uint64_t index = (start + probe) & mask;
-            StatePlanSlot& planned_slot =
-                state_plan_slots_[static_cast<std::size_t>(index)];
-            if (planned_slot.epoch == state_plan_epoch_) {
-                if (planned_slot.plan_index >= state_plans_.size()) {
+            StatePlanSlot* const planned_slot =
+                FindStatePlanSlot(index);
+            if (planned_slot == nullptr) {
+                return PartialOrderEventJournalPublishErrorV2::
+                    kPublicationInvariant;
+            }
+            if (planned_slot->epoch == state_plan_epoch_) {
+                if (planned_slot->order_slot_index != index ||
+                    planned_slot->plan_index >= state_plans_.size()) {
                     return PartialOrderEventJournalPublishErrorV2::
                         kPublicationInvariant;
                 }
                 StatePlan& planned = state_plans_[
-                    static_cast<std::size_t>(planned_slot.plan_index)];
+                    static_cast<std::size_t>(
+                        planned_slot->plan_index)];
                 if (planned.key == key) {
                     planned.event_index = event_index;
+                    planned.canonical_apply_sequence =
+                        canonical_apply_sequence;
                     return PartialOrderEventJournalPublishErrorV2::kNone;
                 }
                 continue;
@@ -1289,11 +1521,12 @@ private:
                 return AddStatePlan(
                     key,
                     event_index,
+                    canonical_apply_sequence,
                     index,
                     0U,
                     0U,
                     true,
-                    &planned_slot);
+                    planned_slot);
             }
             if (key_tag != 2U ||
                 !partial_order_event_wire_v2_detail::AllZero(
@@ -1324,11 +1557,12 @@ private:
                 return AddStatePlan(
                     key,
                     event_index,
+                    canonical_apply_sequence,
                     index,
                     version_index,
                     expected_version_tag,
                     false,
-                    &planned_slot);
+                    planned_slot);
             }
         }
         return PartialOrderEventJournalPublishErrorV2::
@@ -1338,6 +1572,7 @@ private:
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2 AddStatePlan(
         const OrderKey& key,
         std::size_t event_index,
+        std::uint64_t canonical_apply_sequence,
         std::uint64_t slot_index,
         std::uint32_t version_index,
         std::uint64_t expected_version_tag,
@@ -1353,6 +1588,7 @@ private:
         plan.key = key;
         plan.slot_index = slot_index;
         plan.event_index = event_index;
+        plan.canonical_apply_sequence = canonical_apply_sequence;
         plan.version_index = version_index;
         plan.expected_version_tag = expected_version_tag;
         plan.new_key = new_key;
@@ -1360,6 +1596,7 @@ private:
             static_cast<std::uint64_t>(state_plans_.size());
         state_plans_.push_back(plan);
         planned_slot->epoch = state_plan_epoch_;
+        planned_slot->order_slot_index = slot_index;
         planned_slot->plan_index = plan_index;
         return PartialOrderEventJournalPublishErrorV2::kNone;
     }
@@ -1446,18 +1683,28 @@ private:
     std::uint64_t reorder_high_water_ = 0U;
     std::uint64_t shanghai_order_state_count_ = 0U;
     std::uint64_t shenzhen_order_state_count_ = 0U;
+    std::vector<l2flow_instrument_derived_event_row_v1>
+        projected_rows_;
     std::vector<StatePlan> state_plans_;
     std::vector<StatePlanSlot> state_plan_slots_;
     std::vector<std::uint64_t> order_state_backing_words_;
     std::vector<std::uint64_t> order_state_planning_words_;
     std::vector<std::uint64_t> order_state_chunk_plans_;
+    std::uint64_t maximum_events_per_commit_ = 0U;
     std::uint64_t maximum_state_updates_per_commit_ = 0U;
     std::uint64_t state_plan_epoch_ = 0U;
     std::uint64_t order_state_backed_bytes_ = 0U;
     std::uint64_t order_state_backed_chunks_ = 0U;
     std::uint64_t order_state_backing_allocation_calls_ = 0U;
+    std::uint64_t event_backing_allocation_calls_ = 0U;
+    std::uint64_t event_prefault_attempts_ = 0U;
+    std::uint64_t event_prefaulted_bytes_ = 0U;
+    std::uint64_t order_state_prefault_attempts_ = 0U;
+    std::uint64_t order_state_prefaulted_bytes_ = 0U;
     int last_system_error_ = 0;
     bool failed_ = false;
+    bool fully_preallocated_ = false;
+    bool compact_state_planning_ = false;
     PartialOrderEventCommitFailpointV2 failpoint_ =
         PartialOrderEventCommitFailpointV2::kNone;
 };
@@ -1564,6 +1811,12 @@ PartialOrderEventJournalProducerV2::Create(
 }
 
 PartialOrderEventJournalPublishErrorV2
+PartialOrderEventJournalProducerV2::PreallocateBacking(
+    int* system_error_number) noexcept {
+    return impl_->PreallocateBacking(system_error_number);
+}
+
+PartialOrderEventJournalPublishErrorV2
 PartialOrderEventJournalProducerV2::EnsureEventWritable(
     std::uint64_t required_event_count) noexcept {
     return impl_->EnsureEventWritable(required_event_count);
@@ -1578,6 +1831,28 @@ PartialOrderEventJournalProducerV2::PublishCanonicalTick(
         affected_channels) noexcept {
     return impl_->PublishCanonicalTick(
         canonical_apply_sequence, status, events, affected_channels);
+}
+
+PartialOrderEventJournalPublishErrorV2
+PartialOrderEventJournalProducerV2::PublishCanonicalBatch(
+    std::span<const PartialOrderEventCanonicalSliceV2> slices,
+    const PartialOrderEventStatusUpdateV2& status,
+    std::span<const InstrumentDerivedEventV1> events,
+    std::span<const PartialOrderEventChannelHealthV2>
+        affected_channels) noexcept {
+    return impl_->PublishCanonicalBatch(
+        slices, status, events, affected_channels);
+}
+
+PartialOrderEventJournalPublishErrorV2
+PartialOrderEventJournalProducerV2::PublishCanonicalBatchProjected(
+    std::span<const PartialOrderEventCanonicalSliceV2> slices,
+    const PartialOrderEventStatusUpdateV2& status,
+    std::span<const l2flow_instrument_derived_event_row_v1> events,
+    std::span<const PartialOrderEventChannelHealthV2>
+        affected_channels) noexcept {
+    return impl_->PublishCanonicalBatchProjected(
+        slices, status, events, affected_channels);
 }
 
 PartialOrderEventJournalPublishErrorV2

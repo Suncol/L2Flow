@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l2flow/ipc/instrument_derived_event_history_c_v1.h"
 #include "l2flow/ipc/instrument_derived_event_history_v1.h"
 #include "l2flow/ipc/order_event_wire_adapter_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
@@ -25,6 +26,13 @@ struct CertifiedOrderEventHistoryConfigV1 final {
     std::size_t maximum_shanghai_order_states = 0U;
     std::size_t maximum_shenzhen_order_states = 0U;
     std::size_t maximum_events = 0U;
+    // Commits and strictly write-prefaults the fixed event mapping during
+    // Create so the serial writer neither expands nor first-touches backing
+    // pages on its hot path. Create fails if strict population is unsupported.
+    bool preallocate_event_storage = false;
+    // Disable only for an owner-private history whose serial writer consumes
+    // append results directly and never exposes process-local snapshots.
+    bool publish_process_snapshots = true;
     // Optional external append-only wire journal. Production supplies it by
     // default; focused process-local tests may omit it. When present, backing
     // space is reserved before either stateful projection core is mutated.
@@ -59,6 +67,20 @@ struct CertifiedOrderEventHistoryGenerationV1 final {
     std::size_t event_count = 0U;
     std::size_t shanghai_order_state_count = 0U;
     std::size_t shenzhen_order_state_count = 0U;
+};
+
+// Serial-writer result for callers which immediately publish the newly
+// appended prefix. The span points into the history's fixed append-only
+// storage and remains valid for the lifetime of the history.
+struct CertifiedOrderEventHistoryAppendResultV1 final {
+    CertifiedOrderEventHistoryGenerationV1 generation{};
+    std::span<const InstrumentDerivedEventV1> appended_events{};
+    // Owner-private mode (publish_process_snapshots=false) emits the same
+    // lossless rows directly in the frozen 320-byte wire schema, avoiding a
+    // second large cross-market variant materialization. Exactly one of the
+    // two appended spans is nonempty for a source tick with output.
+    std::span<const l2flow_instrument_derived_event_row_v1>
+        appended_wire_events{};
 };
 
 enum class CertifiedOrderEventHistoryErrorV1 : std::uint8_t {
@@ -160,6 +182,20 @@ public:
     AppendCertifiedTick(
         const RealtimeWireTickPayloadV2& input,
         std::uint64_t canonical_apply_sequence) noexcept;
+
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1
+    AppendCertifiedTick(
+        const RealtimeWireTickPayloadV2& input,
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryAppendResultV1* output) noexcept;
+
+    // Serial fast path for a caller which already validated and projected the
+    // Shenzhen wire payload before advancing its recovery coordinator.
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1
+    AppendCertifiedTick(
+        const market::ShenzhenOrderEventInputV1& input,
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryAppendResultV1* output) noexcept;
 
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1
     AcquireGeneration(

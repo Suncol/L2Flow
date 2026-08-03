@@ -1,10 +1,12 @@
 #include "l2flow/ipc/certified_order_event_history_v1.h"
+#include "l2flow/ipc/instrument_derived_event_wire_v1.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -909,6 +911,85 @@ void TestShenzhenLifecycleAndImmutableGeneration(bool* ok) {
         "acquired history generation remains immutable across later publication");
 }
 
+void TestShenzhenPrivateWireEquivalent(bool* ok) {
+    auto public_history = History(ok, 16U, 8U);
+    std::unique_ptr<ipc::CertifiedOrderEventHistoryV1> private_history;
+    *ok &= Expect(
+        ipc::CertifiedOrderEventHistoryV1::Create(
+            {.trade_date = kTradeDate,
+             .maximum_shanghai_order_states = 8U,
+             .maximum_shenzhen_order_states = 8U,
+             .maximum_events = 16U,
+             .preallocate_event_storage = false,
+             .publish_process_snapshots = false,
+             .external_journal = {}},
+            &private_history) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            private_history != nullptr,
+        "create owner-private Shenzhen wire history");
+    if (public_history == nullptr || private_history == nullptr) {
+        return;
+    }
+
+    const std::array<ipc::RealtimeWireTickPayloadV2, 3U> inputs{
+        ShenzhenOrder(1'000, 20U),
+        ShenzhenTrade(1'001, 21U),
+        ShenzhenCancel(1'002, 22U)};
+    for (std::size_t input_index = 0U;
+         input_index < inputs.size();
+         ++input_index) {
+        ipc::CertifiedOrderEventHistoryAppendResultV1 public_result{};
+        ipc::CertifiedOrderEventHistoryAppendResultV1 private_result{};
+        const std::uint64_t canonical_sequence =
+            static_cast<std::uint64_t>(input_index) + 1U;
+        const bool appended =
+            public_history->AppendCertifiedTick(
+                inputs[input_index],
+                canonical_sequence,
+                &public_result) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            private_history->AppendCertifiedTick(
+                inputs[input_index],
+                canonical_sequence,
+                &private_result) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone;
+        *ok &= Expect(
+            appended && public_result.appended_wire_events.empty() &&
+                private_result.appended_events.empty() &&
+                public_result.appended_events.size() ==
+                    private_result.appended_wire_events.size() &&
+                public_result.generation.event_count ==
+                    private_result.generation.event_count &&
+                public_result.generation
+                        .derived_event_sequence_exclusive ==
+                    private_result.generation
+                        .derived_event_sequence_exclusive,
+            "public and owner-private Shenzhen histories publish equal spans");
+        if (!appended ||
+            public_result.appended_events.size() !=
+                private_result.appended_wire_events.size()) {
+            continue;
+        }
+        for (std::size_t event_index = 0U;
+             event_index < public_result.appended_events.size();
+             ++event_index) {
+            l2flow_instrument_derived_event_row_v1 expected{};
+            const bool projected =
+                ipc::ProjectInstrumentDerivedEventWireV1(
+                    public_result.appended_events[event_index],
+                    &expected);
+            *ok &= Expect(
+                projected &&
+                    std::memcmp(
+                        &expected,
+                        &private_result
+                             .appended_wire_events[event_index],
+                        sizeof(expected)) == 0,
+                "direct Shenzhen sink is byte-equivalent to public Event projection");
+        }
+    }
+}
+
 void TestFilteredSkipAndFailureBoundaries(bool* ok) {
     {
         auto history = History(ok);
@@ -1214,6 +1295,7 @@ int main() {
     bool ok = true;
     TestShanghaiExternalRepair(&ok);
     TestShenzhenLifecycleAndImmutableGeneration(&ok);
+    TestShenzhenPrivateWireEquivalent(&ok);
     TestFilteredSkipAndFailureBoundaries(&ok);
     TestSparseLargeJournalReservation(&ok);
     TestConfigurationOverflowAndConcurrentAcquire(&ok);

@@ -199,6 +199,16 @@ bool TestDistinctAbiAndGenerationIdentity() {
             rejected_producer == nullptr,
         "V2 writer rejects unsupported native-order proof claims");
 
+    auto oversized_scratch = Config(2U, 8U);
+    oversized_scratch.maximum_events_per_commit = 3U;
+    ok &= Expect(
+        ipc::PartialOrderEventJournalProducerV2::Create(
+            oversized_scratch, &rejected_producer) ==
+                ipc::PartialOrderEventJournalCreateErrorV2::
+                    kInvalidConfiguration &&
+            rejected_producer == nullptr,
+        "projection scratch bound cannot exceed Event capacity");
+
     std::shared_ptr<ipc::PartialOrderEventJournalProducerV2> producer;
     std::unique_ptr<ipc::PartialOrderEventReaderV2> reader;
     ok &= Expect(
@@ -387,6 +397,182 @@ bool TestEventAndOrderStateJournal() {
     return ok;
 }
 
+bool TestCanonicalMicrobatchPublishesOneCoherentCut() {
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV2> producer;
+    std::unique_ptr<ipc::PartialOrderEventReaderV2> reader;
+    bool ok = CreatePair(Config(16U, 32U), &producer, &reader);
+    if (!ok) {
+        return false;
+    }
+
+    const std::array<ipc::PartialOrderEventCanonicalSliceV2, 3U> slices{
+        ipc::PartialOrderEventCanonicalSliceV2{1U, 1U},
+        ipc::PartialOrderEventCanonicalSliceV2{2U, 3U},
+        ipc::PartialOrderEventCanonicalSliceV2{3U, 0U}};
+    const std::array<ipc::InstrumentDerivedEventV1, 4U> events{
+        ShanghaiRevision(1U, 1U, 0U, 17U, 42, 1U),
+        ShanghaiRevision(2U, 2U, 0U, 17U, 42, 2U),
+        ShanghaiRevision(3U, 2U, 1U, 17U, 43, 1U),
+        ShanghaiRevision(4U, 2U, 2U, 17U, 44, 1U)};
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            slices, Contiguous(3U), events) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::kNone,
+        "publish 1/3/0-Event canonical slices as one cut");
+
+    ipc::PartialOrderEventStatusSnapshotV2 status{};
+    ok &= Expect(
+        reader->ReadStatus(&status) ==
+                ipc::PartialOrderEventReadResultV2::kOk &&
+            producer->commit_sequence() == 2U &&
+            producer->canonical_apply_frontier() == 3U &&
+            producer->published_event_frontier() == 4U &&
+            status.cut.commit_sequence == 2U &&
+            status.cut.canonical_apply_frontier == 3U &&
+            status.cut.history_generation == 3U &&
+            status.cut.event_published_frontier == 4U &&
+            status.cut.order_state_canonical_frontier == 3U &&
+            status.cut.shanghai_order_state_count == 3U,
+        "microbatch advances final frontiers with one publication sequence");
+
+    std::array<ipc::PartialOrderEventEnvelopeV2, 4U> rows{};
+    ipc::PartialOrderEventReadBatchResultV2 batch{};
+    ok &= Expect(
+        reader->ReadEvents(1U, rows, &batch) ==
+                ipc::PartialOrderEventReadResultV2::kOk &&
+            batch.rows_read == rows.size() &&
+            batch.next_event_sequence == 5U &&
+            batch.status.cut.canonical_apply_frontier == 3U &&
+            rows[0U].canonical_apply_sequence == 1U &&
+            rows[1U].canonical_apply_sequence == 2U &&
+            rows[2U].canonical_apply_sequence == 2U &&
+            rows[3U].canonical_apply_sequence == 2U,
+        "reader retains each Event's owning canonical slice");
+
+    const ipc::PartialOrderEventOrderKeyV2 repeated_key{
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1,
+        17U,
+        7,
+        42};
+    ipc::PartialOrderEventOrderStateV2 state{};
+    ok &= Expect(
+        reader->FindOrderState(repeated_key, &state, &status) ==
+                ipc::PartialOrderEventReadResultV2::kOk &&
+            state.canonical_apply_sequence == 2U &&
+            state.order_revision.revision == 2U &&
+            status.cut.canonical_apply_frontier == 3U,
+        "same-key state keeps the final update's real canonical sequence");
+    return ok;
+}
+
+bool TestCanonicalMicrobatchRejectsInvalidSlicesBeforeMutation() {
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV2> producer;
+    std::unique_ptr<ipc::PartialOrderEventReaderV2> reader;
+    auto config = Config(8U, 8U);
+    config.maximum_events_per_commit = 2U;
+    bool ok = CreatePair(config, &producer, &reader);
+    if (!ok) {
+        return false;
+    }
+
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            {}, Contiguous(1U), {}) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::kInvalidArgument,
+        "empty canonical slice list is not a status commit");
+
+    const std::array<ipc::PartialOrderEventCanonicalSliceV2, 1U>
+        wrong_origin{ipc::PartialOrderEventCanonicalSliceV2{2U, 0U}};
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            wrong_origin, Contiguous(1U), {}) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::
+                kCanonicalSequence,
+        "microbatch rejects a first slice beyond the next frontier");
+
+    const std::array<ipc::PartialOrderEventCanonicalSliceV2, 2U>
+        noncontiguous{
+            ipc::PartialOrderEventCanonicalSliceV2{1U, 0U},
+            ipc::PartialOrderEventCanonicalSliceV2{3U, 0U}};
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            noncontiguous, Contiguous(1U), {}) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::
+                kCanonicalSequence,
+        "microbatch rejects a hole between canonical slices");
+
+    auto one_event = ShanghaiRevision(1U, 1U, 0U, 17U, 42, 1U);
+    const std::array<ipc::PartialOrderEventCanonicalSliceV2, 1U>
+        wrong_count{ipc::PartialOrderEventCanonicalSliceV2{1U, 2U}};
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            wrong_count,
+            Contiguous(1U),
+            std::span{&one_event, 1U}) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::kInvalidArgument,
+        "microbatch rejects a slice/Event count mismatch");
+
+    std::array<ipc::InstrumentDerivedEventV1, 2U> wrong_ordinal{
+        ShanghaiRevision(1U, 1U, 0U, 17U, 42, 1U),
+        ShanghaiRevision(2U, 2U, 1U, 17U, 43, 1U)};
+    const std::array<ipc::PartialOrderEventCanonicalSliceV2, 2U>
+        two_singletons{
+            ipc::PartialOrderEventCanonicalSliceV2{1U, 1U},
+            ipc::PartialOrderEventCanonicalSliceV2{2U, 1U}};
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            two_singletons, Contiguous(2U), wrong_ordinal) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::kProjectionError,
+        "source tick ordinal must reset at every canonical slice");
+
+    ipc::PartialOrderEventStatusSnapshotV2 status{};
+    ok &= Expect(
+        reader->ReadStatus(&status) ==
+                ipc::PartialOrderEventReadResultV2::kOk &&
+            status.cut.commit_sequence == 1U &&
+            status.cut.canonical_apply_frontier == 0U &&
+            status.cut.event_published_frontier == 0U &&
+            !producer->failed(),
+        "invalid boundaries and ordinals leave the initial cut untouched");
+
+    wrong_ordinal[1U] = ShanghaiRevision(2U, 2U, 0U, 17U, 43, 1U);
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            two_singletons, Contiguous(2U), wrong_ordinal) ==
+                ipc::PartialOrderEventJournalPublishErrorV2::kNone &&
+            reader->ReadStatus(&status) ==
+                ipc::PartialOrderEventReadResultV2::kOk &&
+            status.cut.canonical_apply_frontier == 2U &&
+            status.cut.event_published_frontier == 2U,
+        "corrected ordinal reset remains publishable after rejection");
+
+    const std::array<ipc::PartialOrderEventCanonicalSliceV2, 3U>
+        oversized_slices{
+            ipc::PartialOrderEventCanonicalSliceV2{3U, 1U},
+            ipc::PartialOrderEventCanonicalSliceV2{4U, 1U},
+            ipc::PartialOrderEventCanonicalSliceV2{5U, 1U}};
+    const std::array<ipc::InstrumentDerivedEventV1, 3U>
+        oversized_events{
+            ShanghaiRevision(3U, 3U, 0U, 17U, 44, 1U),
+            ShanghaiRevision(4U, 4U, 0U, 17U, 45, 1U),
+            ShanghaiRevision(5U, 5U, 0U, 17U, 46, 1U)};
+    ok &= Expect(
+        producer->PublishCanonicalBatch(
+            oversized_slices,
+            Contiguous(5U),
+            oversized_events) ==
+            ipc::PartialOrderEventJournalPublishErrorV2::kEventCapacity,
+        "microbatch rejects an Event count beyond reserved scratch");
+    ok &= Expect(
+        reader->ReadStatus(&status) ==
+                ipc::PartialOrderEventReadResultV2::kOk &&
+            status.cut.canonical_apply_frontier == 2U &&
+            status.cut.event_published_frontier == 2U &&
+            !producer->failed(),
+        "scratch-bound rejection occurs before publication mutation");
+    return ok;
+}
+
 bool TestEveryCommitFailpointFallsBackToOldCut() {
     bool ok = true;
     constexpr std::array<ipc::PartialOrderEventCommitFailpointV2, 6U>
@@ -423,19 +609,26 @@ bool TestEveryCommitFailpointFallsBackToOldCut() {
                 ipc::PartialOrderEventJournalPublishErrorV2::kNone,
             "publish failpoint baseline");
 
-        // A new instrument key proves that even a fully written ghost key and
-        // future version remain invisible until the final cut store.
-        auto future = ShanghaiRevision(2U, 2U, 0U, 19U, 99, 1U);
+        // The first future Event updates an existing key and the second adds a
+        // new key. Together they prove that all pre-cut microbatch state,
+        // including per-slice canonical versions, remains invisible until the
+        // one final cut store.
+        const std::array<ipc::PartialOrderEventCanonicalSliceV2, 3U>
+            slices{
+                ipc::PartialOrderEventCanonicalSliceV2{2U, 1U},
+                ipc::PartialOrderEventCanonicalSliceV2{3U, 1U},
+                ipc::PartialOrderEventCanonicalSliceV2{4U, 0U}};
+        const std::array<ipc::InstrumentDerivedEventV1, 2U> future{
+            ShanghaiRevision(2U, 2U, 0U, 17U, 42, 2U),
+            ShanghaiRevision(3U, 3U, 0U, 19U, 99, 1U)};
         producer->SetCommitFailpointForTest(failpoint);
         ok &= Expect(
-            producer->PublishCanonicalTick(
-                2U,
-                Contiguous(2U),
-                std::span{&future, 1U}) ==
+            producer->PublishCanonicalBatch(
+                slices, Contiguous(4U), future) ==
                     ipc::PartialOrderEventJournalPublishErrorV2::
                         kInjectedFailure &&
                 producer->failed(),
-            "injected commit interruption is terminal for writer");
+            "injected microbatch interruption is terminal for writer");
 
         ipc::PartialOrderEventStatusSnapshotV2 status{};
         ok &= Expect(
@@ -461,6 +654,19 @@ bool TestEveryCommitFailpointFallsBackToOldCut() {
             reader->FindOrderState(future_key, &hidden_state) ==
                 ipc::PartialOrderEventReadResultV2::kNotFound,
             "future key/version is filtered by old canonical cut");
+        const ipc::PartialOrderEventOrderKeyV2 baseline_key{
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1,
+            17U,
+            7,
+            42};
+        ipc::PartialOrderEventOrderStateV2 baseline_state{};
+        ok &= Expect(
+            reader->FindOrderState(
+                baseline_key, &baseline_state, &status) ==
+                    ipc::PartialOrderEventReadResultV2::kOk &&
+                baseline_state.canonical_apply_sequence == 1U &&
+                baseline_state.order_revision.revision == 1U,
+            "future same-key microbatch version leaves last-good state visible");
     }
     return ok;
 }
@@ -525,10 +731,12 @@ bool TestOrderStateBackingChunkIsReused() {
     }
     const auto initial = producer->ResourceSnapshot();
     ok &= Expect(
-        initial.order_state_backed_bytes == 0U &&
+        initial.event_backing_allocation_calls == 0U &&
+            initial.order_state_backed_bytes == 0U &&
             initial.order_state_backed_chunk_count == 0U &&
-            initial.order_state_backing_allocation_calls == 0U,
-        "order-state region starts logically sparse");
+            initial.order_state_backing_allocation_calls == 0U &&
+            !initial.fully_preallocated,
+        "Event and order-state regions start logically sparse");
 
     for (std::uint64_t sequence = 1U; sequence <= 3U; ++sequence) {
         auto event = ShanghaiRevision(
@@ -543,10 +751,11 @@ bool TestOrderStateBackingChunkIsReused() {
     }
     const auto repeated = producer->ResourceSnapshot();
     ok &= Expect(
-        repeated.order_state_backed_bytes != 0U &&
+        repeated.event_backing_allocation_calls == 1U &&
+            repeated.order_state_backed_bytes != 0U &&
             repeated.order_state_backed_chunk_count == 1U &&
             repeated.order_state_backing_allocation_calls == 1U,
-        "first revision backs one lazy chunk and later revisions reuse it");
+        "first revision backs each lazy region and later revisions reuse it");
 
     auto second_key = ShanghaiRevision(4U, 4U, 0U, 17U, 43, 1U);
     ok &= Expect(
@@ -556,7 +765,9 @@ bool TestOrderStateBackingChunkIsReused() {
         "publish another hash key inside the already backed region");
     const auto second = producer->ResourceSnapshot();
     ok &= Expect(
-        second.order_state_backed_bytes ==
+        second.event_backing_allocation_calls ==
+                repeated.event_backing_allocation_calls &&
+            second.order_state_backed_bytes ==
                 repeated.order_state_backed_bytes &&
             second.order_state_backed_chunk_count ==
                 repeated.order_state_backed_chunk_count &&
@@ -571,6 +782,162 @@ bool TestOrderStateBackingChunkIsReused() {
             status.cut.canonical_apply_frontier == 4U &&
             status.cut.shanghai_order_state_count == 2U,
         "chunk reuse preserves the complete public cut and state count");
+    return ok;
+}
+
+bool TestPreallocatedBackingRemainsStableAcrossCommits() {
+    auto config = Config(16U, 32U);
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV2> producer;
+    std::unique_ptr<ipc::PartialOrderEventReaderV2> reader;
+    bool ok = CreatePair(config, &producer, &reader);
+    if (!ok) {
+        return false;
+    }
+
+    const auto align_page = [](std::uint64_t value) noexcept {
+        return ((value + 4095U) / 4096U) * 4096U;
+    };
+    const std::uint64_t event_region_bytes = align_page(
+        static_cast<std::uint64_t>(ipc::kPartialOrderEventHeaderBytesV2) +
+        config.event_capacity *
+            static_cast<std::uint64_t>(
+                ipc::kPartialOrderEventSlotBytesV2));
+    const std::uint64_t channel_bank_bytes = align_page(
+        static_cast<std::uint64_t>(config.affected_channel_capacity) *
+        static_cast<std::uint64_t>(
+            ipc::kPartialOrderEventChannelHealthBytesV2));
+    const std::uint64_t order_state_offset =
+        event_region_bytes + 2U * channel_bank_bytes;
+    const std::uint64_t order_state_region_bytes =
+        producer->session().total_mapping_bytes - order_state_offset;
+    const std::uint64_t order_state_chunk_count =
+        (order_state_region_bytes + config.lazy_commit_chunk_bytes - 1U) /
+        config.lazy_commit_chunk_bytes;
+
+    int system_error = -1;
+    ok &= Expect(
+        producer->PreallocateBacking(&system_error) ==
+                ipc::PartialOrderEventJournalPublishErrorV2::kNone &&
+            system_error == 0,
+        "preallocate the complete Event and order-state backing once");
+    const auto preallocated = producer->ResourceSnapshot();
+    ok &= Expect(
+        preallocated.committed_event_region_bytes ==
+                event_region_bytes &&
+            preallocated.order_state_backed_bytes ==
+                order_state_region_bytes &&
+            preallocated.order_state_backed_chunk_count ==
+                order_state_chunk_count &&
+            preallocated.order_state_backing_allocation_calls == 1U &&
+            preallocated.event_backing_allocation_calls == 1U &&
+            preallocated.order_state_prefault_attempts == 0U &&
+            preallocated.order_state_prefaulted_bytes == 0U &&
+            preallocated.fully_preallocated,
+        "preallocation snapshot accounts for the complete fixed mapping");
+
+    for (std::uint64_t sequence = 1U; sequence <= 3U; ++sequence) {
+        auto event = ShanghaiRevision(
+            sequence,
+            sequence,
+            0U,
+            17U,
+            40 + static_cast<std::int64_t>(sequence),
+            1U);
+        ok &= Expect(
+            producer->PublishCanonicalTick(
+                sequence,
+                Contiguous(sequence),
+                std::span{&event, 1U}) ==
+                ipc::PartialOrderEventJournalPublishErrorV2::kNone,
+            "publish without growing fully preallocated backing");
+        const auto current = producer->ResourceSnapshot();
+        ok &= Expect(
+            current.committed_event_region_bytes ==
+                    preallocated.committed_event_region_bytes &&
+                current.event_backing_allocation_calls ==
+                    preallocated.event_backing_allocation_calls &&
+                current.order_state_backed_bytes ==
+                    preallocated.order_state_backed_bytes &&
+                current.order_state_backed_chunk_count ==
+                    preallocated.order_state_backed_chunk_count &&
+                current.order_state_backing_allocation_calls ==
+                    preallocated.order_state_backing_allocation_calls &&
+                current.order_state_prefault_attempts ==
+                    preallocated.order_state_prefault_attempts &&
+                current.order_state_prefaulted_bytes ==
+                    preallocated.order_state_prefaulted_bytes &&
+                current.fully_preallocated,
+            "resource counters remain stable after a preallocated commit");
+        if (sequence == 1U) {
+            system_error = -1;
+            ok &= Expect(
+                producer->PreallocateBacking(&system_error) ==
+                        ipc::PartialOrderEventJournalPublishErrorV2::
+                            kInvalidArgument &&
+                    system_error == 0,
+                "preallocation is rejected after the first published commit");
+        }
+    }
+    return ok;
+}
+
+bool TestConfiguredOrderStatePrefaultHasExplicitOutcome() {
+    auto config = Config(16U, 32U);
+    config.prefault_order_state_pages = true;
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV2> producer;
+    std::unique_ptr<ipc::PartialOrderEventReaderV2> reader;
+    bool ok = CreatePair(config, &producer, &reader);
+    if (!ok) {
+        return false;
+    }
+
+    int system_error = -1;
+    const auto result = producer->PreallocateBacking(&system_error);
+    const auto resources = producer->ResourceSnapshot();
+    const bool unsupported =
+        result ==
+            ipc::PartialOrderEventJournalPublishErrorV2::
+                kBackingCommitFailed &&
+        (system_error == ENOTSUP || system_error == EINVAL ||
+         system_error == ENOSYS || system_error == EOPNOTSUPP);
+    if (result == ipc::PartialOrderEventJournalPublishErrorV2::kNone) {
+        ok &= Expect(
+            system_error == 0 && resources.fully_preallocated &&
+                resources.event_backing_allocation_calls == 1U &&
+                resources.order_state_backing_allocation_calls == 1U &&
+                resources.order_state_prefault_attempts == 1U &&
+                resources.order_state_prefaulted_bytes ==
+                    resources.order_state_backed_bytes &&
+                resources.order_state_prefaulted_bytes != 0U,
+            "supported prefault synchronously covers the order-state region");
+
+        system_error = -1;
+        ok &= Expect(
+            producer->PreallocateBacking(&system_error) ==
+                    ipc::PartialOrderEventJournalPublishErrorV2::kNone &&
+                system_error == 0,
+            "successful prefault preallocation is idempotent before publish");
+        const auto repeated = producer->ResourceSnapshot();
+        ok &= Expect(
+            repeated.event_backing_allocation_calls ==
+                    resources.event_backing_allocation_calls &&
+                repeated.order_state_backing_allocation_calls ==
+                    resources.order_state_backing_allocation_calls &&
+                repeated.order_state_prefault_attempts ==
+                    resources.order_state_prefault_attempts &&
+                repeated.order_state_prefaulted_bytes ==
+                    resources.order_state_prefaulted_bytes &&
+                repeated.fully_preallocated,
+            "idempotent preallocation performs no second backing or prefault call");
+    } else {
+        ok &= Expect(
+            unsupported && !resources.fully_preallocated &&
+                resources.event_backing_allocation_calls == 1U &&
+                resources.order_state_backing_allocation_calls == 1U &&
+                resources.order_state_prefault_attempts == 1U &&
+                resources.order_state_prefaulted_bytes == 0U,
+            "unsupported prefault fails explicitly after backing allocation");
+    }
     return ok;
 }
 
@@ -956,9 +1323,13 @@ int main() {
     ok &= TestDistinctAbiAndGenerationIdentity();
     ok &= TestStatusAndAffectedChannelCut();
     ok &= TestEventAndOrderStateJournal();
+    ok &= TestCanonicalMicrobatchPublishesOneCoherentCut();
+    ok &= TestCanonicalMicrobatchRejectsInvalidSlicesBeforeMutation();
     ok &= TestEveryCommitFailpointFallsBackToOldCut();
     ok &= TestFutureVersionCannotReplaceLastGoodState();
     ok &= TestOrderStateBackingChunkIsReused();
+    ok &= TestPreallocatedBackingRemainsStableAcrossCommits();
+    ok &= TestConfiguredOrderStatePrefaultHasExplicitOutcome();
     ok &= TestBatchStatePlanDeduplicatesWithoutMutationOnCapacity();
     ok &= TestDefaultScratchCoversLargeEndStyleBatch();
     ok &= TestCreateWithMultiDigitDescriptorPath();

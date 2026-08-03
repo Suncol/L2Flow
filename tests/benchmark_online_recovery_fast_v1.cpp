@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -26,7 +27,9 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <poll.h>
 #include <span>
+#include <spawn.h>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -34,10 +37,15 @@
 #include <utility>
 #include <vector>
 
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+extern char** environ;
 
 namespace {
 
@@ -71,8 +79,21 @@ struct Options final {
     std::size_t warmup_samples = 128U;
     std::size_t measured_samples = 2'048U;
     std::size_t replay_records = 50'000U;
+    std::size_t throughput_rate = 0U;
+    std::size_t throughput_duration_ms = 0U;
     std::uint32_t parallel_decoder_workers = 0U;
     bool mode_supplied = false;
+    bool polars = false;
+
+    [[nodiscard]] bool throughput_enabled() const noexcept {
+        return throughput_rate != 0U || throughput_duration_ms != 0U;
+    }
+
+    [[nodiscard]] std::size_t planned_live_records() const noexcept {
+        return throughput_enabled()
+                   ? throughput_rate * throughput_duration_ms / 1'000U
+                   : warmup_samples + measured_samples;
+    }
 };
 
 [[nodiscard]] std::string_view ModeName(BenchmarkMode mode) noexcept {
@@ -135,12 +156,14 @@ struct Options final {
         }
         if (argument == "--warmup-samples" ||
             argument == "--samples" ||
-            argument == "--replay-records") {
+            argument == "--replay-records" ||
+            argument == "--throughput-rate" ||
+            argument == "--throughput-duration-ms") {
             if (index + 1 >= argc) {
                 return false;
             }
             std::size_t value = 0U;
-            constexpr std::size_t kMaximumRecordCount = 1'000'000U;
+            constexpr std::size_t kMaximumRecordCount = 5'000'000U;
             if (!ParseSize(
                     argv[++index], kMaximumRecordCount, &value)) {
                 return false;
@@ -149,8 +172,12 @@ struct Options final {
                 parsed.warmup_samples = value;
             } else if (argument == "--samples") {
                 parsed.measured_samples = value;
-            } else {
+            } else if (argument == "--replay-records") {
                 parsed.replay_records = value;
+            } else if (argument == "--throughput-rate") {
+                parsed.throughput_rate = value;
+            } else {
+                parsed.throughput_duration_ms = value;
             }
             continue;
         }
@@ -169,9 +196,32 @@ struct Options final {
                 static_cast<std::uint32_t>(value);
             continue;
         }
+        if (argument == "--polars") {
+            parsed.polars = true;
+            continue;
+        }
         return false;
     }
-    if (!parsed.mode_supplied || parsed.measured_samples == 0U ||
+    const bool throughput_pair =
+        (parsed.throughput_rate == 0U) ==
+        (parsed.throughput_duration_ms == 0U);
+    const bool throughput_valid =
+        !parsed.throughput_enabled() ||
+        (parsed.mode == BenchmarkMode::kActive &&
+         parsed.throughput_rate != 0U &&
+         parsed.throughput_duration_ms != 0U &&
+         parsed.throughput_rate <= 1'000'000U &&
+         parsed.throughput_duration_ms <= 10'000U &&
+         parsed.throughput_rate <=
+             std::numeric_limits<std::size_t>::max() /
+                 parsed.throughput_duration_ms &&
+         parsed.planned_live_records() != 0U &&
+         parsed.planned_live_records() <= 5'000'000U);
+    if (!parsed.mode_supplied || !throughput_pair || !throughput_valid ||
+        (parsed.polars &&
+         (parsed.mode != BenchmarkMode::kActive ||
+          parsed.throughput_enabled())) ||
+        (!parsed.throughput_enabled() && parsed.measured_samples == 0U) ||
         parsed.warmup_samples >
             std::numeric_limits<std::size_t>::max() -
                 parsed.measured_samples ||
@@ -892,7 +942,7 @@ struct DailyFixture final {
         market::kIntradayInstrumentStoreMinimumSegmentBytesV1;
     config.intraday_store.maximum_session_records = maximum_records;
     config.intraday_store.maximum_session_accounted_bytes =
-        1ULL * 1024ULL * 1024ULL * 1024ULL;
+        32ULL * 1024ULL * 1024ULL * 1024ULL;
     config.intraday_store.maximum_records_per_batch = 1'024U;
     config.intraday_store.coverage_from_open = coverage_from_open;
     config.enforce_receive_trade_date = false;
@@ -997,6 +1047,23 @@ struct LatencyResult final {
     std::uint64_t poll_calls = 0U;
     std::uint64_t inconsistent_reads = 0U;
     std::uint64_t promotion_overlap_samples = 0U;
+    std::uint64_t first_measured_caller_before_callback_ns = 0U;
+    std::uint64_t last_measured_caller_before_callback_ns = 0U;
+};
+
+struct ThroughputResult final {
+    std::uint64_t planned_callbacks = 0U;
+    std::uint64_t invoked_callbacks = 0U;
+    std::uint64_t start_ns = 0U;
+    std::uint64_t offer_complete_ns = 0U;
+    std::uint64_t promotion_overlap_callbacks = 0U;
+    std::size_t sampled_quarters = 0U;
+    std::array<std::uint64_t, 4U> preview_backlog_at_quarter{};
+    std::array<std::uint64_t, 4U> journal_uncommitted_at_quarter{};
+    std::array<std::uint64_t, 4U> journal_queue_at_quarter{};
+    runtime::RealtimePipelineSnapshotV1 preview_before_finish{};
+    recovery::LiveJournalSnapshotV1 journal_before_finish{};
+    bool fatal_during_offer = false;
 };
 
 struct RecoveryResult final {
@@ -1024,8 +1091,7 @@ public:
         if (!temporary_.valid() || !MakeDailyFixture(&daily_)) {
             return Fail("fixture", "daily fixture creation failed");
         }
-        const std::size_t total_live =
-            options_.warmup_samples + options_.measured_samples;
+        const std::size_t total_live = options_.planned_live_records();
         if (options_.replay_records >
             std::numeric_limits<std::uint64_t>::max() - total_live - 1U) {
             return Fail("configuration", "record bound overflow");
@@ -1160,6 +1226,11 @@ public:
                 return Fail("correlation", "preview payload correlation failed");
             }
             if (measured) {
+                if (output->first_measured_caller_before_callback_ns == 0U) {
+                    output->first_measured_caller_before_callback_ns =
+                        origin;
+                }
+                output->last_measured_caller_before_callback_ns = origin;
                 output->callback_call_ns.push_back(
                     callback_return - origin);
                 output->callback_to_preview_ns.push_back(visible - origin);
@@ -1210,6 +1281,106 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool MeasureThroughput(ThroughputResult* output) {
+        if (output == nullptr || !options_.throughput_enabled() ||
+            options_.mode != BenchmarkMode::kActive ||
+            preview_pipeline_ == nullptr || sdk_state_ == nullptr ||
+            live_journal_ == nullptr) {
+            return false;
+        }
+        *output = {};
+        output->planned_callbacks = static_cast<std::uint64_t>(
+            options_.planned_live_records());
+        if (!ReleaseRecovery()) {
+            return false;
+        }
+        mdl::MessageHandlerBase* const handler = sdk_state_->handler();
+        if (handler == nullptr) {
+            return Fail("sdk_handler", "benchmark SDK handler is absent");
+        }
+
+        MutableTransactionMessage live_message;
+        output->start_ns = MonotonicNowNs();
+        if (output->start_ns == 0U) {
+            return Fail("throughput_clock", "offer clock failed");
+        }
+        std::size_t next_quarter = 0U;
+        for (std::uint64_t index = 0U;
+             index < output->planned_callbacks;
+             ++index) {
+            const std::uint64_t deadline_ns =
+                output->start_ns +
+                (index + 1U) * 1'000'000'000ULL /
+                    static_cast<std::uint64_t>(
+                        options_.throughput_rate);
+            for (;;) {
+                const std::uint64_t now_ns = MonotonicNowNs();
+                if (now_ns == 0U || now_ns >= deadline_ns) {
+                    break;
+                }
+                const std::uint64_t remaining_ns = deadline_ns - now_ns;
+                if (remaining_ns > 100'000U) {
+                    std::this_thread::sleep_for(
+                        std::chrono::nanoseconds(
+                            remaining_ns - 50'000U));
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+
+            const std::uint64_t ingress_sequence = index + 1U;
+            live_message.SetSequence(
+                static_cast<std::uint64_t>(options_.replay_records) +
+                ingress_sequence);
+            if (!promotion_done_.load(std::memory_order_acquire)) {
+                ++output->promotion_overlap_callbacks;
+            }
+            handler->OnMessage(nullptr, &live_message);
+            ++output->invoked_callbacks;
+
+            while (next_quarter < 4U &&
+                   output->invoked_callbacks * 4U >=
+                       output->planned_callbacks *
+                           static_cast<std::uint64_t>(next_quarter + 1U)) {
+                const runtime::RealtimePipelineSnapshotV1 preview =
+                    preview_pipeline_->Snapshot();
+                const recovery::LiveJournalSnapshotV1 journal =
+                    live_journal_->Snapshot();
+                output->preview_backlog_at_quarter[next_quarter] =
+                    preview.accepted_messages >=
+                            preview.processing_progress.applied_sequence
+                        ? preview.accepted_messages -
+                              preview.processing_progress.applied_sequence
+                        : 0U;
+                output->journal_uncommitted_at_quarter[next_quarter] =
+                    journal.accepted_serial >= journal.committed_serial
+                        ? journal.accepted_serial -
+                              journal.committed_serial
+                        : 0U;
+                output->journal_queue_at_quarter[next_quarter] =
+                    static_cast<std::uint64_t>(journal.queue_depth);
+                ++next_quarter;
+            }
+            if ((output->invoked_callbacks & 255U) == 0U) {
+                const auto live = preview_pipeline_->LiveStatus();
+                const auto journal = live_journal_->Snapshot();
+                if (!live.healthy() || !journal.healthy()) {
+                    output->fatal_during_offer = true;
+                    break;
+                }
+            }
+        }
+        output->offer_complete_ns = MonotonicNowNs();
+        output->sampled_quarters = next_quarter;
+        output->preview_before_finish = preview_pipeline_->Snapshot();
+        output->journal_before_finish = live_journal_->Snapshot();
+        output->fatal_during_offer =
+            output->fatal_during_offer ||
+            output->preview_before_finish.fatal ||
+            !output->journal_before_finish.healthy();
+        return output->offer_complete_ns >= output->start_ns;
+    }
+
     [[nodiscard]] bool Finish(
         std::uint64_t* history_records,
         bool* history_complete) {
@@ -1224,6 +1395,8 @@ public:
             if (!cut.published() || cut.store_generation == nullptr) {
                 return Fail("ordinary_cut", "preview generation failed");
             }
+            final_generation_ =
+                cut.store_generation->watermark().generation;
             *history_records = cut.store_generation->record_count();
             *history_complete = ValidateHistory(
                 *cut.store_generation,
@@ -1261,6 +1434,8 @@ public:
         if (!final_cut.published() || final_cut.store_generation == nullptr) {
             return Fail("final_cut", "recovered generation failed");
         }
+        final_generation_ =
+            final_cut.store_generation->watermark().generation;
         const std::uint64_t expected =
             static_cast<std::uint64_t>(options_.replay_records) +
             static_cast<std::uint64_t>(
@@ -1290,8 +1465,25 @@ public:
                    : live_journal_->Snapshot();
     }
 
+    [[nodiscard]] runtime::RealtimePipelineSnapshotV1
+    preview_snapshot() const noexcept {
+        return preview_pipeline_ == nullptr
+                   ? runtime::RealtimePipelineSnapshotV1{}
+                   : preview_pipeline_->Snapshot();
+    }
+
     [[nodiscard]] std::uint64_t csv_published() const noexcept {
         return replay_source_ == nullptr ? 0U : replay_source_->published();
+    }
+
+    [[nodiscard]] std::uint64_t final_generation() const noexcept {
+        return final_generation_;
+    }
+
+    [[nodiscard]] std::filesystem::path recovered_socket_path() const {
+        return recovered_service_ == nullptr
+                   ? std::filesystem::path{}
+                   : recovered_service_->control_socket_path();
     }
 
 private:
@@ -1317,9 +1509,9 @@ private:
         journal_config.trade_date = kTradeDate;
         journal_config.maximum_message_bytes = 4096U;
         journal_config.segment_maximum_bytes =
-            16ULL * 1024ULL * 1024ULL;
-        journal_config.maximum_total_bytes =
             256ULL * 1024ULL * 1024ULL;
+        journal_config.maximum_total_bytes =
+            32ULL * 1024ULL * 1024ULL * 1024ULL;
         journal_config.queue_capacity_records = 65'536U;
         journal_config.sync_batch_records = 256U;
         journal_config.sync_interval = 2ms;
@@ -1608,6 +1800,7 @@ private:
     ScopedDirectory temporary_{};
     DailyFixture daily_{};
     std::uint64_t maximum_records_ = 0U;
+    std::uint64_t final_generation_ = 0U;
     std::shared_ptr<recovery::MdlLiveJournalV1> live_journal_;
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> recovered_service_;
     std::unique_ptr<runtime::RealtimePipelineV1> shadow_pipeline_;
@@ -1625,6 +1818,451 @@ private:
     bool journal_stopped_ = false;
 };
 
+struct RecoveredPolarsResult final {
+    std::uint64_t generation = 0U;
+    std::uint64_t records = 0U;
+    std::uint64_t columns = 0U;
+    std::uint64_t batches = 0U;
+    std::uint64_t history_published_ns = 0U;
+    std::uint64_t open_return_ns = 0U;
+    std::uint64_t ready_ns = 0U;
+    std::uint64_t probe_elapsed_ns = 0U;
+    std::uint64_t dataframe_estimated_bytes = 0U;
+};
+
+[[nodiscard]] bool ParseUnsignedField(
+    std::string_view line,
+    std::string_view key,
+    std::uint64_t* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    const std::string needle = " " + std::string(key) + "=";
+    const std::size_t position = line.find(needle);
+    if (position == std::string_view::npos) {
+        return false;
+    }
+    const std::size_t begin = position + needle.size();
+    const std::size_t end = line.find(' ', begin);
+    const std::string_view value = line.substr(
+        begin,
+        end == std::string_view::npos ? line.size() - begin : end - begin);
+    std::uint64_t parsed = 0U;
+    const auto result = std::from_chars(
+        value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc{} ||
+        result.ptr != value.data() + value.size()) {
+        return false;
+    }
+    *output = parsed;
+    return true;
+}
+
+[[nodiscard]] bool RunRecoveredPolarsProbe(
+    const std::filesystem::path& socket_path,
+    std::uint64_t generation,
+    std::uint64_t expected_records,
+    RecoveredPolarsResult* output) {
+#if defined(L2FLOW_ONLINE_RECOVERY_PYTHON_EXECUTABLE) && \
+    defined(L2FLOW_ONLINE_RECOVERY_POLARS_SCRIPT) && \
+    defined(L2FLOW_ONLINE_RECOVERY_PYTHON_SOURCE) && \
+    defined(L2FLOW_ONLINE_RECOVERY_READER_LIBRARY)
+    if (output == nullptr || socket_path.empty() || generation == 0U ||
+        expected_records == 0U) {
+        return false;
+    }
+    *output = {};
+    std::array<int, 2U> descriptors{-1, -1};
+    if (::pipe2(descriptors.data(), O_CLOEXEC) != 0) {
+        return false;
+    }
+    UniqueFd read_end(descriptors[0U]);
+    UniqueFd write_end(descriptors[1U]);
+    std::array<std::string, 9U> arguments{{
+        L2FLOW_ONLINE_RECOVERY_PYTHON_EXECUTABLE,
+        "-B",
+        L2FLOW_ONLINE_RECOVERY_POLARS_SCRIPT,
+        socket_path.string(),
+        L2FLOW_ONLINE_RECOVERY_READER_LIBRARY,
+        L2FLOW_ONLINE_RECOVERY_PYTHON_SOURCE,
+        std::to_string(generation),
+        std::to_string(expected_records),
+        "1",
+    }};
+    std::array<char*, 10U> argv{};
+    for (std::size_t index = 0U; index < arguments.size(); ++index) {
+        argv[index] = arguments[index].data();
+    }
+    posix_spawn_file_actions_t actions{};
+    if (::posix_spawn_file_actions_init(&actions) != 0) {
+        return false;
+    }
+    bool actions_valid =
+        ::posix_spawn_file_actions_adddup2(
+            &actions, write_end.get(), STDOUT_FILENO) == 0 &&
+        ::posix_spawn_file_actions_adddup2(
+            &actions, write_end.get(), STDERR_FILENO) == 0 &&
+        ::posix_spawn_file_actions_addclose(
+            &actions, read_end.get()) == 0;
+    if (write_end.get() != STDOUT_FILENO &&
+        write_end.get() != STDERR_FILENO) {
+        actions_valid = actions_valid &&
+            ::posix_spawn_file_actions_addclose(
+                &actions, write_end.get()) == 0;
+    }
+    pid_t child = -1;
+    const int spawn_error =
+        actions_valid
+            ? ::posix_spawn(
+                  &child,
+                  argv[0U],
+                  &actions,
+                  nullptr,
+                  argv.data(),
+                  environ)
+            : EINVAL;
+    static_cast<void>(::posix_spawn_file_actions_destroy(&actions));
+    if (spawn_error != 0 || child <= 0) {
+        return false;
+    }
+    write_end.Reset();
+    std::string child_output;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(180);
+    bool timed_out = false;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            timed_out = true;
+            break;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now);
+        pollfd descriptor{};
+        descriptor.fd = read_end.get();
+        descriptor.events = POLLIN | POLLHUP;
+        const int poll_result = ::poll(
+            &descriptor,
+            1U,
+            static_cast<int>(std::min<std::int64_t>(
+                remaining.count(), 1'000)));
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            timed_out = true;
+            break;
+        }
+        if (poll_result == 0) {
+            continue;
+        }
+        std::array<char, 4'096U> buffer{};
+        const ssize_t read_count =
+            ::read(read_end.get(), buffer.data(), buffer.size());
+        if (read_count == 0) {
+            break;
+        }
+        if (read_count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            timed_out = true;
+            break;
+        }
+        child_output.append(
+            buffer.data(), static_cast<std::size_t>(read_count));
+        if (child_output.size() > 64U * 1024U) {
+            timed_out = true;
+            break;
+        }
+    }
+    if (timed_out) {
+        static_cast<void>(::kill(child, SIGKILL));
+    }
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+    std::cout << child_output;
+    if (timed_out || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return false;
+    }
+    std::string_view result_line;
+    std::size_t begin = 0U;
+    constexpr std::string_view kPrefix =
+        "ONLINE_RECOVERY_POLARS_RESULT ";
+    while (begin < child_output.size()) {
+        const std::size_t end = child_output.find('\n', begin);
+        const std::string_view line(
+            child_output.data() + begin,
+            (end == std::string::npos ? child_output.size() : end) -
+                begin);
+        if (line.starts_with(kPrefix)) {
+            if (!result_line.empty()) {
+                return false;
+            }
+            result_line = line;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1U;
+    }
+    return !result_line.empty() &&
+           ParseUnsignedField(result_line, "generation", &output->generation) &&
+           ParseUnsignedField(result_line, "records", &output->records) &&
+           ParseUnsignedField(result_line, "columns", &output->columns) &&
+           ParseUnsignedField(result_line, "batches", &output->batches) &&
+           ParseUnsignedField(
+               result_line,
+               "history_published_monotonic_ns",
+               &output->history_published_ns) &&
+           ParseUnsignedField(
+               result_line, "open_return_ns", &output->open_return_ns) &&
+           ParseUnsignedField(
+               result_line, "polars_ready_ns", &output->ready_ns) &&
+           ParseUnsignedField(
+               result_line,
+               "probe_elapsed_ns",
+               &output->probe_elapsed_ns) &&
+           ParseUnsignedField(
+               result_line,
+               "dataframe_estimated_bytes",
+               &output->dataframe_estimated_bytes) &&
+           output->generation == generation &&
+           output->records == expected_records && output->columns != 0U &&
+           output->batches != 0U &&
+           output->history_published_ns <= output->open_return_ns &&
+           output->open_return_ns <= output->ready_ns;
+#else
+    static_cast<void>(socket_path);
+    static_cast<void>(generation);
+    static_cast<void>(expected_records);
+    static_cast<void>(output);
+    return false;
+#endif
+}
+
+[[nodiscard]] bool RunThroughputBenchmark(const Options& options) {
+    const std::uint64_t planned = static_cast<std::uint64_t>(
+        options.planned_live_records());
+    std::cout
+        << "ONLINE_RECOVERY_THROUGHPUT_ENV"
+        << " mode=" << ModeName(options.mode)
+        << " target_rps=" << options.throughput_rate
+        << " duration_ms=" << options.throughput_duration_ms
+        << " planned_callbacks=" << planned
+        << " replay_records=" << options.replay_records
+        << " parallel_decoder_workers="
+        << options.parallel_decoder_workers
+        << " polars=" << (options.polars ? 1 : 0)
+        << " callback_contract=serialized"
+        << " pacing=absolute_deadline_one_based_no_batch_wait"
+        << " preview_state=LIVE_PARTIAL"
+        << " recovered_state=ACTIVE_after_promotion"
+        << " live_journal_queue_capacity=65536"
+        << " live_journal_segment_bytes=268435456"
+        << " live_journal_maximum_bytes=34359738368"
+        << " clock=CLOCK_MONOTONIC\n";
+
+    BenchmarkHarness harness(options);
+    if (!harness.Initialize()) {
+        return false;
+    }
+    ThroughputResult throughput{};
+    if (!harness.MeasureThroughput(&throughput)) {
+        return false;
+    }
+    const std::uint64_t producer_elapsed_ns =
+        throughput.offer_complete_ns - throughput.start_ns;
+    const long double achieved_offered_rps =
+        producer_elapsed_ns == 0U
+            ? 0.0L
+            : static_cast<long double>(throughput.invoked_callbacks) *
+                  1'000'000'000.0L /
+                  static_cast<long double>(producer_elapsed_ns);
+    const std::uint64_t backlog_budget = std::max<std::uint64_t>(
+        1'024U,
+        (static_cast<std::uint64_t>(options.throughput_rate) + 999U) /
+            1'000U);
+    const bool steady_state_met =
+        throughput.sampled_quarters == 4U &&
+        throughput.preview_backlog_at_quarter[3U] <= backlog_budget &&
+        throughput.preview_backlog_at_quarter[3U] <=
+            throughput.preview_backlog_at_quarter[1U] +
+                backlog_budget &&
+        throughput.journal_queue_at_quarter[3U] <=
+            throughput.journal_queue_at_quarter[1U] + backlog_budget &&
+        throughput.journal_uncommitted_at_quarter[3U] <=
+            throughput.journal_uncommitted_at_quarter[1U] +
+                backlog_budget;
+    const bool offer_target_met =
+        throughput.invoked_callbacks == planned &&
+        achieved_offered_rps >=
+            static_cast<long double>(options.throughput_rate) * 0.98L &&
+        !throughput.fatal_during_offer &&
+        throughput.preview_before_finish.accepted_messages == planned &&
+        throughput.preview_before_finish.rejected_messages == 0U &&
+        throughput.preview_before_finish.post_cut_messages == 0U &&
+        throughput.journal_before_finish.healthy() &&
+        throughput.journal_before_finish.accepted_serial == planned &&
+        steady_state_met;
+
+    runtime::RealtimePipelineSnapshotV1 preview_final =
+        throughput.preview_before_finish;
+    if (offer_target_met) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (std::chrono::steady_clock::now() < deadline) {
+            preview_final = harness.preview_snapshot();
+            if (preview_final.fatal ||
+                (preview_final.decoded_messages == planned &&
+                 preview_final.processing_progress.applied_sequence ==
+                     planned &&
+                 preview_final.store.appended_records == planned)) {
+                break;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    std::uint64_t history_records = 0U;
+    bool history_complete = false;
+    bool finish_complete = false;
+    if (offer_target_met && !preview_final.fatal &&
+        preview_final.decoded_messages == planned &&
+        preview_final.processing_progress.applied_sequence == planned &&
+        preview_final.store.appended_records == planned) {
+        finish_complete = harness.Finish(
+            &history_records, &history_complete);
+    }
+    const std::uint64_t history_ready_ns = MonotonicNowNs();
+    const std::uint64_t history_ready_elapsed_ns =
+        history_ready_ns >= throughput.start_ns
+            ? history_ready_ns - throughput.start_ns
+            : 0U;
+    const long double recovered_history_ready_live_rps =
+        !history_complete || history_ready_elapsed_ns == 0U
+            ? 0.0L
+            : static_cast<long double>(planned) * 1'000'000'000.0L /
+                  static_cast<long double>(history_ready_elapsed_ns);
+    const RecoveryResult& recovered = harness.recovery_result();
+    const recovery::OnlineRecoverySnapshotV1 final_recovery =
+        harness.final_recovery_snapshot();
+    const recovery::LiveJournalSnapshotV1 journal_final =
+        harness.journal_snapshot();
+    const std::uint64_t recovery_duration_ns =
+        recovered.release_ns != 0U &&
+                recovered.promotion_ns >= recovered.release_ns
+            ? recovered.promotion_ns - recovered.release_ns
+            : 0U;
+    const bool exact_preview_prefix =
+        !preview_final.fatal &&
+        preview_final.accepted_messages == planned &&
+        preview_final.rejected_messages == 0U &&
+        preview_final.post_cut_messages == 0U &&
+        preview_final.decoded_messages == planned &&
+        preview_final.processing_progress.applied_sequence == planned &&
+        preview_final.store.appended_records == planned &&
+        preview_final.store.failed_appends == 0U &&
+        !preview_final.store.coverage_lost;
+    const bool exact_journal =
+        journal_final.healthy() &&
+        journal_final.accepted_serial == planned &&
+        journal_final.committed_serial == planned &&
+        journal_final.queue_depth == 0U;
+    const bool scenario_pass =
+        offer_target_met && exact_preview_prefix && exact_journal &&
+        finish_complete && history_complete &&
+        throughput.promotion_overlap_callbacks != 0U &&
+        recovered.boundary.ready() && recovered.mark_promoted &&
+        recovered.recovered_service_started;
+
+    std::cout
+        << "ONLINE_RECOVERY_THROUGHPUT_RESULT"
+        << " mode=" << ModeName(options.mode)
+        << " target_rps=" << options.throughput_rate
+        << " duration_ms=" << options.throughput_duration_ms
+        << " planned_callbacks=" << planned
+        << " invoked_callbacks=" << throughput.invoked_callbacks
+        << " producer_elapsed_ns=" << producer_elapsed_ns
+        << " achieved_offered_rps="
+        << static_cast<double>(achieved_offered_rps)
+        << " offer_target_met=" << (offer_target_met ? 1 : 0)
+        << " scenario_pass=" << (scenario_pass ? 1 : 0)
+        << " process_survived=1"
+        << " fatal_during_offer="
+        << (throughput.fatal_during_offer ? 1 : 0)
+        << " steady_state_met=" << (steady_state_met ? 1 : 0)
+        << " sampled_quarters=" << throughput.sampled_quarters
+        << " backlog_budget=" << backlog_budget
+        << " promotion_overlap_callbacks="
+        << throughput.promotion_overlap_callbacks
+        << " preview_accepted=" << preview_final.accepted_messages
+        << " preview_rejected=" << preview_final.rejected_messages
+        << " preview_post_cut=" << preview_final.post_cut_messages
+        << " preview_decoded=" << preview_final.decoded_messages
+        << " preview_applied="
+        << preview_final.processing_progress.applied_sequence
+        << " preview_store_appended="
+        << preview_final.store.appended_records
+        << " preview_store_failed="
+        << preview_final.store.failed_appends
+        << " preview_fatal=" << (preview_final.fatal ? 1 : 0)
+        << " preview_backlog_q25="
+        << throughput.preview_backlog_at_quarter[0U]
+        << " preview_backlog_q50="
+        << throughput.preview_backlog_at_quarter[1U]
+        << " preview_backlog_q75="
+        << throughput.preview_backlog_at_quarter[2U]
+        << " preview_backlog_q100="
+        << throughput.preview_backlog_at_quarter[3U]
+        << " journal_accepted=" << journal_final.accepted_serial
+        << " journal_committed=" << journal_final.committed_serial
+        << " journal_queue_depth=" << journal_final.queue_depth
+        << " journal_queue_high_water=" << journal_final.queue_high_water
+        << " journal_queue_q25="
+        << throughput.journal_queue_at_quarter[0U]
+        << " journal_queue_q50="
+        << throughput.journal_queue_at_quarter[1U]
+        << " journal_queue_q75="
+        << throughput.journal_queue_at_quarter[2U]
+        << " journal_queue_q100="
+        << throughput.journal_queue_at_quarter[3U]
+        << " journal_uncommitted_q25="
+        << throughput.journal_uncommitted_at_quarter[0U]
+        << " journal_uncommitted_q50="
+        << throughput.journal_uncommitted_at_quarter[1U]
+        << " journal_uncommitted_q75="
+        << throughput.journal_uncommitted_at_quarter[2U]
+        << " journal_uncommitted_q100="
+        << throughput.journal_uncommitted_at_quarter[3U]
+        << " journal_records_read="
+        << final_recovery.journal_records_read
+        << " journal_suffix_publications="
+        << final_recovery.journal_suffix_publications
+        << " csv_published=" << harness.csv_published()
+        << " recovery_duration_ns=" << recovery_duration_ns
+        << " history_ready_elapsed_ns="
+        << history_ready_elapsed_ns
+        << " recovered_history_ready_live_rps="
+        << static_cast<double>(recovered_history_ready_live_rps)
+        << " history_records=" << history_records
+        << " history_expected="
+        << options.replay_records + planned
+        << " history_complete=" << (history_complete ? 1 : 0)
+        << " exact_preview_prefix="
+        << (exact_preview_prefix ? 1 : 0)
+        << " exact_journal=" << (exact_journal ? 1 : 0)
+        << " promotion_ready="
+        << (recovered.boundary.ready() ? 1 : 0)
+        << " mark_promoted=" << (recovered.mark_promoted ? 1 : 0)
+        << " recovered_service_started="
+        << (recovered.recovered_service_started ? 1 : 0)
+        << '\n';
+    return scenario_pass;
+}
+
 [[nodiscard]] bool RunBenchmark(const Options& options) {
     std::cout
         << "ONLINE_RECOVERY_FAST_ENV"
@@ -1635,6 +2273,7 @@ private:
         << " replay_records=" << options.replay_records
         << " parallel_decoder_workers="
         << options.parallel_decoder_workers
+        << " polars=" << (options.polars ? 1 : 0)
         << " replay_source=mdl_csv_shenzhen_transaction"
         << " reader=wire_v2_c_latest_tick"
         << " clock=CLOCK_MONOTONIC"
@@ -1652,6 +2291,60 @@ private:
     bool history_complete = false;
     if (!harness.Finish(&history_records, &history_complete)) {
         return false;
+    }
+
+    bool polars_complete = !options.polars;
+    RecoveredPolarsResult polars{};
+    if (options.polars) {
+        const std::uint64_t expected_records =
+            static_cast<std::uint64_t>(options.replay_records) +
+            static_cast<std::uint64_t>(
+                options.warmup_samples + options.measured_samples);
+        polars_complete =
+            latency.first_measured_caller_before_callback_ns != 0U &&
+            latency.last_measured_caller_before_callback_ns >=
+                latency.first_measured_caller_before_callback_ns &&
+            RunRecoveredPolarsProbe(
+                harness.recovered_socket_path(),
+                harness.final_generation(),
+                expected_records,
+                &polars) &&
+            latency.last_measured_caller_before_callback_ns <=
+                polars.history_published_ns &&
+            polars.history_published_ns <= polars.ready_ns;
+        if (!polars_complete) {
+            return Fail(
+                "recovered_polars",
+                "recovered History Polars probe failed");
+        }
+        std::cout
+            << "ONLINE_RECOVERY_POLARS_BOUNDARY"
+            << " mode=" << ModeName(options.mode)
+            << " replay_records=" << options.replay_records
+            << " measured_records=" << options.measured_samples
+            << " generation=" << polars.generation
+            << " records=" << polars.records
+            << " columns=" << polars.columns
+            << " batches=" << polars.batches
+            << " first_measured_caller_before_callback_ns="
+            << latency.first_measured_caller_before_callback_ns
+            << " last_measured_caller_before_callback_ns="
+            << latency.last_measured_caller_before_callback_ns
+            << " history_published_monotonic_ns="
+            << polars.history_published_ns
+            << " polars_ready_ns=" << polars.ready_ns
+            << " strict_first_callback_to_polars_ns="
+            << polars.ready_ns -
+                   latency.first_measured_caller_before_callback_ns
+            << " strict_last_callback_to_polars_ns="
+            << polars.ready_ns -
+                   latency.last_measured_caller_before_callback_ns
+            << " publication_to_polars_ns="
+            << polars.ready_ns - polars.history_published_ns
+            << " probe_elapsed_ns=" << polars.probe_elapsed_ns
+            << " dataframe_estimated_bytes="
+            << polars.dataframe_estimated_bytes
+            << '\n';
     }
 
     PrintLatency(options.mode, "callback_call", latency.callback_call_ns);
@@ -1735,6 +2428,7 @@ private:
         << options.replay_records + options.warmup_samples +
                options.measured_samples
         << " history_complete=" << (history_complete ? 1 : 0)
+        << " polars_complete=" << (polars_complete ? 1 : 0)
         << " promotion_ready="
         << (options.mode == BenchmarkMode::kOrdinary ||
                     recovered.boundary.ready()
@@ -1751,7 +2445,8 @@ private:
     if (!exact_latency_sample_count) {
         std::cerr << "latency sample cardinality mismatch\n";
     }
-    return history_complete && exact_latency_sample_count;
+    return history_complete && exact_latency_sample_count &&
+           polars_complete;
 }
 
 }  // namespace
@@ -1762,8 +2457,13 @@ int main(int argc, char** argv) {
         std::cerr
             << "usage: benchmark_online_recovery_fast_v1 --mode "
                "ordinary|parked|active [--warmup-samples N] [--samples N] "
-               "[--replay-records N] [--parallel-decoder-workers N]\n";
+               "[--replay-records N] [--parallel-decoder-workers N] "
+               "[--throughput-rate N --throughput-duration-ms N]\n";
         return 2;
     }
-    return RunBenchmark(options) ? 0 : 1;
+    return (options.throughput_enabled()
+                ? RunThroughputBenchmark(options)
+                : RunBenchmark(options))
+               ? 0
+               : 1;
 }

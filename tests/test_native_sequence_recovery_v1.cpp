@@ -28,6 +28,7 @@ using l2flow::realtime::NativeSequenceRecoveryChannelStateV1;
 using l2flow::realtime::NativeSequenceRecoveryCommitErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryConfigV1;
 using l2flow::realtime::NativeSequenceRecoveryCoordinatorV1;
+using l2flow::realtime::NativeSequenceRecoveryCoverageModeV1;
 using l2flow::realtime::NativeSequenceRecoveryCreateErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryFreezeReasonV1;
 using l2flow::realtime::NativeSequenceRecoveryObserveDispositionV1;
@@ -35,6 +36,9 @@ using l2flow::realtime::NativeSequenceRecoveryObserveErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryObserveResultV1;
 using l2flow::realtime::NativeSequenceRecoveryPollErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryRecordClassV1;
+using l2flow::realtime::NativeSequenceRecoverySealDispositionV1;
+using l2flow::realtime::NativeSequenceRecoverySealErrorV1;
+using l2flow::realtime::NativeSequenceRecoverySealResultV1;
 using l2flow::realtime::NativeSequenceRecoveryTokenV1;
 using l2flow::sdk::MessageKey;
 
@@ -131,6 +135,13 @@ NativeSequenceRecoveryConfigV1 StandardConfig() {
     return config;
 }
 
+NativeSequenceRecoveryConfigV1 PartialConfig() {
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.coverage_mode =
+        NativeSequenceRecoveryCoverageModeV1::kProcessStartPartial;
+    return config;
+}
+
 std::unique_ptr<NativeSequenceRecoveryCoordinatorV1> MakeCoordinator(
     NativeSequenceRecoveryConfigV1 config,
     bool* ok) {
@@ -174,7 +185,8 @@ bool Apply(
 bool PollAndCommit(
     NativeSequenceRecoveryCoordinatorV1* coordinator,
     std::uint64_t expected_sequence,
-    std::uint64_t expected_cookie) {
+    std::uint64_t expected_cookie,
+    std::span<const std::byte> expected_payload = {}) {
     NativeSequenceCertifiedReadyV1 ready{};
     bool ok = Expect(
         coordinator->PollCertified(&ready) ==
@@ -184,6 +196,15 @@ bool PollAndCommit(
         ready.descriptor.sequence == expected_sequence &&
             ready.applied_cookie == expected_cookie,
         "certified record preserves native sequence and first cookie");
+    if (!expected_payload.empty()) {
+        ok &= Expect(
+            ready.canonical_payload.size() == expected_payload.size() &&
+                std::equal(
+                    ready.canonical_payload.begin(),
+                    ready.canonical_payload.end(),
+                    expected_payload.begin()),
+            "certified record borrows the first canonical payload");
+    }
     ok &= Expect(
         coordinator->CommitCertified(ready.token) ==
             NativeSequenceRecoveryCommitErrorV1::kNone,
@@ -314,7 +335,8 @@ bool TestNormalAndFilteredProgress() {
                 NativeSequenceRecoveryApplyDispositionV1::kApplied &&
             applied.canonical_applied_cookie == 11U,
         "first canonical payload and cookie are recorded");
-    ok &= PollAndCommit(coordinator.get(), 1U, 11U);
+    ok &= PollAndCommit(
+        coordinator.get(), 1U, 11U, first_payload);
 
     ok &= Observe(
         coordinator.get(),
@@ -332,7 +354,8 @@ bool TestNormalAndFilteredProgress() {
             ready.record_class ==
                 NativeSequenceRecoveryRecordClassV1::kFiltered &&
             ready.descriptor.sequence == 2U &&
-            ready.applied_cookie == 0U,
+            ready.applied_cookie == 0U &&
+            ready.canonical_payload.empty(),
         "filtered frontier is returned as explicit output-free work");
     ok &= Expect(
         coordinator->CommitCertified(ready.token) ==
@@ -358,7 +381,9 @@ bool TestNormalAndFilteredProgress() {
 
 bool TestGapBackfillAndOrderedDrain() {
     bool ok = true;
-    auto coordinator = MakeCoordinator(StandardConfig(), &ok);
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.certified_duplicate_retention_entries = 0U;
+    auto coordinator = MakeCoordinator(config, &ok);
     if (!coordinator) {
         return false;
     }
@@ -628,6 +653,199 @@ bool TestAppliedBeforeObserve() {
             observed.origin_sequence == 10U,
         "later Observe activates the staged application");
     ok &= PollAndCommit(coordinator.get(), 10U, 700U);
+    return ok;
+}
+
+bool TestPartialSealRejectsAppliedOnlyLower() {
+    bool ok = true;
+    auto coordinator = MakeCoordinator(PartialConfig(), &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    NativeSequenceRecoveryApplyResultV1 applied{};
+    const auto payload99 = Payload(99U);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(18U, 99U),
+        kShanghaiTick,
+        payload99,
+        99U,
+        &applied);
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(18U, 100U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kFiltered,
+        &observed);
+
+    NativeSequenceRecoverySealResultV1 sealed{};
+    ok &= Expect(
+        coordinator->SealBoundedOrigin(
+            Shanghai(18U, 99U).domain, 100U, &sealed) ==
+                NativeSequenceRecoverySealErrorV1::kNone &&
+            sealed.disposition ==
+                NativeSequenceRecoverySealDispositionV1::
+                    kOriginExcludesStaged,
+        "seal cannot exclude an applied-only lower position");
+    NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
+    ok &= Expect(
+        coordinator->ChannelSnapshot(
+            Shanghai(18U, 99U).domain, &snapshot) &&
+            !snapshot.origin_sealed && snapshot.origin_sequence == 100U,
+        "rejected seal leaves the provisional origin unchanged");
+
+    ok &= Expect(
+        coordinator->SealBoundedOrigin(
+            Shanghai(18U, 99U).domain, 99U, &sealed) ==
+                NativeSequenceRecoverySealErrorV1::kNone &&
+            sealed.disposition ==
+                NativeSequenceRecoverySealDispositionV1::kSealed &&
+            sealed.observed_contiguous_sequence == 98U &&
+            sealed.highest_observed_sequence == 100U,
+        "retry at the applied-only minimum seals without inventing observation");
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        coordinator->PollCertified(&ready) ==
+            NativeSequenceRecoveryPollErrorV1::kNotReady,
+        "applied-only origin remains blocked until its Observe arrives");
+    return ok;
+}
+
+bool TestPartialSealPreservesSameOriginGap() {
+    bool ok = true;
+    auto coordinator = MakeCoordinator(PartialConfig(), &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(19U, 100U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kFiltered,
+        &observed);
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(19U, 102U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kFiltered,
+        &observed);
+
+    NativeSequenceRecoverySealResultV1 sealed{};
+    ok &= Expect(
+        coordinator->SealBoundedOrigin(
+            Shanghai(19U, 100U).domain, 100U, &sealed) ==
+                NativeSequenceRecoverySealErrorV1::kNone &&
+            sealed.disposition ==
+                NativeSequenceRecoverySealDispositionV1::kSealed &&
+            sealed.observed_contiguous_sequence == 100U &&
+            sealed.highest_observed_sequence == 102U,
+        "same-origin seal preserves the observed gap");
+    NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
+    ok &= Expect(
+        coordinator->ChannelSnapshot(
+            Shanghai(19U, 100U).domain, &snapshot) &&
+            snapshot.missing_sequences == 1U,
+        "same-origin seal reports the missing native position");
+    ok &= PollAndCommit(coordinator.get(), 100U, 0U);
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        coordinator->PollCertified(&ready) ==
+            NativeSequenceRecoveryPollErrorV1::kNotReady,
+        "certification cannot skip the preserved pre-seal gap");
+    return ok;
+}
+
+bool TestPartialLowerOriginDoesNotAdvancePrefix() {
+    bool ok = true;
+    auto coordinator = MakeCoordinator(PartialConfig(), &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(20U, 100U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kFiltered,
+        &observed);
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(20U, 101U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kFiltered,
+        &observed);
+
+    NativeSequenceRecoverySealResultV1 sealed{};
+    ok &= Expect(
+        coordinator->SealBoundedOrigin(
+            Shanghai(20U, 100U).domain, 99U, &sealed) ==
+                NativeSequenceRecoverySealErrorV1::kNone &&
+            sealed.disposition ==
+                NativeSequenceRecoverySealDispositionV1::kSealed &&
+            sealed.observed_contiguous_sequence == 98U &&
+            sealed.highest_observed_sequence == 101U,
+        "lower seal origin opens a leading gap instead of preserving the old prefix");
+    NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        coordinator->ChannelSnapshot(
+            Shanghai(20U, 99U).domain, &snapshot) &&
+            snapshot.missing_sequences == 1U &&
+            coordinator->PollCertified(&ready) ==
+                NativeSequenceRecoveryPollErrorV1::kNotReady,
+        "unobserved lower origin prevents premature certification");
+    return ok;
+}
+
+bool TestPartialPureAppliedOnlySeal() {
+    bool ok = true;
+    auto coordinator = MakeCoordinator(PartialConfig(), &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    const auto payload100 = Payload(100U);
+    NativeSequenceRecoveryApplyResultV1 applied{};
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(21U, 100U),
+        kShanghaiTick,
+        payload100,
+        100U,
+        &applied);
+    NativeSequenceRecoverySealResultV1 sealed{};
+    ok &= Expect(
+        coordinator->SealBoundedOrigin(
+            Shanghai(21U, 100U).domain, 100U, &sealed) ==
+                NativeSequenceRecoverySealErrorV1::kNone &&
+            sealed.disposition ==
+                NativeSequenceRecoverySealDispositionV1::kSealed &&
+            sealed.observed_contiguous_sequence == 99U &&
+            sealed.highest_observed_sequence == 99U,
+        "pure applied-only channel seals at an empty observed baseline");
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        coordinator->PollCertified(&ready) ==
+            NativeSequenceRecoveryPollErrorV1::kNotReady,
+        "pure applied-only position is not certified before Observe");
+
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(21U, 100U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Expect(
+        observed.observed_contiguous_sequence == 100U,
+        "later Observe joins and advances the applied-only origin");
+    ok &= PollAndCommit(
+        coordinator.get(), 100U, 100U, payload100);
     return ok;
 }
 
@@ -930,6 +1148,324 @@ bool TestRetentionOutsideAndAbaToken() {
     return ok;
 }
 
+bool TestNonPowerOfTwoRetentionWrapAndReuse() {
+    bool ok = true;
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.maximum_pending_entries = 1U;
+    config.maximum_pending_entries_per_channel = 1U;
+    config.certified_duplicate_retention_entries = 3U;
+    auto coordinator = MakeCoordinator(config, &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    NativeSequenceRecoveryApplyResultV1 applied{};
+    NativeSequenceRecoveryTokenV1 first_token{};
+    for (std::uint64_t sequence = 1U; sequence <= 12U; ++sequence) {
+        ok &= Observe(
+            coordinator.get(),
+            Shanghai(15U, sequence),
+            kShanghaiTick,
+            NativeSequenceRecoveryRecordClassV1::kTarget,
+            &observed);
+        if (sequence == 1U) {
+            first_token = observed.token;
+        }
+        const auto payload =
+            Payload(static_cast<std::uint32_t>(sequence));
+        ok &= Apply(
+            coordinator.get(),
+            Shanghai(15U, sequence),
+            kShanghaiTick,
+            payload,
+            sequence,
+            &applied);
+        ok &= PollAndCommit(
+            coordinator.get(), sequence, sequence, payload);
+    }
+
+    const auto snapshot = coordinator->Snapshot();
+    ok &= Expect(
+        snapshot.pending_entries == 0U &&
+            snapshot.retained_certified_entries == 3U &&
+            snapshot.canonical_payload_bytes == 12U &&
+            snapshot.frozen_channel_count == 0U,
+        "non-power-of-two retention wraps without corrupting accounting");
+    const auto first_payload = Payload(1U);
+    ok &= Expect(
+        coordinator->MarkTargetApplied(
+            first_token,
+            kShanghaiTick,
+            first_payload,
+            101U,
+            &applied) ==
+                NativeSequenceRecoveryApplyErrorV1::kInvalidToken &&
+            coordinator->CommitCertified(first_token) ==
+                NativeSequenceRecoveryCommitErrorV1::kInvalidToken,
+        "reused free-list slot rejects stale apply and commit tokens");
+
+    const auto retained_payload = Payload(10U);
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(15U, 10U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(15U, 10U),
+        kShanghaiTick,
+        retained_payload,
+        110U,
+        &applied);
+    ok &= Expect(
+        observed.disposition ==
+                NativeSequenceRecoveryObserveDispositionV1::
+                    kDuplicateCertified &&
+            applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::
+                    kExactDuplicate,
+        "wrapped retention still verifies an exact retained duplicate");
+    return ok;
+}
+
+bool TestZeroRetentionContiguousBacklog() {
+    bool ok = true;
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.maximum_pending_entries = 16U;
+    config.maximum_pending_entries_per_channel = 16U;
+    config.certified_duplicate_retention_entries = 0U;
+    auto coordinator = MakeCoordinator(config, &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    NativeSequenceRecoveryApplyResultV1 applied{};
+    for (std::uint64_t sequence = 1U; sequence <= 12U; ++sequence) {
+        ok &= Observe(
+            coordinator.get(),
+            Shanghai(16U, sequence),
+            kShanghaiTick,
+            NativeSequenceRecoveryRecordClassV1::kTarget,
+            &observed);
+    }
+    for (std::uint64_t sequence = 1U; sequence <= 12U; ++sequence) {
+        const auto payload =
+            Payload(static_cast<std::uint32_t>(sequence));
+        ok &= Apply(
+            coordinator.get(),
+            Shanghai(16U, sequence),
+            kShanghaiTick,
+            payload,
+            sequence,
+            &applied);
+    }
+    for (std::uint64_t sequence = 1U; sequence <= 12U; ++sequence) {
+        const auto payload =
+            Payload(static_cast<std::uint32_t>(sequence));
+        ok &= PollAndCommit(
+            coordinator.get(), sequence, sequence, payload);
+    }
+
+    const auto snapshot = coordinator->Snapshot();
+    ok &= Expect(
+        snapshot.pending_entries == 0U &&
+            snapshot.retained_certified_entries == 0U &&
+            snapshot.canonical_payload_bytes == 0U &&
+            snapshot.frozen_channel_count == 0U,
+        "successor hints survive immediate release of each committed entry");
+
+    config.maximum_pending_entries = 1U;
+    config.maximum_pending_entries_per_channel = 1U;
+    auto reused = MakeCoordinator(config, &ok);
+    if (!reused) {
+        return false;
+    }
+    for (std::uint64_t sequence = 1U; sequence <= 12U; ++sequence) {
+        ok &= Observe(
+            reused.get(),
+            Shanghai(17U, sequence),
+            kShanghaiTick,
+            NativeSequenceRecoveryRecordClassV1::kTarget,
+            &observed);
+        const auto payload =
+            Payload(static_cast<std::uint32_t>(sequence));
+        ok &= Apply(
+            reused.get(),
+            Shanghai(17U, sequence),
+            kShanghaiTick,
+            payload,
+            sequence,
+            &applied);
+        ok &= PollAndCommit(
+            reused.get(), sequence, sequence, payload);
+    }
+    ok &= Expect(
+        reused->Snapshot().pending_entries == 0U &&
+            reused->Snapshot().frozen_channel_count == 0U,
+        "successor hints recover when every commit immediately reuses a slot");
+    return ok;
+}
+
+bool TestPreallocatedCanonicalPayloadArena() {
+    bool ok = true;
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.maximum_pending_entries = 1U;
+    config.maximum_pending_entries_per_channel = 1U;
+    config.certified_duplicate_retention_entries = 1U;
+    config.maximum_canonical_payload_bytes_per_entry = 4U;
+    config.maximum_total_canonical_payload_bytes = 8U;
+    config.preallocate_canonical_payload_arena = true;
+    auto coordinator = MakeCoordinator(config, &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    NativeSequenceRecoveryApplyResultV1 applied{};
+    const auto payload1 = Payload(11U);
+    const auto payload2 = Payload(22U);
+    const std::array<std::byte, 2U> payload3{
+        std::byte{0x0bU}, std::byte{0x00U}};
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(14U, 1U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    const NativeSequenceRecoveryTokenV1 first_token = observed.token;
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(14U, 1U),
+        kShanghaiTick,
+        payload1,
+        11U,
+        &applied);
+    ok &= PollAndCommit(
+        coordinator.get(), 1U, 11U, payload1);
+    ok &= Expect(
+        coordinator->Snapshot().retained_certified_entries == 1U &&
+            coordinator->Snapshot().canonical_payload_bytes == 4U,
+        "preallocated arena accounts only live canonical payload bytes");
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(14U, 1U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Expect(
+        observed.disposition ==
+            NativeSequenceRecoveryObserveDispositionV1::
+                kDuplicateCertified,
+        "retained arena payload remains available for duplicate proof");
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(14U, 1U),
+        kShanghaiTick,
+        payload1,
+        12U,
+        &applied);
+    ok &= Expect(
+        applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::
+                    kExactDuplicate &&
+            applied.canonical_applied_cookie == 11U,
+        "arena exact duplicate preserves the first canonical cookie");
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(14U, 2U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(14U, 2U),
+        kShanghaiTick,
+        payload2,
+        22U,
+        &applied);
+    ok &= PollAndCommit(coordinator.get(), 2U, 22U);
+    const auto after_eviction = coordinator->Snapshot();
+    ok &= Expect(
+        after_eviction.retained_certified_entries == 1U &&
+            after_eviction.canonical_payload_bytes == 4U,
+        "arena retention eviction releases logical payload accounting");
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(14U, 3U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    NativeSequenceRecoveryApplyResultV1 stale{};
+    ok &= Expect(
+        coordinator->MarkTargetApplied(
+            first_token,
+            kShanghaiTick,
+            payload1,
+            13U,
+            &stale) ==
+            NativeSequenceRecoveryApplyErrorV1::kInvalidToken,
+        "arena slot reuse preserves ABA generation rejection");
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(14U, 3U),
+        kShanghaiTick,
+        payload3,
+        33U,
+        &applied);
+    ok &= PollAndCommit(coordinator.get(), 3U, 33U);
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(14U, 3U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(14U, 3U),
+        kShanghaiTick,
+        payload3,
+        34U,
+        &applied);
+    ok &= Expect(
+        applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::
+                    kExactDuplicate &&
+            applied.canonical_applied_cookie == 33U,
+        "reused arena slot compares the replacement payload exactly");
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(14U, 3U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(14U, 3U),
+        kShanghaiTick,
+        payload1,
+        35U,
+        &applied);
+    const auto frozen = coordinator->Snapshot();
+    ok &= Expect(
+        applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::
+                    kPayloadConflict &&
+            applied.channel_state ==
+                NativeSequenceRecoveryChannelStateV1::kFrozenConflict &&
+            frozen.retained_certified_entries == 0U &&
+            frozen.canonical_payload_bytes == 0U,
+        "arena conflict freezes the channel and releases live accounting");
+    return ok;
+}
+
 bool TestResourceBoundsAndChannelIsolation() {
     bool ok = true;
     NativeSequenceRecoveryConfigV1 config = StandardConfig();
@@ -1100,6 +1636,43 @@ bool TestConfigurationValidation() {
                 kInvalidConfiguration,
         "total canonical payload bound covers one entry");
     config = StandardConfig();
+    config.maximum_pending_entries = 2U;
+    config.maximum_pending_entries_per_channel = 2U;
+    config.certified_duplicate_retention_entries = 1U;
+    config.maximum_canonical_payload_bytes_per_entry = 4U;
+    config.maximum_total_canonical_payload_bytes = 8U;
+    config.preallocate_canonical_payload_arena = true;
+    ok &= Expect(
+        NativeSequenceRecoveryCoordinatorV1::Create(
+            config, &coordinator) ==
+            NativeSequenceRecoveryCreateErrorV1::
+                kInvalidConfiguration,
+        "preallocated arena requires one maximum-size slot per entry");
+    config.maximum_total_canonical_payload_bytes = 12U;
+    coordinator.reset();
+    ok &= Expect(
+        NativeSequenceRecoveryCoordinatorV1::Create(
+            config, &coordinator) ==
+                NativeSequenceRecoveryCreateErrorV1::kNone &&
+            coordinator != nullptr,
+        "preallocated arena accepts an exact fixed-slot payload bound");
+    config = StandardConfig();
+    config.maximum_pending_entries = 2U;
+    config.maximum_pending_entries_per_channel = 2U;
+    config.certified_duplicate_retention_entries = 0U;
+    config.maximum_canonical_payload_bytes_per_entry =
+        std::numeric_limits<std::size_t>::max();
+    config.maximum_total_canonical_payload_bytes =
+        std::numeric_limits<std::size_t>::max();
+    config.preallocate_canonical_payload_arena = true;
+    coordinator.reset();
+    ok &= Expect(
+        NativeSequenceRecoveryCoordinatorV1::Create(
+            config, &coordinator) ==
+            NativeSequenceRecoveryCreateErrorV1::
+                kInvalidConfiguration,
+        "preallocated arena rejects fixed-slot byte-count overflow");
+    config = StandardConfig();
     config.expected_origin_sequence = 0U;
     ok &= Expect(
         NativeSequenceRecoveryCoordinatorV1::Create(
@@ -1159,9 +1732,16 @@ int main() {
     ok &= TestGapBackfillAndOrderedDrain();
     ok &= TestExplicitOriginRejectsFirstPacketInference();
     ok &= TestAppliedBeforeObserve();
+    ok &= TestPartialSealRejectsAppliedOnlyLower();
+    ok &= TestPartialSealPreservesSameOriginGap();
+    ok &= TestPartialLowerOriginDoesNotAdvancePrefix();
+    ok &= TestPartialPureAppliedOnlySeal();
     ok &= TestDuplicateBarrierAndConflictIsolation();
     ok &= TestShenzhenSharedDomainAndTupleConflict();
     ok &= TestRetentionOutsideAndAbaToken();
+    ok &= TestNonPowerOfTwoRetentionWrapAndReuse();
+    ok &= TestZeroRetentionContiguousBacklog();
+    ok &= TestPreallocatedCanonicalPayloadArena();
     ok &= TestResourceBoundsAndChannelIsolation();
     ok &= TestChannelAndReorderBounds();
     ok &= TestConfigurationValidation();

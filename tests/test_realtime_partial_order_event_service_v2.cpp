@@ -1402,6 +1402,34 @@ void RunProgressAccuracyScenario(TestContext* test) {
         "progress separates certification wait at 101 from the observed gap at 102 and ages the new incident");
 }
 
+void RunBackingPreallocationScenario(TestContext* test) {
+    Fixture fixture{};
+    if (!BuildFixture(test, 1ms, 64U, 32U, 16U, &fixture)) {
+        return;
+    }
+    const auto before = fixture.service->JournalResourceSnapshot();
+    test->Expect(
+        before.fully_preallocated &&
+            before.event_prefaulted_bytes +
+                    ipc::kPartialOrderEventHeaderBytesV2 ==
+                before.committed_event_region_bytes &&
+            before.order_state_prefaulted_bytes ==
+                before.order_state_backed_bytes &&
+            InjectOrder(&fixture, 9U, 100U) &&
+            WaitUntil([&] {
+                return fixture.service->Snapshot()
+                           .canonical_apply_frontier == 1U;
+            }),
+        "Event journal is fully backed before worker admission");
+    fixture.service->MarkDraining();
+    fixture.pipeline->StopAndDrain();
+    fixture.service->MarkStoppedClean();
+    const auto after = fixture.service->JournalResourceSnapshot();
+    test->Expect(
+        after == before,
+        "Event worker performs no backing allocation while processing");
+}
+
 void RunKnownGapNoTimeoutScenario(TestContext* test) {
     Fixture fixture{};
     if (!BuildFixture(test, 1ms, 64U, 32U, 16U, &fixture)) {
@@ -1568,6 +1596,9 @@ void RunBusyQueueSealBarrierScenario(TestContext* test) {
         test->Expect(false, "pause worker for sustained backlog setup");
         return;
     }
+    test->Expect(
+        InjectOrder(&fixture, 7U, 1U),
+        "queue one target before sustained filtered traffic");
     realtime::NativeSequenceObservationV1 observation{};
     observation.message_key = sdk::MessageKey{6U, 101U, 33U};
     observation.record_class =
@@ -1589,12 +1620,7 @@ void RunBusyQueueSealBarrierScenario(TestContext* test) {
         std::size_t lane = 0U;
         while (!producer_stop.load(std::memory_order_acquire)) {
             const auto snapshot = fixture.service->Snapshot();
-            const std::uint64_t backlog =
-                snapshot.enqueued_handoffs >= snapshot.processed_handoffs
-                    ? snapshot.enqueued_handoffs -
-                          snapshot.processed_handoffs
-                    : 0U;
-            if (backlog >= 3500U) {
+            if (snapshot.handoff_queue_depth >= 3500U) {
                 std::this_thread::yield();
                 continue;
             }
@@ -1608,20 +1634,22 @@ void RunBusyQueueSealBarrierScenario(TestContext* test) {
     });
     const bool sealed_while_busy = WaitUntil([&] {
         const auto snapshot = fixture.service->Snapshot();
-        return snapshot.channel_count == 2U &&
+        return snapshot.channel_count == 3U &&
                snapshot.unsealed_channel_count == 0U &&
-               snapshot.enqueued_handoffs >
-                   snapshot.processed_handoffs + 100U;
+               snapshot.handoff_queue_depth > 100U &&
+               snapshot.canonical_apply_frontier >= 1U &&
+               snapshot.published_event_frontier >= 1U;
     });
     producer_stop.store(true, std::memory_order_release);
     producer.join();
     test->Expect(
         sealed_while_busy &&
             !fixture.service->Snapshot().globally_frozen,
-        "queue-position seal barrier advances channel 0 and another channel while traffic remains queued");
+        "queue-position seal and aged target publication advance while filtered traffic remains queued");
     test->Expect(
         WaitUntil([&] {
-            return fixture.service->WaitUntilIdleForTest(1ms);
+            return fixture.service->WaitUntilIdleForTest(1ms) &&
+                   fixture.service->Snapshot().pending_entries == 0U;
         }),
         "busy filtered continuity backlog drains without a known-gap skip");
 }
@@ -1641,6 +1669,7 @@ int main() {
     RunSnapshotCoherenceScenario(&test);
     RunJournalPublicationIdleBarrierScenario(&test);
     RunProgressAccuracyScenario(&test);
+    RunBackingPreallocationScenario(&test);
     RunKnownGapNoTimeoutScenario(&test);
     RunSignedSequenceBoundaryScenario(&test);
     RunBusyQueueSealBarrierScenario(&test);

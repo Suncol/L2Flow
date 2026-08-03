@@ -4,6 +4,7 @@
 #include "l2flow/ipc/instrument_derived_event_history_v1.h"
 #include "l2flow/ipc/partial_order_event_wire_v2.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -34,9 +35,23 @@ struct PartialOrderEventJournalConfigV2 final {
     // A smaller nonzero value is legal only when the caller has a stronger
     // upstream batch bound; exceeding it fails before publication mutation.
     std::uint64_t maximum_order_state_updates_per_commit = 0U;
+    // Bounds the projection scratch reserved once during Create. Zero preserves
+    // the legacy full-event-capacity bound. Microbatch producers should set a
+    // tighter proven maximum; a larger commit is rejected before publication
+    // mutation or sparse-backing growth.
+    std::uint64_t maximum_events_per_commit = 0U;
     std::uint64_t maximum_mapping_bytes = 0U;
     std::uint64_t lazy_commit_chunk_bytes =
         64ULL * 1024ULL * 1024ULL;
+    // Optionally faults every order-state page into the writer mapping during
+    // PreallocateBacking. This is a strict opt-in: when
+    // MADV_POPULATE_WRITE is unavailable or rejected, PreallocateBacking
+    // returns kBackingCommitFailed with ENOTSUP or the madvise errno. It does
+    // not silently weaken the request to asynchronous MADV_WILLNEED.
+    bool prefault_order_state_pages = false;
+    // Apply the same strict policy to the complete append-only Event region.
+    // This prevents first-write page faults from running on the Event worker.
+    bool prefault_event_pages = false;
 };
 
 struct PartialOrderEventJournalSessionV2 final {
@@ -71,13 +86,39 @@ struct PartialOrderEventStatusUpdateV2 final {
         PartialOrderEventLastErrorV2::kNone;
 };
 
-// Writer-thread resource diagnostics. Order-state backing is committed in
-// fixed lazy chunks before any cut, key, version, or Event row is mutated.
+// One canonical input inside a microbatch. event_count partitions the flattened
+// Event span supplied to PublishCanonicalBatch in the same order as these
+// slices. Zero-Event inputs are retained so the canonical frontier can advance
+// without inventing an Event row.
+struct PartialOrderEventCanonicalSliceV2 final {
+    std::uint64_t canonical_apply_sequence = 0U;
+    std::size_t event_count = 0U;
+};
+
+// Writer-thread or quiescent resource diagnostics. Compare a snapshot taken
+// after PreallocateBacking with one taken after the writer stops to prove that
+// no Event or order-state backing allocation occurred in between. Allocation
+// calls count successful post-Create fallocate operations; the fixed header and
+// channel-bank allocations performed by Create are excluded.
 struct PartialOrderEventJournalResourceSnapshotV2 final {
     std::uint64_t committed_event_region_bytes = 0U;
     std::uint64_t order_state_backed_bytes = 0U;
     std::uint64_t order_state_backed_chunk_count = 0U;
     std::uint64_t order_state_backing_allocation_calls = 0U;
+    std::uint64_t event_backing_allocation_calls = 0U;
+    std::uint64_t event_prefault_attempts = 0U;
+    std::uint64_t event_prefaulted_bytes = 0U;
+    // Attempts includes a failed unsupported-kernel request. Prefaulted bytes
+    // advances only after MADV_POPULATE_WRITE succeeds for the complete region.
+    std::uint64_t order_state_prefault_attempts = 0U;
+    std::uint64_t order_state_prefaulted_bytes = 0U;
+    // True only after the complete backing and any requested strict prefault
+    // have succeeded.
+    bool fully_preallocated = false;
+
+    [[nodiscard]] friend bool operator==(
+        const PartialOrderEventJournalResourceSnapshotV2&,
+        const PartialOrderEventJournalResourceSnapshotV2&) noexcept = default;
 };
 
 enum class PartialOrderEventJournalCreateErrorV2 : std::uint8_t {
@@ -147,6 +188,11 @@ public:
         std::shared_ptr<PartialOrderEventJournalProducerV2>* output,
         int* system_error_number = nullptr) noexcept;
 
+    // Commits the complete fixed mapping before a latency-sensitive writer is
+    // started. The default journal remains sparse until this is called.
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2 PreallocateBacking(
+        int* system_error_number = nullptr) noexcept;
+
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2
     EnsureEventWritable(std::uint64_t required_event_count) noexcept;
 
@@ -155,6 +201,29 @@ public:
         std::uint64_t canonical_apply_sequence,
         const PartialOrderEventStatusUpdateV2& status,
         std::span<const InstrumentDerivedEventV1> events,
+        std::span<const PartialOrderEventChannelHealthV2>
+            affected_channels = {}) noexcept;
+
+    // Atomically publishes one contiguous canonical prefix. Readers observe
+    // either the preceding complete cut or the final cut for the whole batch;
+    // every Event and materialized order-state version retains the canonical
+    // sequence of its owning slice.
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    PublishCanonicalBatch(
+        std::span<const PartialOrderEventCanonicalSliceV2> slices,
+        const PartialOrderEventStatusUpdateV2& status,
+        std::span<const InstrumentDerivedEventV1> events,
+        std::span<const PartialOrderEventChannelHealthV2>
+            affected_channels = {}) noexcept;
+
+    // Equivalent serial path for rows already flattened by an owner-private
+    // history. Rows receive the same complete canonical validation before any
+    // cut is changed; this overload only removes redundant variant projection.
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    PublishCanonicalBatchProjected(
+        std::span<const PartialOrderEventCanonicalSliceV2> slices,
+        const PartialOrderEventStatusUpdateV2& status,
+        std::span<const l2flow_instrument_derived_event_row_v1> events,
         std::span<const PartialOrderEventChannelHealthV2>
             affected_channels = {}) noexcept;
 

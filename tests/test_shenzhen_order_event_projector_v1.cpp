@@ -855,6 +855,31 @@ void TestDecodedProjection(bool* ok) {
             projected.price_p6 == 0,
         "decoded ChannelNo-zero order preserves sequence/time anchors and suppresses invalid market price");
 
+    const auto* stored_order =
+        std::get_if<market::ShenzhenOrderV1>(&event);
+    market::StoredMarketEventViewV1 stored_event(
+        std::in_place_type<const market::ShenzhenOrderV1*>,
+        stored_order);
+    market::ShenzhenOrderEventInputV1 stored_projected{};
+    *ok &= Expect(
+        stored_order != nullptr &&
+            market::ProjectShenzhenOrderEventInputV1(
+                stored_event, 321U, 654U, &stored_projected) ==
+                market::ShenzhenOrderEventProjectionV1::kProjected &&
+            stored_projected.trade_date == projected.trade_date &&
+            stored_projected.instrument_id == projected.instrument_id &&
+            stored_projected.channel == projected.channel &&
+            stored_projected.primary_order_id ==
+                projected.primary_order_id &&
+            stored_projected.quantity == projected.quantity &&
+            stored_projected.anchor.native_event_sequence ==
+                projected.anchor.native_event_sequence &&
+            stored_projected.anchor.ingress_sequence ==
+                projected.anchor.ingress_sequence &&
+            stored_projected.anchor.tick_stream_sequence ==
+                projected.anchor.tick_stream_sequence,
+        "stored-event view preserves decoded Shenzhen projection semantics");
+
     market::ShenzhenTransactionV1 ambiguous{};
     ambiguous.common.kind =
         market::MarketEventKindV1::kShenzhenTransaction;
@@ -930,6 +955,125 @@ void TestDecodedProjection(bool* ok) {
             market::ShenzhenOrderEventProjectionV1::
                 kNotShenzhenEvent,
         "decoded adapter rejects non-Shenzhen event");
+}
+
+void TestFixedCapacityAndFinalizeOrder(bool* ok) {
+    {
+        auto projector = Projector(ok, 1U);
+        if (projector == nullptr) {
+            return;
+        }
+        std::vector<market::ShenzhenOrderEventV1> events;
+        const auto first = Order(
+            100,
+            market::SideV1::kBuy,
+            market::OrderTypeV1::kLimit,
+            10);
+        *ok &= Expect(
+            projector->Consume(first, &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::kNone,
+            "fill fixed Shenzhen order capacity");
+        market::ShenzhenOrderSnapshotV1 before{};
+        *ok &= Expect(
+            projector->GetOrder(
+                {20260730U, 1U, 7U, 100}, &before) ==
+                market::ShenzhenOrderProjectorQueryErrorV1::kNone,
+            "read Shenzhen state before capacity failure");
+        *ok &= Expect(
+            projector->Consume(
+                Order(
+                    101,
+                    market::SideV1::kSell,
+                    market::OrderTypeV1::kLimit,
+                    20),
+                &events) ==
+                    market::ShenzhenOrderProjectorConsumeErrorV1::
+                        kOrderCapacity &&
+                events.empty() && projector->order_count() == 1U,
+            "full Shenzhen table rejects a new key without publication");
+        market::ShenzhenOrderSnapshotV1 after{};
+        market::ShenzhenOrderSnapshotV1 missing{};
+        *ok &= Expect(
+            projector->GetOrder(
+                {20260730U, 1U, 7U, 100}, &after) ==
+                    market::ShenzhenOrderProjectorQueryErrorV1::kNone &&
+                after.revision == before.revision &&
+                after.last_anchor.native_event_sequence ==
+                    before.last_anchor.native_event_sequence &&
+                after.remaining_quantity == before.remaining_quantity &&
+                projector->GetOrder(
+                    {20260730U, 1U, 7U, 101}, &missing) ==
+                    market::ShenzhenOrderProjectorQueryErrorV1::
+                        kNotFound,
+            "Shenzhen capacity failure leaves existing state unchanged");
+    }
+
+    {
+        auto projector = Projector(ok, 4U);
+        if (projector == nullptr) {
+            return;
+        }
+        std::vector<market::ShenzhenOrderEventV1> events;
+        const std::vector<market::ShenzhenOrderEventInputV1> shuffled{
+            Order(
+                100,
+                market::SideV1::kBuy,
+                market::OrderTypeV1::kLimit,
+                10,
+                18U,
+                2U),
+            Order(
+                101,
+                market::SideV1::kBuy,
+                market::OrderTypeV1::kLimit,
+                10,
+                17U,
+                4U),
+            Order(
+                102,
+                market::SideV1::kBuy,
+                market::OrderTypeV1::kLimit,
+                10,
+                17U,
+                3U),
+            Order(
+                103,
+                market::SideV1::kBuy,
+                market::OrderTypeV1::kLimit,
+                10,
+                17U,
+                3U)};
+        for (const auto& input : shuffled) {
+            *ok &= Expect(
+                projector->Consume(input, &events) ==
+                    market::ShenzhenOrderProjectorConsumeErrorV1::
+                        kNone,
+                "insert shuffled Shenzhen order key");
+        }
+        *ok &= Expect(
+            projector->Finalize({}, &events) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::kNone,
+            "finalize shuffled Shenzhen order keys");
+        const std::vector<market::ShenzhenOrderKeyV1> expected{
+            {20260730U, 17U, 3U, 102},
+            {20260730U, 17U, 3U, 103},
+            {20260730U, 17U, 4U, 101},
+            {20260730U, 18U, 2U, 100}};
+        bool ordered = events.size() == expected.size();
+        for (std::size_t index = 0U;
+             ordered && index < events.size();
+             ++index) {
+            const auto* revision = Revision(events[index]);
+            ordered = revision != nullptr &&
+                      revision->operation ==
+                          market::ShenzhenOrderDeltaOperationV1::
+                              kFinalize &&
+                      revision->order.key == expected[index];
+        }
+        *ok &= Expect(
+            ordered,
+            "Shenzhen Finalize retains full-key lexicographic order");
+    }
 }
 
 void TestInputOrdering(bool* ok) {
@@ -1046,6 +1190,54 @@ void TestCanonicalOrdering(bool* ok) {
         "regressed Shenzhen canonical sequence is rejected before mutation");
 }
 
+bool RejectSinkRevision(
+    void*,
+    market::ShenzhenOrderDeltaOperationV1,
+    const market::ShenzhenEventSourceAnchorV1&,
+    const market::ShenzhenOrderSnapshotV1&) noexcept {
+    return false;
+}
+
+bool AcceptSinkTrade(
+    void*, const market::ShenzhenTradeEventV1&) noexcept {
+    return true;
+}
+
+bool AcceptSinkCancel(
+    void*, const market::ShenzhenCancelEventV1&) noexcept {
+    return true;
+}
+
+void TestSinkFailureClosesProjector(bool* ok) {
+    auto projector = Projector(ok);
+    if (projector == nullptr) {
+        return;
+    }
+    const market::ShenzhenOrderEventSinkV1 sink{
+        nullptr,
+        &RejectSinkRevision,
+        &AcceptSinkTrade,
+        &AcceptSinkCancel};
+    const auto first = Order(
+        900,
+        market::SideV1::kBuy,
+        market::OrderTypeV1::kLimit,
+        10);
+    const auto second = Order(
+        901,
+        market::SideV1::kSell,
+        market::OrderTypeV1::kLimit,
+        10);
+    *ok &= Expect(
+        projector->ConsumeCanonicalToSink(first, 1U, sink) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::kFailed &&
+            projector->order_count() == 1U &&
+            projector->ConsumeCanonicalToSink(second, 2U, sink) ==
+                market::ShenzhenOrderProjectorConsumeErrorV1::kFailed &&
+            projector->order_count() == 1U,
+        "failed synchronous sink permanently closes a mutated projector");
+}
+
 }  // namespace
 
 int main() {
@@ -1058,7 +1250,9 @@ int main() {
     TestQuantityConflicts(&ok);
     TestKeyIsolationAndFinalization(&ok);
     TestDecodedProjection(&ok);
+    TestFixedCapacityAndFinalizeOrder(&ok);
     TestInputOrdering(&ok);
     TestCanonicalOrdering(&ok);
+    TestSinkFailureClosesProjector(&ok);
     return ok ? 0 : 1;
 }

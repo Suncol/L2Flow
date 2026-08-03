@@ -931,5 +931,164 @@ int main() {
             "cancel without A is conflict-audited and never treated as a clean T-only finalization");
     }
 
+    {
+        std::unique_ptr<market::ShanghaiOrderEventAggregatorV1>
+            aggregator = Aggregator(1U, &ok);
+        ok &= Consume(
+            aggregator.get(),
+            Add(
+                1,
+                10,
+                market::SideV1::kBuy,
+                market::TradingPhaseV1::kContinuous,
+                10'000'000,
+                10,
+                0),
+            &events,
+            "fill fixed Shanghai order capacity");
+        const market::ShanghaiOrderSnapshotV1 before =
+            ReadOrder(*aggregator, 10, &ok);
+        ok &= Expect(
+            aggregator->Consume(
+                Add(
+                    2,
+                    20,
+                    market::SideV1::kSell,
+                    market::TradingPhaseV1::kContinuous,
+                    10'100'000,
+                    20,
+                    0),
+                &events) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kOrderCapacity &&
+                events.empty() && aggregator->order_count() == 1U,
+            "full Shanghai table rejects a new key without publication");
+        const market::ShanghaiOrderSnapshotV1 after =
+            ReadOrder(*aggregator, 10, &ok);
+        market::ShanghaiOrderSnapshotV1 missing{};
+        ok &= Expect(
+            after.revision == before.revision &&
+                after.last_anchor.native_event_sequence ==
+                    before.last_anchor.native_event_sequence &&
+                after.remaining_quantity == before.remaining_quantity &&
+                aggregator->GetOrder(
+                    {20260730U, 17U, 3, 20}, &missing) ==
+                    market::ShanghaiOrderAggregatorQueryErrorV1::
+                        kNotFound,
+            "Shanghai capacity failure leaves existing state unchanged");
+    }
+
+    {
+        std::unique_ptr<market::ShanghaiOrderEventAggregatorV1>
+            aggregator = Aggregator(2U, &ok);
+        ok &= Consume(
+            aggregator.get(),
+            Add(
+                1,
+                200,
+                market::SideV1::kSell,
+                market::TradingPhaseV1::kContinuous,
+                10'000'000,
+                10,
+                0),
+            &events,
+            "seed Shanghai state before dense-vector growth");
+        ok &= Consume(
+            aggregator.get(),
+            Trade(
+                2,
+                100,
+                200,
+                market::AggressorV1::kBuy,
+                market::TradingPhaseV1::kContinuous,
+                10'000'000,
+                3),
+            &events,
+            "insert one Shanghai state while retaining another state pointer");
+        const market::ShanghaiOrderSnapshotV1 buy =
+            ReadOrder(*aggregator, 100, &ok);
+        const market::ShanghaiOrderSnapshotV1 sell =
+            ReadOrder(*aggregator, 200, &ok);
+        ok &= Expect(
+            aggregator->order_count() == 2U &&
+                buy.total_trade_quantity == 3 &&
+                sell.total_trade_quantity == 3 &&
+                sell.remaining_quantity == 7,
+            "reserved Shanghai dense storage keeps prior state addresses stable");
+    }
+
+    {
+        std::unique_ptr<market::ShanghaiOrderEventAggregatorV1>
+            aggregator = Aggregator(4U, &ok);
+        std::vector<market::ShanghaiOrderEventInputV1> shuffled;
+        shuffled.push_back(Add(
+            1,
+            50,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'000'000,
+            10,
+            0));
+        shuffled.back().instrument_id = 18U;
+        shuffled.back().channel = 2;
+        shuffled.push_back(Add(
+            2,
+            30,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'000'000,
+            10,
+            0));
+        shuffled.back().channel = 4;
+        shuffled.push_back(Add(
+            3,
+            40,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'000'000,
+            10,
+            0));
+        shuffled.push_back(Add(
+            4,
+            20,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'000'000,
+            10,
+            0));
+        for (const auto& input : shuffled) {
+            ok &= Consume(
+                aggregator.get(),
+                input,
+                &events,
+                "insert shuffled Shanghai order key");
+        }
+        ok &= Expect(
+            aggregator->Finalize({}, &events) ==
+                market::ShanghaiOrderAggregatorConsumeErrorV1::kNone,
+            "finalize shuffled Shanghai order keys");
+        const std::vector<market::ShanghaiOrderKeyV1> expected{
+            {20260730U, 17U, 3, 20},
+            {20260730U, 17U, 3, 40},
+            {20260730U, 17U, 4, 30},
+            {20260730U, 18U, 2, 50}};
+        bool ordered = events.size() == expected.size();
+        for (std::size_t index = 0U;
+             ordered && index < events.size();
+             ++index) {
+            const auto* revision =
+                std::get_if<market::ShanghaiOrderRevisionEventV1>(
+                    &events[index]);
+            ordered = revision != nullptr &&
+                      revision->operation ==
+                          market::ShanghaiOrderDeltaOperationV1::
+                              kFinalize &&
+                      revision->order.key == expected[index];
+        }
+        ok &= Expect(
+            ordered,
+            "Shanghai Finalize retains full-key lexicographic order");
+    }
+
     return ok ? 0 : 1;
 }
