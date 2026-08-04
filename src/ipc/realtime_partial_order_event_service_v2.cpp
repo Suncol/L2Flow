@@ -4,6 +4,7 @@
 #include "l2flow/control/quality_flags_v1.h"
 #include "l2flow/ipc/certified_order_event_history_v1.h"
 #include "l2flow/ipc/order_event_wire_adapter_v2.h"
+#include "l2flow/ipc/partial_order_event_journal_v3.h"
 #include "l2flow/ipc/realtime_certified_wire_v1.h"
 #include "l2flow/ipc/realtime_wire_projection_v2.h"
 
@@ -272,6 +273,42 @@ static_assert(std::is_trivially_copyable_v<AppliedHandoff>);
 static_assert(std::is_trivially_copyable_v<
               realtime::NativeSequenceObservationV1>);
 
+enum class TargetJoinState : std::uint8_t {
+    kEmpty = 0U,
+    kObservationReady,
+    kAppliedWriting,
+    kJoined,
+    kObservationWorker,
+    kObservationProcessed,
+    kTargetWorker,
+    kLateAppliedWriting,
+};
+
+// Admission publishes the observation before the decoder command becomes
+// visible. Store publishers can therefore join by ingress_sequence without a
+// lock. The worker owns either kObservationWorker or kTargetWorker; an applied
+// publisher owns either writing state. No state permits both to mutate the
+// ordinary fields concurrently.
+struct alignas(64) TargetJoinSlot final {
+    std::atomic<TargetJoinState> state{TargetJoinState::kEmpty};
+    std::array<std::uint8_t, 7U> reserved{};
+    // Atomic because a duplicate/colliding applied publisher may inspect the
+    // slot while the worker retires it and the serialized observer reuses it.
+    std::atomic<std::uint64_t> ingress_sequence{0U};
+    realtime::NativeSequenceObservationV1 observation{};
+    std::size_t ordinal = 0U;
+    const market::RealtimeHistoryRecordV1* record = nullptr;
+};
+static_assert(std::atomic<TargetJoinState>::is_always_lock_free);
+
+struct PendingTargetJoin final {
+    TargetJoinSlot* slot = nullptr;
+    // A queued observation must not consume its join grace period while
+    // older ingress records are ahead of it. Start the bounded wait only
+    // after this entry reaches the FIFO head.
+    std::uint64_t head_wait_started_monotonic_ns = 0U;
+};
+
 // Native observations have exactly one producer: the serialized SDK
 // admission path. Keep that lane SPSC so the callback does not pay for an
 // MPMC reservation and a second per-cell synchronization protocol.
@@ -496,16 +533,22 @@ private:
     // Bound the interval in which the worker is not checking its input lanes.
     // Journal slices still accumulate across turns to kCanonicalBatchSize, so
     // this responsiveness quantum does not give up commit batching.
-    static constexpr std::size_t kCanonicalDrainQuantum = 512U;
-    // A target tick contributes one observation and one applied handoff.
+    static constexpr std::size_t kCanonicalDrainQuantum =
+        kCanonicalBatchSize;
+    // A normally joined target contributes exactly one worker handoff.
     static constexpr std::size_t kHandoffBatchSize =
-        kCanonicalDrainQuantum * 2U;
+        kCanonicalBatchSize;
     static constexpr std::uint64_t kMaximumOrdinaryEventsPerTick = 3U;
     // Full 500-625k/s target streams reach the size bound first. The age
     // bound prevents a sparse target tail from being hidden indefinitely by
     // sustained filtered traffic without adding another worker or timer.
     static constexpr std::uint64_t kCanonicalBatchMaximumAgeNs =
         4'000'000U;
+    // Low-rate traffic waits briefly for Store to attach the already-admitted
+    // record. On expiry the observation is processed alone so diagnostics and
+    // origin discovery never depend indefinitely on Store progress.
+    static constexpr std::uint64_t kTargetJoinMaximumWaitNs =
+        kCanonicalBatchMaximumAgeNs;
     static constexpr std::uint64_t kStatusPublishMaximumAgeNs = 4'000'000U;
 
     struct ChannelRuntime final {
@@ -546,7 +589,7 @@ public:
                     std::numeric_limits<std::intptr_t>::max()) ||
             config_.handoff_queue_capacity >
                 static_cast<std::uint64_t>(
-                    std::numeric_limits<std::size_t>::max()) ||
+                    std::numeric_limits<std::size_t>::max() / 2U) ||
             config_.maximum_pending_entries == 0U ||
             config_.maximum_pending_entries >
                 static_cast<std::uint64_t>(
@@ -566,6 +609,12 @@ public:
             config_.event_journal_capacity == 0U ||
             config_.event_journal_capacity <
                 config_.maximum_derived_events ||
+            (config_.journal_layout !=
+                 RealtimePartialOrderEventJournalLayoutV2::
+                     kMaterializedStateV2 &&
+             config_.journal_layout !=
+                 RealtimePartialOrderEventJournalLayoutV2::
+                     kCompactStateReferenceV3) ||
             !IsPowerOfTwo(config_.order_state_capacity) ||
             config_.lazy_commit_chunk_bytes < 4096U ||
             config_.lazy_commit_chunk_bytes % 4096U != 0U) {
@@ -629,6 +678,33 @@ public:
                 kRecoveryCreateFailed;
         }
 
+        std::uint64_t ordinary_batch_events = 0U;
+        const std::uint64_t maximum_single_tick_state_updates =
+            config_.maximum_order_state_updates_per_commit == 0U
+                ? static_cast<std::uint64_t>(
+                      config_.maximum_shanghai_order_states)
+                : static_cast<std::uint64_t>(
+                      config_.maximum_order_state_updates_per_commit);
+        std::uint64_t maximum_single_tick_events = 0U;
+        if (!CheckedMultiply(
+                kMaximumOrdinaryEventsPerTick,
+                static_cast<std::uint64_t>(kCanonicalBatchSize),
+                &ordinary_batch_events) ||
+            !CheckedAdd(
+                maximum_single_tick_state_updates,
+                1U,
+                &maximum_single_tick_events)) {
+            return RealtimePartialOrderEventServiceCreateErrorV2::
+                kInvalidConfiguration;
+        }
+        maximum_events_per_journal_commit_ = std::min(
+            config_.event_journal_capacity,
+            std::max(ordinary_batch_events, maximum_single_tick_events));
+        if (maximum_events_per_journal_commit_ == 0U) {
+            return RealtimePartialOrderEventServiceCreateErrorV2::
+                kInvalidConfiguration;
+        }
+
         CertifiedOrderEventHistoryConfigV1 history_config{};
         history_config.trade_date = config_.trade_date;
         history_config.maximum_shanghai_order_states =
@@ -636,6 +712,11 @@ public:
         history_config.maximum_shenzhen_order_states =
             config_.maximum_shenzhen_order_states;
         history_config.maximum_events = config_.maximum_derived_events;
+        history_config.maximum_private_batch_events =
+            static_cast<std::size_t>(std::min<std::uint64_t>(
+                maximum_events_per_journal_commit_,
+                static_cast<std::uint64_t>(
+                    config_.maximum_derived_events)));
         history_config.preallocate_event_storage = true;
         history_config.publish_process_snapshots = false;
         if (CertifiedOrderEventHistoryV1::Create(
@@ -668,32 +749,6 @@ public:
         // latency on the publication path.
         journal_config.prefault_order_state_pages = true;
         journal_config.prefault_event_pages = true;
-        std::uint64_t ordinary_batch_events = 0U;
-        const std::uint64_t maximum_single_tick_state_updates =
-            config_.maximum_order_state_updates_per_commit == 0U
-                ? static_cast<std::uint64_t>(
-                      config_.maximum_shanghai_order_states)
-                : static_cast<std::uint64_t>(
-                      config_.maximum_order_state_updates_per_commit);
-        std::uint64_t maximum_single_tick_events = 0U;
-        if (!CheckedMultiply(
-                kMaximumOrdinaryEventsPerTick,
-                static_cast<std::uint64_t>(kCanonicalBatchSize),
-                &ordinary_batch_events) ||
-            !CheckedAdd(
-                maximum_single_tick_state_updates,
-                1U,
-                &maximum_single_tick_events)) {
-            return RealtimePartialOrderEventServiceCreateErrorV2::
-                kInvalidConfiguration;
-        }
-        maximum_events_per_journal_commit_ = std::min(
-            config_.event_journal_capacity,
-            std::max(ordinary_batch_events, maximum_single_tick_events));
-        if (maximum_events_per_journal_commit_ == 0U) {
-            return RealtimePartialOrderEventServiceCreateErrorV2::
-                kInvalidConfiguration;
-        }
         journal_config.maximum_events_per_commit =
             maximum_events_per_journal_commit_;
         if (config_.maximum_order_state_updates_per_commit != 0U) {
@@ -714,14 +769,25 @@ public:
             config_.maximum_mapping_bytes;
         journal_config.lazy_commit_chunk_bytes =
             config_.lazy_commit_chunk_bytes;
-        if (PartialOrderEventJournalProducerV2::Create(
-                journal_config, &journal_, system_error_number) !=
+        const auto journal_create_error =
+            config_.journal_layout ==
+                    RealtimePartialOrderEventJournalLayoutV2::
+                        kCompactStateReferenceV3
+                ? PartialOrderEventJournalProducerV3::Create(
+                      journal_config,
+                      &compact_journal_,
+                      system_error_number)
+                : PartialOrderEventJournalProducerV2::Create(
+                      journal_config,
+                      &journal_,
+                      system_error_number);
+        if (journal_create_error !=
                 PartialOrderEventJournalCreateErrorV2::kNone ||
-            journal_ == nullptr) {
+            !JournalPresent()) {
             return RealtimePartialOrderEventServiceCreateErrorV2::
                 kJournalCreateFailed;
         }
-        if (journal_->PreallocateBacking(system_error_number) !=
+        if (JournalPreallocateBacking(system_error_number) !=
             PartialOrderEventJournalPublishErrorV2::kNone) {
             return RealtimePartialOrderEventServiceCreateErrorV2::
                 kJournalCreateFailed;
@@ -736,6 +802,16 @@ public:
             applied_queue_ =
                 std::make_unique<BoundedMpmcQueue<AppliedHandoff>>(
                     handoff_capacity);
+            const std::size_t target_join_capacity =
+                handoff_capacity * 2U;
+            target_join_slots_ =
+                std::make_unique<TargetJoinSlot[]>(
+                    target_join_capacity);
+            pending_target_joins_ =
+                std::make_unique<PendingTargetJoin[]>(
+                    target_join_capacity);
+            target_join_mask_ = target_join_capacity - 1U;
+            pending_target_mask_ = target_join_mask_;
             channels_.resize(config_.channel_capacity);
             std::size_t index_capacity = 1U;
             while (index_capacity <
@@ -765,7 +841,8 @@ public:
         if (worker_startup_.load(std::memory_order_acquire) !=
                 WorkerStartupState::kNotStarted ||
             worker_thread_.joinable() || observation_queue_ == nullptr ||
-            applied_queue_ == nullptr) {
+            applied_queue_ == nullptr || target_join_slots_ == nullptr ||
+            pending_target_joins_ == nullptr) {
             SetSystemError(system_error_number, EINVAL);
             return false;
         }
@@ -835,19 +912,13 @@ public:
             globally_frozen_.load(std::memory_order_acquire)) {
             return true;
         }
-        AppliedHandoff handoff{};
-        handoff.ordinal = ordinal;
-        handoff.record = &record;
-        if (!applied_queue_->TryPush(handoff)) {
-            StoreMaximum(
-                &handoff_queue_high_water_,
-                CombinedQueueDepth());
-            static_cast<void>(IncrementSaturating(&dropped_handoffs_));
-            RequestGlobalFailure(
-                PartialOrderEventLastErrorV2::kResourceExhausted);
+        if (!JoinOrEnqueueApplied(ordinal, record)) {
             return true;
         }
-        WakeWorkerAfterEnqueue();
+        if (!IncrementSaturating(&applied_records_)) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kResourceExhausted);
+        }
         return true;
     }
 
@@ -864,11 +935,47 @@ public:
             globally_frozen_.load(std::memory_order_acquire)) {
             return;
         }
+        TargetJoinSlot* join_slot = nullptr;
+        if (observation.record_class ==
+                realtime::NativeSequenceRecoveryRecordClassV1::kTarget &&
+            observation.ingress_sequence != 0U) {
+            join_slot = &target_join_slots_[
+                static_cast<std::size_t>(
+                    observation.ingress_sequence) &
+                target_join_mask_];
+            if (join_slot->state.load(std::memory_order_acquire) !=
+                    TargetJoinState::kEmpty) {
+                static_cast<void>(
+                    IncrementSaturating(&dropped_handoffs_));
+                RequestGlobalFailure(
+                    PartialOrderEventLastErrorV2::kResourceExhausted);
+                return;
+            }
+            join_slot->ingress_sequence.store(
+                observation.ingress_sequence,
+                std::memory_order_relaxed);
+            join_slot->observation = observation;
+            join_slot->ordinal = 0U;
+            join_slot->record = nullptr;
+            join_slot->state.store(
+                TargetJoinState::kObservationReady,
+                std::memory_order_release);
+        }
         if (!observation_queue_->TryPush(observation)) {
+            if (join_slot != nullptr) {
+                join_slot->state.store(
+                    TargetJoinState::kEmpty,
+                    std::memory_order_release);
+            }
             StoreMaximum(
                 &handoff_queue_high_water_,
                 CombinedQueueDepth());
             static_cast<void>(IncrementSaturating(&dropped_handoffs_));
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kResourceExhausted);
+            return;
+        }
+        if (!IncrementSaturating(&observed_native_messages_)) {
             RequestGlobalFailure(
                 PartialOrderEventLastErrorV2::kResourceExhausted);
             return;
@@ -965,23 +1072,15 @@ public:
             canonical_apply_frontier_.load(std::memory_order_acquire);
         result.published_event_frontier =
             published_event_frontier_.load(std::memory_order_acquire);
+        result.journal_wire_major = JournalWireMajor();
         result.captured_source_frontier =
             captured_source_frontier_.load(std::memory_order_acquire);
         static_assert(sizeof(std::size_t) <= sizeof(std::uint64_t));
-        const std::uint64_t enqueued_observations =
-            static_cast<std::uint64_t>(
-                observation_queue_->EnqueuePosition());
-        const std::uint64_t enqueued_applied =
-            static_cast<std::uint64_t>(
-                applied_queue_->EnqueuePosition());
-        result.observed_native_messages = enqueued_observations;
-        result.applied_records = enqueued_applied;
-        result.enqueued_handoffs =
-            enqueued_observations <=
-                    std::numeric_limits<std::uint64_t>::max() -
-                        enqueued_applied
-                ? enqueued_observations + enqueued_applied
-                : std::numeric_limits<std::uint64_t>::max();
+        result.observed_native_messages =
+            observed_native_messages_.load(std::memory_order_acquire);
+        result.applied_records =
+            applied_records_.load(std::memory_order_acquire);
+        result.enqueued_handoffs = EnqueuedHandoffCount();
         result.processed_handoffs =
             processed_handoffs_.load(std::memory_order_acquire);
         result.dropped_handoffs =
@@ -1019,7 +1118,7 @@ public:
             worker_running_.load(std::memory_order_acquire);
         result.accepting = !result.globally_frozen &&
                            accepting_.load(std::memory_order_acquire);
-        result.journal_failed = journal_ == nullptr ||
+        result.journal_failed = !JournalPresent() ||
                                 journal_failed_.load(
                                     std::memory_order_acquire);
         result.history_failed = history_ == nullptr || history_->failed();
@@ -1029,23 +1128,22 @@ public:
     [[nodiscard]] bool DuplicateReadOnlyDescriptor(
         int* output_fd,
         int* system_error_number) const noexcept {
-        return journal_ != nullptr &&
-               journal_->DuplicateReadOnlyDescriptor(
-                   output_fd, system_error_number);
+        return JournalDuplicateReadOnlyDescriptor(
+            output_fd, system_error_number);
     }
 
     [[nodiscard]] PartialOrderEventJournalSessionV2 session()
         const noexcept {
-        return journal_ == nullptr
-                   ? PartialOrderEventJournalSessionV2{}
-                   : journal_->session();
+        return JournalSession();
+    }
+
+    [[nodiscard]] std::uint16_t journal_wire_major() const noexcept {
+        return JournalWireMajor();
     }
 
     [[nodiscard]] PartialOrderEventJournalResourceSnapshotV2
     JournalResourceSnapshot() const noexcept {
-        return journal_ == nullptr
-                   ? PartialOrderEventJournalResourceSnapshotV2{}
-                   : journal_->ResourceSnapshot();
+        return ActiveJournalResourceSnapshot();
     }
 
     [[nodiscard]] bool WaitUntilIdleForTest(
@@ -1102,13 +1200,127 @@ public:
     }
 
 private:
-    [[nodiscard]] bool QueuesEmpty() const noexcept {
-        return observation_queue_->Empty() && applied_queue_->Empty();
+    [[nodiscard]] bool JournalPresent() const noexcept {
+        return journal_ != nullptr || compact_journal_ != nullptr;
     }
 
-    [[nodiscard]] bool QueuesEmptyForWait() const noexcept {
-        return observation_queue_->EmptyForWait() &&
-               applied_queue_->EmptyForWait();
+    [[nodiscard]] bool JournalFailed() const noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->failed()
+                   : journal_ == nullptr || journal_->failed();
+    }
+
+    [[nodiscard]] std::uint16_t JournalWireMajor() const noexcept {
+        return compact_journal_ != nullptr
+                   ? kPartialOrderEventWireMajorV3
+                   : journal_ != nullptr
+                         ? kPartialOrderEventWireMajorV2
+                         : 0U;
+    }
+
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    JournalPreallocateBacking(int* system_error_number) noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->PreallocateBacking(
+                         system_error_number)
+                   : journal_ != nullptr
+                         ? journal_->PreallocateBacking(
+                               system_error_number)
+                         : PartialOrderEventJournalPublishErrorV2::kFailed;
+    }
+
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    JournalPublishCanonicalBatchProjected(
+        std::span<const PartialOrderEventCanonicalSliceV2> slices,
+        const PartialOrderEventStatusUpdateV2& status,
+        std::span<const l2flow_instrument_derived_event_row_v1> events,
+        std::span<const PartialOrderEventChannelHealthV2>
+            affected_channels) noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->PublishCanonicalBatchProjected(
+                         slices, status, events, affected_channels)
+                   : journal_ != nullptr
+                         ? journal_->PublishCanonicalBatchProjected(
+                               slices,
+                               status,
+                               events,
+                               affected_channels)
+                         : PartialOrderEventJournalPublishErrorV2::kFailed;
+    }
+
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    JournalPublishStatus(
+        const PartialOrderEventStatusUpdateV2& status,
+        std::span<const PartialOrderEventChannelHealthV2>
+            affected_channels) noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->PublishStatus(
+                         status, affected_channels)
+                   : journal_ != nullptr
+                         ? journal_->PublishStatus(
+                               status, affected_channels)
+                         : PartialOrderEventJournalPublishErrorV2::kFailed;
+    }
+
+    [[nodiscard]] bool JournalDuplicateReadOnlyDescriptor(
+        int* output_fd,
+        int* system_error_number) const noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->DuplicateReadOnlyDescriptor(
+                         output_fd, system_error_number)
+                   : journal_ != nullptr &&
+                         journal_->DuplicateReadOnlyDescriptor(
+                             output_fd, system_error_number);
+    }
+
+    [[nodiscard]] PartialOrderEventJournalSessionV2 JournalSession()
+        const noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->session()
+                   : journal_ != nullptr
+                         ? journal_->session()
+                         : PartialOrderEventJournalSessionV2{};
+    }
+
+    [[nodiscard]] PartialOrderEventJournalResourceSnapshotV2
+    ActiveJournalResourceSnapshot() const noexcept {
+        return compact_journal_ != nullptr
+                   ? compact_journal_->ResourceSnapshot()
+                   : journal_ != nullptr
+                         ? journal_->ResourceSnapshot()
+                         : PartialOrderEventJournalResourceSnapshotV2{};
+    }
+
+    [[nodiscard]] bool QueuesEmpty() const noexcept {
+        return observation_queue_->Empty() && applied_queue_->Empty() &&
+               pending_target_count_.load(std::memory_order_acquire) ==
+                   0U;
+    }
+
+    [[nodiscard]] bool ImmediateQueueWorkForWait() const noexcept {
+        if (!applied_queue_->EmptyForWait()) {
+            return true;
+        }
+        if (!observation_queue_->EmptyForWait() &&
+            (!seal_barrier_active_ ||
+             observation_queue_->DequeuePosition() <
+                 observation_seal_barrier_target_)) {
+            return true;
+        }
+        if (pending_target_count_.load(std::memory_order_acquire) ==
+            0U) {
+            return false;
+        }
+        const PendingTargetJoin& pending = pending_target_joins_[
+            pending_target_read_position_ & pending_target_mask_];
+        if (pending.slot == nullptr ||
+            pending.head_wait_started_monotonic_ns == 0U) {
+            return true;
+        }
+        const TargetJoinState state =
+            pending.slot->state.load(std::memory_order_acquire);
+        return state != TargetJoinState::kObservationReady &&
+               state != TargetJoinState::kAppliedWriting;
     }
 
     [[nodiscard]] std::uint64_t EnqueuedHandoffCount() const noexcept {
@@ -1127,18 +1339,118 @@ private:
             observation_queue_->Depth());
         const std::uint64_t applied = static_cast<std::uint64_t>(
             applied_queue_->Depth());
-        return observations + applied;
+        const std::uint64_t pending = static_cast<std::uint64_t>(
+            pending_target_count_.load(std::memory_order_acquire));
+        return observations + applied + pending;
     }
 
     [[nodiscard]] bool SealBarrierReached() const noexcept {
         return observation_queue_->DequeuePosition() >=
                    observation_seal_barrier_target_ &&
                applied_queue_->DequeuePosition() >=
-                   applied_seal_barrier_target_;
+                   applied_seal_barrier_target_ &&
+               pending_target_count_.load(
+                   std::memory_order_acquire) == 0U;
     }
 
     void UpdateHandoffQueueHighWater(std::uint64_t depth) noexcept {
         StoreMaximum(&handoff_queue_high_water_, depth);
+    }
+
+    [[nodiscard]] bool EnqueueApplied(
+        std::size_t ordinal,
+        const market::RealtimeHistoryRecordV1& record) noexcept {
+        const AppliedHandoff handoff{ordinal, &record};
+        if (!applied_queue_->TryPush(handoff)) {
+            StoreMaximum(
+                &handoff_queue_high_water_,
+                CombinedQueueDepth());
+            static_cast<void>(IncrementSaturating(&dropped_handoffs_));
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kResourceExhausted);
+            return false;
+        }
+        WakeWorkerAfterEnqueue();
+        return true;
+    }
+
+    [[nodiscard]] bool JoinOrEnqueueApplied(
+        std::size_t ordinal,
+        const market::RealtimeHistoryRecordV1& record) noexcept {
+        const std::uint64_t ingress_sequence =
+            record.ingress_sequence();
+        if (ingress_sequence == 0U) {
+            return EnqueueApplied(ordinal, record);
+        }
+        TargetJoinSlot& slot = target_join_slots_[
+            static_cast<std::size_t>(ingress_sequence) &
+            target_join_mask_];
+        for (;;) {
+            TargetJoinState state =
+                slot.state.load(std::memory_order_acquire);
+            if (state == TargetJoinState::kEmpty) {
+                // Preserve the pre-existing applied-before-observation
+                // contract for direct callers. The production pipeline
+                // publishes observation before the decoder command.
+                return EnqueueApplied(ordinal, record);
+            }
+            if (state == TargetJoinState::kObservationReady) {
+                if (slot.ingress_sequence.load(
+                        std::memory_order_acquire) !=
+                    ingress_sequence) {
+                    static_cast<void>(
+                        IncrementSaturating(&dropped_handoffs_));
+                    RequestGlobalFailure(
+                        PartialOrderEventLastErrorV2::
+                            kResourceExhausted);
+                    return false;
+                }
+                if (!slot.state.compare_exchange_strong(
+                        state,
+                        TargetJoinState::kAppliedWriting,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    continue;
+                }
+                slot.ordinal = ordinal;
+                slot.record = &record;
+                slot.state.store(
+                    TargetJoinState::kJoined,
+                    std::memory_order_release);
+                WakeWorker();
+                return true;
+            }
+            if (state == TargetJoinState::kObservationWorker ||
+                state == TargetJoinState::kObservationProcessed) {
+                if (slot.ingress_sequence.load(
+                        std::memory_order_acquire) !=
+                    ingress_sequence) {
+                    static_cast<void>(
+                        IncrementSaturating(&dropped_handoffs_));
+                    RequestGlobalFailure(
+                        PartialOrderEventLastErrorV2::
+                            kResourceExhausted);
+                    return false;
+                }
+                if (!slot.state.compare_exchange_strong(
+                        state,
+                        TargetJoinState::kLateAppliedWriting,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    continue;
+                }
+                const bool enqueued = EnqueueApplied(ordinal, record);
+                slot.state.store(
+                    TargetJoinState::kEmpty,
+                    std::memory_order_release);
+                return enqueued;
+            }
+            static_cast<void>(
+                IncrementSaturating(&dropped_handoffs_));
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return false;
+        }
     }
 
     void JoinWorker() noexcept {
@@ -1390,7 +1702,9 @@ private:
 
     void HandleApplied(
         std::size_t ordinal,
-        const market::RealtimeHistoryRecordV1* record) noexcept {
+        const market::RealtimeHistoryRecordV1* record,
+        const realtime::NativeSequenceObservationV1* observation =
+            nullptr) noexcept {
         if (record == nullptr) {
             RequestGlobalFailure(
                 PartialOrderEventLastErrorV2::kProjectionFailure);
@@ -1409,12 +1723,45 @@ private:
             captured_source_frontier_local_,
             payload.common.ingress_sequence);
         const auto descriptor = DescriptorFromPayload(payload);
+        const sdk::MessageKey message_key =
+            MessageKeyFromPayload(payload);
+        if (observation != nullptr &&
+            (observation->record_class !=
+                 realtime::NativeSequenceRecoveryRecordClassV1::kTarget ||
+             observation->ingress_sequence !=
+                 payload.common.ingress_sequence ||
+             observation->descriptor != descriptor ||
+             !(observation->message_key == message_key))) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kProjectionFailure);
+            return;
+        }
         ChannelRuntime* runtime = EnsureChannel(descriptor);
         if (runtime == nullptr) {
             return;
         }
-        const sdk::MessageKey message_key =
-            MessageKeyFromPayload(payload);
+        if (observation != nullptr) {
+            realtime::NativeSequenceRecoveryObserveResultV1
+                observe_result{};
+            const auto observe_error = recovery_->Observe(
+                descriptor,
+                message_key,
+                realtime::NativeSequenceRecoveryRecordClassV1::kTarget,
+                &observe_result);
+            if (observe_error !=
+                    realtime::NativeSequenceRecoveryObserveErrorV1::kNone) {
+                RequestGlobalFailure(
+                    PartialOrderEventLastErrorV2::kProjectionFailure);
+                return;
+            }
+            if (observe_result.disposition ==
+                realtime::NativeSequenceRecoveryObserveDispositionV1::
+                    kChannelCapacity) {
+                RequestGlobalFailure(
+                    PartialOrderEventLastErrorV2::kResourceExhausted);
+                return;
+            }
+        }
         CanonicalizeBusinessPayload(&payload);
         static_assert(sizeof(std::uintptr_t) <= sizeof(std::uint64_t));
         const std::uint64_t cookie = static_cast<std::uint64_t>(
@@ -1691,7 +2038,7 @@ private:
                 : std::span<const l2flow_instrument_derived_event_row_v1>{
                       canonical_batch_event_begin_,
                       canonical_batch_event_count_};
-        if (journal_->PublishCanonicalBatchProjected(
+        if (JournalPublishCanonicalBatchProjected(
                 canonical_batch_slices_,
                 current_status_,
                 events,
@@ -1721,6 +2068,12 @@ private:
             static_cast<std::uint64_t>(
                 history_generation_.event_count),
             std::memory_order_release);
+        if (!history_->ReleasePrivateWireBatch()) {
+            AbandonCanonicalBatch();
+            FreezeFromWorker(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return false;
+        }
         std::uint64_t published_ns = 0U;
         if (ReadMonotonicNs(&published_ns)) {
             last_journal_publication_monotonic_ns_ = published_ns;
@@ -2323,7 +2676,7 @@ private:
     }
 
     void PublishStatusIfDirty(bool force = false) noexcept {
-        if (journal_ == nullptr || journal_->failed() ||
+        if (!JournalPresent() || JournalFailed() ||
             !status_dirty_.load(std::memory_order_acquire)) {
             return;
         }
@@ -2362,7 +2715,7 @@ private:
         }
         BuildStatusAndChannels();
         PauseBeforeJournalPublicationForTest();
-        if (journal_->PublishStatus(
+        if (JournalPublishStatus(
                 current_status_, affected_channels_) !=
             PartialOrderEventJournalPublishErrorV2::kNone) {
             journal_failed_.store(true, std::memory_order_release);
@@ -2435,13 +2788,212 @@ private:
                kCanonicalBatchMaximumAgeNs;
     }
 
+    [[nodiscard]] std::uint64_t
+    NextTargetJoinDeadlineNs() const noexcept {
+        if (pending_target_count_.load(std::memory_order_acquire) ==
+            0U) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        const PendingTargetJoin& pending = pending_target_joins_[
+            pending_target_read_position_ & pending_target_mask_];
+        if (pending.slot == nullptr ||
+            pending.head_wait_started_monotonic_ns == 0U) {
+            return 0U;
+        }
+        if (pending.head_wait_started_monotonic_ns >
+            std::numeric_limits<std::uint64_t>::max() -
+                kTargetJoinMaximumWaitNs) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        return pending.head_wait_started_monotonic_ns +
+               kTargetJoinMaximumWaitNs;
+    }
+
+    [[nodiscard]] bool ReadBatchMonotonicNs(
+        std::uint64_t* cached_now_ns) noexcept {
+        if (cached_now_ns == nullptr) {
+            return false;
+        }
+        if (*cached_now_ns != 0U) {
+            return true;
+        }
+        if (ReadMonotonicNs(cached_now_ns)) {
+            return true;
+        }
+        RequestGlobalFailure(
+            PartialOrderEventLastErrorV2::kWorkerExited);
+        return false;
+    }
+
+    [[nodiscard]] bool StagePendingTargetObservation(
+        const realtime::NativeSequenceObservationV1& observation) noexcept {
+        const std::size_t count = pending_target_count_.load(
+            std::memory_order_relaxed);
+        const std::size_t capacity = pending_target_mask_ + 1U;
+        if (count >= capacity) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kResourceExhausted);
+            return false;
+        }
+        TargetJoinSlot& slot = target_join_slots_[
+            static_cast<std::size_t>(observation.ingress_sequence) &
+            target_join_mask_];
+        const TargetJoinState state =
+            slot.state.load(std::memory_order_acquire);
+        if (slot.ingress_sequence.load(std::memory_order_acquire) !=
+                observation.ingress_sequence ||
+            slot.observation.descriptor !=
+                observation.descriptor ||
+            !(slot.observation.message_key ==
+              observation.message_key) ||
+            slot.observation.record_class !=
+                realtime::NativeSequenceRecoveryRecordClassV1::kTarget ||
+            (state != TargetJoinState::kObservationReady &&
+             state != TargetJoinState::kAppliedWriting &&
+             state != TargetJoinState::kJoined)) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return false;
+        }
+        PendingTargetJoin& pending = pending_target_joins_[
+            pending_target_write_position_ & pending_target_mask_];
+        if (pending.slot != nullptr) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return false;
+        }
+        pending.slot = &slot;
+        pending.head_wait_started_monotonic_ns = 0U;
+        ++pending_target_write_position_;
+        pending_target_count_.store(count + 1U, std::memory_order_release);
+        return true;
+    }
+
+    void RetirePendingTargetObservation() noexcept {
+        const std::size_t count = pending_target_count_.load(
+            std::memory_order_relaxed);
+        if (count == 0U) {
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return;
+        }
+        PendingTargetJoin& pending = pending_target_joins_[
+            pending_target_read_position_ & pending_target_mask_];
+        pending = {};
+        ++pending_target_read_position_;
+        pending_target_count_.store(count - 1U, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool TryProcessPendingTargetObservation(
+        bool force,
+        std::uint64_t* cached_now_ns) noexcept {
+        if (pending_target_count_.load(std::memory_order_acquire) ==
+            0U) {
+            return false;
+        }
+        PendingTargetJoin& pending = pending_target_joins_[
+            pending_target_read_position_ & pending_target_mask_];
+        if (pending.slot == nullptr) {
+            RetirePendingTargetObservation();
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return true;
+        }
+        TargetJoinSlot& slot = *pending.slot;
+
+        TargetJoinState state =
+            slot.state.load(std::memory_order_acquire);
+        const realtime::NativeSequenceObservationV1 observation =
+            slot.observation;
+        if (slot.ingress_sequence.load(std::memory_order_acquire) !=
+                observation.ingress_sequence ||
+            observation.record_class !=
+                realtime::NativeSequenceRecoveryRecordClassV1::kTarget) {
+            RetirePendingTargetObservation();
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return true;
+        }
+        if (state == TargetJoinState::kAppliedWriting) {
+            return false;
+        }
+        if (state == TargetJoinState::kJoined) {
+            if (!slot.state.compare_exchange_strong(
+                    state,
+                    TargetJoinState::kTargetWorker,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return false;
+            }
+            if (!globally_frozen_.load(std::memory_order_acquire)) {
+                HandleApplied(
+                    slot.ordinal,
+                    slot.record,
+                    &observation);
+            }
+            slot.state.store(
+                TargetJoinState::kEmpty,
+                std::memory_order_release);
+            RetirePendingTargetObservation();
+            return true;
+        }
+        if (state != TargetJoinState::kObservationReady) {
+            RetirePendingTargetObservation();
+            RequestGlobalFailure(
+                PartialOrderEventLastErrorV2::kPublicationInvariant);
+            return true;
+        }
+
+        if (!force) {
+            if (!ReadBatchMonotonicNs(cached_now_ns)) {
+                force = true;
+            } else {
+                if (pending.head_wait_started_monotonic_ns == 0U ||
+                    *cached_now_ns <
+                        pending.head_wait_started_monotonic_ns) {
+                    pending.head_wait_started_monotonic_ns =
+                        *cached_now_ns;
+                    return false;
+                }
+                if (*cached_now_ns -
+                        pending.head_wait_started_monotonic_ns <
+                    kTargetJoinMaximumWaitNs) {
+                    return false;
+                }
+            }
+        }
+        if (!slot.state.compare_exchange_strong(
+                state,
+                TargetJoinState::kObservationWorker,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        if (!globally_frozen_.load(std::memory_order_acquire)) {
+            HandleObservation(observation);
+        }
+        TargetJoinState worker_state =
+            TargetJoinState::kObservationWorker;
+        static_cast<void>(slot.state.compare_exchange_strong(
+            worker_state,
+            TargetJoinState::kObservationProcessed,
+            std::memory_order_release,
+            std::memory_order_acquire));
+        RetirePendingTargetObservation();
+        return true;
+    }
+
     [[nodiscard]] std::size_t DrainHandoffBatch() noexcept {
-        constexpr std::size_t kLaneBatchSize =
-            kHandoffBatchSize / 2U;
-        std::size_t batch = 0U;
+        std::size_t operations = 0U;
+        std::size_t completed = 0U;
         std::size_t observations = 0U;
         std::size_t applied = 0U;
-        const auto pop_observation = [this, &batch, &observations]() {
+        std::uint64_t batch_now_ns = 0U;
+        const auto pop_observation = [this,
+                                      &operations,
+                                      &completed,
+                                      &observations,
+                                      &batch_now_ns]() {
             if (seal_barrier_active_ &&
                 observation_queue_->DequeuePosition() >=
                     observation_seal_barrier_target_) {
@@ -2451,14 +3003,36 @@ private:
             if (!observation_queue_->TryPop(&observation)) {
                 return false;
             }
-            if (!globally_frozen_.load(std::memory_order_acquire)) {
+            if (observation.record_class ==
+                    realtime::NativeSequenceRecoveryRecordClassV1::kTarget &&
+                observation.ingress_sequence != 0U) {
+                const bool staged =
+                    StagePendingTargetObservation(observation);
+                if (!staged) {
+                    ++completed;
+                } else if (TryProcessPendingTargetObservation(
+                               stop_requested_.load(
+                                   std::memory_order_acquire) ||
+                                   globally_frozen_.load(
+                                       std::memory_order_acquire),
+                               &batch_now_ns)) {
+                    ++completed;
+                }
+            } else if (!globally_frozen_.load(
+                           std::memory_order_acquire)) {
                 HandleObservation(observation);
+                ++completed;
+            } else {
+                ++completed;
             }
-            ++batch;
+            ++operations;
             ++observations;
             return true;
         };
-        const auto pop_applied = [this, &batch, &applied]() {
+        const auto pop_applied = [this,
+                                  &operations,
+                                  &completed,
+                                  &applied]() {
             if (seal_barrier_active_ &&
                 applied_queue_->DequeuePosition() >=
                     applied_seal_barrier_target_) {
@@ -2471,33 +3045,47 @@ private:
             if (!globally_frozen_.load(std::memory_order_acquire)) {
                 HandleApplied(handoff.ordinal, handoff.record);
             }
-            ++batch;
+            ++operations;
+            ++completed;
             ++applied;
             return true;
         };
 
-        // Give both producer classes an equal bounded share. Recovery's join
-        // contract permits either side to arrive first, so this removes the
-        // producer CAS hotspot without inventing cross-lane ordering.
-        while (batch < kHandoffBatchSize) {
+        // Alternate lanes while allowing either one to consume the full
+        // bounded batch. Applied-only entries are exceptional fallbacks after
+        // the normal target observation/applied join.
+        while (operations < kHandoffBatchSize) {
             bool progressed = false;
-            if (observations < kLaneBatchSize) {
-                progressed = pop_observation();
+            if (TryProcessPendingTargetObservation(
+                    stop_requested_.load(std::memory_order_acquire) ||
+                        globally_frozen_.load(
+                            std::memory_order_acquire),
+                    &batch_now_ns)) {
+                ++operations;
+                ++completed;
+                progressed = true;
                 if (seal_barrier_active_ && SealBarrierReached()) {
-                    return batch;
+                    return completed;
                 }
             }
-            if (applied < kLaneBatchSize) {
+            if (observations < kHandoffBatchSize) {
+                progressed = pop_observation() || progressed;
+                if (seal_barrier_active_ && SealBarrierReached()) {
+                    return completed;
+                }
+            }
+            if (operations < kHandoffBatchSize &&
+                applied < kHandoffBatchSize) {
                 progressed = pop_applied() || progressed;
                 if (seal_barrier_active_ && SealBarrierReached()) {
-                    return batch;
+                    return completed;
                 }
             }
             if (!progressed) {
                 break;
             }
         }
-        return batch;
+        return completed;
     }
 
     void WorkerLoop() noexcept {
@@ -2599,7 +3187,7 @@ private:
                     }
                     return;
                 }
-                if (!QueuesEmpty() ||
+                if (ImmediateQueueWorkForWait() ||
                     canonical_drain_quantum_exhausted_) {
                     continue;
                 }
@@ -2610,16 +3198,18 @@ private:
                 const std::uint64_t observed_wake =
                     wake_epoch_.load(std::memory_order_acquire);
                 const std::uint64_t deadline = std::min(
-                    NextCanonicalBatchDeadlineNs(),
+                    NextTargetJoinDeadlineNs(),
                     std::min(
-                        NextSealDeadlineNs(),
-                        NextStatusDeadlineNs()));
+                        NextCanonicalBatchDeadlineNs(),
+                        std::min(
+                            NextSealDeadlineNs(),
+                            NextStatusDeadlineNs())));
                 const auto predicate = [this, observed_wake]() noexcept {
                     return wake_epoch_.load(std::memory_order_acquire) !=
                                observed_wake ||
                            stop_requested_.load(
                                std::memory_order_acquire) ||
-                           !QueuesEmptyForWait();
+                           ImmediateQueueWorkForWait();
                 };
                 if (deadline ==
                     std::numeric_limits<std::uint64_t>::max()) {
@@ -2651,9 +3241,17 @@ private:
         recovery_;
     std::unique_ptr<CertifiedOrderEventHistoryV1> history_;
     std::shared_ptr<PartialOrderEventJournalProducerV2> journal_;
+    std::shared_ptr<PartialOrderEventJournalProducerV3> compact_journal_;
     std::unique_ptr<BoundedSpscQueue<
         realtime::NativeSequenceObservationV1>> observation_queue_;
     std::unique_ptr<BoundedMpmcQueue<AppliedHandoff>> applied_queue_;
+    std::unique_ptr<TargetJoinSlot[]> target_join_slots_;
+    std::unique_ptr<PendingTargetJoin[]> pending_target_joins_;
+    std::size_t target_join_mask_ = 0U;
+    std::size_t pending_target_mask_ = 0U;
+    std::size_t pending_target_read_position_ = 0U;
+    std::size_t pending_target_write_position_ = 0U;
+    std::atomic<std::size_t> pending_target_count_{0U};
     std::vector<ChannelRuntime> channels_;
     std::vector<std::uint32_t> channel_index_;
     std::vector<PartialOrderEventChannelHealthV2> affected_channels_;
@@ -2713,6 +3311,8 @@ private:
     std::atomic<std::uint64_t> canonical_apply_frontier_{0U};
     std::atomic<std::uint64_t> published_event_frontier_{0U};
     std::atomic<std::uint64_t> captured_source_frontier_{0U};
+    std::atomic<std::uint64_t> observed_native_messages_{0U};
+    std::atomic<std::uint64_t> applied_records_{0U};
     alignas(64) std::atomic<std::uint64_t> processed_handoffs_{0U};
     std::atomic<std::uint64_t> dropped_handoffs_{0U};
     alignas(64) std::atomic<std::uint64_t>
@@ -2873,6 +3473,11 @@ PartialOrderEventJournalSessionV2
 RealtimePartialOrderEventServiceV2::session() const noexcept {
     return impl_ == nullptr ? PartialOrderEventJournalSessionV2{}
                             : impl_->session();
+}
+
+std::uint16_t RealtimePartialOrderEventServiceV2::journal_wire_major()
+    const noexcept {
+    return impl_ == nullptr ? 0U : impl_->journal_wire_major();
 }
 
 PartialOrderEventJournalResourceSnapshotV2

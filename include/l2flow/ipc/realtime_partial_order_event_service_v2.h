@@ -17,6 +17,15 @@ namespace l2flow::ipc {
 using RealtimePartialOrderEventFailureNotifierV2 =
     void (*)(void* context) noexcept;
 
+enum class RealtimePartialOrderEventJournalLayoutV2 : std::uint8_t {
+    // Existing wire major: every state slot embeds two complete 320-byte
+    // order-revision payloads.
+    kMaterializedStateV2 = 2U,
+    // Distinct wire major: every state version references its immutable Event
+    // row. Consumers must open the descriptor with PartialOrderEventReaderV3.
+    kCompactStateReferenceV3 = 3U,
+};
+
 struct RealtimePartialOrderEventServiceConfigV2 final {
     common::Identity128 run_id{};
     std::uint64_t session_epoch = 0U;
@@ -62,6 +71,9 @@ struct RealtimePartialOrderEventServiceConfigV2 final {
 
     std::uint64_t event_journal_capacity = 16'000'000U;
     std::uint64_t order_state_capacity = 2'097'152U;
+    RealtimePartialOrderEventJournalLayoutV2 journal_layout =
+        RealtimePartialOrderEventJournalLayoutV2::
+            kMaterializedStateV2;
     // Zero lets the journal derive the bound from order_state_capacity. A
     // production composition may set a tighter measured bound explicitly.
     std::uint32_t maximum_order_state_updates_per_commit = 0U;
@@ -98,9 +110,13 @@ struct RealtimePartialOrderEventServiceSnapshotV2 final {
         PartialOrderEventLastErrorV2::kNone;
     std::uint64_t canonical_apply_frontier = 0U;
     std::uint64_t published_event_frontier = 0U;
+    std::uint16_t journal_wire_major = 0U;
     std::uint64_t captured_source_frontier = 0U;
     std::uint64_t observed_native_messages = 0U;
     std::uint64_t applied_records = 0U;
+    // Actual worker queue publications. A normally paired target contributes
+    // one handoff; an observation whose Store record misses the bounded join
+    // window contributes a later applied fallback as a second handoff.
     std::uint64_t enqueued_handoffs = 0U;
     std::uint64_t processed_handoffs = 0U;
     std::uint64_t dropped_handoffs = 0U;
@@ -178,6 +194,7 @@ public:
         int* system_error_number = nullptr) const noexcept;
     [[nodiscard]] PartialOrderEventJournalSessionV2 session()
         const noexcept;
+    [[nodiscard]] std::uint16_t journal_wire_major() const noexcept;
     // Read before admission or after Stop/MarkStoppedClean when proving that
     // the Event worker performed no backing allocation on its hot path.
     [[nodiscard]] PartialOrderEventJournalResourceSnapshotV2

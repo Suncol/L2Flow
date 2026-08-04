@@ -2,6 +2,7 @@
 
 #include "l2flow/ipc/partial_order_event_reader_c_v2.h"
 #include "l2flow/ipc/partial_order_event_reader_v2.h"
+#include "l2flow/ipc/partial_order_event_reader_v3.h"
 #include "l2flow/ipc/realtime_partial_order_event_service_v2.h"
 #include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/instrument_runtime_state_v2.h"
@@ -308,6 +309,7 @@ struct Fixture final {
     std::shared_ptr<ipc::RealtimePartialOrderEventServiceV2> service;
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
     std::unique_ptr<ipc::PartialOrderEventReaderV2> reader;
+    std::unique_ptr<ipc::PartialOrderEventReaderV3> compact_reader;
 
     ~Fixture() {
         if (pipeline != nullptr) {
@@ -345,7 +347,10 @@ void SignalBrokerFailure(void* opaque) noexcept {
     Fixture* output,
     ipc::RealtimePartialOrderEventFailureNotifierV2 failure_notifier =
         &CountEventFailure,
-    void* failure_notifier_context = nullptr) {
+    void* failure_notifier_context = nullptr,
+    ipc::RealtimePartialOrderEventJournalLayoutV2 journal_layout =
+        ipc::RealtimePartialOrderEventJournalLayoutV2::
+            kMaterializedStateV2) {
     if (test == nullptr || output == nullptr) {
         return false;
     }
@@ -418,6 +423,7 @@ void SignalBrokerFailure(void* opaque) noexcept {
     service_config.maximum_derived_events = maximum_events;
     service_config.event_journal_capacity = maximum_events;
     service_config.order_state_capacity = 128U;
+    service_config.journal_layout = journal_layout;
     service_config.maximum_mapping_bytes = 4U * 1024U * 1024U;
     service_config.lazy_commit_chunk_bytes = 4096U;
     int system_error = 0;
@@ -447,11 +453,26 @@ void SignalBrokerFailure(void* opaque) noexcept {
     expected.publication_generation = session.publication_generation;
     expected.correction_epoch = session.correction_epoch;
     const auto reader_error =
-        ipc::PartialOrderEventReaderV2::OpenDescriptor(
-            descriptor, expected, &output->reader, &system_error);
+        journal_layout ==
+                ipc::RealtimePartialOrderEventJournalLayoutV2::
+                    kCompactStateReferenceV3
+            ? ipc::PartialOrderEventReaderV3::OpenDescriptor(
+                  descriptor,
+                  expected,
+                  &output->compact_reader,
+                  &system_error)
+            : ipc::PartialOrderEventReaderV2::OpenDescriptor(
+                  descriptor,
+                  expected,
+                  &output->reader,
+                  &system_error);
     static_cast<void>(::close(descriptor));
     if (reader_error != ipc::PartialOrderEventReaderOpenErrorV2::kNone ||
-        output->reader == nullptr) {
+        (journal_layout ==
+                 ipc::RealtimePartialOrderEventJournalLayoutV2::
+                     kCompactStateReferenceV3
+             ? output->compact_reader == nullptr
+             : output->reader == nullptr)) {
         return false;
     }
 
@@ -617,6 +638,78 @@ void RunCrossFamilyReorderScenario(TestContext* test) {
             order_state.canonical_apply_sequence == 3U &&
             order_state.order_revision.native_event_sequence == 102,
         "latest order-state reflects the canonical transaction revision");
+}
+
+void RunCompactStateJournalScenario(TestContext* test) {
+    Fixture fixture{};
+    if (!BuildFixture(
+            test,
+            1ms,
+            64U,
+            64U,
+            32U,
+            &fixture,
+            &CountEventFailure,
+            nullptr,
+            ipc::RealtimePartialOrderEventJournalLayoutV2::
+                kCompactStateReferenceV3)) {
+        return;
+    }
+    const auto preallocated =
+        fixture.service->JournalResourceSnapshot();
+    test->Expect(
+        fixture.service->journal_wire_major() ==
+                ipc::kPartialOrderEventWireMajorV3 &&
+            fixture.service->Snapshot().journal_wire_major ==
+                ipc::kPartialOrderEventWireMajorV3 &&
+            preallocated.fully_preallocated,
+        "compact service advertises V3 and preallocates its complete backing");
+
+    test->Expect(
+        InjectTransaction(&fixture, 12U, 102U, 100U) &&
+            InjectOrder(&fixture, 12U, 100U) &&
+            InjectOrder(&fixture, 12U, 101U),
+        "inject reordered target traffic into compact Event service");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.canonical_apply_frontier == 3U &&
+                   snapshot.published_event_frontier != 0U &&
+                   snapshot.observed_native_messages == 3U &&
+                   snapshot.applied_records == 3U;
+        }),
+        "compact Event worker publishes the complete canonical prefix");
+
+    ipc::PartialOrderEventStatusSnapshotV3 status{};
+    ipc::PartialOrderEventOrderStateV3 state{};
+    const ipc::PartialOrderEventOrderKeyV3 key{
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHENZHEN_V1,
+        fixture.shenzhen_instrument_id,
+        12,
+        100};
+    test->Expect(
+        fixture.compact_reader->ReadStatus(&status) ==
+                ipc::PartialOrderEventReadResultV3::kOk &&
+            status.cut.canonical_apply_frontier == 3U &&
+            status.cut.event_published_frontier != 0U &&
+            fixture.compact_reader->FindOrderState(key, &state) ==
+                ipc::PartialOrderEventReadResultV3::kOk &&
+            state.canonical_apply_sequence == 3U &&
+            state.order_revision.native_event_sequence == 102,
+        "V3 reader reconstructs the final service state from the published Event row");
+
+    const auto after = fixture.service->JournalResourceSnapshot();
+    test->Expect(
+        after.fully_preallocated &&
+            after.event_backing_allocation_calls ==
+                preallocated.event_backing_allocation_calls &&
+            after.order_state_backing_allocation_calls ==
+                preallocated.order_state_backing_allocation_calls &&
+            after.event_prefault_attempts ==
+                preallocated.event_prefault_attempts &&
+            after.order_state_prefault_attempts ==
+                preallocated.order_state_prefault_attempts,
+        "compact Event worker performs no backing growth or prefault call after startup");
 }
 
 void RunShanghaiStartupReorderScenario(TestContext* test) {
@@ -1211,6 +1304,57 @@ void RunQueueFailureIsolationScenario(TestContext* test) {
         "FAST remains available and the first terminal diagnosis is retained");
 }
 
+void RunTargetJoinHeadGraceScenario(TestContext* test) {
+    Fixture fixture{};
+    constexpr std::uint64_t kObservationCount = 1024U;
+    if (!BuildFixture(
+            test,
+            1min,
+            kObservationCount,
+            16U,
+            8U,
+            &fixture)) {
+        return;
+    }
+
+    realtime::NativeSequenceObservationV1 observation{};
+    observation.descriptor.domain.market =
+        realtime::NativeSequenceMarketV1::kShenzhen;
+    observation.descriptor.domain.channel = 12U;
+    observation.message_key = sdk::MessageKey{6U, 101U, 33U};
+    observation.record_class =
+        realtime::NativeSequenceRecoveryRecordClassV1::kTarget;
+    for (std::uint64_t sequence = 1U;
+         sequence <= kObservationCount;
+         ++sequence) {
+        observation.descriptor.sequence = sequence;
+        observation.ingress_sequence = sequence;
+        fixture.service->ObserveNativeSequence(observation);
+    }
+
+    const bool first_missing_applied_expired = WaitUntil([&] {
+        return fixture.service->Snapshot().processed_handoffs != 0U;
+    });
+    const auto after_first_expiry = fixture.service->Snapshot();
+    test->Expect(
+        first_missing_applied_expired &&
+            after_first_expiry.observed_native_messages ==
+                kObservationCount &&
+            after_first_expiry.processed_handoffs < kObservationCount &&
+            after_first_expiry.handoff_queue_depth != 0U &&
+            after_first_expiry.dropped_handoffs == 0U &&
+            !after_first_expiry.globally_frozen,
+        "target join grace starts at the FIFO head instead of expiring the queued tail in bulk");
+
+    fixture.service->Stop();
+    const auto stopped = fixture.service->Snapshot();
+    test->Expect(
+        stopped.processed_handoffs == stopped.enqueued_handoffs &&
+            stopped.handoff_queue_depth == 0U &&
+            stopped.dropped_handoffs == 0U && !stopped.globally_frozen,
+        "forced shutdown drains a target-only join backlog without loss");
+}
+
 void RunSnapshotCoherenceScenario(TestContext* test) {
     Fixture fixture{};
     if (!BuildFixture(test, 1ms, 64U, 32U, 16U, &fixture)) {
@@ -1659,6 +1803,7 @@ void RunBusyQueueSealBarrierScenario(TestContext* test) {
 int main() {
     TestContext test;
     RunCrossFamilyReorderScenario(&test);
+    RunCompactStateJournalScenario(&test);
     RunShanghaiStartupReorderScenario(&test);
     RunShenzhenChannelZeroScenario(&test);
     RunCorrectionIsolationScenario(&test);
@@ -1666,6 +1811,7 @@ int main() {
     RunBrokeredFailureIntegrationScenario(&test);
     RunCoverageLossDiagnosticScenario(&test);
     RunQueueFailureIsolationScenario(&test);
+    RunTargetJoinHeadGraceScenario(&test);
     RunSnapshotCoherenceScenario(&test);
     RunJournalPublicationIdleBarrierScenario(&test);
     RunProgressAccuracyScenario(&test);

@@ -26,6 +26,10 @@ struct CertifiedOrderEventHistoryConfigV1 final {
     std::size_t maximum_shanghai_order_states = 0U;
     std::size_t maximum_shenzhen_order_states = 0U;
     std::size_t maximum_events = 0U;
+    // Owner-private mode retains only the rows awaiting publication by its
+    // serial caller. Zero preserves the legacy maximum_events-sized buffer;
+    // a microbatch publisher should provide its proven per-commit bound.
+    std::size_t maximum_private_batch_events = 0U;
     // Commits and strictly write-prefaults the fixed event mapping during
     // Create so the serial writer neither expands nor first-touches backing
     // pages on its hot path. Create fails if strict population is unsupported.
@@ -70,8 +74,9 @@ struct CertifiedOrderEventHistoryGenerationV1 final {
 };
 
 // Serial-writer result for callers which immediately publish the newly
-// appended prefix. The span points into the history's fixed append-only
-// storage and remains valid for the lifetime of the history.
+// appended prefix. In snapshot mode the span points into fixed append-only
+// storage. In owner-private mode appended_wire_events remains valid until
+// ReleasePrivateWireBatch is called after the external publication succeeds.
 struct CertifiedOrderEventHistoryAppendResultV1 final {
     CertifiedOrderEventHistoryGenerationV1 generation{};
     std::span<const InstrumentDerivedEventV1> appended_events{};
@@ -196,6 +201,11 @@ public:
         const market::ShenzhenOrderEventInputV1& input,
         std::uint64_t canonical_apply_sequence,
         CertifiedOrderEventHistoryAppendResultV1* output) noexcept;
+
+    // Serial-only publication acknowledgement for owner-private mode. It
+    // recycles the fixed wire batch without changing global generation or
+    // derived-event sequence state. Returns false in snapshot mode.
+    [[nodiscard]] bool ReleasePrivateWireBatch() noexcept;
 
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1
     AcquireGeneration(

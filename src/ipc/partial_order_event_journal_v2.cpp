@@ -1,4 +1,5 @@
 #include "l2flow/ipc/partial_order_event_journal_v2.h"
+#include "l2flow/ipc/partial_order_event_journal_v3.h"
 
 #include "l2flow/common/crc32c.h"
 #include "l2flow/ipc/certified_order_event_wire_v1.h"
@@ -19,6 +20,7 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -36,6 +38,7 @@ namespace l2flow::ipc {
 namespace {
 
 static_assert(kPartialOrderEventOrderStateSlotBytesV2 <= 4096U);
+static_assert(kPartialOrderEventOrderStateSlotBytesV3 <= 4096U);
 
 template <typename T>
 [[nodiscard]] std::atomic_ref<T> Atomic(T& value) noexcept {
@@ -221,8 +224,15 @@ void AtomicStoreWords(Wire* destination, const Wire& source) noexcept {
 
 class PartialOrderEventJournalProducerV2::Impl final {
 public:
-    explicit Impl(PartialOrderEventJournalConfigV2 config)
-        : config_(std::move(config)) {}
+    explicit Impl(
+        PartialOrderEventJournalConfigV2 config,
+        bool compact_state_references)
+        : config_(std::move(config)),
+          compact_state_references_(compact_state_references),
+          order_state_slot_bytes_(
+              compact_state_references
+                  ? kPartialOrderEventOrderStateSlotBytesV3
+                  : kPartialOrderEventOrderStateSlotBytesV2) {}
 
     ~Impl() {
         CloseDescriptor(&read_only_fd_);
@@ -289,7 +299,7 @@ public:
                 &order_states_offset_) ||
             !CheckedMultiply(
                 config_.order_state_capacity,
-                kPartialOrderEventOrderStateSlotBytesV2,
+                order_state_slot_bytes_,
                 &order_bytes) ||
             !CheckedAdd(
                 order_states_offset_, order_bytes, &logical_end) ||
@@ -388,7 +398,9 @@ public:
         }
 
         memfd_ = ::memfd_create(
-            "l2flow-partial-order-events-v2",
+            compact_state_references_
+                ? "l2flow-partial-order-events-v3"
+                : "l2flow-partial-order-events-v2",
             MFD_CLOEXEC | MFD_ALLOW_SEALING);
         if (memfd_ < 0 ||
             ::ftruncate(memfd_, static_cast<off_t>(mapping_bytes_)) !=
@@ -488,15 +500,25 @@ public:
             reinterpret_cast<PartialOrderEventOrderStateSlotV2*>(
                 static_cast<std::byte*>(mapping_) +
                 order_states_offset_);
+        compact_order_state_slots_ =
+            reinterpret_cast<PartialOrderEventOrderStateSlotV3*>(
+                static_cast<std::byte*>(mapping_) +
+                order_states_offset_);
 
         std::uint64_t heartbeat = 0U;
         if (!ReadMonotonicNs(&heartbeat)) {
             return PartialOrderEventJournalCreateErrorV2::
                 kUnexpectedFailure;
         }
-        header_->magic = kPartialOrderEventMagicV2;
-        header_->abi_major = kPartialOrderEventWireMajorV2;
-        header_->abi_minor = kPartialOrderEventWireMinorV2;
+        header_->magic = compact_state_references_
+                             ? kPartialOrderEventMagicV3
+                             : kPartialOrderEventMagicV2;
+        header_->abi_major = compact_state_references_
+                                 ? kPartialOrderEventWireMajorV3
+                                 : kPartialOrderEventWireMajorV2;
+        header_->abi_minor = compact_state_references_
+                                 ? kPartialOrderEventWireMinorV3
+                                 : kPartialOrderEventWireMinorV2;
         header_->header_bytes = kPartialOrderEventHeaderBytesV2;
         header_->endian_marker = kPartialOrderEventEndianMarkerV2;
         header_->temporal_coverage =
@@ -527,7 +549,7 @@ public:
         header_->order_states_offset = order_states_offset_;
         header_->order_state_capacity = config_.order_state_capacity;
         header_->order_state_stride =
-            kPartialOrderEventOrderStateSlotBytesV2;
+            static_cast<std::uint32_t>(order_state_slot_bytes_);
 
         PartialOrderEventCommitCutV2 initial{};
         initial.commit_sequence = 1U;
@@ -548,9 +570,17 @@ public:
         initial.publish_tag = 2U;
         header_->cuts[0U] = initial;
 
-        if (!PartialOrderEventHeaderLayoutCanonicalV2(*header_) ||
-            !PartialOrderEventCommitCutCanonicalV2(
-                *header_, header_->cuts[0U], 0U)) {
+        const bool header_valid = compact_state_references_
+                                      ? PartialOrderEventHeaderLayoutCanonicalV3(
+                                            *header_)
+                                      : PartialOrderEventHeaderLayoutCanonicalV2(
+                                            *header_);
+        const bool cut_valid = compact_state_references_
+                                   ? PartialOrderEventCommitCutCanonicalV3(
+                                         *header_, header_->cuts[0U], 0U)
+                                   : PartialOrderEventCommitCutCanonicalV2(
+                                         *header_, header_->cuts[0U], 0U);
+        if (!header_valid || !cut_valid) {
             return PartialOrderEventJournalCreateErrorV2::
                 kUnexpectedFailure;
         }
@@ -1152,80 +1182,25 @@ private:
         std::uint64_t new_shanghai_count = shanghai_order_state_count_;
         std::uint64_t new_shenzhen_count = shenzhen_order_state_count_;
         for (const StatePlan& plan : state_plans_) {
-            PartialOrderEventOrderStateSlotV2& state_slot =
-                order_state_slots_[plan.slot_index];
-            if (plan.new_key) {
-                // Planning observed this slot empty and reserved it for this
-                // plan epoch. This producer is the sole writer; readers treat
-                // the odd tag as uncommitted, so a release store is sufficient
-                // to claim the key without a second random slot load or RMW.
-                Atomic(state_slot.key_publish_tag)
-                    .store(1U, std::memory_order_release);
-                std::atomic_thread_fence(std::memory_order_release);
-                if (TripFailpoint(
-                        PartialOrderEventCommitFailpointV2::
-                            kAfterOrderStateKeyInvalidated)) {
-                    return PartialOrderEventJournalPublishErrorV2::
-                        kInjectedFailure;
-                }
-                state_slot.market = plan.key.market;
-                state_slot.instrument_id = plan.key.instrument_id;
-                state_slot.channel = plan.key.channel;
-                state_slot.order_id = plan.key.order_id;
-                Atomic(state_slot.key_publish_tag)
-                    .store(2U, std::memory_order_release);
-                if (plan.key.market ==
-                    L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1) {
-                    ++new_shanghai_count;
-                } else {
-                    ++new_shenzhen_count;
-                }
+            const auto state_error = compact_state_references_
+                                         ? CommitStatePlan(
+                                               compact_order_state_slots_[
+                                                   plan.slot_index],
+                                               plan,
+                                               commit_rows,
+                                               &new_shanghai_count,
+                                               &new_shenzhen_count)
+                                         : CommitStatePlan(
+                                               order_state_slots_[
+                                                   plan.slot_index],
+                                               plan,
+                                               commit_rows,
+                                               &new_shanghai_count,
+                                               &new_shenzhen_count);
+            if (state_error !=
+                PartialOrderEventJournalPublishErrorV2::kNone) {
+                return state_error;
             }
-            PartialOrderEventOrderStateVersionV2& version =
-                state_slot.versions[plan.version_index];
-            const l2flow_instrument_derived_event_row_v1* state_row =
-                &commit_rows[plan.event_index];
-            if (state_row->event_kind !=
-                L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1) {
-                return FailTerminal(
-                    PartialOrderEventJournalPublishErrorV2::
-                        kProjectionError);
-            }
-            if (Atomic(version.publish_tag)
-                    .load(std::memory_order_acquire) !=
-                plan.expected_version_tag) {
-                return FailTerminal(
-                    PartialOrderEventJournalPublishErrorV2::
-                        kPublicationInvariant);
-            }
-            Atomic(version.publish_tag)
-                .store(
-                    plan.canonical_apply_sequence * 2U - 1U,
-                    std::memory_order_release);
-            std::atomic_thread_fence(std::memory_order_release);
-            if (TripFailpoint(
-                    PartialOrderEventCommitFailpointV2::
-                        kAfterOrderStateVersionInvalidated)) {
-                return PartialOrderEventJournalPublishErrorV2::
-                    kInjectedFailure;
-            }
-            std::array<std::uint64_t, 40U> state_words{};
-            std::memcpy(
-                state_words.data(), state_row, sizeof(*state_row));
-            Atomic(version.canonical_apply_sequence)
-                .store(
-                    plan.canonical_apply_sequence,
-                    std::memory_order_relaxed);
-            for (std::size_t word = 0U;
-                 word < state_words.size();
-                 ++word) {
-                Atomic(version.payload_words[word])
-                    .store(state_words[word], std::memory_order_relaxed);
-            }
-            Atomic(version.publish_tag)
-                .store(
-                    plan.canonical_apply_sequence * 2U,
-                    std::memory_order_release);
         }
 
         event_index = 0U;
@@ -1311,6 +1286,101 @@ private:
         return PartialOrderEventJournalPublishErrorV2::kNone;
     }
 
+    template <typename StateSlot>
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2 CommitStatePlan(
+        StateSlot& state_slot,
+        const StatePlan& plan,
+        std::span<const l2flow_instrument_derived_event_row_v1> rows,
+        std::uint64_t* shanghai_count,
+        std::uint64_t* shenzhen_count) noexcept {
+        if (shanghai_count == nullptr || shenzhen_count == nullptr ||
+            plan.event_index >= rows.size() ||
+            plan.version_index >= state_slot.versions.size()) {
+            return FailTerminal(
+                PartialOrderEventJournalPublishErrorV2::
+                    kPublicationInvariant);
+        }
+        if (plan.new_key) {
+            Atomic(state_slot.key_publish_tag)
+                .store(1U, std::memory_order_release);
+            std::atomic_thread_fence(std::memory_order_release);
+            if (TripFailpoint(
+                    PartialOrderEventCommitFailpointV2::
+                        kAfterOrderStateKeyInvalidated)) {
+                return PartialOrderEventJournalPublishErrorV2::
+                    kInjectedFailure;
+            }
+            state_slot.market = plan.key.market;
+            state_slot.instrument_id = plan.key.instrument_id;
+            state_slot.channel = plan.key.channel;
+            state_slot.order_id = plan.key.order_id;
+            Atomic(state_slot.key_publish_tag)
+                .store(2U, std::memory_order_release);
+            if (plan.key.market ==
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1) {
+                ++(*shanghai_count);
+            } else {
+                ++(*shenzhen_count);
+            }
+        }
+
+        auto& version = state_slot.versions[plan.version_index];
+        const auto& state_row = rows[plan.event_index];
+        if (state_row.event_kind !=
+            L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1) {
+            return FailTerminal(
+                PartialOrderEventJournalPublishErrorV2::kProjectionError);
+        }
+        if (Atomic(version.publish_tag)
+                .load(std::memory_order_acquire) !=
+            plan.expected_version_tag) {
+            return FailTerminal(
+                PartialOrderEventJournalPublishErrorV2::
+                    kPublicationInvariant);
+        }
+        Atomic(version.publish_tag)
+            .store(
+                plan.canonical_apply_sequence * 2U - 1U,
+                std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_release);
+        if (TripFailpoint(
+                PartialOrderEventCommitFailpointV2::
+                    kAfterOrderStateVersionInvalidated)) {
+            return PartialOrderEventJournalPublishErrorV2::
+                kInjectedFailure;
+        }
+        Atomic(version.canonical_apply_sequence)
+            .store(
+                plan.canonical_apply_sequence,
+                std::memory_order_relaxed);
+        if constexpr (std::is_same_v<
+                          StateSlot,
+                          PartialOrderEventOrderStateSlotV3>) {
+            const std::uint64_t derived_event_sequence =
+                published_event_frontier_ +
+                static_cast<std::uint64_t>(plan.event_index) + 1U;
+            Atomic(version.derived_event_sequence)
+                .store(
+                    derived_event_sequence,
+                    std::memory_order_relaxed);
+        } else {
+            std::array<std::uint64_t, 40U> state_words{};
+            std::memcpy(
+                state_words.data(), &state_row, sizeof(state_row));
+            for (std::size_t word = 0U;
+                 word < state_words.size();
+                 ++word) {
+                Atomic(version.payload_words[word])
+                    .store(state_words[word], std::memory_order_relaxed);
+            }
+        }
+        Atomic(version.publish_tag)
+            .store(
+                plan.canonical_apply_sequence * 2U,
+                std::memory_order_release);
+        return PartialOrderEventJournalPublishErrorV2::kNone;
+    }
+
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2
     EnsureOrderStateBacking() noexcept {
         if (fully_preallocated_) {
@@ -1330,11 +1400,11 @@ private:
             std::uint64_t relative_slot_end = 0U;
             if (!partial_order_event_wire_v2_detail::CheckedMultiply(
                     plan.slot_index,
-                    kPartialOrderEventOrderStateSlotBytesV2,
+                    order_state_slot_bytes_,
                     &relative_slot_offset) ||
                 !partial_order_event_wire_v2_detail::CheckedAdd(
                     relative_slot_offset,
-                    kPartialOrderEventOrderStateSlotBytesV2,
+                    order_state_slot_bytes_,
                     &relative_slot_end) ||
                 relative_slot_end == 0U ||
                 relative_slot_end > order_state_region_bytes_) {
@@ -1482,6 +1552,30 @@ private:
                 canonical_apply_sequence;
             return PartialOrderEventJournalPublishErrorV2::kNone;
         }
+        return compact_state_references_
+                   ? PlanStateUpdateInTable(
+                         compact_order_state_slots_,
+                         key,
+                         event_index,
+                         canonical_apply_sequence)
+                   : PlanStateUpdateInTable(
+                         order_state_slots_,
+                         key,
+                         event_index,
+                         canonical_apply_sequence);
+    }
+
+    template <typename StateSlot>
+    [[nodiscard]] PartialOrderEventJournalPublishErrorV2
+    PlanStateUpdateInTable(
+        StateSlot* order_state_slots,
+        const OrderKey& key,
+        std::size_t event_index,
+        std::uint64_t canonical_apply_sequence) noexcept {
+        if (order_state_slots == nullptr) {
+            return PartialOrderEventJournalPublishErrorV2::
+                kPublicationInvariant;
+        }
         const std::uint64_t mask = config_.order_state_capacity - 1U;
         const std::uint64_t start = HashOrderKey(key) & mask;
         for (std::uint64_t probe = 0U;
@@ -1512,8 +1606,7 @@ private:
                 continue;
             }
 
-            PartialOrderEventOrderStateSlotV2& slot =
-                order_state_slots_[index];
+            StateSlot& slot = order_state_slots[index];
             const std::uint64_t key_tag =
                 Atomic(slot.key_publish_tag)
                     .load(std::memory_order_acquire);
@@ -1601,9 +1694,10 @@ private:
         return PartialOrderEventJournalPublishErrorV2::kNone;
     }
 
+    template <typename StateSlot>
     [[nodiscard]] PartialOrderEventJournalPublishErrorV2
     SelectOlderVersion(
-        const PartialOrderEventOrderStateSlotV2& slot,
+        const StateSlot& slot,
         std::uint32_t* output_index,
         std::uint64_t* output_tag) const noexcept {
         if (output_index == nullptr || output_tag == nullptr) {
@@ -1624,13 +1718,26 @@ private:
             const std::uint64_t sequence =
                 Atomic(version.canonical_apply_sequence)
                     .load(std::memory_order_relaxed);
+            std::uint64_t derived_event_sequence = 1U;
+            std::uint64_t reserved = 0U;
+            if constexpr (std::is_same_v<
+                              StateSlot,
+                              PartialOrderEventOrderStateSlotV3>) {
+                derived_event_sequence =
+                    Atomic(version.derived_event_sequence)
+                        .load(std::memory_order_relaxed);
+                reserved = Atomic(version.reserved)
+                               .load(std::memory_order_relaxed);
+            }
             std::atomic_thread_fence(std::memory_order_acq_rel);
             if (Atomic(version.publish_tag)
                         .load(std::memory_order_acquire) != tag ||
                 sequence == 0U ||
                 sequence >
                     std::numeric_limits<std::uint64_t>::max() / 2U ||
-                tag != sequence * 2U) {
+                tag != sequence * 2U || derived_event_sequence == 0U ||
+                derived_event_sequence > published_event_frontier_ ||
+                reserved != 0U) {
                 return PartialOrderEventJournalPublishErrorV2::
                     kPublicationInvariant;
             }
@@ -1659,6 +1766,8 @@ private:
     }
 
     PartialOrderEventJournalConfigV2 config_{};
+    bool compact_state_references_ = false;
+    std::uint64_t order_state_slot_bytes_ = 0U;
     int memfd_ = -1;
     int read_only_fd_ = -1;
     void* mapping_ = MAP_FAILED;
@@ -1667,6 +1776,8 @@ private:
     std::array<PartialOrderEventChannelHealthV2*, 2U>
         channel_banks_{};
     PartialOrderEventOrderStateSlotV2* order_state_slots_ = nullptr;
+    PartialOrderEventOrderStateSlotV3* compact_order_state_slots_ =
+        nullptr;
     std::uint64_t mapping_bytes_ = 0U;
     std::array<std::uint64_t, 2U> channel_bank_offsets_{};
     std::uint64_t channel_bank_bytes_ = 0U;
@@ -1787,13 +1898,24 @@ PartialOrderEventJournalProducerV2::Create(
     PartialOrderEventJournalConfigV2 config,
     std::shared_ptr<PartialOrderEventJournalProducerV2>* output,
     int* system_error_number) noexcept {
+    return CreateInternal(
+        std::move(config), false, output, system_error_number);
+}
+
+PartialOrderEventJournalCreateErrorV2
+PartialOrderEventJournalProducerV2::CreateInternal(
+    PartialOrderEventJournalConfigV2 config,
+    bool compact_state_references,
+    std::shared_ptr<PartialOrderEventJournalProducerV2>* output,
+    int* system_error_number) noexcept {
     SetSystemError(system_error_number, 0);
     if (output == nullptr) {
         return PartialOrderEventJournalCreateErrorV2::kNullOutput;
     }
     output->reset();
     try {
-        auto impl = std::make_unique<Impl>(std::move(config));
+        auto impl = std::make_unique<Impl>(
+            std::move(config), compact_state_references);
         const auto error = impl->Initialize(system_error_number);
         if (error != PartialOrderEventJournalCreateErrorV2::kNone) {
             return error;

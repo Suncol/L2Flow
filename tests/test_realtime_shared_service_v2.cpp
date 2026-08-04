@@ -7558,7 +7558,24 @@ struct ThroughputBenchmarkConfigV1 final {
         StartupBenchmarkScenarioV1::kFromOpen;
     std::chrono::milliseconds generation_interval{0};
     std::string partial_event_worker_cpu_set;
+    ipc::RealtimePartialOrderEventJournalLayoutV2
+        partial_event_journal_layout =
+            ipc::RealtimePartialOrderEventJournalLayoutV2::
+                kCompactStateReferenceV3;
 };
+
+[[nodiscard]] std::string_view PartialEventJournalLayoutNameV1(
+    ipc::RealtimePartialOrderEventJournalLayoutV2 layout) noexcept {
+    switch (layout) {
+        case ipc::RealtimePartialOrderEventJournalLayoutV2::
+            kMaterializedStateV2:
+            return "event_v2";
+        case ipc::RealtimePartialOrderEventJournalLayoutV2::
+            kCompactStateReferenceV3:
+            return "event_v3";
+    }
+    return "unknown";
+}
 
 [[nodiscard]] std::string_view ThroughputWorkloadNameV1(
     ThroughputWorkloadV1 workload) noexcept {
@@ -7979,6 +7996,9 @@ bool RunThroughputProfileBenchmark(
         << (benchmark.partial_event_worker_cpu_set.empty()
                 ? "none"
                 : benchmark.partial_event_worker_cpu_set)
+        << " partial_event_journal_layout="
+        << PartialEventJournalLayoutNameV1(
+               benchmark.partial_event_journal_layout)
         << " native_sequence_base="
         << (benchmark.scenario ==
                     StartupBenchmarkScenarioV1::kFromOpen
@@ -8171,6 +8191,8 @@ bool RunThroughputProfileBenchmark(
             static_cast<std::size_t>(derived_event_capacity);
         event_config.event_journal_capacity = derived_event_capacity;
         event_config.order_state_capacity = order_state_capacity;
+        event_config.journal_layout =
+            benchmark.partial_event_journal_layout;
         event_config.maximum_order_state_updates_per_commit = 3U;
         event_config.maximum_mapping_bytes =
             256ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -8919,13 +8941,20 @@ bool RunThroughputProfileBenchmark(
          !partial_event_snapshot.globally_frozen &&
          !partial_event_snapshot.journal_failed &&
          !partial_event_snapshot.history_failed &&
+         partial_event_snapshot.journal_wire_major ==
+             static_cast<std::uint16_t>(
+                 benchmark.partial_event_journal_layout) &&
          partial_event_snapshot.frozen_channel_count == 0U &&
          partial_event_snapshot.applied_records ==
              expected_target_messages &&
          partial_event_snapshot.observed_native_messages ==
              expected_target_messages &&
-         partial_event_snapshot.enqueued_handoffs ==
-             expected_target_messages * 2U &&
+         partial_event_snapshot.enqueued_handoffs >=
+             expected_target_messages &&
+         partial_event_snapshot.enqueued_handoffs <=
+             expected_target_messages +
+                 std::max<std::uint64_t>(
+                     64U, expected_target_messages / 100U) &&
          partial_event_snapshot.processed_handoffs ==
              partial_event_snapshot.enqueued_handoffs &&
          partial_event_snapshot.dropped_handoffs == 0U &&
@@ -9377,6 +9406,11 @@ bool RunThroughputProfileBenchmark(
         << (partial_event_idle ? 1 : 0)
         << " partial_event_healthy="
         << (partial_event_healthy ? 1 : 0)
+        << " partial_event_journal_layout="
+        << PartialEventJournalLayoutNameV1(
+               benchmark.partial_event_journal_layout)
+        << " partial_event_journal_wire_major="
+        << partial_event_snapshot.journal_wire_major
         << " partial_event_quarter_health_sticky="
         << (partial_event_quarter_health_sticky ? 1 : 0)
         << " partial_event_health_q25="
@@ -11882,7 +11916,8 @@ int main(int argc, char** argv) {
         }
         return false;
     };
-    if ((argc == 13 || argc == 14 || argc == 15 || argc == 16) &&
+    if ((argc == 13 || argc == 14 || argc == 15 || argc == 16 ||
+         argc == 17) &&
         std::string_view(argv[1]) ==
             "--throughput-profile-benchmark") {
         std::array<std::uint64_t, 8U> numeric{};
@@ -11991,8 +12026,24 @@ int main(int argc, char** argv) {
                     static_cast<std::chrono::milliseconds::rep>(
                         generation_interval_ms));
         }
-        if (argc == 16) {
+        if (argc >= 16) {
             config.partial_event_worker_cpu_set = argv[15];
+        }
+        if (argc == 17) {
+            const std::string_view layout(argv[16]);
+            if (layout == "event_v2") {
+                config.partial_event_journal_layout =
+                    ipc::RealtimePartialOrderEventJournalLayoutV2::
+                        kMaterializedStateV2;
+            } else if (layout == "event_v3") {
+                config.partial_event_journal_layout =
+                    ipc::RealtimePartialOrderEventJournalLayoutV2::
+                        kCompactStateReferenceV3;
+            } else {
+                std::cerr
+                    << "invalid partial Event journal layout\n";
+                return 2;
+            }
         }
         return RunThroughputProfileBenchmark(config) ? 0 : 1;
     }
@@ -12106,8 +12157,11 @@ int main(int argc, char** argv) {
                "PARALLEL_DECODER_WORKERS IDLE_INLINE "
                "DECODER_QUEUE STORE_QUEUE "
                "SEGMENT_KIB WORKLOAD SINK [SCENARIO "
-               "GENERATION_INTERVAL_MS [EVENT_WORKER_CPU_SET]]]\n"
-               "  SCENARIO: from_open|live_partial_no_recovery\n";
+               "GENERATION_INTERVAL_MS [EVENT_WORKER_CPU_SET "
+               "[EVENT_JOURNAL_LAYOUT]]]]\n"
+               "  SCENARIO: from_open|live_partial_no_recovery\n"
+               "  EVENT_JOURNAL_LAYOUT: event_v2|event_v3 "
+               "(default event_v3)\n";
         return 2;
     }
     if (!TestMalformedHistoryResponseClosesReceivedDescriptor() ||

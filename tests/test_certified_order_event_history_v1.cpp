@@ -920,6 +920,7 @@ void TestShenzhenPrivateWireEquivalent(bool* ok) {
              .maximum_shanghai_order_states = 8U,
              .maximum_shenzhen_order_states = 8U,
              .maximum_events = 16U,
+             .maximum_private_batch_events = 3U,
              .preallocate_event_storage = false,
              .publish_process_snapshots = false,
              .external_journal = {}},
@@ -987,7 +988,32 @@ void TestShenzhenPrivateWireEquivalent(bool* ok) {
                         sizeof(expected)) == 0,
                 "direct Shenzhen sink is byte-equivalent to public Event projection");
         }
+        *ok &= Expect(
+            private_history->ReleasePrivateWireBatch(),
+            "owner-private history recycles its bounded batch after publication");
     }
+    *ok &= Expect(
+        private_history->config().maximum_private_batch_events == 3U &&
+            private_history->config().maximum_events == 16U &&
+            !public_history->ReleasePrivateWireBatch(),
+        "batch recycling preserves global history capacity and is unavailable in snapshot mode");
+
+    std::unique_ptr<ipc::CertifiedOrderEventHistoryV1> rejected;
+    *ok &= Expect(
+        ipc::CertifiedOrderEventHistoryV1::Create(
+            {.trade_date = kTradeDate,
+             .maximum_shanghai_order_states = 8U,
+             .maximum_shenzhen_order_states = 8U,
+             .maximum_events = 2U,
+             .maximum_private_batch_events = 3U,
+             .preallocate_event_storage = false,
+             .publish_process_snapshots = false,
+             .external_journal = {}},
+            &rejected) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::
+                    kInvalidConfiguration &&
+            rejected == nullptr,
+        "owner-private batch capacity cannot exceed total Event capacity");
 }
 
 void TestFilteredSkipAndFailureBoundaries(bool* ok) {

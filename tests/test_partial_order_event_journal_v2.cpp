@@ -1,6 +1,8 @@
 #include "l2flow/ipc/certified_order_event_wire_v1.h"
 #include "l2flow/ipc/partial_order_event_journal_v2.h"
+#include "l2flow/ipc/partial_order_event_journal_v3.h"
 #include "l2flow/ipc/partial_order_event_reader_v2.h"
+#include "l2flow/ipc/partial_order_event_reader_v3.h"
 
 #include <array>
 #include <atomic>
@@ -175,6 +177,46 @@ private:
     return true;
 }
 
+[[nodiscard]] bool CreatePairV3(
+    const ipc::PartialOrderEventJournalConfigV3& config,
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV3>* producer,
+    std::unique_ptr<ipc::PartialOrderEventReaderV3>* reader) {
+    int system_error = 0;
+    const auto create_error =
+        ipc::PartialOrderEventJournalProducerV3::Create(
+            config, producer, &system_error);
+    if (create_error !=
+            ipc::PartialOrderEventJournalCreateErrorV3::kNone ||
+        *producer == nullptr || system_error != 0) {
+        std::cerr << "CreatePairV3 producer error="
+                  << ipc::PartialOrderEventJournalCreateErrorNameV2(
+                         create_error)
+                  << " errno=" << system_error << '\n';
+        return false;
+    }
+    Descriptor descriptor;
+    if (!(*producer)->DuplicateReadOnlyDescriptor(
+            descriptor.output(), &system_error) ||
+        system_error != 0) {
+        return false;
+    }
+    const auto reader_error =
+        ipc::PartialOrderEventReaderV3::OpenDescriptor(
+            descriptor.get(),
+            Expected((*producer)->session()),
+            reader,
+            &system_error);
+    if (reader_error != ipc::PartialOrderEventReaderOpenErrorV3::kNone ||
+        *reader == nullptr || system_error != 0) {
+        std::cerr << "CreatePairV3 reader error="
+                  << ipc::PartialOrderEventReaderOpenErrorNameV2(
+                         reader_error)
+                  << " errno=" << system_error << '\n';
+        return false;
+    }
+    return true;
+}
+
 bool TestDistinctAbiAndGenerationIdentity() {
     bool ok = true;
     ok &= Expect(
@@ -255,6 +297,128 @@ bool TestDistinctAbiAndGenerationIdentity() {
                 kSessionMismatch &&
             rejected == nullptr,
         "reader fails closed across correction epochs");
+    return ok;
+}
+
+bool TestCompactV3StateReferencesPreserveCutSemantics() {
+    constexpr std::uint64_t kStateCapacity = 1'024U;
+    const auto config = Config(16U, kStateCapacity);
+
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV2> full_producer;
+    std::unique_ptr<ipc::PartialOrderEventReaderV2> full_reader;
+    bool ok = CreatePair(config, &full_producer, &full_reader);
+    std::shared_ptr<ipc::PartialOrderEventJournalProducerV3>
+        compact_producer;
+    std::unique_ptr<ipc::PartialOrderEventReaderV3> compact_reader;
+    ok &= CreatePairV3(config, &compact_producer, &compact_reader);
+    if (full_producer == nullptr || compact_producer == nullptr ||
+        compact_reader == nullptr) {
+        return false;
+    }
+
+    constexpr std::uint64_t kBytesSavedPerStateSlot =
+        ipc::kPartialOrderEventOrderStateSlotBytesV2 -
+        ipc::kPartialOrderEventOrderStateSlotBytesV3;
+    ok &= Expect(
+        sizeof(ipc::PartialOrderEventOrderStateSlotV3) == 128U &&
+            full_producer->session().total_mapping_bytes ==
+                compact_producer->session().total_mapping_bytes +
+                    kStateCapacity * kBytesSavedPerStateSlot,
+        "V3 replaces each 832-byte materialized state slot with a 128-byte reference slot");
+
+    Descriptor descriptor;
+    int system_error = 0;
+    std::unique_ptr<ipc::PartialOrderEventReaderV2>
+        incompatible_reader;
+    ok &= Expect(
+        compact_producer->DuplicateReadOnlyDescriptor(
+            descriptor.output(), &system_error) &&
+            system_error == 0 &&
+            ipc::PartialOrderEventReaderV2::OpenDescriptor(
+                descriptor.get(),
+                Expected(compact_producer->session()),
+                &incompatible_reader,
+                &system_error) ==
+                ipc::PartialOrderEventReaderOpenErrorV2::
+                    kIncompatibleLayout &&
+            incompatible_reader == nullptr,
+        "exact V2 reader rejects the distinct compact V3 wire major");
+
+    auto first = ShanghaiRevision(1U, 1U, 0U, 17U, 42, 1U);
+    auto second = ShanghaiRevision(2U, 2U, 0U, 17U, 42, 2U);
+    ok &= Expect(
+        compact_producer->PublishCanonicalTick(
+            1U,
+            Contiguous(1U),
+            std::span{&first, 1U}) ==
+                ipc::PartialOrderEventJournalPublishErrorV3::kNone &&
+            compact_producer->PublishCanonicalTick(
+                2U,
+                Contiguous(2U),
+                std::span{&second, 1U}) ==
+                ipc::PartialOrderEventJournalPublishErrorV3::kNone,
+        "publish two revisions through compact V3 state references");
+
+    const ipc::PartialOrderEventOrderKeyV3 key{
+        L2FLOW_INSTRUMENT_DERIVED_EVENT_MARKET_SHANGHAI_V1,
+        17U,
+        7,
+        42};
+    ipc::PartialOrderEventOrderStateV3 state{};
+    ipc::PartialOrderEventStatusSnapshotV3 status{};
+    ipc::PartialOrderEventEnvelopeV3 event{};
+    ok &= Expect(
+        compact_reader->FindOrderState(key, &state, &status) ==
+                ipc::PartialOrderEventReadResultV3::kOk &&
+            state.canonical_apply_sequence == 2U &&
+            state.order_revision.revision == 2U &&
+            state.order_revision.instrument_id == key.instrument_id &&
+            state.order_revision.channel == key.channel &&
+            state.order_revision.order_id == key.order_id &&
+            status.cut.canonical_apply_frontier == 2U &&
+            status.cut.event_published_frontier == 2U &&
+            compact_reader->ReadEvent(2U, &event) ==
+                ipc::PartialOrderEventReadResultV3::kOk &&
+            event.event.revision == 2U,
+        "V3 reader reconstructs the complete latest state from its immutable Event row");
+
+    std::array<ipc::PartialOrderEventOrderStateV3, 2U> states{};
+    ipc::PartialOrderEventOrderStateBatchResultV3 state_batch{};
+    ok &= Expect(
+        compact_reader->ReadOrderStates(0U, states, &state_batch) ==
+                ipc::PartialOrderEventReadResultV3::kOk &&
+            state_batch.rows_read == 1U &&
+            states[0U].canonical_apply_sequence == 2U &&
+            states[0U].order_revision.revision == 2U,
+        "V3 physical state scan dereferences the same visible Event row");
+
+    auto future = ShanghaiRevision(3U, 3U, 0U, 17U, 42, 3U);
+    compact_producer->SetCommitFailpointForTest(
+        ipc::PartialOrderEventCommitFailpointV3::
+            kAfterEventRowsWritten);
+    ok &= Expect(
+        compact_producer->PublishCanonicalTick(
+            3U,
+            Contiguous(3U),
+            std::span{&future, 1U}) ==
+                ipc::PartialOrderEventJournalPublishErrorV3::
+                    kInjectedFailure &&
+            compact_producer->failed(),
+        "interrupt V3 after the future Event row but before its cut");
+
+    state = {};
+    status = {};
+    event = {};
+    ok &= Expect(
+        compact_reader->FindOrderState(key, &state, &status) ==
+                ipc::PartialOrderEventReadResultV3::kOk &&
+            status.cut.canonical_apply_frontier == 2U &&
+            status.cut.event_published_frontier == 2U &&
+            state.canonical_apply_sequence == 2U &&
+            state.order_revision.revision == 2U &&
+            compact_reader->ReadEvent(3U, &event) ==
+                ipc::PartialOrderEventReadResultV3::kNotYetPublished,
+        "old V3 cut hides both the future state reference and unpublished Event row");
     return ok;
 }
 
@@ -1321,6 +1485,7 @@ bool TestConcurrentSameKeyPublicationIsCoherent() {
 int main() {
     bool ok = true;
     ok &= TestDistinctAbiAndGenerationIdentity();
+    ok &= TestCompactV3StateReferencesPreserveCutSemantics();
     ok &= TestStatusAndAffectedChannelCut();
     ok &= TestEventAndOrderStateJournal();
     ok &= TestCanonicalMicrobatchPublishesOneCoherentCut();

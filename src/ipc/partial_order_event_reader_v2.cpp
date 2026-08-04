@@ -1,4 +1,5 @@
 #include "l2flow/ipc/partial_order_event_reader_v2.h"
+#include "l2flow/ipc/partial_order_event_reader_v3.h"
 
 #include "l2flow/common/crc32c.h"
 
@@ -161,6 +162,11 @@ enum class StableCopyResult : std::uint8_t {
     kCorrupt,
 };
 
+struct CompactStateReference final {
+    std::uint64_t canonical_apply_sequence = 0U;
+    std::uint64_t derived_event_sequence = 0U;
+};
+
 }  // namespace
 
 class PartialOrderEventReaderV2::Impl final {
@@ -175,7 +181,9 @@ public:
     [[nodiscard]] PartialOrderEventReaderOpenErrorV2 Initialize(
         int source_descriptor,
         const PartialOrderEventExpectedSessionV2& expected_session,
+        bool compact_state_references,
         int* system_error_number) noexcept {
+        compact_state_references_ = compact_state_references;
         SetSystemError(system_error_number, 0);
         if constexpr (std::endian::native != std::endian::little) {
             return PartialOrderEventReaderOpenErrorV2::
@@ -251,7 +259,12 @@ public:
             return PartialOrderEventReaderOpenErrorV2::kMappingFailed;
         }
         header_ = static_cast<const PartialOrderEventHeaderV2*>(mapping_);
-        if (!PartialOrderEventHeaderLayoutCanonicalV2(*header_) ||
+        const bool header_valid = compact_state_references_
+                                      ? PartialOrderEventHeaderLayoutCanonicalV3(
+                                            *header_)
+                                      : PartialOrderEventHeaderLayoutCanonicalV2(
+                                            *header_);
+        if (!header_valid ||
             header_->total_mapping_bytes != mapping_bytes_) {
             return PartialOrderEventReaderOpenErrorV2::
                 kIncompatibleLayout;
@@ -272,6 +285,10 @@ public:
         }
         order_state_slots_ =
             reinterpret_cast<const PartialOrderEventOrderStateSlotV2*>(
+                static_cast<const std::byte*>(mapping_) +
+                header_->order_states_offset);
+        compact_order_state_slots_ =
+            reinterpret_cast<const PartialOrderEventOrderStateSlotV3*>(
                 static_cast<const std::byte*>(mapping_) +
                 header_->order_states_offset);
 
@@ -455,6 +472,25 @@ public:
         if (!KeyValid(key) || output == nullptr) {
             return PartialOrderEventReadResultV2::kInvalidArgument;
         }
+        return compact_state_references_
+                   ? FindOrderStateInTable(
+                         compact_order_state_slots_,
+                         key,
+                         output,
+                         output_status)
+                   : FindOrderStateInTable(
+                         order_state_slots_, key, output, output_status);
+    }
+
+    template <typename StateSlot>
+    [[nodiscard]] PartialOrderEventReadResultV2 FindOrderStateInTable(
+        const StateSlot* order_state_slots,
+        const PartialOrderEventOrderKeyV2& key,
+        PartialOrderEventOrderStateV2* output,
+        PartialOrderEventStatusSnapshotV2* output_status) const noexcept {
+        if (order_state_slots == nullptr) {
+            return PartialOrderEventReadResultV2::kCorrupt;
+        }
         PartialOrderEventStatusSnapshotV2 status{};
         std::uint32_t cut_bank = 0U;
         std::uint64_t cut_tag = 0U;
@@ -471,7 +507,7 @@ public:
             const std::uint64_t index = (start + probe) & mask;
             PartialOrderEventOrderStateSlotV2 slot_identity{};
             const auto key_result =
-                CopyStateKey(order_state_slots_[index], &slot_identity);
+                CopyStateKey(order_state_slots[index], &slot_identity);
             if (key_result == StableCopyResult::kAbsent) {
                 return PartialOrderEventReadResultV2::kNotFound;
             }
@@ -488,9 +524,10 @@ public:
             }
             PartialOrderEventOrderStateV2 local{};
             const auto state_result = CopyVisibleOrderState(
-                order_state_slots_[index],
+                order_state_slots[index],
                 slot_identity,
                 status.cut.order_state_canonical_frontier,
+                status.cut.event_published_frontier,
                 &local);
             std::atomic_thread_fence(std::memory_order_acq_rel);
             if (Atomic(header_->cuts[cut_bank].publish_tag)
@@ -522,6 +559,29 @@ public:
             output.empty() || result == nullptr) {
             return PartialOrderEventReadResultV2::kInvalidArgument;
         }
+        return compact_state_references_
+                   ? ReadOrderStatesFromTable(
+                         compact_order_state_slots_,
+                         first_physical_slot,
+                         output,
+                         result)
+                   : ReadOrderStatesFromTable(
+                         order_state_slots_,
+                         first_physical_slot,
+                         output,
+                         result);
+    }
+
+    template <typename StateSlot>
+    [[nodiscard]] PartialOrderEventReadResultV2
+    ReadOrderStatesFromTable(
+        const StateSlot* order_state_slots,
+        std::uint64_t first_physical_slot,
+        std::span<PartialOrderEventOrderStateV2> output,
+        PartialOrderEventOrderStateBatchResultV2* result) const noexcept {
+        if (order_state_slots == nullptr) {
+            return PartialOrderEventReadResultV2::kCorrupt;
+        }
         *result = {};
         PartialOrderEventStatusSnapshotV2 status{};
         std::uint32_t cut_bank = 0U;
@@ -537,13 +597,14 @@ public:
                output_index < output.size()) {
             PartialOrderEventOrderStateSlotV2 identity{};
             const auto key_result = CopyStateKey(
-                order_state_slots_[slot_index], &identity);
+                order_state_slots[slot_index], &identity);
             if (key_result == StableCopyResult::kCopied) {
                 PartialOrderEventOrderStateV2 state{};
                 const auto state_result = CopyVisibleOrderState(
-                    order_state_slots_[slot_index],
+                    order_state_slots[slot_index],
                     identity,
                     status.cut.order_state_canonical_frontier,
+                    status.cut.event_published_frontier,
                     &state);
                 if (state_result == StableCopyResult::kCopied) {
                     output[output_index] = state;
@@ -651,8 +712,12 @@ private:
                 (end & 1U) != 0U) {
                 continue;
             }
-            if (!PartialOrderEventCommitCutCanonicalV2(
-                    *header_, local, bank)) {
+            const bool canonical = compact_state_references_
+                                       ? PartialOrderEventCommitCutCanonicalV3(
+                                             *header_, local, bank)
+                                       : PartialOrderEventCommitCutCanonicalV2(
+                                             *header_, local, bank);
+            if (!canonical) {
                 return false;
             }
             *output = local;
@@ -716,8 +781,9 @@ private:
         return StableCopyResult::kInconsistent;
     }
 
+    template <typename StateSlot>
     [[nodiscard]] StableCopyResult CopyStateKey(
-        const PartialOrderEventOrderStateSlotV2& source,
+        const StateSlot& source,
         PartialOrderEventOrderStateSlotV2* output) const noexcept {
         if (output == nullptr) {
             return StableCopyResult::kCorrupt;
@@ -767,6 +833,7 @@ private:
         const PartialOrderEventOrderStateSlotV2& source,
         const PartialOrderEventOrderStateSlotV2& identity,
         std::uint64_t visible_canonical_frontier,
+        std::uint64_t,
         PartialOrderEventOrderStateV2* output) const noexcept {
         if (output == nullptr) {
             return StableCopyResult::kCorrupt;
@@ -811,6 +878,79 @@ private:
             return StableCopyResult::kCorrupt;
         }
         *output = states[selected];
+        return StableCopyResult::kCopied;
+    }
+
+    [[nodiscard]] StableCopyResult CopyVisibleOrderState(
+        const PartialOrderEventOrderStateSlotV3& source,
+        const PartialOrderEventOrderStateSlotV2& identity,
+        std::uint64_t visible_canonical_frontier,
+        std::uint64_t visible_event_frontier,
+        PartialOrderEventOrderStateV2* output) const noexcept {
+        if (output == nullptr) {
+            return StableCopyResult::kCorrupt;
+        }
+        std::array<CompactStateReference, 2U> references{};
+        std::array<bool, 2U> visible{};
+        for (std::size_t index = 0U; index < references.size(); ++index) {
+            const auto result = CopyCompactStateVersion(
+                source.versions[index], &references[index]);
+            if (result == StableCopyResult::kInconsistent ||
+                result == StableCopyResult::kCorrupt) {
+                return result;
+            }
+            visible[index] =
+                result == StableCopyResult::kCopied &&
+                references[index].canonical_apply_sequence <=
+                    visible_canonical_frontier &&
+                references[index].derived_event_sequence <=
+                    visible_event_frontier;
+        }
+        if (!visible[0U] && !visible[1U]) {
+            return StableCopyResult::kAbsent;
+        }
+        std::size_t selected = visible[1U] ? 1U : 0U;
+        if (visible[0U] &&
+            (!visible[1U] ||
+             references[0U].canonical_apply_sequence >
+                 references[1U].canonical_apply_sequence)) {
+            selected = 0U;
+        }
+        if (visible[0U] && visible[1U] &&
+            references[0U].canonical_apply_sequence ==
+                references[1U].canonical_apply_sequence) {
+            return StableCopyResult::kCorrupt;
+        }
+
+        PartialOrderEventEnvelopeV2 envelope{};
+        const CompactStateReference& reference = references[selected];
+        const auto event_result = CopyEvent(
+            reference.derived_event_sequence,
+            visible_event_frontier,
+            &envelope);
+        if (event_result != StableCopyResult::kCopied) {
+            return event_result;
+        }
+        PartialOrderEventOrderStateV2 state{};
+        state.canonical_apply_sequence =
+            reference.canonical_apply_sequence;
+        state.order_revision = envelope.event;
+        if (envelope.canonical_apply_sequence !=
+                reference.canonical_apply_sequence ||
+            envelope.event.derived_event_sequence !=
+                reference.derived_event_sequence ||
+            envelope.event.event_kind !=
+                L2FLOW_INSTRUMENT_DERIVED_EVENT_ORDER_REVISION_V1 ||
+            !PartialOrderEventOrderStateCanonicalV2(
+                state,
+                header_->trade_date,
+                identity.market,
+                identity.instrument_id,
+                identity.channel,
+                identity.order_id)) {
+            return StableCopyResult::kCorrupt;
+        }
+        *output = state;
         return StableCopyResult::kCopied;
     }
 
@@ -862,6 +1002,53 @@ private:
         return StableCopyResult::kInconsistent;
     }
 
+    [[nodiscard]] StableCopyResult CopyCompactStateVersion(
+        const PartialOrderEventOrderStateVersionV3& source,
+        CompactStateReference* output) const noexcept {
+        if (output == nullptr) {
+            return StableCopyResult::kCorrupt;
+        }
+        for (std::size_t attempt = 0U; attempt < kReadAttempts;
+             ++attempt) {
+            const std::uint64_t begin =
+                Atomic(source.publish_tag)
+                    .load(std::memory_order_acquire);
+            if (begin == 0U) {
+                return StableCopyResult::kAbsent;
+            }
+            if ((begin & 1U) != 0U) {
+                return StableCopyResult::kUncommitted;
+            }
+            CompactStateReference reference{};
+            reference.canonical_apply_sequence =
+                Atomic(source.canonical_apply_sequence)
+                    .load(std::memory_order_relaxed);
+            reference.derived_event_sequence =
+                Atomic(source.derived_event_sequence)
+                    .load(std::memory_order_relaxed);
+            const std::uint64_t reserved =
+                Atomic(source.reserved).load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acq_rel);
+            const std::uint64_t end =
+                Atomic(source.publish_tag)
+                    .load(std::memory_order_acquire);
+            if (begin != end || (end & 1U) != 0U) {
+                continue;
+            }
+            if (reference.canonical_apply_sequence == 0U ||
+                reference.canonical_apply_sequence >
+                    std::numeric_limits<std::uint64_t>::max() / 2U ||
+                begin != reference.canonical_apply_sequence * 2U ||
+                reference.derived_event_sequence == 0U ||
+                reserved != 0U) {
+                return StableCopyResult::kCorrupt;
+            }
+            *output = reference;
+            return StableCopyResult::kCopied;
+        }
+        return StableCopyResult::kInconsistent;
+    }
+
     int descriptor_ = -1;
     void* mapping_ = MAP_FAILED;
     std::size_t mapping_bytes_ = 0U;
@@ -871,6 +1058,9 @@ private:
         channel_banks_{};
     const PartialOrderEventOrderStateSlotV2* order_state_slots_ =
         nullptr;
+    const PartialOrderEventOrderStateSlotV3*
+        compact_order_state_slots_ = nullptr;
+    bool compact_state_references_ = false;
 };
 
 std::string_view PartialOrderEventReaderOpenErrorNameV2(
@@ -941,6 +1131,21 @@ PartialOrderEventReaderV2::OpenDescriptor(
     const PartialOrderEventExpectedSessionV2& expected_session,
     std::unique_ptr<PartialOrderEventReaderV2>* output,
     int* system_error_number) noexcept {
+    return OpenDescriptorInternal(
+        descriptor,
+        expected_session,
+        false,
+        output,
+        system_error_number);
+}
+
+PartialOrderEventReaderOpenErrorV2
+PartialOrderEventReaderV2::OpenDescriptorInternal(
+    int descriptor,
+    const PartialOrderEventExpectedSessionV2& expected_session,
+    bool compact_state_references,
+    std::unique_ptr<PartialOrderEventReaderV2>* output,
+    int* system_error_number) noexcept {
     SetSystemError(system_error_number, 0);
     if (output == nullptr) {
         return PartialOrderEventReaderOpenErrorV2::kNullOutput;
@@ -949,7 +1154,10 @@ PartialOrderEventReaderV2::OpenDescriptor(
     try {
         auto impl = std::make_unique<Impl>();
         const auto error = impl->Initialize(
-            descriptor, expected_session, system_error_number);
+            descriptor,
+            expected_session,
+            compact_state_references,
+            system_error_number);
         if (error != PartialOrderEventReaderOpenErrorV2::kNone) {
             return error;
         }

@@ -218,8 +218,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         src/ipc/order_event_wire_adapter_v2.cpp
         src/ipc/partial_order_event_control_v2.cpp
         src/ipc/partial_order_event_journal_v2.cpp
+        src/ipc/partial_order_event_journal_v3.cpp
         src/ipc/partial_order_event_reader_v2.cpp
+        src/ipc/partial_order_event_reader_v3.cpp
         src/ipc/partial_order_event_wire_v2.cpp
+        src/ipc/partial_order_event_wire_v3.cpp
         src/ipc/realtime_certified_reader_v1.cpp
         src/ipc/realtime_certified_service_v1.cpp
         src/ipc/realtime_partial_order_event_service_v2.cpp

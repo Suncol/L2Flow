@@ -10,6 +10,8 @@
 
 namespace l2flow::ipc {
 
+class PartialOrderEventReaderV3;
+
 struct PartialOrderEventExpectedSessionV2 final {
     common::Identity128 run_id{};
     std::uint64_t session_epoch = 0U;
@@ -121,6 +123,14 @@ public:
         PartialOrderEventOrderStateBatchResultV2* result) const noexcept;
 
 private:
+    friend class PartialOrderEventReaderV3;
+    [[nodiscard]] static PartialOrderEventReaderOpenErrorV2
+    OpenDescriptorInternal(
+        int descriptor,
+        const PartialOrderEventExpectedSessionV2& expected_session,
+        bool compact_state_references,
+        std::unique_ptr<PartialOrderEventReaderV2>* output,
+        int* system_error_number) noexcept;
     class Impl;
     explicit PartialOrderEventReaderV2(
         std::unique_ptr<Impl> impl) noexcept;

@@ -12,6 +12,8 @@
 
 namespace l2flow::ipc {
 
+class PartialOrderEventJournalProducerV3;
+
 struct PartialOrderEventJournalConfigV2 final {
     common::Identity128 run_id{};
     std::uint64_t session_epoch = 0U;
@@ -251,6 +253,13 @@ public:
         PartialOrderEventCommitFailpointV2 failpoint) noexcept;
 
 private:
+    friend class PartialOrderEventJournalProducerV3;
+    [[nodiscard]] static PartialOrderEventJournalCreateErrorV2
+    CreateInternal(
+        PartialOrderEventJournalConfigV2 config,
+        bool compact_state_references,
+        std::shared_ptr<PartialOrderEventJournalProducerV2>* output,
+        int* system_error_number) noexcept;
     class Impl;
     explicit PartialOrderEventJournalProducerV2(
         std::unique_ptr<Impl> impl) noexcept;
