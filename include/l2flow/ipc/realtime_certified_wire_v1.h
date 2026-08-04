@@ -18,7 +18,7 @@ inline constexpr std::array<std::uint8_t, 8U>
     kRealtimeCertifiedShmMagicV1{
         'L', '2', 'F', 'C', 'E', 'R', 'T', '1'};
 inline constexpr std::uint16_t kRealtimeCertifiedWireMajorV1 = 1U;
-inline constexpr std::uint16_t kRealtimeCertifiedWireMinorV1 = 0U;
+inline constexpr std::uint16_t kRealtimeCertifiedWireMinorV1 = 1U;
 inline constexpr std::uint32_t
     kRealtimeCertifiedLittleEndianMarkerV1 = 0x01020304U;
 inline constexpr std::size_t kRealtimeCertifiedHeaderBytesV1 = 4096U;
@@ -41,6 +41,9 @@ enum class RealtimeCertifiedStateV1 : std::uint32_t {
     kFrozenConflict = 6U,
     kFrozenResource = 7U,
     kStopped = 8U,
+    // One or more native domains are isolated while healthy domains continue
+    // to publish. This is nonterminal for partial consumers.
+    kDegraded = 9U,
 };
 
 namespace realtime_certified_wire_v1_detail {
@@ -441,9 +444,10 @@ struct alignas(64) RealtimeCertifiedChannelStateV1 final {
     std::uint64_t gap_recovered_count = 0U;
     std::uint32_t state = 0U;
     std::uint32_t trade_date = 0U;
-    std::int64_t channel = 0;
+    std::uint32_t channel = 0U;
     std::uint8_t market = 0U;
-    std::array<std::uint8_t, 7U> reserved{};
+    std::array<std::uint8_t, 3U> reserved{};
+    std::uint64_t channel_correction_epoch = 0U;
 };
 static_assert(
     sizeof(RealtimeCertifiedChannelStateV1) ==
@@ -513,7 +517,11 @@ static_assert(
 static_assert(
     offsetof(RealtimeCertifiedChannelStateV1, channel) == 112U);
 static_assert(
-    offsetof(RealtimeCertifiedChannelStateV1, market) == 120U);
+    offsetof(RealtimeCertifiedChannelStateV1, market) == 116U);
+static_assert(
+    offsetof(
+        RealtimeCertifiedChannelStateV1,
+        channel_correction_epoch) == 120U);
 
 // The embedded V2 payload is the sole native domain truth for a published
 // tick: market is payload.common.market, channel is payload.channel, and
@@ -610,7 +618,7 @@ static_assert(
                    RealtimeCertifiedStateV1::kDisabled) &&
            value <=
                static_cast<std::uint32_t>(
-                   RealtimeCertifiedStateV1::kStopped);
+                   RealtimeCertifiedStateV1::kDegraded);
 }
 
 [[nodiscard]] constexpr bool RealtimeCertifiedPublishTagStableV1(
@@ -772,6 +780,9 @@ RealtimeCertifiedHeaderStateValidV1(
                    header.resource_exhaustion_count != 0U;
         case RealtimeCertifiedStateV1::kStopped:
             return true;
+        case RealtimeCertifiedStateV1::kDegraded:
+            return header.correction_epoch != 0U &&
+                   header.frozen_channel_count != 0U;
     }
     return false;
 }
@@ -833,10 +844,13 @@ RealtimeCertifiedChannelStateCanonicalV1(
         !realtime_certified_wire_v1_detail::ValidTradeDate(
             row.trade_date) ||
         (row.market != 1U && row.market != 2U) ||
-        (row.market == 1U ? row.channel <= 0
-                          : row.channel < 0) ||
+        (row.market == 1U &&
+         (row.channel == 0U ||
+          row.channel > static_cast<std::uint32_t>(
+                            std::numeric_limits<std::int32_t>::max()))) ||
         !realtime_certified_wire_v1_detail::AllZero(
             row.reserved) ||
+        row.channel_correction_epoch == 0U ||
         !RealtimeCertifiedChannelStateCountersValidV1(row)) {
         return false;
     }
@@ -861,8 +875,26 @@ RealtimeCertifiedChannelStateCanonicalV1(
                row.gap_recovered_count == 0U;
     }
 
-    if (row.origin_sequence <= 0 ||
-        row.observed_native_message_count == 0U) {
+    if (row.origin_sequence == 0) {
+        const bool bootstrapping =
+            state == RealtimeCertifiedStateV1::kGapOpen &&
+            row.observed_native_message_count != 0U &&
+            row.highest_observed_sequence > 0;
+        const bool frozen_before_origin =
+            state == RealtimeCertifiedStateV1::kFrozenConflict ||
+            state == RealtimeCertifiedStateV1::kFrozenResource;
+        return (bootstrapping || frozen_before_origin) &&
+               (!bootstrapping || row.pending_token_count != 0U) &&
+               row.observed_contiguous_frontier == 0 &&
+               row.certified_published_frontier == 0 &&
+               row.canonical_apply_frontier == 0U &&
+               ((row.observed_native_message_count == 0U) ==
+                (row.highest_observed_sequence == 0));
+    }
+    if (row.observed_native_message_count == 0U) {
+        return false;
+    }
+    if (row.origin_sequence <= 0) {
         return false;
     }
     const std::int64_t before_origin = row.origin_sequence - 1;
@@ -896,6 +928,8 @@ RealtimeCertifiedChannelStateCanonicalV1(
         case RealtimeCertifiedStateV1::kFrozenResource:
         case RealtimeCertifiedStateV1::kStopped:
             return true;
+        case RealtimeCertifiedStateV1::kDegraded:
+            return false;
         case RealtimeCertifiedStateV1::kDisabled:
         case RealtimeCertifiedStateV1::kNoData:
             return false;

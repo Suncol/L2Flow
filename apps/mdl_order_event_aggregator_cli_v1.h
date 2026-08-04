@@ -28,10 +28,6 @@ struct OrderEventAggregatorOptionsV1 final {
     std::size_t read_batch_records = 0U;
     std::uint32_t poll_interval_ms = 0U;
     std::uint32_t control_timeout_ms = 0U;
-    // Nonzero only for a router-managed sidecar. The process arms Linux
-    // parent-death signaling and verifies this exact parent before attaching
-    // any source mapping. Standalone/external deployments leave it zero.
-    std::uint64_t managed_parent_pid = 0U;
     // Empty preserves inherited affinity. A nonempty value is applied and
     // read back exactly by the aggregation thread before source attach; the
     // control thread subsequently inherits that same mask.
@@ -72,8 +68,6 @@ OrderEventAggregatorHelpV1() noexcept {
         "accepts LIVE_PARTIAL\n"
         "  --cpu-set LIST                    optional strict logical CPU "
         "set for this Event process\n"
-        "  --parent-pid N                    managed mode: exact router PID "
-        "death guard\n"
         "\n"
         "Other:\n"
         "  --help                            print this help and exit\n"
@@ -81,7 +75,8 @@ OrderEventAggregatorHelpV1() noexcept {
         "The process always starts at the selected source coverage's local\n"
         "tick sequence 1. It has no\n"
         "skip, overrun catch-up, WAL, recovery, Parquet, or compaction "
-        "mode.\n";
+        "mode. Its Wire input must already be ordered by each native domain; "
+        "do not attach it to live callback-order Wire.\n";
 }
 
 namespace order_event_aggregator_cli_detail {
@@ -179,7 +174,6 @@ ParseOrderEventAggregatorArgumentsV1(
         bool timeout_seen = false;
         bool temporal_coverage_seen = false;
         bool cpu_set_seen = false;
-        bool parent_pid_seen = false;
 
         const auto duplicate = [&](bool* seen,
                                    std::string_view name) {
@@ -381,20 +375,6 @@ ParseOrderEventAggregatorArgumentsV1(
                     return OrderEventAggregatorParseResultV1::kError;
                 }
                 parsed.cpu_set = std::string(value);
-            } else if (name == "--parent-pid") {
-                if (duplicate(&parent_pid_seen, name) ||
-                    !ParseUnsigned(value, &numeric) ||
-                    numeric == 0U ||
-                    numeric > static_cast<std::uint64_t>(
-                                  std::numeric_limits<int>::max())) {
-                    if (error_message->empty()) {
-                        SetError(
-                            error_message,
-                            "--parent-pid must be a positive Linux pid_t");
-                    }
-                    return OrderEventAggregatorParseResultV1::kError;
-                }
-                parsed.managed_parent_pid = numeric;
             } else if (
                 name == "--poll-ms" || name == "--timeout-ms") {
                 bool* const seen =

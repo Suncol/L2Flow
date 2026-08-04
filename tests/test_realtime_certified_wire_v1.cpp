@@ -75,6 +75,7 @@ MakeChannelState() noexcept {
     row.trade_date = 20260730U;
     row.channel = 1;
     row.market = 1U;
+    row.channel_correction_epoch = 1U;
     return row;
 }
 
@@ -129,7 +130,7 @@ static_assert(
     std::array<std::uint8_t, 8U>{
         'L', '2', 'F', 'C', 'E', 'R', 'T', '1'});
 static_assert(ipc::kRealtimeCertifiedWireMajorV1 == 1U);
-static_assert(ipc::kRealtimeCertifiedWireMinorV1 == 0U);
+static_assert(ipc::kRealtimeCertifiedWireMinorV1 == 1U);
 static_assert(
     ipc::kRealtimeCertifiedLittleEndianMarkerV1 ==
     0x01020304U);
@@ -198,6 +199,10 @@ static_assert(
         ipc::RealtimeCertifiedChannelStateV1,
         channel) == 112U);
 static_assert(
+    offsetof(
+        ipc::RealtimeCertifiedChannelStateV1,
+        channel_correction_epoch) == 120U);
+static_assert(
     offsetof(ipc::RealtimeCertifiedTickEnvelopeV1, payload) ==
     32U);
 static_assert(
@@ -228,6 +233,9 @@ static_assert(
 static_assert(
     static_cast<std::uint32_t>(
         ipc::RealtimeCertifiedStateV1::kStopped) == 8U);
+static_assert(
+    static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kDegraded) == 9U);
 
 static_assert(ipc::RealtimeCertifiedHeaderCanonicalV1(MakeHeader()));
 static_assert(
@@ -315,6 +323,13 @@ static_assert([]() constexpr {
 }());
 static_assert([]() constexpr {
     auto header = MakeHeader();
+    header.aggregate_state = static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kDegraded);
+    header.frozen_channel_count = 1U;
+    return ipc::RealtimeCertifiedHeaderCanonicalV1(header);
+}());
+static_assert([]() constexpr {
+    auto header = MakeHeader();
     header.reserved_identity = 1U;
     return !ipc::RealtimeCertifiedHeaderCanonicalV1(header);
 }());
@@ -365,6 +380,81 @@ static_assert([]() constexpr {
 static_assert([]() constexpr {
     auto row = MakeChannelState();
     row.reserved[0U] = 1U;
+    return !ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
+}());
+static_assert([]() constexpr {
+    auto row = MakeChannelState();
+    row.origin_sequence = 0;
+    row.observed_contiguous_frontier = 0;
+    row.certified_published_frontier = 0;
+    row.highest_observed_sequence = 99;
+    row.canonical_apply_frontier = 0U;
+    row.observed_native_message_count = 2U;
+    row.certified_tick_count = 0U;
+    row.pending_token_count = 2U;
+    row.state = static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kGapOpen);
+    return ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
+}());
+static_assert([]() constexpr {
+    auto row = MakeChannelState();
+    row.origin_sequence = 0;
+    row.observed_contiguous_frontier = 0;
+    row.certified_published_frontier = 0;
+    row.highest_observed_sequence = 100;
+    row.canonical_apply_frontier = 0U;
+    row.observed_native_message_count = 1U;
+    row.certified_tick_count = 0U;
+    row.pending_token_count = 1U;
+    row.state = static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kFrozenResource);
+    return ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
+}());
+static_assert([]() constexpr {
+    auto row = MakeChannelState();
+    row.origin_sequence = 0;
+    row.observed_contiguous_frontier = 0;
+    row.certified_published_frontier = 0;
+    row.highest_observed_sequence = 0;
+    row.canonical_apply_frontier = 0U;
+    row.observed_native_message_count = 0U;
+    row.certified_tick_count = 0U;
+    row.pending_token_count = 1U;
+    row.state = static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kFrozenConflict);
+    return ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
+}());
+static_assert([]() constexpr {
+    auto row = MakeChannelState();
+    row.origin_sequence = 0;
+    row.observed_contiguous_frontier = 0;
+    row.certified_published_frontier = 0;
+    row.highest_observed_sequence = 0;
+    row.canonical_apply_frontier = 0U;
+    row.observed_native_message_count = 0U;
+    row.certified_tick_count = 0U;
+    row.pending_token_count = 0U;
+    row.state = static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kFrozenResource);
+    return ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
+}());
+static_assert([]() constexpr {
+    auto row = MakeChannelState();
+    row.origin_sequence = 0;
+    row.observed_contiguous_frontier = 0;
+    row.certified_published_frontier = 0;
+    row.highest_observed_sequence = 0;
+    row.canonical_apply_frontier = 0U;
+    row.observed_native_message_count = 1U;
+    row.certified_tick_count = 0U;
+    row.pending_token_count = 1U;
+    row.state = static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kFrozenResource);
+    return !ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
+}());
+static_assert([]() constexpr {
+    auto row = MakeChannelState();
+    row.channel_correction_epoch = 0U;
     return !ipc::RealtimeCertifiedChannelStateCanonicalV1(row);
 }());
 

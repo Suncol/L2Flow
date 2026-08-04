@@ -16,13 +16,19 @@ struct CertifiedOrderEventJournalConfigV1 final {
     std::uint64_t session_epoch = 0U;
     std::uint32_t trade_date = 0U;
     std::uint64_t event_capacity = 0U;
-    // Zero derives the exact checked full-day mapping from event_capacity.
+    // Zero derives the exact checked mapping from event_capacity.
     // A nonzero value is an additional operator bound; there is no arbitrary
-    // production cap below a correctly configured full-day capacity.
+    // production cap below a correctly configured capacity.
     std::uint64_t maximum_mapping_bytes = 0U;
     // Physical backing is reserved only as publication approaches a chunk.
     std::uint64_t lazy_commit_chunk_bytes =
         64ULL * 1024ULL * 1024ULL;
+    CertifiedOrderEventTemporalCoverageV1 temporal_coverage =
+        CertifiedOrderEventTemporalCoverageV1::kFromOpen;
+    // Zero for from-open. A process-start service supplies a nonzero
+    // provisional boundary at construction, then finalizes it behind its
+    // pre-exposure worker barrier after SDK Connect succeeds.
+    std::uint64_t coverage_start_unix_ns = 0U;
 };
 
 struct CertifiedOrderEventJournalSessionV1 final {
@@ -31,6 +37,9 @@ struct CertifiedOrderEventJournalSessionV1 final {
     std::uint32_t trade_date = 0U;
     std::uint64_t event_capacity = 0U;
     std::uint64_t total_mapping_bytes = 0U;
+    CertifiedOrderEventTemporalCoverageV1 temporal_coverage =
+        CertifiedOrderEventTemporalCoverageV1::kFromOpen;
+    std::uint64_t coverage_start_unix_ns = 0U;
 
     [[nodiscard]] friend bool operator==(
         const CertifiedOrderEventJournalSessionV1&,
@@ -119,7 +128,14 @@ public:
     // prefix barrier, before the control socket is exposed. This is a
     // monotonic transition and remains false for ordinary from-open startup.
     [[nodiscard]] bool MarkStartupPrefixRecovered() noexcept;
+    // Serial-writer operation used once by a process-start service before its
+    // descriptor can be exposed. It replaces the provisional boundary with
+    // the post-Connect coverage boundary under the header publication tag.
+    [[nodiscard]] bool FinalizeProcessStartCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept;
     [[nodiscard]] std::uint32_t coverage_flags() const noexcept;
+    [[nodiscard]] std::uint64_t coverage_start_unix_ns() const
+        noexcept;
     [[nodiscard]] bool failed() const noexcept;
 
 private:

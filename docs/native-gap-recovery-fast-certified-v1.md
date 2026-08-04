@@ -62,11 +62,13 @@ shadow Pipeline，闭合 handoff 后发布 recovered FAST/CERTIFIED 前缀。任
 晚于开盘的可信 checkpoint、上次进程状态或 ring overrun catch-up 仍不在
 本协议范围内。
 
-`--intraday-live-partial` 是第三种 startup mode，但不是 coverage source：它
-服务进程启动后的 latest 数据，并可通过不可变 generation 查询同一起点的
-单标的 History/tick delta；它自动禁用 CERTIFIED sidecar，并始终保持
-`certified_prefix_valid=false`。它不能用启动后的 native sequence 片段伪造
-从开盘完整的 CERTIFIED 前缀。
+`--intraday-live-partial` 是第三种 startup mode，但不是 from-open coverage
+source：它服务进程启动后的 latest 数据，并可通过不可变 generation 查询
+同一起点的单标的 History/tick delta。canonical service 使用 bounded unknown-
+origin bootstrap 生成 process-start Event journal，但 FAST 仍保持
+`certified_prefix_valid=false`，Event wire 也明确标记
+`PROCESS_START_PARTIAL`。它不能用启动后的 native sequence 片段伪造从开盘
+完整的 CERTIFIED 前缀。
 
 不同 channel 之间没有文档定义的交易所总序。本实现的
 `canonical_apply_sequence` 只是本进程对多个已就绪 channel 的确定性发布
@@ -115,7 +117,8 @@ SDK callback
 
 每个原生 domain 独立维护：
 
-- `origin_sequence`：生产为 1；
+- `origin_sequence`：from-open/recovered 为 1；partial 在 bounded bootstrap
+  完成后取该 coverage epoch 已证明的最小序号；
 - `observed_contiguous_sequence`：从原点起已经收到的稠密前缀；
 - `highest_observed_sequence`；
 - `certified_sequence`：已经提交到 CERTIFIED 下游的原生前缀；
@@ -128,10 +131,19 @@ SDK callback
 | 状态 | 含义 | 对 FAST 的影响 |
 |---|---|---|
 | `Healthy` / `CONTIGUOUS` | observed 与 certified 前缀连续 | 无 |
+| `Bootstrapping` / `GAP_OPEN` | partial origin 尚未由 disorder bound 证明 | 无 |
 | `Repairing` / `GAP_OPEN` | 仍有未收到的原生位置 | 无 |
 | `CatchingUp` | 缺口已收到，但异步下游尚未提交完 | 无 |
 | `FrozenConflict` | 同一原生 key 出现不同 canonical 业务负载 | 无 |
 | `FrozenResource` | 有界容量、保留窗口或内部证明条件不足 | 无 |
+
+partial 对每个 channel 维护最小值 `m`、最高值 `H` 和 operator 声明的最大
+向后位移 `D`。当 `H-m >= D` 时，未来再到达 `u<m` 会推出
+`H-u>D`，所以此时才把 `m` 确认为 origin。origin 建立后，若下一个缺失位置
+为 `e`，`H-e == D` 仍允许合法晚到；只有 `H-e > D` 才冻结该 channel。
+clean shutdown 在 handoff 排空后执行 `SealInput()`：连续低流量尾部从最小值
+flush，真实 hole 或 observation/application 未闭合则只冻结对应 channel。
+运行中不使用毫秒 timeout 猜测 origin。
 
 以进程收到的第一条上海消息为 `BizIndex=3` 为例：
 
@@ -164,7 +176,7 @@ CERTIFIED 私有区；所以公开历史始终是不可变的正确前缀。
 1. 构造并校验 envelope，预检 Tick ring/latest 槽；
 2. 提交 recovery 内部 token；
 3. 在 `AppendCertifiedTick()` 内先预检 Event 容量与物理 backing，再更新
-   order projector 并向 full-day Event journal 追加 Event；
+   order projector 并向 canonical Event journal 追加 Event；
 4. 取得与本 Tick 对应的 Event generation；
 5. 发布 CERTIFIED Tick ring 与 per-instrument latest 槽；
 6. 推进进程级 `canonical_apply_frontier` 和对应 channel 状态；
@@ -190,7 +202,8 @@ coherent_canonical_apply_frontier =
 - 原始 native sequence/channel；
 - 原始 source、ingress、tick-stream anchors。
 
-历史 Event 是 append-only full-day journal，不受有限 Tick ring 回绕影响。
+Event 是 append-only journal，不受有限 Tick ring 回绕影响；其 V1.3 header
+明确区分 from-open 与 process-start coverage。
 
 ### 并发发布协议
 
@@ -233,9 +246,9 @@ History 在所有 publisher join 后、释放 append-only Store 前调用
 `QuiesceRecordReferences()`；CERTIFIED worker 先排空/停止，从而保证 queue
 中借用的 record 指针不会悬空。
 
-异常 shutdown 不会把 `FrozenConflict`、`FrozenResource`、`GAP_OPEN` 或
-`CATCHING_UP` 覆盖成无信息的 `STOPPED`。只有健康/无数据状态才发布 clean
-`STOPPED`。
+clean shutdown 发布 `STOPPED`，但保留 per-channel frozen/gap counters；严格
+whole-market consumer 因此仍能拒绝不完整前缀。运行中单 channel freeze 的
+aggregate state 是非终止 `DEGRADED`，健康 channel 可继续发布。
 
 ## 7. 生产启用方式
 
@@ -247,6 +260,9 @@ Native recovery / CERTIFIED 默认开启：
 
 --disable-native-gap-recovery
     显式关闭，运行原 FAST-only 组合
+
+--native-maximum-backward-displacement D
+    partial canonical Event 必填；声明 callback 最大向后位移
 ```
 
 常规 from-open 组合中，CERTIFIED Create/Start/容量配置失败只记录
@@ -264,7 +280,7 @@ journal record，直到最早完整前缀被找到或同一个 absolute warmup d
 
 ### 正确性
 
-- Release 全量 CTest：49/49 通过；
+- Release 全量 CTest；
 - 核心恢复、wire、reader、Event journal/history、service、pipeline、
   上海/深圳 Event projector 在 ASan+UBSan 下通过；
 - native recovery、reader、Event journal 与真实 UDS service 在 TSan

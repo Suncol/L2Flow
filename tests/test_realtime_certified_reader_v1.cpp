@@ -218,6 +218,7 @@ public:
         channel.trade_date = 20260730U;
         channel.channel = 1;
         channel.market = 1U;
+        channel.channel_correction_epoch = 1U;
 
         if (!ipc::RealtimeCertifiedHeaderCanonicalV1(*header_)) {
             return false;
@@ -454,7 +455,8 @@ bool TestOpenAndReads() {
         reader->ReadChannelState(0U, &channel) ==
                 ipc::RealtimeCertifiedReadResultV1::kOk &&
             channel.observed_contiguous_frontier == 105 &&
-            channel.certified_published_frontier == 105,
+            channel.certified_published_frontier == 105 &&
+            channel.channel_correction_epoch == 1U,
         "read coherent per-channel native frontiers");
     ok &= Expect(
         reader->ReadChannelState(1U, &channel) ==

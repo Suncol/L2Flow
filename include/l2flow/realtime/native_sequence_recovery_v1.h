@@ -75,6 +75,16 @@ enum class NativeSequenceRecoveryRecordClassV1 : std::uint8_t {
     kFiltered,
 };
 
+enum class NativeSequenceOriginPolicyV1 : std::uint8_t {
+    // The coverage epoch begins at expected_origin_sequence (or resumes at
+    // trusted_checkpoint_sequence + 1).
+    kExplicitOrigin = 0U,
+    // The process-start origin is unknown. A channel remains bootstrapping
+    // until its observed min/max span proves the minimum under the declared
+    // maximum backward displacement.
+    kBoundedProcessStart = 1U,
+};
+
 struct NativeSequenceRecoveryConfigV1 final {
     std::size_t maximum_channels = 0U;
     // Unique native keys retained before certification. Applied-before-
@@ -99,8 +109,9 @@ struct NativeSequenceRecoveryConfigV1 final {
     // discovered channel. It must be nonzero: the coordinator never infers
     // completeness from the first packet it happens to observe. The production
     // from-open composition uses the default of one because both supported
-    // vendor domains are documented as starting at one. A partial-session
-    // caller must instead provide its explicit trusted epoch origin.
+    // vendor domains are documented as starting at one. This field is ignored
+    // as an origin under kBoundedProcessStart; a caller with an authoritative
+    // per-channel partial origin registers it before the first observation.
     std::uint64_t expected_origin_sequence = 1U;
 
     // Optional caller-certified prefix within the explicit coverage epoch.
@@ -111,6 +122,15 @@ struct NativeSequenceRecoveryConfigV1 final {
     // it as authoritative and begins waiting at checkpoint + 1.
     //
     std::uint64_t trusted_checkpoint_sequence = 0U;
+
+    NativeSequenceOriginPolicyV1 origin_policy =
+        NativeSequenceOriginPolicyV1::kExplicitOrigin;
+
+    // Runtime declaration for process-start callback disorder. For every
+    // previously unseen native position s, highest_seen_before_arrival - s
+    // must not exceed this value. It is distinct from maximum_reorder_span,
+    // which bounds forward pending distance from a certified frontier.
+    std::uint64_t maximum_backward_displacement = 0U;
 };
 
 enum class NativeSequenceRecoveryCreateErrorV1 : std::uint8_t {
@@ -126,6 +146,7 @@ enum class NativeSequenceRecoveryChannelStateV1 : std::uint8_t {
     kRepairing,
     kFrozenConflict,
     kFrozenResource,
+    kBootstrapping,
 };
 
 enum class NativeSequenceRecoveryFreezeReasonV1 : std::uint8_t {
@@ -137,6 +158,8 @@ enum class NativeSequenceRecoveryFreezeReasonV1 : std::uint8_t {
     kReorderWindowExceeded,
     kDuplicateVerificationUnavailable,
     kInternalInvariant,
+    kReorderBoundExceeded,
+    kInputSealedIncomplete,
 };
 
 // The token is an ABA-protected reference to one pending native position.
@@ -191,6 +214,7 @@ enum class NativeSequenceRecoveryObserveErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
     kInvalidInput,
+    kInputSealed,
 };
 
 struct NativeSequenceRecoveryObserveResultV1 final {
@@ -218,6 +242,7 @@ enum class NativeSequenceRecoveryApplyErrorV1 : std::uint8_t {
     kWrongRecordClass,
     kUnexpectedApplication,
     kChannelFrozen,
+    kInputSealed,
 };
 
 enum class NativeSequenceRecoveryApplyDispositionV1 :
@@ -292,9 +317,24 @@ struct NativeSequenceRecoveryChannelSnapshotV1 final {
     std::uint64_t duplicate_outside_retention = 0U;
     std::uint64_t conflicts = 0U;
     std::uint64_t filtered_sequences_certified = 0U;
+    std::uint64_t channel_correction_epoch = 1U;
     std::size_t pending_entries = 0U;
     std::uint64_t missing_sequences = 0U;
     bool coverage_from_sequence_one = false;
+};
+
+enum class NativeSequenceRecoveryRegisterOriginErrorV1
+    : std::uint8_t {
+    kNone = 0U,
+    kInvalidInput,
+    kInputSealed,
+    kChannelAlreadyObserved,
+    kChannelCapacity,
+};
+
+enum class NativeSequenceRecoverySealErrorV1 : std::uint8_t {
+    kNone = 0U,
+    kAlreadySealed,
 };
 
 struct NativeSequenceRecoverySnapshotV1 final {
@@ -348,6 +388,16 @@ public:
         std::unique_ptr<NativeSequenceRecoveryCoordinatorV1>* output)
         noexcept;
 
+    // Registers an authoritative per-channel coverage epoch before the first
+    // observation/application for that channel. checkpoint zero means
+    // origin - 1. This fixed-table operation is intended for worker-thread
+    // startup, never an SDK callback lookup.
+    [[nodiscard]] NativeSequenceRecoveryRegisterOriginErrorV1
+    RegisterTrustedOrigin(
+        const NativeSequenceChannelV1& domain,
+        std::uint64_t origin,
+        std::uint64_t checkpoint = 0U) noexcept;
+
     [[nodiscard]] NativeSequenceRecoveryObserveErrorV1 Observe(
         const NativeSequenceDescriptorV1& descriptor,
         const l2flow::sdk::MessageKey& message_key,
@@ -393,6 +443,13 @@ public:
     // that CERTIFIED stream if the downstream transaction then fails.
     [[nodiscard]] NativeSequenceRecoveryCommitErrorV1 CommitCertified(
         const NativeSequenceRecoveryTokenV1& token) noexcept;
+
+    // Terminal input barrier. No Observe/MarkTargetApplied call is accepted
+    // afterwards. A still-bootstrapping contiguous channel is safely started
+    // at its observed minimum; a real native hole or unmatched handoff
+    // freezes only that channel as incomplete.
+    [[nodiscard]] NativeSequenceRecoverySealErrorV1 SealInput()
+        noexcept;
 
     [[nodiscard]] bool ChannelSnapshot(
         const NativeSequenceChannelV1& domain,

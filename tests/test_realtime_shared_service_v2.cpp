@@ -1981,7 +1981,8 @@ template <typename Message>
 
 [[nodiscard]] bool SpawnPythonHistoryLatencyProbe(
     const std::filesystem::path& socket_path,
-    PythonLatencyProcess* output) {
+    PythonLatencyProcess* output,
+    const std::filesystem::path& certified_socket_path = {}) {
 #if defined(L2FLOW_V2_PYTHON_PROBE_EXECUTABLE) && \
     defined(L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT) && \
     defined(L2FLOW_V2_PYTHON_SOURCE) && \
@@ -1999,15 +2000,18 @@ template <typename Message>
     }
     UniqueFd parent_socket(sockets[0U]);
     UniqueFd child_socket(sockets[1U]);
-    std::array<std::string, 6U> arguments{{
+    std::vector<std::string> arguments{
         L2FLOW_V2_PYTHON_PROBE_EXECUTABLE,
         "-B",
         L2FLOW_V2_PYTHON_HISTORY_LATENCY_SCRIPT,
         socket_path.string(),
         L2FLOW_V2_PYTHON_READER_LIBRARY,
         L2FLOW_V2_PYTHON_SOURCE,
-    }};
-    std::array<char*, 7U> argv{};
+    };
+    if (!certified_socket_path.empty()) {
+        arguments.push_back(certified_socket_path.string());
+    }
+    std::vector<char*> argv(arguments.size() + 1U, nullptr);
     for (std::size_t index = 0U; index < arguments.size(); ++index) {
         argv[index] = arguments[index].data();
     }
@@ -2069,6 +2073,7 @@ template <typename Message>
 #else
     static_cast<void>(socket_path);
     static_cast<void>(output);
+    static_cast<void>(certified_socket_path);
     return false;
 #endif
 }
@@ -7549,6 +7554,8 @@ struct ThroughputBenchmarkConfigV1 final {
     StartupBenchmarkScenarioV1 scenario =
         StartupBenchmarkScenarioV1::kFromOpen;
     std::chrono::milliseconds generation_interval{0};
+    bool loaded_polars_latency = false;
+    bool loaded_event_polars_latency = false;
 };
 
 [[nodiscard]] std::string_view ThroughputWorkloadNameV1(
@@ -7874,16 +7881,28 @@ bool RunThroughputProfileBenchmark(
     constexpr std::uint64_t kCertifiedQueueCapacity = 4'194'304U;
     constexpr std::uint64_t kMaximumTargetRate = 1'000'000U;
     constexpr std::uint64_t kMaximumDurationMs = 10'000U;
+    constexpr std::uint64_t kLoadedMaximumDurationMs = 300'000U;
     constexpr std::uint64_t kMaximumPlannedCallbacks = 5'000'000U;
+    constexpr std::uint64_t kLoadedMaximumPlannedCallbacks =
+        150'000'000U;
     constexpr std::uint64_t kMaximumAccountedBytes =
         32ULL * 1024ULL * 1024ULL * 1024ULL;
+    constexpr std::uint64_t kLoadedMaximumAccountedBytes =
+        640ULL * 1024ULL * 1024ULL * 1024ULL;
+    const bool loaded_latency =
+        benchmark.loaded_polars_latency ||
+        benchmark.loaded_event_polars_latency;
     const std::uint64_t duration_ms =
         static_cast<std::uint64_t>(benchmark.duration.count());
     const bool factor_generation_enabled =
         benchmark.scenario == StartupBenchmarkScenarioV1::kFromOpen;
     if (benchmark.target_rate == 0U ||
         benchmark.target_rate > kMaximumTargetRate ||
-        duration_ms == 0U || duration_ms > kMaximumDurationMs ||
+        duration_ms == 0U ||
+        duration_ms >
+            (loaded_latency
+                 ? kLoadedMaximumDurationMs
+                 : kMaximumDurationMs) ||
         benchmark.instruments_per_market == 0U ||
         benchmark.instruments_per_market > 14'599U ||
         benchmark.store_worker_count == 0U ||
@@ -7893,7 +7912,24 @@ bool RunThroughputProfileBenchmark(
         benchmark.generation_interval.count() < 0 ||
         (benchmark.scenario ==
              StartupBenchmarkScenarioV1::kLivePartialNoRecovery &&
-         benchmark.sink != ThroughputSinkV1::kFast)) {
+         benchmark.sink != ThroughputSinkV1::kFast) ||
+        (benchmark.loaded_polars_latency &&
+         (benchmark.target_rate > 500'000U ||
+          benchmark.workload !=
+              ThroughputWorkloadV1::kFiveTupleUniform ||
+          benchmark.sink != ThroughputSinkV1::kFast ||
+          benchmark.generation_interval.count() <= 0)) ||
+        (benchmark.loaded_event_polars_latency &&
+         (benchmark.target_rate > 500'000U ||
+          benchmark.workload !=
+              ThroughputWorkloadV1::kFiveTupleUniform ||
+          benchmark.sink !=
+              ThroughputSinkV1::kFastAndCertified ||
+          benchmark.scenario !=
+              StartupBenchmarkScenarioV1::kFromOpen ||
+          benchmark.generation_interval.count() <= 0)) ||
+        (benchmark.loaded_polars_latency &&
+         benchmark.loaded_event_polars_latency)) {
         std::cerr << "invalid throughput profile arguments\n";
         return false;
     }
@@ -7904,7 +7940,11 @@ bool RunThroughputProfileBenchmark(
     }
     const std::uint64_t planned =
         benchmark.target_rate * duration_ms / 1'000U;
-    if (planned == 0U || planned > kMaximumPlannedCallbacks) {
+    if (planned == 0U ||
+        planned >
+            (loaded_latency
+                 ? kLoadedMaximumPlannedCallbacks
+                 : kMaximumPlannedCallbacks)) {
         std::cerr << "throughput profile callback count out of range\n";
         return false;
     }
@@ -7940,6 +7980,10 @@ bool RunThroughputProfileBenchmark(
         << " online_recovery=0"
         << " factor_generation_enabled="
         << (factor_generation_enabled ? 1 : 0)
+        << " loaded_polars_latency="
+        << (benchmark.loaded_polars_latency ? 1 : 0)
+        << " loaded_event_polars_latency="
+        << (benchmark.loaded_event_polars_latency ? 1 : 0)
         << " generation_interval_ms="
         << benchmark.generation_interval.count()
         << " native_sequence_base="
@@ -7987,6 +8031,19 @@ bool RunThroughputProfileBenchmark(
             "create throughput profile fixture")) {
         return false;
     }
+    std::uint32_t loaded_polars_instrument_id = 0U;
+    if (benchmark.loaded_polars_latency) {
+        const auto lookup = fixture.catalog->Lookup(
+            Key("", "600001"));
+        if (!Expect(
+                lookup.error ==
+                        market::DailyInstrumentCatalogLookupErrorV2::kNone &&
+                    lookup.entry != nullptr,
+                "resolve loaded Polars benchmark instrument")) {
+            return false;
+        }
+        loaded_polars_instrument_id = lookup.entry->instrument_id;
+    }
     const common::Identity128 run_id = RunId(0x82U);
     const std::filesystem::path socket_path =
         temporary.path() / "throughput-profile-fast.sock";
@@ -8033,6 +8090,8 @@ bool RunThroughputProfileBenchmark(
 
     std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
         certified_service;
+    const std::filesystem::path certified_socket_path =
+        temporary.path() / "throughput-profile-certified.sock";
     if (benchmark.sink == ThroughputSinkV1::kFastAndCertified) {
         ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
         certified_config.run_id = run_id;
@@ -8057,8 +8116,7 @@ bool RunThroughputProfileBenchmark(
             static_cast<std::size_t>(planned);
         certified_config.maximum_derived_events =
             static_cast<std::size_t>(planned * 4U);
-        certified_config.control_socket_path =
-            temporary.path() / "throughput-profile-certified.sock";
+        certified_config.control_socket_path = certified_socket_path;
         const auto certified_error =
             ipc::RealtimeCertifiedMarketServiceV1::Create(
                 std::move(certified_config),
@@ -8069,7 +8127,8 @@ bool RunThroughputProfileBenchmark(
                         ipc::RealtimeCertifiedServiceCreateErrorV1::
                             kNone &&
                     certified_service != nullptr &&
-                    certified_service->Start(&system_error),
+                    certified_service->Start(&system_error) &&
+                    service->MarkCertifiedPrefixValid(),
                 "create/start throughput CERTIFIED service")) {
             if (certified_service != nullptr) {
                 certified_service->StopControl();
@@ -8104,7 +8163,9 @@ bool RunThroughputProfileBenchmark(
     pipeline_config.intraday_store.maximum_session_records =
         planned + benchmark.decoder_queue_capacity_per_source;
     pipeline_config.intraday_store.maximum_session_accounted_bytes =
-        kMaximumAccountedBytes;
+        loaded_latency
+            ? kLoadedMaximumAccountedBytes
+            : kMaximumAccountedBytes;
     pipeline_config.intraday_store.maximum_records_per_batch =
         65'536U;
     pipeline_config.intraday_store.coverage_from_open =
@@ -8173,6 +8234,101 @@ bool RunThroughputProfileBenchmark(
         return false;
     }
 
+    PythonLatencyProcess loaded_python;
+    ProtocolChannel* loaded_protocol = nullptr;
+    std::uint64_t loaded_baseline_generation = 0U;
+    auto run_loaded_python_command = [](
+                                         ProtocolChannel* protocol,
+                                         const std::string& command,
+                                         std::string_view sample_prefix,
+                                         std::string* sample) {
+        if (protocol == nullptr || command.empty() ||
+            sample_prefix.empty() || sample == nullptr ||
+            !protocol->SendLine(command)) {
+            return false;
+        }
+        if (!protocol->ReadLine(
+                std::chrono::seconds(120), sample) ||
+            !sample->starts_with(sample_prefix)) {
+            std::cerr << "loaded Polars sample: " << *sample << '\n';
+            return false;
+        }
+        std::cout << "PYTHON_" << *sample << '\n';
+        std::string done;
+        if (!protocol->ReadLine(
+                std::chrono::seconds(120), &done) ||
+            !done.starts_with("DONE ")) {
+            std::cerr << "loaded Polars DONE: " << done << '\n';
+            return false;
+        }
+        std::cout << "PYTHON_" << done << '\n';
+        return true;
+    };
+    if (loaded_latency) {
+        if (!Expect(
+                SpawnPythonHistoryLatencyProbe(
+                    socket_path,
+                    &loaded_python,
+                    benchmark.loaded_event_polars_latency
+                        ? certified_socket_path
+                        : std::filesystem::path{}) &&
+                    loaded_python.channel() != nullptr,
+                "start loaded Python/Polars probe")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        loaded_protocol = loaded_python.channel();
+        std::string ready;
+        if (!Expect(
+                loaded_protocol->ReadLine(
+                    std::chrono::seconds(30), &ready) &&
+                    ready.starts_with("READY "),
+                "loaded Python/Polars probe becomes ready")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        std::cout << "PYTHON_" << ready << '\n';
+    }
+    if (benchmark.loaded_polars_latency) {
+        const runtime::RealtimePipelineCutResultV1 baseline_cut =
+            pipeline->CutAndPublishGeneration(
+                std::chrono::seconds(60));
+        const bool baseline_factor_valid =
+            baseline_cut.factor_generation_enabled ==
+                factor_generation_enabled &&
+            (factor_generation_enabled
+                 ? baseline_cut.factor_generation != nullptr
+                 : baseline_cut.factor_generation == nullptr);
+        if (!Expect(
+                baseline_cut.published() &&
+                    baseline_cut.store_generation != nullptr &&
+                    baseline_factor_valid &&
+                    baseline_cut.store_generation->record_count() == 0U,
+                "publish loaded Polars empty baseline")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        loaded_baseline_generation =
+            baseline_cut.store_generation->watermark().generation;
+        std::string baseline_sample;
+        if (!Expect(
+                run_loaded_python_command(
+                    loaded_protocol,
+                    "RAW_POLARS_BASELINE " +
+                        std::to_string(loaded_polars_instrument_id) + " " +
+                        std::to_string(loaded_baseline_generation),
+                    "RAW_POLARS_BASELINE ",
+                    &baseline_sample),
+                "establish loaded Polars baseline")) {
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
+
     std::array<std::uint64_t, 5U> offered_by_tuple{};
     std::array<std::uint64_t, 4U> backlog_at_quarter{};
     const std::uint64_t native_sequence_base =
@@ -8184,6 +8340,83 @@ bool RunThroughputProfileBenchmark(
     std::uint64_t shenzhen_native_sequence = native_sequence_base;
     const std::size_t cycle_size =
         ThroughputCycleSizeV1(benchmark.workload);
+
+    struct LoadedPolarsCallbackBoundaryV1 final {
+        std::uint64_t ingress_sequence = 0U;
+        std::uint64_t caller_before_callback_ns = 0U;
+    };
+    std::vector<LoadedPolarsCallbackBoundaryV1>
+        loaded_polars_boundaries;
+    std::atomic<std::uint64_t> loaded_polars_boundary_count{0U};
+    std::vector<std::uint64_t> loaded_polars_strict_first_ns;
+    std::vector<std::uint64_t> loaded_polars_strict_last_ns;
+    std::vector<std::uint64_t> loaded_polars_publication_ns;
+    std::vector<std::uint64_t> loaded_polars_open_to_ready_ns;
+    std::vector<std::uint64_t> loaded_event_command_to_ready_ns;
+    struct LoadedEventPolarsLoadV1 final {
+        std::uint64_t duration_ms = 0U;
+        std::uint64_t elapsed_ns = 0U;
+        std::uint64_t rows = 0U;
+        std::uint64_t batches = 0U;
+        std::uint64_t nonempty_batches = 0U;
+        std::uint64_t first_event_sequence = 0U;
+        std::uint64_t last_event_sequence = 0U;
+        std::uint64_t next_event_sequence = 0U;
+        std::uint64_t advertised_event_sequence = 0U;
+        std::uint64_t event_backlog = 0U;
+        std::uint64_t caught_up = 0U;
+        std::uint64_t materialized_events_per_second = 0U;
+        std::uint64_t strict_first_min_ns = 0U;
+        std::uint64_t strict_first_p50_ns = 0U;
+        std::uint64_t strict_first_p95_ns = 0U;
+        std::uint64_t strict_first_p99_ns = 0U;
+        std::uint64_t strict_first_max_ns = 0U;
+        std::uint64_t strict_last_min_ns = 0U;
+        std::uint64_t strict_last_p50_ns = 0U;
+        std::uint64_t strict_last_p95_ns = 0U;
+        std::uint64_t strict_last_p99_ns = 0U;
+        std::uint64_t strict_last_max_ns = 0U;
+    } loaded_event_load;
+    std::thread loaded_event_load_thread;
+    std::atomic<bool> loaded_event_load_valid{false};
+    std::atomic<bool> loaded_polars_failed{false};
+    std::uint64_t loaded_polars_records = 0U;
+    std::uint64_t loaded_event_polars_rows = 0U;
+    std::uint64_t loaded_polars_next_boundary = 0U;
+    std::uint64_t loaded_polars_sample_index = 0U;
+    if (benchmark.loaded_polars_latency) {
+        try {
+            const std::uint64_t maximum_target_records =
+                planned /
+                    static_cast<std::uint64_t>(
+                        benchmark.instruments_per_market) +
+                static_cast<std::uint64_t>(cycle_size) + 1U;
+            if (maximum_target_records >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max())) {
+                throw std::length_error(
+                    "loaded Polars callback boundary capacity");
+            }
+            loaded_polars_boundaries.resize(
+                static_cast<std::size_t>(maximum_target_records));
+            const std::size_t expected_samples =
+                static_cast<std::size_t>(
+                    duration_ms /
+                        static_cast<std::uint64_t>(
+                            benchmark.generation_interval.count()) +
+                    2U);
+            loaded_polars_strict_first_ns.reserve(expected_samples);
+            loaded_polars_strict_last_ns.reserve(expected_samples);
+            loaded_polars_publication_ns.reserve(expected_samples);
+            loaded_polars_open_to_ready_ns.reserve(expected_samples);
+            loaded_event_command_to_ready_ns.reserve(expected_samples);
+        } catch (...) {
+            std::cerr << "loaded Polars telemetry allocation failed\n";
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+    }
 
     std::mutex generation_mutex;
     std::condition_variable generation_cv;
@@ -8231,12 +8464,339 @@ bool RunThroughputProfileBenchmark(
                                 true, std::memory_order_release);
                             return;
                         }
+                        if (benchmark.loaded_polars_latency) {
+                            bool sample_valid = true;
+                            const std::uint64_t cut_ingress =
+                                cut.store_generation == nullptr
+                                    ? 0U
+                                    : cut.store_generation->watermark()
+                                          .ingress_sequence_exclusive -
+                                          1U;
+                            const std::uint64_t boundary_count =
+                                loaded_polars_boundary_count.load(
+                                    std::memory_order_acquire);
+                            std::uint64_t end =
+                                loaded_polars_next_boundary;
+                            while (end < boundary_count &&
+                                   loaded_polars_boundaries[
+                                       static_cast<std::size_t>(end)]
+                                           .ingress_sequence <=
+                                       cut_ingress) {
+                                ++end;
+                            }
+                            if (end > loaded_polars_next_boundary) {
+                                const auto& first =
+                                    loaded_polars_boundaries[
+                                        static_cast<std::size_t>(
+                                            loaded_polars_next_boundary)];
+                                const auto& last =
+                                    loaded_polars_boundaries[
+                                        static_cast<std::size_t>(end - 1U)];
+                                std::uint64_t ingress_sum = 0U;
+                                for (std::uint64_t index =
+                                         loaded_polars_next_boundary;
+                                     index < end;
+                                     ++index) {
+                                    const std::uint64_t ingress =
+                                        loaded_polars_boundaries[
+                                            static_cast<std::size_t>(index)]
+                                            .ingress_sequence;
+                                    if (ingress_sum >
+                                        std::numeric_limits<
+                                            std::uint64_t>::max() -
+                                            ingress) {
+                                        sample_valid = false;
+                                        break;
+                                    }
+                                    ingress_sum += ingress;
+                                }
+                                std::string sample;
+                                if (sample_valid) {
+                                    try {
+                                        const std::string command =
+                                            "RAW_POLARS_LOADED_UPDATE " +
+                                            std::to_string(
+                                                loaded_polars_instrument_id) +
+                                            " " +
+                                            std::to_string(
+                                                cut.store_generation
+                                                    ->watermark()
+                                                    .generation) +
+                                            " " +
+                                            std::to_string(
+                                                end -
+                                                loaded_polars_next_boundary) +
+                                            " " +
+                                            std::to_string(
+                                                first.ingress_sequence) +
+                                            " " +
+                                            std::to_string(
+                                                last.ingress_sequence) +
+                                            " " +
+                                            std::to_string(ingress_sum);
+                                        sample_valid =
+                                            run_loaded_python_command(
+                                                loaded_protocol,
+                                                command,
+                                                "RAW_POLARS_LOADED_SAMPLE ",
+                                                &sample);
+                                    } catch (...) {
+                                        sample_valid = false;
+                                    }
+                                }
+                                std::uint64_t sample_generation = 0U;
+                                std::uint64_t sample_records = 0U;
+                                std::uint64_t sample_first_ingress = 0U;
+                                std::uint64_t sample_last_ingress = 0U;
+                                std::uint64_t first_entry_ns = 0U;
+                                std::uint64_t last_entry_ns = 0U;
+                                std::uint64_t published_ns = 0U;
+                                std::uint64_t ready_ns = 0U;
+                                std::uint64_t open_to_ready_ns = 0U;
+                                sample_valid = sample_valid &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "generation",
+                                        &sample_generation) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "records",
+                                        &sample_records) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "first_ingress",
+                                        &sample_first_ingress) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "last_ingress",
+                                        &sample_last_ingress) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "first_callback_entry_ns",
+                                        &first_entry_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "last_callback_entry_ns",
+                                        &last_entry_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "history_published_monotonic_ns",
+                                        &published_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "polars_ready_ns",
+                                        &ready_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "open_to_polars_ns",
+                                        &open_to_ready_ns) &&
+                                    sample_generation ==
+                                        cut.store_generation->watermark()
+                                            .generation &&
+                                    sample_records ==
+                                        end -
+                                            loaded_polars_next_boundary &&
+                                    sample_first_ingress ==
+                                        first.ingress_sequence &&
+                                    sample_last_ingress ==
+                                        last.ingress_sequence &&
+                                    first.caller_before_callback_ns <=
+                                        first_entry_ns &&
+                                    last.caller_before_callback_ns <=
+                                        last_entry_ns &&
+                                    first_entry_ns <= last_entry_ns &&
+                                    last_entry_ns <= published_ns &&
+                                    published_ns <= ready_ns;
+                                if (sample_valid) {
+                                    const std::uint64_t strict_first_ns =
+                                        ready_ns -
+                                        first.caller_before_callback_ns;
+                                    const std::uint64_t strict_last_ns =
+                                        ready_ns -
+                                        last.caller_before_callback_ns;
+                                    loaded_polars_strict_first_ns.push_back(
+                                        strict_first_ns);
+                                    loaded_polars_strict_last_ns.push_back(
+                                        strict_last_ns);
+                                    loaded_polars_publication_ns.push_back(
+                                        ready_ns - published_ns);
+                                    loaded_polars_open_to_ready_ns.push_back(
+                                        open_to_ready_ns);
+                                    loaded_polars_records += sample_records;
+                                    std::cout
+                                        << "LOADED_POLARS_SAMPLE sample="
+                                        << loaded_polars_sample_index
+                                        << " generation="
+                                        << sample_generation
+                                        << " records=" << sample_records
+                                        << " first_ingress="
+                                        << sample_first_ingress
+                                        << " last_ingress="
+                                        << sample_last_ingress
+                                        << " strict_first_callback_to_polars_ns="
+                                        << strict_first_ns
+                                        << " strict_last_callback_to_polars_ns="
+                                        << strict_last_ns
+                                        << " publication_to_polars_ns="
+                                        << ready_ns - published_ns
+                                        << " open_to_polars_ns="
+                                        << open_to_ready_ns << '\n';
+                                    ++loaded_polars_sample_index;
+                                    loaded_polars_next_boundary = end;
+                                }
+                            }
+                            if (!sample_valid) {
+                                loaded_polars_failed.store(
+                                    true, std::memory_order_release);
+                                periodic_generation_failed.store(
+                                    true, std::memory_order_release);
+                                return;
+                            }
+                        } else if (
+                            benchmark.loaded_event_polars_latency) {
+                            bool sample_valid = true;
+                            const std::uint64_t boundary_count =
+                                loaded_polars_boundary_count.load(
+                                    std::memory_order_acquire);
+                            const std::uint64_t end = boundary_count;
+                            if (end > loaded_polars_next_boundary) {
+                                const auto& first =
+                                    loaded_polars_boundaries[
+                                        static_cast<std::size_t>(
+                                            loaded_polars_next_boundary)];
+                                const auto& last =
+                                    loaded_polars_boundaries[
+                                        static_cast<std::size_t>(end - 1U)];
+                                std::string sample;
+                                try {
+                                    const std::string command =
+                                        "CERTIFIED_EVENT_POLARS_DRAIN " +
+                                        std::to_string(
+                                            loaded_polars_instrument_id) +
+                                        " " +
+                                        std::to_string(
+                                            first.ingress_sequence) +
+                                        " " +
+                                        std::to_string(
+                                            last.ingress_sequence);
+                                    sample_valid =
+                                        run_loaded_python_command(
+                                            loaded_protocol,
+                                            command,
+                                            "CERTIFIED_EVENT_POLARS_SAMPLE ",
+                                            &sample);
+                                } catch (...) {
+                                    sample_valid = false;
+                                }
+                                std::uint64_t sample_first_ingress = 0U;
+                                std::uint64_t sample_last_ingress = 0U;
+                                std::uint64_t first_entry_ns = 0U;
+                                std::uint64_t last_entry_ns = 0U;
+                                std::uint64_t command_received_ns = 0U;
+                                std::uint64_t ready_ns = 0U;
+                                std::uint64_t command_to_ready_ns = 0U;
+                                std::uint64_t drained_rows = 0U;
+                                std::uint64_t batches = 0U;
+                                sample_valid = sample_valid &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "first_ingress",
+                                        &sample_first_ingress) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "last_ingress",
+                                        &sample_last_ingress) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "first_callback_entry_ns",
+                                        &first_entry_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "last_callback_entry_ns",
+                                        &last_entry_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "command_received_ns",
+                                        &command_received_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "polars_ready_ns",
+                                        &ready_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "command_to_polars_ns",
+                                        &command_to_ready_ns) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "drained_rows",
+                                        &drained_rows) &&
+                                    ParseLineUnsignedField(
+                                        sample,
+                                        "batches",
+                                        &batches) &&
+                                    sample_first_ingress ==
+                                        first.ingress_sequence &&
+                                    sample_last_ingress ==
+                                        last.ingress_sequence &&
+                                    first.caller_before_callback_ns <=
+                                        first_entry_ns &&
+                                    last.caller_before_callback_ns <=
+                                        last_entry_ns &&
+                                    first_entry_ns <= last_entry_ns &&
+                                    last_entry_ns <= command_received_ns &&
+                                    command_received_ns <= ready_ns &&
+                                    command_to_ready_ns ==
+                                        ready_ns - command_received_ns &&
+                                    drained_rows != 0U && batches != 0U;
+                                if (sample_valid) {
+                                    const std::uint64_t strict_first_ns =
+                                        ready_ns -
+                                        first.caller_before_callback_ns;
+                                    const std::uint64_t strict_last_ns =
+                                        ready_ns -
+                                        last.caller_before_callback_ns;
+                                    loaded_polars_strict_first_ns.push_back(
+                                        strict_first_ns);
+                                    loaded_polars_strict_last_ns.push_back(
+                                        strict_last_ns);
+                                    loaded_event_command_to_ready_ns.push_back(
+                                        command_to_ready_ns);
+                                    loaded_event_polars_rows += drained_rows;
+                                    std::cout
+                                        << "LOADED_EVENT_POLARS_SAMPLE sample="
+                                        << loaded_polars_sample_index
+                                        << " event_rows=" << drained_rows
+                                        << " batches=" << batches
+                                        << " first_ingress="
+                                        << sample_first_ingress
+                                        << " last_ingress="
+                                        << sample_last_ingress
+                                        << " strict_first_callback_to_polars_ns="
+                                        << strict_first_ns
+                                        << " strict_last_callback_to_polars_ns="
+                                        << strict_last_ns
+                                        << " command_to_polars_ns="
+                                        << command_to_ready_ns << '\n';
+                                    ++loaded_polars_sample_index;
+                                    loaded_polars_next_boundary = end;
+                                }
+                            }
+                            if (!sample_valid) {
+                                loaded_polars_failed.store(
+                                    true, std::memory_order_release);
+                                periodic_generation_failed.store(
+                                    true, std::memory_order_release);
+                                return;
+                            }
+                        }
                         periodic_generation_cuts.fetch_add(
                             1U, std::memory_order_relaxed);
                         lock.lock();
-                        deadline =
-                            std::chrono::steady_clock::now() +
-                            benchmark.generation_interval;
+                        deadline = loaded_latency
+                                       ? deadline +
+                                             benchmark.generation_interval
+                                       : std::chrono::steady_clock::now() +
+                                             benchmark.generation_interval;
                     }
                 });
         } catch (...) {
@@ -8261,12 +8821,208 @@ bool RunThroughputProfileBenchmark(
         }
     };
 
+    if (benchmark.loaded_event_polars_latency) {
+        std::string started;
+        std::uint64_t started_duration_ms = 0U;
+        if (!Expect(
+                loaded_protocol != nullptr &&
+                    loaded_protocol->SendLine(
+                        "CERTIFIED_EVENT_POLARS_LOAD " +
+                        std::to_string(duration_ms)) &&
+                    loaded_protocol->ReadLine(
+                        std::chrono::seconds(30), &started) &&
+                    started.starts_with(
+                        "CERTIFIED_EVENT_POLARS_STARTED ") &&
+                    ParseLineUnsignedField(
+                        started,
+                        "duration_ms",
+                        &started_duration_ms) &&
+                    started_duration_ms == duration_ms,
+                "start continuous CERTIFIED Event Polars load")) {
+            stop_periodic_generations();
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
+        std::cout << "PYTHON_" << started << '\n';
+    }
+
     const std::uint64_t start_ns = MonotonicNowNs();
     if (!Expect(start_ns != 0U, "start throughput profile clock")) {
         stop_periodic_generations();
         service->MarkFailed();
         service->StopControl();
         return false;
+    }
+    if (benchmark.loaded_event_polars_latency) {
+        try {
+            loaded_event_load_thread = std::thread([&]() noexcept {
+                std::string sample;
+                std::string done;
+                bool valid =
+                    loaded_protocol->ReadLine(
+                        std::chrono::hours(1), &sample) &&
+                    sample.starts_with(
+                        "CERTIFIED_EVENT_POLARS_LOAD ") &&
+                    loaded_protocol->ReadLine(
+                        std::chrono::seconds(30), &done) &&
+                    done.starts_with("DONE ") &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "duration_ms",
+                        &loaded_event_load.duration_ms) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "elapsed_ns",
+                        &loaded_event_load.elapsed_ns) &&
+                    ParseLineUnsignedField(
+                        sample, "rows", &loaded_event_load.rows) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "batches",
+                        &loaded_event_load.batches) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "nonempty_batches",
+                        &loaded_event_load.nonempty_batches) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "first_event_sequence",
+                        &loaded_event_load.first_event_sequence) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "last_event_sequence",
+                        &loaded_event_load.last_event_sequence) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "next_event_sequence",
+                        &loaded_event_load.next_event_sequence) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "advertised_event_sequence",
+                        &loaded_event_load
+                             .advertised_event_sequence) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "event_backlog",
+                        &loaded_event_load.event_backlog) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "caught_up",
+                        &loaded_event_load.caught_up) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "materialized_events_per_second",
+                        &loaded_event_load
+                             .materialized_events_per_second) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_first_min_ns",
+                        &loaded_event_load.strict_first_min_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_first_p50_ns",
+                        &loaded_event_load.strict_first_p50_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_first_p95_ns",
+                        &loaded_event_load.strict_first_p95_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_first_p99_ns",
+                        &loaded_event_load.strict_first_p99_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_first_max_ns",
+                        &loaded_event_load.strict_first_max_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_last_min_ns",
+                        &loaded_event_load.strict_last_min_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_last_p50_ns",
+                        &loaded_event_load.strict_last_p50_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_last_p95_ns",
+                        &loaded_event_load.strict_last_p95_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_last_p99_ns",
+                        &loaded_event_load.strict_last_p99_ns) &&
+                    ParseLineUnsignedField(
+                        sample,
+                        "strict_last_max_ns",
+                        &loaded_event_load.strict_last_max_ns);
+                if (valid) {
+                    const auto ordered = [](
+                        std::uint64_t minimum,
+                        std::uint64_t p50,
+                        std::uint64_t p95,
+                        std::uint64_t p99,
+                        std::uint64_t maximum) noexcept {
+                        return minimum <= p50 && p50 <= p95 &&
+                               p95 <= p99 && p99 <= maximum;
+                    };
+                    valid =
+                        loaded_event_load.duration_ms == duration_ms &&
+                        loaded_event_load.elapsed_ns >=
+                            duration_ms * 1'000'000U &&
+                        loaded_event_load.rows != 0U &&
+                        loaded_event_load.batches >=
+                            loaded_event_load.nonempty_batches &&
+                        loaded_event_load.nonempty_batches != 0U &&
+                        loaded_event_load.first_event_sequence == 1U &&
+                        loaded_event_load.last_event_sequence ==
+                            loaded_event_load.rows &&
+                        loaded_event_load.next_event_sequence ==
+                            loaded_event_load.rows + 1U &&
+                        loaded_event_load.advertised_event_sequence >=
+                            loaded_event_load.rows &&
+                        loaded_event_load.event_backlog ==
+                            loaded_event_load
+                                    .advertised_event_sequence -
+                                loaded_event_load.rows &&
+                        loaded_event_load.caught_up ==
+                            (loaded_event_load.event_backlog == 0U
+                                 ? 1U
+                                 : 0U) &&
+                        loaded_event_load
+                                .materialized_events_per_second != 0U &&
+                        ordered(
+                            loaded_event_load.strict_first_min_ns,
+                            loaded_event_load.strict_first_p50_ns,
+                            loaded_event_load.strict_first_p95_ns,
+                            loaded_event_load.strict_first_p99_ns,
+                            loaded_event_load.strict_first_max_ns) &&
+                        ordered(
+                            loaded_event_load.strict_last_min_ns,
+                            loaded_event_load.strict_last_p50_ns,
+                            loaded_event_load.strict_last_p95_ns,
+                            loaded_event_load.strict_last_p99_ns,
+                            loaded_event_load.strict_last_max_ns);
+                }
+                if (valid) {
+                    loaded_event_polars_rows = loaded_event_load.rows;
+                    loaded_polars_sample_index =
+                        loaded_event_load.nonempty_batches;
+                    std::cout << "PYTHON_" << sample << '\n';
+                    std::cout << "PYTHON_" << done << '\n';
+                } else {
+                    std::cerr
+                        << "continuous CERTIFIED Event Polars load: "
+                        << sample << " / " << done << '\n';
+                }
+                loaded_event_load_valid.store(
+                    valid, std::memory_order_release);
+            });
+        } catch (...) {
+            stop_periodic_generations();
+            service->MarkFailed();
+            service->StopControl();
+            return false;
+        }
     }
     std::uint64_t invoked = 0U;
     bool message_patch_failed = false;
@@ -8372,7 +9128,37 @@ bool RunThroughputProfileBenchmark(
                 std::this_thread::yield();
             }
         }
+        const bool loaded_polars_target =
+            benchmark.loaded_polars_latency &&
+            instrument_index == 0U &&
+            tuple == 1U;
+        std::uint64_t loaded_boundary_index = 0U;
+        if (loaded_polars_target) {
+            loaded_boundary_index =
+                loaded_polars_boundary_count.load(
+                    std::memory_order_relaxed);
+            if (loaded_boundary_index >=
+                loaded_polars_boundaries.size()) {
+                message_patch_failed = true;
+                break;
+            }
+            loaded_polars_boundaries[
+                static_cast<std::size_t>(loaded_boundary_index)] = {
+                index + 1U,
+                MonotonicNowNs()};
+            if (loaded_polars_boundaries[
+                    static_cast<std::size_t>(loaded_boundary_index)]
+                    .caller_before_callback_ns == 0U) {
+                message_patch_failed = true;
+                break;
+            }
+        }
         handler->OnMessage(nullptr, message);
+        if (loaded_polars_target) {
+            loaded_polars_boundary_count.store(
+                loaded_boundary_index + 1U,
+                std::memory_order_release);
+        }
         ++invoked;
         ++offered_by_tuple[tuple];
         while (next_quarter < backlog_at_quarter.size() &&
@@ -8398,6 +9184,47 @@ bool RunThroughputProfileBenchmark(
     const runtime::RealtimePipelineSnapshotV1 before_drain =
         pipeline->Snapshot();
     stop_periodic_generations();
+    if (loaded_event_load_thread.joinable()) {
+        loaded_event_load_thread.join();
+    }
+    if (benchmark.loaded_event_polars_latency &&
+        !loaded_event_load_valid.load(std::memory_order_acquire)) {
+        loaded_polars_failed.store(true, std::memory_order_release);
+    }
+    bool loaded_python_stopped = true;
+    if (benchmark.loaded_polars_latency) {
+        loaded_python_stopped = false;
+        if (!loaded_polars_failed.load(std::memory_order_acquire) &&
+            loaded_protocol != nullptr &&
+            loaded_protocol->SendLine("QUIT")) {
+            std::string bye;
+            if (loaded_protocol->ReadLine(
+                    std::chrono::seconds(30), &bye) &&
+                bye.starts_with("BYE ") &&
+                loaded_python.Wait(std::chrono::seconds(30))) {
+                std::cout << "PYTHON_" << bye << '\n';
+                loaded_python_stopped = true;
+            }
+        }
+        if (!loaded_python_stopped) {
+            loaded_polars_failed.store(
+                true, std::memory_order_release);
+        }
+        if (!loaded_polars_strict_first_ns.empty()) {
+            PrintLatency(
+                "loaded_polars_strict_first_callback_to_polars",
+                loaded_polars_strict_first_ns);
+            PrintLatency(
+                "loaded_polars_strict_last_callback_to_polars",
+                loaded_polars_strict_last_ns);
+            PrintLatency(
+                "loaded_polars_publication_to_polars",
+                loaded_polars_publication_ns);
+            PrintLatency(
+                "loaded_polars_open_to_polars",
+                loaded_polars_open_to_ready_ns);
+        }
+    }
     const std::uint64_t applied_before_drain =
         before_drain.processing_progress.applied_sequence;
     const std::uint64_t backlog_before_drain =
@@ -8417,11 +9244,75 @@ bool RunThroughputProfileBenchmark(
 
     bool certified_idle = true;
     ipc::RealtimeCertifiedServiceSnapshotV1 certified_snapshot{};
+    bool certified_event_generation_valid =
+        !benchmark.loaded_event_polars_latency;
+    std::uint64_t certified_event_count = 0U;
     if (certified_service != nullptr) {
         certified_idle = certified_service->WaitUntilIdleForTest(
             std::chrono::seconds(60));
+        if (benchmark.loaded_event_polars_latency && certified_idle) {
+            ipc::CertifiedOrderEventHistorySnapshotV1 event_history{};
+            const auto event_error =
+                certified_service->AcquireEventGeneration(
+                    &event_history);
+            const auto event_generation = event_history.generation();
+            const auto event_service_snapshot =
+                certified_service->Snapshot();
+            certified_event_generation_valid =
+                event_error ==
+                    ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+                event_history.valid() &&
+                event_service_snapshot.wire_snapshot_consistent &&
+                event_generation.input_frontier
+                        .canonical_apply_sequence ==
+                    event_service_snapshot.canonical_apply_frontier &&
+                event_generation.derived_event_sequence_exclusive ==
+                    static_cast<std::uint64_t>(
+                        event_generation.event_count) + 1U &&
+                event_history.events().size() ==
+                    event_generation.event_count;
+            if (certified_event_generation_valid) {
+                certified_event_count =
+                    static_cast<std::uint64_t>(
+                        event_generation.event_count);
+            }
+        }
         certified_service->MarkStoppedClean();
         certified_snapshot = certified_service->Snapshot();
+    }
+
+    std::uint64_t loaded_event_final_backlog = 0U;
+    bool loaded_event_final_valid =
+        !benchmark.loaded_event_polars_latency;
+    if (benchmark.loaded_event_polars_latency) {
+        loaded_python_stopped = false;
+        loaded_event_final_valid =
+            certified_event_generation_valid &&
+            loaded_event_load_valid.load(std::memory_order_acquire) &&
+            loaded_event_polars_rows == loaded_event_load.rows &&
+            certified_event_count >=
+                loaded_event_load.advertised_event_sequence &&
+            certified_event_count >= loaded_event_polars_rows;
+        if (loaded_event_final_valid) {
+            loaded_event_final_backlog =
+                certified_event_count - loaded_event_polars_rows;
+        }
+        if (loaded_event_final_valid &&
+            loaded_protocol != nullptr &&
+            loaded_protocol->SendLine("QUIT")) {
+            std::string bye;
+            if (loaded_protocol->ReadLine(
+                    std::chrono::seconds(30), &bye) &&
+                bye.starts_with("BYE ") &&
+                loaded_python.Wait(std::chrono::seconds(30))) {
+                std::cout << "PYTHON_" << bye << '\n';
+                loaded_python_stopped = true;
+            }
+        }
+        if (!loaded_python_stopped) {
+            loaded_polars_failed.store(
+                true, std::memory_order_release);
+        }
     }
 
     const std::array<std::uint64_t, 4U> expected_source_records{{
@@ -8551,7 +9442,10 @@ bool RunThroughputProfileBenchmark(
              : final_cut.factor_generation == nullptr) &&
         final_cut.store_generation != nullptr &&
         final_cut.store_generation->watermark().generation ==
-            published_periodic_generations + 1U &&
+            published_periodic_generations + 1U +
+                (benchmark.loaded_polars_latency
+                     ? loaded_baseline_generation
+                     : 0U) &&
         (benchmark.generation_interval.count() == 0 ||
          duration_ms < static_cast<std::uint64_t>(
                            benchmark.generation_interval.count()) ||
@@ -8565,6 +9459,35 @@ bool RunThroughputProfileBenchmark(
          certified_snapshot.processed_handoffs ==
              certified_snapshot.enqueued_observations +
                  certified_snapshot.enqueued_applied_records);
+    const bool loaded_raw_polars_valid =
+        !benchmark.loaded_polars_latency ||
+        (!loaded_polars_failed.load(std::memory_order_acquire) &&
+         loaded_python_stopped && loaded_polars_sample_index != 0U &&
+         loaded_polars_strict_first_ns.size() ==
+             loaded_polars_sample_index &&
+         loaded_polars_strict_last_ns.size() ==
+             loaded_polars_sample_index &&
+         loaded_polars_publication_ns.size() ==
+             loaded_polars_sample_index &&
+         loaded_polars_open_to_ready_ns.size() ==
+             loaded_polars_sample_index &&
+         loaded_polars_records == loaded_polars_next_boundary &&
+         loaded_polars_next_boundary <=
+             loaded_polars_boundary_count.load(
+                 std::memory_order_acquire));
+    const bool loaded_event_polars_valid =
+        !benchmark.loaded_event_polars_latency ||
+        (!loaded_polars_failed.load(std::memory_order_acquire) &&
+         loaded_python_stopped && loaded_event_final_valid &&
+         certified_event_generation_valid &&
+         loaded_event_load_valid.load(std::memory_order_acquire) &&
+         loaded_polars_sample_index ==
+             loaded_event_load.nonempty_batches &&
+         loaded_event_polars_rows == loaded_event_load.rows &&
+         loaded_event_final_backlog ==
+             certified_event_count - loaded_event_polars_rows);
+    const bool loaded_polars_valid =
+        loaded_raw_polars_valid && loaded_event_polars_valid;
     const bool complete_prefix =
         !final.fatal && !periodic_failed && generation_sequence_valid &&
         invoked == planned && final.accepted_messages == planned &&
@@ -8575,6 +9498,7 @@ bool RunThroughputProfileBenchmark(
         final.store.failed_appends == 0U &&
         !final.store.coverage_lost && !service->failed() &&
         history_validation.passed && certified_healthy &&
+        loaded_polars_valid &&
         ((benchmark.parallel_decoder_worker_count == 0U &&
           !final.parallel_decoder.enabled) ||
          (final.parallel_decoder.enabled &&
@@ -8639,6 +9563,10 @@ bool RunThroughputProfileBenchmark(
         << " online_recovery=0"
         << " factor_generation_enabled="
         << (factor_generation_enabled ? 1 : 0)
+        << " loaded_polars_latency="
+        << (benchmark.loaded_polars_latency ? 1 : 0)
+        << " loaded_event_polars_latency="
+        << (benchmark.loaded_event_polars_latency ? 1 : 0)
         << " workload=" << ThroughputWorkloadNameV1(benchmark.workload)
         << " sink=" << ThroughputSinkNameV1(benchmark.sink)
         << " instruments_per_market="
@@ -8689,6 +9617,10 @@ bool RunThroughputProfileBenchmark(
         << " store_failed_appends=" << final.store.failed_appends
         << " store_coverage_lost="
         << (final.store.coverage_lost ? 1 : 0)
+        << " store_accounted_record_bytes="
+        << final.store.accounted_record_bytes
+        << " store_allocated_index_bytes="
+        << final.store.allocated_index_bytes
         << " decoder_depth_before_drain="
         << decoder_depth_before_drain
         << " decoder_high_water_max="
@@ -8756,6 +9688,44 @@ bool RunThroughputProfileBenchmark(
         << periodic_cut_error.load(std::memory_order_acquire)
         << " periodic_generation_error="
         << periodic_generation_error.load(std::memory_order_acquire)
+        << " loaded_polars_baseline_generation="
+        << loaded_baseline_generation
+        << " loaded_polars_samples="
+        << loaded_polars_sample_index
+        << " loaded_polars_records="
+        << loaded_polars_records
+        << " loaded_polars_boundary_count="
+        << loaded_polars_boundary_count.load(
+               std::memory_order_acquire)
+        << " loaded_polars_failed="
+        << (loaded_polars_failed.load(
+                std::memory_order_acquire)
+                ? 1
+                : 0)
+        << " loaded_polars_python_stopped="
+        << (loaded_python_stopped ? 1 : 0)
+        << " loaded_event_polars_rows="
+        << loaded_event_polars_rows
+        << " loaded_event_polars_batches="
+        << loaded_event_load.nonempty_batches
+        << " loaded_event_polars_advertised="
+        << loaded_event_load.advertised_event_sequence
+        << " loaded_event_polars_backlog_at_load_stop="
+        << loaded_event_load.event_backlog
+        << " loaded_event_polars_final_backlog="
+        << loaded_event_final_backlog
+        << " loaded_event_polars_materialized_rps="
+        << loaded_event_load.materialized_events_per_second
+        << " loaded_event_polars_load_valid="
+        << (loaded_event_load_valid.load(
+                std::memory_order_acquire)
+                ? 1
+                : 0)
+        << " certified_event_count=" << certified_event_count
+        << " certified_event_generation_valid="
+        << (certified_event_generation_valid ? 1 : 0)
+        << " loaded_event_final_valid="
+        << (loaded_event_final_valid ? 1 : 0)
         << " final_cut_published="
         << (final_cut.published() ? 1 : 0)
         << " final_cut_error="
@@ -11106,8 +12076,18 @@ int main(int argc, char** argv) {
         return false;
     };
     if ((argc == 13 || argc == 14 || argc == 15) &&
-        std::string_view(argv[1]) ==
-            "--throughput-profile-benchmark") {
+        (std::string_view(argv[1]) ==
+             "--throughput-profile-benchmark" ||
+         std::string_view(argv[1]) ==
+             "--throughput-polars-loaded-benchmark" ||
+         std::string_view(argv[1]) ==
+             "--throughput-event-polars-loaded-benchmark")) {
+        const bool loaded_polars_latency =
+            std::string_view(argv[1]) ==
+            "--throughput-polars-loaded-benchmark";
+        const bool loaded_event_polars_latency =
+            std::string_view(argv[1]) ==
+            "--throughput-event-polars-loaded-benchmark";
         std::array<std::uint64_t, 8U> numeric{};
         for (std::size_t index = 0U;
              index < numeric.size();
@@ -11190,6 +12170,9 @@ int main(int argc, char** argv) {
             static_cast<std::uint32_t>(segment_kib);
         config.workload = workload;
         config.sink = sink;
+        config.loaded_polars_latency = loaded_polars_latency;
+        config.loaded_event_polars_latency =
+            loaded_event_polars_latency;
         if (argc >= 14 &&
             !parse_scenario(argv[13], &config.scenario)) {
             std::cerr << "invalid throughput startup scenario\n";
@@ -11322,6 +12305,9 @@ int main(int argc, char** argv) {
                "WORKERS [SCENARIO]"
                "|--throughput-stability-benchmark RATE DURATION_MS"
                "|--throughput-profile-benchmark RATE DURATION_MS "
+               "|--throughput-polars-loaded-benchmark RATE "
+               "|--throughput-event-polars-loaded-benchmark RATE "
+               "DURATION_MS "
                "INSTRUMENTS_PER_MARKET STORE_WORKERS "
                "PARALLEL_DECODER_WORKERS IDLE_INLINE "
                "DECODER_QUEUE STORE_QUEUE "

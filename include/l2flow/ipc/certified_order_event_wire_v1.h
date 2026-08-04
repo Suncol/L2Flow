@@ -12,16 +12,15 @@
 
 namespace l2flow::ipc {
 
-// Independent, append-only full-day Event/history ABI.  It is deliberately
+// Independent, append-only canonical Event/history ABI. It is deliberately
 // separate from both FAST Wire V2 and the bounded CERTIFIED Tick ring.
 inline constexpr std::array<std::uint8_t, 8U>
     kCertifiedOrderEventMagicV1{
         'L', '2', 'F', 'C', 'E', 'V', 'T', '1'};
 inline constexpr std::uint16_t kCertifiedOrderEventWireMajorV1 = 1U;
-// V1.2 retains every mapping size/offset but requires derived row schema 2,
-// whose former reserved bytes carry explicit source-tick event identity.
-// Exact-minor readers fail closed on a V1.1 mapping.
-inline constexpr std::uint16_t kCertifiedOrderEventWireMinorV1 = 2U;
+// V1.3 retains the mapping size and slot offsets while making temporal
+// coverage explicit. Exact-minor readers fail closed on earlier mappings.
+inline constexpr std::uint16_t kCertifiedOrderEventWireMinorV1 = 3U;
 inline constexpr std::uint32_t kCertifiedOrderEventEndianMarkerV1 =
     0x01020304U;
 inline constexpr std::uint32_t kCertifiedOrderEventHeaderBytesV1 =
@@ -35,18 +34,23 @@ inline constexpr std::uint64_t
         0x315456454346324cULL;  // "L2FCEVT1" little-endian
 
 enum CertifiedOrderEventCoverageFlagV1 : std::uint32_t {
-    // CERTIFIED always proves native continuity from the documented sequence
-    // origin. It is never exposed for a process-start partial session.
     kCertifiedOrderEventCoverageFromOpenV1 = 1U << 0U,
     // The from-open prefix was rebuilt behind an exact worker barrier before
     // the control socket became queryable. Ordinary from-open startup leaves
     // this bit clear.
     kCertifiedOrderEventStartupPrefixRecoveredV1 = 1U << 1U,
+    kCertifiedOrderEventCoverageFromProcessStartV1 = 1U << 2U,
 };
 inline constexpr std::uint32_t
     kCertifiedOrderEventKnownCoverageFlagsV1 =
         kCertifiedOrderEventCoverageFromOpenV1 |
-        kCertifiedOrderEventStartupPrefixRecoveredV1;
+        kCertifiedOrderEventStartupPrefixRecoveredV1 |
+        kCertifiedOrderEventCoverageFromProcessStartV1;
+
+enum class CertifiedOrderEventTemporalCoverageV1 : std::uint8_t {
+    kFromOpen = 0U,
+    kFromProcessStart = 1U,
+};
 
 // Every mutable scalar is accessed through an always-lock-free atomic_ref.
 // The journal is append-only: event_published_sequence is the immutable
@@ -73,7 +77,8 @@ struct alignas(4096) CertifiedOrderEventHeaderV1 final {
     std::uint32_t slot_stride = kCertifiedOrderEventSlotBytesV1;
     std::uint32_t region_alignment =
         kCertifiedOrderEventAlignmentV1;
-    std::array<std::uint8_t, 40U> reserved_layout{};
+    std::uint64_t coverage_start_unix_ns = 0U;
+    std::array<std::uint8_t, 32U> reserved_layout{};
 
     // Stable even -> odd -> field stores -> next stable even.
     std::uint64_t status_publish_tag = 0U;
@@ -147,7 +152,8 @@ struct CertifiedOrderEventControlResponseV1 final {
     std::uint32_t slot_stride =
         kCertifiedOrderEventSlotBytesV1;
     std::uint32_t coverage_flags = 0U;
-    std::array<std::uint8_t, 48U> reserved{};
+    std::uint64_t coverage_start_unix_ns = 0U;
+    std::array<std::uint8_t, 40U> reserved{};
 };
 static_assert(sizeof(CertifiedOrderEventControlResponseV1) == 128U);
 static_assert(

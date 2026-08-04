@@ -673,21 +673,24 @@ class L2FlowClient:
         self,
         certified_control_socket_path,
         *,
+        coverage_requirement: str = "from_open",
         native_library=None,
         native_library_path=None,
         timeout=_USE_CLIENT_CONTROL_TIMEOUT,
         start_event_sequence: int = 1,
         batch_records: int = 4096,
     ) -> "CertifiedOrderEventReader":
-        """Open one full-day CERTIFIED Event history-to-tail cursor.
+        """Open one canonical CERTIFIED Event history-to-tail cursor.
 
         The same reader drains the immutable prefix already present when it
-        attaches and subsequently returns newly appended rows. Online-recovery
-        sessions are attachable only after FAST advertises the completed
-        CERTIFIED promotion barrier.
+        attaches and subsequently returns newly appended rows. Process-start
+        coverage must be requested explicitly.
         """
 
-        from .certified_order_events import open_certified_order_events
+        from .certified_order_events import (
+            _validate_fast_session_coverage,
+            open_certified_order_events,
+        )
 
         if native_library is not None and native_library_path is not None:
             raise ValueError(
@@ -696,6 +699,9 @@ class L2FlowClient:
             )
         with self._lock:
             session = self._checked_session()
+            _validate_fast_session_coverage(
+                session, coverage_requirement
+            )
             effective_timeout = (
                 self._control_timeout
                 if timeout is _USE_CLIENT_CONTROL_TIMEOUT
@@ -717,6 +723,7 @@ class L2FlowClient:
         reader = open_certified_order_events(
             certified_control_socket_path,
             expected_session=session,
+            coverage_requirement=coverage_requirement,
             native_library=effective_library,
             native_library_path=native_library_path,
             timeout=effective_timeout,
@@ -726,17 +733,20 @@ class L2FlowClient:
         try:
             with self._lock:
                 current = self._checked_session()
-                if current.identity != session.identity:
-                    raise StaleSessionError(
-                        "FAST session changed while opening CERTIFIED events"
-                    )
                 if (
-                    not current.coverage_from_open
-                    or not current.certified_prefix_valid
+                    current.identity != session.identity
+                    or current.trade_date != session.trade_date
+                    or current.catalog_digest != session.catalog_digest
+                    or current.catalog_scope != session.catalog_scope
+                    or current.catalog_version != session.catalog_version
                 ):
-                    raise UnavailableError(
-                        "FAST no longer advertises a valid CERTIFIED prefix"
+                    raise StaleSessionError(
+                        "FAST catalog session changed while opening "
+                        "CERTIFIED events"
                     )
+                _validate_fast_session_coverage(
+                    current, coverage_requirement
+                )
             return reader
         except BaseException:
             reader.close()

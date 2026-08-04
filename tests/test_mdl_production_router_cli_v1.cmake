@@ -52,15 +52,15 @@ run_case(
     --help)
 
 run_case(
-    help_lists_default_partial_event_socket
+    help_lists_partial_native_disorder_bound
     0
-    "partial mode derives <ipc>.events by default"
+    "--native-maximum-backward-displacement N"
     --help)
 
 run_case(
-    help_lists_zero_latency_event_poll
+    help_describes_partial_canonical_event
     0
-    "0..1000, default 0; 0 yields"
+    "mid-session FAST plus bounded canonical Event"
     --help)
 
 run_case(
@@ -87,16 +87,36 @@ run_case(
     "production requires exactly one of"
     ${base})
 
-# Reaching the fixed-date runtime check (exit 1), rather than option parsing
-# (exit 2), proves that partial mode is valid without explicitly disabling the
-# default CERTIFIED sidecar.  ParseOptions disables that semantically invalid
-# sidecar for this mode before Run is entered.
 run_case(
-    valid_partial_mode_reaches_runtime
+    partial_requires_declared_disorder_bound
+    2
+    "requires --native-maximum-backward-displacement"
+    ${base}
+    --intraday-live-partial)
+
+run_case(
+    valid_partial_canonical_mode_reaches_runtime
     1
     "--trade-date must equal the current"
     ${base}
-    --intraday-live-partial)
+    --intraday-live-partial
+    --native-maximum-backward-displacement 2)
+
+run_case(
+    partial_rejects_unbounded_disorder_declaration
+    2
+    "must be below both the reorder span and per-channel pending capacity"
+    ${base}
+    --intraday-live-partial
+    --native-maximum-backward-displacement 16384)
+
+run_case(
+    partial_fast_only_mode_reaches_runtime
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --disable-native-gap-recovery)
 
 run_case(
     parallel_decoder_zero_reaches_runtime
@@ -104,6 +124,7 @@ run_case(
     "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
+    --native-maximum-backward-displacement 2
     --parallel-decoder-workers 0)
 
 run_case(
@@ -112,6 +133,7 @@ run_case(
     "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
+    --native-maximum-backward-displacement 2
     --parallel-decoder-workers 4)
 
 run_case(
@@ -120,6 +142,7 @@ run_case(
     "--parallel-decoder-workers must be 0..64"
     ${base}
     --intraday-live-partial
+    --native-maximum-backward-displacement 2
     --parallel-decoder-workers 65)
 
 run_case(
@@ -144,39 +167,33 @@ run_case(
     "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
+    --native-maximum-backward-displacement 2
     --kline-windows-ms 60000)
 
 run_case(
-    partial_rejects_certified_socket
-    2
-    "does not expose CERTIFIED"
+    partial_accepts_canonical_event_socket
+    1
+    "--trade-date must equal the current"
     ${base}
     --intraday-live-partial
+    --native-maximum-backward-displacement 2
     --certified-ipc-socket /tmp/l2flow-cli-certified.sock)
 
 run_case(
-    partial_accepts_explicit_event_aggregator
-    1
-    "--trade-date must equal the current"
+    removed_arrival_order_event_socket_is_unknown
+    2
+    "unknown option: --event-aggregator-socket"
     ${base}
     --intraday-live-partial
     --event-aggregator-socket /tmp/l2flow-cli-events.sock)
 
 run_case(
-    partial_accepts_zero_event_poll
-    1
-    "--trade-date must equal the current"
+    partial_managed_event_poll_option_is_removed
+    2
+    "unknown option: --event-aggregator-poll-ms"
     ${base}
     --intraday-live-partial
     --event-aggregator-poll-ms 0)
-
-run_case(
-    partial_rejects_event_poll_above_bound
-    2
-    "--event-aggregator-poll-ms must be 0..1000"
-    ${base}
-    --intraday-live-partial
-    --event-aggregator-poll-ms 1001)
 
 run_case(
     partial_rejects_invalid_event_cpu_set
@@ -184,49 +201,42 @@ run_case(
     "--event-cpu-set is invalid: invalid_syntax"
     ${base}
     --intraday-live-partial
+    --native-maximum-backward-displacement 2
     --event-cpu-set "8, 9")
 
 run_case(
-    partial_external_event_cannot_claim_managed_affinity
+    partial_disorder_bound_rejects_fast_only_mode
     2
-    "cannot pin an externally supervised partial Event process"
+    "cannot be combined with --disable-native-gap-recovery"
     ${base}
     --intraday-live-partial
-    --event-aggregator-socket /tmp/l2flow-cli-events.sock
+    --disable-native-gap-recovery
+    --native-maximum-backward-displacement 2)
+
+run_case(
+    partial_fast_only_rejects_event_cpu_set
+    2
+    "--event-cpu-set requires the canonical Event service"
+    ${base}
+    --intraday-live-partial
+    --disable-native-gap-recovery
     --event-cpu-set 8)
 
 run_case(
-    partial_rejects_relative_event_executable
+    partial_managed_event_executable_option_is_removed
     2
-    "--event-aggregator-executable must be an absolute path"
+    "unknown option: --event-aggregator-executable"
     ${base}
     --intraday-live-partial
     --event-aggregator-executable relative-event-aggregator)
 
 run_case(
-    from_open_rejects_partial_event_executable
+    native_disorder_bound_requires_partial_mode
     2
-    "--event-aggregator-executable is only used by --intraday-live-partial"
+    "requires --intraday-live-partial"
     ${base}
     --intraday-store-from-open
-    --event-aggregator-executable /tmp/mdl-order-event-aggregator)
-
-run_case(
-    from_open_external_event_cannot_claim_router_affinity
-    2
-    "cannot pin the legacy externally supervised Event process"
-    ${base}
-    --intraday-store-from-open
-    --event-aggregator-socket /tmp/l2flow-cli-events.sock
-    --event-cpu-set 8)
-
-run_case(
-    partial_rejects_event_socket_aliasing_fast
-    2
-    "--event-aggregator-socket must be distinct from --ipc-socket"
-    ${base}
-    --intraday-live-partial
-    --event-aggregator-socket /tmp/l2flow-cli-test.sock)
+    --native-maximum-backward-displacement 2)
 
 run_case(
     partial_rejects_recovery_mode
@@ -234,6 +244,7 @@ run_case(
     "requires --intraday-recovery-csv-dir"
     ${base}
     --intraday-live-partial
+    --disable-native-gap-recovery
     --intraday-recovery-mode online)
 
 run_case(
@@ -322,4 +333,5 @@ run_case(
     "journal/live-preview options require"
     ${base}
     --intraday-live-partial
+    --disable-native-gap-recovery
     --intraday-recovery-progress-interval-seconds 1)

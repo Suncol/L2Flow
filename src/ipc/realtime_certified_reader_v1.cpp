@@ -157,6 +157,9 @@ void SetSystemError(
                    status.resource_exhaustion_count != 0U;
         case RealtimeCertifiedStateV1::kStopped:
             return true;
+        case RealtimeCertifiedStateV1::kDegraded:
+            return status.correction_epoch != 0U &&
+                   status.frozen_channel_count != 0U;
     }
     return false;
 }
@@ -440,6 +443,9 @@ void ApplyStatusToHeaderCopy(
             Atomic(source.channel).load(std::memory_order_relaxed);
         copy.market =
             Atomic(source.market).load(std::memory_order_relaxed);
+        copy.channel_correction_epoch =
+            Atomic(source.channel_correction_epoch)
+                .load(std::memory_order_relaxed);
         for (std::size_t index = 0U;
              index < copy.reserved.size();
              ++index) {

@@ -277,6 +277,7 @@ JournalConfig(
     const TickStatusFixture& tick,
     const std::shared_ptr<
         ipc::CertifiedOrderEventJournalProducerV1>& journal,
+    ipc::CertifiedOrderEventCoverageRequirementV1 coverage_requirement,
     std::unique_ptr<ipc::CertifiedOrderEventReaderV1>* output) {
     Descriptor event_fd;
     if (journal == nullptr ||
@@ -288,6 +289,7 @@ JournalConfig(
                    tick.read_only_fd(),
                    event_fd.get(),
                    tick.expected_session(),
+                   coverage_requirement,
                    output) ==
                ipc::CertifiedOrderEventReaderOpenErrorV1::kNone &&
            *output != nullptr;
@@ -328,7 +330,11 @@ bool TestLazyCommitAndCoherentCut() {
 
     std::unique_ptr<ipc::CertifiedOrderEventReaderV1> reader;
     ok &= Expect(
-        OpenCombined(tick, journal, &reader),
+        OpenCombined(
+            tick,
+            journal,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &reader),
         "open combined Tick/Event descriptor reader");
     if (reader == nullptr) {
         return false;
@@ -445,7 +451,11 @@ bool TestShenzhenChannelZero() {
         "publish documented Shenzhen channel zero");
     std::unique_ptr<ipc::CertifiedOrderEventReaderV1> reader;
     ok &= Expect(
-        OpenCombined(tick, journal, &reader),
+        OpenCombined(
+            tick,
+            journal,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &reader),
         "open Shenzhen combined reader");
     ipc::CertifiedOrderEventEnvelopeV1 envelope{};
     ok &= Expect(
@@ -559,7 +569,11 @@ bool TestConcurrentPublicationNeverTears() {
     }
     std::unique_ptr<ipc::CertifiedOrderEventReaderV1> reader;
     ok &= Expect(
-        OpenCombined(tick, journal, &reader),
+        OpenCombined(
+            tick,
+            journal,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &reader),
         "open concurrent combined reader");
     if (reader == nullptr) {
         return false;
@@ -655,6 +669,126 @@ bool TestConcurrentPublicationNeverTears() {
     return ok;
 }
 
+bool TestProcessStartCoverageContract() {
+    bool ok = true;
+    TickStatusFixture tick;
+    ok &= Expect(
+        tick.Create(0U),
+        "create empty Tick fixture for process-start coverage");
+    if (!ok) {
+        return false;
+    }
+
+    constexpr std::uint64_t coverage_start =
+        1'785'834'365'123'456'789ULL;
+    ipc::CertifiedOrderEventJournalConfigV1 config =
+        JournalConfig(tick.expected_session(), 8U);
+    config.temporal_coverage =
+        ipc::CertifiedOrderEventTemporalCoverageV1::
+            kFromProcessStart;
+    config.coverage_start_unix_ns = coverage_start;
+    std::shared_ptr<ipc::CertifiedOrderEventJournalProducerV1>
+        journal;
+    ok &= Expect(
+        ipc::CertifiedOrderEventJournalProducerV1::Create(
+            config, &journal) ==
+                ipc::CertifiedOrderEventJournalCreateErrorV1::kNone &&
+            journal != nullptr,
+        "create explicit process-start Event journal");
+    if (journal == nullptr) {
+        return false;
+    }
+    const ipc::CertifiedOrderEventJournalSessionV1 provisional_session =
+        journal->session();
+    ok &= Expect(
+        provisional_session.temporal_coverage ==
+                ipc::CertifiedOrderEventTemporalCoverageV1::
+                    kFromProcessStart &&
+            provisional_session.coverage_start_unix_ns == coverage_start &&
+            journal->coverage_flags() ==
+                ipc::kCertifiedOrderEventCoverageFromProcessStartV1,
+        "journal session exposes one process-start temporal contract");
+
+    constexpr std::uint64_t finalized_coverage_start =
+        coverage_start + 1'000U;
+    ok &= Expect(
+        !journal->FinalizeProcessStartCoverage(coverage_start - 1U) &&
+            journal->coverage_start_unix_ns() == coverage_start,
+        "process-start finalization cannot move the boundary backward");
+    ok &= Expect(
+        journal->FinalizeProcessStartCoverage(
+            finalized_coverage_start) &&
+            journal->session().coverage_start_unix_ns ==
+                finalized_coverage_start &&
+            journal->coverage_start_unix_ns() ==
+                finalized_coverage_start,
+        "process-start finalization atomically replaces the hidden boundary");
+    ok &= Expect(
+        !journal->FinalizeProcessStartCoverage(
+            finalized_coverage_start + 1U) &&
+            journal->coverage_start_unix_ns() ==
+                finalized_coverage_start,
+        "process-start finalization is one-shot");
+
+    Descriptor event_fd;
+    ok &= Expect(
+        journal->DuplicateReadOnlyDescriptor(event_fd.output()),
+        "duplicate process-start Event descriptor");
+    std::unique_ptr<ipc::CertifiedOrderEventReaderV1> rejected;
+    ok &= Expect(
+        ipc::CertifiedOrderEventReaderV1::OpenDescriptorsForTest(
+            tick.read_only_fd(),
+            event_fd.get(),
+            tick.expected_session(),
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &rejected) ==
+                ipc::CertifiedOrderEventReaderOpenErrorV1::
+                    kLayoutInvalid &&
+            rejected == nullptr,
+        "from-open reader rejects process-start Event coverage");
+
+    std::unique_ptr<ipc::CertifiedOrderEventReaderV1> reader;
+    ok &= Expect(
+        OpenCombined(
+            tick,
+            journal,
+            ipc::CertifiedOrderEventCoverageRequirementV1::
+                kProcessStartPartial,
+            &reader),
+        "process-start reader explicitly accepts partial Event coverage");
+    ipc::CertifiedOrderEventStatusSnapshotV1 status{};
+    ok &= Expect(
+        reader != nullptr &&
+            reader->ReadStatus(&status) ==
+                ipc::CertifiedOrderEventReadResultV1::kOk &&
+            status.process_start_partial() &&
+            !status.coverage_from_open() &&
+            !status.startup_prefix_recovered() &&
+            status.coverage_start_unix_ns ==
+                finalized_coverage_start &&
+            reader->coverage_start_unix_ns() ==
+                finalized_coverage_start,
+        "reader preserves process-start boundary without from-open claim");
+
+    std::shared_ptr<ipc::CertifiedOrderEventJournalProducerV1> invalid;
+    config.coverage_start_unix_ns = 0U;
+    ok &= Expect(
+        ipc::CertifiedOrderEventJournalProducerV1::Create(
+            config, &invalid) ==
+            ipc::CertifiedOrderEventJournalCreateErrorV1::
+                kInvalidConfiguration,
+        "process-start coverage requires a nonzero UTC boundary");
+    config = JournalConfig(tick.expected_session(), 8U);
+    config.coverage_start_unix_ns = coverage_start;
+    ok &= Expect(
+        ipc::CertifiedOrderEventJournalProducerV1::Create(
+            config, &invalid) ==
+            ipc::CertifiedOrderEventJournalCreateErrorV1::
+                kInvalidConfiguration,
+        "from-open coverage rejects a process-start boundary");
+    return ok;
+}
+
 bool TestFullCapacityNaturalTailLifecycle() {
     struct Case final {
         ipc::RealtimeCertifiedStateV1 state;
@@ -708,7 +842,12 @@ bool TestFullCapacityNaturalTailLifecycle() {
 
         std::unique_ptr<ipc::CertifiedOrderEventReaderV1> reader;
         ok &= Expect(
-            OpenCombined(tick, journal, &reader),
+            OpenCombined(
+                tick,
+                journal,
+                ipc::CertifiedOrderEventCoverageRequirementV1::
+                    kFromOpen,
+                &reader),
             "open exact-capacity combined Event reader");
         if (reader == nullptr) {
             return false;
@@ -745,6 +884,7 @@ int main() {
     ok &= TestShenzhenChannelZero();
     ok &= TestRejectsNonCanonicalSourceTickIdentity();
     ok &= TestConcurrentPublicationNeverTears();
+    ok &= TestProcessStartCoverageContract();
     ok &= TestFullCapacityNaturalTailLifecycle();
     if (ok) {
         std::cout << "PASS: certified order Event journal v1\n";

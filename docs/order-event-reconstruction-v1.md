@@ -133,16 +133,21 @@ SELL -> min(fill_price)
 ### 输入顺序契约
 
 两份通联文档说明同一 `ChannelNo` 下 `ApplSeqNum` 唯一连续，但没有说明
-SDK 对 6.33 与 6.36 两个消息族的跨回调调度细节。本版本因此不把任意多线程
-callback 到达顺序冒充交易所顺序，支持的生产契约是：上游已经按
-`(ChannelNo, ApplSeqNum)` 合并交付 6.33/6.36。
+SDK 对 6.33 与 6.36 两个消息族的跨回调调度细节。本版本因此不把 callback
+到达顺序冒充交易所顺序。projector 的输入契约是上游已经按
+`(ChannelNo, ApplSeqNum)` 合并交付 6.33/6.36；生产路径由 capture-layer
+coordinator 满足该契约。
 
-物理 SDK 路径创建 `multithread_callback=false` 的 Subscriber，并强制
-`io_threads=1`；同一 source lane 再保持 capture 顺序。projector 对每个 channel
-检查 `ApplSeqNum` 严格递增，发现跨消息族倒序会在修改订单状态前 fail-close，
-不会静默错算。上线前仍应使用 feeder CSV 做 6.33/6.36 联合单调性验证；若实际
-厂商回调不满足该契约，必须改用 6.53 或在采集层增加正式归并，不能只扩大
-event ring 或放宽检查。本阶段不实现这种 catch-up/恢复路径。
+物理 SDK 路径仍创建 `multithread_callback=false` 的 Subscriber，并强制
+`io_threads=1`，但这只能定义本地 callback admission 顺序，不能证明独立
+6.33/6.36 消息族已经按共享原生序列合并。生产 canonical Event 路径在 A-share
+filter 前捕获所有 native position，由 `NativeSequenceRecoveryCoordinatorV1`
+按每个 `(market, ChannelNo)` 的 exact-next 位置推进；partial 启动使用声明的
+maximum backward displacement 建立有界 origin。projector 继续检查
+`ApplSeqNum` 严格递增，作为修改订单状态前的最后一道 fail-close 不变量。
+standalone arrival-order aggregator 只允许连接已经原生有序的 replay/诊断输入，
+不能连接 live callback-order Wire。扩大 event ring、放宽 projector 校验或在
+Polars 端排序都不能替代采集层归并。
 
 ### 6.33 委托
 
@@ -230,23 +235,37 @@ revision 正确更新为 A-backed exact revision。checkpoint 只有消费显式
 
 ## Canonical CERTIFIED Event：完整历史到实时 tail
 
-普通 from-open 和成功 promotion 的 online recovery 默认使用 CERTIFIED worker
-中的 canonical projector。native sequence coordinator 先处理 gap、重复与乱序
-回补，再把严格 canonical apply 顺序同时提交给 CERTIFIED Tick 和 append-only
-Event journal。因此晚到的 `3,1,2` 修复不会进入下面 arrival-order standalone
-engine 的非递增保护，也不会重写已经公开的 Event prefix。
+from-open、成功 promotion 的 online recovery，以及 process-start partial 都使用
+CERTIFIED worker 中的 canonical projector。native sequence coordinator 先处理
+gap、重复与乱序回补，再把严格 canonical apply 顺序同时提交给 CERTIFIED Tick
+和 append-only Event journal。因此晚到的 `3,1,2` 会按 `1,2,3` 进入 projector，
+但 Event row 中的 source、ingress 和 tick identity 保持原始 arrival 身份。
+
+partial 模式下，每个深圳 `ChannelNo` 的 6.33/6.36 共用同一
+`ApplSeqNum` domain。未知起点使用声明的最大向后位移 `D` 做 bounded bootstrap：
+仅当 `highest_seen - provisional_min >= D` 时确认 origin；origin 建立后，只有
+`highest_seen - expected > D` 才冻结该 channel。系统不使用 wall-clock timeout
+强制 flush，clean stop 则在 callback gate 关闭且 handoff 排空后执行
+`SealInput()`。一个 channel 的 gap/conflict 进入 `DEGRADED`，其他 channel 与
+FAST 继续发布。
 
 CERTIFIED control 的 `kGetEventHistory` 返回独立只读 mapping。C++、稳定 C ABI
 和 Python `L2FlowClient.open_certified_order_events()` 使用同一 stateful cursor
 先读 attach 时的完整历史，再在 idle 后继续读取新 append 的 live events。
 online recovery 在 control 暴露前执行 FIFO prefix barrier 并原子标记
 `startup_prefix_recovered`；control 可查询后 late barrier 被拒绝，所以 coverage
-不会在 reader attach 后改变。该路径是需要全日 Event/history 或需要 native
-gap 回补时的默认路径。
+不会在 reader attach 后改变。process-start service 先在 closed exposure gate
+后创建 journal，再由 Event worker 在 SDK Connect 成功后的 FIFO barrier 中写入
+最终 `coverage_start_unix_ns`；只有该边界与 FAST metadata 都完成后才开放
+control。它始终保持 `certified_prefix_valid=false`。
 
-## Low-latency event-delta 实时链路
+Event wire V1.3 要求 temporal coverage bit 恰好一个。Python reader 默认要求
+`coverage_requirement="from_open"`；partial consumer 必须显式传入
+`"process_start_partial"`，不能把 partial Event 冒充成全日 prefix。
 
-正式实时链路为：
+## ordered-input standalone event-delta 工具
+
+该独立工具链路为：
 
 ```text
 Wire V2 global tick ring
@@ -256,9 +275,12 @@ Wire V2 global tick ring
   -> C++ / stable C ABI / Python live reader
 ```
 
-`OrderEventLiveAggregationEngineV1` 必须从所声明时间覆盖起点的
-`tick_stream_sequence=1` 开始稠密消费沪深混合 global tick 流。默认起点是开盘；
-显式 process-start 模式的起点是本进程开始接收行情。快照等非目标
+它只适用于已经保证 native order 的回放/诊断输入。production router 不再启动、
+等待或公开这条路径；live callback-order Wire 无法保证深圳 6.33/6.36 的共享
+`(ChannelNo, ApplSeqNum)` 顺序，生产 Event 必须使用前述 canonical service。
+
+`OrderEventLiveAggregationEngineV1` 必须从 from-open source 的
+`tick_stream_sequence=1` 开始稠密消费沪深混合 global tick 流。快照等非目标
 消息产生零条派生事件，但仍推进 source cursor；不能只读关心的证券或 source
 slot。每个目标 tick 只调用一次 `PublishSourceTick`：
 
@@ -290,35 +312,15 @@ fail-close；V1 没有跳过缺口、overrun catch-up、reset 或恢复入口。
 5. 运行时源 overrun、序号缺口、状态容量耗尽或任何投影/发布失败均关闭
    event session。
 
-默认 `--temporal-coverage from-open` 只接受带
-`coverage_from_open=true` 的源。`--temporal-coverage process-start` 才接受
-`LIVE_PARTIAL`，并从该源的本地 tick sequence 1 建立完整的本进程期内事件流。
-event/source session 都传递同一 temporal coverage 和
-`LOCAL_TICK_STREAM_CONTIGUOUS` quality。后者只证明本地
-`tick_stream_sequence` 稠密；它不声称启动前数据或 vendor-native gap 已回补。
-沪深 native `BizIndex/ApplSeqNum` 的非递增保护仍独立 fail-close。
-
-`--intraday-live-partial` 默认由 router 派生 `<ipc-socket>.events` 并管理该
-进程；显式 `--event-aggregator-socket` 则保留给外部 supervisor。受管模式在
-SDK connect 前等待 process-start READY，因此不会丢失第一条 callback。Event
-进程运行期失败只降级 Event，不反向停止或阻塞 FAST。router 每个 generation
-周期检查 control identity、heartbeat、消费进度与 source-ring lag；受管进程还
-用 `PR_SET_PDEATHSIG` 绑定精确父 PID，并以有界 TERM/KILL 流程回收。外部模式
-同样接受运行期健康检查，但进程生命周期仍由外部 supervisor 负责。
+production router 在 SDK Connect 前启动 bounded canonical service，并把
+observation 与 applied record 投递给同一 worker；它没有 arrival-order Event
+fallback。`--disable-native-gap-recovery` 明确选择 FAST-only。
 
 可选 `--event-cpu-set LIST` 会把启动允许的逻辑 CPU 严格分成
-`Event=LIST` 与 `FAST=allowed-LIST`；两者均经内核 exact readback，FAST 补集
-必须非空。缺省不执行 affinity syscall。该集合关系不等价于物理核、SMT、
-NUMA 或 IRQ 隔离，拓扑选择仍由部署方负责。
-
-生产 router 的 `--event-aggregator-socket` 是可选兼容开关；配置后则是强制
-启动门槛。router 在创建 SDK pipeline 之前等待同一
-`source run_id/session_epoch/trade_date` 及完整冻结 daily-catalog identity
-（digest、generation、version、scope、coverage、capacity/bound count）的
-READY，并额外要求
-`source_tick_consumed_sequence=0`、`event_published_sequence=0`。因此启用该
-门槛时，SDK 第一条 callback 不可能先于聚合器 READY。超时由
-`--event-aggregator-ready-timeout-ms` 控制。
+`canonical Event=LIST` 与 `FAST=allowed-LIST`；两者均经内核 exact readback，
+FAST 补集必须非空。缺省不执行 affinity syscall。该集合关系不等价于物理核、
+SMT、NUMA 或 IRQ 隔离，拓扑选择仍由部署方负责。standalone 工具若单独运行，
+使用自己的 `--cpu-set`。
 
 event control V1.2 使用固定宽度 Unix `SOCK_SEQPACKET` 协议、双向 same-UID
 `SO_PEERCRED` 校验和 `SCM_RIGHTS`。只有 ACTIVE 且 coverage 未丢失时才传递
@@ -346,8 +348,8 @@ Python 控制面再次校验 source identity、协议保留字段、same-UID pee
 Python 对象；`.row(i)` 只用于冷路径检查。
 
 实时可见性不等待 immutable generation。进程在有数据时连续 drain；只有空读
-才按 `--poll-ms` 等待。正值按对应毫秒休眠；`0` 执行 scheduler yield，供受管
-partial sidecar 的低延迟默认值使用，不增加固定毫秒级等待。
+才按 `--poll-ms` 等待。该 standalone poll 选项不参与 partial canonical
+bootstrap，也不能作为 native reorder 的正确性边界。
 instrument full/update 历史接口则仍受 generation 周期约束，两者用途不能混淆。
 
 容量至少同时满足：

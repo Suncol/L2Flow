@@ -35,6 +35,7 @@ from l2flow_realtime.certified_order_events import (  # noqa: E402
 from l2flow_realtime.polars import (  # noqa: E402
     LivePolarsHistory,
     PolarsCertifiedOrderEventHistory,
+    PolarsHistoryCoverageError,
     PolarsHistoryCoverageOrigin,
     PolarsHistoryProductKind,
     PolarsHistoryNotReadyError,
@@ -996,6 +997,61 @@ class LivePolarsManifestTests(unittest.TestCase):
         self.assertEqual(current.next_event_sequence, 4)
         self.assertEqual(current.row_count, 3)
         self.assertEqual(old.lazyframe.collect().height, 2)
+
+    def test_certified_process_start_history_requires_explicit_opt_in(self):
+        coverage = HistoryCoverageInfo(
+            run_id=b"C" * 16,
+            session_epoch=19,
+            trade_date=20260803,
+            coverage_kind=TemporalCoverageKind.PROCESS_START_PARTIAL,
+            coverage_start_unix_ns=1_722_750_365_000_000_000,
+        )
+        reader = _FakeCertifiedReader((), coverage)
+        with self.assertRaises(PolarsHistoryCoverageError):
+            PolarsCertifiedOrderEventHistory(
+                reader, autostart=False
+            )
+
+        history = PolarsCertifiedOrderEventHistory(
+            reader,
+            coverage_requirement="process_start_partial",
+            autostart=False,
+        )
+        self.addCleanup(history.close)
+        self.assertTrue(history.history_coverage.process_start_partial)
+
+    def test_certified_degraded_channel_does_not_stop_healthy_history(self):
+        coverage = HistoryCoverageInfo(
+            run_id=b"C" * 16,
+            session_epoch=19,
+            trade_date=20260803,
+            coverage_kind=TemporalCoverageKind.PROCESS_START_PARTIAL,
+            coverage_start_unix_ns=1_722_750_365_000_000_000,
+        )
+        batch = _FakeCertifiedBatch(
+            (_derived_event(1), _derived_event(2)),
+            3,
+            _FakeCertifiedStatus(
+                2,
+                5,
+                state=CertifiedOrderEventState.DEGRADED,
+                frozen_channel_count=1,
+            ),
+            coverage,
+        )
+        history = PolarsCertifiedOrderEventHistory(
+            _FakeCertifiedReader((batch,), coverage),
+            coverage_requirement="process_start_partial",
+            poll_interval=None,
+        )
+        self.addCleanup(history.close)
+        history.wait_ready(timeout=2.0)
+        snapshot = history.latest_snapshot()
+        self.assertEqual(snapshot.row_count, 2)
+        self.assertIs(
+            snapshot.status.state,
+            CertifiedOrderEventState.DEGRADED,
+        )
 
     def test_certified_initial_prefix_is_hidden_until_caught_up(self):
         coverage = HistoryCoverageInfo(

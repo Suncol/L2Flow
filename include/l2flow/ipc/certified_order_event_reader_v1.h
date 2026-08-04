@@ -44,6 +44,12 @@ enum class CertifiedOrderEventReadResultV1 : std::uint8_t {
     kProducerFailed,
 };
 
+enum class CertifiedOrderEventCoverageRequirementV1 : std::uint8_t {
+    kFromOpen = 0U,
+    kProcessStartPartial = 1U,
+    kAnyExplicit = 2U,
+};
+
 [[nodiscard]] std::string_view
 CertifiedOrderEventReaderOpenErrorNameV1(
     CertifiedOrderEventReaderOpenErrorV1 error) noexcept;
@@ -54,6 +60,7 @@ CertifiedOrderEventReadResultNameV1(
 struct CertifiedOrderEventStatusSnapshotV1 final {
     RealtimeCertifiedStatusSnapshotV1 tick{};
     std::uint32_t coverage_flags = 0U;
+    std::uint64_t coverage_start_unix_ns = 0U;
     std::uint64_t event_publish_tag = 0U;
     std::uint64_t event_heartbeat_monotonic_ns = 0U;
     std::uint64_t event_canonical_apply_frontier = 0U;
@@ -75,6 +82,10 @@ struct CertifiedOrderEventStatusSnapshotV1 final {
     [[nodiscard]] bool startup_prefix_recovered() const noexcept {
         return (coverage_flags &
                 kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U;
+    }
+    [[nodiscard]] bool process_start_partial() const noexcept {
+        return (coverage_flags &
+                kCertifiedOrderEventCoverageFromProcessStartV1) != 0U;
     }
 };
 
@@ -101,6 +112,7 @@ public:
     // kGetEventHistory request obtains the Event fd.
     [[nodiscard]] static CertifiedOrderEventReaderOpenErrorV1 Open(
         RealtimeCertifiedReaderOpenOptionsV1 options,
+        CertifiedOrderEventCoverageRequirementV1 coverage_requirement,
         std::unique_ptr<CertifiedOrderEventReaderV1>* output,
         int* system_error_number = nullptr) noexcept;
 
@@ -111,6 +123,7 @@ public:
         int tick_descriptor,
         int event_descriptor,
         const RealtimeCertifiedExpectedSessionV1& expected_session,
+        CertifiedOrderEventCoverageRequirementV1 coverage_requirement,
         std::unique_ptr<CertifiedOrderEventReaderV1>* output,
         int* system_error_number = nullptr) noexcept;
 
@@ -137,6 +150,8 @@ public:
     [[nodiscard]] const RealtimeCertifiedExpectedSessionV1&
     session() const noexcept;
     [[nodiscard]] std::uint64_t event_capacity() const noexcept;
+    [[nodiscard]] std::uint64_t coverage_start_unix_ns() const
+        noexcept;
 
 private:
     class Impl;

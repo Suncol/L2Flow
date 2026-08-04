@@ -156,6 +156,23 @@ template <typename Unsigned>
                NativeSequenceRecoveryRecordClassV1::kFiltered;
 }
 
+[[nodiscard]] bool IsValidOriginPolicy(
+    NativeSequenceOriginPolicyV1 policy) noexcept {
+    return policy == NativeSequenceOriginPolicyV1::kExplicitOrigin ||
+           policy ==
+               NativeSequenceOriginPolicyV1::kBoundedProcessStart;
+}
+
+[[nodiscard]] bool IsValidChannelDomain(
+    const NativeSequenceChannelV1& domain) noexcept {
+    return IsKnownMarket(domain.market) &&
+           (domain.market != NativeSequenceMarketV1::kShanghai ||
+            (domain.channel != 0U &&
+             domain.channel <=
+                 static_cast<std::uint32_t>(
+                     std::numeric_limits<std::int32_t>::max())));
+}
+
 [[nodiscard]] std::uint64_t Mix64(std::uint64_t value) noexcept {
     value ^= value >> 30U;
     value *= UINT64_C(0xbf58476d1ce4e5b9);
@@ -331,6 +348,8 @@ std::string_view NativeSequenceRecoveryChannelStateNameV1(
             return "frozen_conflict";
         case NativeSequenceRecoveryChannelStateV1::kFrozenResource:
             return "frozen_resource";
+        case NativeSequenceRecoveryChannelStateV1::kBootstrapping:
+            return "bootstrapping";
     }
     return "unknown";
 }
@@ -359,6 +378,12 @@ std::string_view NativeSequenceRecoveryFreezeReasonNameV1(
         case NativeSequenceRecoveryFreezeReasonV1::
             kInternalInvariant:
             return "internal_invariant";
+        case NativeSequenceRecoveryFreezeReasonV1::
+            kReorderBoundExceeded:
+            return "reorder_bound_exceeded";
+        case NativeSequenceRecoveryFreezeReasonV1::
+            kInputSealedIncomplete:
+            return "input_sealed_incomplete";
     }
     return "unknown";
 }
@@ -442,6 +467,9 @@ public:
         std::uint64_t duplicate_outside_retention = 0U;
         std::uint64_t conflicts = 0U;
         std::uint64_t filtered_sequences_certified = 0U;
+        std::uint64_t channel_correction_epoch = 1U;
+        std::uint64_t provisional_min_sequence = 0U;
+        std::size_t bootstrap_observed_entries = 0U;
         // Number of unique observed positions in
         // (observed_contiguous_sequence, highest_observed_sequence].
         // Maintaining this incrementally keeps gap status O(1), including
@@ -537,16 +565,19 @@ public:
                 channel = Channel{};
                 channel.occupied = true;
                 channel.domain = domain;
-                const std::uint64_t checkpoint =
-                    config_.trusted_checkpoint_sequence != 0U
-                        ? config_.trusted_checkpoint_sequence
-                        : config_.expected_origin_sequence - 1U;
-                channel.initialized = true;
-                channel.origin_sequence =
-                    config_.expected_origin_sequence;
-                channel.certified_sequence = checkpoint;
-                channel.observed_contiguous_sequence = checkpoint;
-                channel.highest_observed_sequence = checkpoint;
+                if (config_.origin_policy ==
+                    NativeSequenceOriginPolicyV1::kExplicitOrigin) {
+                    const std::uint64_t checkpoint =
+                        config_.trusted_checkpoint_sequence != 0U
+                            ? config_.trusted_checkpoint_sequence
+                            : config_.expected_origin_sequence - 1U;
+                    channel.initialized = true;
+                    channel.origin_sequence =
+                        config_.expected_origin_sequence;
+                    channel.certified_sequence = checkpoint;
+                    channel.observed_contiguous_sequence = checkpoint;
+                    channel.highest_observed_sequence = checkpoint;
+                }
                 occupied_channel_slots_[channel_count_] =
                     static_cast<std::uint32_t>(slot);
                 ++channel_count_;
@@ -574,7 +605,8 @@ public:
                 kFrozenResource;
         }
         if (!channel.initialized) {
-            return NativeSequenceRecoveryChannelStateV1::kHealthy;
+            return NativeSequenceRecoveryChannelStateV1::
+                kBootstrapping;
         }
         if (channel.observed_contiguous_sequence <
             channel.highest_observed_sequence) {
@@ -853,6 +885,96 @@ public:
         }
     }
 
+    [[nodiscard]] bool UnseenSequenceWithinBackwardBound(
+        std::uint32_t channel_slot,
+        std::uint64_t sequence) noexcept {
+        Channel& channel = channels_[channel_slot];
+        if (config_.origin_policy !=
+                NativeSequenceOriginPolicyV1::kBoundedProcessStart ||
+            channel.highest_observed_sequence == 0U ||
+            sequence >= channel.highest_observed_sequence) {
+            return true;
+        }
+        const std::uint64_t displacement =
+            channel.highest_observed_sequence - sequence;
+        if (displacement <=
+            config_.maximum_backward_displacement) {
+            return true;
+        }
+        FreezeChannel(
+            channel_slot,
+            NativeSequenceRecoveryFreezeReasonV1::
+                kReorderBoundExceeded);
+        return false;
+    }
+
+    [[nodiscard]] bool EstablishBootstrapOrigin(
+        std::uint32_t channel_slot) noexcept {
+        Channel& channel = channels_[channel_slot];
+        if (channel.initialized ||
+            channel.provisional_min_sequence == 0U ||
+            channel.highest_observed_sequence <
+                channel.provisional_min_sequence ||
+            channel.bootstrap_observed_entries == 0U) {
+            return false;
+        }
+        channel.initialized = true;
+        channel.origin_sequence =
+            channel.provisional_min_sequence;
+        channel.certified_sequence =
+            channel.origin_sequence - 1U;
+        channel.observed_contiguous_sequence =
+            channel.origin_sequence - 1U;
+        channel.observed_above_contiguous =
+            channel.bootstrap_observed_entries;
+
+        while (channel.observed_contiguous_sequence <
+               channel.highest_observed_sequence) {
+            const std::uint64_t next_sequence =
+                channel.observed_contiguous_sequence + 1U;
+            const std::uint32_t next_index =
+                FindEntry(channel_slot, next_sequence);
+            if (next_index == kInvalidIndex ||
+                !entries_[next_index].sequence_observed) {
+                break;
+            }
+            if (channel.observed_above_contiguous == 0U) {
+                FreezeChannel(
+                    channel_slot,
+                    NativeSequenceRecoveryFreezeReasonV1::
+                        kInternalInvariant);
+                return false;
+            }
+            --channel.observed_above_contiguous;
+            ++channel.observed_contiguous_sequence;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool EnforceEstablishedGapBound(
+        std::uint32_t channel_slot) noexcept {
+        Channel& channel = channels_[channel_slot];
+        if (config_.origin_policy !=
+                NativeSequenceOriginPolicyV1::kBoundedProcessStart ||
+            !channel.initialized || channel.frozen ||
+            channel.observed_contiguous_sequence >=
+                channel.highest_observed_sequence) {
+            return !channel.frozen;
+        }
+        const std::uint64_t expected_sequence =
+            channel.observed_contiguous_sequence + 1U;
+        if (channel.highest_observed_sequence <= expected_sequence ||
+            channel.highest_observed_sequence - expected_sequence <=
+                config_.maximum_backward_displacement) {
+            return true;
+        }
+        FreezeChannel(
+            channel_slot,
+            NativeSequenceRecoveryFreezeReasonV1::
+                kReorderBoundExceeded);
+        return false;
+    }
+
     [[nodiscard]] bool SequenceFitsWindow(
         const Channel& channel,
         std::uint64_t sequence) const noexcept {
@@ -900,13 +1022,46 @@ public:
         IncrementCounter(&channel.unique_sequences);
 
         if (!channel.initialized) {
-            channel.initialized = true;
-            channel.origin_sequence = entry.sequence;
-            channel.certified_sequence = entry.sequence - 1U;
-            channel.observed_contiguous_sequence = entry.sequence;
-            channel.highest_observed_sequence = entry.sequence;
-            return true;
+            if (channel.bootstrap_observed_entries ==
+                std::numeric_limits<std::size_t>::max()) {
+                FreezeChannel(
+                    channel_slot,
+                    NativeSequenceRecoveryFreezeReasonV1::
+                        kInternalInvariant);
+                return false;
+            }
+            ++channel.bootstrap_observed_entries;
+            if (channel.provisional_min_sequence == 0U ||
+                entry.sequence < channel.provisional_min_sequence) {
+                channel.provisional_min_sequence = entry.sequence;
+            }
+            if (entry.sequence > channel.highest_observed_sequence) {
+                channel.highest_observed_sequence = entry.sequence;
+            }
+            const std::uint64_t observed_span =
+                channel.highest_observed_sequence -
+                channel.provisional_min_sequence;
+            if (observed_span <
+                config_.maximum_backward_displacement) {
+                return true;
+            }
+            if (!EstablishBootstrapOrigin(channel_slot)) {
+                return false;
+            }
+            if (channel.highest_observed_sequence -
+                    channel.certified_sequence >
+                config_.maximum_reorder_span) {
+                FreezeChannel(
+                    channel_slot,
+                    NativeSequenceRecoveryFreezeReasonV1::
+                        kReorderWindowExceeded);
+                return false;
+            }
+            return EnforceEstablishedGapBound(channel_slot);
         }
+        const bool gap_before =
+            channel.observed_contiguous_sequence <
+            channel.highest_observed_sequence;
         if (entry.sequence > channel.highest_observed_sequence) {
             channel.highest_observed_sequence = entry.sequence;
         }
@@ -936,9 +1091,30 @@ public:
         } else if (
             entry.sequence >
             channel.observed_contiguous_sequence) {
+            if (channel.observed_above_contiguous ==
+                std::numeric_limits<std::size_t>::max()) {
+                FreezeChannel(
+                    channel_slot,
+                    NativeSequenceRecoveryFreezeReasonV1::
+                        kInternalInvariant);
+                return false;
+            }
             ++channel.observed_above_contiguous;
         }
-        return true;
+        if (gap_before &&
+            channel.observed_contiguous_sequence ==
+                channel.highest_observed_sequence) {
+            if (channel.channel_correction_epoch ==
+                std::numeric_limits<std::uint64_t>::max()) {
+                FreezeChannel(
+                    channel_slot,
+                    NativeSequenceRecoveryFreezeReasonV1::
+                        kInternalInvariant);
+                return false;
+            }
+            ++channel.channel_correction_epoch;
+        }
+        return EnforceEstablishedGapBound(channel_slot);
     }
 
     [[nodiscard]] NativeSequenceRecoveryTokenV1 TokenFor(
@@ -1204,6 +1380,7 @@ public:
     std::size_t canonical_payload_bytes_ = 0U;
     std::uint64_t channel_capacity_failures_ = 0U;
     std::uint64_t invalid_observations_ = 0U;
+    bool input_sealed_ = false;
 };
 
 NativeSequenceRecoveryCoordinatorV1::
@@ -1227,13 +1404,29 @@ NativeSequenceRecoveryCoordinatorV1::Create(
     constexpr std::uint64_t maximum_native_sequence =
         static_cast<std::uint64_t>(
             std::numeric_limits<std::int64_t>::max());
+    const bool explicit_origin =
+        config.origin_policy ==
+        NativeSequenceOriginPolicyV1::kExplicitOrigin;
+    const bool bounded_process_start =
+        config.origin_policy ==
+        NativeSequenceOriginPolicyV1::kBoundedProcessStart;
     const bool invalid_explicit_baseline =
-        config.expected_origin_sequence == 0U ||
-        config.expected_origin_sequence > maximum_native_sequence ||
-        config.trusted_checkpoint_sequence >= maximum_native_sequence ||
-        (config.trusted_checkpoint_sequence != 0U &&
-         config.trusted_checkpoint_sequence <
-             config.expected_origin_sequence - 1U);
+        explicit_origin &&
+        (config.expected_origin_sequence == 0U ||
+         config.expected_origin_sequence > maximum_native_sequence ||
+         config.trusted_checkpoint_sequence >= maximum_native_sequence ||
+         (config.trusted_checkpoint_sequence != 0U &&
+          config.trusted_checkpoint_sequence <
+              config.expected_origin_sequence - 1U));
+    const bool invalid_process_start =
+        bounded_process_start &&
+        (config.expected_origin_sequence != 1U ||
+         config.trusted_checkpoint_sequence != 0U ||
+         config.maximum_backward_displacement >=
+             config.maximum_reorder_span ||
+         config.maximum_backward_displacement >=
+             static_cast<std::uint64_t>(
+                 config.maximum_pending_entries_per_channel));
     if (config.maximum_channels == 0U ||
         config.maximum_pending_entries == 0U ||
         config.maximum_pending_entries_per_channel == 0U ||
@@ -1244,7 +1437,11 @@ NativeSequenceRecoveryCoordinatorV1::Create(
         config.maximum_canonical_payload_bytes_per_entry >
             config.maximum_total_canonical_payload_bytes ||
         config.maximum_reorder_span == 0U ||
+        !IsValidOriginPolicy(config.origin_policy) ||
         invalid_explicit_baseline ||
+        invalid_process_start ||
+        (explicit_origin &&
+         config.maximum_backward_displacement != 0U) ||
         config.certified_duplicate_retention_entries >
             std::numeric_limits<std::size_t>::max() -
                 config.maximum_pending_entries) {
@@ -1292,6 +1489,50 @@ NativeSequenceRecoveryCoordinatorV1::Create(
     return NativeSequenceRecoveryCreateErrorV1::kNone;
 }
 
+NativeSequenceRecoveryRegisterOriginErrorV1
+NativeSequenceRecoveryCoordinatorV1::RegisterTrustedOrigin(
+    const NativeSequenceChannelV1& domain,
+    std::uint64_t origin,
+    std::uint64_t checkpoint) noexcept {
+    constexpr std::uint64_t maximum_native_sequence =
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max());
+    if (!IsValidChannelDomain(domain) || origin == 0U ||
+        origin > maximum_native_sequence ||
+        checkpoint >= maximum_native_sequence) {
+        return NativeSequenceRecoveryRegisterOriginErrorV1::
+            kInvalidInput;
+    }
+    const std::uint64_t effective_checkpoint =
+        checkpoint == 0U ? origin - 1U : checkpoint;
+    if (effective_checkpoint < origin - 1U) {
+        return NativeSequenceRecoveryRegisterOriginErrorV1::
+            kInvalidInput;
+    }
+    if (impl_->input_sealed_) {
+        return NativeSequenceRecoveryRegisterOriginErrorV1::
+            kInputSealed;
+    }
+    if (impl_->FindChannel(domain) != kInvalidIndex) {
+        return NativeSequenceRecoveryRegisterOriginErrorV1::
+            kChannelAlreadyObserved;
+    }
+    const std::uint32_t channel_slot =
+        impl_->FindOrCreateChannel(domain);
+    if (channel_slot == kInvalidIndex) {
+        return NativeSequenceRecoveryRegisterOriginErrorV1::
+            kChannelCapacity;
+    }
+    NativeSequenceRecoveryCoordinatorV1::Impl::Channel& channel =
+        impl_->channels_[channel_slot];
+    channel.initialized = true;
+    channel.origin_sequence = origin;
+    channel.certified_sequence = effective_checkpoint;
+    channel.observed_contiguous_sequence = effective_checkpoint;
+    channel.highest_observed_sequence = effective_checkpoint;
+    return NativeSequenceRecoveryRegisterOriginErrorV1::kNone;
+}
+
 NativeSequenceRecoveryObserveErrorV1
 NativeSequenceRecoveryCoordinatorV1::Observe(
     const NativeSequenceDescriptorV1& descriptor,
@@ -1309,6 +1550,9 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
         !IsValidRecordClass(record_class)) {
         IncrementCounter(&impl_->invalid_observations_);
         return NativeSequenceRecoveryObserveErrorV1::kInvalidInput;
+    }
+    if (impl_->input_sealed_) {
+        return NativeSequenceRecoveryObserveErrorV1::kInputSealed;
     }
 
     const std::uint32_t channel_slot =
@@ -1351,6 +1595,16 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
         }
 
         if (!entry.sequence_observed) {
+            if (!impl_->UnseenSequenceWithinBackwardBound(
+                    channel_slot, descriptor.sequence)) {
+                impl_->FillObserveResult(
+                    channel,
+                    NativeSequenceRecoveryObserveDispositionV1::
+                        kResourceFrozen,
+                    NativeSequenceRecoveryTokenV1{},
+                    output);
+                return NativeSequenceRecoveryObserveErrorV1::kNone;
+            }
             if (channel.initialized &&
                 descriptor.sequence < channel.origin_sequence) {
                 impl_->ReleaseEntry(existing_index);
@@ -1449,6 +1703,16 @@ NativeSequenceRecoveryCoordinatorV1::Observe(
         return NativeSequenceRecoveryObserveErrorV1::kNone;
     }
 
+    if (!impl_->UnseenSequenceWithinBackwardBound(
+            channel_slot, descriptor.sequence)) {
+        impl_->FillObserveResult(
+            channel,
+            NativeSequenceRecoveryObserveDispositionV1::
+                kResourceFrozen,
+            NativeSequenceRecoveryTokenV1{},
+            output);
+        return NativeSequenceRecoveryObserveErrorV1::kNone;
+    }
     if (channel.initialized &&
         descriptor.sequence < channel.origin_sequence) {
         impl_->FillObserveResult(
@@ -1556,6 +1820,9 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
             descriptor.domain, message_key) ||
         canonical_payload.empty()) {
         return NativeSequenceRecoveryApplyErrorV1::kInvalidInput;
+    }
+    if (impl_->input_sealed_) {
+        return NativeSequenceRecoveryApplyErrorV1::kInputSealed;
     }
 
     const std::uint32_t channel_slot =
@@ -1672,6 +1939,9 @@ NativeSequenceRecoveryCoordinatorV1::MarkTargetApplied(
         return NativeSequenceRecoveryApplyErrorV1::kNullOutput;
     }
     *output = NativeSequenceRecoveryApplyResultV1{};
+    if (impl_->input_sealed_) {
+        return NativeSequenceRecoveryApplyErrorV1::kInputSealed;
+    }
     if (!token.valid() || canonical_payload.empty() ||
         token.channel_slot >= impl_->channels_.size()) {
         return NativeSequenceRecoveryApplyErrorV1::kInvalidToken;
@@ -1863,6 +2133,67 @@ NativeSequenceRecoveryCoordinatorV1::CommitCertified(
     return NativeSequenceRecoveryCommitErrorV1::kNone;
 }
 
+NativeSequenceRecoverySealErrorV1
+NativeSequenceRecoveryCoordinatorV1::SealInput() noexcept {
+    if (impl_->input_sealed_) {
+        return NativeSequenceRecoverySealErrorV1::kAlreadySealed;
+    }
+    impl_->input_sealed_ = true;
+
+    for (std::size_t dense_index = 0U;
+         dense_index < impl_->channel_count_;
+         ++dense_index) {
+        const std::uint32_t channel_slot =
+            impl_->occupied_channel_slots_[dense_index];
+        if (channel_slot == kInvalidIndex ||
+            channel_slot >= impl_->channels_.size()) {
+            continue;
+        }
+        Impl::Channel& channel = impl_->channels_[channel_slot];
+        if (!channel.occupied || channel.frozen) {
+            continue;
+        }
+        if (!channel.initialized &&
+            !impl_->EstablishBootstrapOrigin(channel_slot)) {
+            impl_->FreezeChannel(
+                channel_slot,
+                NativeSequenceRecoveryFreezeReasonV1::
+                    kInputSealedIncomplete);
+            continue;
+        }
+        if (channel.observed_contiguous_sequence <
+            channel.highest_observed_sequence) {
+            impl_->FreezeChannel(
+                channel_slot,
+                NativeSequenceRecoveryFreezeReasonV1::
+                    kInputSealedIncomplete);
+            continue;
+        }
+
+        bool incomplete = false;
+        for (const Impl::Entry& entry : impl_->entries_) {
+            if (!entry.occupied ||
+                entry.channel_slot != channel_slot) {
+                continue;
+            }
+            if (!entry.sequence_observed ||
+                (entry.record_class ==
+                     NativeSequenceRecoveryRecordClassV1::kTarget &&
+                 entry.apply_calls != entry.observe_calls)) {
+                incomplete = true;
+                break;
+            }
+        }
+        if (incomplete) {
+            impl_->FreezeChannel(
+                channel_slot,
+                NativeSequenceRecoveryFreezeReasonV1::
+                    kInputSealedIncomplete);
+        }
+    }
+    return NativeSequenceRecoverySealErrorV1::kNone;
+}
+
 bool NativeSequenceRecoveryCoordinatorV1::ChannelSnapshot(
     const NativeSequenceChannelV1& domain,
     NativeSequenceRecoveryChannelSnapshotV1* output) const noexcept {
@@ -1897,6 +2228,8 @@ bool NativeSequenceRecoveryCoordinatorV1::ChannelSnapshot(
     output->conflicts = channel.conflicts;
     output->filtered_sequences_certified =
         channel.filtered_sequences_certified;
+    output->channel_correction_epoch =
+        channel.channel_correction_epoch;
     output->pending_entries = channel.pending_entries;
     output->coverage_from_sequence_one =
         channel.initialized && channel.origin_sequence == 1U;

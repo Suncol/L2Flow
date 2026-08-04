@@ -80,8 +80,6 @@ void TestProcessStartAndZeroPoll(bool* ok) {
     arguments.push_back("process-start");
     arguments.push_back("--cpu-set");
     arguments.push_back("8-9,12");
-    arguments.push_back("--parent-pid");
-    arguments.push_back("1234");
     app::OrderEventAggregatorOptionsV1 options{};
     std::string error;
     *ok &= Expect(
@@ -92,8 +90,7 @@ void TestProcessStartAndZeroPoll(bool* ok) {
             options.temporal_coverage ==
                 ipc::OrderEventDeltaTemporalCoverageV1::
                     kFromProcessStart &&
-            options.cpu_set == "8-9,12" &&
-            options.managed_parent_pid == 1234U,
+            options.cpu_set == "8-9,12",
         "process-start permits yield polling and strict Event affinity");
 }
 
@@ -203,20 +200,6 @@ void TestInvalidInputs(bool* ok) {
                     app::OrderEventAggregatorParseResultV1::kError &&
                 error.find("invalid_syntax") != std::string::npos,
             "Event CPU set uses the strict no-whitespace grammar");
-    }
-    {
-        std::vector<std::string_view> arguments(
-            kValidArguments.begin(), kValidArguments.end());
-        arguments.push_back("--parent-pid");
-        arguments.push_back("0");
-        app::OrderEventAggregatorOptionsV1 options{};
-        std::string error;
-        *ok &= Expect(
-            app::ParseOrderEventAggregatorArgumentsV1(
-                arguments, &options, &error) ==
-                    app::OrderEventAggregatorParseResultV1::kError &&
-                error.find("parent-pid") != std::string::npos,
-            "managed parent PID must be a positive pid_t");
     }
     {
         constexpr std::array<std::string_view, 2U> arguments{

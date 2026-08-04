@@ -213,6 +213,7 @@ enum class HandoffKind : std::uint8_t {
     kApplied = 2U,
     kPrefixProbe = 3U,
     kPrefixCommit = 4U,
+    kProcessStartCoverage = 5U,
 };
 
 enum class PrefixCommitPhase : std::uint8_t {
@@ -223,6 +224,15 @@ enum class PrefixCommitPhase : std::uint8_t {
     kFailed,
     kCancelled,
     kWorkerFailed,
+};
+
+enum class ProcessStartCoveragePhase : std::uint8_t {
+    kNotStarted = 0U,
+    kPending,
+    kCompleting,
+    kReady,
+    kFailed,
+    kCancelled,
 };
 
 struct HandoffEvent final {
@@ -628,6 +638,32 @@ public:
             config_.certified_duplicate_retention_entries >
                 std::numeric_limits<std::size_t>::max() ||
             config_.maximum_reorder_span == 0U ||
+            (config_.origin_policy !=
+                 realtime::NativeSequenceOriginPolicyV1::
+                     kExplicitOrigin &&
+             config_.origin_policy !=
+                 realtime::NativeSequenceOriginPolicyV1::
+                     kBoundedProcessStart) ||
+            (config_.origin_policy ==
+                     realtime::NativeSequenceOriginPolicyV1::
+                         kExplicitOrigin
+                 ? (config_.maximum_backward_displacement != 0U ||
+                    config_.event_temporal_coverage !=
+                        CertifiedOrderEventTemporalCoverageV1::
+                            kFromOpen ||
+                    config_.event_coverage_start_unix_ns != 0U)
+                 : (config_.maximum_backward_displacement >=
+                        config_.maximum_reorder_span ||
+                    config_.maximum_backward_displacement >=
+                        config_.maximum_pending_entries_per_channel ||
+                    config_.event_temporal_coverage !=
+                        CertifiedOrderEventTemporalCoverageV1::
+                            kFromProcessStart ||
+                    config_.event_coverage_start_unix_ns == 0U ||
+                    config_.control_exposure_gate == nullptr ||
+                    config_.control_exposure_gate->load(
+                        std::memory_order_acquire) ||
+                    config_.control_requires_prefix_commit)) ||
             config_.maximum_order_states == 0U ||
             config_.maximum_derived_events == 0U ||
             (config_.maximum_derived_event_mapping_bytes != 0U &&
@@ -743,11 +779,9 @@ public:
             static_cast<std::size_t>(payload_bytes);
         recovery_config.maximum_reorder_span =
             config_.maximum_reorder_span;
-        // Both supported exchange-native domains are documented as starting
-        // from one and production requires capture from market open. Never
-        // bless a later first packet as complete: it is a gap until 1..N-1
-        // arrive. A resumed trusted checkpoint would also require restored
-        // Event projection state, so this fresh service supplies none.
+        recovery_config.origin_policy = config_.origin_policy;
+        recovery_config.maximum_backward_displacement =
+            config_.maximum_backward_displacement;
         recovery_config.expected_origin_sequence = 1U;
         recovery_config.trusted_checkpoint_sequence = 0U;
         if (realtime::NativeSequenceRecoveryCoordinatorV1::Create(
@@ -844,6 +878,10 @@ public:
             exact_event_mapping_bytes;
         event_wire_config.lazy_commit_chunk_bytes =
             config_.derived_event_lazy_commit_chunk_bytes;
+        event_wire_config.temporal_coverage =
+            config_.event_temporal_coverage;
+        event_wire_config.coverage_start_unix_ns =
+            config_.event_coverage_start_unix_ns;
         if (CertifiedOrderEventJournalProducerV1::Create(
                 event_wire_config,
                 &event_journal_,
@@ -1683,6 +1721,127 @@ public:
         return false;
     }
 
+    [[nodiscard]] bool FinalizeProcessStartCoverage(
+        std::uint64_t coverage_start_unix_ns,
+        std::chrono::milliseconds timeout,
+        int* system_error_number) noexcept {
+        SetSystemError(system_error_number, 0);
+        if (coverage_start_unix_ns == 0U || timeout.count() <= 0 ||
+            timeout > std::chrono::hours(24) ||
+            config_.event_temporal_coverage !=
+                CertifiedOrderEventTemporalCoverageV1::
+                    kFromProcessStart) {
+            SetSystemError(system_error_number, EINVAL);
+            return false;
+        }
+        std::lock_guard<std::mutex> call(
+            process_start_coverage_call_mutex_);
+        if (config_.control_exposure_gate == nullptr ||
+            config_.control_exposure_gate->load(
+                std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EALREADY);
+            return false;
+        }
+        if (!worker_running_.load(std::memory_order_acquire) ||
+            worker_stop_requested_.load(std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EPIPE);
+            return false;
+        }
+        auto expected = ProcessStartCoveragePhase::kNotStarted;
+        if (!process_start_coverage_phase_.compare_exchange_strong(
+                expected,
+                ProcessStartCoveragePhase::kPending,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            SetSystemError(system_error_number, EALREADY);
+            return false;
+        }
+
+        HandoffEvent barrier{};
+        barrier.kind = HandoffKind::kProcessStartCoverage;
+        barrier.barrier_id = coverage_start_unix_ns;
+        const auto deadline =
+            std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (queue_ != nullptr && queue_->TryPush(barrier)) {
+                WakeWorker();
+                break;
+            }
+            if (!worker_running_.load(std::memory_order_acquire) ||
+                worker_stop_requested_.load(
+                    std::memory_order_acquire) ||
+                globally_frozen_resource_.load(
+                    std::memory_order_acquire)) {
+                auto pending = ProcessStartCoveragePhase::kPending;
+                static_cast<void>(process_start_coverage_phase_
+                                      .compare_exchange_strong(
+                                          pending,
+                                          ProcessStartCoveragePhase::kFailed,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire));
+                SetSystemError(system_error_number, EPIPE);
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                auto pending = ProcessStartCoveragePhase::kPending;
+                if (process_start_coverage_phase_
+                        .compare_exchange_strong(
+                            pending,
+                            ProcessStartCoveragePhase::kCancelled,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                    SetSystemError(system_error_number, ETIMEDOUT);
+                    return false;
+                }
+            }
+            std::this_thread::yield();
+        }
+
+        for (;;) {
+            const ProcessStartCoveragePhase phase =
+                process_start_coverage_phase_.load(
+                    std::memory_order_acquire);
+            if (phase == ProcessStartCoveragePhase::kReady) {
+                return true;
+            }
+            if (phase == ProcessStartCoveragePhase::kFailed) {
+                SetSystemError(system_error_number, EIO);
+                return false;
+            }
+            if (phase == ProcessStartCoveragePhase::kCancelled) {
+                SetSystemError(system_error_number, ETIMEDOUT);
+                return false;
+            }
+            if ((!worker_running_.load(std::memory_order_acquire) ||
+                 worker_stop_requested_.load(
+                     std::memory_order_acquire) ||
+                 globally_frozen_resource_.load(
+                     std::memory_order_acquire)) &&
+                phase == ProcessStartCoveragePhase::kPending) {
+                auto pending = ProcessStartCoveragePhase::kPending;
+                static_cast<void>(process_start_coverage_phase_
+                                      .compare_exchange_strong(
+                                          pending,
+                                          ProcessStartCoveragePhase::kFailed,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire));
+                continue;
+            }
+            if (phase == ProcessStartCoveragePhase::kPending &&
+                std::chrono::steady_clock::now() >= deadline) {
+                auto pending = ProcessStartCoveragePhase::kPending;
+                static_cast<void>(process_start_coverage_phase_
+                                      .compare_exchange_strong(
+                                          pending,
+                                          ProcessStartCoveragePhase::kCancelled,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire));
+                continue;
+            }
+            std::this_thread::yield();
+        }
+    }
+
     [[nodiscard]] bool PublishApplied(
         std::size_t ordinal,
         const market::RealtimeHistoryRecordV1& record) noexcept {
@@ -1734,6 +1893,7 @@ public:
         // failure. Draining here makes every queued pointer lifetime-safe.
         AbortPendingPrefixCommitForWorkerStop();
         accepting_.store(false, std::memory_order_release);
+        seal_input_requested_.store(true, std::memory_order_release);
         worker_stop_requested_.store(true, std::memory_order_release);
         WakeWorker();
         if (worker_thread_.joinable()) {
@@ -1791,6 +1951,7 @@ public:
     void MarkStoppedClean() noexcept {
         AbortPendingPrefixCommitForWorkerStop();
         accepting_.store(false, std::memory_order_release);
+        seal_input_requested_.store(true, std::memory_order_release);
         worker_stop_requested_.store(true, std::memory_order_release);
         WakeWorker();
         if (worker_thread_.joinable()) {
@@ -2280,7 +2441,8 @@ private:
             state == RealtimeCertifiedStateV1::kContiguous;
         const bool incomplete_native_prefix =
             state == RealtimeCertifiedStateV1::kGapOpen ||
-            state == RealtimeCertifiedStateV1::kCatchingUp;
+            state == RealtimeCertifiedStateV1::kCatchingUp ||
+            state == RealtimeCertifiedStateV1::kDegraded;
         const bool complete =
             drain == TickHistoryDrainResult::kOk && complete_state &&
             tick_history_frontier_.load(std::memory_order_acquire) ==
@@ -2491,7 +2653,8 @@ private:
             result.state == RealtimeCertifiedStateV1::kGapOpen ||
             result.state == RealtimeCertifiedStateV1::kCatchingUp ||
             result.state == RealtimeCertifiedStateV1::kFrozenConflict ||
-            result.state == RealtimeCertifiedStateV1::kFrozenResource;
+            result.state == RealtimeCertifiedStateV1::kFrozenResource ||
+            result.state == RealtimeCertifiedStateV1::kDegraded;
         const bool event_count_valid =
             generation.derived_event_sequence_exclusive != 0U &&
             generation.event_count <=
@@ -2596,6 +2759,17 @@ private:
                         // publication that acknowledges this fence.
                         break;
                     }
+                    if (event.kind ==
+                        HandoffKind::kProcessStartCoverage) {
+                        if (!globally_frozen_resource_.load(
+                                std::memory_order_acquire)) {
+                            HandleHandoff(event);
+                        }
+                        ++batch;
+                        // Finalize one exact pre-exposure FIFO cut before
+                        // processing callbacks admitted after the boundary.
+                        break;
+                    }
                     if (!globally_frozen_resource_.load(
                             std::memory_order_acquire)) {
                         HandleHandoff(event);
@@ -2606,6 +2780,25 @@ private:
                         FreezeGlobalResource();
                     }
                     ++batch;
+                }
+                if (!globally_frozen_resource_.load(
+                        std::memory_order_acquire) &&
+                    !input_sealed_by_worker_ &&
+                    seal_input_requested_.load(
+                        std::memory_order_acquire) &&
+                    queue_->Empty()) {
+                    const auto seal_error = recovery_->SealInput();
+                    if (seal_error !=
+                        realtime::NativeSequenceRecoverySealErrorV1::
+                            kNone) {
+                        FreezeGlobalResource();
+                    } else {
+                        input_sealed_by_worker_ = true;
+                        for (auto& [domain, runtime] : channels_) {
+                            static_cast<void>(runtime);
+                            UpdateChannel(domain);
+                        }
+                    }
                 }
                 if (!globally_frozen_resource_.load(
                         std::memory_order_acquire)) {
@@ -2757,10 +2950,48 @@ private:
             PublishHeader(
                 RealtimeCertifiedStateV1::kFrozenResource);
         }
+        auto pending = ProcessStartCoveragePhase::kPending;
+        static_cast<void>(process_start_coverage_phase_
+                              .compare_exchange_strong(
+                                  pending,
+                                  ProcessStartCoveragePhase::kFailed,
+                                  std::memory_order_acq_rel,
+                                  std::memory_order_acquire));
+        auto completing = ProcessStartCoveragePhase::kCompleting;
+        static_cast<void>(process_start_coverage_phase_
+                              .compare_exchange_strong(
+                                  completing,
+                                  ProcessStartCoveragePhase::kFailed,
+                                  std::memory_order_acq_rel,
+                                  std::memory_order_acquire));
+        process_start_coverage_phase_.notify_all();
         worker_running_.store(false, std::memory_order_release);
     }
 
     void HandleHandoff(const HandoffEvent& event) {
+        if (event.kind == HandoffKind::kProcessStartCoverage) {
+            auto pending = ProcessStartCoveragePhase::kPending;
+            if (!process_start_coverage_phase_.compare_exchange_strong(
+                    pending,
+                    ProcessStartCoveragePhase::kCompleting,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return;
+            }
+            const bool finalized =
+                event_journal_ != nullptr &&
+                event_journal_->FinalizeProcessStartCoverage(
+                    event.barrier_id);
+            process_start_coverage_phase_.store(
+                finalized ? ProcessStartCoveragePhase::kReady
+                          : ProcessStartCoveragePhase::kFailed,
+                std::memory_order_release);
+            process_start_coverage_phase_.notify_all();
+            if (!finalized) {
+                FreezeGlobalResource();
+            }
+            return;
+        }
         if (event.kind == HandoffKind::kObservation) {
             HandleObservation(event.observation);
             return;
@@ -3140,6 +3371,9 @@ private:
             case realtime::NativeSequenceRecoveryChannelStateV1::
                 kFrozenResource:
                 return RealtimeCertifiedStateV1::kFrozenResource;
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kBootstrapping:
+                return RealtimeCertifiedStateV1::kGapOpen;
         }
         return RealtimeCertifiedStateV1::kFrozenResource;
     }
@@ -3151,6 +3385,7 @@ private:
             runtime.row_index >= config_.channel_capacity ||
             !runtime.initialized ||
             !runtime.wire_dirty ||
+            runtime.snapshot.channel_correction_epoch == 0U ||
             aggregate_commit_tag < 2U ||
             (aggregate_commit_tag & 1U) != 0U) {
             return false;
@@ -3229,12 +3464,14 @@ private:
         Atomic(row.trade_date).store(
             config_.trade_date, std::memory_order_relaxed);
         Atomic(row.channel).store(
-            static_cast<std::int64_t>(
-                runtime.snapshot.domain.channel),
+            runtime.snapshot.domain.channel,
             std::memory_order_relaxed);
         Atomic(row.market).store(
             static_cast<std::uint8_t>(
                 runtime.snapshot.domain.market),
+            std::memory_order_relaxed);
+        Atomic(row.channel_correction_epoch).store(
+            runtime.snapshot.channel_correction_epoch,
             std::memory_order_relaxed);
         tag.store(
             aggregate_commit_tag, std::memory_order_release);
@@ -3248,8 +3485,7 @@ private:
             unrepresented_resource_failure_) {
             return RealtimeCertifiedStateV1::kFrozenResource;
         }
-        bool conflict = false;
-        bool resource = false;
+        bool degraded = false;
         bool gap = false;
         bool catching_up = false;
         for (const auto& [domain, runtime] : channels_) {
@@ -3258,12 +3494,12 @@ private:
                 case realtime::
                     NativeSequenceRecoveryChannelStateV1::
                         kFrozenConflict:
-                    conflict = true;
+                    degraded = true;
                     break;
                 case realtime::
                     NativeSequenceRecoveryChannelStateV1::
                         kFrozenResource:
-                    resource = true;
+                    degraded = true;
                     break;
                 case realtime::
                     NativeSequenceRecoveryChannelStateV1::
@@ -3277,15 +3513,17 @@ private:
                     break;
                 case realtime::
                     NativeSequenceRecoveryChannelStateV1::
+                        kBootstrapping:
+                    gap = true;
+                    break;
+                case realtime::
+                    NativeSequenceRecoveryChannelStateV1::
                         kHealthy:
                     break;
             }
         }
-        if (resource) {
-            return RealtimeCertifiedStateV1::kFrozenResource;
-        }
-        if (conflict) {
-            return RealtimeCertifiedStateV1::kFrozenConflict;
+        if (degraded) {
+            return RealtimeCertifiedStateV1::kDegraded;
         }
         if (gap) {
             return RealtimeCertifiedStateV1::kGapOpen;
@@ -3351,6 +3589,11 @@ private:
                     NativeSequenceRecoveryChannelStateV1::
                         kHealthy:
                     break;
+                case realtime::
+                    NativeSequenceRecoveryChannelStateV1::
+                        kBootstrapping:
+                    ++gap_count;
+                    break;
             }
         }
         std::atomic_ref<std::uint64_t> tag =
@@ -3411,44 +3654,9 @@ private:
         const std::uint64_t resource_exhaustion_count =
             resource_exhaustion_count_.load(std::memory_order_acquire);
         if (globally_frozen_resource ||
-            unrepresented_resource_failure_ ||
-            resource_exhaustion_count != 0U) {
+            unrepresented_resource_failure_) {
             requested_state =
                 RealtimeCertifiedStateV1::kFrozenResource;
-        } else if (requested_state ==
-                   RealtimeCertifiedStateV1::kStopped) {
-            // A clean stop is terminal only for a healthy/no-data stream.
-            // An unresolved correctness condition remains the reader-facing
-            // terminal state so shutdown cannot erase why certification
-            // stopped at its last correct prefix.
-            bool conflict = false;
-            bool resource = false;
-            for (const auto& [domain, runtime] : channels_) {
-                static_cast<void>(domain);
-                conflict = conflict ||
-                    runtime.snapshot.state ==
-                        realtime::
-                            NativeSequenceRecoveryChannelStateV1::
-                                kFrozenConflict;
-                resource = resource ||
-                    runtime.snapshot.state ==
-                        realtime::
-                            NativeSequenceRecoveryChannelStateV1::
-                                kFrozenResource;
-            }
-            if (resource) {
-                requested_state =
-                    RealtimeCertifiedStateV1::kFrozenResource;
-            } else if (conflict) {
-                requested_state =
-                    RealtimeCertifiedStateV1::kFrozenConflict;
-            } else if (gap_count != 0U) {
-                requested_state =
-                    RealtimeCertifiedStateV1::kGapOpen;
-            } else if (catching_count != 0U) {
-                requested_state =
-                    RealtimeCertifiedStateV1::kCatchingUp;
-            }
         }
         Atomic(header_->heartbeat_monotonic_ns).store(
             heartbeat, std::memory_order_relaxed);
@@ -3992,6 +4200,8 @@ private:
         response.event_capacity = session.event_capacity;
         response.coverage_flags =
             event_journal_->coverage_flags();
+        response.coverage_start_unix_ns =
+            event_journal_->coverage_start_unix_ns();
         int descriptor = -1;
         if (!event_journal_->DuplicateReadOnlyDescriptor(
                 &descriptor)) {
@@ -4069,6 +4279,7 @@ private:
     std::mutex tick_history_writer_mutex_;
     std::mutex control_lifecycle_mutex_;
     std::mutex prefix_call_mutex_;
+    std::mutex process_start_coverage_call_mutex_;
 
     std::map<
         realtime::NativeSequenceChannelV1,
@@ -4099,11 +4310,15 @@ private:
     std::atomic<bool> prefix_barrier_completed_{false};
     std::atomic<PrefixCommitPhase> prefix_commit_phase_{
         PrefixCommitPhase::kNotStarted};
+    std::atomic<ProcessStartCoveragePhase>
+        process_start_coverage_phase_{
+            ProcessStartCoveragePhase::kNotStarted};
     std::atomic<bool> prefix_probe_active_{false};
     std::atomic<bool> accepting_{false};
     std::atomic<bool> draining_{false};
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> worker_stop_requested_{false};
+    std::atomic<bool> seal_input_requested_{false};
     std::atomic<bool> tick_history_writer_running_{false};
     std::atomic<bool> tick_history_stop_requested_{false};
     std::atomic<bool> tick_history_failed_{false};
@@ -4136,6 +4351,7 @@ private:
     std::atomic<std::uint64_t> observed_native_message_count_{0U};
     std::atomic<std::uint64_t> conflicting_duplicate_count_{0U};
     std::atomic<std::uint64_t> resource_exhaustion_count_{0U};
+    bool input_sealed_by_worker_ = false;
 };
 
 RealtimeCertifiedMarketServiceV1::
@@ -4191,6 +4407,18 @@ bool RealtimeCertifiedMarketServiceV1::StartControl(
     int* system_error_number) noexcept {
     return impl_ != nullptr &&
            impl_->StartControl(system_error_number);
+}
+
+bool RealtimeCertifiedMarketServiceV1::
+    FinalizeProcessStartCoverage(
+        std::uint64_t coverage_start_unix_ns,
+        std::chrono::milliseconds timeout,
+        int* system_error_number) noexcept {
+    return impl_ != nullptr &&
+           impl_->FinalizeProcessStartCoverage(
+               coverage_start_unix_ns,
+               timeout,
+               system_error_number);
 }
 
 RealtimeCertifiedPrefixFenceOperationErrorV1

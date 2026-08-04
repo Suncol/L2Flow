@@ -27,7 +27,10 @@ from ._history_worker_protocol import (
     DEFAULT_RESULT_COLUMNS,
     RESULT_COLUMN_BY_NAME,
 )
-from .certified_order_events import CertifiedOrderEventState
+from .certified_order_events import (
+    CertifiedOrderEventState,
+    _validate_history_coverage as _validate_certified_event_coverage,
+)
 from .models import (
     HistoryCoverageInfo,
     LatestStatus,
@@ -3041,6 +3044,7 @@ class PolarsCertifiedOrderEventHistory:
         self,
         reader,
         *,
+        coverage_requirement: str = "from_open",
         poll_interval: Optional[float] = 0.001,
         maximum_rows: Optional[int] = None,
         maximum_chunks: Optional[int] = None,
@@ -3052,7 +3056,12 @@ class PolarsCertifiedOrderEventHistory:
     ) -> None:
         _require_polars()
         coverage = getattr(reader, "history_coverage", None)
-        _coverage_requirement(coverage, "from_open")
+        try:
+            _validate_certified_event_coverage(
+                coverage, coverage_requirement
+            )
+        except (TypeError, ValueError, UnavailableError) as error:
+            raise PolarsHistoryCoverageError(str(error)) from error
         if getattr(reader, "next_event_sequence", None) != 1:
             raise PolarsHistoryCoverageError(
                 "complete CERTIFIED Polars history must start at sequence 1"
@@ -3791,6 +3800,7 @@ class PolarsClient:
         self,
         certified_control_socket_path,
         *,
+        coverage_requirement: str = "from_open",
         native_library=None,
         native_library_path=None,
         timeout=_USE_CLIENT_TIMEOUT,
@@ -3800,7 +3810,7 @@ class PolarsClient:
         maximum_chunks: Optional[int] = None,
         compact_after_chunks: Optional[int] = 256,
     ) -> PolarsCertifiedOrderEventHistory:
-        """Open a complete CERTIFIED Event history-to-tail Polars cache."""
+        """Open a canonical CERTIFIED Event history-to-tail Polars cache."""
 
         fast_session = self._client.session_info()
         dataset_identity = _certified_order_event_dataset_identity(
@@ -3809,6 +3819,7 @@ class PolarsClient:
         arguments = {
             "native_library": native_library,
             "native_library_path": native_library_path,
+            "coverage_requirement": coverage_requirement,
             "start_event_sequence": 1,
             "batch_records": batch_records,
         }
@@ -3847,6 +3858,7 @@ class PolarsClient:
                 )
             return PolarsCertifiedOrderEventHistory(
                 reader,
+                coverage_requirement=coverage_requirement,
                 poll_interval=poll_interval,
                 maximum_rows=maximum_rows,
                 maximum_chunks=maximum_chunks,

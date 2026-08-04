@@ -46,14 +46,16 @@ History 与 tick generation delta；`coverage_from_open` 及全部强完整性 f
 
 不显式指定时 CSV 仍进入 online recovery；`blocking` 会被明确拒绝。盘中启动、
 不 recovery 时应显式使用
-`--intraday-live-partial`；此时不允许 recovery tuning 或 CERTIFIED，但可通过
-`--kline-windows-ms` 显式启用 process-start partial KLine。它保留按交易所
-自然时间对齐的窗口，只发布 latest KLine；SDK Connect 成功后立即采样保守的
-live coverage boundary。只有已 materialize 的 bar 严格满足
+`--intraday-live-partial`；此时用
+`--native-maximum-backward-displacement` 声明 per-channel callback disorder
+上界并启用 process-start canonical Event，也可通过 `--kline-windows-ms`
+显式启用 process-start partial KLine。它保留按交易所
+自然时间对齐的窗口，只发布 latest KLine；在 SDK Connect 可能交付 callback
+前采样保守的 live coverage boundary。只有已 materialize 的 bar 严格满足
 `window_start < boundary < window_end` 时才标记为 left-truncated；无成交窗口
-不会合成所谓“首根 bar”。`full_day_kline_valid` 始终为 false。partial
-仍默认启动独立的 process-start Event sidecar，且不作全日或 native-gap 完整性
-声明。盘中启动却使用
+不会合成所谓“首根 bar”。`full_day_kline_valid` 始终为 false。partial Event
+明确携带 process-start coverage，且不作全日完整性声明；
+`--disable-native-gap-recovery` 则选择 FAST-only partial。盘中启动却使用
 `--intraday-store-from-open` 仍是错误的事实声明；该参数只适用于本进程确实
 从首条相关市场消息前开始接收并持续健康的会话。
 
@@ -74,11 +76,9 @@ live coverage boundary。只有已 materialize 的 bar 严格满足
 开盘完整”，程序也不能仅凭文件大小证明外部 writer 没有把一条更早收到的
 完整消息延迟到 capture 之后才落盘。
 
-CSV 恢复暂不允许与旧的 `--event-aggregator-socket` 组合。外部
-`mdl-order-event-aggregator` 没有在 ACTIVE 前接收整段回放的专用接管协议，
-也不能假设其有界 ring 足以容纳全天前缀。默认开启的 CERTIFIED worker 会在
-隐藏阶段按 canonical 顺序构建 append-only Event journal，并在 promotion
-barrier 后与 recovered FAST 一起开放 History-to-live-tail API。
+production router 没有 arrival-order Event 兼容入口。默认开启的 CERTIFIED
+worker 会在隐藏阶段按 canonical 顺序构建 append-only Event journal，并在
+promotion barrier 后与 recovered FAST 一起开放 History-to-live-tail API。
 
 ## 2. 支持的消息与八个 CSV 文件
 
@@ -573,8 +573,8 @@ CERTIFIED 且 prefix barrier/control 成功时，
    或复用 inode；
 5. Store record/内存上限足以容纳完整前缀，并同时考虑 preview partial
    Store、shadow full Store、journal queue/cache 和 WAL 磁盘增长；
-6. 未配置旧的外部 `--event-aggregator-socket`；若需要 CPU 隔离，显式选择
-   `--event-cpu-set`，并确认它是启动 affinity 的真子集；
+6. 若需要 CPU 隔离，显式选择 `--event-cpu-set`，并确认它是启动 affinity
+   的真子集；
 7. 预期 `coverage_from_open` 是运维事实声明，并接受深圳快照
    `ChannelNo=0` 及上海队列操作/订单 ID 为零、同时携带 source-field
    unavailable notice 的字段边界；

@@ -29,7 +29,6 @@
 
 #include <fcntl.h>
 #include <sys/random.h>
-#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -205,44 +204,6 @@ template <typename Value, std::size_t Size>
     action.sa_flags = 0;
     return ::sigaction(SIGINT, &action, nullptr) == 0 &&
            ::sigaction(SIGTERM, &action, nullptr) == 0;
-}
-
-[[nodiscard]] bool ArmManagedParentDeathGuard(
-    const app::OrderEventAggregatorOptionsV1& options,
-    std::string* error) noexcept {
-    if (options.managed_parent_pid == 0U) {
-        return true;
-    }
-    if (error == nullptr) {
-        return false;
-    }
-    const pid_t expected_parent =
-        static_cast<pid_t>(options.managed_parent_pid);
-    if (expected_parent <= 0 || ::getppid() != expected_parent) {
-        *error = "managed parent exited before Event initialization";
-        return false;
-    }
-    if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
-        *error =
-            "PR_SET_PDEATHSIG failed: errno=" +
-            std::to_string(errno);
-        return false;
-    }
-    // Close the race where the parent exits between the first getppid and
-    // PR_SET_PDEATHSIG. In that case the kernel could not deliver the signal
-    // retroactively, but reparenting makes this exact comparison fail.
-    if (::getppid() != expected_parent) {
-        *error = "managed parent exited while arming Event death guard";
-        return false;
-    }
-    return true;
-}
-
-[[nodiscard]] bool ManagedParentAlive(
-    const app::OrderEventAggregatorOptionsV1& options) noexcept {
-    return options.managed_parent_pid == 0U ||
-           ::getppid() ==
-               static_cast<pid_t>(options.managed_parent_pid);
 }
 
 using IoDeadline = std::chrono::steady_clock::time_point;
@@ -1072,11 +1033,8 @@ enum class LiveLoopResult : std::uint8_t {
     std::uint64_t* next_heartbeat_ns,
     std::string* error) {
     for (;;) {
-        if (g_stop_requested != 0 || !ManagedParentAlive(options)) {
-            *error = options.managed_parent_pid != 0U &&
-                             !ManagedParentAlive(options)
-                         ? "managed parent exited"
-                         : "termination signal received";
+        if (g_stop_requested != 0) {
+            *error = "termination signal received";
             return LiveLoopResult::kInterrupted;
         }
         l2flow_shm_health_v2 health{};
@@ -1222,14 +1180,6 @@ enum class LiveLoopResult : std::uint8_t {
                "signal handlers\n";
         return 1;
     }
-    std::string parent_guard_error;
-    if (!ArmManagedParentDeathGuard(options, &parent_guard_error)) {
-        std::cerr
-            << "mdl-order-event-aggregator: managed parent guard failed: "
-            << parent_guard_error << '\n';
-        return 1;
-    }
-
     ShmReaderPtr source_reader;
     l2flow_shm_session_info_v2 initial_source{};
     int system_error = 0;

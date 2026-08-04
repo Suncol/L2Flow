@@ -58,6 +58,10 @@ static_assert(
     static_cast<std::uint32_t>(
         ipc::RealtimeCertifiedStateV1::kStopped) ==
     L2FLOW_CERTIFIED_ORDER_EVENT_STATE_STOPPED_V1);
+static_assert(
+    static_cast<std::uint32_t>(
+        ipc::RealtimeCertifiedStateV1::kDegraded) ==
+    L2FLOW_CERTIFIED_ORDER_EVENT_STATE_DEGRADED_V1);
 
 [[nodiscard]] ipc::RealtimeCertifiedExpectedSessionV1 ExpectedSession(
     const l2flow_certified_order_event_expected_session_v1& source)
@@ -146,6 +150,7 @@ extern "C" int l2flow_certified_order_event_reader_open_v1(
     const char* absolute_control_socket_path,
     const l2flow_certified_order_event_expected_session_v1*
         expected_session,
+    std::uint32_t coverage_requirement,
     std::uint32_t timeout_ms,
     l2flow_certified_order_event_reader_v1** output,
     int* system_error_number) {
@@ -158,7 +163,9 @@ extern "C" int l2flow_certified_order_event_reader_open_v1(
     *output = nullptr;
     if (absolute_control_socket_path == nullptr ||
         expected_session == nullptr || timeout_ms == 0U ||
-        expected_session->reserved != 0U) {
+        expected_session->reserved != 0U ||
+        coverage_requirement >
+            L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_ANY_EXPLICIT_V1) {
         return L2FLOW_CERTIFIED_ORDER_EVENT_OPEN_INVALID_ARGUMENT_V1;
     }
     try {
@@ -168,7 +175,12 @@ extern "C" int l2flow_certified_order_event_reader_open_v1(
         options.timeout = std::chrono::milliseconds(timeout_ms);
         std::unique_ptr<ipc::CertifiedOrderEventReaderV1> native;
         const auto error = ipc::CertifiedOrderEventReaderV1::Open(
-            std::move(options), &native, system_error_number);
+            std::move(options),
+            static_cast<
+                ipc::CertifiedOrderEventCoverageRequirementV1>(
+                coverage_requirement),
+            &native,
+            system_error_number);
         if (error !=
                 ipc::CertifiedOrderEventReaderOpenErrorV1::kNone ||
             native == nullptr) {
@@ -213,6 +225,8 @@ extern "C" int l2flow_certified_order_event_reader_session_v1(
         return result;
     }
     output->coverage_flags = status.coverage_flags;
+    output->coverage_start_unix_ns =
+        reader->reader->coverage_start_unix_ns();
     return L2FLOW_CERTIFIED_ORDER_EVENT_READ_OK_V1;
 }
 

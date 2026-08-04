@@ -4,7 +4,6 @@
 #if !defined(L2FLOW_HAS_LINUX_REALTIME_IPC_V2)
 #error "mdl-production-router requires Linux realtime IPC Wire V2"
 #endif
-#include "l2flow/ipc/order_event_delta_control_v1.h"
 #include "l2flow/ipc/realtime_certified_service_v1.h"
 #include "l2flow/ipc/realtime_shared_service_v2.h"
 #include "l2flow/ipc/realtime_wire_v2.h"
@@ -15,7 +14,6 @@
 #include "l2flow/recovery/online_recovery_v1.h"
 #include "l2flow/runtime/realtime_pipeline_v1.h"
 
-#include "managed_sidecar_process_v1.h"
 #include "event_cpu_partition_v1.h"
 
 #include <algorithm>
@@ -41,7 +39,6 @@
 #include <vector>
 
 #include <unistd.h>
-#include <sys/wait.h>
 #include <time.h>
 
 namespace {
@@ -209,18 +206,6 @@ struct Options final {
     std::uint32_t generation_timeout_ms = 10'000U;
 
     std::filesystem::path ipc_socket;
-    std::filesystem::path event_aggregator_socket;
-    bool event_aggregator_socket_set = false;
-    std::filesystem::path event_aggregator_executable;
-    bool event_aggregator_executable_set = false;
-    std::uint32_t event_aggregator_ready_timeout_ms = 30'000U;
-    bool event_aggregator_ready_timeout_set = false;
-    std::uint64_t event_aggregator_ring_records = 1'048'576U;
-    std::size_t event_aggregator_read_batch_records = 4096U;
-    // Zero is the low-latency scheduler-friendly mode: an empty read yields
-    // instead of imposing a fixed millisecond sleep. This is sidecar-only and
-    // never enters FAST publication or reader code.
-    std::uint32_t event_aggregator_poll_ms = 0U;
     // Optional strict logical-CPU partition. When set, the router's current
     // allowed mask is split into disjoint FAST=complement and Event=requested
     // masks before any long-lived service or Pipeline thread is created.
@@ -230,10 +215,11 @@ struct Options final {
         16ULL * 1024ULL * 1024ULL;
     std::uint64_t ipc_maximum_mapping_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
-    // Native-gap recovery and its independent CERTIFIED sidecar are enabled
-    // by default. --disable-native-gap-recovery restores the literal legacy
-    // FAST composition.
+    // Native-gap recovery and its independent CERTIFIED service are enabled
+    // by default. The disable option runs only the required FAST service.
     bool native_gap_recovery_enabled = true;
+    std::uint64_t native_maximum_backward_displacement = 0U;
+    bool native_maximum_backward_displacement_set = false;
     std::filesystem::path certified_ipc_socket;
     bool certified_ipc_socket_set = false;
 };
@@ -260,8 +246,8 @@ void PrintUsage(std::ostream& output) {
         << "    --intraday-recovery-csv-dir PATH\n"
         << "                                absolute same-day vendor CSV "
            "directory complete from open\n"
-        << "    --intraday-live-partial    mid-session latest plus process-start "
-           "History/delta; no recovery or from-open claim\n"
+        << "    --intraday-live-partial    mid-session FAST plus bounded "
+           "canonical Event; no from-open claim\n"
         << "  optional explicit CSV recovery selector:\n"
         << "    --intraday-recovery-mode MODE\n"
         << "                                online (the only supported mode)\n"
@@ -323,25 +309,13 @@ void PrintUsage(std::ostream& output) {
         << "  --disable-native-gap-recovery disable the default CERTIFIED "
            "recovery sidecar;\n"
         << "                                FAST Wire V2 remains unchanged\n"
-        << "  --event-aggregator-socket PATH\n"
-        << "                                optional explicit event-delta "
-           "UDS; partial mode derives <ipc>.events by default\n"
-        << "  --event-aggregator-executable PATH\n"
-        << "                                absolute managed partial-event "
-           "sidecar; default is router sibling binary\n"
-        << "  --event-aggregator-ring-records N\n"
-        << "                                positive u64, default 1048576\n"
-        << "  --event-aggregator-read-batch-records N\n"
-        << "                                positive size_t, default 4096\n"
-        << "  --event-aggregator-poll-ms N\n"
-        << "                                0..1000, default 0; 0 yields\n"
+        << "  --native-maximum-backward-displacement N\n"
+        << "                                required for partial canonical "
+           "Event; declared per-channel callback disorder bound\n"
         << "  --event-cpu-set LIST          optional strict logical CPU set for "
-           "canonical/managed Event work;\n"
+           "canonical Event work;\n"
         << "                                router/FAST inherits the nonempty "
            "allowed complement\n"
-        << "  --event-aggregator-ready-timeout-ms N\n"
-        << "                                1..600000, default 30000; "
-           "requires event socket\n"
         << "  --help\n\n"
         << "The catalog must declare complete Shanghai+Shenzhen A-share "
            "subscription coverage for the exact trade date. Identity is "
@@ -547,16 +521,11 @@ bool ParseOptions(
             option != "--generation-timeout-ms" &&
             option != "--ipc-socket" &&
             option != "--live-preview-ipc-socket" &&
-            option != "--event-aggregator-socket" &&
-            option != "--event-aggregator-executable" &&
-            option != "--event-aggregator-ring-records" &&
-            option != "--event-aggregator-read-batch-records" &&
-            option != "--event-aggregator-poll-ms" &&
             option != "--event-cpu-set" &&
-            option != "--event-aggregator-ready-timeout-ms" &&
             option != "--ipc-tick-ring-records" &&
             option != "--ipc-key-arena-mib" &&
             option != "--ipc-max-mapping-mib" &&
+            option != "--native-maximum-backward-displacement" &&
             option != "--certified-ipc-socket") {
             *error = "unknown option: " + std::string(option);
             return false;
@@ -885,42 +854,6 @@ bool ParseOptions(
             parsed.ipc_socket = std::string(value);
         } else if (option == "--live-preview-ipc-socket") {
             parsed.live_preview_ipc_socket = std::string(value);
-        } else if (option == "--event-aggregator-socket") {
-            parsed.event_aggregator_socket = std::string(value);
-            parsed.event_aggregator_socket_set = true;
-        } else if (option == "--event-aggregator-executable") {
-            parsed.event_aggregator_executable = std::string(value);
-            parsed.event_aggregator_executable_set = true;
-        } else if (option == "--event-aggregator-ring-records") {
-            if (!ParseU64(
-                    value,
-                    &parsed.event_aggregator_ring_records) ||
-                parsed.event_aggregator_ring_records == 0U) {
-                *error =
-                    "--event-aggregator-ring-records must be positive u64";
-                return false;
-            }
-        } else if (
-            option == "--event-aggregator-read-batch-records") {
-            std::uint64_t records = 0U;
-            if (!ParseU64(value, &records) || records == 0U ||
-                records >
-                    static_cast<std::uint64_t>(
-                        std::numeric_limits<std::size_t>::max())) {
-                *error =
-                    "--event-aggregator-read-batch-records must fit a "
-                    "positive size_t";
-                return false;
-            }
-            parsed.event_aggregator_read_batch_records =
-                static_cast<std::size_t>(records);
-        } else if (option == "--event-aggregator-poll-ms") {
-            if (!ParseU32(
-                    value, &parsed.event_aggregator_poll_ms) ||
-                parsed.event_aggregator_poll_ms > 1000U) {
-                *error = "--event-aggregator-poll-ms must be 0..1000";
-                return false;
-            }
         } else if (option == "--event-cpu-set") {
             common::LinuxCpuSetV1 parsed_cpu_set{};
             const common::LinuxCpuSetParseErrorV1 cpu_error =
@@ -934,19 +867,6 @@ bool ParseOptions(
                 return false;
             }
             parsed.event_cpu_set = std::string(value);
-        } else if (
-            option == "--event-aggregator-ready-timeout-ms") {
-            if (!ParseU32(
-                    value,
-                    &parsed.event_aggregator_ready_timeout_ms) ||
-                parsed.event_aggregator_ready_timeout_ms == 0U ||
-                parsed.event_aggregator_ready_timeout_ms > 600'000U) {
-                *error =
-                    "--event-aggregator-ready-timeout-ms must be "
-                    "1..600000";
-                return false;
-            }
-            parsed.event_aggregator_ready_timeout_set = true;
         } else if (option == "--ipc-tick-ring-records") {
             if (!ParseU64(
                     value, &parsed.ipc_tick_ring_records) ||
@@ -979,6 +899,16 @@ bool ParseOptions(
                     "byte conversion does not overflow";
                 return false;
             }
+        } else if (
+            option == "--native-maximum-backward-displacement") {
+            if (!ParseU64(
+                    value,
+                    &parsed.native_maximum_backward_displacement)) {
+                *error =
+                    "--native-maximum-backward-displacement must be u64";
+                return false;
+            }
+            parsed.native_maximum_backward_displacement_set = true;
         } else if (option == "--certified-ipc-socket") {
             parsed.certified_ipc_socket = std::string(value);
             parsed.certified_ipc_socket_set = true;
@@ -1021,36 +951,6 @@ bool ParseOptions(
         *error = "--live-preview-ipc-socket must be an absolute path";
         return false;
     }
-    // Standalone partial Event is a default capability. An explicit socket
-    // keeps the existing externally supervised deployment; otherwise the
-    // router derives a private endpoint and manages its sibling sidecar.
-    if (parsed.intraday_live_partial &&
-        parsed.event_aggregator_socket.empty()) {
-        parsed.event_aggregator_socket =
-            parsed.ipc_socket.string() + ".events";
-    }
-    if (!parsed.event_aggregator_socket.empty() &&
-        !parsed.event_aggregator_socket.is_absolute()) {
-        *error =
-            "--event-aggregator-socket must be an absolute path";
-        return false;
-    }
-    if (!parsed.event_aggregator_socket.empty()) {
-        const std::string event_socket_text =
-            parsed.event_aggregator_socket.string();
-        if (event_socket_text.size() >= 108U) {
-            *error =
-                "--event-aggregator-socket must be shorter than the "
-                "Linux sockaddr_un limit";
-            return false;
-        }
-        if (parsed.event_aggregator_socket == parsed.ipc_socket) {
-            *error =
-                "--event-aggregator-socket must be distinct from "
-                "--ipc-socket";
-            return false;
-        }
-    }
     const bool csv_recovery =
         !parsed.intraday_recovery_csv_dir.empty();
     const unsigned int startup_mode_count =
@@ -1066,55 +966,39 @@ bool ParseOptions(
         return false;
     }
     if (parsed.intraday_live_partial) {
-        if (parsed.certified_ipc_socket_set) {
+        if (parsed.native_gap_recovery_enabled &&
+            !parsed.native_maximum_backward_displacement_set) {
             *error =
-                "--intraday-live-partial does not expose CERTIFIED; "
-                "omit --certified-ipc-socket";
+                "--intraday-live-partial canonical Event requires "
+                "--native-maximum-backward-displacement";
             return false;
         }
-        // A process-start fragment cannot establish the native sequence
-        // prefix from market open.  Keep the public contract unambiguous by
-        // disabling the default sidecar for this explicit partial mode.
-        parsed.native_gap_recovery_enabled = false;
-        parsed.certified_ipc_socket.clear();
-    }
-    if (parsed.event_aggregator_executable_set &&
-        !parsed.intraday_live_partial) {
+        if (!parsed.native_gap_recovery_enabled &&
+            parsed.native_maximum_backward_displacement_set) {
+            *error =
+                "--native-maximum-backward-displacement cannot be "
+                "combined with --disable-native-gap-recovery";
+            return false;
+        }
+        if (parsed.native_gap_recovery_enabled &&
+            (parsed.native_maximum_backward_displacement >=
+                 ipc::kRealtimeCertifiedDefaultReorderSpanV1 ||
+             parsed.native_maximum_backward_displacement >= 16'384U)) {
+            *error =
+                "--native-maximum-backward-displacement must be below "
+                "both the reorder span and per-channel pending capacity";
+            return false;
+        }
+    } else if (parsed.native_maximum_backward_displacement_set) {
         *error =
-            "--event-aggregator-executable is only used by "
+            "--native-maximum-backward-displacement requires "
             "--intraday-live-partial";
         return false;
     }
-    if (!parsed.event_aggregator_executable.empty() &&
-        !parsed.event_aggregator_executable.is_absolute()) {
-        *error = "--event-aggregator-executable must be an absolute path";
-        return false;
-    }
     if (!parsed.event_cpu_set.empty() &&
-        !parsed.intraday_live_partial &&
         !parsed.native_gap_recovery_enabled) {
         *error =
-            "--event-cpu-set requires the canonical Event service or "
-            "--intraday-live-partial";
-        return false;
-    }
-    if (!parsed.event_cpu_set.empty() &&
-        parsed.intraday_live_partial &&
-        parsed.event_aggregator_socket_set &&
-        !parsed.event_aggregator_executable_set) {
-        *error =
-            "--event-cpu-set cannot pin an externally supervised partial "
-            "Event process; also provide --event-aggregator-executable "
-            "or omit the explicit event socket";
-        return false;
-    }
-    if (!parsed.event_cpu_set.empty() &&
-        !parsed.intraday_live_partial &&
-        parsed.event_aggregator_socket_set) {
-        *error =
-            "--event-cpu-set cannot pin the legacy externally supervised "
-            "Event process in a full-session mode; use the canonical "
-            "CERTIFIED Event service or supervise affinity externally";
+            "--event-cpu-set requires the canonical Event service";
         return false;
     }
     if (parsed.certified_ipc_socket_set &&
@@ -1133,36 +1017,18 @@ bool ParseOptions(
             *error = "--certified-ipc-socket must be an absolute path";
             return false;
         }
-        if (parsed.certified_ipc_socket == parsed.ipc_socket ||
-            (!parsed.event_aggregator_socket.empty() &&
-             parsed.certified_ipc_socket ==
-                 parsed.event_aggregator_socket)) {
+        if (parsed.certified_ipc_socket == parsed.ipc_socket) {
             *error =
-                "--certified-ipc-socket must be distinct from other "
-                "control sockets";
+                "--certified-ipc-socket must be distinct from "
+                "--ipc-socket";
             return false;
         }
-    }
-    if (parsed.event_aggregator_socket.empty() &&
-        parsed.event_aggregator_ready_timeout_set) {
-        *error =
-            "--event-aggregator-ready-timeout-ms requires "
-            "--event-aggregator-socket";
-        return false;
     }
     if (!parsed.intraday_store_maximum_records_set ||
         !parsed.intraday_store_memory_set) {
         *error =
             "production requires explicit positive "
             "--intraday-store-max-records and --intraday-store-memory-gib";
-        return false;
-    }
-    if (csv_recovery &&
-        !parsed.event_aggregator_socket.empty()) {
-        *error =
-            "--intraday-recovery-csv-dir cannot be combined with "
-            "--event-aggregator-socket: the external aggregator has "
-            "no pre-ACTIVE full-replay handoff";
         return false;
     }
     if (!csv_recovery && parsed.intraday_recovery_mode_set) {
@@ -1292,426 +1158,6 @@ void ReportFatalSnapshot(
         << '\n';
 }
 
-bool EventAggregatorProbeErrorIsRetryable(
-    ipc::OrderEventDeltaControlClientErrorV1 error,
-    int system_error) noexcept {
-    using Error = ipc::OrderEventDeltaControlClientErrorV1;
-    return error == Error::kConnectFailed ||
-           error == Error::kTimeout ||
-           error == Error::kTransportFailed ||
-           error == Error::kUnavailable ||
-           (error == Error::kSocketPathInvalid &&
-            system_error == ENOENT);
-}
-
-ipc::OrderEventDeltaControlClientConfigV1
-BuildEventAggregatorControlClientConfig(
-    const Options& options,
-    const common::Identity128& source_run_id,
-    const market::DailyInstrumentCatalogV2& daily_catalog) {
-    ipc::OrderEventDeltaControlClientConfigV1 config{};
-    config.control_socket_path = options.event_aggregator_socket;
-    config.expected_source_session.run_id = source_run_id;
-    config.expected_source_session.catalog_digest =
-        daily_catalog.catalog_digest();
-    config.expected_source_session.session_epoch =
-        options.session_epoch;
-    config.expected_source_session.catalog_generation = 1U;
-    config.expected_source_session.catalog_version =
-        daily_catalog.catalog_version();
-    config.expected_source_session.trade_date = options.trade_date;
-    config.expected_source_session.catalog_trade_date =
-        daily_catalog.trade_date();
-    config.expected_source_session.capacity =
-        static_cast<std::uint32_t>(
-            daily_catalog.instrument_count());
-    config.expected_source_session.bound_count =
-        config.expected_source_session.capacity;
-    config.expected_source_session.catalog_scope =
-        static_cast<std::uint32_t>(
-            ipc::RealtimeCatalogScopeV2::kDeclaredDailyAShare);
-    config.expected_source_session.coverage_complete =
-        daily_catalog.coverage_complete() ? 1U : 0U;
-    config.expected_source_session.temporal_coverage =
-        options.intraday_live_partial
-            ? ipc::OrderEventDeltaTemporalCoverageV1::
-                  kFromProcessStart
-            : ipc::OrderEventDeltaTemporalCoverageV1::
-                  kFromMarketOpen;
-    config.expected_source_session.stream_quality =
-        ipc::OrderEventDeltaStreamQualityV1::
-            kLocalTickStreamContiguous;
-    return config;
-}
-
-bool WaitForEventAggregatorReady(
-    const Options& options,
-    const common::Identity128& source_run_id,
-    const market::DailyInstrumentCatalogV2& daily_catalog,
-    app::ManagedSidecarProcessV1* managed_sidecar,
-    ipc::OrderEventDeltaControlSnapshotV1* output_snapshot,
-    std::string* output_detail) {
-    if (output_snapshot == nullptr || output_detail == nullptr ||
-        options.event_aggregator_socket.empty()) {
-        return false;
-    }
-    *output_snapshot = {};
-    output_detail->clear();
-
-    ipc::OrderEventDeltaControlClientConfigV1 config =
-        BuildEventAggregatorControlClientConfig(
-            options, source_run_id, daily_catalog);
-
-    const auto deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(
-            options.event_aggregator_ready_timeout_ms);
-    ipc::OrderEventDeltaControlClientErrorV1 last_error =
-        ipc::OrderEventDeltaControlClientErrorV1::kConnectFailed;
-    int last_system_error = 0;
-
-    for (;;) {
-        if (managed_sidecar != nullptr) {
-            int wait_status = -1;
-            if (!managed_sidecar->Running(&wait_status)) {
-                *output_detail =
-                    "managed Event process exited before READY: wait_status=" +
-                    std::to_string(wait_status);
-                return false;
-            }
-        }
-        if (g_stop_requested != 0) {
-            *output_detail = "stop signal while waiting for READY";
-            return false;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            *output_detail =
-                "READY timeout: last_error=" +
-                std::string(
-                    ipc::OrderEventDeltaControlClientErrorNameV1(
-                        last_error)) +
-                " errno=" + std::to_string(last_system_error);
-            return false;
-        }
-
-        auto remaining =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
-        if (remaining.count() == 0) {
-            remaining = std::chrono::milliseconds(1);
-        }
-        config.timeout = std::min(
-            remaining, std::chrono::milliseconds(250));
-
-        ipc::OrderEventDeltaControlSnapshotV1 snapshot{};
-        int system_error = 0;
-        const ipc::OrderEventDeltaControlClientErrorV1 probe_error =
-            ipc::OrderEventDeltaControlProbeV1(
-                config, &snapshot, &system_error);
-        if (probe_error ==
-            ipc::OrderEventDeltaControlClientErrorV1::kNone) {
-            // The source pipeline has not been created, so an exact-session
-            // event service can only be a pre-ingress READY if both public
-            // prefixes are still empty. This is the startup guarantee that
-            // prevents silently beginning after the first callback.
-            if (snapshot.source_tick_consumed_sequence != 0U ||
-                snapshot.event_published_sequence != 0U) {
-                *output_detail =
-                    "READY service is not at the pre-ingress origin";
-                return false;
-            }
-            if (snapshot.event_session.temporal_coverage !=
-                    config.expected_source_session.temporal_coverage ||
-                snapshot.event_session.stream_quality !=
-                    config.expected_source_session.stream_quality ||
-                snapshot.source_session.temporal_coverage !=
-                    snapshot.event_session.temporal_coverage ||
-                snapshot.source_session.stream_quality !=
-                    snapshot.event_session.stream_quality) {
-                *output_detail =
-                    "READY service coverage contract mismatch";
-                return false;
-            }
-            *output_snapshot = snapshot;
-            return true;
-        }
-        last_error = probe_error;
-        last_system_error = system_error;
-        if (!EventAggregatorProbeErrorIsRetryable(
-                probe_error, system_error)) {
-            *output_detail =
-                "READY probe failed: error=" +
-                std::string(
-                    ipc::OrderEventDeltaControlClientErrorNameV1(
-                        probe_error)) +
-                " errno=" + std::to_string(system_error);
-            return false;
-        }
-
-        const auto after_probe = std::chrono::steady_clock::now();
-        if (after_probe >= deadline) {
-            continue;
-        }
-        const auto retry_delay = std::min(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - after_probe),
-            std::chrono::milliseconds(25));
-        const IntervalWaitResult wait =
-            WaitForInterval(retry_delay, options.trade_date);
-        if (wait == IntervalWaitResult::kSignal) {
-            *output_detail = "stop signal while waiting for READY";
-            return false;
-        }
-        if (wait == IntervalWaitResult::kTradeDateBoundary) {
-            *output_detail =
-                "trade-date boundary while waiting for READY";
-            return false;
-        }
-        if (wait == IntervalWaitResult::kClockFailure) {
-            *output_detail =
-                "clock failure while waiting for READY";
-            return false;
-        }
-    }
-}
-
-[[nodiscard]] bool ResolveManagedEventAggregatorExecutable(
-    const Options& options,
-    std::filesystem::path* output,
-    std::string* error) {
-    if (output == nullptr || error == nullptr) {
-        return false;
-    }
-    output->clear();
-    error->clear();
-    try {
-        std::filesystem::path executable =
-            options.event_aggregator_executable;
-        if (executable.empty()) {
-            const std::filesystem::path router =
-                std::filesystem::read_symlink("/proc/self/exe");
-            if (!router.is_absolute() || router.parent_path().empty()) {
-                *error = "cannot resolve the router executable directory";
-                return false;
-            }
-            executable =
-                router.parent_path() / "mdl-order-event-aggregator";
-        }
-        executable = executable.lexically_normal();
-        if (!executable.is_absolute() ||
-            ::access(executable.c_str(), X_OK) != 0) {
-            *error =
-                "event aggregator executable is not executable: " +
-                executable.string() + " errno=" +
-                std::to_string(errno);
-            return false;
-        }
-        *output = std::move(executable);
-        return true;
-    } catch (const std::exception& exception) {
-        *error = exception.what();
-        return false;
-    } catch (...) {
-        *error = "unexpected executable-path failure";
-        return false;
-    }
-}
-
-[[nodiscard]] bool StartManagedPartialEventAggregator(
-    const Options& options,
-    std::unique_ptr<app::ManagedSidecarProcessV1>* output,
-    std::string* error) {
-    if (output == nullptr || error == nullptr ||
-        options.event_aggregator_socket.empty()) {
-        return false;
-    }
-    output->reset();
-    error->clear();
-    if (options.intraday_store_maximum_records == 0U ||
-        options.intraday_store_maximum_records >
-            static_cast<std::uint64_t>(
-                std::numeric_limits<std::size_t>::max())) {
-        *error = "event order-state capacity does not fit size_t";
-        return false;
-    }
-
-    std::filesystem::path executable;
-    if (!ResolveManagedEventAggregatorExecutable(
-            options, &executable, error)) {
-        return false;
-    }
-    std::vector<std::string> arguments{
-        "--source-socket",
-        options.ipc_socket.string(),
-        "--event-socket",
-        options.event_aggregator_socket.string(),
-        "--session-epoch",
-        std::to_string(options.session_epoch),
-        "--trade-date",
-        std::to_string(options.trade_date),
-        "--shanghai-state-capacity",
-        std::to_string(options.intraday_store_maximum_records),
-        "--shenzhen-state-capacity",
-        std::to_string(options.intraday_store_maximum_records),
-        "--event-ring-capacity",
-        std::to_string(options.event_aggregator_ring_records),
-        "--event-maximum-mapping-bytes",
-        std::to_string(options.ipc_maximum_mapping_bytes),
-        "--read-batch-records",
-        std::to_string(options.event_aggregator_read_batch_records),
-        "--temporal-coverage",
-        "process-start",
-        "--parent-pid",
-        std::to_string(::getpid())};
-    if (!options.event_cpu_set.empty()) {
-        arguments.emplace_back("--cpu-set");
-        arguments.emplace_back(options.event_cpu_set);
-    }
-    arguments.insert(
-        arguments.end(),
-        {"--poll-ms",
-        std::to_string(options.event_aggregator_poll_ms),
-        "--timeout-ms",
-        "1000"});
-    int system_error = 0;
-    const app::ManagedSidecarProcessErrorV1 spawn_error =
-        app::ManagedSidecarProcessV1::Spawn(
-            executable, arguments, output, &system_error);
-    if (spawn_error != app::ManagedSidecarProcessErrorV1::kNone ||
-        *output == nullptr) {
-        *error =
-            std::string(app::ManagedSidecarProcessErrorNameV1(
-                spawn_error)) +
-            " errno=" + std::to_string(system_error);
-        return false;
-    }
-    std::cerr
-        << "mdl-production-router: managed partial Event sidecar "
-           "started: pid="
-        << (*output)->pid() << " executable=" << executable
-        << " socket=" << options.event_aggregator_socket << '\n';
-    return true;
-}
-
-struct PartialEventHealthState final {
-    std::uint64_t last_source_tick_consumed = 0U;
-    std::uint64_t last_event_published = 0U;
-    std::uint64_t last_heartbeat_monotonic_ns = 0U;
-    std::uint64_t stalled_since_monotonic_ns = 0U;
-};
-
-[[nodiscard]] bool CurrentMonotonicNs(
-    std::uint64_t* output) noexcept {
-    if (output == nullptr) {
-        return false;
-    }
-    timespec value{};
-    if (::clock_gettime(CLOCK_MONOTONIC, &value) != 0 ||
-        value.tv_sec < 0 || value.tv_nsec < 0 ||
-        value.tv_nsec >= 1'000'000'000L) {
-        return false;
-    }
-    const std::uint64_t seconds =
-        static_cast<std::uint64_t>(value.tv_sec);
-    constexpr std::uint64_t kNanosecondsPerSecond =
-        1'000'000'000ULL;
-    if (seconds >
-        (std::numeric_limits<std::uint64_t>::max() -
-         static_cast<std::uint64_t>(value.tv_nsec)) /
-            kNanosecondsPerSecond) {
-        return false;
-    }
-    *output = seconds * kNanosecondsPerSecond +
-              static_cast<std::uint64_t>(value.tv_nsec);
-    return true;
-}
-
-[[nodiscard]] bool ProbePartialEventHealth(
-    const Options& options,
-    const common::Identity128& source_run_id,
-    const market::DailyInstrumentCatalogV2& daily_catalog,
-    std::uint64_t source_tick_frontier,
-    PartialEventHealthState* health,
-    std::string* detail) {
-    if (health == nullptr || detail == nullptr) {
-        return false;
-    }
-    detail->clear();
-    ipc::OrderEventDeltaControlClientConfigV1 config =
-        BuildEventAggregatorControlClientConfig(
-            options, source_run_id, daily_catalog);
-    config.timeout = std::chrono::milliseconds(100);
-    ipc::OrderEventDeltaControlSnapshotV1 snapshot{};
-    int system_error = 0;
-    const ipc::OrderEventDeltaControlClientErrorV1 error =
-        ipc::OrderEventDeltaControlProbeV1(
-            config, &snapshot, &system_error);
-    if (error != ipc::OrderEventDeltaControlClientErrorV1::kNone) {
-        *detail =
-            "control probe failed: error=" +
-            std::string(
-                ipc::OrderEventDeltaControlClientErrorNameV1(error)) +
-            " errno=" + std::to_string(system_error);
-        return false;
-    }
-    std::uint64_t now = 0U;
-    if (!CurrentMonotonicNs(&now)) {
-        *detail = "CLOCK_MONOTONIC health sample failed";
-        return false;
-    }
-    constexpr std::uint64_t kMinimumStaleNs = 5'000'000'000ULL;
-    const std::uint64_t configured_stale_ns =
-        static_cast<std::uint64_t>(options.generation_interval_ms) *
-        3'000'000ULL;
-    const std::uint64_t stale_ns =
-        std::max(kMinimumStaleNs, configured_stale_ns);
-    if (snapshot.heartbeat_monotonic_ns == 0U ||
-        snapshot.heartbeat_monotonic_ns > now ||
-        now - snapshot.heartbeat_monotonic_ns > stale_ns) {
-        *detail = "Event heartbeat is stale or non-canonical";
-        return false;
-    }
-    if (snapshot.source_tick_consumed_sequence <
-            health->last_source_tick_consumed ||
-        snapshot.event_published_sequence <
-            health->last_event_published ||
-        snapshot.heartbeat_monotonic_ns <
-            health->last_heartbeat_monotonic_ns ||
-        snapshot.source_tick_consumed_sequence >
-            source_tick_frontier) {
-        *detail = "Event progress regressed or exceeded source frontier";
-        return false;
-    }
-    if (source_tick_frontier -
-            snapshot.source_tick_consumed_sequence >=
-        options.ipc_tick_ring_records) {
-        *detail = "Event consumer fell outside the retained source ring";
-        return false;
-    }
-    if (snapshot.source_tick_consumed_sequence <
-        source_tick_frontier) {
-        if (snapshot.source_tick_consumed_sequence >
-                health->last_source_tick_consumed ||
-            health->stalled_since_monotonic_ns == 0U) {
-            health->stalled_since_monotonic_ns = now;
-        } else if (
-            now - health->stalled_since_monotonic_ns > stale_ns) {
-            *detail = "Event consumer made no progress while source advanced";
-            return false;
-        }
-    } else {
-        health->stalled_since_monotonic_ns = 0U;
-    }
-    health->last_source_tick_consumed =
-        snapshot.source_tick_consumed_sequence;
-    health->last_event_published =
-        snapshot.event_published_sequence;
-    health->last_heartbeat_monotonic_ns =
-        snapshot.heartbeat_monotonic_ns;
-    return true;
-}
-
 struct OnlineRunState final {
     void Fail(std::string value) noexcept {
         try {
@@ -1837,6 +1283,16 @@ int RunLivePartial(
     market::InstrumentRuntimeStateV2* runtime_state) {
     const std::vector<market::KLineWindowSpecV1> kline_windows =
         BuildKLineWindows(options);
+    std::uint64_t provisional_event_coverage_unix_ns = 0U;
+    if (!CurrentRealtimeNs(&provisional_event_coverage_unix_ns)) {
+        std::cerr
+            << "mdl-production-router: LIVE_PARTIAL coverage clock "
+               "read failed\n";
+        return 1;
+    }
+
+    const auto exposure_gate =
+        std::make_shared<std::atomic<bool>>(false);
     ipc::RealtimeSharedServiceConfigV2 ipc_config =
         BuildOnlineIpcConfig(
             options,
@@ -1849,6 +1305,7 @@ int RunLivePartial(
     ipc_config.full_day_kline_valid = false;
     ipc_config.full_day_factor_valid = false;
     ipc_config.certified_prefix_valid = false;
+    ipc_config.control_exposure_gate = exposure_gate;
 
     std::shared_ptr<ipc::RealtimeSharedMarketServiceV2> ipc_service;
     int ipc_system_error = 0;
@@ -1863,57 +1320,99 @@ int RunLivePartial(
         !ipc_service->StartLivePartialWithProcessStartHistory(
             &ipc_system_error)) {
         std::cerr
-            << "mdl-production-router: standalone LIVE_PARTIAL IPC "
-               "start failed: "
+            << "mdl-production-router: LIVE_PARTIAL FAST start failed: "
             << ipc::RealtimeSharedServiceCreateErrorNameV2(ipc_error)
             << " errno=" << ipc_system_error << '\n';
+        if (ipc_service != nullptr) {
+            ipc_service->MarkFailed();
+            ipc_service->StopControl();
+        }
         return 1;
     }
 
-    std::unique_ptr<app::ManagedSidecarProcessV1>
-        managed_event_sidecar;
-    const bool manage_event_sidecar =
-        !options.event_aggregator_socket_set ||
-        options.event_aggregator_executable_set;
-    std::string event_detail;
-    if (manage_event_sidecar &&
-        !StartManagedPartialEventAggregator(
-            options, &managed_event_sidecar, &event_detail)) {
-        std::cerr
-            << "mdl-production-router: managed partial Event start "
-               "failed: "
-            << event_detail << '\n';
-        ipc_service->MarkFailed();
-        ipc_service->StopControl();
-        return 1;
-    }
-    ipc::OrderEventDeltaControlSnapshotV1 event_snapshot{};
-    if (!WaitForEventAggregatorReady(
-            options,
-            run_id,
-            *daily_catalog,
-            managed_event_sidecar.get(),
-            &event_snapshot,
-            &event_detail)) {
-        std::cerr
-            << "mdl-production-router: partial Event READY gate failed: "
-            << event_detail << '\n';
-        if (managed_event_sidecar != nullptr) {
-            static_cast<void>(managed_event_sidecar->StopAndWait(
-                std::chrono::milliseconds(2000)));
+    std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
+        certified_service;
+    bool event_available = false;
+    if (options.native_gap_recovery_enabled) {
+        constexpr std::size_t maximum_size =
+            std::numeric_limits<std::size_t>::max();
+        if (options.intraday_store_maximum_records > maximum_size ||
+            options.intraday_store_maximum_records >
+                maximum_size / 4U) {
+            std::cerr
+                << "mdl-production-router: partial canonical Event "
+                   "unavailable: capacity is not representable; "
+                   "FAST remains available\n";
+        } else {
+            const std::size_t maximum_order_states =
+                static_cast<std::size_t>(
+                    options.intraday_store_maximum_records);
+            ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
+            certified_config.run_id = run_id;
+            certified_config.session_epoch = options.session_epoch;
+            certified_config.trade_date = options.trade_date;
+            certified_config.daily_catalog = daily_catalog;
+            certified_config.fast_sink = ipc_service;
+            certified_config.certified_tick_ring_capacity =
+                options.ipc_tick_ring_records;
+            certified_config.handoff_queue_capacity =
+                options.certified_handoff_queue_records;
+            certified_config.maximum_mapping_bytes =
+                options.ipc_maximum_mapping_bytes;
+            certified_config.maximum_order_states =
+                maximum_order_states;
+            certified_config.maximum_derived_events =
+                maximum_order_states * 4U;
+            certified_config.maximum_certified_ticks =
+                options.intraday_store_maximum_records;
+            certified_config.worker_cpu_set = options.event_cpu_set;
+            certified_config.control_cpu_set = options.event_cpu_set;
+            certified_config.tick_history_worker_cpu_set =
+                options.event_cpu_set;
+            certified_config.control_exposure_gate = exposure_gate;
+            certified_config.control_socket_path =
+                options.certified_ipc_socket;
+            certified_config.origin_policy =
+                l2flow::realtime::NativeSequenceOriginPolicyV1::
+                    kBoundedProcessStart;
+            certified_config.maximum_backward_displacement =
+                options.native_maximum_backward_displacement;
+            certified_config.event_temporal_coverage =
+                ipc::CertifiedOrderEventTemporalCoverageV1::
+                    kFromProcessStart;
+            certified_config.event_coverage_start_unix_ns =
+                provisional_event_coverage_unix_ns;
+
+            int certified_system_error = 0;
+            const ipc::RealtimeCertifiedServiceCreateErrorV1
+                certified_error =
+                    ipc::RealtimeCertifiedMarketServiceV1::Create(
+                        std::move(certified_config),
+                        &certified_service,
+                        &certified_system_error);
+            if (certified_error !=
+                    ipc::RealtimeCertifiedServiceCreateErrorV1::kNone ||
+                certified_service == nullptr ||
+                !certified_service->StartWorker(
+                    &certified_system_error) ||
+                !certified_service->StartControl(
+                    &certified_system_error)) {
+                std::cerr
+                    << "mdl-production-router: partial canonical Event "
+                       "start failed: "
+                    << ipc::RealtimeCertifiedServiceCreateErrorNameV1(
+                           certified_error)
+                    << " errno=" << certified_system_error
+                    << "; FAST remains available\n";
+                if (certified_service != nullptr) {
+                    certified_service->StopControl();
+                    certified_service.reset();
+                }
+            } else {
+                event_available = true;
+            }
         }
-        ipc_service->MarkFailed();
-        ipc_service->StopControl();
-        return 1;
     }
-    std::cerr
-        << "mdl-production-router: partial Event READY: socket="
-        << options.event_aggregator_socket
-        << " coverage=PROCESS_START_PARTIAL"
-        << " event_ring_capacity="
-        << event_snapshot.event_session.ring_capacity
-        << " source_tick_consumed_sequence=0"
-        << " event_published_sequence=0\n";
 
     runtime::RealtimePipelineConfigV1 pipeline_config =
         BuildOnlinePipelineBase(
@@ -1929,7 +1428,18 @@ int RunLivePartial(
     pipeline_config.sdk.message_encoding =
         datayes::mdl::MDLEID_BINARY;
     pipeline_config.sdk.merge_message = false;
-    pipeline_config.applied_record_sink = ipc_service;
+    pipeline_config.applied_record_sink =
+        certified_service != nullptr
+            ? std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  certified_service)
+            : std::static_pointer_cast<
+                  market::RealtimeAppliedRecordSinkV1>(
+                  ipc_service);
+    if (certified_service != nullptr) {
+        pipeline_config.native_sequence_observation_sink =
+            certified_service;
+    }
     pipeline_config.processing_progress_sink = ipc_service;
     pipeline_config.store_generation_sink = ipc_service;
 
@@ -1940,12 +1450,11 @@ int RunLivePartial(
         std::cerr
             << "mdl-production-router: LIVE_PARTIAL tick ring is "
                "smaller than the applied dispatch window\n";
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
         ipc_service->MarkFailed();
         ipc_service->StopControl();
-        if (managed_event_sidecar != nullptr) {
-            static_cast<void>(managed_event_sidecar->StopAndWait(
-                std::chrono::milliseconds(2000)));
-        }
         return 1;
     }
 
@@ -1958,23 +1467,18 @@ int RunLivePartial(
             runtime::RealtimePipelineCreateErrorV1::kNone ||
         pipeline == nullptr) {
         std::cerr
-            << "mdl-production-router: standalone LIVE_PARTIAL pipeline "
+            << "mdl-production-router: LIVE_PARTIAL pipeline "
                "create/connect failed: "
             << runtime::RealtimePipelineCreateErrorNameV1(create_error)
             << (detail.empty() ? "" : ": ") << detail << '\n';
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
         ipc_service->MarkFailed();
         ipc_service->StopControl();
-        if (managed_event_sidecar != nullptr) {
-            static_cast<void>(managed_event_sidecar->StopAndWait(
-                std::chrono::milliseconds(2000)));
-        }
         return 1;
     }
 
-    // Create includes SDK Connect and leaves the Pipeline accepting. Sampling
-    // only after it returns avoids claiming coverage for time during which the
-    // subscription was not yet proven active. Any synchronous Connect callback
-    // that already reached KLine is conservatively before this boundary.
     std::uint64_t process_start_coverage_unix_ns = 0U;
     if (!CurrentRealtimeNs(&process_start_coverage_unix_ns) ||
         !ipc_service->PrepareProcessStartHistoryCoverage(
@@ -1983,20 +1487,44 @@ int RunLivePartial(
          !ipc_service->PrepareProcessStartKLineCoverage(
              process_start_coverage_unix_ns))) {
         std::cerr
-            << "mdl-production-router: standalone LIVE_PARTIAL "
-               "coverage preparation failed\n";
+            << "mdl-production-router: LIVE_PARTIAL coverage "
+               "preparation failed\n";
         pipeline->StopAndDrain();
+        if (certified_service != nullptr) {
+            certified_service->StopControl();
+        }
         ipc_service->MarkFailed();
         ipc_service->StopControl();
-        if (managed_event_sidecar != nullptr) {
-            static_cast<void>(managed_event_sidecar->StopAndWait(
-                std::chrono::milliseconds(2000)));
-        }
         return 1;
     }
+    if (certified_service != nullptr) {
+        int coverage_system_error = 0;
+        if (!certified_service->FinalizeProcessStartCoverage(
+                process_start_coverage_unix_ns,
+                std::chrono::milliseconds(
+                    options.generation_timeout_ms),
+                &coverage_system_error)) {
+            event_available = false;
+            std::cerr
+                << "mdl-production-router: partial canonical Event "
+                   "coverage finalization failed after SDK Connect: errno="
+                << coverage_system_error
+                << "; FAST remains available\n";
+            certified_service->StopControl();
+        }
+    }
+    if (event_available && certified_service != nullptr &&
+        !certified_service->ControlRunningConfirmed()) {
+        event_available = false;
+        std::cerr
+            << "mdl-production-router: partial canonical Event control "
+               "failed before exposure; FAST remains available\n";
+        certified_service->StopControl();
+    }
 
+    exposure_gate->store(true, std::memory_order_release);
     std::cerr
-        << "mdl-production-router: standalone LIVE_PARTIAL available: "
+        << "mdl-production-router: LIVE_PARTIAL available: "
         << "socket=" << ipc_service->control_socket_path()
         << " run_id=" << common::Identity128Hex(run_id)
         << " coverage_from_open=false"
@@ -2013,29 +1541,32 @@ int RunLivePartial(
         << process_start_coverage_unix_ns
         << " full_day_factor_valid=false"
         << " certified_prefix_valid=false"
-        << " event_socket=" << options.event_aggregator_socket
-        << " event_quality=PROCESS_START_PARTIAL"
-        << " event_stream_quality=LOCAL_TICK_STREAM_CONTIGUOUS"
-        << " event_native_gap_recovered=false"
+        << " event_available="
+        << (event_available ? "true" : "false")
+        << " event_socket="
+        << (event_available
+                ? options.certified_ipc_socket.string()
+                : std::string("none"))
+        << " event_temporal_coverage="
+        << (event_available ? "PROCESS_START_PARTIAL" : "UNAVAILABLE")
+        << " event_ordering="
+        << (event_available ? "PER_CHANNEL_NATIVE_CANONICAL" : "NONE")
+        << " event_full_day_complete=false"
+        << " maximum_backward_displacement="
+        << options.native_maximum_backward_displacement
         << " event_logical_cpu_disjoint="
         << (!options.event_cpu_set.empty() ? "true" : "false")
-        << " history_control=process_start_after_first_generation"
-        << " tick_delta_control=process_start_after_first_generation"
-        << " recovery=disabled\n";
+        << " recovery="
+        << (event_available ? "bounded" : "disabled")
+        << '\n';
 
     const auto interval =
         std::chrono::milliseconds(options.generation_interval_ms);
     const auto timeout =
         std::chrono::milliseconds(options.generation_timeout_ms);
     int exit_code = 0;
-    bool event_sidecar_degraded = false;
-    PartialEventHealthState event_health{};
-    event_health.last_source_tick_consumed =
-        event_snapshot.source_tick_consumed_sequence;
-    event_health.last_event_published =
-        event_snapshot.event_published_sequence;
-    event_health.last_heartbeat_monotonic_ns =
-        event_snapshot.heartbeat_monotonic_ns;
+    bool event_failure_reported = !event_available;
+    bool channel_degradation_reported = false;
     while (g_stop_requested == 0) {
         const IntervalWaitResult wait =
             WaitForInterval(interval, options.trade_date);
@@ -2054,39 +1585,45 @@ int RunLivePartial(
             exit_code = 1;
             break;
         }
-        if (!event_sidecar_degraded &&
-            managed_event_sidecar != nullptr) {
-            int wait_status = -1;
-            if (!managed_event_sidecar->Running(&wait_status)) {
-                event_sidecar_degraded = true;
+
+        if (certified_service != nullptr) {
+            const ipc::RealtimeCertifiedServiceSnapshotV1 event_snapshot =
+                certified_service->Snapshot();
+            const bool event_failed =
+                event_snapshot.globally_frozen_resource ||
+                event_snapshot.state ==
+                    ipc::RealtimeCertifiedStateV1::kFrozenConflict ||
+                event_snapshot.state ==
+                    ipc::RealtimeCertifiedStateV1::kFrozenResource ||
+                event_snapshot.control_state ==
+                    ipc::RealtimeCertifiedServiceSnapshotV1::
+                        ControlState::kFailed;
+            if (event_failed && !event_failure_reported) {
+                event_failure_reported = true;
+                event_available = false;
                 std::cerr
-                    << "mdl-production-router: partial Event sidecar "
+                    << "mdl-production-router: partial canonical Event "
                        "failed after ACTIVE; FAST remains available: "
-                    << "wait_status=" << wait_status << '\n';
-                managed_event_sidecar.reset();
-            }
-        }
-        if (!event_sidecar_degraded) {
-            std::string health_detail;
-            const std::uint64_t source_tick_frontier =
-                ipc_service->tick_contiguous_published_sequence();
-            if (!ProbePartialEventHealth(
-                    options,
-                    run_id,
-                    *daily_catalog,
-                    source_tick_frontier,
-                    &event_health,
-                    &health_detail)) {
-                event_sidecar_degraded = true;
+                    << "state="
+                    << static_cast<std::uint32_t>(
+                           event_snapshot.state)
+                    << " frozen_channel_count="
+                    << event_snapshot.frozen_channel_count
+                    << " dropped_handoffs="
+                    << event_snapshot.dropped_handoffs << '\n';
+            } else if (
+                event_snapshot.state ==
+                    ipc::RealtimeCertifiedStateV1::kDegraded &&
+                !channel_degradation_reported) {
+                channel_degradation_reported = true;
                 std::cerr
-                    << "mdl-production-router: partial Event unhealthy "
-                       "after ACTIVE; FAST remains available: "
-                    << health_detail << '\n';
-                if (managed_event_sidecar != nullptr) {
-                    managed_event_sidecar->RequestStop();
-                }
+                    << "mdl-production-router: partial canonical Event "
+                       "is channel-isolated DEGRADED; healthy channels "
+                       "remain available: frozen_channel_count="
+                    << event_snapshot.frozen_channel_count << '\n';
             }
         }
+
         const runtime::RealtimePipelineCutResultV1 cut =
             pipeline->CutAndPublishGeneration(timeout);
         if (!cut.published()) {
@@ -2111,6 +1648,9 @@ int RunLivePartial(
     if (!ipc_service->failed()) {
         ipc_service->MarkDraining();
     }
+    if (certified_service != nullptr) {
+        certified_service->MarkDraining();
+    }
     runtime::RealtimePipelineCutResultV1 final{};
     if (exit_code == 0 && !pipeline->fatal()) {
         final = pipeline->StopAndPublishFinalGeneration(timeout);
@@ -2134,6 +1674,17 @@ int RunLivePartial(
     if (snapshot.fatal) {
         exit_code = 1;
     }
+
+    ipc::RealtimeCertifiedServiceSnapshotV1 event_snapshot{};
+    if (certified_service != nullptr) {
+        if (exit_code == 0) {
+            certified_service->MarkStoppedClean();
+            event_snapshot = certified_service->Snapshot();
+        } else {
+            event_snapshot = certified_service->Snapshot();
+        }
+        certified_service->StopControl();
+    }
     if (exit_code == 0) {
         if (!ipc_service->MarkStoppedClean(
                 snapshot.tick_stream_sequence)) {
@@ -2142,33 +1693,8 @@ int RunLivePartial(
     }
     if (exit_code != 0) {
         ipc_service->MarkFailed();
-        if (managed_event_sidecar != nullptr) {
-            managed_event_sidecar->RequestStop();
-        }
-    } else if (managed_event_sidecar != nullptr) {
-        int event_wait_status = 0;
-        if (!managed_event_sidecar->WaitForExit(
-                std::chrono::milliseconds(5000),
-                &event_wait_status)) {
-            std::cerr
-                << "mdl-production-router: partial Event sidecar did not "
-                   "drain after source clean-stop; terminating it\n";
-            event_sidecar_degraded = true;
-            if (!managed_event_sidecar->StopAndWait(
-                    std::chrono::milliseconds(2000))) {
-                std::cerr
-                    << "mdl-production-router: partial Event sidecar "
-                       "could not be reaped within bounded shutdown\n";
-            }
-        } else if (!WIFEXITED(event_wait_status) ||
-                   WEXITSTATUS(event_wait_status) != 0) {
-            event_sidecar_degraded = true;
-            std::cerr
-                << "mdl-production-router: partial Event sidecar clean "
-                   "drain failed: wait_status="
-                << event_wait_status << '\n';
-        }
     }
+
     std::cerr
         << "mdl-production-router: LIVE_PARTIAL final: exit_code="
         << exit_code
@@ -2179,12 +1705,17 @@ int RunLivePartial(
         << " records=" << snapshot.store.appended_records
         << " tick_stream_sequence=" << snapshot.tick_stream_sequence
         << " coverage_from_open=false"
-        << " event_degraded="
-        << (event_sidecar_degraded ? "true" : "false")
-        << " recovery=disabled\n";
+        << " event_state="
+        << static_cast<std::uint32_t>(event_snapshot.state)
+        << " event_frozen_channel_count="
+        << event_snapshot.frozen_channel_count
+        << " event_canonical_apply_frontier="
+        << event_snapshot.canonical_apply_frontier
+        << " recovery="
+        << (certified_service != nullptr ? "bounded" : "disabled")
+        << '\n';
     return exit_code;
 }
-
 int RunOnlineRecovery(
     const Options& options,
     const common::Identity128& recovered_run_id,
@@ -3350,7 +2881,7 @@ int RunOnlineRecovery(
                 << " full_day_factor_valid=true"
                 << " certified_prefix_valid="
                 << (certified_service != nullptr ? "true" : "false")
-                << " event_aggregator="
+                << " event_service="
                 << (certified_service != nullptr
                         ? "CERTIFIED_CANONICAL"
                         : "DISABLED")
@@ -4339,33 +3870,6 @@ int Run(const Options& options) {
         ipc_service->StopControl();
         return 1;
     }
-    if (!options.event_aggregator_socket.empty()) {
-        ipc::OrderEventDeltaControlSnapshotV1 event_snapshot{};
-        std::string ready_detail;
-        if (!WaitForEventAggregatorReady(
-                options,
-                run_id,
-                *daily_catalog,
-                nullptr,
-                &event_snapshot,
-                &ready_detail)) {
-            std::cerr
-                << "mdl-production-router: event aggregator READY "
-                   "gate failed: "
-                << ready_detail << '\n';
-            ipc_service->MarkFailed();
-            ipc_service->StopControl();
-            return 1;
-        }
-        std::cerr
-            << "mdl-production-router: event aggregator READY: socket="
-            << options.event_aggregator_socket
-            << " event_ring_capacity="
-            << event_snapshot.event_session.ring_capacity
-            << " source_tick_consumed_sequence=0"
-            << " event_published_sequence=0\n";
-    }
-
     std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
         certified_service;
     // FAST is the required service. CERTIFIED is enabled by default, but it
@@ -4471,7 +3975,7 @@ int Run(const Options& options) {
                 << " handoff_queue_records="
                 << certified_service->handoff_queue_capacity()
                 << " native_gap_recovery=true"
-                << " event_aggregator=CERTIFIED_CANONICAL"
+                << " event_service=CERTIFIED_CANONICAL"
                 << " event_history=FULL_DAY_APPEND_ONLY"
                 << " event_temporal_coverage=FROM_MARKET_OPEN"
                 << " event_logical_cpu_disjoint="

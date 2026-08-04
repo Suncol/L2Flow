@@ -242,48 +242,47 @@ startup mode:
 - `--intraday-live-partial` explicitly starts a process-start-only service
   without CSV recovery and without claiming coverage from market open.
 
-The standalone partial mode uses `--ipc-socket` for FAST and derives
-`<ipc-socket>.events` for a managed Event sidecar by default. It starts the
-FAST control plane first so the sidecar can attach at local tick sequence 1,
-waits for an exact process-start READY at the zero-prefix origin, and only then
-connects the real SDK. FAST serves GET_SESSION plus latest snapshot/tick reads
-with `server_state=LIVE_PARTIAL`. Each periodic generation
+Partial mode uses `--ipc-socket` for FAST and the canonical
+`--certified-ipc-socket` Event service. The router starts both workers and
+control listeners behind one closed exposure gate before SDK Connect, then
+connects the pipeline and opens the gate. FAST serves GET_SESSION plus latest
+snapshot/tick reads with `server_state=LIVE_PARTIAL`. Each periodic generation
 cut also exposes the complete retained single-instrument History from this
 process's start and tick generation delta; before the first cut those opens are
 temporarily unavailable. The generation truthfully carries
 `record_coverage_complete=true` and `coverage_from_open=false`.
 When `--kline-windows-ms` is present, the same cuts publish latest KLine data
 using exchange-natural, local-midnight-aligned windows. Those bars contain only
-trades received by this process. The router samples a conservative live
-coverage boundary immediately after SDK Connect succeeds. A materialized bar
-is marked left-truncated exactly when its natural bounds satisfy
+trades received by this process. After SDK Connect succeeds, the router captures
+one conservative process-start boundary and finalizes FAST/Event metadata before
+opening the shared exposure gate. A materialized bar is marked left-truncated
+exactly when its natural bounds satisfy
 `window_start < boundary < window_end`; a no-trade window does not synthesize a
 bar. The session advertises process-start partial KLine coverage rather than
 full-day validity. The public IPC surface remains latest-KLine only; it does
 not expose a partial KLine history cursor.
 `startup_prefix_recovered`, both full-day validity flags, and
 `certified_prefix_valid` remain false for the whole run.
-The Event stream is explicitly `FROM_PROCESS_START` and
-`LOCAL_TICK_STREAM_CONTIGUOUS`; it does not claim startup-prefix or native-gap
-recovery. After READY, the router probes Event control identity, heartbeat,
-monotonic consumption, source-ring retention, and forward progress once per
-generation interval. A managed child exit or any managed/external health
-failure is reported as degraded but does not stop or block FAST. Managed
-children additionally arm Linux parent-death signaling and use bounded
-TERM/KILL reaping, so a router crash or shutdown cannot intentionally leave an
-unsupervised Event process running. The mode creates no startup buffer, live
-journal, CSV source, shadow pipeline, or CERTIFIED sidecar. It also configures
+The Event journal is explicitly `PROCESS_START_PARTIAL` and requires
+`--native-maximum-backward-displacement D`. Shenzhen 6.33/6.36 share one
+per-channel `ApplSeqNum` domain; the worker withholds output until its bounded
+origin proof is complete, then publishes exact-next canonical order. A gap or
+conflict freezes only that channel and reports `DEGRADED`; global Event
+resource failure is also isolated from FAST. No timer flushes native order.
+`--disable-native-gap-recovery` selects FAST-only partial. The mode creates no
+startup buffer, live journal, CSV source, or shadow pipeline. It also configures
 `factor_generation_enabled=false`, so
 periodic Store generations remain publishable for History/delta without
-creating or invoking the C++ generation Factor engine. A CERTIFIED socket and
-full-day Event/KLine claims remain unavailable. This is the
+creating or invoking the C++ generation Factor engine. The Event socket does
+not claim a full-day Event/KLine prefix, and `certified_prefix_valid` remains
+false. This is the
 factually correct
 mode for a mid-session launch that deliberately does not recover the
 market-open prefix; using
 `--intraday-store-from-open` in that situation remains an invalid operator
 assertion.
 
-This opt-in applies only to standalone `--intraday-live-partial`. The separate
+This behavior applies only to standalone `--intraday-live-partial`. The separate
 `LIVE_PARTIAL` socket used while CSV online recovery is running remains
 snapshot/tick latest-only, carries no KLine windows, and continues to reject
 History/delta, so recovery-side bulk reads cannot be introduced through the
@@ -414,11 +413,8 @@ recovery fence waits for the matching Tick-history frontier on that cold
 control path. Disabling native-gap recovery explicitly removes these
 canonical services and leaves `certified_prefix_valid=false`.
 
-CSV recovery cannot be combined with the legacy
-`--event-aggregator-socket` in this version. The external event-delta process
-has no pre-ACTIVE full-replay handoff and its bounded ring cannot be assumed to
-retain an entire intraday replay; the default CERTIFIED Event journal is the
-supported recovered path. See the
+The default CERTIFIED Event journal is the only production order-event path;
+the router has no arrival-order Event fallback. See the
 [CSV startup recovery contract](docs/csv-startup-recovery-v1.md) before using
 the recovery option.
 
@@ -433,36 +429,8 @@ sz	31303220	303030303031	share	equity	documented_core	-
 The Shenzhen source above decodes to the four bytes `102 `; the loader never
 trims or normalizes it.
 
-For the optional standalone event-delta compatibility path, add
-`--event-aggregator-socket /absolute/private/events.sock` to the router and
-start `build/mdl-order-event-aggregator` against the router's source socket:
-
-```bash
-build/mdl-order-event-aggregator \
-  --source-socket /absolute/private/l2flow.sock \
-  --event-socket /absolute/private/events.sock \
-  --session-epoch 1 \
-  --trade-date 20260730 \
-  --shanghai-state-capacity 5000000 \
-  --shenzhen-state-capacity 5000000 \
-  --event-ring-capacity 1048576 \
-  --event-maximum-mapping-bytes 1073741824 \
-  --read-batch-records 4096 \
-  --temporal-coverage from-open \
-  --poll-ms 1 \
-  --timeout-ms 1000
-```
-
-Both socket parents must be same-UID, owner-only directories and neither
-socket may already exist. With the event socket configured, the router starts
-its source IPC service, then waits for an event service with the exact source
-run and frozen daily-catalog identity at the zero-prefix origin before
-creating the SDK pipeline. Size the source and event rings for measured rates
-and maximum reader pauses; an overrun fails closed and this version does not
-catch up or recover.
-
-For ordinary from-open and promoted online-recovery sessions, the default
-native-gap CERTIFIED service is instead the canonical order-event path. It
+For from-open, promoted online-recovery, and process-start partial sessions,
+the native-gap CERTIFIED service is the canonical order-event path. It
 reorders/repairs native positions before projection and exposes the entire
 append-only history plus future live events on the CERTIFIED socket:
 
@@ -477,7 +445,9 @@ with client.open_certified_order_events(
 
 Online clients may attach only after recovered FAST advertises
 `certified_prefix_valid=true`; the Event coverage flags are immutable once the
-CERTIFIED control socket is exposed.
+CERTIFIED control socket is exposed. A partial client instead passes
+`coverage_requirement="process_start_partial"`; the default remains strict
+from-open.
 
 ### Default Mainland A-share admission filter
 
@@ -654,7 +624,11 @@ CERTIFIED. See
 supported API matrix, partial/from-open rules, stable Event UID, promotion,
 spill, and resource limits.
 
-The standalone `mdl-order-event-aggregator` consumes every record in the
+The standalone `mdl-order-event-aggregator` remains an ordered-input replay and
+diagnostic tool; the production router does not start, gate, or advertise it.
+It must not be attached to live callback-order Wire data because that source
+cannot guarantee the shared Shenzhen 6.33/6.36 native order. Given an input
+whose native order is already guaranteed, it consumes every record in the
 dense global tick ring and publishes a fail-closed event-delta memfd ring. It
 assigns a distinct dense derived-event sequence, advances the source-tick
 cursor even for zero-event ticks, and publishes each source cursor only after

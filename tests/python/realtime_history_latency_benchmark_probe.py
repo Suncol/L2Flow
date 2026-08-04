@@ -32,6 +32,9 @@ After one ``READY`` line, stdin accepts these exact commands:
     RAW_POLARS_UPDATE \
         INSTRUMENT GENERATION REPEATS EXPECTED_RECORDS \
         EXPECTED_FIRST_INGRESS EXPECTED_LAST_INGRESS
+    RAW_POLARS_LOADED_UPDATE \
+        INSTRUMENT GENERATION EXPECTED_RECORDS \
+        EXPECTED_FIRST_INGRESS EXPECTED_LAST_INGRESS EXPECTED_INGRESS_SUM
     QUIT
 
 Every measured repetition emits one ``*_SAMPLE`` key/value line.  A ``DONE``
@@ -101,6 +104,18 @@ def _require(condition: bool, message: str) -> None:
 
 def _now_ns() -> int:
     return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
+def _percentile_r7_ns(values: list[int], probability: float) -> int:
+    ordered = sorted(values)
+    _require(bool(ordered), "latency distribution is empty")
+    position = (len(ordered) - 1) * probability
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return round(
+        ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+    )
 
 
 def _decimal(
@@ -1940,17 +1955,29 @@ def _run_raw_polars_update(
     expected_records: int,
     expected_first_ingress: int,
     expected_last_ingress: int,
+    expected_ingress_sum: Optional[int] = None,
+    sample_kind: str = "RAW_POLARS_SAMPLE",
+    operation: str = "RAW_POLARS_UPDATE",
 ) -> None:
     _require(
         instrument_id in checkpoints,
         "raw Polars update has no verified baseline",
     )
     _require(
-        expected_last_ingress >= expected_first_ingress
-        and expected_last_ingress - expected_first_ingress + 1
-        == expected_records,
-        "raw Polars expected ingress interval is inconsistent",
+        expected_last_ingress >= expected_first_ingress,
+        "raw Polars expected ingress interval is reversed",
     )
+    if expected_ingress_sum is None:
+        _require(
+            expected_last_ingress - expected_first_ingress + 1
+            == expected_records,
+            "raw Polars expected ingress interval is inconsistent",
+        )
+        expected_ingress_sum = (
+            (expected_first_ingress + expected_last_ingress)
+            * expected_records
+            // 2
+        )
     base = checkpoints[instrument_id]
     target_checkpoint = None
     target_checksum = None
@@ -2018,11 +2045,6 @@ def _run_raw_polars_update(
             and last_ingress == expected_last_ingress,
             "raw Polars ingress interval differs from the offered interval",
         )
-        expected_ingress_sum = (
-            (expected_first_ingress + expected_last_ingress)
-            * expected_records
-            // 2
-        )
         _require(
             ingress_sum == expected_ingress_sum,
             "raw Polars ingress interval is not complete",
@@ -2044,7 +2066,7 @@ def _run_raw_polars_update(
                 "repeated raw Polars reads disagree",
             )
         _emit(
-            "RAW_POLARS_SAMPLE",
+            sample_kind,
             command=command_index,
             sample=repeat,
             instrument_id=instrument_id,
@@ -2078,7 +2100,7 @@ def _run_raw_polars_update(
     _emit(
         "DONE",
         command=command_index,
-        operation="RAW_POLARS_UPDATE",
+        operation=operation,
         samples=repeats,
     )
 
@@ -2236,6 +2258,296 @@ def _run_derived_polars(
     )
 
 
+def _run_certified_event_polars_drain(
+    polars,
+    certified_order_event_batch_frame,
+    reader,
+    *,
+    command_index: int,
+    instrument_id: int,
+    first_ingress: int,
+    last_ingress: int,
+) -> None:
+    command_received_ns = _now_ns()
+    deadline = time.monotonic() + 30.0
+    rows = 0
+    batches = 0
+    first_recv_ns = 0
+    last_recv_ns = 0
+    first_event_sequence = 0
+    last_event_sequence = 0
+    caught_up = False
+    advertised_event_sequence = 0
+    while time.monotonic() < deadline:
+        begin_sequence = reader.next_event_sequence
+        batch = reader.read_batch()
+        frame = certified_order_event_batch_frame(batch)
+        batches += 1
+        advertised_event_sequence = int(
+            batch.status.event_published_sequence
+        )
+        caught_up = (
+            batch.next_event_sequence == advertised_event_sequence + 1
+        )
+        if frame.height:
+            sequence = frame.get_column("derived_event_sequence")
+            _require(
+                int(sequence.item(0)) == begin_sequence
+                and int(sequence.item(-1))
+                == begin_sequence + frame.height - 1
+                and sequence.n_unique() == frame.height,
+                "CERTIFIED Event Polars sequence is not dense",
+            )
+            rows += frame.height
+            relevant = frame.filter(
+                (polars.col("instrument_id") == instrument_id)
+                & polars.col("ingress_sequence").is_in(
+                    [first_ingress, last_ingress]
+                )
+            )
+            for ingress, recv_ns, event_sequence in relevant.select(
+                "ingress_sequence",
+                "recv_monotonic_ns",
+                "derived_event_sequence",
+            ).iter_rows():
+                if ingress == first_ingress:
+                    first_recv_ns = (
+                        recv_ns
+                        if first_recv_ns == 0
+                        else min(first_recv_ns, recv_ns)
+                    )
+                    first_event_sequence = (
+                        event_sequence
+                        if first_event_sequence == 0
+                        else min(first_event_sequence, event_sequence)
+                    )
+                if ingress == last_ingress:
+                    last_recv_ns = (
+                        recv_ns
+                        if last_recv_ns == 0
+                        else min(last_recv_ns, recv_ns)
+                    )
+                    last_event_sequence = max(
+                        last_event_sequence, event_sequence
+                    )
+        # The latency boundary is the first Polars materialization that
+        # contains both requested callbacks.  Do not wait for the global
+        # producer tail here: callbacks continue arriving while this command
+        # runs, so requiring a moving global tail would turn a one-second
+        # latency sample into an unbounded catch-up benchmark.
+        if first_recv_ns and last_recv_ns:
+            break
+        if frame.height == 0:
+            time.sleep(0.0001)
+    ready_ns = _now_ns()
+    _require(
+        first_recv_ns > 0
+        and last_recv_ns > 0
+        and first_event_sequence > 0
+        and last_event_sequence >= first_event_sequence,
+        "CERTIFIED Event Polars did not reach the requested ingress tail "
+        f"(rows={rows}, batches={batches}, next_event_sequence="
+        f"{reader.next_event_sequence}, advertised_event_sequence="
+        f"{advertised_event_sequence}, first_found={int(first_recv_ns > 0)}, "
+        f"last_found={int(last_recv_ns > 0)})",
+    )
+    _emit(
+        "CERTIFIED_EVENT_POLARS_SAMPLE",
+        command=command_index,
+        instrument_id=instrument_id,
+        first_ingress=first_ingress,
+        last_ingress=last_ingress,
+        first_event_sequence=first_event_sequence,
+        last_event_sequence=last_event_sequence,
+        first_callback_entry_ns=first_recv_ns,
+        last_callback_entry_ns=last_recv_ns,
+        advertised_event_sequence=advertised_event_sequence,
+        next_event_sequence=reader.next_event_sequence,
+        drained_rows=rows,
+        batches=batches,
+        command_received_ns=command_received_ns,
+        polars_ready_ns=ready_ns,
+        command_to_polars_ns=ready_ns - command_received_ns,
+    )
+    _emit(
+        "DONE",
+        command=command_index,
+        operation="CERTIFIED_EVENT_POLARS_DRAIN",
+        samples=1,
+    )
+
+
+def _run_certified_event_polars_final(
+    certified_order_event_batch_frame,
+    reader,
+    *,
+    command_index: int,
+    expected_events: int,
+) -> None:
+    start_ns = _now_ns()
+    rows = 0
+    batches = 0
+    deadline = time.monotonic() + 120.0
+    advertised_event_sequence = 0
+    while time.monotonic() < deadline:
+        batch = reader.read_batch()
+        frame = certified_order_event_batch_frame(batch)
+        rows += frame.height
+        batches += 1
+        advertised_event_sequence = int(
+            batch.status.event_published_sequence
+        )
+        if (
+            reader.next_event_sequence == expected_events + 1
+            and advertised_event_sequence == expected_events
+        ):
+            break
+        if frame.height == 0:
+            time.sleep(0.0001)
+    ready_ns = _now_ns()
+    _require(
+        reader.next_event_sequence == expected_events + 1
+        and advertised_event_sequence == expected_events,
+        "CERTIFIED Event final prefix differs from expected",
+    )
+    _emit(
+        "CERTIFIED_EVENT_POLARS_FINAL",
+        command=command_index,
+        expected_events=expected_events,
+        total_events=reader.next_event_sequence - 1,
+        drained_rows=rows,
+        batches=batches,
+        elapsed_ns=ready_ns - start_ns,
+    )
+    _emit(
+        "DONE",
+        command=command_index,
+        operation="CERTIFIED_EVENT_POLARS_FINAL",
+        samples=1,
+    )
+
+
+def _run_certified_event_polars_load(
+    polars,
+    certified_order_event_batch_frame,
+    reader,
+    *,
+    command_index: int,
+    duration_ms: int,
+) -> None:
+    start_ns = _now_ns()
+    _emit(
+        "CERTIFIED_EVENT_POLARS_STARTED",
+        command=command_index,
+        duration_ms=duration_ms,
+        start_ns=start_ns,
+    )
+    deadline_ns = start_ns + duration_ms * 1_000_000
+    rows = 0
+    batches = 0
+    nonempty_batches = 0
+    first_event_sequence = 0
+    last_event_sequence = 0
+    advertised_event_sequence = 0
+    strict_first_latencies: list[int] = []
+    strict_last_latencies: list[int] = []
+    while _now_ns() < deadline_ns:
+        begin_sequence = reader.next_event_sequence
+        batch = reader.read_batch()
+        frame = certified_order_event_batch_frame(batch)
+        ready_ns = _now_ns()
+        batches += 1
+        advertised_event_sequence = int(
+            batch.status.event_published_sequence
+        )
+        if frame.height == 0:
+            time.sleep(0.0001)
+            continue
+        sequence = frame.get_column("derived_event_sequence")
+        frame_first_sequence = int(sequence.item(0))
+        frame_last_sequence = int(sequence.item(-1))
+        _require(
+            frame_first_sequence == begin_sequence
+            and frame_last_sequence == begin_sequence + frame.height - 1
+            and sequence.n_unique() == frame.height,
+            "CERTIFIED Event Polars load sequence is not dense",
+        )
+        callback_entries = frame.get_column("recv_monotonic_ns")
+        first_callback_entry_ns = int(callback_entries.min())
+        last_callback_entry_ns = int(callback_entries.max())
+        _require(
+            0 < first_callback_entry_ns <= last_callback_entry_ns <= ready_ns,
+            "CERTIFIED Event callback timestamps are invalid",
+        )
+        if first_event_sequence == 0:
+            first_event_sequence = frame_first_sequence
+        last_event_sequence = frame_last_sequence
+        rows += frame.height
+        nonempty_batches += 1
+        strict_first_latencies.append(ready_ns - first_callback_entry_ns)
+        strict_last_latencies.append(ready_ns - last_callback_entry_ns)
+    stop_ns = _now_ns()
+    _require(
+        rows > 0
+        and nonempty_batches == len(strict_first_latencies)
+        and nonempty_batches == len(strict_last_latencies)
+        and first_event_sequence == 1
+        and last_event_sequence == rows
+        and reader.next_event_sequence == rows + 1,
+        "CERTIFIED Event Polars load produced an invalid consumed prefix",
+    )
+    event_backlog = max(
+        0, advertised_event_sequence + 1 - reader.next_event_sequence
+    )
+    elapsed_ns = stop_ns - start_ns
+    _emit(
+        "CERTIFIED_EVENT_POLARS_LOAD",
+        command=command_index,
+        duration_ms=duration_ms,
+        elapsed_ns=elapsed_ns,
+        rows=rows,
+        batches=batches,
+        nonempty_batches=nonempty_batches,
+        first_event_sequence=first_event_sequence,
+        last_event_sequence=last_event_sequence,
+        next_event_sequence=reader.next_event_sequence,
+        advertised_event_sequence=advertised_event_sequence,
+        event_backlog=event_backlog,
+        caught_up=int(event_backlog == 0),
+        materialized_events_per_second=(
+            rows * 1_000_000_000 // elapsed_ns
+        ),
+        strict_first_min_ns=min(strict_first_latencies),
+        strict_first_p50_ns=_percentile_r7_ns(
+            strict_first_latencies, 0.50
+        ),
+        strict_first_p95_ns=_percentile_r7_ns(
+            strict_first_latencies, 0.95
+        ),
+        strict_first_p99_ns=_percentile_r7_ns(
+            strict_first_latencies, 0.99
+        ),
+        strict_first_max_ns=max(strict_first_latencies),
+        strict_last_min_ns=min(strict_last_latencies),
+        strict_last_p50_ns=_percentile_r7_ns(
+            strict_last_latencies, 0.50
+        ),
+        strict_last_p95_ns=_percentile_r7_ns(
+            strict_last_latencies, 0.95
+        ),
+        strict_last_p99_ns=_percentile_r7_ns(
+            strict_last_latencies, 0.99
+        ),
+        strict_last_max_ns=max(strict_last_latencies),
+    )
+    _emit(
+        "DONE",
+        command=command_index,
+        operation="CERTIFIED_EVENT_POLARS_LOAD",
+        samples=nonempty_batches,
+    )
+
+
 def _validate_paths(
     control_socket: str,
     native_library: str,
@@ -2264,13 +2576,20 @@ def _validate_paths(
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 4:
+    if len(argv) not in (4, 5):
         raise RuntimeError(
             "usage: realtime_history_latency_benchmark_probe.py "
-            "CONTROL_SOCKET NATIVE_LIBRARY SOURCE_PYTHON"
+            "CONTROL_SOCKET NATIVE_LIBRARY SOURCE_PYTHON "
+            "[CERTIFIED_CONTROL_SOCKET]"
         )
-    control_socket, native_library, source_python = argv[1:]
+    control_socket, native_library, source_python = argv[1:4]
+    certified_control_socket = argv[4] if len(argv) == 5 else None
     _validate_paths(control_socket, native_library, source_python)
+    if certified_control_socket is not None:
+        _require(
+            os.path.isabs(certified_control_socket),
+            "CERTIFIED control socket path must be absolute",
+        )
     sys.path.insert(0, source_python)
 
     import polars as pl  # pylint: disable=import-outside-toplevel
@@ -2286,6 +2605,7 @@ def main(argv: list[str]) -> int:
         LatestStatus,
     )
     from l2flow_realtime.polars import (  # pylint: disable=import-outside-toplevel
+        certified_order_event_batch_frame,
         derived_event_batch_frame,
         raw_event_batch_frame,
     )
@@ -2312,6 +2632,15 @@ def main(argv: list[str]) -> int:
             raw_event_columns=INSTRUMENT_RAW_EVENT_COLUMNS,
             ring_slots=4,
             batch_capacity=_PAGE_RECORDS,
+        )
+        certified_event_reader = (
+            client.open_certified_order_events(
+                certified_control_socket,
+                coverage_requirement="from_open",
+                batch_records=65_536,
+            )
+            if certified_control_socket is not None
+            else None
         )
         session = client.session_info()
         clock = time.get_clock_info("monotonic")
@@ -2347,6 +2676,10 @@ def main(argv: list[str]) -> int:
             native_library_sha256=_sha256_file(native_library),
             probe_sha256=_sha256_file(__file__),
             polars_version=pl.__version__,
+            certified_event_reader=int(certified_event_reader is not None),
+            certified_event_batch_records=(
+                65_536 if certified_event_reader is not None else 0
+            ),
         )
 
         command_index = 0
@@ -2501,6 +2834,96 @@ def main(argv: list[str]) -> int:
                         samples=1,
                     )
                     continue
+                if operation == "CERTIFIED_EVENT_POLARS_DRAIN":
+                    _require(
+                        len(words) == 4,
+                        "CERTIFIED_EVENT_POLARS_DRAIN requires three "
+                        "arguments",
+                    )
+                    _require(
+                        certified_event_reader is not None,
+                        "CERTIFIED Event reader was not configured",
+                    )
+                    instrument_id = _decimal(
+                        words[1],
+                        "instrument_id",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    first_ingress = _decimal(
+                        words[2],
+                        "first_ingress",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    last_ingress = _decimal(
+                        words[3],
+                        "last_ingress",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    _require(
+                        first_ingress <= last_ingress,
+                        "CERTIFIED Event ingress range is reversed",
+                    )
+                    command_index += 1
+                    _run_certified_event_polars_drain(
+                        pl,
+                        certified_order_event_batch_frame,
+                        certified_event_reader,
+                        command_index=command_index,
+                        instrument_id=instrument_id,
+                        first_ingress=first_ingress,
+                        last_ingress=last_ingress,
+                    )
+                    continue
+                if operation == "CERTIFIED_EVENT_POLARS_LOAD":
+                    _require(
+                        len(words) == 2,
+                        "CERTIFIED_EVENT_POLARS_LOAD requires one argument",
+                    )
+                    _require(
+                        certified_event_reader is not None,
+                        "CERTIFIED Event reader was not configured",
+                    )
+                    duration_ms = _decimal(
+                        words[1],
+                        "duration_ms",
+                        maximum=300_000,
+                        allow_zero=False,
+                    )
+                    command_index += 1
+                    _run_certified_event_polars_load(
+                        pl,
+                        certified_order_event_batch_frame,
+                        certified_event_reader,
+                        command_index=command_index,
+                        duration_ms=duration_ms,
+                    )
+                    continue
+                if operation == "CERTIFIED_EVENT_POLARS_FINAL":
+                    _require(
+                        len(words) == 2,
+                        "CERTIFIED_EVENT_POLARS_FINAL requires one argument",
+                    )
+                    _require(
+                        certified_event_reader is not None,
+                        "CERTIFIED Event reader was not configured",
+                    )
+                    expected_events = _decimal(
+                        words[1],
+                        "expected_events",
+                        maximum=_UINT64_MAX,
+                        allow_zero=True,
+                    )
+                    command_index += 1
+                    _run_certified_event_polars_final(
+                        certified_order_event_batch_frame,
+                        certified_event_reader,
+                        command_index=command_index,
+                        expected_events=expected_events,
+                    )
+                    continue
                 if operation == "RAW_POLARS_BASELINE":
                     _require(
                         len(words) == 3,
@@ -2581,6 +3004,65 @@ def main(argv: list[str]) -> int:
                         expected_records=expected_records,
                         expected_first_ingress=expected_first_ingress,
                         expected_last_ingress=expected_last_ingress,
+                    )
+                    continue
+                if operation == "RAW_POLARS_LOADED_UPDATE":
+                    _require(
+                        len(words) == 7,
+                        "RAW_POLARS_LOADED_UPDATE requires six arguments",
+                    )
+                    instrument_id = _decimal(
+                        words[1],
+                        "instrument_id",
+                        maximum=_UINT32_MAX,
+                        allow_zero=False,
+                    )
+                    generation = _decimal(
+                        words[2],
+                        "generation",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_records = _decimal(
+                        words[3],
+                        "expected_records",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_first_ingress = _decimal(
+                        words[4],
+                        "expected_first_ingress",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_last_ingress = _decimal(
+                        words[5],
+                        "expected_last_ingress",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    expected_ingress_sum = _decimal(
+                        words[6],
+                        "expected_ingress_sum",
+                        maximum=_UINT64_MAX,
+                        allow_zero=False,
+                    )
+                    command_index += 1
+                    _run_raw_polars_update(
+                        pl,
+                        raw_event_batch_frame,
+                        raw_history,
+                        raw_polars_checkpoints,
+                        command_index=command_index,
+                        instrument_id=instrument_id,
+                        expected_generation=generation,
+                        repeats=1,
+                        expected_records=expected_records,
+                        expected_first_ingress=expected_first_ingress,
+                        expected_last_ingress=expected_last_ingress,
+                        expected_ingress_sum=expected_ingress_sum,
+                        sample_kind="RAW_POLARS_LOADED_SAMPLE",
+                        operation="RAW_POLARS_LOADED_UPDATE",
                     )
                     continue
                 if operation == "DERIVED_POLARS":
@@ -2734,6 +3216,8 @@ def main(argv: list[str]) -> int:
                     reader.close()
                 except BaseException:
                     pass
+            if certified_event_reader is not None:
+                certified_event_reader.close()
             raw_history.close()
             delta_worker.close()
     raise RuntimeError("stdin reached EOF before QUIT")

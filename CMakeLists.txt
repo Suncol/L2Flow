@@ -262,7 +262,6 @@ endif()
 
 add_executable(mdl_production_router
     apps/event_cpu_partition_v1.cpp
-    apps/managed_sidecar_process_v1.cpp
     apps/mdl_production_main.cpp)
 l2flow_configure_target(mdl_production_router)
 target_link_libraries(mdl_production_router PRIVATE L2Flow::realtime)
@@ -430,12 +429,6 @@ if(L2FLOW_BUILD_TESTS)
             PRIVATE L2Flow::common)
         add_test(NAME test_event_cpu_partition_v1
             COMMAND test_event_cpu_partition_v1)
-        add_executable(test_managed_sidecar_process_v1
-            apps/managed_sidecar_process_v1.cpp
-            tests/test_managed_sidecar_process_v1.cpp)
-        l2flow_configure_target(test_managed_sidecar_process_v1)
-        add_test(NAME test_managed_sidecar_process_v1
-            COMMAND test_managed_sidecar_process_v1)
         l2flow_add_test(test_realtime_wire_v2
             tests/test_realtime_wire_v2.cpp L2Flow::common)
         l2flow_add_test(test_realtime_certified_wire_v1

@@ -53,7 +53,7 @@ frames = as_polars(fast)
 |---|---:|---|---|---|---|
 | FAST raw Tick | 单标的 | `open_instrument_tick_history()` | `PolarsInstrumentTickHistory` | `PolarsFastTickHistory`，需 `live_tail=True` | from-open；partial 需显式 opt-in |
 | FAST-derived Event | 单标的 | `open_instrument_derived_event_history()` | `PolarsInstrumentDerivedEventHistory` | `PolarsFastDerivedEventHistory`，需 `live_tail=True` 和 `event_control_socket_path` | from-open；partial 需显式 opt-in |
-| CERTIFIED Event | 全局 | `open_certified_order_event_history()` | `PolarsCertifiedOrderEventHistory` | 同一 handle 已包含 history-to-tail | 仅 from-open，必须从 event sequence 1 开始 |
+| CERTIFIED Event | 全局 | `open_certified_order_event_history()` | `PolarsCertifiedOrderEventHistory` | 同一 handle 已包含 history-to-tail | from-open；process-start partial 需显式 opt-in；必须从 event sequence 1 开始 |
 | CERTIFIED Tick | 全局 | `open_certified_tick_history()` | `PolarsCertifiedTickHistory` | 同一 handle 已包含 history-to-tail | 仅 from-open，必须从 canonical apply sequence 1 开始 |
 
 四种产品有不同的 continuity domain，不能混用它们的 sequence：
@@ -342,6 +342,7 @@ source-free trading-day finalization row 在历史 schema 中可以没有 UID。
 ```python
 cert_events = frames.open_certified_order_event_history(
     "/run/l2flow/certified.sock",
+    coverage_requirement="from_open",
     batch_records=4096,
     poll_interval=0.001,
 )
@@ -349,7 +350,8 @@ cert_events = frames.open_certified_order_event_history(
 
 该接口返回全局 `PolarsCertifiedOrderEventHistory`，并强制：
 
-- coverage 必须是 from-open；
+- coverage 必须精确满足 `coverage_requirement`；默认值是 `from_open`，partial
+  必须显式使用 `process_start_partial`；`any_explicit` 接受两种明确 coverage；
 - native reader 从 Event sequence 1 开始；
 - 每批 next sequence 与 row count 对齐；
 - `derived_event_sequence` 在该 CERTIFIED cursor 中 dense；
@@ -412,7 +414,9 @@ coverage_requirement="allow_process_start_partial"
 
 该选项只是允许返回 process-start partial 数据，不会把它提升成完整日数据。调用方应同时保存 snapshot 的 `history_coverage`。
 
-CERTIFIED Event 和 CERTIFIED Tick Polars history 当前都硬性要求 from-open，不能用 partial opt-in 绕过。
+CERTIFIED Tick Polars history 仍硬性要求 from-open。CERTIFIED Event 支持
+`from_open`、`process_start_partial` 和 `any_explicit` 三种 requirement；这只是
+选择可接受的时间覆盖，不会在 Polars 端按 `(channel, ApplSeqNum)` 重新排序。
 
 ## 12. fail-closed 与 stale read
 
@@ -592,7 +596,8 @@ uids = event_table.select("event_uid")
 
 ```python
 cert_events = frames.open_certified_order_event_history(
-    "/run/l2flow/certified.sock"
+    "/run/l2flow/certified.sock",
+    coverage_requirement="from_open",
 )
 cert_ticks = frames.open_certified_tick_history(
     "/run/l2flow/certified.sock",
@@ -613,7 +618,10 @@ finally:
     cert_ticks.close()
 ```
 
-两个产品都是全局 from-open history-to-tail，但 sequence、schema 和 dataset identity 不同，不能互相 append。
+这个示例中的两个产品都是全局 from-open history-to-tail，但 sequence、schema
+和 dataset identity 不同，不能互相 append。partial 模式只开放 CERTIFIED
+Event，并要求 `coverage_requirement="process_start_partial"`；CERTIFIED Tick
+full-day history 不会因此变成可用。
 
 ### 15.5 显式 recovered socket promotion factory
 

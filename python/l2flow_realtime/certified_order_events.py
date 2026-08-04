@@ -1,7 +1,7 @@
 """Append-only CERTIFIED order-event History plus low-latency live tail.
 
 One reader starts at a caller-selected dense event sequence (one by default),
-drains the already-published full-day journal, and then keeps the same cursor
+drains the already-published canonical journal, and then keeps the same cursor
 for newly appended rows. Empty batches are temporary tail-idle results, not
 EOF. Every returned row is bounded by the coherent Tick/Event canonical
 frontier, including the online-recovery promotion boundary.
@@ -45,7 +45,16 @@ _READ_END_OF_STREAM = 6
 _READ_PRODUCER_FAILED = 7
 _COVERAGE_FROM_OPEN = 1 << 0
 _STARTUP_PREFIX_RECOVERED = 1 << 1
-_KNOWN_COVERAGE_FLAGS = _COVERAGE_FROM_OPEN | _STARTUP_PREFIX_RECOVERED
+_COVERAGE_FROM_PROCESS_START = 1 << 2
+_TEMPORAL_COVERAGE_FLAGS = (
+    _COVERAGE_FROM_OPEN | _COVERAGE_FROM_PROCESS_START
+)
+_KNOWN_COVERAGE_FLAGS = _TEMPORAL_COVERAGE_FLAGS | _STARTUP_PREFIX_RECOVERED
+_COVERAGE_REQUIREMENTS = {
+    "from_open": 0,
+    "process_start_partial": 1,
+    "any_explicit": 2,
+}
 _STATUS_SCHEMA_VERSION = 1
 _RESULT_SCHEMA_VERSION = 1
 _DEFAULT_BATCH_RECORDS = 4096
@@ -62,6 +71,7 @@ class CertifiedOrderEventState(IntEnum):
     FROZEN_CONFLICT = 6
     FROZEN_RESOURCE = 7
     STOPPED = 8
+    DEGRADED = 9
 
 
 class _ExpectedSessionC(ctypes.Structure):
@@ -80,7 +90,8 @@ class _SessionC(ctypes.Structure):
         ("event_capacity", ctypes.c_uint64),
         ("trade_date", ctypes.c_uint32),
         ("coverage_flags", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint8 * 24),
+        ("coverage_start_unix_ns", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint8 * 16),
     ]
 
 
@@ -151,6 +162,7 @@ class CertifiedOrderEventSession:
     trade_date: int
     event_capacity: int
     coverage_flags: int
+    coverage_start_unix_ns: int
 
     @property
     def coverage_from_open(self) -> bool:
@@ -161,17 +173,32 @@ class CertifiedOrderEventSession:
         return bool(self.coverage_flags & _STARTUP_PREFIX_RECOVERED)
 
     @property
+    def process_start_partial(self) -> bool:
+        return bool(
+            self.coverage_flags & _COVERAGE_FROM_PROCESS_START
+        )
+
+    @property
     def identity(self) -> SessionIdentity:
         return SessionIdentity(self.run_id, self.session_epoch)
 
     @property
     def history_coverage(self) -> HistoryCoverageInfo:
+        coverage_kind = (
+            TemporalCoverageKind.FROM_OPEN
+            if self.coverage_from_open
+            else TemporalCoverageKind.PROCESS_START_PARTIAL
+        )
         return HistoryCoverageInfo(
             run_id=self.run_id,
             session_epoch=self.session_epoch,
             trade_date=self.trade_date,
-            coverage_kind=TemporalCoverageKind.FROM_OPEN,
-            coverage_start_unix_ns=None,
+            coverage_kind=coverage_kind,
+            coverage_start_unix_ns=(
+                self.coverage_start_unix_ns
+                if self.process_start_partial
+                else None
+            ),
         )
 
 
@@ -380,6 +407,7 @@ def _bind_library(library) -> None:
         ctypes.c_char_p,
         ctypes.POINTER(_ExpectedSessionC),
         ctypes.c_uint32,
+        ctypes.c_uint32,
         ctypes.POINTER(handle),
         ctypes.POINTER(ctypes.c_int),
     ]
@@ -434,13 +462,83 @@ def _expected_session(
 
 
 def _coverage_valid(flags: int) -> bool:
+    temporal = flags & _TEMPORAL_COVERAGE_FLAGS
     return (
         flags & ~_KNOWN_COVERAGE_FLAGS == 0
-        and bool(flags & _COVERAGE_FROM_OPEN)
+        and temporal in (
+            _COVERAGE_FROM_OPEN,
+            _COVERAGE_FROM_PROCESS_START,
+        )
         and not (
             flags & _STARTUP_PREFIX_RECOVERED
-            and not flags & _COVERAGE_FROM_OPEN
+            and temporal != _COVERAGE_FROM_OPEN
         )
+    )
+
+
+def _coverage_requirement_code(requirement: str) -> int:
+    if not isinstance(requirement, str):
+        raise TypeError("coverage_requirement must be str")
+    try:
+        return _COVERAGE_REQUIREMENTS[requirement]
+    except KeyError as error:
+        raise ValueError(
+            "coverage_requirement must be 'from_open', "
+            "'process_start_partial', or 'any_explicit'"
+        ) from error
+
+
+def _validate_history_coverage(
+    coverage: HistoryCoverageInfo, requirement: str
+) -> None:
+    code = _coverage_requirement_code(requirement)
+    if not isinstance(coverage, HistoryCoverageInfo):
+        raise TypeError("history coverage must be HistoryCoverageInfo")
+    if not coverage.available:
+        raise UnavailableError(
+            "CERTIFIED Event history coverage is unavailable"
+        )
+    if code == 0 and not coverage.coverage_from_open:
+        raise UnavailableError(
+            "CERTIFIED Event history is process-start partial"
+        )
+    if code == 1 and not coverage.process_start_partial:
+        raise UnavailableError(
+            "CERTIFIED Event history has from-open coverage"
+        )
+
+
+def _validate_fast_session_coverage(
+    session: SessionInfo, requirement: str
+) -> None:
+    code = _coverage_requirement_code(requirement)
+    if code == 0:
+        if not session.coverage_from_open or not session.certified_prefix_valid:
+            raise UnavailableError(
+                "FAST does not advertise a valid from-open CERTIFIED prefix"
+            )
+        return
+    if code == 1:
+        if session.coverage_from_open or session.certified_prefix_valid:
+            raise UnavailableError(
+                "FAST session is not process-start partial"
+            )
+        return
+    if session.coverage_from_open != session.certified_prefix_valid:
+        raise UnavailableError(
+            "FAST temporal coverage and CERTIFIED prefix validity disagree"
+        )
+
+
+def _status_matches_session(
+    status: CertifiedOrderEventStatus,
+    session: CertifiedOrderEventSession,
+) -> bool:
+    status_temporal = status.coverage_flags & _TEMPORAL_COVERAGE_FLAGS
+    session_temporal = session.coverage_flags & _TEMPORAL_COVERAGE_FLAGS
+    return status_temporal == session_temporal and not (
+        session.startup_prefix_recovered
+        and not status.startup_prefix_recovered
     )
 
 
@@ -492,6 +590,10 @@ def _session_from_c(value: _SessionC) -> CertifiedOrderEventSession:
         or value.event_capacity == 0
         or any(value.reserved)
         or not _coverage_valid(flags)
+        or (
+            bool(flags & _COVERAGE_FROM_OPEN)
+            != (value.coverage_start_unix_ns == 0)
+        )
     ):
         raise WireFormatError("invalid CERTIFIED order-event session ABI")
     return CertifiedOrderEventSession(
@@ -500,6 +602,7 @@ def _session_from_c(value: _SessionC) -> CertifiedOrderEventSession:
         trade_date=value.trade_date,
         event_capacity=value.event_capacity,
         coverage_flags=flags,
+        coverage_start_unix_ns=value.coverage_start_unix_ns,
     )
 
 
@@ -545,6 +648,7 @@ class CertifiedOrderEventReader:
         run_id: bytes,
         session_epoch: int,
         trade_date: int,
+        coverage_requirement: str = "from_open",
         timeout: float = 1.0,
         start_event_sequence: int = 1,
         batch_records: int = _DEFAULT_BATCH_RECORDS,
@@ -582,6 +686,7 @@ class CertifiedOrderEventReader:
                 f"batch_records must be in [1, {_MAX_BATCH_RECORDS}]"
             )
         expected = _expected_session(run_id, session_epoch, trade_date)
+        requirement = _coverage_requirement_code(coverage_requirement)
         library = (
             native_library
             if native_library is not None
@@ -594,6 +699,7 @@ class CertifiedOrderEventReader:
         code = library.l2flow_certified_order_event_reader_open_v1(
             os.fsencode(path),
             ctypes.byref(expected),
+            requirement,
             timeout_ms,
             ctypes.byref(handle),
             ctypes.byref(system_error),
@@ -612,6 +718,9 @@ class CertifiedOrderEventReader:
             if read != _READ_OK:
                 raise CertifiedOrderEventError("session", read)
             session = _session_from_c(native_session)
+            _validate_history_coverage(
+                session.history_coverage, coverage_requirement
+            )
             if (
                 session.run_id != run_id
                 or session.session_epoch != session_epoch
@@ -663,7 +772,7 @@ class CertifiedOrderEventReader:
             if code != _READ_OK:
                 raise CertifiedOrderEventError("status", code)
             status = _status_from_c(value)
-            if status.coverage_flags != self._session.coverage_flags:
+            if not _status_matches_session(status, self._session):
                 raise WireFormatError(
                     "CERTIFIED event coverage changed after attachment"
                 )
@@ -700,7 +809,7 @@ class CertifiedOrderEventReader:
             ):
                 raise WireFormatError("invalid CERTIFIED event read result ABI")
             status = _status_from_c(result.status)
-            if status.coverage_flags != self._session.coverage_flags:
+            if not _status_matches_session(status, self._session):
                 raise WireFormatError(
                     "CERTIFIED event coverage changed after attachment"
                 )
@@ -781,22 +890,19 @@ def open_certified_order_events(
     control_socket_path: Union[str, os.PathLike],
     *,
     expected_session: SessionInfo,
+    coverage_requirement: str = "from_open",
     **kwargs,
 ) -> CertifiedOrderEventReader:
     if not isinstance(expected_session, SessionInfo):
         raise TypeError("expected_session must be SessionInfo")
-    if not expected_session.coverage_from_open:
-        raise UnavailableError(
-            "CERTIFIED event history requires from-open coverage"
-        )
-    if not expected_session.certified_prefix_valid:
-        raise UnavailableError(
-            "FAST session does not advertise a valid CERTIFIED prefix"
-        )
+    _validate_fast_session_coverage(
+        expected_session, coverage_requirement
+    )
     return CertifiedOrderEventReader.connect(
         control_socket_path,
         run_id=expected_session.run_id,
         session_epoch=expected_session.session_epoch,
         trade_date=expected_session.trade_date,
+        coverage_requirement=coverage_requirement,
         **kwargs,
     )

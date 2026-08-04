@@ -1,6 +1,7 @@
 #include "l2flow/ipc/certified_order_event_wire_v1.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <limits>
 
@@ -46,6 +47,10 @@ bool CertifiedOrderEventHeaderCanonicalV1(
     const CertifiedOrderEventHeaderV1& header) noexcept {
     using namespace certified_order_event_wire_v1_detail;
 
+    const std::uint32_t temporal_coverage =
+        header.flags &
+        (kCertifiedOrderEventCoverageFromOpenV1 |
+         kCertifiedOrderEventCoverageFromProcessStartV1);
     if (header.magic != kCertifiedOrderEventMagicV1 ||
         header.abi_major != kCertifiedOrderEventWireMajorV1 ||
         header.abi_minor != kCertifiedOrderEventWireMinorV1 ||
@@ -53,11 +58,14 @@ bool CertifiedOrderEventHeaderCanonicalV1(
         header.endian_marker !=
             kCertifiedOrderEventEndianMarkerV1 ||
         (header.flags & ~kCertifiedOrderEventKnownCoverageFlagsV1) != 0U ||
-        (header.flags & kCertifiedOrderEventCoverageFromOpenV1) == 0U ||
+        !std::has_single_bit(temporal_coverage) ||
         ((header.flags &
               kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U &&
-         (header.flags &
-              kCertifiedOrderEventCoverageFromOpenV1) == 0U) ||
+         temporal_coverage !=
+             kCertifiedOrderEventCoverageFromOpenV1) ||
+        ((temporal_coverage ==
+              kCertifiedOrderEventCoverageFromOpenV1) !=
+         (header.coverage_start_unix_ns == 0U)) ||
         !AnyNonzero(header.run_id) ||
         header.session_epoch == 0U ||
         !ValidTradeDate(header.trade_date) ||

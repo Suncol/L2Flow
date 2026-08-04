@@ -3,6 +3,7 @@
 #include "l2flow/common/identity128.h"
 #include "l2flow/common/linux_thread_affinity_v1.h"
 #include "l2flow/ipc/certified_order_event_history_v1.h"
+#include "l2flow/ipc/certified_order_event_wire_v1.h"
 #include "l2flow/ipc/realtime_certified_wire_v1.h"
 #include "l2flow/market/daily_instrument_catalog_v2.h"
 #include "l2flow/market/realtime_history_v1.h"
@@ -134,20 +135,28 @@ struct RealtimeCertifiedServiceConfigV1 final {
         kRealtimeCertifiedDefaultDuplicateRetentionV1;
     std::uint64_t maximum_reorder_span =
         kRealtimeCertifiedDefaultReorderSpanV1;
+    l2flow::realtime::NativeSequenceOriginPolicyV1 origin_policy =
+        l2flow::realtime::NativeSequenceOriginPolicyV1::kExplicitOrigin;
+    std::uint64_t maximum_backward_displacement = 0U;
     std::uint64_t maximum_mapping_bytes =
         2ULL * 1024ULL * 1024ULL * 1024ULL;
 
     // The Event projector is part of the same certified commit. Production
-    // exposes an independent append-only full-day wire journal; the legacy
-    // in-process immutable-generation view remains available and is gated to
-    // the same last Tick frontier already published to external readers.
+    // exposes an independent append-only canonical journal and gates its
+    // visibility to the same last Tick frontier published to readers.
     std::size_t maximum_order_states = 1'000'000U;
     std::size_t maximum_derived_events = 16'000'000U;
-    // Zero derives the exact checked full-day wire size from
+    // Zero derives the exact checked wire size from
     // maximum_derived_events. A nonzero value is an additional operator cap.
     std::uint64_t maximum_derived_event_mapping_bytes = 0U;
     std::uint64_t derived_event_lazy_commit_chunk_bytes =
         64ULL * 1024ULL * 1024ULL;
+    CertifiedOrderEventTemporalCoverageV1 event_temporal_coverage =
+        CertifiedOrderEventTemporalCoverageV1::kFromOpen;
+    // Zero for from-open. Process-start creation uses a nonzero provisional
+    // value while control_exposure_gate is false; the worker replaces it with
+    // the post-Connect boundary before that gate may be released.
+    std::uint64_t event_coverage_start_unix_ns = 0U;
 
     // Optional strict Linux cpusets using the grammar accepted by
     // ParseLinuxCpuSetV1 (for example "4-7,12"). Empty strings preserve the
@@ -171,18 +180,15 @@ struct RealtimeCertifiedServiceConfigV1 final {
     std::filesystem::path control_socket_path;
 
     // Online-recovery sessions set this true. Their control plane cannot start
-    // until the one-shot recovered-prefix commit succeeds. Appending this
-    // default-false field preserves existing positional aggregate initializers
-    // and ordinary live-from-open startup behavior.
+    // until the one-shot recovered-prefix commit succeeds.
     bool control_requires_prefix_commit = false;
 
     // Append-only history is intentionally independent of the bounded hot
-    // ring. These fields are appended so existing positional aggregate
-    // initializers retain their original meaning. The full virtual mapping is
-    // fixed at Create, while backing is committed lazily by an independent
-    // history writer. The already-published bounded ring is that writer's
-    // retention buffer: a writer overrun fails only Tick History and never
-    // freezes FAST or the bounded CERTIFIED service.
+    // ring. The full virtual mapping is fixed at Create, while backing is
+    // committed lazily by an independent history writer. The already-
+    // published bounded ring is that writer's retention buffer: a writer
+    // overrun fails only Tick History and never freezes FAST or bounded
+    // CERTIFIED publication.
     std::uint64_t maximum_certified_ticks =
         kRealtimeCertifiedDefaultTickHistoryCapacityV1;
     // Zero derives the exact page-aligned mapping from the Tick capacity.
@@ -193,6 +199,7 @@ struct RealtimeCertifiedServiceConfigV1 final {
     // writer on the Event/CERTIFIED cores without requiring a second option;
     // tests and embedders may supply a stricter dedicated mask.
     std::string tick_history_worker_cpu_set;
+
 };
 
 enum class RealtimeCertifiedServiceCreateErrorV1 : std::uint8_t {
@@ -317,6 +324,11 @@ struct RealtimeCertifiedPrefixFenceResultV1 final {
                (state == RealtimeCertifiedStateV1::kFrozenConflict ||
                 state == RealtimeCertifiedStateV1::kFrozenResource);
     }
+    [[nodiscard]] bool degraded() const noexcept {
+        return operation_error ==
+                   RealtimeCertifiedPrefixFenceOperationErrorV1::kNone &&
+               state == RealtimeCertifiedStateV1::kDegraded;
+    }
 };
 
 // Default-on production composition for native-gap recovery. It is both the
@@ -351,6 +363,13 @@ public:
     [[nodiscard]] bool StartWorker(
         int* system_error_number = nullptr) noexcept;
     [[nodiscard]] bool StartControl(
+        int* system_error_number = nullptr) noexcept;
+    // One-shot process-start metadata barrier. The worker serializes the final
+    // post-Connect boundary with Event header publication while the shared
+    // control exposure gate remains closed.
+    [[nodiscard]] bool FinalizeProcessStartCoverage(
+        std::uint64_t coverage_start_unix_ns,
+        std::chrono::milliseconds timeout,
         int* system_error_number = nullptr) noexcept;
     // Repeatable, side-effect-free recovery readiness probe. It commits the
     // ordinary Tick/Event data prefix at an exact worker FIFO boundary, but

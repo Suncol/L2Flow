@@ -226,18 +226,22 @@ thread 都就绪且 preview backlog 低于启动高水位后，才对外切到
 完成后才进入 ACTIVE。详见
 [`csv-startup-recovery-v1.md`](csv-startup-recovery-v1.md)。
 
-盘中明确不恢复时，partial 模式在连接 SDK 前以 `LIVE_PARTIAL` 启动控制面，
+盘中明确不恢复时，partial 模式在连接 SDK 前启动 FAST 与 bounded canonical
+Event worker/control，并用同一个 exposure gate 暂缓 descriptor 传递。Pipeline
+连接成功且 process-start metadata 完成后才打开 gate。FAST 以 `LIVE_PARTIAL`
 允许 latest 查询，并按既有 generation interval 发布不可变 Store generation；
+Event 则按 per-channel native sequence 发布 process-start partial journal。
 首次 generation 后可查询从本进程启动点到该 cut 的单标的完整 History 和 tick
-generation delta。它不创建 journal/shadow，也不宣称 `coverage_from_open`；
+generation delta。它不创建 startup live journal/shadow，也不宣称
+`coverage_from_open`；
 可选 KLine 使用交易所自然时间窗口，只发布 process-start latest KLine；router
-在 SDK Connect 成功后立即采样保守 live coverage boundary。只有已发布 bar
-严格满足 `window_start < boundary < window_end` 时才标记为 left-truncated；
-无成交窗口不合成 bar，且 session 不宣称
-`full_day_kline_valid`；CERTIFIED 仍不可用。router 默认在 SDK connect 前启动
-并等待独立的 process-start Event sidecar READY；其本地 tick 流完整，但不声明启动前数据或
-native gap 已回补。router 低频检查该 sidecar 的 control、heartbeat 和消费
-进度；受管进程还绑定父进程死亡信号并使用有界回收。CSV online recovery 的
+在 SDK Connect 成功后采样保守 process-start boundary，并在共享 exposure gate
+开放前由 Event worker 完成 metadata barrier。只有已发布 bar 严格满足
+`window_start < boundary < window_end` 时才标记为 left-truncated；
+无成交窗口不合成 bar，且 session 不宣称 `full_day_kline_valid` 或
+`certified_prefix_valid`。canonical Event journal 明确声明 process-start
+coverage；深圳 6.33/6.36 在 capture observation 层共享 per-channel native
+domain，并由 bounded exact-next gate 纠序。CSV online recovery 的
 partial preview 使用独立的 latest-only 启动策略，即使内部存在 Store
 generation 也不会开放 History/delta。
 
@@ -264,6 +268,15 @@ sequenceDiagram
         Main->>Live: Create from-open Pipeline
         Live->>Sdk: 最后创建并 Connect
         Note over Live,Sdk: callback 直接进入 admission/decoder/History
+    else process-start partial
+        Main->>Main: 采样 coverage boundary，创建 gate=false
+        Main->>Recovered: Create + Start LIVE_PARTIAL FAST
+        Main->>Certified: Create bounded-origin worker + StartControl
+        Main->>Live: Create partial Pipeline(CERTIFIED wrapper)
+        Live->>Sdk: 最后创建并 Connect
+        Main->>Recovered: 准备 History/KLine coverage metadata
+        Main->>Main: gate=true
+        Note over Live,Certified: FAST 先发布；Event handoff 无等待且可降级
     else CSV online recovery
         Main->>Journal: Create empty session-local live journal
         Main->>Preview: Create，保持 INITIALIZING
@@ -306,7 +319,9 @@ sequenceDiagram
 3. 生成本次进程唯一的 `run_id`；online recovery 另外生成独立 preview
    `run_id`，两个 socket/cursor 不能跨 run 复用。
 4. 常规 from-open 模式先建立并启动 FAST 控制面，再创建唯一的 SDK-owner
-   Pipeline。online recovery 则先创建空 live journal 和尚未对外启动的
+   Pipeline。partial 模式先在共享 exposure gate 后启动 FAST 与 canonical
+   Event，再创建唯一 SDK-owner Pipeline，SDK Connect 成功且 coverage metadata
+   就绪后一次开放 gate。online recovery 则先创建空 live journal 和尚未对外启动的
    `LIVE_PARTIAL` preview mapping，再创建带 capture sink 的 SDK-owner preview
    Pipeline；这保证 SDK Connect 后的受支持 callback 先进入 journal，再推进
    partial preview，同时允许 `INITIALIZING` mapping 保存已 applied 的 latest 与
@@ -988,7 +1003,7 @@ live journal 不是通用审计旁路，只在指定 CSV online recovery 时创�
 推进 `committed_serial`；shadow reader 不读取该 durable frontier 之后的记录。
 capture queue/容量耗尽、write/sync 失败、journal reader 校验失败，或者最终
 `committed_serial != accepted_serial` 都会使 online recovery session fail
-closed。普通 from-open 和 standalone `--intraday-live-partial` 的配置保持
+closed。普通 from-open 和 `--intraday-live-partial` 的配置保持
 `live_ingress_capture_sink == nullptr`，因此完全不进入这条 capture 路径。
 
 journal 的启动、flush 和 reader tail 生命周期由生产应用与 online recovery
@@ -2101,12 +2116,13 @@ ConsumeAndCommitRolling(cursor, rolling_store, factor):
 2. CSV online recovery：required live capture 维持 queryable latest-only
    preview，SDK-less shadow 从 CSV 与 durable journal 闭合 handoff，完成
    generation/CERTIFIED Tick+Event barrier 后发布独立 recovered session；
-3. standalone partial：不做 recovery、不宣称 from-open，但周期发布
-   process-start Store generation，开放单标的 complete-history 与 tick-delta；
-   默认受管 Event sidecar 从本进程 tick sequence 1 发布 process-start delta；
-   可选发布自然交易时间窗口的 process-start partial latest KLine，但不开放
-   KLine history 或 full-day 声明；CERTIFIED 禁用，并通过
-   `factor_generation_enabled=false` 不创建或调用 generation Factor engine；
+3. standalone partial：不宣称 from-open，周期发布 process-start Store
+   generation、单标的 complete-history 与 tick-delta；默认 CERTIFIED worker
+   在 capture observation 层按 per-channel native sequence 生成 process-start
+   canonical Tick/Event，FAST callback-admission 顺序不变。可选发布自然交易时间
+   窗口的 process-start partial latest KLine，但不开放 KLine history 或 full-day
+   声明；`factor_generation_enabled=false`，不创建或调用 generation Factor
+   engine；
 4. Wire V2 查询：latest/ring、complete-history V2 和 generation-bound
    tick-delta V2 使用同一 daily-catalog/session identity，并以显式
    unavailable、EOF、overrun 或 checkpoint mismatch fail closed。

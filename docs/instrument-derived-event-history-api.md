@@ -83,12 +83,12 @@ immutable generation 只是发布/读取边界，绝不意味着交易阶段结�
 后调用。该调用不推进 raw checkpoint，并永久封存 session。
 
 当前生产深交所输入严格使用 **6.33 委托 + 6.36 成交/撤单** 的同 channel
-`ApplSeqNum` 已归并流；不启用 6.53。两份输入文档没有证明 SDK 跨消息族的
-多线程 callback 顺序，因此生产捕获强制单 I/O thread、非多线程 callback，
-projector 还会对 channel 内非递增序号 fail-close；部署前应以 feeder CSV 验证
-这一上游契约。6.33/6.36 不提供可供该逐笔 projector 使用的交易阶段，因此深圳
-派生行不会根据本地时钟猜 phase。深圳成交也不猜主动方，金额不由价格乘数量
-伪造。
+`ApplSeqNum` canonical 流；不启用 6.53。SDK 的跨消息族 callback 顺序不是该
+流的顺序权威：capture layer 在 filter 前记录所有 native position，
+`NativeSequenceRecoveryCoordinatorV1` 按 channel exact-next 推进后才调用
+projector。projector 继续对 channel 内非递增序号 fail-close。6.33/6.36 不提供
+可供该逐笔 projector 使用的交易阶段，因此深圳派生行不会根据本地时钟猜
+phase。深圳成交也不猜主动方，金额不由价格乘数量伪造。
 
 ## C++ 与 C/Python
 

@@ -12,6 +12,7 @@
 #include "l2flow/sdk/market_message_catalog_v1.h"
 #include "l2flow/sdk/vendor_head_view.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -110,10 +111,11 @@ private:
     std::uint64_t biz_index,
     std::uint64_t quantity,
     std::string_view security_id = "600007",
-    std::string_view raw_type = "T") {
+    std::string_view raw_type = "T",
+    std::uint32_t channel = 7U) {
     WireWriter writer(70U);
     writer.StoreU64(0U, biz_index);
-    writer.StoreU32(8U, 7U);
+    writer.StoreU32(8U, channel);
     writer.StoreU32(18U, 93'000'125U);
     writer.StoreU64(28U, 11'001U);
     writer.StoreU64(36U, 22'002U);
@@ -133,6 +135,42 @@ private:
     writer.StoreU32(30U, 12'345U);
     writer.StoreString(4U, security_id);
     writer.StoreString(38U, "TRADE");
+    return std::move(writer).Take();
+}
+
+[[nodiscard]] std::vector<std::byte> ShenzhenOrderBody(
+    std::uint32_t channel,
+    std::uint64_t application_sequence,
+    std::uint64_t quantity = 100U) {
+    WireWriter writer(58U);
+    writer.StoreU32(0U, channel);
+    writer.StoreU64(4U, application_sequence);
+    writer.StoreU64(30U, 123'456U);
+    writer.StoreU64(38U, quantity);
+    writer.StoreU32(46U, 49U);
+    writer.StoreU32(50U, 93'000'123U);
+    writer.StoreU32(54U, 50U);
+    writer.StoreString(12U, "010");
+    writer.StoreString(18U, "000001");
+    writer.StoreString(24U, "102");
+    return std::move(writer).Take();
+}
+
+[[nodiscard]] std::vector<std::byte> ShenzhenTransactionBody(
+    std::uint32_t channel,
+    std::uint64_t application_sequence) {
+    WireWriter writer(70U);
+    writer.StoreU32(0U, channel);
+    writer.StoreU64(4U, application_sequence);
+    writer.StoreU64(18U, 0U);
+    writer.StoreU64(26U, 0U);
+    writer.StoreU64(46U, 123'456U);
+    writer.StoreU64(54U, 100U);
+    writer.StoreU32(62U, 70U);
+    writer.StoreU32(66U, 93'000'124U);
+    writer.StoreString(12U, "010");
+    writer.StoreString(34U, "000001");
+    writer.StoreString(40U, "102");
     return std::move(writer).Take();
 }
 
@@ -240,18 +278,28 @@ struct Fixture final {
     if (output == nullptr) {
         return false;
     }
-    market::DailyInstrumentSourceEntryV2 source{};
-    source.key.market = market::MarketV1::kShanghai;
-    const std::string_view security_id = "600007";
-    const auto bytes = std::as_bytes(
-        std::span(security_id.data(), security_id.size()));
-    source.key.security_id.assign(bytes.begin(), bytes.end());
-    source.metadata.quantity_unit =
-        market::QuantityUnitV1::kShare;
-    source.metadata.security_type =
-        market::SecurityTypeV1::kEquity;
-    source.metadata.asset_scope =
-        market::AssetScopeV1::kDocumentedCore;
+    std::array<market::DailyInstrumentSourceEntryV2, 2U> sources{};
+    sources[0U].key.market = market::MarketV1::kShanghai;
+    sources[1U].key.market = market::MarketV1::kShenzhen;
+    constexpr std::array<std::string_view, 2U> security_ids{
+        "600007", "000001"};
+    for (std::size_t index = 0U; index < sources.size(); ++index) {
+        const auto bytes = std::as_bytes(std::span(
+            security_ids[index].data(), security_ids[index].size()));
+        sources[index].key.security_id.assign(
+            bytes.begin(), bytes.end());
+        sources[index].metadata.quantity_unit =
+            market::QuantityUnitV1::kShare;
+        sources[index].metadata.security_type =
+            market::SecurityTypeV1::kEquity;
+        sources[index].metadata.asset_scope =
+            market::AssetScopeV1::kDocumentedCore;
+    }
+    const std::string_view shenzhen_source = "102";
+    const auto shenzhen_source_bytes = std::as_bytes(std::span(
+        shenzhen_source.data(), shenzhen_source.size()));
+    sources[1U].key.security_id_source.assign(
+        shenzhen_source_bytes.begin(), shenzhen_source_bytes.end());
     market::DailyInstrumentCatalogConfigV2 config{};
     config.trade_date = 20260730U;
     config.catalog_version = 1U;
@@ -259,10 +307,17 @@ struct Fixture final {
     config.market_scope = market::kDailyCatalogMainlandScopeV2;
     config.coverage_complete = true;
     std::unique_ptr<market::DailyInstrumentCatalogV2> catalog;
-    if (market::DailyInstrumentCatalogV2::Create(
-            config, std::span(&source, 1U), &catalog) !=
+    const auto catalog_error =
+        market::DailyInstrumentCatalogV2::Create(
+            config, sources, &catalog);
+    if (catalog_error !=
             market::DailyInstrumentCatalogCreateErrorV2::kNone ||
         catalog == nullptr) {
+        std::cerr
+            << "catalog fixture create error: "
+            << market::DailyInstrumentCatalogCreateErrorNameV2(
+                   catalog_error)
+            << '\n';
         return false;
     }
     output->catalog =
@@ -349,6 +404,40 @@ template <typename Predicate>
     return pipeline->InjectSdkMessageForTest(&message);
 }
 
+[[nodiscard]] runtime::RealtimePipelineIngressResultV1 InjectChannel(
+    runtime::RealtimePipelineV1* pipeline,
+    std::uint32_t channel,
+    std::uint64_t sequence,
+    std::uint64_t quantity) {
+    FakeMessage message(
+        ShanghaiTradeBody(
+            sequence, quantity, "600007", "T", channel));
+    return pipeline->InjectSdkMessageForTest(&message);
+}
+
+[[nodiscard]] runtime::RealtimePipelineIngressResultV1
+InjectShenzhenOrder(
+    runtime::RealtimePipelineV1* pipeline,
+    std::uint32_t channel,
+    std::uint64_t sequence,
+    std::uint64_t quantity = 100U) {
+    FakeMessage message(
+        ShenzhenOrderBody(channel, sequence, quantity),
+        sdk::MessageKey{6U, 101U, 33U});
+    return pipeline->InjectSdkMessageForTest(&message);
+}
+
+[[nodiscard]] runtime::RealtimePipelineIngressResultV1
+InjectShenzhenTransaction(
+    runtime::RealtimePipelineV1* pipeline,
+    std::uint32_t channel,
+    std::uint64_t sequence) {
+    FakeMessage message(
+        ShenzhenTransactionBody(channel, sequence),
+        sdk::MessageKey{6U, 101U, 36U});
+    return pipeline->InjectSdkMessageForTest(&message);
+}
+
 [[nodiscard]] runtime::RealtimePipelineIngressResultV1
 InjectSnapshot(runtime::RealtimePipelineV1* pipeline) {
     FakeMessage message(
@@ -360,6 +449,7 @@ InjectSnapshot(runtime::RealtimePipelineV1* pipeline) {
 struct WorkerBarrierFixture final {
     Fixture instrument{};
     std::shared_ptr<FastSink> fast;
+    std::shared_ptr<std::atomic<bool>> exposure_gate;
     ipc::RealtimeCertifiedServiceConfigV1 service_config{};
     std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1> service;
     std::unique_ptr<runtime::RealtimePipelineV1> pipeline;
@@ -386,7 +476,8 @@ struct WorkerBarrierFixture final {
     bool control_requires_prefix_commit = false,
     std::uint64_t maximum_certified_ticks = 1024U,
     std::uint64_t certified_tick_ring_capacity = 64U,
-    std::uint64_t maximum_derived_events = 1024U) {
+    std::uint64_t maximum_derived_events = 1024U,
+    bool process_start_partial = false) {
     if (test == nullptr || output == nullptr) {
         return false;
     }
@@ -422,10 +513,25 @@ struct WorkerBarrierFixture final {
     service_config.maximum_mapping_bytes = 8U * 1024U * 1024U;
     service_config.maximum_order_states = 128U;
     service_config.maximum_derived_events = maximum_derived_events;
+    if (process_start_partial) {
+        service_config.origin_policy =
+            l2flow::realtime::NativeSequenceOriginPolicyV1::
+                kBoundedProcessStart;
+        service_config.maximum_backward_displacement = 2U;
+        service_config.event_temporal_coverage =
+            ipc::CertifiedOrderEventTemporalCoverageV1::
+                kFromProcessStart;
+        service_config.event_coverage_start_unix_ns =
+            1'785'834'365'123'456'789ULL;
+    }
     service_config.worker_cpu_set = std::string(worker_cpu_set);
     service_config.control_cpu_set = std::string(control_cpu_set);
-    service_config.control_exposure_gate =
-        std::move(exposure_gate);
+    if (process_start_partial && exposure_gate == nullptr) {
+        output->exposure_gate =
+            std::make_shared<std::atomic<bool>>(false);
+        exposure_gate = output->exposure_gate;
+    }
+    service_config.control_exposure_gate = std::move(exposure_gate);
     service_config.control_requires_prefix_commit =
         control_requires_prefix_commit;
     service_config.control_socket_path =
@@ -483,7 +589,8 @@ struct WorkerBarrierFixture final {
     pipeline_config.intraday_store.maximum_session_accounted_bytes =
         8U * 1024U * 1024U;
     pipeline_config.intraday_store.maximum_records_per_batch = 16U;
-    pipeline_config.intraday_store.coverage_from_open = true;
+    pipeline_config.intraday_store.coverage_from_open =
+        !process_start_partial;
     pipeline_config.applied_record_sink = output->service;
     pipeline_config.native_sequence_observation_sink =
         output->service;
@@ -1556,7 +1663,10 @@ void RunControlExposureGateScenario(TestContext* test) {
             open, &hidden_tick, &system_error);
     const auto hidden_event_error =
         ipc::CertifiedOrderEventReaderV1::Open(
-            open, &hidden_event, &system_error);
+            open,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &hidden_event,
+            &system_error);
     test->Expect(
         hidden_tick_error !=
                 ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
@@ -1574,7 +1684,10 @@ void RunControlExposureGateScenario(TestContext* test) {
             open, &visible_tick, &system_error);
     const auto visible_event_error =
         ipc::CertifiedOrderEventReaderV1::Open(
-            open, &visible_event, &system_error);
+            open,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &visible_event,
+            &system_error);
     ipc::CertifiedOrderEventStatusSnapshotV1 status{};
     test->Expect(
         visible_tick_error ==
@@ -1747,6 +1860,7 @@ void RunTickHistoryCleanShutdownScenario(TestContext* test) {
         l2flow_certified_order_event_reader_open_v1(
             fixture.service_config.control_socket_path.c_str(),
             &event_expected,
+            L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_FROM_OPEN_V1,
             5'000U,
             &event_reader,
             &event_open_system_error) ==
@@ -2347,6 +2461,7 @@ void RunRecoveryScenario(TestContext* test) {
         l2flow_certified_order_event_reader_open_v1(
             service_config.control_socket_path.c_str(),
             &promotion_expected,
+            L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_FROM_OPEN_V1,
             5'000U,
             &promotion_reader,
             &promotion_open_system_error) ==
@@ -2558,52 +2673,48 @@ void RunRecoveryScenario(TestContext* test) {
             return fast->count() == 6U &&
                    service->Snapshot().state ==
                        ipc::RealtimeCertifiedStateV1::
-                           kFrozenConflict;
+                           kDegraded;
         }),
-        "conflict freezes CERTIFIED while FAST remains live");
+        "conflict isolates one channel while FAST remains live");
     test->Expect(
         WaitUntil([&] {
             const auto frozen = service->Snapshot();
             ipc::RealtimeCertifiedTickEnvelopeV1 retained{};
             return frozen.wire_snapshot_consistent &&
                    frozen.canonical_apply_frontier == 4U &&
+                   frozen.frozen_channel_count == 1U &&
                    fast->native(5U) == 5 &&
                    !fast->coverage_lost() &&
                    !pipeline->fatal() &&
-                   service->ReadLatestForTest(0U, &retained) &&
+                   service->ReadCanonicalForTest(4U, &retained) &&
                    retained.payload.native_event_sequence == 5;
         }),
-        "frozen CERTIFIED preserves last-good latest and FAST health");
+        "isolated channel preserves its last-good prefix and FAST health");
     test->Expect(
-        WaitUntil([&] {
-            return tick_history_reader != nullptr &&
-                   tick_history_reader->ReadStatus(
-                       &tick_history_status) ==
-                       ipc::CertifiedTickJournalReadResultV1::kOk &&
-                   tick_history_status.state ==
-                       ipc::CertifiedTickJournalStateV1::kFailed;
-        }) &&
-            tick_history_status.failure ==
-                ipc::CertifiedTickJournalAppendErrorV1::
-                    kUpstreamFailed &&
+        tick_history_reader != nullptr &&
+            tick_history_reader->ReadStatus(
+                &tick_history_status) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            tick_history_status.state ==
+                ipc::CertifiedTickJournalStateV1::kActive &&
             tick_history_status.canonical_apply_frontier == 4U &&
             tick_history_reader->ReadOne(
                 5U, &tick_history_tail) ==
                 ipc::CertifiedTickJournalReadResultV1::
-                    kProducerFailed &&
+                    kNotYetPublished &&
             tick_history_reader->ReadOne(
                 1U, &tick_history_tail) ==
                 ipc::CertifiedTickJournalReadResultV1::kOk,
-        "terminal CERTIFIED conflict fail-closes only the Tick-history suffix and preserves its prefix");
+        "channel degradation keeps Tick history live at its retained prefix");
     test->Expect(
         c_tick_history_reader != nullptr &&
             l2flow_certified_tick_history_reader_status_v1(
                 c_tick_history_reader, &c_tick_status) ==
                 L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
             c_tick_status.state ==
-                L2FLOW_CERTIFIED_TICK_HISTORY_STATE_FAILED_V1 &&
+                L2FLOW_CERTIFIED_TICK_HISTORY_STATE_ACTIVE_V1 &&
             c_tick_status.failure ==
-                L2FLOW_CERTIFIED_TICK_HISTORY_FAILURE_UPSTREAM_V1 &&
+                L2FLOW_CERTIFIED_TICK_HISTORY_FAILURE_NONE_V1 &&
             c_tick_status.canonical_apply_frontier == 4U &&
             l2flow_certified_tick_history_reader_read_v1(
                 c_tick_history_reader,
@@ -2611,8 +2722,39 @@ void RunRecoveryScenario(TestContext* test) {
                 c_tick_rows.data(),
                 1U,
                 &c_tick_batch) ==
-                L2FLOW_CERTIFIED_TICK_HISTORY_READ_PRODUCER_FAILED_V1,
-        "C ABI reports the exact terminal failure while retaining its published prefix");
+                L2FLOW_CERTIFIED_TICK_HISTORY_READ_NOT_YET_PUBLISHED_V1,
+        "C ABI reports a live degraded tail rather than global failure");
+
+    test->Expect(
+        InjectChannel(pipeline.get(), 8U, 1U, 101U).accepted(),
+        "inject a healthy channel after another channel is isolated");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = service->Snapshot();
+            return fast->count() == 7U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kDegraded &&
+                   snapshot.canonical_apply_frontier == 5U &&
+                   snapshot.frozen_channel_count == 1U &&
+                   snapshot.tick_history_frontier == 5U;
+        }),
+        "healthy channel continues canonical Event publication in DEGRADED");
+    test->Expect(
+        tick_history_reader->ReadOne(5U, &tick_history_tail) ==
+                ipc::CertifiedTickJournalReadResultV1::kOk &&
+            tick_history_tail.payload.channel == 8 &&
+            tick_history_tail.payload.native_event_sequence == 1,
+        "Tick history appends the healthy channel after isolation");
+    test->Expect(
+        l2flow_certified_tick_history_reader_read_v1(
+            c_tick_history_reader,
+            5U,
+            c_tick_rows.data(),
+            1U,
+            &c_tick_batch) ==
+                L2FLOW_CERTIFIED_TICK_HISTORY_READ_OK_V1 &&
+            c_tick_batch.records_written == 1U,
+        "C ABI reads the healthy channel after isolation");
 
     ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
     open.control_socket_path = service_config.control_socket_path;
@@ -2635,24 +2777,48 @@ void RunRecoveryScenario(TestContext* test) {
             reader->ReadStatus(&reader_status) ==
                 ipc::RealtimeCertifiedReadResultV1::kOk &&
             reader_status.state ==
-                ipc::RealtimeCertifiedStateV1::kFrozenConflict &&
+                ipc::RealtimeCertifiedStateV1::kDegraded &&
+            reader_status.frozen_channel_count == 1U &&
             reader->ReadLatest(0U, &latest) ==
-                ipc::RealtimeCertifiedReadResultV1::kOk,
-        "reader keeps last-good data available while frozen");
-    ipc::RealtimeCertifiedChannelStateV1 channel{};
-    test->Expect(
-        reader != nullptr &&
-            reader->ReadChannelState(0U, &channel) ==
                 ipc::RealtimeCertifiedReadResultV1::kOk &&
-            channel.origin_sequence == 1 &&
-            channel.observed_contiguous_frontier == 5 &&
-            channel.certified_published_frontier == 5,
-        "wire channel preserves documented from-open origin and coverage");
+            latest.payload.channel == 8 &&
+            latest.payload.native_event_sequence == 1,
+        "reader exposes healthy-channel progress while degraded");
+    ipc::RealtimeCertifiedChannelStateV1 frozen_channel{};
+    ipc::RealtimeCertifiedChannelStateV1 healthy_channel{};
+    const auto frozen_channel_read =
+        reader != nullptr
+            ? reader->ReadChannelState(0U, &frozen_channel)
+            : ipc::RealtimeCertifiedReadResultV1::kCorrupt;
+    const auto healthy_channel_read =
+        reader != nullptr
+            ? reader->ReadChannelState(1U, &healthy_channel)
+            : ipc::RealtimeCertifiedReadResultV1::kCorrupt;
+    const bool channel_isolation_visible =
+        frozen_channel_read ==
+                ipc::RealtimeCertifiedReadResultV1::kOk &&
+        frozen_channel.state == static_cast<std::uint32_t>(
+            ipc::RealtimeCertifiedStateV1::kFrozenConflict) &&
+        frozen_channel.channel == 7 &&
+        frozen_channel.origin_sequence == 1 &&
+        frozen_channel.certified_published_frontier == 5 &&
+        healthy_channel_read ==
+                ipc::RealtimeCertifiedReadResultV1::kOk &&
+        healthy_channel.state == static_cast<std::uint32_t>(
+            ipc::RealtimeCertifiedStateV1::kContiguous) &&
+        healthy_channel.channel == 8 &&
+        healthy_channel.certified_published_frontier == 1;
+    test->Expect(
+        channel_isolation_visible,
+        "wire isolates the frozen channel and publishes the healthy channel");
 
     std::unique_ptr<ipc::CertifiedOrderEventReaderV1> event_reader;
     test->Expect(
         ipc::CertifiedOrderEventReaderV1::Open(
-            open, &event_reader, &system_error) ==
+            open,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &event_reader,
+            &system_error) ==
                 ipc::CertifiedOrderEventReaderOpenErrorV1::kNone &&
             event_reader != nullptr,
         "open production UDS Tick/Event reader");
@@ -2662,14 +2828,15 @@ void RunRecoveryScenario(TestContext* test) {
             event_reader->ReadStatus(&event_status) ==
                 ipc::CertifiedOrderEventReadResultV1::kOk &&
             event_status.tick.state ==
-                ipc::RealtimeCertifiedStateV1::kFrozenConflict &&
-            event_status.tick.canonical_apply_frontier == 4U &&
+                ipc::RealtimeCertifiedStateV1::kDegraded &&
+            event_status.tick.frozen_channel_count == 1U &&
+            event_status.tick.canonical_apply_frontier == 5U &&
             event_status.coverage_from_open() &&
             event_status.startup_prefix_recovered() &&
-            event_status.event_canonical_apply_frontier == 4U &&
-            event_status.coherent_canonical_apply_frontier == 4U &&
+            event_status.event_canonical_apply_frontier == 5U &&
+            event_status.coherent_canonical_apply_frontier == 5U &&
             event_status.event_published_sequence > 0U,
-        "external Event journal preserves repaired coherent prefix");
+        "external Event journal continues a coherent degraded prefix");
     std::array<ipc::CertifiedOrderEventEnvelopeV1, 32U>
         event_rows{};
     ipc::CertifiedOrderEventReadBatchResultV1 event_batch{};
@@ -2693,12 +2860,14 @@ void RunRecoveryScenario(TestContext* test) {
         const std::uint64_t canonical =
             row.canonical_apply_sequence;
         const std::int64_t expected_native =
-            canonical == 4U
-                ? 5
-                : static_cast<std::int64_t>(canonical);
+            canonical == 5U
+                ? 1
+                : canonical == 4U
+                      ? 5
+                      : static_cast<std::int64_t>(canonical);
         event_order_valid =
             row.event.derived_event_sequence == index + 1U &&
-            canonical >= 1U && canonical <= 4U &&
+            canonical >= 1U && canonical <= 5U &&
             canonical >= previous_canonical &&
             row.event.native_event_sequence == expected_native;
         previous_canonical = canonical;
@@ -2713,9 +2882,9 @@ void RunRecoveryScenario(TestContext* test) {
                 ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
             events.valid() &&
             events.generation().input_frontier
-                    .canonical_apply_sequence == 4U &&
+                    .canonical_apply_sequence == 5U &&
             !events.events().empty(),
-        "CERTIFIED Event/history advances through repaired prefix only");
+        "CERTIFIED Event/history advances on the healthy channel");
 
     l2flow_certified_tick_history_reader_close_v1(
         c_tick_history_reader);
@@ -2723,11 +2892,344 @@ void RunRecoveryScenario(TestContext* test) {
 
     pipeline->StopAndDrain();
     service->MarkStoppedClean();
+    const auto stopped = service->Snapshot();
     test->Expect(
-        service->Snapshot().state ==
-            ipc::RealtimeCertifiedStateV1::kFrozenConflict,
-        "clean-stop request does not erase terminal conflict state");
+        stopped.state == ipc::RealtimeCertifiedStateV1::kStopped &&
+            stopped.frozen_channel_count == 1U,
+        "clean stop preserves channel degradation diagnostics");
+    test->Expect(
+        WaitUntil([&] {
+            return tick_history_reader != nullptr &&
+                   tick_history_reader->ReadStatus(
+                       &tick_history_status) ==
+                       ipc::CertifiedTickJournalReadResultV1::kOk &&
+                   tick_history_status.state ==
+                       ipc::CertifiedTickJournalStateV1::kFailed;
+        }) &&
+            tick_history_status.failure ==
+                ipc::CertifiedTickJournalAppendErrorV1::
+                    kIncompleteNativePrefix &&
+            tick_history_status.canonical_apply_frontier == 5U,
+        "strict full-market Tick history marks degraded clean-stop incomplete");
     service->StopControl();
+}
+
+void RunProcessStartNativeReorderScenario(TestContext* test) {
+    WorkerBarrierFixture fixture{};
+    const bool ready = BuildWorkerBarrierFixture(
+        test,
+        "process-start-native-reorder",
+        std::byte{0x6e},
+        &fixture,
+        true,
+        {},
+        {},
+        nullptr,
+        false,
+        1024U,
+        64U,
+        1024U,
+        true);
+    if (!ready || fixture.pipeline == nullptr ||
+        fixture.service == nullptr) {
+        return;
+    }
+    int system_error = 0;
+    test->Expect(
+        fixture.service->StartControl(&system_error),
+        "start process-start canonical Event control");
+    constexpr std::uint64_t finalized_coverage_start =
+        1'785'834'366'000'000'000ULL;
+    test->Expect(
+        fixture.exposure_gate != nullptr &&
+            fixture.service->FinalizeProcessStartCoverage(
+                finalized_coverage_start, 1s, &system_error),
+        "finalize process-start coverage behind the control gate");
+    if (fixture.exposure_gate != nullptr) {
+        fixture.exposure_gate->store(true, std::memory_order_release);
+    }
+
+    test->Expect(
+        InjectShenzhenOrder(
+            fixture.pipeline.get(), 2013U, 98U, 98U)
+                .accepted() &&
+            InjectShenzhenOrder(
+                fixture.pipeline.get(), 2013U, 99U, 99U)
+                .accepted(),
+        "admit 6.33 native 98 and 99 before 6.36 native 97");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 2U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kGapOpen &&
+                   snapshot.canonical_apply_frontier == 0U;
+        }),
+        "D=2 bootstrap publishes FAST but withholds canonical Event");
+
+    test->Expect(
+        InjectShenzhenTransaction(
+            fixture.pipeline.get(), 2013U, 97U)
+            .accepted(),
+        "admit late 6.36 native 97");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 3U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kContiguous &&
+                   snapshot.canonical_apply_frontier == 3U &&
+                   snapshot.pending_token_count == 0U;
+        }),
+        "late 97 establishes origin and drains 97, 98, 99");
+
+    std::array<ipc::RealtimeCertifiedTickEnvelopeV1, 3U> ticks{};
+    bool canonical_identity_valid = true;
+    for (std::uint64_t canonical = 1U;
+         canonical <= ticks.size();
+         ++canonical) {
+        canonical_identity_valid =
+            canonical_identity_valid &&
+            fixture.service->ReadCanonicalForTest(
+                canonical,
+                &ticks[static_cast<std::size_t>(canonical - 1U)]);
+    }
+    canonical_identity_valid =
+        canonical_identity_valid &&
+        ticks[0U].payload.native_event_sequence == 97 &&
+        ticks[0U].payload.common.event_kind == 5U &&
+        ticks[0U].payload.common.source_sequence == 3U &&
+        ticks[0U].payload.common.ingress_sequence == 3U &&
+        ticks[0U].payload.common.tick_stream_sequence == 3U &&
+        ticks[1U].payload.native_event_sequence == 98 &&
+        ticks[1U].payload.common.event_kind == 4U &&
+        ticks[1U].payload.common.source_sequence == 1U &&
+        ticks[1U].payload.common.ingress_sequence == 1U &&
+        ticks[1U].payload.common.tick_stream_sequence == 1U &&
+        ticks[2U].payload.native_event_sequence == 99 &&
+        ticks[2U].payload.common.event_kind == 4U &&
+        ticks[2U].payload.common.source_sequence == 2U &&
+        ticks[2U].payload.common.ingress_sequence == 2U &&
+        ticks[2U].payload.common.tick_stream_sequence == 2U;
+    test->Expect(
+        canonical_identity_valid,
+        "canonical order changes without rewriting source identity");
+
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    open.timeout = 1s;
+    std::unique_ptr<ipc::CertifiedOrderEventReaderV1> rejected;
+    test->Expect(
+        ipc::CertifiedOrderEventReaderV1::Open(
+            open,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &rejected,
+            &system_error) ==
+                ipc::CertifiedOrderEventReaderOpenErrorV1::
+                    kLayoutInvalid &&
+            rejected == nullptr,
+        "from-open Event reader rejects process-start service");
+
+    std::unique_ptr<ipc::CertifiedOrderEventReaderV1> event_reader;
+    test->Expect(
+        ipc::CertifiedOrderEventReaderV1::Open(
+            open,
+            ipc::CertifiedOrderEventCoverageRequirementV1::
+                kProcessStartPartial,
+            &event_reader,
+            &system_error) ==
+                ipc::CertifiedOrderEventReaderOpenErrorV1::kNone &&
+            event_reader != nullptr,
+        "explicit process-start Event reader opens canonical service");
+    ipc::CertifiedOrderEventStatusSnapshotV1 status{};
+    std::array<ipc::CertifiedOrderEventEnvelopeV1, 16U> rows{};
+    ipc::CertifiedOrderEventReadBatchResultV1 batch{};
+    test->Expect(
+        event_reader != nullptr &&
+            event_reader->ReadStatus(&status) ==
+                ipc::CertifiedOrderEventReadResultV1::kOk &&
+            status.process_start_partial() &&
+            !status.coverage_from_open() &&
+            status.coverage_start_unix_ns ==
+                finalized_coverage_start &&
+            event_reader->Read(1U, rows, &batch) ==
+                ipc::CertifiedOrderEventReadResultV1::kOk &&
+            batch.written != 0U,
+        "process-start Event journal exposes explicit coverage and rows");
+
+    std::array<bool, 3U> canonical_seen{};
+    bool event_identity_valid = batch.written <= rows.size();
+    for (std::size_t index = 0U;
+         event_identity_valid && index < batch.written;
+         ++index) {
+        const auto& row = rows[index];
+        if (row.canonical_apply_sequence == 0U ||
+            row.canonical_apply_sequence > canonical_seen.size()) {
+            event_identity_valid = false;
+            break;
+        }
+        const std::size_t canonical_index =
+            static_cast<std::size_t>(
+                row.canonical_apply_sequence - 1U);
+        canonical_seen[canonical_index] = true;
+        event_identity_valid =
+            row.event.native_event_sequence ==
+                ticks[canonical_index]
+                    .payload.native_event_sequence &&
+            row.event.source_sequence ==
+                ticks[canonical_index]
+                    .payload.common.source_sequence &&
+            row.event.ingress_sequence ==
+                ticks[canonical_index]
+                    .payload.common.ingress_sequence &&
+            row.event.tick_stream_sequence ==
+                ticks[canonical_index]
+                    .payload.common.tick_stream_sequence;
+    }
+    test->Expect(
+        event_identity_valid &&
+            std::all_of(
+                canonical_seen.begin(),
+                canonical_seen.end(),
+                [](bool value) { return value; }),
+        "derived Event rows retain each reordered source identity");
+
+    fixture.pipeline->StopAndDrain();
+    fixture.service->MarkStoppedClean();
+    fixture.service->StopControl();
+}
+
+void RunPreOriginBoundIsolationScenario(TestContext* test) {
+    WorkerBarrierFixture fixture{};
+    const bool ready = BuildWorkerBarrierFixture(
+        test,
+        "pre-origin-bound-isolation",
+        std::byte{0x6f},
+        &fixture,
+        true,
+        {},
+        {},
+        nullptr,
+        false,
+        1024U,
+        64U,
+        1024U,
+        true);
+    if (!ready || fixture.pipeline == nullptr ||
+        fixture.service == nullptr) {
+        return;
+    }
+    int system_error = 0;
+    test->Expect(
+        fixture.service->StartControl(&system_error),
+        "start pre-origin isolation control");
+    test->Expect(
+        fixture.exposure_gate != nullptr &&
+            fixture.service->FinalizeProcessStartCoverage(
+                1'785'834'366'100'000'000ULL,
+                1s,
+                &system_error),
+        "finalize pre-origin isolation coverage");
+    if (fixture.exposure_gate != nullptr) {
+        fixture.exposure_gate->store(true, std::memory_order_release);
+    }
+
+    test->Expect(
+        InjectChannel(fixture.pipeline.get(), 7U, 100U, 100U)
+            .accepted(),
+        "admit first bootstrapping position");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 1U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kGapOpen &&
+                   snapshot.canonical_apply_frontier == 0U;
+        }),
+        "unknown origin remains bounded bootstrapping");
+
+    test->Expect(
+        InjectChannel(fixture.pipeline.get(), 7U, 96U, 96U)
+            .accepted(),
+        "admit a pre-origin displacement beyond D=2");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 2U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kDegraded &&
+                   !snapshot.globally_frozen_resource &&
+                   snapshot.frozen_channel_count == 1U &&
+                   snapshot.canonical_apply_frontier == 0U;
+        }),
+        "pre-origin bound violation isolates only its channel");
+
+    test->Expect(
+        InjectChannel(fixture.pipeline.get(), 8U, 1U, 1U)
+                .accepted() &&
+            InjectChannel(fixture.pipeline.get(), 8U, 2U, 2U)
+                .accepted() &&
+            InjectChannel(fixture.pipeline.get(), 8U, 3U, 3U)
+                .accepted(),
+        "admit a healthy channel after pre-origin isolation");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return fixture.fast->count() == 5U &&
+                   snapshot.state ==
+                       ipc::RealtimeCertifiedStateV1::kDegraded &&
+                   !snapshot.globally_frozen_resource &&
+                   snapshot.frozen_channel_count == 1U &&
+                   snapshot.canonical_apply_frontier == 3U;
+        }),
+        "healthy channel canonicalizes while the failed domain stays isolated");
+
+    ipc::RealtimeCertifiedReaderOpenOptionsV1 open{};
+    open.control_socket_path =
+        fixture.service_config.control_socket_path;
+    std::memcpy(
+        open.expected_session.run_id.data(),
+        fixture.service_config.run_id.data(),
+        fixture.service_config.run_id.size());
+    open.expected_session.session_epoch =
+        fixture.service_config.session_epoch;
+    open.expected_session.trade_date =
+        fixture.service_config.trade_date;
+    open.timeout = 1s;
+    std::unique_ptr<ipc::RealtimeCertifiedReaderV1> reader;
+    test->Expect(
+        ipc::RealtimeCertifiedReaderV1::Open(
+            open, &reader, &system_error) ==
+                ipc::RealtimeCertifiedReaderOpenErrorV1::kNone &&
+            reader != nullptr,
+        "open reader after pre-origin channel isolation");
+    ipc::RealtimeCertifiedChannelStateV1 frozen{};
+    ipc::RealtimeCertifiedChannelStateV1 healthy{};
+    test->Expect(
+        reader != nullptr &&
+            reader->ReadChannelState(0U, &frozen) ==
+                ipc::RealtimeCertifiedReadResultV1::kOk &&
+            frozen.channel == 7U && frozen.origin_sequence == 0 &&
+            frozen.state == static_cast<std::uint32_t>(
+                ipc::RealtimeCertifiedStateV1::kFrozenResource) &&
+            reader->ReadChannelState(1U, &healthy) ==
+                ipc::RealtimeCertifiedReadResultV1::kOk &&
+            healthy.channel == 8U && healthy.origin_sequence == 1 &&
+            healthy.certified_published_frontier == 3,
+        "wire represents an origin-unknown frozen row without global failure");
+
+    fixture.pipeline->StopAndDrain();
+    fixture.service->MarkStoppedClean();
+    fixture.service->StopControl();
 }
 
 void RunEventCapacityFailOpenScenario(TestContext* test) {
@@ -2832,7 +3334,10 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
         event_reader;
     test->Expect(
         ipc::CertifiedOrderEventReaderV1::Open(
-            open, &event_reader, &system_error) ==
+            open,
+            ipc::CertifiedOrderEventCoverageRequirementV1::kFromOpen,
+            &event_reader,
+            &system_error) ==
                 ipc::CertifiedOrderEventReaderOpenErrorV1::kNone &&
             event_reader != nullptr,
         "open ordinary from-open Event reader before first data");
@@ -2853,6 +3358,7 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
         l2flow_certified_order_event_reader_open_v1(
             service_config.control_socket_path.c_str(),
             &c_event_expected,
+            L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_FROM_OPEN_V1,
             5'000U,
             &c_event_reader,
             &c_event_open_system_error) ==
@@ -3113,6 +3619,8 @@ int main() {
     RunTickHistoryIncompleteGapScenario(&test);
     RunTickHistoryRetentionLossFailOpenScenario(&test);
     RunRecoveryScenario(&test);
+    RunProcessStartNativeReorderScenario(&test);
+    RunPreOriginBoundIsolationScenario(&test);
     RunEventCapacityFailOpenScenario(&test);
     if (test.failures() != 0) {
         return 1;

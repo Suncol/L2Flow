@@ -86,8 +86,51 @@ void CloseDescriptor(int* descriptor) noexcept {
            left.trade_date == right.trade_date;
 }
 
+[[nodiscard]] bool CoverageRequirementValid(
+    CertifiedOrderEventCoverageRequirementV1 requirement) noexcept {
+    return requirement ==
+               CertifiedOrderEventCoverageRequirementV1::kFromOpen ||
+           requirement ==
+               CertifiedOrderEventCoverageRequirementV1::
+                   kProcessStartPartial ||
+           requirement ==
+               CertifiedOrderEventCoverageRequirementV1::kAnyExplicit;
+}
+
+[[nodiscard]] bool CoverageCanonical(
+    std::uint32_t flags,
+    std::uint64_t coverage_start_unix_ns) noexcept {
+    const std::uint32_t temporal =
+        flags &
+        (kCertifiedOrderEventCoverageFromOpenV1 |
+         kCertifiedOrderEventCoverageFromProcessStartV1);
+    return (flags & ~kCertifiedOrderEventKnownCoverageFlagsV1) == 0U &&
+           std::has_single_bit(temporal) &&
+           ((flags &
+                 kCertifiedOrderEventStartupPrefixRecoveredV1) == 0U ||
+            temporal == kCertifiedOrderEventCoverageFromOpenV1) &&
+           ((temporal == kCertifiedOrderEventCoverageFromOpenV1) ==
+            (coverage_start_unix_ns == 0U));
+}
+
+[[nodiscard]] bool CoverageMeetsRequirement(
+    std::uint32_t flags,
+    CertifiedOrderEventCoverageRequirementV1 requirement) noexcept {
+    if (requirement ==
+        CertifiedOrderEventCoverageRequirementV1::kAnyExplicit) {
+        return true;
+    }
+    const std::uint32_t required =
+        requirement ==
+                CertifiedOrderEventCoverageRequirementV1::kFromOpen
+            ? kCertifiedOrderEventCoverageFromOpenV1
+            : kCertifiedOrderEventCoverageFromProcessStartV1;
+    return (flags & required) != 0U;
+}
+
 struct EventStatus final {
     std::uint32_t coverage_flags = 0U;
+    std::uint64_t coverage_start_unix_ns = 0U;
     std::uint64_t publish_tag = 0U;
     std::uint64_t heartbeat_monotonic_ns = 0U;
     std::uint64_t canonical_apply_frontier = 0U;
@@ -125,6 +168,9 @@ struct EventStatus final {
         status.publish_tag = begin;
         status.coverage_flags =
             Atomic(header.flags).load(std::memory_order_relaxed);
+        status.coverage_start_unix_ns =
+            Atomic(header.coverage_start_unix_ns)
+                .load(std::memory_order_relaxed);
         status.heartbeat_monotonic_ns =
             Atomic(header.heartbeat_monotonic_ns)
                 .load(std::memory_order_relaxed);
@@ -156,10 +202,9 @@ struct EventStatus final {
         if (begin != end || (end & 1U) != 0U) {
             continue;
         }
-        if ((status.coverage_flags &
-                 ~kCertifiedOrderEventKnownCoverageFlagsV1) != 0U ||
-            (status.coverage_flags &
-                 kCertifiedOrderEventCoverageFromOpenV1) == 0U ||
+        if (!CoverageCanonical(
+                status.coverage_flags,
+                status.coverage_start_unix_ns) ||
             status.heartbeat_monotonic_ns == 0U ||
             status.generation !=
                 status.canonical_apply_frontier ||
@@ -198,6 +243,8 @@ struct EventStatus final {
     result.event_capacity = source.event_capacity;
     result.slot_stride = source.slot_stride;
     result.region_alignment = source.region_alignment;
+    result.coverage_start_unix_ns =
+        status.coverage_start_unix_ns;
     result.reserved_layout = source.reserved_layout;
     result.status_publish_tag = status.publish_tag;
     result.heartbeat_monotonic_ns =
@@ -420,12 +467,15 @@ RequestEventDescriptor(
     const RealtimeCertifiedReaderOpenOptionsV1& options,
     int* output_descriptor,
     std::uint32_t* output_coverage_flags,
+    std::uint64_t* output_coverage_start_unix_ns,
     int* system_error_number) noexcept {
     *output_descriptor = -1;
-    if (output_coverage_flags == nullptr) {
+    if (output_coverage_flags == nullptr ||
+        output_coverage_start_unix_ns == nullptr) {
         return CertifiedOrderEventReaderOpenErrorV1::kInvalidArgument;
     }
     *output_coverage_flags = 0U;
+    *output_coverage_start_unix_ns = 0U;
     if (!SocketPathSyntaxValid(options.control_socket_path)) {
         return CertifiedOrderEventReaderOpenErrorV1::
             kSocketPathInvalid;
@@ -525,8 +575,9 @@ RequestEventDescriptor(
         response.response_bytes == sizeof(response) &&
         response.nonce == request.nonce &&
         response.reserved0 == 0U &&
-        (response.coverage_flags &
-             ~kCertifiedOrderEventKnownCoverageFlagsV1) == 0U &&
+        CoverageCanonical(
+            response.coverage_flags,
+            response.coverage_start_unix_ns) &&
         AllZero(response.reserved) &&
         response.status <= static_cast<std::uint16_t>(
             RealtimeCertifiedControlStatusV1::kInternal);
@@ -580,6 +631,8 @@ RequestEventDescriptor(
     }
     *output_descriptor = received.descriptor;
     *output_coverage_flags = response.coverage_flags;
+    *output_coverage_start_unix_ns =
+        response.coverage_start_unix_ns;
     received.descriptor = -1;
     return CertifiedOrderEventReaderOpenErrorV1::kNone;
 }
@@ -599,11 +652,13 @@ public:
     OpenEventDescriptor(
         int descriptor,
         const RealtimeCertifiedExpectedSessionV1& expected,
+        CertifiedOrderEventCoverageRequirementV1 coverage_requirement,
         std::unique_ptr<RealtimeCertifiedReaderV1> tick,
         std::unique_ptr<Impl>* output,
         int* system_error_number) noexcept {
         if (descriptor < 0 || tick == nullptr ||
-            output == nullptr || !ExpectedSessionValid(expected)) {
+            output == nullptr || !ExpectedSessionValid(expected) ||
+            !CoverageRequirementValid(coverage_requirement)) {
             return CertifiedOrderEventReaderOpenErrorV1::
                 kInvalidArgument;
         }
@@ -661,7 +716,9 @@ public:
             CopyHeader(*header, status);
         if (status_result != StableCopyResult::kCopied ||
             !CertifiedOrderEventHeaderCanonicalV1(header_copy) ||
-            header_copy.total_mapping_bytes != mapping_bytes) {
+            header_copy.total_mapping_bytes != mapping_bytes ||
+            !CoverageMeetsRequirement(
+                header_copy.flags, coverage_requirement)) {
             static_cast<void>(::munmap(
                 mapping, static_cast<std::size_t>(mapping_bytes)));
             return CertifiedOrderEventReaderOpenErrorV1::
@@ -696,6 +753,12 @@ public:
                 header_copy.slots_offset);
         impl->session_ = expected;
         impl->event_capacity_ = header_copy.event_capacity;
+        impl->temporal_coverage_flags_ =
+            header_copy.flags &
+            (kCertifiedOrderEventCoverageFromOpenV1 |
+             kCertifiedOrderEventCoverageFromProcessStartV1);
+        impl->coverage_start_unix_ns_ =
+            header_copy.coverage_start_unix_ns;
         *output = std::move(impl);
         return CertifiedOrderEventReaderOpenErrorV1::kNone;
     }
@@ -723,9 +786,19 @@ public:
         if (event_result != StableCopyResult::kCopied) {
             return CertifiedOrderEventReadResultV1::kCorrupt;
         }
+        if ((event.coverage_flags &
+             (kCertifiedOrderEventCoverageFromOpenV1 |
+              kCertifiedOrderEventCoverageFromProcessStartV1)) !=
+                temporal_coverage_flags_ ||
+            event.coverage_start_unix_ns !=
+                coverage_start_unix_ns_) {
+            return CertifiedOrderEventReadResultV1::kCorrupt;
+        }
         CertifiedOrderEventStatusSnapshotV1 result{};
         result.tick = tick;
         result.coverage_flags = event.coverage_flags;
+        result.coverage_start_unix_ns =
+            event.coverage_start_unix_ns;
         result.event_publish_tag = event.publish_tag;
         result.event_heartbeat_monotonic_ns =
             event.heartbeat_monotonic_ns;
@@ -897,6 +970,8 @@ public:
     const CertifiedOrderEventSlotV1* event_slots_ = nullptr;
     RealtimeCertifiedExpectedSessionV1 session_{};
     std::uint64_t event_capacity_ = 0U;
+    std::uint32_t temporal_coverage_flags_ = 0U;
+    std::uint64_t coverage_start_unix_ns_ = 0U;
 };
 
 std::string_view CertifiedOrderEventReaderOpenErrorNameV1(
@@ -989,6 +1064,7 @@ CertifiedOrderEventReaderV1::OpenDescriptorsForTest(
     int tick_descriptor,
     int event_descriptor,
     const RealtimeCertifiedExpectedSessionV1& expected_session,
+    CertifiedOrderEventCoverageRequirementV1 coverage_requirement,
     std::unique_ptr<CertifiedOrderEventReaderV1>* output,
     int* system_error_number) noexcept {
     SetSystemError(system_error_number, 0);
@@ -1010,6 +1086,7 @@ CertifiedOrderEventReaderV1::OpenDescriptorsForTest(
     const auto error = Impl::OpenEventDescriptor(
         event_descriptor,
         expected_session,
+        coverage_requirement,
         std::move(tick),
         &impl,
         system_error_number);
@@ -1030,6 +1107,7 @@ CertifiedOrderEventReaderV1::OpenDescriptorsForTest(
 CertifiedOrderEventReaderOpenErrorV1
 CertifiedOrderEventReaderV1::Open(
     RealtimeCertifiedReaderOpenOptionsV1 options,
+    CertifiedOrderEventCoverageRequirementV1 coverage_requirement,
     std::unique_ptr<CertifiedOrderEventReaderV1>* output,
     int* system_error_number) noexcept {
     SetSystemError(system_error_number, 0);
@@ -1038,6 +1116,7 @@ CertifiedOrderEventReaderV1::Open(
     }
     output->reset();
     if (!ExpectedSessionValid(options.expected_session) ||
+        !CoverageRequirementValid(coverage_requirement) ||
         options.timeout.count() <= 0 ||
         options.timeout > std::chrono::hours(24)) {
         return CertifiedOrderEventReaderOpenErrorV1::
@@ -1052,10 +1131,12 @@ CertifiedOrderEventReaderV1::Open(
     }
     int descriptor = -1;
     std::uint32_t control_coverage_flags = 0U;
+    std::uint64_t control_coverage_start_unix_ns = 0U;
     const auto request_error = RequestEventDescriptor(
         options,
         &descriptor,
         &control_coverage_flags,
+        &control_coverage_start_unix_ns,
         system_error_number);
     if (request_error !=
         CertifiedOrderEventReaderOpenErrorV1::kNone) {
@@ -1065,6 +1146,7 @@ CertifiedOrderEventReaderV1::Open(
     const auto open_error = Impl::OpenEventDescriptor(
         descriptor,
         options.expected_session,
+        coverage_requirement,
         std::move(tick),
         &impl,
         system_error_number);
@@ -1074,9 +1156,21 @@ CertifiedOrderEventReaderV1::Open(
         return open_error;
     }
     CertifiedOrderEventStatusSnapshotV1 status{};
+    const std::uint32_t temporal_mask =
+        kCertifiedOrderEventCoverageFromOpenV1 |
+        kCertifiedOrderEventCoverageFromProcessStartV1;
     if (impl->ReadStatus(&status) !=
             CertifiedOrderEventReadResultV1::kOk ||
-        status.coverage_flags != control_coverage_flags) {
+        (status.coverage_flags & temporal_mask) !=
+            (control_coverage_flags & temporal_mask) ||
+        ((control_coverage_flags &
+          kCertifiedOrderEventStartupPrefixRecoveredV1) != 0U &&
+         (status.coverage_flags &
+          kCertifiedOrderEventStartupPrefixRecoveredV1) == 0U)) {
+        return CertifiedOrderEventReaderOpenErrorV1::kProtocolError;
+    }
+    if (status.coverage_start_unix_ns !=
+        control_coverage_start_unix_ns) {
         return CertifiedOrderEventReaderOpenErrorV1::kProtocolError;
     }
     auto reader = std::unique_ptr<CertifiedOrderEventReaderV1>(
@@ -1126,6 +1220,12 @@ CertifiedOrderEventReaderV1::session() const noexcept {
 std::uint64_t
 CertifiedOrderEventReaderV1::event_capacity() const noexcept {
     return impl_ == nullptr ? 0U : impl_->event_capacity_;
+}
+
+std::uint64_t
+CertifiedOrderEventReaderV1::coverage_start_unix_ns() const noexcept {
+    return impl_ == nullptr ? 0U
+                            : impl_->coverage_start_unix_ns_;
 }
 
 }  // namespace l2flow::ipc

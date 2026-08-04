@@ -110,8 +110,7 @@ public:
         ipc::OrderEventDeltaTemporalCoverageV1 temporal_coverage =
             ipc::OrderEventDeltaTemporalCoverageV1::
                 kFromMarketOpen,
-        std::uint32_t poll_interval_ms = 1U,
-        std::uint64_t managed_parent_pid = 0U) {
+        std::uint32_t poll_interval_ms = 1U) {
         std::vector<std::string> arguments{
             executable.string(),
             "--source-socket",
@@ -143,11 +142,6 @@ public:
                 ? "from-open"
                 : "process-start",
         };
-        if (managed_parent_pid != 0U) {
-            arguments.emplace_back("--parent-pid");
-            arguments.emplace_back(
-                std::to_string(managed_parent_pid));
-        }
         std::vector<char*> child_argv;
         child_argv.reserve(arguments.size() + 1U);
         for (std::string& argument : arguments) {
@@ -383,21 +377,6 @@ int main(int argc, char** argv) {
     const std::filesystem::path event_socket =
         temporary.path() / "events.sock";
 
-    ChildProcess wrong_parent_child;
-    int wrong_parent_exit = 0;
-    ok &= Expect(
-        wrong_parent_child.Spawn(
-            argv[1],
-            temporary.path() / "missing-source.sock",
-            temporary.path() / "wrong-parent-events.sock",
-            ipc::OrderEventDeltaTemporalCoverageV1::kFromMarketOpen,
-            0U,
-            static_cast<std::uint64_t>(::getpid()) + 1U) &&
-            wrong_parent_child.Wait(
-                std::chrono::seconds(1), &wrong_parent_exit) &&
-            wrong_parent_exit != 0,
-        "managed Event rejects a parent mismatch before source attach");
-
     ipc::RealtimeSharedServiceConfigV2 config{};
     config.run_id = RunId();
     config.session_epoch = kEpoch;
@@ -526,8 +505,7 @@ int main(int argc, char** argv) {
             partial_source_socket,
             partial_event_socket,
             process_start,
-            0U,
-            static_cast<std::uint64_t>(::getpid())) &&
+            0U) &&
             partial_child.ReadReady(
                 std::chrono::seconds(5), &transcript),
         "explicit process-start aggregator reaches READY from local seq=1");

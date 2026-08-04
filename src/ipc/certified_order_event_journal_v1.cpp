@@ -160,7 +160,15 @@ public:
              config_.maximum_mapping_bytes <
                  kCertifiedOrderEventHeaderBytesV1) ||
             config_.lazy_commit_chunk_bytes < 4096U ||
-            config_.lazy_commit_chunk_bytes % 4096U != 0U) {
+            config_.lazy_commit_chunk_bytes % 4096U != 0U ||
+            (config_.temporal_coverage !=
+                 CertifiedOrderEventTemporalCoverageV1::kFromOpen &&
+             config_.temporal_coverage !=
+                 CertifiedOrderEventTemporalCoverageV1::
+                     kFromProcessStart) ||
+            ((config_.temporal_coverage ==
+                  CertifiedOrderEventTemporalCoverageV1::kFromOpen) !=
+             (config_.coverage_start_unix_ns == 0U))) {
             return CertifiedOrderEventJournalCreateErrorV1::
                 kInvalidConfiguration;
         }
@@ -265,7 +273,10 @@ public:
         header_->endian_marker =
             kCertifiedOrderEventEndianMarkerV1;
         header_->flags =
-            kCertifiedOrderEventCoverageFromOpenV1;
+            config_.temporal_coverage ==
+                    CertifiedOrderEventTemporalCoverageV1::kFromOpen
+                ? kCertifiedOrderEventCoverageFromOpenV1
+                : kCertifiedOrderEventCoverageFromProcessStartV1;
         header_->total_mapping_bytes = mapping_bytes_;
         CopyIdentity(config_.run_id, &header_->run_id);
         header_->session_epoch = config_.session_epoch;
@@ -276,6 +287,8 @@ public:
         header_->slot_stride = kCertifiedOrderEventSlotBytesV1;
         header_->region_alignment =
             kCertifiedOrderEventAlignmentV1;
+        header_->coverage_start_unix_ns =
+            config_.coverage_start_unix_ns;
         header_->status_publish_tag = 2U;
         header_->heartbeat_monotonic_ns = now;
         header_->committed_mapping_bytes =
@@ -587,7 +600,9 @@ public:
             config_.session_epoch,
             config_.trade_date,
             config_.event_capacity,
-            mapping_bytes_};
+            mapping_bytes_,
+            config_.temporal_coverage,
+            config_.coverage_start_unix_ns};
     }
 
     [[nodiscard]] std::uint64_t canonical_apply_frontier()
@@ -647,11 +662,66 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool FinalizeProcessStartCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept {
+        if (failed_ || header_ == nullptr ||
+            config_.temporal_coverage !=
+                CertifiedOrderEventTemporalCoverageV1::
+                    kFromProcessStart ||
+            coverage_start_unix_ns == 0U ||
+            coverage_start_unix_ns <
+                config_.coverage_start_unix_ns ||
+            process_start_coverage_finalized_) {
+            return false;
+        }
+        const std::uint32_t current_flags =
+            Atomic(header_->flags).load(std::memory_order_acquire);
+        if (current_flags !=
+            kCertifiedOrderEventCoverageFromProcessStartV1) {
+            failed_ = true;
+            return false;
+        }
+        std::atomic_ref<std::uint64_t> tag =
+            Atomic(header_->status_publish_tag);
+        const std::uint64_t stable =
+            tag.load(std::memory_order_acquire);
+        if (stable == 0U || (stable & 1U) != 0U ||
+            stable >
+                std::numeric_limits<std::uint64_t>::max() - 2U) {
+            failed_ = true;
+            return false;
+        }
+        std::uint64_t expected = stable;
+        if (!tag.compare_exchange_strong(
+                expected,
+                stable + 1U,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            failed_ = true;
+            return false;
+        }
+        Atomic(header_->coverage_start_unix_ns)
+            .store(coverage_start_unix_ns, std::memory_order_relaxed);
+        tag.store(stable + 2U, std::memory_order_release);
+        config_.coverage_start_unix_ns = coverage_start_unix_ns;
+        process_start_coverage_finalized_ = true;
+        if (!CertifiedOrderEventHeaderCanonicalV1(*header_)) {
+            failed_ = true;
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] std::uint32_t coverage_flags() const noexcept {
         return header_ == nullptr
                    ? 0U
                    : Atomic(header_->flags)
                          .load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::uint64_t coverage_start_unix_ns() const
+        noexcept {
+        return config_.coverage_start_unix_ns;
     }
 
     [[nodiscard]] bool failed() const noexcept {
@@ -677,6 +747,7 @@ private:
     std::uint64_t published_event_sequence_ = 0U;
     int last_system_error_ = 0;
     bool failed_ = false;
+    bool process_start_coverage_finalized_ = false;
 };
 
 std::string_view CertifiedOrderEventJournalCreateErrorNameV1(
@@ -837,9 +908,23 @@ bool CertifiedOrderEventJournalProducerV1::
            impl_->MarkStartupPrefixRecovered();
 }
 
+bool CertifiedOrderEventJournalProducerV1::
+    FinalizeProcessStartCoverage(
+        std::uint64_t coverage_start_unix_ns) noexcept {
+    return impl_ != nullptr &&
+           impl_->FinalizeProcessStartCoverage(
+               coverage_start_unix_ns);
+}
+
 std::uint32_t CertifiedOrderEventJournalProducerV1::coverage_flags()
     const noexcept {
     return impl_ == nullptr ? 0U : impl_->coverage_flags();
+}
+
+std::uint64_t CertifiedOrderEventJournalProducerV1::
+    coverage_start_unix_ns() const noexcept {
+    return impl_ == nullptr ? 0U
+                            : impl_->coverage_start_unix_ns();
 }
 
 bool CertifiedOrderEventJournalProducerV1::failed() const noexcept {

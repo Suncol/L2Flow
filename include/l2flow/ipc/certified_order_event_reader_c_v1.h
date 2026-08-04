@@ -63,11 +63,19 @@ enum l2flow_certified_order_event_state_v1 {
     L2FLOW_CERTIFIED_ORDER_EVENT_STATE_FROZEN_CONFLICT_V1 = 6,
     L2FLOW_CERTIFIED_ORDER_EVENT_STATE_FROZEN_RESOURCE_V1 = 7,
     L2FLOW_CERTIFIED_ORDER_EVENT_STATE_STOPPED_V1 = 8,
+    L2FLOW_CERTIFIED_ORDER_EVENT_STATE_DEGRADED_V1 = 9,
 };
 
 enum l2flow_certified_order_event_coverage_flag_v1 {
     L2FLOW_CERTIFIED_ORDER_EVENT_COVERAGE_FROM_OPEN_V1 = 1U << 0U,
     L2FLOW_CERTIFIED_ORDER_EVENT_STARTUP_PREFIX_RECOVERED_V1 = 1U << 1U,
+    L2FLOW_CERTIFIED_ORDER_EVENT_COVERAGE_FROM_PROCESS_START_V1 = 1U << 2U,
+};
+
+enum l2flow_certified_order_event_coverage_requirement_v1 {
+    L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_FROM_OPEN_V1 = 0,
+    L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_PROCESS_START_PARTIAL_V1 = 1,
+    L2FLOW_CERTIFIED_ORDER_EVENT_REQUIRE_ANY_EXPLICIT_V1 = 2,
 };
 
 typedef struct l2flow_certified_order_event_expected_session_v1 {
@@ -83,12 +91,13 @@ typedef struct l2flow_certified_order_event_session_v1 {
     uint64_t event_capacity;
     uint32_t trade_date;
     uint32_t coverage_flags;
-    uint8_t reserved[24];
+    uint64_t coverage_start_unix_ns;
+    uint8_t reserved[16];
 } l2flow_certified_order_event_session_v1;
 
 // One coherent Tick/Event status cut. Quality and native-gap counters come
 // from the CERTIFIED Tick header; the Event fields describe the append-only
-// full-day journal. Only rows at or below coherent_canonical_apply_frontier
+// canonical journal. Only rows at or below coherent_canonical_apply_frontier
 // are returned by read APIs.
 typedef struct l2flow_certified_order_event_status_v1 {
     uint32_t status_schema_version;
@@ -145,6 +154,7 @@ l2flow_certified_order_event_reader_open_v1(
     const char* absolute_control_socket_path,
     const l2flow_certified_order_event_expected_session_v1*
         expected_session,
+    uint32_t coverage_requirement,
     uint32_t timeout_ms,
     l2flow_certified_order_event_reader_v1** output,
     int* system_error_number);

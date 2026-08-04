@@ -30,11 +30,14 @@ using l2flow::realtime::NativeSequenceRecoveryConfigV1;
 using l2flow::realtime::NativeSequenceRecoveryCoordinatorV1;
 using l2flow::realtime::NativeSequenceRecoveryCreateErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryFreezeReasonV1;
+using l2flow::realtime::NativeSequenceOriginPolicyV1;
 using l2flow::realtime::NativeSequenceRecoveryObserveDispositionV1;
 using l2flow::realtime::NativeSequenceRecoveryObserveErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryObserveResultV1;
 using l2flow::realtime::NativeSequenceRecoveryPollErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryRecordClassV1;
+using l2flow::realtime::NativeSequenceRecoveryRegisterOriginErrorV1;
+using l2flow::realtime::NativeSequenceRecoverySealErrorV1;
 using l2flow::realtime::NativeSequenceRecoveryTokenV1;
 using l2flow::sdk::MessageKey;
 
@@ -144,6 +147,16 @@ std::unique_ptr<NativeSequenceRecoveryCoordinatorV1> MakeCoordinator(
     return output;
 }
 
+NativeSequenceRecoveryConfigV1 ProcessStartConfig(
+    std::uint64_t maximum_backward_displacement) {
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.origin_policy =
+        NativeSequenceOriginPolicyV1::kBoundedProcessStart;
+    config.maximum_backward_displacement =
+        maximum_backward_displacement;
+    return config;
+}
+
 bool Observe(
     NativeSequenceRecoveryCoordinatorV1* coordinator,
     const NativeSequenceDescriptorV1& descriptor,
@@ -169,6 +182,33 @@ bool Apply(
             descriptor, key, payload, cookie, output) ==
             NativeSequenceRecoveryApplyErrorV1::kNone,
         "key-based apply returns no API error");
+}
+
+bool ObserveAndApply(
+    NativeSequenceRecoveryCoordinatorV1* coordinator,
+    const NativeSequenceDescriptorV1& descriptor,
+    const MessageKey& key,
+    std::uint64_t cookie,
+    NativeSequenceRecoveryObserveResultV1* observed = nullptr) {
+    NativeSequenceRecoveryObserveResultV1 local_observed{};
+    NativeSequenceRecoveryApplyResultV1 applied{};
+    NativeSequenceRecoveryObserveResultV1* observation =
+        observed == nullptr ? &local_observed : observed;
+    const auto payload = Payload(
+        static_cast<std::uint32_t>(cookie));
+    return Observe(
+               coordinator,
+               descriptor,
+               key,
+               NativeSequenceRecoveryRecordClassV1::kTarget,
+               observation) &&
+           Apply(
+               coordinator,
+               descriptor,
+               key,
+               payload,
+               cookie,
+               &applied);
 }
 
 bool PollAndCommit(
@@ -1078,6 +1118,314 @@ bool TestChannelAndReorderBounds() {
     return ok;
 }
 
+bool TestShenzhenFieldSequenceWithTrustedOrigin() {
+    bool ok = true;
+    auto coordinator = MakeCoordinator(
+        ProcessStartConfig(2U), &ok);
+    if (!coordinator) {
+        return false;
+    }
+    const NativeSequenceChannelV1 domain{
+        NativeSequenceMarketV1::kShenzhen, 2013U};
+    ok &= Expect(
+        coordinator->RegisterTrustedOrigin(
+            domain, 32'447'397U, 32'447'396U) ==
+            NativeSequenceRecoveryRegisterOriginErrorV1::kNone,
+        "register trusted Shenzhen process-start frontier");
+
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 32'447'398U),
+        kShenzhenOrder,
+        11U);
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 32'447'399U),
+        kShenzhenOrder,
+        12U);
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        coordinator->PollCertified(&ready) ==
+            NativeSequenceRecoveryPollErrorV1::kNotReady,
+        "6.33 callbacks above the trusted frontier wait for 6.36");
+
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 32'447'397U),
+        kShenzhenTransaction,
+        13U);
+    ok &= PollAndCommit(
+        coordinator.get(), 32'447'397U, 13U);
+    ok &= PollAndCommit(
+        coordinator.get(), 32'447'398U, 11U);
+    ok &= PollAndCommit(
+        coordinator.get(), 32'447'399U, 12U);
+
+    NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
+    ok &= Expect(
+        coordinator->ChannelSnapshot(domain, &snapshot) &&
+            snapshot.state ==
+                NativeSequenceRecoveryChannelStateV1::kHealthy &&
+            snapshot.certified_sequence == 32'447'399U,
+        "6.33 and 6.36 drain through one Shenzhen channel domain");
+    return ok;
+}
+
+bool TestBoundedProcessStartBootstrapAndCorrectionEpoch() {
+    bool ok = true;
+    auto coordinator = MakeCoordinator(
+        ProcessStartConfig(2U), &ok);
+    if (!coordinator) {
+        return false;
+    }
+    const NativeSequenceChannelV1 domain{
+        NativeSequenceMarketV1::kShenzhen, 2013U};
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 98U),
+        kShenzhenOrder,
+        11U,
+        &observed);
+    ok &= Expect(
+        observed.channel_state ==
+                NativeSequenceRecoveryChannelStateV1::kBootstrapping &&
+            observed.origin_sequence == 0U,
+        "unknown process-start origin remains provisional after 98");
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 99U),
+        kShenzhenOrder,
+        12U,
+        &observed);
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        coordinator->PollCertified(&ready) ==
+            NativeSequenceRecoveryPollErrorV1::kNotReady,
+        "98 and 99 do not establish a D=2 origin");
+
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 97U),
+        kShenzhenTransaction,
+        13U,
+        &observed);
+    ok &= Expect(
+        observed.origin_sequence == 97U &&
+            observed.observed_contiguous_sequence == 99U,
+        "H-minus-m equal to D establishes the proven origin");
+    ok &= PollAndCommit(coordinator.get(), 97U, 13U);
+    ok &= PollAndCommit(coordinator.get(), 98U, 11U);
+    ok &= PollAndCommit(coordinator.get(), 99U, 12U);
+
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 101U),
+        kShenzhenTransaction,
+        15U);
+    NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
+    ok &= Expect(
+        coordinator->ChannelSnapshot(domain, &snapshot) &&
+            snapshot.channel_correction_epoch == 1U &&
+            snapshot.missing_sequences == 1U,
+        "an open native gap does not advance the channel epoch");
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2013U, 100U),
+        kShenzhenOrder,
+        14U);
+    ok &= Expect(
+        coordinator->ChannelSnapshot(domain, &snapshot) &&
+            snapshot.channel_correction_epoch == 2U &&
+            snapshot.missing_sequences == 0U,
+        "closing one channel gap advances only its correction epoch");
+    ok &= PollAndCommit(coordinator.get(), 100U, 14U);
+    ok &= PollAndCommit(coordinator.get(), 101U, 15U);
+
+    ok &= Observe(
+        coordinator.get(),
+        Shenzhen(2013U, 96U),
+        kShenzhenTransaction,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Expect(
+        observed.disposition ==
+                NativeSequenceRecoveryObserveDispositionV1::
+                    kResourceFrozen,
+        "a post-bootstrap callback beyond D freezes its channel");
+    ok &= Expect(
+        coordinator->ChannelSnapshot(domain, &snapshot) &&
+            snapshot.freeze_reason ==
+                NativeSequenceRecoveryFreezeReasonV1::
+                    kReorderBoundExceeded,
+        "the channel reports the violated callback disorder bound");
+
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2014U, 202U),
+        kShenzhenOrder,
+        21U);
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2014U, 203U),
+        kShenzhenTransaction,
+        22U);
+    ok &= ObserveAndApply(
+        coordinator.get(),
+        Shenzhen(2014U, 201U),
+        kShenzhenOrder,
+        23U);
+    ok &= PollAndCommit(coordinator.get(), 201U, 23U);
+    ok &= PollAndCommit(coordinator.get(), 202U, 21U);
+    ok &= PollAndCommit(coordinator.get(), 203U, 22U);
+    const NativeSequenceChannelV1 healthy_domain{
+        NativeSequenceMarketV1::kShenzhen, 2014U};
+    ok &= Expect(
+        coordinator->ChannelSnapshot(healthy_domain, &snapshot) &&
+            snapshot.state ==
+                NativeSequenceRecoveryChannelStateV1::kHealthy &&
+            coordinator->Snapshot().frozen_channel_count == 1U,
+        "a frozen Shenzhen channel does not block another channel");
+    return ok;
+}
+
+bool TestFilteredBootstrapAndTerminalSeal() {
+    bool ok = true;
+    auto filtered = MakeCoordinator(ProcessStartConfig(2U), &ok);
+    if (!filtered) {
+        return false;
+    }
+    ok &= ObserveAndApply(
+        filtered.get(),
+        Shenzhen(2013U, 98U),
+        kShenzhenOrder,
+        98U);
+    ok &= ObserveAndApply(
+        filtered.get(),
+        Shenzhen(2013U, 99U),
+        kShenzhenTransaction,
+        99U);
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    ok &= Observe(
+        filtered.get(),
+        Shenzhen(2013U, 97U),
+        kShenzhenOrder,
+        NativeSequenceRecoveryRecordClassV1::kFiltered,
+        &observed);
+    NativeSequenceCertifiedReadyV1 ready{};
+    ok &= Expect(
+        filtered->PollCertified(&ready) ==
+                NativeSequenceRecoveryPollErrorV1::kNone &&
+            ready.record_class ==
+                NativeSequenceRecoveryRecordClassV1::kFiltered &&
+            ready.descriptor.sequence == 97U,
+        "a filtered native position establishes and advances origin");
+    ok &= Expect(
+        filtered->CommitCertified(ready.token) ==
+            NativeSequenceRecoveryCommitErrorV1::kNone,
+        "commit filtered bootstrap position");
+    ok &= PollAndCommit(filtered.get(), 98U, 98U);
+    ok &= PollAndCommit(filtered.get(), 99U, 99U);
+
+    auto sealed = MakeCoordinator(ProcessStartConfig(4U), &ok);
+    if (!sealed) {
+        return false;
+    }
+    ok &= ObserveAndApply(
+        sealed.get(),
+        Shenzhen(2013U, 98U),
+        kShenzhenOrder,
+        98U);
+    ok &= ObserveAndApply(
+        sealed.get(),
+        Shenzhen(2013U, 100U),
+        kShenzhenTransaction,
+        100U);
+    ok &= ObserveAndApply(
+        sealed.get(),
+        Shenzhen(2014U, 201U),
+        kShenzhenOrder,
+        201U);
+    ok &= ObserveAndApply(
+        sealed.get(),
+        Shenzhen(2014U, 202U),
+        kShenzhenTransaction,
+        202U);
+    ok &= Expect(
+        sealed->SealInput() ==
+            NativeSequenceRecoverySealErrorV1::kNone,
+        "terminal barrier seals process-start input");
+
+    NativeSequenceRecoveryChannelSnapshotV1 snapshot{};
+    ok &= Expect(
+        sealed->ChannelSnapshot(
+            Shenzhen(2013U, 98U).domain, &snapshot) &&
+            snapshot.state ==
+                NativeSequenceRecoveryChannelStateV1::
+                    kFrozenResource &&
+            snapshot.freeze_reason ==
+                NativeSequenceRecoveryFreezeReasonV1::
+                    kInputSealedIncomplete,
+        "SealInput reports a true min-to-max native hole");
+    ok &= PollAndCommit(sealed.get(), 201U, 201U);
+    ok &= PollAndCommit(sealed.get(), 202U, 202U);
+    ok &= Expect(
+        sealed->ChannelSnapshot(
+            Shenzhen(2014U, 201U).domain, &snapshot) &&
+            snapshot.state ==
+                NativeSequenceRecoveryChannelStateV1::kHealthy,
+        "SealInput flushes a contiguous low-volume channel");
+    ok &= Expect(
+        sealed->Observe(
+            Shenzhen(2014U, 203U),
+            kShenzhenOrder,
+            NativeSequenceRecoveryRecordClassV1::kTarget,
+            &observed) ==
+            NativeSequenceRecoveryObserveErrorV1::kInputSealed,
+        "sealed coordinator rejects later observations");
+
+    auto unmatched = MakeCoordinator(ProcessStartConfig(4U), &ok);
+    if (!unmatched) {
+        return false;
+    }
+    NativeSequenceRecoveryObserveResultV1 unmatched_observed{};
+    NativeSequenceRecoveryApplyResultV1 unmatched_applied{};
+    const auto unmatched_descriptor = Shenzhen(2015U, 301U);
+    const auto unmatched_payload = Payload(301U);
+    ok &= Observe(
+        unmatched.get(),
+        unmatched_descriptor,
+        kShenzhenOrder,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &unmatched_observed);
+    ok &= Apply(
+        unmatched.get(),
+        unmatched_descriptor,
+        kShenzhenOrder,
+        unmatched_payload,
+        301U,
+        &unmatched_applied);
+    ok &= Apply(
+        unmatched.get(),
+        unmatched_descriptor,
+        kShenzhenOrder,
+        unmatched_payload,
+        301U,
+        &unmatched_applied);
+    ok &= Expect(
+        unmatched->SealInput() ==
+            NativeSequenceRecoverySealErrorV1::kNone &&
+            unmatched->ChannelSnapshot(
+                unmatched_descriptor.domain, &snapshot) &&
+            snapshot.state ==
+                NativeSequenceRecoveryChannelStateV1::kFrozenResource &&
+            snapshot.freeze_reason ==
+                NativeSequenceRecoveryFreezeReasonV1::
+                    kInputSealedIncomplete,
+        "SealInput rejects unmatched observe/apply handoffs");
+    return ok;
+}
+
 bool TestConfigurationValidation() {
     bool ok = true;
     std::unique_ptr<NativeSequenceRecoveryCoordinatorV1> coordinator;
@@ -1164,6 +1512,9 @@ int main() {
     ok &= TestRetentionOutsideAndAbaToken();
     ok &= TestResourceBoundsAndChannelIsolation();
     ok &= TestChannelAndReorderBounds();
+    ok &= TestShenzhenFieldSequenceWithTrustedOrigin();
+    ok &= TestBoundedProcessStartBootstrapAndCorrectionEpoch();
+    ok &= TestFilteredBootstrapAndTerminalSeal();
     ok &= TestConfigurationValidation();
     if (!ok) {
         return 1;
