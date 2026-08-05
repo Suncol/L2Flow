@@ -49,75 +49,10 @@ constexpr std::int64_t kNullI64 =
     static_assert(type::ServiceVer == (version));                            \
     static_assert(type::MessageID == (message))
 
-L2FLOW_ASSERT_MESSAGE_KEY(sh::SHL2MarketData, 4, 101, 4);
 L2FLOW_ASSERT_MESSAGE_KEY(sh::NGTSTick, 4, 101, 24);
-L2FLOW_ASSERT_MESSAGE_KEY(sz::Snapshot300111_v2, 6, 101, 28);
 L2FLOW_ASSERT_MESSAGE_KEY(sz::Order300192_v2, 6, 101, 33);
 L2FLOW_ASSERT_MESSAGE_KEY(sz::Transaction300191_v2, 6, 101, 36);
 
-static_assert(sizeof(sh::SHL2MarketData) == 248U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, UpdateTime, 0U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, SecurityID, 4U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, ImageStatus, 10U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, PreCloPrice, 14U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, OpenPrice, 18U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, HighPrice, 22U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, LowPrice, 26U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, LastPrice, 30U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, ClosePrice, 34U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, InstruStatus, 38U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TradNumber, 44U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TradVolume, 48U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, Turnover, 56U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TotalBidVol, 64U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WAvgBidPri, 72U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, AltWAvgBidPri, 76U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TotalAskVol, 80U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WAvgAskPri, 88U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, AltWAvgAskPri, 92U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, EtfBuyNumber, 96U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, EtfBuyVolume, 100U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, EtfBuyMoney, 108U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, EtfSellNumber, 116U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, EtfSellVolume, 120U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, ETFSellMoney, 128U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, YieldToMatu, 136U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TotWarExNum, 140U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WarLowerPri, 148U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WarUpperPri, 156U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WiDBuyNum, 164U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WiDBuyVol, 168U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WiDBuyMon, 176U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WiDSellNum, 184U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WiDSellVol, 188U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, WiDSellMon, 196U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TotBidNum, 204U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, TotSellNum, 208U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, MaxBidDur, 212U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, MaxSellDur, 216U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, BidNum, 220U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, SellNum, 224U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, BidLevels, 228U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, SellLevels, 236U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData, IOPV, 244U);
-static_assert(sizeof(sh::SHL2MarketData::BidLevelsItem) == 28U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::BidLevelsItem, OrderPrice, 4U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::BidLevelsItem, OrderVol, 8U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::BidLevelsItem, OrderNum, 16U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::BidLevelsItem, NOrders, 20U);
-static_assert(
-    sizeof(sh::SHL2MarketData::BidLevelsItem::NOrdersItem) == 16U);
-L2FLOW_ASSERT_OFFSET(
-    sh::SHL2MarketData::BidLevelsItem::NOrdersItem, OrderQty, 8U);
-static_assert(sizeof(sh::SHL2MarketData::SellLevelsItem) == 28U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::SellLevelsItem, OrderPrice, 4U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::SellLevelsItem, OrderVol, 8U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::SellLevelsItem, OrderNum, 16U);
-L2FLOW_ASSERT_OFFSET(sh::SHL2MarketData::SellLevelsItem, NoOrders, 20U);
-static_assert(
-    sizeof(sh::SHL2MarketData::SellLevelsItem::NoOrdersItem) == 16U);
-L2FLOW_ASSERT_OFFSET(
-    sh::SHL2MarketData::SellLevelsItem::NoOrdersItem, OrderQty, 8U);
 
 static_assert(sizeof(sh::NGTSTick) == 70U);
 L2FLOW_ASSERT_OFFSET(sh::NGTSTick, BizIndex, 0U);
@@ -132,55 +67,6 @@ L2FLOW_ASSERT_OFFSET(sh::NGTSTick, Qty, 48U);
 L2FLOW_ASSERT_OFFSET(sh::NGTSTick, TradeMoney, 56U);
 L2FLOW_ASSERT_OFFSET(sh::NGTSTick, TickBSFlag, 64U);
 
-static_assert(sizeof(sz::Snapshot300111_v2) == 224U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, UpdateTime, 0U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, ChannelNo, 4U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, MDStreamID, 8U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, SecurityID, 14U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, SecurityIDSource, 20U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, TradingPhaseCode, 26U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, PreCloPrice, 32U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, TurnNum, 40U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, Volume, 48U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, Turnover, 56U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, LastPrice, 64U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, OpenPrice, 72U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, HighPrice, 80U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, LowPrice, 88U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, DifPrice1, 96U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, DifPrice2, 104U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, PE1, 112U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, PE2, 120U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, PreCloseIOPV, 128U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, IOPV, 136U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, TotalOfferQty, 144U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, WeightedAvgOfferPx, 152U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, TotalBidQty, 160U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, WeightedAvgBidPx, 168U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, HighLimitPrice, 176U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, LowLimitPrice, 184U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, OpenInt, 192U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, OptPremiumRatio, 200U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, BidPriceLevel, 208U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2, AskPriceLevel, 216U);
-static_assert(sizeof(sz::Snapshot300111_v2::BidPriceLevelItem) == 28U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::BidPriceLevelItem, Volume, 0U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::BidPriceLevelItem, Price, 8U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::BidPriceLevelItem, NumOrders, 16U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::BidPriceLevelItem, Orders, 20U);
-static_assert(
-    sizeof(sz::Snapshot300111_v2::BidPriceLevelItem::OrdersItem) == 8U);
-L2FLOW_ASSERT_OFFSET(
-    sz::Snapshot300111_v2::BidPriceLevelItem::OrdersItem, OrderQty, 0U);
-static_assert(sizeof(sz::Snapshot300111_v2::AskPriceLevelItem) == 28U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::AskPriceLevelItem, Volume, 0U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::AskPriceLevelItem, Price, 8U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::AskPriceLevelItem, NumOrders, 16U);
-L2FLOW_ASSERT_OFFSET(sz::Snapshot300111_v2::AskPriceLevelItem, Orders, 20U);
-static_assert(
-    sizeof(sz::Snapshot300111_v2::AskPriceLevelItem::OrdersItem) == 8U);
-L2FLOW_ASSERT_OFFSET(
-    sz::Snapshot300111_v2::AskPriceLevelItem::OrdersItem, OrderQty, 0U);
 
 static_assert(sizeof(sz::Order300192_v2) == 58U);
 L2FLOW_ASSERT_OFFSET(sz::Order300192_v2, ChannelNo, 0U);
@@ -208,29 +94,11 @@ L2FLOW_ASSERT_OFFSET(sz::Transaction300191_v2, ExecType, 62U);
 L2FLOW_ASSERT_OFFSET(sz::Transaction300191_v2, TransactTime, 66U);
 
 static_assert(std::is_same_v<
-              decltype(sh::SHL2MarketData::PreCloPrice),
-              datayes::mdl::MDLFloatT<3>>);
-static_assert(std::is_same_v<
-              decltype(sh::SHL2MarketData::Turnover),
-              datayes::mdl::MDLDoubleT<5>>);
-static_assert(std::is_same_v<
-              decltype(sh::SHL2MarketData::WarLowerPri),
-              datayes::mdl::MDLDoubleT<3>>);
-static_assert(std::is_same_v<
-              decltype(sh::SHL2MarketData::WarUpperPri),
-              datayes::mdl::MDLDoubleT<5>>);
-static_assert(std::is_same_v<
               decltype(sh::NGTSTick::Price),
               datayes::mdl::MDLFloatT<3>>);
 static_assert(std::is_same_v<
               decltype(sh::NGTSTick::TradeMoney),
               datayes::mdl::MDLDoubleT<3>>);
-static_assert(std::is_same_v<
-              decltype(sz::Snapshot300111_v2::PreCloPrice),
-              datayes::mdl::MDLDoubleT<4>>);
-static_assert(std::is_same_v<
-              decltype(sz::Snapshot300111_v2::LastPrice),
-              datayes::mdl::MDLDoubleT<6>>);
 static_assert(std::is_same_v<
               decltype(sz::Order300192_v2::Price),
               datayes::mdl::MDLDoubleT<4>>);
@@ -464,20 +332,6 @@ MarketDecodeErrorV1 NormalizeDecimalP6(
     return MarketDecodeErrorV1::kNone;
 }
 
-MarketDecodeErrorV1 DecodeDecimal(
-    std::int64_t raw,
-    std::uint8_t scale,
-    std::int64_t null_value,
-    std::uint64_t* quality_flags,
-    DecimalValueV1* output) noexcept {
-    const MarketDecodeErrorV1 load_error = LoadDecimalRaw(
-        raw, scale, null_value, quality_flags, output);
-    if (load_error != MarketDecodeErrorV1::kNone) {
-        return load_error;
-    }
-    return NormalizeDecimalP6(output);
-}
-
 MarketDecodeErrorV1 LoadDecimalI32Raw(
     std::span<const std::byte> body,
     std::size_t offset,
@@ -506,20 +360,6 @@ MarketDecodeErrorV1 LoadDecimalI64Raw(
         raw, scale, kNullI64, quality_flags, output);
 }
 
-MarketDecodeErrorV1 DecodeDecimalI64(
-    std::span<const std::byte> body,
-    std::size_t offset,
-    std::uint8_t scale,
-    std::uint64_t* quality_flags,
-    DecimalValueV1* output) noexcept {
-    std::int64_t raw = 0;
-    if (!LoadI64(body, offset, &raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    return DecodeDecimal(
-        raw, scale, kNullI64, quality_flags, output);
-}
-
 MarketDecodeErrorV1 NormalizeStrictlyPositivePriceP6(
     DecimalValueV1* output,
     std::uint64_t* market_notices) noexcept {
@@ -538,61 +378,6 @@ MarketDecodeErrorV1 NormalizeStrictlyPositivePriceP6(
         return MarketDecodeErrorV1::kNone;
     }
     return NormalizeDecimalP6(output);
-}
-
-MarketDecodeErrorV1 DecodeStrictlyPositivePriceI32(
-    std::span<const std::byte> body,
-    std::size_t offset,
-    std::uint8_t scale,
-    std::uint64_t* quality_flags,
-    std::uint64_t* market_notices,
-    DecimalValueV1* output) noexcept {
-    const MarketDecodeErrorV1 error = LoadDecimalI32Raw(
-        body, offset, scale, quality_flags, output);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    return NormalizeStrictlyPositivePriceP6(output, market_notices);
-}
-
-MarketDecodeErrorV1 DecodeStrictlyPositivePriceI64(
-    std::span<const std::byte> body,
-    std::size_t offset,
-    std::uint8_t scale,
-    std::uint64_t* quality_flags,
-    std::uint64_t* market_notices,
-    DecimalValueV1* output) noexcept {
-    const MarketDecodeErrorV1 error = LoadDecimalI64Raw(
-        body, offset, scale, quality_flags, output);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    return NormalizeStrictlyPositivePriceP6(output, market_notices);
-}
-
-MarketDecodeErrorV1 LoadQuantityI64Raw(
-    std::span<const std::byte> body,
-    std::size_t offset,
-    std::uint8_t scale,
-    bool nullable,
-    std::uint64_t* quality_flags,
-    QuantityValueV1* output) noexcept {
-    if (quality_flags == nullptr || output == nullptr) {
-        return MarketDecodeErrorV1::kInvalidInput;
-    }
-    std::int64_t raw = 0;
-    if (!LoadI64(body, offset, &raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    output->raw = raw;
-    output->scale = scale;
-    if (nullable && raw == kNullI64) {
-        output->is_null = true;
-        *quality_flags |= QualityBit(QualityFlagV1::kNullValuePresent);
-    }
-    // valid remains false: this helper is for exact raw retention when a
-    // versioned product-applicability contract is unavailable.
-    return MarketDecodeErrorV1::kNone;
 }
 
 MarketDecodeErrorV1 DecodeQuantityI64(
@@ -716,411 +501,6 @@ void MarkInstrumentAwaitingCatalogIdentity(
         QualityBit(QualityFlagV1::kInstrumentUnknown);
     common->quality_flags |=
         QualityBit(QualityFlagV1::kQtyUnitUnknown);
-}
-
-MarketDecodeErrorV1 DecodeShLevel(
-    CheckedBodyViewV1* view,
-    const CheckedBodyRangeV1& levels,
-    std::size_t level_index,
-    bool bid,
-    const MarketDecoderLimitsV1& limits,
-    std::uint64_t* quality_flags,
-    std::uint64_t* market_notices,
-    BookLevelV1* retained_level,
-    BestQueueV1* best_queue) noexcept {
-    const std::size_t level_offset =
-        levels.start + level_index * levels.item_bytes;
-    BookLevelV1 local_level{};
-    MarketDecodeErrorV1 error = DecodeStrictlyPositivePriceI32(
-        view->body(), level_offset + 4U, 3U,
-        quality_flags, market_notices, &local_level.price);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    error = DecodeQuantityI64(
-        view->body(), level_offset + 8U, 3U, true,
-        quality_flags, market_notices, &local_level.quantity);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    if (!LoadUnsigned(
-            view->body(), level_offset + 16U,
-            &local_level.order_count)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    local_level.order_count_valid = true;
-
-    CheckedBodyRangeV1 queue;
-    const CheckedBodyErrorV1 body_error = view->ReadList(
-        level_offset + 20U,
-        16U,
-        sizeof(sh::SHL2MarketData),
-        limits.maximum_queue_items,
-        &queue);
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    if (queue.count > local_level.order_count) {
-        return MarketDecodeErrorV1::kCountMismatch;
-    }
-    if (queue.count > kMaximumPublicQueueV1) {
-        *quality_flags |=
-            QualityBit(QualityFlagV1::kQueueTruncatedTo50);
-    }
-    for (std::size_t index = 0U; index < queue.count; ++index) {
-        QuantityValueV1 quantity{};
-        error = DecodeQuantityI64(
-            view->body(),
-            queue.start + index * queue.item_bytes + 8U,
-            3U,
-            true,
-            quality_flags,
-            market_notices,
-            &quantity);
-        if (error != MarketDecodeErrorV1::kNone) {
-            return error;
-        }
-        if (level_index == 0U && index < kMaximumPublicQueueV1) {
-            best_queue->quantities[index] = quantity;
-        }
-    }
-    if (level_index == 0U) {
-        best_queue->total_order_count = local_level.order_count;
-        best_queue->actual_revealed_count =
-            static_cast<std::uint32_t>(queue.count);
-        best_queue->retained_count = static_cast<std::uint32_t>(
-            std::min(queue.count, kMaximumPublicQueueV1));
-    }
-    if (retained_level != nullptr) {
-        *retained_level = local_level;
-    }
-    static_cast<void>(bid);
-    return MarketDecodeErrorV1::kNone;
-}
-
-MarketDecodeErrorV1 DecodeSzLevel(
-    CheckedBodyViewV1* view,
-    const CheckedBodyRangeV1& levels,
-    std::size_t level_index,
-    const MarketDecoderLimitsV1& limits,
-    std::uint64_t* quality_flags,
-    std::uint64_t* market_notices,
-    BookLevelV1* retained_level,
-    BestQueueV1* best_queue) noexcept {
-    const std::size_t level_offset =
-        levels.start + level_index * levels.item_bytes;
-    BookLevelV1 local_level{};
-    MarketDecodeErrorV1 error = DecodeQuantityI64(
-        view->body(), level_offset, 0U, false,
-        quality_flags, market_notices, &local_level.quantity);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    error = DecodeStrictlyPositivePriceI64(
-        view->body(), level_offset + 8U, 6U,
-        quality_flags, market_notices, &local_level.price);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    if (!LoadUnsigned(
-            view->body(), level_offset + 16U,
-            &local_level.order_count)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    local_level.order_count_valid = true;
-
-    CheckedBodyRangeV1 queue;
-    const CheckedBodyErrorV1 body_error = view->ReadList(
-        level_offset + 20U,
-        8U,
-        sizeof(sz::Snapshot300111_v2),
-        limits.maximum_queue_items,
-        &queue);
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    if (queue.count > local_level.order_count) {
-        return MarketDecodeErrorV1::kCountMismatch;
-    }
-    if (queue.count > kMaximumPublicQueueV1) {
-        *quality_flags |=
-            QualityBit(QualityFlagV1::kQueueTruncatedTo50);
-    }
-    for (std::size_t index = 0U; index < queue.count; ++index) {
-        QuantityValueV1 quantity{};
-        error = DecodeQuantityI64(
-            view->body(),
-            queue.start + index * queue.item_bytes,
-            0U,
-            false,
-            quality_flags,
-            market_notices,
-            &quantity);
-        if (error != MarketDecodeErrorV1::kNone) {
-            return error;
-        }
-        if (level_index == 0U && index < kMaximumPublicQueueV1) {
-            best_queue->quantities[index] = quantity;
-        }
-    }
-    if (level_index == 0U) {
-        best_queue->total_order_count = local_level.order_count;
-        best_queue->actual_revealed_count =
-            static_cast<std::uint32_t>(queue.count);
-        best_queue->retained_count = static_cast<std::uint32_t>(
-            std::min(queue.count, kMaximumPublicQueueV1));
-    }
-    if (retained_level != nullptr) {
-        *retained_level = local_level;
-    }
-    return MarketDecodeErrorV1::kNone;
-}
-
-void ApplyDepthQuality(
-    std::size_t bid_depth,
-    std::size_t ask_depth,
-    DecodedMarketCommonV1* common) noexcept {
-    if (bid_depth < kMaximumPublicDepthV1 ||
-        ask_depth < kMaximumPublicDepthV1) {
-        common->quality_flags |=
-            QualityBit(QualityFlagV1::kSnapshotDepthShort);
-    }
-    if (bid_depth > kMaximumPublicDepthV1 ||
-        ask_depth > kMaximumPublicDepthV1) {
-        common->market_notices |= MarketNoticeBitV1(
-            MarketNoticeV1::kSnapshotDepthTruncatedTo10);
-    }
-}
-
-MarketDecodeErrorV1 DecodeShanghaiSnapshot(
-    const MarketMessageViewV1& input,
-    const MarketDecoderConfigV1& config,
-    ShanghaiSnapshotV1* output) {
-    CheckedBodyViewV1 view(input.body);
-    CheckedBodyErrorV1 body_error =
-        view.RequireFixed(sizeof(sh::SHL2MarketData));
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    std::uint32_t exchange_time_raw = 0U;
-    if (!LoadUnsigned(input.body, 0U, &exchange_time_raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    ShanghaiSnapshotV1 decoded{};
-    decoded.common = MakeCommon(
-        input,
-        MarketEventKindV1::kShanghaiSnapshot,
-        MarketV1::kShanghai,
-        exchange_time_raw);
-    MarketDecodeErrorV1 error = ReadText(
-        &view, 4U, sizeof(sh::SHL2MarketData),
-        config.limits.maximum_text_bytes, true,
-        &decoded.common.quality_flags,
-        &decoded.common.security_id,
-        &decoded.common.security_id_valid);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    error = ReadText(
-        &view, 38U, sizeof(sh::SHL2MarketData),
-        config.limits.maximum_text_bytes, false,
-        &decoded.common.quality_flags,
-        &decoded.instrument_status,
-        &decoded.instrument_status_valid);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    if (!LoadI32(input.body, 10U, &decoded.image_status)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-
-    const auto price32 = [&](std::size_t offset,
-                             std::uint8_t scale,
-                             DecimalValueV1* value) {
-        return DecodeStrictlyPositivePriceI32(
-            input.body, offset, scale,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, value);
-    };
-    const auto decimal64 = [&](std::size_t offset,
-                               std::uint8_t scale,
-                               DecimalValueV1* value) {
-        return DecodeDecimalI64(
-            input.body, offset, scale,
-            &decoded.common.quality_flags, value);
-    };
-    const auto quantity64 = [&](std::size_t offset,
-                                std::uint8_t scale,
-                                QuantityValueV1* value) {
-        return DecodeQuantityI64(
-            input.body, offset, scale, true,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, value);
-    };
-#define L2FLOW_DECODE_OR_RETURN(expression)                                  \
-    do {                                                                     \
-        error = (expression);                                                \
-        if (error != MarketDecodeErrorV1::kNone) {                          \
-            return error;                                                    \
-        }                                                                    \
-    } while (false)
-    L2FLOW_DECODE_OR_RETURN(price32(14U, 3U, &decoded.pre_close_price));
-    L2FLOW_DECODE_OR_RETURN(price32(18U, 3U, &decoded.open_price));
-    L2FLOW_DECODE_OR_RETURN(price32(22U, 3U, &decoded.high_price));
-    L2FLOW_DECODE_OR_RETURN(price32(26U, 3U, &decoded.low_price));
-    L2FLOW_DECODE_OR_RETURN(price32(30U, 3U, &decoded.last_price));
-    L2FLOW_DECODE_OR_RETURN(price32(34U, 3U, &decoded.close_price));
-    if (!LoadUnsigned(input.body, 44U, &decoded.trade_count)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    L2FLOW_DECODE_OR_RETURN(quantity64(48U, 3U, &decoded.trade_volume));
-    L2FLOW_DECODE_OR_RETURN(decimal64(56U, 5U, &decoded.turnover));
-    L2FLOW_DECODE_OR_RETURN(quantity64(64U, 3U, &decoded.total_bid_volume));
-    L2FLOW_DECODE_OR_RETURN(price32(
-        72U, 3U, &decoded.weighted_average_bid_price));
-    L2FLOW_DECODE_OR_RETURN(price32(
-        76U, 3U, &decoded.alternate_weighted_average_bid_price));
-    L2FLOW_DECODE_OR_RETURN(quantity64(80U, 3U, &decoded.total_ask_volume));
-    L2FLOW_DECODE_OR_RETURN(price32(
-        88U, 3U, &decoded.weighted_average_ask_price));
-    L2FLOW_DECODE_OR_RETURN(price32(
-        92U, 3U, &decoded.alternate_weighted_average_ask_price));
-    if (!LoadUnsigned(
-            input.body, 96U, &decoded.vendor_etf_buy_count.raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
-        input.body, 100U, 3U, true,
-        &decoded.common.quality_flags,
-        &decoded.vendor_etf_buy_quantity));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 108U, 5U,
-        &decoded.common.quality_flags,
-        &decoded.vendor_etf_buy_amount));
-    if (!LoadUnsigned(
-            input.body, 116U, &decoded.vendor_etf_sell_count.raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
-        input.body, 120U, 3U, true,
-        &decoded.common.quality_flags,
-        &decoded.vendor_etf_sell_quantity));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 128U, 5U,
-        &decoded.common.quality_flags,
-        &decoded.vendor_etf_sell_amount));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI32Raw(
-        input.body, 136U, 4U,
-        &decoded.common.quality_flags,
-        &decoded.yield_to_maturity));
-    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
-        input.body, 140U, 3U, true,
-        &decoded.common.quality_flags,
-        &decoded.total_warrant_exercise_quantity));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 148U, 3U, &decoded.common.quality_flags,
-        &decoded.vendor_war_lower_value));
-    decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kVendorWarLowerSemanticsUnknown);
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 156U, 5U, &decoded.common.quality_flags,
-        &decoded.vendor_war_upper_value));
-    decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kVendorWarUpperSemanticsUnknown);
-    decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kProductApplicabilityUnknown);
-    if (!LoadUnsigned(input.body, 164U, &decoded.withdrawal_buy_count)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    L2FLOW_DECODE_OR_RETURN(quantity64(
-        168U, 3U, &decoded.withdrawal_buy_volume));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
-        176U, 5U, &decoded.withdrawal_buy_amount));
-    if (!LoadUnsigned(input.body, 184U, &decoded.withdrawal_sell_count)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    L2FLOW_DECODE_OR_RETURN(quantity64(
-        188U, 3U, &decoded.withdrawal_sell_volume));
-    L2FLOW_DECODE_OR_RETURN(decimal64(
-        196U, 5U, &decoded.withdrawal_sell_amount));
-    if (!LoadUnsigned(
-            input.body, 204U, &decoded.total_bid_order_count) ||
-        !LoadUnsigned(
-            input.body, 208U, &decoded.total_ask_order_count) ||
-        !LoadUnsigned(
-            input.body, 212U, &decoded.maximum_bid_duration.raw) ||
-        !LoadUnsigned(
-            input.body, 216U, &decoded.maximum_ask_duration.raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    decoded.maximum_bid_duration.valid =
-        decoded.maximum_bid_duration.raw !=
-        std::numeric_limits<std::uint32_t>::max();
-    decoded.maximum_ask_duration.valid =
-        decoded.maximum_ask_duration.raw !=
-        std::numeric_limits<std::uint32_t>::max();
-    if (!decoded.maximum_bid_duration.valid ||
-        !decoded.maximum_ask_duration.valid) {
-        decoded.common.market_notices |= MarketNoticeBitV1(
-            MarketNoticeV1::kMaximumDurationUnavailable);
-    }
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI32Raw(
-        input.body, 244U, 3U,
-        &decoded.common.quality_flags, &decoded.iopv));
-
-    CheckedBodyRangeV1 bids;
-    body_error = view.ReadList(
-        228U, 28U, sizeof(sh::SHL2MarketData),
-        config.limits.maximum_depth_items, &bids);
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    CheckedBodyRangeV1 asks;
-    body_error = view.ReadList(
-        236U, 28U, sizeof(sh::SHL2MarketData),
-        config.limits.maximum_depth_items, &asks);
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    // SHL2MarketData::BidNum/SellNum are independent feed counters, not the
-    // MDLListT lengths.  Live continuous-trading messages routinely carry,
-    // for example, BidNum=43 and SellNum=74 while both level lists contain
-    // the published ten-depth book.  The list descriptors are the only
-    // authoritative bounds for the following dynamic level payloads.
-    decoded.book.actual_bid_depth = static_cast<std::uint32_t>(bids.count);
-    decoded.book.actual_ask_depth = static_cast<std::uint32_t>(asks.count);
-    decoded.book.retained_bid_depth = static_cast<std::uint32_t>(
-        std::min(bids.count, kMaximumPublicDepthV1));
-    decoded.book.retained_ask_depth = static_cast<std::uint32_t>(
-        std::min(asks.count, kMaximumPublicDepthV1));
-    for (std::size_t index = 0U; index < bids.count; ++index) {
-        BookLevelV1* retained =
-            index < kMaximumPublicDepthV1
-                ? &decoded.book.bids[index]
-                : nullptr;
-        L2FLOW_DECODE_OR_RETURN(DecodeShLevel(
-            &view, bids, index, true, config.limits,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, retained,
-            &decoded.book.bid1_queue));
-    }
-    for (std::size_t index = 0U; index < asks.count; ++index) {
-        BookLevelV1* retained =
-            index < kMaximumPublicDepthV1
-                ? &decoded.book.asks[index]
-                : nullptr;
-        L2FLOW_DECODE_OR_RETURN(DecodeShLevel(
-            &view, asks, index, false, config.limits,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, retained,
-            &decoded.book.ask1_queue));
-    }
-    ApplyDepthQuality(bids.count, asks.count, &decoded.common);
-    ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
-    *output = std::move(decoded);
-    return MarketDecodeErrorV1::kNone;
-#undef L2FLOW_DECODE_OR_RETURN
 }
 
 TradingPhaseV1 ParseShPhase(std::string_view value) noexcept {
@@ -1418,194 +798,6 @@ MarketDecodeErrorV1 FinalizeShanghaiTickInSourceOrder(
     return MarketDecodeErrorV1::kNone;
 }
 
-MarketDecodeErrorV1 DecodeShenzhenSnapshot(
-    const MarketMessageViewV1& input,
-    const MarketDecoderConfigV1& config,
-    ShenzhenSnapshotV1* output) {
-    CheckedBodyViewV1 view(input.body);
-    CheckedBodyErrorV1 body_error =
-        view.RequireFixed(sizeof(sz::Snapshot300111_v2));
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    std::uint32_t exchange_time_raw = 0U;
-    if (!LoadUnsigned(input.body, 0U, &exchange_time_raw)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    ShenzhenSnapshotV1 decoded{};
-    decoded.common = MakeCommon(
-        input,
-        MarketEventKindV1::kShenzhenSnapshot,
-        MarketV1::kShenzhen,
-        exchange_time_raw);
-    MarketDecodeErrorV1 error = ReadText(
-        &view, 8U, sizeof(sz::Snapshot300111_v2),
-        config.limits.maximum_text_bytes, true,
-        &decoded.common.quality_flags,
-        &decoded.common.md_stream_id,
-        &decoded.common.md_stream_id_valid);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    error = ReadText(
-        &view, 14U, sizeof(sz::Snapshot300111_v2),
-        config.limits.maximum_text_bytes, true,
-        &decoded.common.quality_flags,
-        &decoded.common.security_id,
-        &decoded.common.security_id_valid);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    error = ReadText(
-        &view, 20U, sizeof(sz::Snapshot300111_v2),
-        config.limits.maximum_text_bytes, true,
-        &decoded.common.quality_flags,
-        &decoded.common.security_id_source,
-        &decoded.common.security_id_source_valid);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    error = ReadText(
-        &view, 26U, sizeof(sz::Snapshot300111_v2),
-        config.limits.maximum_text_bytes, true,
-        &decoded.common.quality_flags,
-        &decoded.trading_phase_code,
-        &decoded.trading_phase_code_valid);
-    if (error != MarketDecodeErrorV1::kNone) {
-        return error;
-    }
-    if (!LoadUnsigned(input.body, 4U, &decoded.channel) ||
-        !LoadI64(input.body, 40U, &decoded.trade_count)) {
-        return MarketDecodeErrorV1::kTruncated;
-    }
-    const auto decimal64 = [&](std::size_t offset,
-                               std::uint8_t scale,
-                               DecimalValueV1* value) {
-        return DecodeDecimalI64(
-            input.body, offset, scale,
-            &decoded.common.quality_flags, value);
-    };
-    const auto price64 = [&](std::size_t offset,
-                             std::uint8_t scale,
-                             DecimalValueV1* value) {
-        return DecodeStrictlyPositivePriceI64(
-            input.body, offset, scale,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, value);
-    };
-    const auto quantity64 = [&](std::size_t offset,
-                                QuantityValueV1* value) {
-        return DecodeQuantityI64(
-            input.body, offset, 0U, false,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, value);
-    };
-#define L2FLOW_DECODE_OR_RETURN(expression)                                  \
-    do {                                                                     \
-        error = (expression);                                                \
-        if (error != MarketDecodeErrorV1::kNone) {                          \
-            return error;                                                    \
-        }                                                                    \
-    } while (false)
-    L2FLOW_DECODE_OR_RETURN(price64(32U, 4U, &decoded.pre_close_price));
-    L2FLOW_DECODE_OR_RETURN(quantity64(48U, &decoded.volume));
-    L2FLOW_DECODE_OR_RETURN(decimal64(56U, 4U, &decoded.turnover));
-    L2FLOW_DECODE_OR_RETURN(price64(64U, 6U, &decoded.last_price));
-    L2FLOW_DECODE_OR_RETURN(price64(72U, 6U, &decoded.open_price));
-    L2FLOW_DECODE_OR_RETURN(price64(80U, 6U, &decoded.high_price));
-    L2FLOW_DECODE_OR_RETURN(price64(88U, 6U, &decoded.low_price));
-    L2FLOW_DECODE_OR_RETURN(decimal64(96U, 6U, &decoded.price_change_1));
-    L2FLOW_DECODE_OR_RETURN(decimal64(104U, 6U, &decoded.price_change_2));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 112U, 6U,
-        &decoded.common.quality_flags, &decoded.pe_ratio_1));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 120U, 6U,
-        &decoded.common.quality_flags, &decoded.pe_ratio_2));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 128U, 6U,
-        &decoded.common.quality_flags, &decoded.pre_close_iopv));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 136U, 6U,
-        &decoded.common.quality_flags, &decoded.iopv));
-    L2FLOW_DECODE_OR_RETURN(quantity64(144U, &decoded.total_ask_quantity));
-    L2FLOW_DECODE_OR_RETURN(price64(
-        152U, 6U, &decoded.weighted_average_ask_price));
-    L2FLOW_DECODE_OR_RETURN(quantity64(160U, &decoded.total_bid_quantity));
-    L2FLOW_DECODE_OR_RETURN(price64(
-        168U, 6U, &decoded.weighted_average_bid_price));
-    // No authoritative sentinel table is present in this decoder.
-    // Preserve exact raw values but do not publish them as factor-safe finite
-    // prices merely because they fit int64/p6.  Versioned reference policy
-    // must resolve kUnknown before a downstream calculator uses them.
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 176U, 6U, &decoded.common.quality_flags,
-        &decoded.high_limit_price));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 184U, 6U, &decoded.common.quality_flags,
-        &decoded.low_limit_price));
-    decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kLimitPriceSemanticsUnknown);
-    L2FLOW_DECODE_OR_RETURN(LoadQuantityI64Raw(
-        input.body, 192U, 0U, false,
-        &decoded.common.quality_flags, &decoded.open_interest));
-    L2FLOW_DECODE_OR_RETURN(LoadDecimalI64Raw(
-        input.body, 200U, 6U, &decoded.common.quality_flags,
-        &decoded.vendor_opt_premium_ratio));
-    decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kVendorOptPremiumRatioSemanticsUnknown);
-    decoded.common.market_notices |= MarketNoticeBitV1(
-        MarketNoticeV1::kProductApplicabilityUnknown);
-
-    CheckedBodyRangeV1 bids;
-    body_error = view.ReadList(
-        208U, 28U, sizeof(sz::Snapshot300111_v2),
-        config.limits.maximum_depth_items, &bids);
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    CheckedBodyRangeV1 asks;
-    body_error = view.ReadList(
-        216U, 28U, sizeof(sz::Snapshot300111_v2),
-        config.limits.maximum_depth_items, &asks);
-    if (body_error != CheckedBodyErrorV1::kNone) {
-        return TranslateBodyError(body_error);
-    }
-    decoded.book.actual_bid_depth = static_cast<std::uint32_t>(bids.count);
-    decoded.book.actual_ask_depth = static_cast<std::uint32_t>(asks.count);
-    decoded.book.retained_bid_depth = static_cast<std::uint32_t>(
-        std::min(bids.count, kMaximumPublicDepthV1));
-    decoded.book.retained_ask_depth = static_cast<std::uint32_t>(
-        std::min(asks.count, kMaximumPublicDepthV1));
-    for (std::size_t index = 0U; index < bids.count; ++index) {
-        BookLevelV1* retained =
-            index < kMaximumPublicDepthV1
-                ? &decoded.book.bids[index]
-                : nullptr;
-        L2FLOW_DECODE_OR_RETURN(DecodeSzLevel(
-            &view, bids, index, config.limits,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, retained,
-            &decoded.book.bid1_queue));
-    }
-    for (std::size_t index = 0U; index < asks.count; ++index) {
-        BookLevelV1* retained =
-            index < kMaximumPublicDepthV1
-                ? &decoded.book.asks[index]
-                : nullptr;
-        L2FLOW_DECODE_OR_RETURN(DecodeSzLevel(
-            &view, asks, index, config.limits,
-            &decoded.common.quality_flags,
-            &decoded.common.market_notices, retained,
-            &decoded.book.ask1_queue));
-    }
-    ApplyDepthQuality(bids.count, asks.count, &decoded.common);
-    ApplyBodyNotices(view, &decoded.common);
-    MarkInstrumentAwaitingCatalogIdentity(&decoded.common);
-    *output = std::move(decoded);
-    return MarketDecodeErrorV1::kNone;
-#undef L2FLOW_DECODE_OR_RETURN
-}
 
 MarketDecodeErrorV1 ReadSzIdentity(
     CheckedBodyViewV1* view,
@@ -1884,12 +1076,10 @@ MarketDecodeErrorV1 DecodeShenzhenTransaction(
 bool RecognizedCoreMessage(
     std::uint8_t service_id,
     std::uint16_t message_id) noexcept {
-    return (service_id == sh::SHL2MarketData::ServiceID &&
-            (message_id == sh::SHL2MarketData::MessageID ||
-             message_id == sh::NGTSTick::MessageID)) ||
-           (service_id == sz::Snapshot300111_v2::ServiceID &&
-            (message_id == sz::Snapshot300111_v2::MessageID ||
-             message_id == sz::Order300192_v2::MessageID ||
+    return (service_id == sh::NGTSTick::ServiceID &&
+            message_id == sh::NGTSTick::MessageID) ||
+           (service_id == sz::Order300192_v2::ServiceID &&
+            (message_id == sz::Order300192_v2::MessageID ||
              message_id == sz::Transaction300191_v2::MessageID));
 }
 
@@ -2019,16 +1209,6 @@ MarketDecodeErrorV1 DecodeMessageV1(
     }
 
     try {
-        if (input.service_id == sh::SHL2MarketData::ServiceID &&
-            input.message_id == sh::SHL2MarketData::MessageID) {
-            ShanghaiSnapshotV1 decoded{};
-            const MarketDecodeErrorV1 error =
-                DecodeShanghaiSnapshot(input, config, &decoded);
-            if (error == MarketDecodeErrorV1::kNone) {
-                *output = DecodedMarketEventV1(std::move(decoded));
-            }
-            return error;
-        }
         if (input.service_id == sh::NGTSTick::ServiceID &&
             input.message_id == sh::NGTSTick::MessageID) {
             ShanghaiTickV1 decoded{};
@@ -2039,16 +1219,6 @@ MarketDecodeErrorV1 DecodeMessageV1(
                 error = FinalizeShanghaiTickInSourceOrder(
                     config, ordered_phases, &decoded);
             }
-            if (error == MarketDecodeErrorV1::kNone) {
-                *output = DecodedMarketEventV1(std::move(decoded));
-            }
-            return error;
-        }
-        if (input.service_id == sz::Snapshot300111_v2::ServiceID &&
-            input.message_id == sz::Snapshot300111_v2::MessageID) {
-            ShenzhenSnapshotV1 decoded{};
-            const MarketDecodeErrorV1 error =
-                DecodeShenzhenSnapshot(input, config, &decoded);
             if (error == MarketDecodeErrorV1::kNone) {
                 *output = DecodedMarketEventV1(std::move(decoded));
             }
@@ -2105,23 +1275,11 @@ MarketDecodeErrorV1 ExtractExactInstrumentKeyV2(
     std::size_t security_id_offset = 0U;
     std::size_t source_offset = 0U;
     MarketV1 market = MarketV1::kUnknown;
-    if (input.service_id == sh::SHL2MarketData::ServiceID &&
-        input.message_id == sh::SHL2MarketData::MessageID) {
-        fixed_bytes = sizeof(sh::SHL2MarketData);
-        security_id_offset = 4U;
-        market = MarketV1::kShanghai;
-    } else if (
-        input.service_id == sh::NGTSTick::ServiceID &&
+    if (input.service_id == sh::NGTSTick::ServiceID &&
         input.message_id == sh::NGTSTick::MessageID) {
         fixed_bytes = sizeof(sh::NGTSTick);
         security_id_offset = 12U;
         market = MarketV1::kShanghai;
-    } else if (
-        input.message_id == sz::Snapshot300111_v2::MessageID) {
-        fixed_bytes = sizeof(sz::Snapshot300111_v2);
-        security_id_offset = 14U;
-        source_offset = 20U;
-        market = MarketV1::kShenzhen;
     } else if (input.message_id == sz::Order300192_v2::MessageID) {
         fixed_bytes = sizeof(sz::Order300192_v2);
         security_id_offset = 18U;
@@ -2218,8 +1376,10 @@ MarketDecoderV1::MarketDecoderV1(
         config_.source_stream_id != 0U &&
         config_.trade_date >= kMinimumFixedUtc8TradeDate &&
         ParseDate(config_.trade_date, &ignored_days) &&
-        config_.limits.maximum_body_bytes >=
-            sizeof(sh::SHL2MarketData) &&
+        config_.limits.maximum_body_bytes >= std::max({
+            sizeof(sh::NGTSTick),
+            sizeof(sz::Order300192_v2),
+            sizeof(sz::Transaction300191_v2)}) &&
         config_.limits.maximum_text_bytes != 0U &&
         config_.limits.maximum_depth_items != 0U &&
         config_.limits.maximum_queue_items != 0U &&

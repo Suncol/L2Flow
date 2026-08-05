@@ -12,7 +12,7 @@ class SdkSubscriber;
 inline constexpr std::size_t kProductionSubscriptionCountV1 =
     kProductionMessageCountV1;
 
-// The one production Subscriber owns exactly these five market message
+// The one production Subscriber owns exactly these three Tick message
 // tuples.  The order is stable so tests and diagnostics can compare the SDK
 // calls without set normalization.
 [[nodiscard]] const std::array<MessageKey,

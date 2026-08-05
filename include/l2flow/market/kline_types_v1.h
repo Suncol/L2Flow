@@ -4,8 +4,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string_view>
-#include <vector>
 
 namespace l2flow::market {
 
@@ -16,8 +14,6 @@ inline constexpr std::uint64_t kKLineNanosecondsPerSecondV1 =
 inline constexpr std::uint64_t kKLineNanosecondsPerDayV1 =
     86'400ULL * kKLineNanosecondsPerSecondV1;
 inline constexpr std::size_t kKLineMaximumWindowsV1 = 32U;
-inline constexpr std::size_t kKLineMaximumBarsPerReadV1 =
-    1024U * 1024U;
 
 // Windows are aligned to exchange-local midnight. A duration need not divide
 // 24 hours; the final non-empty window may end after midnight in Unix time,
@@ -27,37 +23,20 @@ struct KLineWindowSpecV1 final {
     std::uint64_t duration_ns = 0U;
 };
 
-struct KLineAggregatorConfigV1 final {
-    // This is the process trade date supplied by the server/operator. It
-    // anchors fixed-UTC+08 Unix boundaries and rejects cross-date input;
-    // bucket selection still uses the exchange time carried by the message.
-    std::uint32_t trade_date = 0U;
-    std::vector<KLineWindowSpecV1> windows;
-    // Per owner-worker bound. The history runtime derives a safe value from
-    // its already-required retained-record bound when this is zero.
-    std::uint64_t maximum_bars = 0U;
-    // Optional dense owner-local row count. When nonzero, the history runtime
-    // supplies worker_local_row to make the per-trade series lookup O(1).
-    // Standalone users may leave it zero and use the ID-indexed overload.
-    std::size_t instrument_capacity = 0U;
-    std::size_t bars_per_chunk = 256U;
-    std::size_t maximum_bars_per_read = 64U * 1024U;
-
-    [[nodiscard]] bool enabled() const noexcept {
-        return !windows.empty();
-    }
-};
-
 // Stable total order used only when selecting open/close. Exchange event time
-// is authoritative; a positive native event sequence is preferred for equal
-// timestamps, followed by process source/ingress sequence tie-breakers.
+// is authoritative; equal timestamps use channel-local BusinessSequence and
+// then process source/arrival identities as deterministic tie-breakers. No
+// ordering claim is made between different channels.
 struct KLineEventOrderV1 final {
     std::uint64_t event_time_ns_since_midnight = 0U;
-    // Native business/application sequence when positive, otherwise the
-    // process source sequence.
+    // Positive native BizIndex/ApplSeqNum within channel.
     std::uint64_t event_sequence = 0U;
     std::uint64_t source_sequence = 0U;
     std::uint64_t ingress_sequence = 0U;
+    // Business sequence is comparable only inside this channel. Channel is
+    // therefore part of the deterministic equal-time tie-break rather than
+    // being silently discarded.
+    std::int32_t channel = 0;
 };
 
 struct KLineTradeV1 final {
@@ -73,11 +52,12 @@ struct KLineTradeV1 final {
     std::uint64_t event_sequence = 0U;
     std::uint64_t source_sequence = 0U;
     std::uint64_t ingress_sequence = 0U;
+    std::int32_t channel = 0;
 };
 
-// Only non-empty bars are materialized. A bar is the exact result for its
-// immutable ingress generation; "window_end" does not imply that future late
-// messages cannot revise the same window in a later generation.
+// Only non-empty bars are materialized. A bar is one stable revision;
+// "window_end" does not imply that a future late trade cannot publish a newer
+// revision for the same stable bar key.
 struct KLineBarV1 final {
     std::uint32_t trade_date = 0U;
     std::uint32_t instrument_id = 0U;
@@ -105,46 +85,5 @@ enum class KLineTradeProjectionV1 : std::uint8_t {
     kTrade,
     kInvalidTrade,
 };
-
-enum class KLineCreateErrorV1 : std::uint8_t {
-    kNone = 0U,
-    kNullOutput,
-    kInvalidConfiguration,
-    kResourceExhausted,
-};
-
-enum class KLineAppendErrorV1 : std::uint8_t {
-    kNone = 0U,
-    kInvalidTrade,
-    kBarCapacity,
-    kNumericOverflow,
-    kResourceExhausted,
-    kFailed,
-};
-
-enum class KLineCaptureErrorV1 : std::uint8_t {
-    kNone = 0U,
-    kNullOutput,
-    kResourceExhausted,
-    kFailed,
-};
-
-enum class KLineQueryErrorV1 : std::uint8_t {
-    kNone = 0U,
-    kNullOutput,
-    kInvalidArgument,
-    kNotFound,
-    kBatchLimitExceeded,
-    kResourceExhausted,
-};
-
-[[nodiscard]] std::string_view KLineCreateErrorNameV1(
-    KLineCreateErrorV1 error) noexcept;
-[[nodiscard]] std::string_view KLineAppendErrorNameV1(
-    KLineAppendErrorV1 error) noexcept;
-[[nodiscard]] std::string_view KLineCaptureErrorNameV1(
-    KLineCaptureErrorV1 error) noexcept;
-[[nodiscard]] std::string_view KLineQueryErrorNameV1(
-    KLineQueryErrorV1 error) noexcept;
 
 }  // namespace l2flow::market

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -47,18 +46,10 @@ enum class AssetScopeV1 : std::uint8_t {
 };
 
 enum class MarketEventKindV1 : std::uint8_t {
-    kShanghaiSnapshot = 1U,
     kShanghaiTick = 2U,
-    kShenzhenSnapshot = 3U,
     kShenzhenOrder = 4U,
     kShenzhenTransaction = 5U,
 };
-
-[[nodiscard]] constexpr bool IsSnapshotEventKindV1(
-    MarketEventKindV1 kind) noexcept {
-    return kind == MarketEventKindV1::kShanghaiSnapshot ||
-           kind == MarketEventKindV1::kShenzhenSnapshot;
-}
 
 [[nodiscard]] constexpr bool IsTickEventKindV1(
     MarketEventKindV1 kind) noexcept {
@@ -108,16 +99,6 @@ enum class TradingPhaseV1 : std::uint8_t {
     kEnd,
 };
 
-// A numeric high/low limit is not factor-safe until versioned reference data
-// has distinguished an ordinary finite value from the vendor's business
-// sentinels. The decoder retains the raw wire integer but defaults to unknown;
-// it never guesses from magnitude.
-enum class LimitPriceSemanticsV1 : std::uint8_t {
-    kUnknown = 0U,
-    kFinite,
-    kNoLimit,
-};
-
 struct DecimalValueV1 final {
     // Exact vendor fixed-point integer and scale are retained even when the
     // field is null, action-inapplicable, product applicability is unknown,
@@ -142,13 +123,6 @@ struct QuantityValueV1 final {
     std::uint8_t scale = 0U;
     bool valid = false;
     bool is_null = false;
-};
-
-struct UnsignedValueV1 final {
-    // Exact unsigned vendor wire value.  The owning field documents why valid
-    // may be false; consumers must never infer validity from raw alone.
-    std::uint32_t raw = 0U;
-    bool valid = false;
 };
 
 struct TimeValueV1 final {
@@ -184,8 +158,6 @@ struct MarketMessageViewV1 final {
 enum class MarketNoticeV1 : std::uint8_t {
     kExchangeTimeInvalid = 0U,
     kVendorLocalTimeInvalid,
-    kSnapshotDepthTruncatedTo10,
-    kLimitPriceSemanticsUnknown,
     kMatchedQuantityDomainInvalid,
     kEventSequenceDomainInvalid,
     kOrderReferenceDomainInvalid,
@@ -197,13 +169,6 @@ enum class MarketNoticeV1 : std::uint8_t {
     kProductApplicabilityUnknown,
     kMaximumDurationUnavailable,
     kTradeAmountDomainInvalid,
-    // The event was reconstructed from the vendor client's startup CSV
-    // capture rather than received directly from the live SDK callback.
-    kRecoveredFromCsv,
-    // A CSV schema did not carry a source field present on the SDK message.
-    // The reconstructed wire field is left at its documented neutral value;
-    // consumers must not infer it from another stream.
-    kCsvSourceFieldUnavailable,
 };
 
 [[nodiscard]] constexpr std::uint64_t MarketNoticeBitV1(
@@ -213,7 +178,7 @@ enum class MarketNoticeV1 : std::uint8_t {
 }
 
 struct DecodedMarketCommonV1 final {
-    MarketEventKindV1 kind = MarketEventKindV1::kShanghaiSnapshot;
+    MarketEventKindV1 kind = MarketEventKindV1::kShanghaiTick;
     MarketV1 market = MarketV1::kUnknown;
     MarketMessageViewV1 origin{};
     // origin.body is cleared before publication so an owned event never
@@ -239,91 +204,6 @@ struct DecodedMarketCommonV1 final {
     AssetScopeV1 asset_scope = AssetScopeV1::kUnknown;
     std::uint64_t quality_flags = 0U;
     std::uint64_t market_notices = 0U;
-};
-
-inline constexpr std::size_t kMaximumPublicDepthV1 = 10U;
-inline constexpr std::size_t kMaximumPublicQueueV1 = 50U;
-
-struct BookLevelV1 final {
-    DecimalValueV1 price{};
-    QuantityValueV1 quantity{};
-    std::uint32_t order_count = 0U;
-    bool order_count_valid = false;
-};
-
-struct BestQueueV1 final {
-    std::uint32_t total_order_count = 0U;
-    std::uint32_t actual_revealed_count = 0U;
-    std::uint32_t retained_count = 0U;
-    std::array<QuantityValueV1, kMaximumPublicQueueV1> quantities{};
-};
-
-struct SnapshotBookV1 final {
-    std::uint32_t actual_bid_depth = 0U;
-    std::uint32_t actual_ask_depth = 0U;
-    std::uint32_t retained_bid_depth = 0U;
-    std::uint32_t retained_ask_depth = 0U;
-    std::array<BookLevelV1, kMaximumPublicDepthV1> bids{};
-    std::array<BookLevelV1, kMaximumPublicDepthV1> asks{};
-    BestQueueV1 bid1_queue{};
-    BestQueueV1 ask1_queue{};
-};
-
-struct ShanghaiSnapshotV1 final {
-    DecodedMarketCommonV1 common{};
-    std::int32_t image_status = 0;
-    std::string instrument_status;
-    bool instrument_status_valid = false;
-    DecimalValueV1 pre_close_price{};
-    DecimalValueV1 open_price{};
-    DecimalValueV1 high_price{};
-    DecimalValueV1 low_price{};
-    DecimalValueV1 last_price{};
-    DecimalValueV1 close_price{};
-    std::uint32_t trade_count = 0U;
-    QuantityValueV1 trade_volume{};
-    DecimalValueV1 turnover{};
-    QuantityValueV1 total_bid_volume{};
-    DecimalValueV1 weighted_average_bid_price{};
-    DecimalValueV1 alternate_weighted_average_bid_price{};
-    QuantityValueV1 total_ask_volume{};
-    DecimalValueV1 weighted_average_ask_price{};
-    DecimalValueV1 alternate_weighted_average_ask_price{};
-    // Neutral names preserve the vendor's EtfBuy*/EtfSell* groups without
-    // asserting subscription/redemption semantics absent a versioned field
-    // dictionary.
-    // No versioned instrument-capability table currently proves that this
-    // vendor ETF group applies to an observed instrument. V1 retains exact
-    // raw values but publishes every member invalid, even for coarse
-    // SecurityType::kFund.
-    UnsignedValueV1 vendor_etf_buy_count{};
-    QuantityValueV1 vendor_etf_buy_quantity{};
-    DecimalValueV1 vendor_etf_buy_amount{};
-    UnsignedValueV1 vendor_etf_sell_count{};
-    QuantityValueV1 vendor_etf_sell_quantity{};
-    DecimalValueV1 vendor_etf_sell_amount{};
-    DecimalValueV1 yield_to_maturity{};
-    QuantityValueV1 total_warrant_exercise_quantity{};
-    // The SDK calls these fields WarLowerPri and WarUpperPri, but no
-    // authoritative product/version applicability table is available here.
-    // V1 therefore retains raw/scale with valid=false; consumers must not
-    // infer warrant-price, IOPV, or other financial semantics from the names.
-    DecimalValueV1 vendor_war_lower_value{};
-    DecimalValueV1 vendor_war_upper_value{};
-    std::uint32_t withdrawal_buy_count = 0U;
-    QuantityValueV1 withdrawal_buy_volume{};
-    DecimalValueV1 withdrawal_buy_amount{};
-    std::uint32_t withdrawal_sell_count = 0U;
-    QuantityValueV1 withdrawal_sell_volume{};
-    DecimalValueV1 withdrawal_sell_amount{};
-    std::uint32_t total_bid_order_count = 0U;
-    std::uint32_t total_ask_order_count = 0U;
-    // Units are intentionally not guessed.  UINT32_MAX is the observed
-    // unavailable sentinel; every other raw value, including zero, is valid.
-    UnsignedValueV1 maximum_bid_duration{};
-    UnsignedValueV1 maximum_ask_duration{};
-    DecimalValueV1 iopv{};
-    SnapshotBookV1 book{};
 };
 
 enum TickValidityBitV1 : std::uint32_t {
@@ -368,45 +248,6 @@ struct ShanghaiTickV1 final {
     TickFieldsV1 fields{};
 };
 
-struct ShenzhenSnapshotV1 final {
-    DecodedMarketCommonV1 common{};
-    std::uint32_t channel = 0U;
-    std::string trading_phase_code;
-    bool trading_phase_code_valid = false;
-    DecimalValueV1 pre_close_price{};
-    std::int64_t trade_count = 0;
-    QuantityValueV1 volume{};
-    DecimalValueV1 turnover{};
-    DecimalValueV1 last_price{};
-    DecimalValueV1 open_price{};
-    DecimalValueV1 high_price{};
-    DecimalValueV1 low_price{};
-    DecimalValueV1 price_change_1{};
-    DecimalValueV1 price_change_2{};
-    DecimalValueV1 pe_ratio_1{};
-    DecimalValueV1 pe_ratio_2{};
-    DecimalValueV1 pre_close_iopv{};
-    DecimalValueV1 iopv{};
-    QuantityValueV1 total_ask_quantity{};
-    DecimalValueV1 weighted_average_ask_price{};
-    QuantityValueV1 total_bid_quantity{};
-    DecimalValueV1 weighted_average_bid_price{};
-    // Sentinel interpretation is intentionally delegated to versioned
-    // versioned reference metadata. Until such policy is supplied, raw/scale
-    // are preserved, DecimalValueV1::valid is false, and semantics is unknown.
-    DecimalValueV1 high_limit_price{};
-    DecimalValueV1 low_limit_price{};
-    LimitPriceSemanticsV1 high_limit_semantics =
-        LimitPriceSemanticsV1::kUnknown;
-    LimitPriceSemanticsV1 low_limit_semantics =
-        LimitPriceSemanticsV1::kUnknown;
-    QuantityValueV1 open_interest{};
-    // The SDK calls this OptPremiumRatio. Raw/scale are retained with
-    // valid=false until a versioned business dictionary pins its meaning.
-    DecimalValueV1 vendor_opt_premium_ratio{};
-    SnapshotBookV1 book{};
-};
-
 struct ShenzhenOrderV1 final {
     DecodedMarketCommonV1 common{};
     std::uint32_t channel = 0U;
@@ -424,39 +265,15 @@ struct ShenzhenTransactionV1 final {
     TickFieldsV1 fields{};
 };
 
+// Production decoding has exactly the three subscribed Tick alternatives.
 using DecodedMarketEventV1 = std::variant<
-    ShanghaiSnapshotV1,
     ShanghaiTickV1,
-    ShenzhenSnapshotV1,
     ShenzhenOrderV1,
     ShenzhenTransactionV1>;
-
-// Durable events are placement-constructed as their exact concrete type in a
-// store-owned segmented arena.  A record exposes only this borrowed view; the
-// matching generation/session owns the payload storage.
-using StoredMarketEventViewV1 = std::variant<
-    const ShanghaiSnapshotV1*,
-    const ShanghaiTickV1*,
-    const ShenzhenSnapshotV1*,
-    const ShenzhenOrderV1*,
-    const ShenzhenTransactionV1*>;
-
-template <typename Event>
-[[nodiscard]] const Event* StoredMarketEventGetV1(
-    const StoredMarketEventViewV1& event) noexcept {
-    const auto* pointer = std::get_if<const Event*>(&event);
-    return pointer == nullptr ? nullptr : *pointer;
-}
 
 [[nodiscard]] const DecodedMarketCommonV1& MarketCommonV1(
     const DecodedMarketEventV1& event) noexcept;
 [[nodiscard]] DecodedMarketCommonV1& MarketCommonV1(
     DecodedMarketEventV1& event) noexcept;
-// Active concrete object size plus a conservative logical charge for each
-// dynamic string's capacity. It deliberately does not charge
-// sizeof(DecodedMarketEventV1), because the durable arena stores only the
-// active alternative. This is a hard-budget charge, not allocator RSS.
-[[nodiscard]] std::size_t EstimateStoredMarketEventBytesV1(
-    const DecodedMarketEventV1& event) noexcept;
 
 }  // namespace l2flow::market

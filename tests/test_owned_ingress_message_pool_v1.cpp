@@ -57,7 +57,7 @@ public:
             static_cast<std::uint8_t>(mdl::MDLEID_BINARY);
         head_.ServiceID = 4U;
         head_.ServiceVersion = 101U;
-        head_.MessageID = 4U;
+        head_.MessageID = 24U;
         head_.LocalTime.m_Value = 93'000'000U;
         head_.SequenceID = 1U;
     }
@@ -89,7 +89,6 @@ private:
     metadata.source_sequence = sequence;
     metadata.recv_realtime_ns = 1'000U + sequence;
     metadata.recv_monotonic_ns = 2'000U + sequence;
-    metadata.tick_stream_sequence = 0U;
     return metadata;
 }
 

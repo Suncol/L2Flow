@@ -11,7 +11,7 @@
 
 namespace l2flow::market {
 
-// Borrowed exact identity extracted from one of the five production message
+// Borrowed exact identity extracted from one of the three production Tick
 // bodies. The spans point into MarketMessageViewV1::body and are valid only
 // while that body remains alive. Extraction performs no allocation and is
 // used by callback admission for immutable daily-catalog lookup before the
@@ -90,7 +90,7 @@ public:
     MarketDecoderV1& operator=(MarketDecoderV1&&) = delete;
     ~MarketDecoderV1() = default;
 
-    // kUnsupportedMessage means the tuple is outside this five-message
+    // kUnsupportedMessage means the tuple is outside this three-message
     // decoder.  Only a caller that has classified it as optional/irrelevant
     // may ignore it; a required unknown tuple must be failed closed upstream.
     [[nodiscard]] MarketDecodeErrorV1 Decode(
@@ -146,26 +146,5 @@ private:
 [[nodiscard]] bool ApplyDailyInstrumentIdentityV2(
     const DailyInstrumentIdentityViewV2& identity,
     DecodedMarketEventV1* event) noexcept;
-
-// Narrow source-compatibility aliases for callers migrating from the former
-// observed-universe terminology. New pipeline code uses the daily/exact
-// names above; these declarations do not restore dynamic identity binding.
-using ObservedInstrumentKeyViewV2 = ExactInstrumentKeyViewV2;
-using ObservedInstrumentIdentityViewV2 = DailyInstrumentIdentityViewV2;
-
-[[nodiscard]] inline MarketDecodeErrorV1
-ExtractObservedInstrumentKeyV2(
-    const MarketMessageViewV1& input,
-    std::size_t maximum_text_bytes,
-    ObservedInstrumentKeyViewV2* output) noexcept {
-    return ExtractExactInstrumentKeyV2(
-        input, maximum_text_bytes, output);
-}
-
-[[nodiscard]] inline bool ApplyObservedInstrumentIdentityV2(
-    const ObservedInstrumentIdentityViewV2& identity,
-    DecodedMarketEventV1* event) noexcept {
-    return ApplyDailyInstrumentIdentityV2(identity, event);
-}
 
 }  // namespace l2flow::market

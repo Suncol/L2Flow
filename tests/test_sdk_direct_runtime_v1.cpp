@@ -164,9 +164,7 @@ struct TestContext final {
 
 void CheckProductionSubscriptions(TestContext* test) {
     const std::vector<sdk::MessageKey> expected = {
-        {4U, 101U, 4U},
         {4U, 101U, 24U},
-        {6U, 101U, 28U},
         {6U, 101U, 33U},
         {6U, 101U, 36U},
     };
@@ -176,13 +174,13 @@ void CheckProductionSubscriptions(TestContext* test) {
     test->Expect(
         std::vector<sdk::MessageKey>(
             configured.begin(), configured.end()) == expected,
-        "the production catalog is exactly the five required tuples");
+        "the production catalog is exactly the three required tuples");
     test->Expect(
         std::all_of(
             expected.begin(),
             expected.end(),
             sdk::IsRequiredProductionSubscriptionV1),
-        "all five catalog tuples are classified as required");
+        "all three catalog tuples are classified as required");
     test->Expect(
         !sdk::IsRequiredProductionSubscriptionV1(forbidden),
         "6.101.53 is not a required production tuple");
@@ -194,7 +192,7 @@ void CheckProductionSubscriptions(TestContext* test) {
     sdk::AddProductionSubscriptionsV1(subscriber);
     test->Expect(
         subscriber.keys == expected,
-        "one Subscriber receives the five tuples once in stable order");
+        "one Subscriber receives the three tuples once in stable order");
     test->Expect(
         std::find(
             subscriber.keys.begin(),
@@ -282,7 +280,7 @@ void CheckDirectLoaderSuccessPath(
         const auto& expected = sdk::ProductionSubscriptionKeysV1();
         test->Expect(
             inspection.subscription_count() == expected.size(),
-            "the DSO observes exactly five subscription calls");
+            "the DSO observes exactly three subscription calls");
         for (std::uint32_t index = 0U; index < expected.size(); ++index) {
             const sdk::MessageKey& key = expected[index];
             test->Expect(
@@ -356,7 +354,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout
-        << "direct SDK dlopen/dlsym, single-subscriber five-key "
+        << "direct SDK dlopen/dlsym, single-subscriber three-key "
            "subscription, and ordered release passed\n";
     return 0;
 }

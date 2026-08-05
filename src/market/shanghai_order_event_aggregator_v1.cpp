@@ -100,7 +100,6 @@ constexpr std::uint64_t kConflictQualityMask =
     return anchor.native_event_sequence > 0 &&
            anchor.source_sequence > 0U &&
            anchor.ingress_sequence > 0U &&
-           anchor.tick_stream_sequence > 0U &&
            (!anchor.event_time_unix_ns_valid ||
             anchor.event_time_valid);
 }
@@ -110,7 +109,6 @@ constexpr std::uint64_t kConflictQualityMask =
     return anchor.native_event_sequence == 0 &&
            anchor.source_sequence == 0U &&
            anchor.ingress_sequence == 0U &&
-           anchor.tick_stream_sequence == 0U &&
            anchor.vendor_sequence_id == 0U &&
            anchor.event_time_ns_since_midnight == 0U &&
            anchor.event_time_unix_ns == 0 &&
@@ -482,111 +480,6 @@ bool operator<(
                rhs.order_id);
 }
 
-ShanghaiOrderEventProjectionV1 ProjectShanghaiOrderEventInputV1(
-    const DecodedMarketEventV1& event,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
-    ShanghaiOrderEventInputV1* output) noexcept {
-    if (output == nullptr) {
-        return ShanghaiOrderEventProjectionV1::kInvalidTick;
-    }
-    *output = {};
-    const ShanghaiTickV1* tick =
-        std::get_if<ShanghaiTickV1>(&event);
-    if (tick == nullptr) {
-        return ShanghaiOrderEventProjectionV1::kNotShanghaiTick;
-    }
-    if (tick->common.kind !=
-            MarketEventKindV1::kShanghaiTick ||
-        tick->common.market != MarketV1::kShanghai ||
-        tick->common.origin.trade_date == 0U ||
-        tick->common.instrument_id == 0U ||
-        tick->channel <= 0 || tick->business_index <= 0 ||
-        ingress_sequence == 0U || tick_stream_sequence == 0U ||
-        (tick->fields.quantity.valid &&
-         tick->fields.quantity.scale != 0U) ||
-        (tick->fields.matched_quantity.valid &&
-         tick->fields.matched_quantity.scale != 0U)) {
-        return ShanghaiOrderEventProjectionV1::kInvalidTick;
-    }
-
-    ShanghaiOrderEventInputV1 projected{};
-    projected.trade_date = tick->common.origin.trade_date;
-    projected.instrument_id = tick->common.instrument_id;
-    projected.channel = tick->channel;
-    projected.anchor.native_event_sequence =
-        tick->business_index;
-    projected.anchor.source_sequence =
-        tick->common.origin.source_sequence;
-    projected.anchor.ingress_sequence = ingress_sequence;
-    projected.anchor.tick_stream_sequence =
-        tick_stream_sequence;
-    projected.anchor.vendor_sequence_id =
-        tick->common.origin.vendor_sequence_id;
-    projected.anchor.event_time_ns_since_midnight =
-        tick->common.exchange_time.nanoseconds_since_midnight;
-    projected.anchor.event_time_unix_ns =
-        tick->common.exchange_time.unix_nanoseconds;
-    projected.anchor.recv_realtime_ns =
-        tick->common.origin.recv_realtime_ns;
-    projected.anchor.recv_monotonic_ns =
-        tick->common.origin.recv_monotonic_ns;
-    projected.anchor.vendor_local_time_raw =
-        tick->common.origin.vendor_local_time_raw;
-    projected.anchor.vendor_local_time_ns_since_midnight =
-        tick->common.vendor_local_time.nanoseconds_since_midnight;
-    projected.anchor.event_time_valid =
-        tick->common.exchange_time.valid &&
-        (tick->fields.validity_bitmap &
-         kTickExchangeTimeValidV1) != 0U;
-    projected.anchor.event_time_unix_ns_valid =
-        projected.anchor.event_time_valid &&
-        tick->common.exchange_time.unix_nanoseconds_valid;
-    projected.anchor.vendor_local_time_valid =
-        tick->common.vendor_local_time.valid;
-    projected.action = tick->fields.action;
-    projected.side = tick->fields.side;
-    projected.aggressor = tick->fields.aggressor;
-    projected.phase = tick->fields.phase;
-    projected.price_p6 =
-        tick->fields.price.normalized_p6;
-    projected.trade_amount_p6 =
-        tick->fields.trade_amount.normalized_p6;
-    projected.quantity = tick->fields.quantity.raw;
-    projected.matched_quantity =
-        tick->fields.matched_quantity.raw;
-    projected.primary_order_id =
-        tick->fields.primary_order_id;
-    projected.buy_order_id = tick->fields.buy_order_id;
-    projected.sell_order_id =
-        tick->fields.sell_order_id;
-    projected.price_valid =
-        tick->fields.price.valid &&
-        (tick->fields.validity_bitmap &
-         kTickPriceValidV1) != 0U;
-    projected.trade_amount_valid =
-        tick->fields.trade_amount.valid &&
-        (tick->fields.validity_bitmap &
-         kTickTradeAmountValidV1) != 0U;
-    projected.quantity_valid =
-        tick->fields.quantity.valid &&
-        (tick->fields.validity_bitmap &
-         kTickQuantityValidV1) != 0U;
-    projected.matched_quantity_valid =
-        tick->fields.matched_quantity.valid &&
-        (tick->fields.validity_bitmap &
-         kTickMatchedQuantityValidV1) != 0U;
-    projected.phase_valid =
-        (tick->fields.validity_bitmap &
-         kTickPhaseValidV1) != 0U;
-    projected.source_quality_flags =
-        tick->common.quality_flags;
-    projected.source_market_notices =
-        tick->common.market_notices;
-    *output = projected;
-    return ShanghaiOrderEventProjectionV1::kProjected;
-}
-
 class ShanghaiOrderEventAggregatorV1::Impl final {
 public:
     explicit Impl(
@@ -595,7 +488,6 @@ public:
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 Consume(
         const ShanghaiOrderEventInputV1& input,
-        std::uint64_t ordering_sequence,
         std::vector<ShanghaiOrderEventV1>* output) {
         if (output == nullptr) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kNullOutput;
@@ -608,9 +500,7 @@ public:
             return ShanghaiOrderAggregatorConsumeErrorV1::
                 kAlreadyFinalized;
         }
-        if (!ValidInput(input) || ordering_sequence == 0U ||
-            ordering_sequence ==
-                std::numeric_limits<std::uint64_t>::max()) {
+        if (!ValidInput(input)) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
         }
         if (input.trade_date != config_.trade_date) {
@@ -620,11 +510,9 @@ public:
             last_native_sequence_by_channel_.try_emplace(
                 input.channel, 0);
         static_cast<void>(channel_inserted);
-        if ((last_ordering_sequence_ != 0U &&
-             ordering_sequence <= last_ordering_sequence_) ||
-            (channel_position->second != 0 &&
+        if (channel_position->second != 0 &&
              input.anchor.native_event_sequence <=
-                 channel_position->second)) {
+                 channel_position->second) {
             return ShanghaiOrderAggregatorConsumeErrorV1::
                 kOutOfOrderInput;
         }
@@ -648,7 +536,6 @@ public:
                     kInvalidInput;
         }
         if (error == ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
-            last_ordering_sequence_ = ordering_sequence;
             channel_position->second =
                 input.anchor.native_event_sequence;
         }
@@ -1288,7 +1175,6 @@ private:
     OrderTable orders_;
     std::map<std::int32_t, std::int64_t>
         last_native_sequence_by_channel_;
-    std::uint64_t last_ordering_sequence_ = 0U;
     bool finalized_ = false;
     bool failed_ = false;
 };
@@ -1393,17 +1279,8 @@ ShanghaiOrderEventAggregatorV1::Create(
 }
 
 ShanghaiOrderAggregatorConsumeErrorV1
-ShanghaiOrderEventAggregatorV1::Consume(
+ShanghaiOrderEventAggregatorV1::ConsumeBusinessOrdered(
     const ShanghaiOrderEventInputV1& input,
-    std::vector<ShanghaiOrderEventV1>* output) noexcept {
-    return ConsumeCanonical(
-        input, input.anchor.tick_stream_sequence, output);
-}
-
-ShanghaiOrderAggregatorConsumeErrorV1
-ShanghaiOrderEventAggregatorV1::ConsumeCanonical(
-    const ShanghaiOrderEventInputV1& input,
-    std::uint64_t canonical_apply_sequence,
     std::vector<ShanghaiOrderEventV1>* output) noexcept {
     if (impl_ == nullptr) {
         if (output != nullptr) {
@@ -1412,8 +1289,7 @@ ShanghaiOrderEventAggregatorV1::ConsumeCanonical(
         return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
     }
     try {
-        return impl_->Consume(
-            input, canonical_apply_sequence, output);
+        return impl_->Consume(input, output);
     } catch (const std::bad_alloc&) {
         if (output != nullptr) {
             output->clear();
@@ -1441,28 +1317,6 @@ ShanghaiOrderEventAggregatorV1::MaximumOutputForInput(
         return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
     }
     return impl_->MaximumOutputForInput(input, output);
-}
-
-ShanghaiOrderAggregatorConsumeErrorV1
-ShanghaiOrderEventAggregatorV1::ConsumeDecoded(
-    const DecodedMarketEventV1& event,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
-    std::vector<ShanghaiOrderEventV1>* output) noexcept {
-    if (output == nullptr) {
-        return ShanghaiOrderAggregatorConsumeErrorV1::kNullOutput;
-    }
-    output->clear();
-    ShanghaiOrderEventInputV1 projected{};
-    if (ProjectShanghaiOrderEventInputV1(
-            event,
-            ingress_sequence,
-            tick_stream_sequence,
-            &projected) !=
-        ShanghaiOrderEventProjectionV1::kProjected) {
-        return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
-    }
-    return Consume(projected, output);
 }
 
 ShanghaiOrderAggregatorConsumeErrorV1

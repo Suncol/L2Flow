@@ -15,7 +15,7 @@
 
 namespace l2flow::realtime {
 
-inline constexpr std::size_t kOwnedIngressSourceCountV1 = 4U;
+inline constexpr std::size_t kOwnedIngressSourceCountV1 = 2U;
 inline constexpr std::size_t kRequiredOwnedIngressMessageCountV1 =
     l2flow::sdk::kProductionMessageCountV1;
 inline constexpr std::uint32_t kOwnedIngressMaximumMessageBytesV1 =
@@ -24,16 +24,14 @@ inline constexpr std::size_t
     kOwnedIngressMaximumInflightMessagesV1 = 10'000'000U;
 inline constexpr std::size_t kOwnedIngressMaximumPrewarmBytesV1 =
     256U * 1024U * 1024U;
-static_assert(kRequiredOwnedIngressMessageCountV1 == 5U);
+static_assert(kRequiredOwnedIngressMessageCountV1 == 3U);
 
-// These are the only market messages admitted by the production realtime
-// ingress. Shanghai and Shenzhen each have a snapshot source; the two
-// Shenzhen tick message types deliberately share one serial source.
+// These are the only market sources admitted by production. The two Shenzhen
+// Tick message types deliberately share one serial owner so their callback
+// order is retained.
 enum class OwnedIngressSourceV1 : std::uint8_t {
-    kShanghaiSnapshot = 0U,
-    kShanghaiTick = 1U,
-    kShenzhenSnapshot = 2U,
-    kShenzhenTick = 3U,
+    kShanghaiTick = 0U,
+    kShenzhenTick = 1U,
 };
 
 inline constexpr const auto& kRequiredOwnedIngressMessageKeysV1 =
@@ -61,20 +59,18 @@ enum class OwnedIngressKeyErrorV1 : std::uint8_t {
     OwnedIngressSourceV1* output) noexcept;
 
 // Sequence values are assigned by the single serialized subscription
-// callback. They describe the dense prefix committed directly to the four
+// callback. They describe the dense prefix committed directly to the two
 // source decoder FIFOs, not vendor event time. A source-lane admission
 // failure does not commit its candidate sequence and fails the session closed.
-// tick_stream_sequence is one dense order shared by Shanghai tick, Shenzhen
-// order, and Shenzhen transaction. Snapshot messages carry zero. UINT64_MAX
-// is reserved as the exhaustion sentinel so an exclusive generation cut can
-// always be represented without wraparound.
+// global_ingress_sequence is retained only as an arrival identity and repair
+// handshake; it is not a public live cursor or an Event/KLine ordering key.
+// UINT64_MAX is reserved as the exhaustion sentinel.
 struct OwnedIngressMetadataV1 final {
     l2flow::common::Identity128 run_id{};
     std::uint64_t global_ingress_sequence = 0U;
     std::uint64_t source_sequence = 0U;
     std::uint64_t recv_realtime_ns = 0U;
     std::uint64_t recv_monotonic_ns = 0U;
-    std::uint64_t tick_stream_sequence = 0U;
 };
 
 enum class OwnedIngressMessageErrorV1 : std::uint8_t {
@@ -146,8 +142,7 @@ private:
     friend class OwnedIngressMessagePoolStateV1;
 
     bool valid_ = false;
-    OwnedIngressSourceV1 source_ =
-        OwnedIngressSourceV1::kShanghaiSnapshot;
+    OwnedIngressSourceV1 source_ = OwnedIngressSourceV1::kShanghaiTick;
     l2flow::sdk::MessageKey key_{};
     l2flow::sdk::VendorHeadBytes vendor_head_bytes_{};
     std::span<const std::byte> body_{};
@@ -229,9 +224,6 @@ public:
     [[nodiscard]] std::uint64_t source_sequence() const noexcept {
         return metadata_.source_sequence;
     }
-    [[nodiscard]] std::uint64_t tick_stream_sequence() const noexcept {
-        return metadata_.tick_stream_sequence;
-    }
     [[nodiscard]] std::uint64_t recv_realtime_ns() const noexcept {
         return metadata_.recv_realtime_ns;
     }
@@ -291,8 +283,7 @@ private:
     l2flow::sdk::MessageKey key_{};
     std::uint32_t body_size_ = 0U;
     mutable std::atomic<std::uint32_t> references_{1U};
-    OwnedIngressSourceV1 source_ =
-        OwnedIngressSourceV1::kShanghaiSnapshot;
+    OwnedIngressSourceV1 source_ = OwnedIngressSourceV1::kShanghaiTick;
     std::uint8_t size_class_index_ = 0U;
 };
 

@@ -67,7 +67,6 @@ struct ShenzhenEventSourceAnchorV1 final {
     std::int64_t native_event_sequence = 0;
     std::uint64_t source_sequence = 0U;
     std::uint64_t ingress_sequence = 0U;
-    std::uint64_t tick_stream_sequence = 0U;
     std::uint64_t vendor_sequence_id = 0U;
     std::uint64_t event_time_ns_since_midnight = 0U;
     std::int64_t event_time_unix_ns = 0;
@@ -117,8 +116,7 @@ enum class ShenzhenOrderEventProjectionV1 : std::uint8_t {
 [[nodiscard]] ShenzhenOrderEventProjectionV1
 ProjectShenzhenOrderEventInputV1(
     const DecodedMarketEventV1& event,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
+    std::uint64_t arrival_id,
     ShenzhenOrderEventInputV1* output) noexcept;
 
 struct ShenzhenOrderSnapshotV1 final {
@@ -256,34 +254,17 @@ public:
         std::unique_ptr<ShenzhenOrderEventProjectorV1>* output)
         noexcept;
 
-    // output is replaced by the events caused by exactly this input. A
-    // transaction source event is first; revisions follow in OrderKey order.
-    // The merged 6.33/6.36 input must retain upstream order:
-    // tick_stream_sequence is strictly increasing globally and ApplSeqNum is
-    // strictly increasing among observed messages in each channel. Gaps are
-    // allowed for filtered streams and do not establish exchange completeness.
-    // An allocation or unexpected exception can occur after an order mutation;
-    // such an error permanently fail-closes the instance so the same input can
-    // never be applied twice against partially published state.
-    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1 Consume(
+    // Ordering is established exclusively by
+    // (channel, ApplSeqNum) before this call. Source/arrival IDs remain
+    // diagnostic and are not ordering inputs. Numeric gaps are valid.
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1
+    ConsumeBusinessOrdered(
         const ShenzhenOrderEventInputV1& input,
-        std::vector<ShenzhenOrderEventV1>* output) noexcept;
-
-    // Recovery/certification path. canonical_apply_sequence is a dense,
-    // process-owned publication order used only for the global monotonic
-    // consume guard. Source anchors retain their original arrival
-    // tick_stream_sequence, while ApplSeqNum monotonicity remains enforced per
-    // channel across the merged 6.33/6.36 stream. Do not mix this method with
-    // Consume on one instance.
-    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1 ConsumeCanonical(
-        const ShenzhenOrderEventInputV1& input,
-        std::uint64_t canonical_apply_sequence,
         std::vector<ShenzhenOrderEventV1>* output) noexcept;
 
     [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1 ConsumeDecoded(
         const DecodedMarketEventV1& event,
-        std::uint64_t ingress_sequence,
-        std::uint64_t tick_stream_sequence,
+        std::uint64_t arrival_id,
         std::vector<ShenzhenOrderEventV1>* output) noexcept;
 
     // The anchor may identify a real source message selected by the caller as

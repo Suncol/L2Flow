@@ -79,7 +79,6 @@ constexpr std::uint64_t kOrderConflictMask =
     return anchor.native_event_sequence > 0 &&
            anchor.source_sequence > 0U &&
            anchor.ingress_sequence > 0U &&
-           anchor.tick_stream_sequence > 0U &&
            (!anchor.event_time_unix_ns_valid ||
             anchor.event_time_valid);
 }
@@ -89,7 +88,6 @@ constexpr std::uint64_t kOrderConflictMask =
     return anchor.native_event_sequence == 0 &&
            anchor.source_sequence == 0U &&
            anchor.ingress_sequence == 0U &&
-           anchor.tick_stream_sequence == 0U &&
            anchor.vendor_sequence_id == 0U &&
            anchor.event_time_ns_since_midnight == 0U &&
            anchor.event_time_unix_ns == 0 &&
@@ -335,33 +333,25 @@ void IncrementRevision(OrderState* state) noexcept {
 void FillAnchor(
     const DecodedMarketCommonV1& common,
     std::int64_t application_sequence,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
+    std::uint64_t arrival_id,
     ShenzhenEventSourceAnchorV1* output) noexcept {
     output->native_event_sequence = application_sequence;
     output->source_sequence = common.origin.source_sequence;
-    output->ingress_sequence = ingress_sequence;
-    output->tick_stream_sequence = tick_stream_sequence;
-    output->vendor_sequence_id =
-        common.origin.vendor_sequence_id;
+    output->ingress_sequence = arrival_id;
+    output->vendor_sequence_id = common.origin.vendor_sequence_id;
     output->event_time_ns_since_midnight =
         common.exchange_time.nanoseconds_since_midnight;
-    output->event_time_unix_ns =
-        common.exchange_time.unix_nanoseconds;
-    output->recv_realtime_ns =
-        common.origin.recv_realtime_ns;
-    output->recv_monotonic_ns =
-        common.origin.recv_monotonic_ns;
-    output->vendor_local_time_raw =
-        common.origin.vendor_local_time_raw;
+    output->event_time_unix_ns = common.exchange_time.unix_nanoseconds;
+    output->recv_realtime_ns = common.origin.recv_realtime_ns;
+    output->recv_monotonic_ns = common.origin.recv_monotonic_ns;
+    output->vendor_local_time_raw = common.origin.vendor_local_time_raw;
     output->vendor_local_time_ns_since_midnight =
         common.vendor_local_time.nanoseconds_since_midnight;
     output->event_time_valid = common.exchange_time.valid;
     output->event_time_unix_ns_valid =
         common.exchange_time.valid &&
         common.exchange_time.unix_nanoseconds_valid;
-    output->vendor_local_time_valid =
-        common.vendor_local_time.valid;
+    output->vendor_local_time_valid = common.vendor_local_time.valid;
 }
 
 }  // namespace
@@ -384,15 +374,13 @@ bool operator<(
 ShenzhenOrderEventProjectionV1
 ProjectShenzhenOrderEventInputV1(
     const DecodedMarketEventV1& event,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
+    std::uint64_t arrival_id,
     ShenzhenOrderEventInputV1* output) noexcept {
     if (output == nullptr) {
         return ShenzhenOrderEventProjectionV1::kInvalidEvent;
     }
     *output = {};
-    if (ingress_sequence == 0U ||
-        tick_stream_sequence == 0U) {
+    if (arrival_id == 0U) {
         return ShenzhenOrderEventProjectionV1::kInvalidEvent;
     }
 
@@ -416,8 +404,7 @@ ProjectShenzhenOrderEventInputV1(
         FillAnchor(
             common,
             order->application_sequence,
-            ingress_sequence,
-            tick_stream_sequence,
+            arrival_id,
             &projected.anchor);
         projected.action = TickActionV1::kAdd;
         projected.side = order->fields.side;
@@ -472,8 +459,7 @@ ProjectShenzhenOrderEventInputV1(
         FillAnchor(
             common,
             transaction->application_sequence,
-            ingress_sequence,
-            tick_stream_sequence,
+            arrival_id,
             &projected.anchor);
         projected.action = transaction->fields.action;
         projected.side = transaction->fields.side;
@@ -550,7 +536,6 @@ public:
         orders;
     std::map<std::uint32_t, std::int64_t>
         last_native_sequence_by_channel;
-    std::uint64_t last_ordering_sequence = 0U;
     bool finalized = false;
     bool failed = false;
 };
@@ -655,17 +640,8 @@ ShenzhenOrderEventProjectorV1::Create(
 }
 
 ShenzhenOrderProjectorConsumeErrorV1
-ShenzhenOrderEventProjectorV1::Consume(
+ShenzhenOrderEventProjectorV1::ConsumeBusinessOrdered(
     const ShenzhenOrderEventInputV1& input,
-    std::vector<ShenzhenOrderEventV1>* output) noexcept {
-    return ConsumeCanonical(
-        input, input.anchor.tick_stream_sequence, output);
-}
-
-ShenzhenOrderProjectorConsumeErrorV1
-ShenzhenOrderEventProjectorV1::ConsumeCanonical(
-    const ShenzhenOrderEventInputV1& input,
-    std::uint64_t canonical_apply_sequence,
     std::vector<ShenzhenOrderEventV1>* output) noexcept {
     if (output == nullptr) {
         return ShenzhenOrderProjectorConsumeErrorV1::kNullOutput;
@@ -677,9 +653,7 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
     if (impl_->failed) {
         return ShenzhenOrderProjectorConsumeErrorV1::kFailed;
     }
-    if (!ValidInput(input) || canonical_apply_sequence == 0U ||
-        canonical_apply_sequence ==
-            std::numeric_limits<std::uint64_t>::max()) {
+    if (!ValidInput(input)) {
         return ShenzhenOrderProjectorConsumeErrorV1::kInvalidInput;
     }
     if (input.trade_date != impl_->config.trade_date) {
@@ -696,12 +670,9 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
             impl_->last_native_sequence_by_channel.try_emplace(
                 input.channel, 0);
         static_cast<void>(channel_inserted);
-        if ((impl_->last_ordering_sequence != 0U &&
-             canonical_apply_sequence <=
-                 impl_->last_ordering_sequence) ||
-            (channel_position->second != 0 &&
+        if (channel_position->second != 0 &&
              input.anchor.native_event_sequence <=
-                 channel_position->second)) {
+                 channel_position->second) {
             return ShenzhenOrderProjectorConsumeErrorV1::
                 kOutOfOrderInput;
         }
@@ -917,8 +888,6 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
             }
         }
         if (result == ShenzhenOrderProjectorConsumeErrorV1::kNone) {
-            impl_->last_ordering_sequence =
-                canonical_apply_sequence;
             channel_position->second =
                 input.anchor.native_event_sequence;
         }
@@ -938,8 +907,7 @@ ShenzhenOrderEventProjectorV1::ConsumeCanonical(
 ShenzhenOrderProjectorConsumeErrorV1
 ShenzhenOrderEventProjectorV1::ConsumeDecoded(
     const DecodedMarketEventV1& event,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
+    std::uint64_t arrival_id,
     std::vector<ShenzhenOrderEventV1>* output) noexcept {
     if (output == nullptr) {
         return ShenzhenOrderProjectorConsumeErrorV1::kNullOutput;
@@ -949,15 +917,14 @@ ShenzhenOrderEventProjectorV1::ConsumeDecoded(
     const ShenzhenOrderEventProjectionV1 projected =
         ProjectShenzhenOrderEventInputV1(
             event,
-            ingress_sequence,
-            tick_stream_sequence,
+            arrival_id,
             &input);
     if (projected !=
         ShenzhenOrderEventProjectionV1::kProjected) {
         return ShenzhenOrderProjectorConsumeErrorV1::
             kInvalidInput;
     }
-    return Consume(input, output);
+    return ConsumeBusinessOrdered(input, output);
 }
 
 ShenzhenOrderProjectorConsumeErrorV1

@@ -24,10 +24,8 @@ constexpr std::uint16_t kSupportedServiceVersion = 101U;
 constexpr std::uint32_t kTradeDate = 20260722U;
 constexpr std::uint32_t kSourceStreamId = 404U;
 
-constexpr std::array<MessageKey, 5U> kCoreMessages{{
-    {4U, 4U},
+constexpr std::array<MessageKey, 3U> kCoreMessages{{
     {4U, 24U},
-    {6U, 28U},
     {6U, 33U},
     {6U, 36U},
 }};

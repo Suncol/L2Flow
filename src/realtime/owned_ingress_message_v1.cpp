@@ -49,25 +49,7 @@ static_assert(
            metadata.global_ingress_sequence !=
                std::numeric_limits<std::uint64_t>::max() &&
            metadata.source_sequence !=
-               std::numeric_limits<std::uint64_t>::max() &&
-           metadata.tick_stream_sequence !=
-               std::numeric_limits<std::uint64_t>::max() &&
-           metadata.tick_stream_sequence <=
-               metadata.global_ingress_sequence;
-}
-
-[[nodiscard]] bool TickStreamSequenceMatchesSource(
-    OwnedIngressSourceV1 source,
-    std::uint64_t tick_stream_sequence) noexcept {
-    switch (source) {
-        case OwnedIngressSourceV1::kShanghaiSnapshot:
-        case OwnedIngressSourceV1::kShenzhenSnapshot:
-            return tick_stream_sequence == 0U;
-        case OwnedIngressSourceV1::kShanghaiTick:
-        case OwnedIngressSourceV1::kShenzhenTick:
-            return tick_stream_sequence != 0U;
-    }
-    return false;
+               std::numeric_limits<std::uint64_t>::max();
 }
 
 [[nodiscard]] bool IsValidMaximumMessageBytes(
@@ -240,10 +222,6 @@ public:
         }
         if (!InspectionValid(inspection)) {
             return OwnedIngressMessageErrorV1::kInvalidInspection;
-        }
-        if (!TickStreamSequenceMatchesSource(
-                inspection.source(), metadata.tick_stream_sequence)) {
-            return OwnedIngressMessageErrorV1::kInvalidMetadata;
         }
         if (inspection.wire_size_ > config_.maximum_message_bytes) {
             return OwnedIngressMessageErrorV1::kMessageTooLarge;
@@ -1117,7 +1095,7 @@ private:
         const l2flow::sdk::VendorHeadView head(
             inspection.vendor_head_bytes_);
         OwnedIngressSourceV1 classified_source =
-            OwnedIngressSourceV1::kShanghaiSnapshot;
+            OwnedIngressSourceV1::kShanghaiTick;
         return head.head_size() == l2flow::sdk::kVendorHeadBytes &&
                head.message_size() == inspection.wire_size_ &&
                head.message_encoding() ==
@@ -1235,16 +1213,11 @@ OwnedIngressKeyErrorV1 ClassifyOwnedIngressMessageKeyV1(
         return OwnedIngressKeyErrorV1::kForbiddenCombinedTick;
     }
 
-    OwnedIngressSourceV1 source =
-        OwnedIngressSourceV1::kShanghaiSnapshot;
+    OwnedIngressSourceV1 source = OwnedIngressSourceV1::kShanghaiTick;
     if (key == kRequiredOwnedIngressMessageKeysV1[0U]) {
-        source = OwnedIngressSourceV1::kShanghaiSnapshot;
-    } else if (key == kRequiredOwnedIngressMessageKeysV1[1U]) {
         source = OwnedIngressSourceV1::kShanghaiTick;
-    } else if (key == kRequiredOwnedIngressMessageKeysV1[2U]) {
-        source = OwnedIngressSourceV1::kShenzhenSnapshot;
-    } else if (key == kRequiredOwnedIngressMessageKeysV1[3U] ||
-               key == kRequiredOwnedIngressMessageKeysV1[4U]) {
+    } else if (key == kRequiredOwnedIngressMessageKeysV1[1U] ||
+               key == kRequiredOwnedIngressMessageKeysV1[2U]) {
         source = OwnedIngressSourceV1::kShenzhenTick;
     } else {
         return OwnedIngressKeyErrorV1::kUnsupported;

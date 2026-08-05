@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream-compare an mdl-sdk-feeder-probe capture with feeder backups.
+"""Stream-compare a Tick-only mdl-sdk-feeder-probe capture with backups.
 
 The capture can contain tens of millions of records.  This implementation
 therefore keeps only per-stream counters, a compact SeqNo bitmap, and one
@@ -27,27 +27,6 @@ class StreamSpec:
 
 
 STREAM_SPECS: dict[str, StreamSpec] = {
-    "4.101.4": StreamSpec(
-        "mdl_4_4_0.csv",
-        (
-            ("EventTime", "UpdateTime"),
-            ("SecurityID", "SecurityID"),
-            ("EventType", "InstruStatus"),
-            ("TradeCount", "TradNumber"),
-            ("Volume", "TradVolume"),
-            ("Turnover", "Turnover"),
-            ("PreClosePrice", "PreCloPrice"),
-            ("OpenPrice", "OpenPrice"),
-            ("HighPrice", "HighPrice"),
-            ("LowPrice", "LowPrice"),
-            ("LastPrice", "LastPrice"),
-            ("TotalBidQuantity", "TotalBidVol"),
-            ("WeightedAverageBidPrice", "WAvgBidPri"),
-            ("TotalOfferQuantity", "TotalAskVol"),
-            ("WeightedAverageOfferPrice", "WAvgAskPri"),
-            ("LocalTime", "LocalTime"),
-        ),
-    ),
     "4.101.24": StreamSpec(
         "mdl_4_24_0.csv",
         (
@@ -62,29 +41,6 @@ STREAM_SPECS: dict[str, StreamSpec] = {
             ("Quantity", "Qty"),
             ("Turnover", "TradeMoney"),
             ("TickBSFlag", "TickBSFlag"),
-            ("LocalTime", "LocalTime"),
-        ),
-    ),
-    "6.101.28": StreamSpec(
-        "mdl_6_28_0.csv",
-        (
-            ("EventTime", "UpdateTime"),
-            ("MDStreamID", "MDStreamID"),
-            ("SecurityID", "SecurityID"),
-            ("SecurityIDSource", "SecurityIDSource"),
-            ("TradingPhaseCode", "TradingPhaseCode"),
-            ("TradeCount", "TurnNum"),
-            ("Volume", "Volume"),
-            ("Turnover", "Turnover"),
-            ("PreClosePrice", "PreCloPrice"),
-            ("OpenPrice", "OpenPrice"),
-            ("HighPrice", "HighPrice"),
-            ("LowPrice", "LowPrice"),
-            ("LastPrice", "LastPrice"),
-            ("TotalBidQuantity", "TotalBidQty"),
-            ("WeightedAverageBidPrice", "WeightedAvgBidPx"),
-            ("TotalOfferQuantity", "TotalOfferQty"),
-            ("WeightedAverageOfferPrice", "WeightedAvgOfferPx"),
             ("LocalTime", "LocalTime"),
         ),
     ),

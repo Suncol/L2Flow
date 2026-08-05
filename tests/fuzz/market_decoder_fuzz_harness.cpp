@@ -36,7 +36,10 @@ int main() {
 
     // Exercise every core selector and both supported/unknown-version paths
     // at all fixed-size boundaries before the pseudorandom corpus.
-    for (std::size_t selector = 0U; selector < 5U; ++selector) {
+    constexpr std::size_t kSelectorCount = 3U;
+    for (std::size_t selector = 0U;
+         selector < kSelectorCount;
+         ++selector) {
         for (std::size_t version_mode = 0U;
              version_mode < 2U;
              ++version_mode) {
@@ -62,7 +65,8 @@ int main() {
             Next(&state) % 4'097U);
         input.resize(4U + body_size);
         Fill(&input, &state);
-        input[0] = static_cast<std::uint8_t>(iteration % 5U);
+        input[0] = static_cast<std::uint8_t>(
+            iteration % kSelectorCount);
         // Alternate schema-valid parsing with fail-closed unknown versions.
         input[1] = static_cast<std::uint8_t>(iteration & 1U);
         if (LLVMFuzzerTestOneInput(input.data(), input.size()) != 0) {
@@ -71,7 +75,8 @@ int main() {
     }
 
     std::cout << "phase4 deterministic decoder fuzz smoke passed: "
-              << kDeterministicCases + 5U * 2U * kBodyEdges.size()
+              << kDeterministicCases +
+                     kSelectorCount * 2U * kBodyEdges.size()
               << " cases\n";
     return 0;
 }

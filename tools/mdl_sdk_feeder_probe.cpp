@@ -65,7 +65,7 @@ void PrintUsage(std::ostream& output) {
         << "  --help                    show this help\n\n"
         << "The probe uses a fixed non-secret local client label, binary"
            " encoding,\n"
-        << "and the five required L2Flow subscriptions. It never accepts a"
+        << "and the three Tick-only L2Flow subscriptions. It never accepts a"
            " token on the command line. It reports copied market-message heads;\n"
         << "the target endpoint must be a trusted local feeder. Use a minimum"
            " of 0 only\n"
@@ -382,34 +382,6 @@ bool DecodeMarketRecord(const mdl::MDLMessage* message,
         head->SequenceID};
 
     std::size_t body_size = 0U;
-    if (head->ServiceID == sh::SHL2MarketData::ServiceID &&
-        head->ServiceVersion == sh::SHL2MarketData::ServiceVer &&
-        head->MessageID == sh::SHL2MarketData::MessageID) {
-        const sh::SHL2MarketData* const body =
-            CheckedBody<sh::SHL2MarketData>(message, head, &body_size);
-        if (body == nullptr ||
-            !FormatTime(body->UpdateTime, &output->event_time) ||
-            !CopyBoundedString(message->GetBody(), body_size,
-                               body->SecurityID, &output->security_id) ||
-            !CopyBoundedString(message->GetBody(), body_size,
-                               body->InstruStatus, &output->event_type)) {
-            return false;
-        }
-        output->message_type = "SHL2MarketData";
-        output->last_price = FormatFixed(body->LastPrice);
-        output->pre_close_price = FormatFixed(body->PreCloPrice);
-        output->open_price = FormatFixed(body->OpenPrice);
-        output->high_price = FormatFixed(body->HighPrice);
-        output->low_price = FormatFixed(body->LowPrice);
-        output->trade_count = std::to_string(body->TradNumber);
-        output->volume = FormatFixed(body->TradVolume);
-        output->turnover = FormatFixed(body->Turnover);
-        output->total_bid_quantity = FormatFixed(body->TotalBidVol);
-        output->weighted_average_bid_price = FormatFixed(body->WAvgBidPri);
-        output->total_offer_quantity = FormatFixed(body->TotalAskVol);
-        output->weighted_average_offer_price = FormatFixed(body->WAvgAskPri);
-        return true;
-    }
     if (head->ServiceID == sh::NGTSTick::ServiceID &&
         head->ServiceVersion == sh::NGTSTick::ServiceVer &&
         head->MessageID == sh::NGTSTick::MessageID) {
@@ -435,44 +407,6 @@ bool DecodeMarketRecord(const mdl::MDLMessage* message,
         output->price = FormatFixed(body->Price);
         output->quantity = std::to_string(body->Qty);
         output->turnover = FormatFixed(body->TradeMoney);
-        return true;
-    }
-    if (head->ServiceID == sz::Snapshot300111_v2::ServiceID &&
-        head->ServiceVersion == sz::Snapshot300111_v2::ServiceVer &&
-        head->MessageID == sz::Snapshot300111_v2::MessageID) {
-        const sz::Snapshot300111_v2* const body =
-            CheckedBody<sz::Snapshot300111_v2>(
-                message, head, &body_size);
-        if (body == nullptr ||
-            !FormatTime(body->UpdateTime, &output->event_time) ||
-            !CopyBoundedString(message->GetBody(), body_size,
-                               body->MDStreamID, &output->md_stream_id) ||
-            !CopyBoundedString(message->GetBody(), body_size,
-                               body->SecurityID, &output->security_id) ||
-            !CopyBoundedString(message->GetBody(), body_size,
-                               body->SecurityIDSource,
-                               &output->security_id_source) ||
-            !CopyBoundedString(message->GetBody(), body_size,
-                               body->TradingPhaseCode,
-                               &output->trading_phase_code)) {
-            return false;
-        }
-        output->message_type = "Snapshot300111_v2";
-        output->channel_no = std::to_string(body->ChannelNo);
-        output->trade_count = std::to_string(body->TurnNum);
-        output->volume = std::to_string(body->Volume);
-        output->turnover = FormatFixed(body->Turnover);
-        output->pre_close_price = FormatFixed(body->PreCloPrice);
-        output->open_price = FormatFixed(body->OpenPrice);
-        output->high_price = FormatFixed(body->HighPrice);
-        output->low_price = FormatFixed(body->LowPrice);
-        output->last_price = FormatFixed(body->LastPrice);
-        output->total_bid_quantity = std::to_string(body->TotalBidQty);
-        output->weighted_average_bid_price =
-            FormatFixed(body->WeightedAvgBidPx);
-        output->total_offer_quantity = std::to_string(body->TotalOfferQty);
-        output->weighted_average_offer_price =
-            FormatFixed(body->WeightedAvgOfferPx);
         return true;
     }
     if (head->ServiceID == sz::Order300192_v2::ServiceID &&

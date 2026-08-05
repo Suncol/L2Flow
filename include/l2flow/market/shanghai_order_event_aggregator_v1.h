@@ -97,7 +97,6 @@ struct ShanghaiOrderSourceAnchorV1 final {
     std::int64_t native_event_sequence = 0;
     std::uint64_t source_sequence = 0U;
     std::uint64_t ingress_sequence = 0U;
-    std::uint64_t tick_stream_sequence = 0U;
     std::uint64_t vendor_sequence_id = 0U;
     std::uint64_t event_time_ns_since_midnight = 0U;
     std::int64_t event_time_unix_ns = 0;
@@ -141,22 +140,6 @@ struct ShanghaiOrderEventInputV1 final {
     std::uint64_t source_quality_flags = 0U;
     std::uint64_t source_market_notices = 0U;
 };
-
-enum class ShanghaiOrderEventProjectionV1 : std::uint8_t {
-    kProjected = 0U,
-    kNotShanghaiTick,
-    kInvalidTick,
-};
-
-// Projects the owned decoder representation into the dependency-light core
-// input. An IPC process can map RealtimeWireTickPayloadV2 to the same input
-// without linking the core back to IPC.
-[[nodiscard]] ShanghaiOrderEventProjectionV1
-ProjectShanghaiOrderEventInputV1(
-    const DecodedMarketEventV1& event,
-    std::uint64_t ingress_sequence,
-    std::uint64_t tick_stream_sequence,
-    ShanghaiOrderEventInputV1* output) noexcept;
 
 struct ShanghaiOrderSnapshotV1 final {
     ShanghaiOrderKeyV1 key{};
@@ -324,31 +307,18 @@ public:
         std::unique_ptr<ShanghaiOrderEventAggregatorV1>* output)
         noexcept;
 
-    // output is replaced with the events caused by exactly this input.
-    // Trades and cancels are emitted as source events; order revisions follow
-    // them in ascending OrderKey order. Inputs must retain upstream order:
-    // tick_stream_sequence is strictly increasing globally and BizIndex is
-    // strictly increasing among observed messages in each channel. Gaps are
-    // allowed here because an instrument-filtered stream naturally omits other
-    // products; exchange-level gap completeness must be established before
-    // filtering.
-    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 Consume(
+    // Ordering is established exclusively by
+    // (channel, BizIndex) before this call. The source/arrival values retained
+    // in the anchor are diagnostics and are deliberately not compared. Gaps
+    // are valid; a duplicate or non-increasing BizIndex in the same channel
+    // is rejected.
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    ConsumeBusinessOrdered(
         const ShanghaiOrderEventInputV1& input,
         std::vector<ShanghaiOrderEventV1>* output) noexcept;
 
-    // Recovery/certification path. canonical_apply_sequence is a dense,
-    // process-owned publication order supplied by a gap coordinator. It is
-    // used only for the global monotonic-consume guard; every source anchor in
-    // input and output retains the original arrival tick_stream_sequence.
-    // Native BizIndex monotonicity remains enforced independently per channel.
-    // Do not mix Consume and ConsumeCanonical on one instance.
-    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeCanonical(
-        const ShanghaiOrderEventInputV1& input,
-        std::uint64_t canonical_apply_sequence,
-        std::vector<ShanghaiOrderEventV1>* output) noexcept;
-
-    // Returns the authoritative upper bound for the events which Consume or
-    // ConsumeCanonical can emit for this input against the current state.
+    // Returns the authoritative upper bound for the events which the business
+    // ordered consume can emit for this input against the current state.
     // For an END status this is exact: the status row plus only unfinished
     // orders in the input's (trade_date, instrument_id, channel) range.
     // The query does not advance ordering frontiers or mutate order state.
@@ -356,12 +326,6 @@ public:
     MaximumOutputForInput(
         const ShanghaiOrderEventInputV1& input,
         std::size_t* output) const noexcept;
-
-    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeDecoded(
-        const DecodedMarketEventV1& event,
-        std::uint64_t ingress_sequence,
-        std::uint64_t tick_stream_sequence,
-        std::vector<ShanghaiOrderEventV1>* output) noexcept;
 
     // Finalizes all still-open states at the explicit clean trade-date
     // boundary. It performs no clock lookup and permanently seals this
