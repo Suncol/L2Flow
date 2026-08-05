@@ -5,7 +5,6 @@
 #include "l2flow/sdk/production_subscription_v1.h"
 #include "l2flow/sdk/vendor_head_view.h"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <limits>
@@ -74,12 +73,12 @@ private:
     alignas(64) std::atomic<std::size_t> tail_{0U};
 };
 
-struct DecoderCommandV1 final {
+struct RawTickEnvelopeV1 final {
     realtime::OwnedIngressMessageHandleV1 message;
     market::DailyInstrumentIdentityViewV2 identity{};
 };
 
-struct SourceSignalV1 final {
+struct TickWorkerSignalV1 final {
     std::atomic<std::uint64_t> epoch{0U};
 
     void Notify() noexcept {
@@ -183,8 +182,10 @@ std::string_view FastTickPipelineCreateErrorNameV1(
             return "plane_create_failed";
         case FastTickPipelineCreateErrorV1::kIngressPoolCreateFailed:
             return "ingress_pool_create_failed";
-        case FastTickPipelineCreateErrorV1::kDecoderThreadStartFailed:
-            return "decoder_thread_start_failed";
+        case FastTickPipelineCreateErrorV1::kTickWorkerThreadStartFailed:
+            return "tick_worker_thread_start_failed";
+        case FastTickPipelineCreateErrorV1::kTickWorkerAffinityFailed:
+            return "tick_worker_affinity_failed";
         case FastTickPipelineCreateErrorV1::kSdkLoadFailed:
             return "sdk_load_failed";
         case FastTickPipelineCreateErrorV1::kSdkManagerCreateFailed:
@@ -230,8 +231,8 @@ std::string_view FastTickPipelineIngressErrorNameV1(
             return "instrument_key_rejected";
         case FastTickPipelineIngressErrorV1::kCatalogMiss:
             return "catalog_miss";
-        case FastTickPipelineIngressErrorV1::kDecoderQueueFull:
-            return "decoder_queue_full";
+        case FastTickPipelineIngressErrorV1::kRawTickQueueFull:
+            return "raw_tick_queue_full";
         case FastTickPipelineIngressErrorV1::kStopped:
             return "stopped";
         case FastTickPipelineIngressErrorV1::kFatal:
@@ -242,16 +243,24 @@ std::string_view FastTickPipelineIngressErrorNameV1(
 
 class FastTickPipelineV1::Impl final : public mdl::MessageHandlerBase {
 public:
-    class DecoderLane final {
+    class RawTickLane final {
     public:
-        DecoderLane(
+        RawTickLane(
             std::size_t capacity,
             market::MarketDecoderConfigV1 decoder_config)
             : queue(capacity), decoder(decoder_config) {}
 
-        SpscQueueV1<DecoderCommandV1> queue;
+        SpscQueueV1<RawTickEnvelopeV1> queue;
         market::MarketDecoderV1 decoder;
-        SourceSignalV1 signal{};
+        std::unique_ptr<realtime::OwnedIngressMessagePoolV1> pool;
+    };
+
+    class TickWorker final {
+    public:
+        std::array<std::unique_ptr<RawTickLane>,
+                   realtime::kOwnedIngressSourceCountV1>
+            lanes{};
+        TickWorkerSignalV1 signal{};
         std::thread thread;
     };
 
@@ -276,14 +285,14 @@ public:
             config_.maximum_sdk_message_bytes == 0U ||
             config_.maximum_sdk_message_bytes >
                 realtime::kOwnedIngressMaximumMessageBytesV1 ||
-            config_.decoder_queue_capacity_per_source == 0U ||
-            config_.decoder_queue_capacity_per_source ==
-                std::numeric_limits<std::size_t>::max() ||
-            config_.decoder_batch_budget == 0U ||
-            config_.maximum_inflight_messages <
-                realtime::kOwnedIngressSourceCountV1 ||
-            config_.prewarm_message_count >
-                config_.maximum_inflight_messages ||
+            config_.raw_tick_queue_capacity_per_source_worker == 0U ||
+            config_.raw_tick_queue_capacity_per_source_worker >
+                realtime::kOwnedIngressMaximumInflightMessagesV1 - 2U ||
+            config_.raw_tick_batch_budget == 0U ||
+            config_.prewarm_message_count_per_source_worker >
+                config_.raw_tick_queue_capacity_per_source_worker + 2U ||
+            (config_.prewarm_message_bytes == 0U) !=
+                (config_.prewarm_message_count_per_source_worker == 0U) ||
             config_.prewarm_message_bytes >
                 config_.maximum_sdk_message_bytes ||
             !SameIdentity(config_.run_id, config_.planes.fast.session_id) ||
@@ -339,52 +348,78 @@ public:
             pool_config.maximum_message_bytes =
                 config_.maximum_sdk_message_bytes;
             pool_config.maximum_inflight_messages =
-                config_.maximum_inflight_messages;
+                config_.raw_tick_queue_capacity_per_source_worker + 2U;
             pool_config.prewarm_message_bytes =
                 config_.prewarm_message_bytes;
             pool_config.prewarm_message_count =
-                config_.prewarm_message_count;
+                config_.prewarm_message_count_per_source_worker;
             pool_config.serialized_acquire = true;
-            const auto pool_error =
-                realtime::OwnedIngressMessagePoolV1::Create(
-                    pool_config, &ingress_pool_);
-            if (pool_error !=
-                    realtime::OwnedIngressMessageErrorV1::kNone ||
-                ingress_pool_ == nullptr) {
+            tick_workers_.reserve(config_.planes.fast.worker_count);
+            for (std::uint32_t worker = 0U;
+                 worker < config_.planes.fast.worker_count; ++worker) {
+                auto tick_worker = std::make_unique<TickWorker>();
+                for (std::size_t source = 0U;
+                     source < realtime::kOwnedIngressSourceCountV1;
+                     ++source) {
+                    market::MarketDecoderConfigV1 decoder_config{};
+                    decoder_config.trade_date = config_.trade_date;
+                    decoder_config.source_stream_id =
+                        config_.source_stream_ids[source];
+                    decoder_config.limits = config_.decoder_limits;
+                    auto lane = std::make_unique<RawTickLane>(
+                        config_
+                            .raw_tick_queue_capacity_per_source_worker,
+                        decoder_config);
+                    if (!lane->decoder.configuration_valid()) {
+                        if (detail != nullptr) {
+                            *detail =
+                                "invalid Tick-worker decoder configuration";
+                        }
+                        return FastTickPipelineCreateErrorV1::
+                            kInvalidConfiguration;
+                    }
+                    const auto pool_error =
+                        realtime::OwnedIngressMessagePoolV1::Create(
+                            pool_config, &lane->pool);
+                    if (pool_error !=
+                            realtime::OwnedIngressMessageErrorV1::kNone ||
+                        lane->pool == nullptr) {
+                        if (detail != nullptr) {
+                            *detail =
+                                "sharded owned ingress pool creation failed: " +
+                                std::string(
+                                    realtime::
+                                        OwnedIngressMessageErrorNameV1(
+                                            pool_error));
+                        }
+                        return FastTickPipelineCreateErrorV1::
+                            kIngressPoolCreateFailed;
+                    }
+                    tick_worker->lanes[source] = std::move(lane);
+                }
+                tick_workers_.push_back(std::move(tick_worker));
+            }
+            for (std::uint32_t worker = 0U;
+                 worker < config_.planes.fast.worker_count; ++worker) {
+                tick_workers_[worker]->thread = std::thread(
+                    [this, worker] { TickWorkerLoop(worker); });
+            }
+            std::uint64_t started = tick_workers_started_.load(
+                std::memory_order_acquire);
+            while (started != config_.planes.fast.worker_count) {
+                tick_workers_started_.wait(
+                    started, std::memory_order_acquire);
+                started = tick_workers_started_.load(
+                    std::memory_order_acquire);
+            }
+            if (tick_worker_affinity_failed_.load(
+                    std::memory_order_acquire)) {
                 if (detail != nullptr) {
-                    *detail = "owned ingress pool creation failed: " +
-                        std::string(
-                            realtime::OwnedIngressMessageErrorNameV1(
-                                pool_error));
+                    *detail =
+                        "Tick-worker affinity application/readback failed";
                 }
                 return FastTickPipelineCreateErrorV1::
-                    kIngressPoolCreateFailed;
-            }
-
-            for (std::size_t source = 0U;
-                 source < realtime::kOwnedIngressSourceCountV1;
-                 ++source) {
-                market::MarketDecoderConfigV1 decoder_config{};
-                decoder_config.trade_date = config_.trade_date;
-                decoder_config.source_stream_id =
-                    config_.source_stream_ids[source];
-                decoder_config.limits = config_.decoder_limits;
-                lanes_[source] = std::make_unique<DecoderLane>(
-                    config_.decoder_queue_capacity_per_source,
-                    decoder_config);
-                if (!lanes_[source]->decoder.configuration_valid()) {
-                    if (detail != nullptr) {
-                        *detail = "invalid source decoder configuration";
-                    }
-                    return FastTickPipelineCreateErrorV1::
-                        kInvalidConfiguration;
-                }
-            }
-            for (std::size_t source = 0U;
-                 source < realtime::kOwnedIngressSourceCountV1;
-                 ++source) {
-                lanes_[source]->thread = std::thread(
-                    [this, source] { DecoderLoop(source); });
+                    kTickWorkerAffinityFailed;
             }
         } catch (const std::system_error& error) {
             if (detail != nullptr) {
@@ -395,7 +430,7 @@ public:
                 }
             }
             return FastTickPipelineCreateErrorV1::
-                kDecoderThreadStartFailed;
+                kTickWorkerThreadStartFailed;
         } catch (...) {
             return FastTickPipelineCreateErrorV1::kResourceExhausted;
         }
@@ -529,7 +564,7 @@ public:
         if (extraction != market::MarketDecodeErrorV1::kNone) {
             result.error = FastTickPipelineIngressErrorV1::
                 kInstrumentKeyRejected;
-            decoder_failures_.fetch_add(1U, std::memory_order_relaxed);
+            decode_failures_.fetch_add(1U, std::memory_order_relaxed);
             rejected_messages_.fetch_add(1U, std::memory_order_relaxed);
             TripFatal(0U);
             return result;
@@ -564,6 +599,21 @@ public:
         identity.quantity_unit = entry.metadata.quantity_unit;
         identity.security_type = entry.metadata.security_type;
         identity.asset_scope = entry.metadata.asset_scope;
+        if (entry.ordinal >= config_.planes.fast.tick_routes.size()) {
+            result.error = FastTickPipelineIngressErrorV1::kFatal;
+            rejected_messages_.fetch_add(1U, std::memory_order_relaxed);
+            TripFatal(entry.instrument_id);
+            return result;
+        }
+        const std::uint32_t tick_worker =
+            config_.planes.fast.tick_routes[entry.ordinal];
+        if (tick_worker >= tick_workers_.size()) {
+            result.error = FastTickPipelineIngressErrorV1::kFatal;
+            rejected_messages_.fetch_add(1U, std::memory_order_relaxed);
+            TripFatal(entry.instrument_id);
+            return result;
+        }
+        result.tick_worker = tick_worker;
 
         constexpr std::uint64_t sentinel =
             std::numeric_limits<std::uint64_t>::max();
@@ -581,22 +631,27 @@ public:
         metadata.source_sequence = source_sequences_[source] + 1U;
         metadata.recv_realtime_ns = recv_realtime_ns;
         metadata.recv_monotonic_ns = recv_monotonic_ns;
-        DecoderCommandV1 command{};
-        command.identity = identity;
-        result.owned_error = ingress_pool_->Acquire(
-            inspection, metadata, &command.message);
+        RawTickEnvelopeV1 envelope{};
+        envelope.identity = identity;
+        RawTickLane& lane =
+            *tick_workers_[tick_worker]->lanes[source];
+        result.owned_error = lane.pool->Acquire(
+            inspection, metadata, &envelope.message);
         if (result.owned_error !=
                 realtime::OwnedIngressMessageErrorV1::kNone ||
-            !command.message) {
+            !envelope.message) {
             result.error =
                 FastTickPipelineIngressErrorV1::kOwnedMessageRejected;
             rejected_messages_.fetch_add(1U, std::memory_order_relaxed);
             MarkInstrumentCoverageLost(entry.instrument_id);
             return result;
         }
-        if (!lanes_[source]->queue.TryPush(std::move(command))) {
-            result.error = FastTickPipelineIngressErrorV1::kDecoderQueueFull;
+        if (!lane.queue.TryPush(std::move(envelope))) {
+            result.error =
+                FastTickPipelineIngressErrorV1::kRawTickQueueFull;
             rejected_messages_.fetch_add(1U, std::memory_order_relaxed);
+            raw_tick_queue_failures_.fetch_add(
+                1U, std::memory_order_relaxed);
             MarkInstrumentCoverageLost(entry.instrument_id);
             return result;
         }
@@ -608,78 +663,135 @@ public:
         accepted_messages_.fetch_add(1U, std::memory_order_relaxed);
         accepted_by_source_[source].fetch_add(
             1U, std::memory_order_relaxed);
-        lanes_[source]->signal.Notify();
+        tick_workers_[tick_worker]->signal.Notify();
         return result;
     }
 
-    void DecoderLoop(std::size_t source) noexcept {
-        DecoderCommandV1 command{};
-        for (;;) {
+    [[nodiscard]] bool TickWorkerQueuesEmpty(
+        std::uint32_t worker) const noexcept {
+        for (const auto& lane : tick_workers_[worker]->lanes) {
+            if (!lane->queue.empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ApplyTickWorkerAffinity(
+        std::uint32_t worker) const noexcept {
+        if (!config_.planes.affinity.enforce) {
+            return true;
+        }
+        return worker < config_.planes.affinity.tick_workers.size() &&
+               l2flow::common::ApplyCurrentLinuxThreadAffinityExactV1(
+                   config_.planes.affinity.tick_workers[worker]) ==
+                   l2flow::common::LinuxThreadAffinityErrorV1::kNone;
+    }
+
+    void MarkTickWorkerStarted(bool affinity_ok) noexcept {
+        if (!affinity_ok) {
+            tick_worker_affinity_failed_.store(
+                true, std::memory_order_release);
+        }
+        tick_workers_started_.fetch_add(1U, std::memory_order_release);
+        tick_workers_started_.notify_all();
+    }
+
+    void TickWorkerLoop(std::uint32_t worker) noexcept {
+        const bool affinity_ok = ApplyTickWorkerAffinity(worker);
+        MarkTickWorkerStarted(affinity_ok);
+        RawTickEnvelopeV1 envelope{};
+        std::size_t source_cursor = 0U;
+        while (affinity_ok) {
             const std::uint64_t observed_epoch =
-                lanes_[source]->signal.epoch.load(
+                tick_workers_[worker]->signal.epoch.load(
                     std::memory_order_acquire);
             bool worked = false;
             for (std::size_t count = 0U;
-                 count < config_.decoder_batch_budget; ++count) {
-                if (!lanes_[source]->queue.TryPop(&command)) {
+                 count < config_.raw_tick_batch_budget; ++count) {
+                bool popped = false;
+                for (std::size_t offset = 0U;
+                     offset < realtime::kOwnedIngressSourceCountV1;
+                     ++offset) {
+                    const std::size_t source =
+                        (source_cursor + offset) %
+                        realtime::kOwnedIngressSourceCountV1;
+                    if (!tick_workers_[worker]
+                             ->lanes[source]
+                             ->queue.TryPop(&envelope)) {
+                        continue;
+                    }
+                    source_cursor = (source + 1U) %
+                        realtime::kOwnedIngressSourceCountV1;
+                    DecodeOne(worker, source, &envelope);
+                    envelope = RawTickEnvelopeV1{};
+                    popped = true;
+                    worked = true;
                     break;
                 }
-                worked = true;
-                DecodeOne(source, &command);
-                command = DecoderCommandV1{};
+                if (!popped) {
+                    break;
+                }
             }
-            if (decoder_stop_requested_.load(std::memory_order_acquire) &&
-                lanes_[source]->queue.empty()) {
+            if (tick_worker_stop_requested_.load(
+                    std::memory_order_acquire) &&
+                TickWorkerQueuesEmpty(worker)) {
                 break;
             }
             if (!worked) {
-                lanes_[source]->signal.epoch.wait(
+                tick_workers_[worker]->signal.epoch.wait(
                     observed_epoch, std::memory_order_acquire);
             }
         }
     }
 
     void DecodeOne(
+        std::uint32_t worker,
         std::size_t source,
-        DecoderCommandV1* command) noexcept {
-        if (command == nullptr || !command->message ||
-            command->message->source_slot() != source ||
-            command->message->recv_realtime_ns() >
+        RawTickEnvelopeV1* envelope) noexcept {
+        if (envelope == nullptr || !envelope->message ||
+            envelope->identity.ordinal >=
+                config_.planes.fast.tick_routes.size() ||
+            config_.planes.fast.tick_routes[
+                envelope->identity.ordinal] != worker ||
+            envelope->message->source_slot() != source ||
+            envelope->message->recv_realtime_ns() >
                 static_cast<std::uint64_t>(
                     std::numeric_limits<std::int64_t>::max()) ||
-            command->message->recv_monotonic_ns() >
+            envelope->message->recv_monotonic_ns() >
                 static_cast<std::uint64_t>(
                     std::numeric_limits<std::int64_t>::max())) {
-            decoder_failures_.fetch_add(1U, std::memory_order_relaxed);
-            TripFatal(command == nullptr
+            decode_failures_.fetch_add(1U, std::memory_order_relaxed);
+            TripFatal(envelope == nullptr
                           ? 0U
-                          : command->identity.instrument_id);
+                          : envelope->identity.instrument_id);
             return;
         }
-        const sdk::VendorHeadView head = command->message->vendor_head();
+        const sdk::VendorHeadView head = envelope->message->vendor_head();
         market::MarketMessageViewV1 view{};
         view.source_stream_id = config_.source_stream_ids[source];
         view.trade_date = config_.trade_date;
-        view.source_sequence = command->message->source_sequence();
-        view.service_id = command->message->key().service_id;
-        view.service_version = command->message->key().service_version;
-        view.message_id = command->message->key().message_id;
+        view.source_sequence = envelope->message->source_sequence();
+        view.service_id = envelope->message->key().service_id;
+        view.service_version = envelope->message->key().service_version;
+        view.message_id = envelope->message->key().message_id;
         view.message_encoding = head.message_encoding();
         view.vendor_local_time_raw = head.local_time_raw();
         view.vendor_sequence_id = head.sequence_id();
         view.recv_realtime_ns = static_cast<std::int64_t>(
-            command->message->recv_realtime_ns());
+            envelope->message->recv_realtime_ns());
         view.recv_monotonic_ns = static_cast<std::int64_t>(
-            command->message->recv_monotonic_ns());
-        view.body = command->message->body();
+            envelope->message->recv_monotonic_ns());
+        view.body = envelope->message->body();
 
         market::DecodedMarketEventV1 decoded;
-        if (lanes_[source]->decoder.Decode(view, &decoded) !=
+        if (tick_workers_[worker]->lanes[source]->decoder.Decode(
+                view, &decoded) !=
                 market::MarketDecodeErrorV1::kNone ||
             !market::ApplyDailyInstrumentIdentityV2(
-                command->identity, &decoded)) {
-            decoder_failures_.fetch_add(1U, std::memory_order_relaxed);
-            MarkInstrumentCoverageLost(command->identity.instrument_id);
+                envelope->identity, &decoded)) {
+            decode_failures_.fetch_add(1U, std::memory_order_relaxed);
+            MarkInstrumentCoverageLost(envelope->identity.instrument_id);
             return;
         }
         market::DecodedFastTickV1 owned;
@@ -690,29 +802,29 @@ public:
                           realtime::OwnedIngressSourceV1::kShanghaiTick)
                 ? market::FastTickSourceV1::kShanghaiTick
                 : market::FastTickSourceV1::kShenzhenTick,
-            command->message->global_ingress_sequence(),
+            envelope->message->global_ingress_sequence(),
             &owned,
             &compact);
         if (projection != market::FastTickProjectionErrorV1::kNone) {
-            decoder_failures_.fetch_add(1U, std::memory_order_relaxed);
-            MarkInstrumentCoverageLost(command->identity.instrument_id);
-            return;
-        }
-        const RealtimeRouteResultV1 routed = planes_->RouteDecoded(
-            compact, std::move(owned));
-        if (routed.error != RealtimeRouteErrorV1::kNone) {
-            decoder_failures_.fetch_add(1U, std::memory_order_relaxed);
-            if (routed.error == RealtimeRouteErrorV1::kFastQueueFull ||
-                routed.error ==
-                    RealtimeRouteErrorV1::kFastCoverageLost) {
-                MarkInstrumentCoverageLost(
-                    command->identity.instrument_id);
-            } else {
-                TripFatal(command->identity.instrument_id);
-            }
+            decode_failures_.fetch_add(1U, std::memory_order_relaxed);
+            MarkInstrumentCoverageLost(envelope->identity.instrument_id);
             return;
         }
         decoded_messages_.fetch_add(1U, std::memory_order_relaxed);
+        const RealtimePublishResultV1 published = planes_->PublishDecoded(
+            worker, compact, std::move(owned));
+        if (published.error != RealtimePublishErrorV1::kNone) {
+            if (published.error ==
+                    RealtimePublishErrorV1::kFastAppendFailed ||
+                published.error ==
+                    RealtimePublishErrorV1::kFastCoverageLost) {
+                MarkInstrumentCoverageLost(
+                    envelope->identity.instrument_id);
+            } else {
+                TripFatal(envelope->identity.instrument_id);
+            }
+            return;
+        }
     }
 
     void TripFatal(std::uint32_t instrument_id) noexcept {
@@ -845,22 +957,30 @@ public:
             sdk_manager_.reset();
         }
 
-        decoder_stop_requested_.store(true, std::memory_order_release);
-        for (auto& lane : lanes_) {
-            if (lane != nullptr) {
-                lane->signal.Notify();
+        tick_worker_stop_requested_.store(
+            true, std::memory_order_release);
+        for (auto& worker : tick_workers_) {
+            if (worker != nullptr) {
+                worker->signal.Notify();
             }
         }
-        for (auto& lane : lanes_) {
-            if (lane != nullptr && lane->thread.joinable()) {
-                lane->thread.join();
+        for (auto& worker : tick_workers_) {
+            if (worker != nullptr && worker->thread.joinable()) {
+                worker->thread.join();
             }
         }
         if (planes_ != nullptr) {
             planes_->StopAndDrain();
         }
-        if (ingress_pool_ != nullptr) {
-            ingress_pool_->Retire();
+        for (auto& worker : tick_workers_) {
+            if (worker == nullptr) {
+                continue;
+            }
+            for (auto& lane : worker->lanes) {
+                if (lane != nullptr && lane->pool != nullptr) {
+                    lane->pool->Retire();
+                }
+            }
         }
         stopped_.store(true, std::memory_order_release);
     }
@@ -877,7 +997,9 @@ public:
             std::memory_order_acquire);
         result.decoded_messages = decoded_messages_.load(
             std::memory_order_acquire);
-        result.decoder_failures = decoder_failures_.load(
+        result.decode_failures = decode_failures_.load(
+            std::memory_order_acquire);
+        result.raw_tick_queue_failures = raw_tick_queue_failures_.load(
             std::memory_order_acquire);
         for (std::size_t source = 0U;
              source < realtime::kOwnedIngressSourceCountV1;
@@ -900,10 +1022,7 @@ public:
     std::unique_ptr<sdk::SdkManager> sdk_manager_;
     std::unique_ptr<sdk::SdkSubscriber> sdk_subscriber_;
     std::unique_ptr<RealtimePlanesV1> planes_;
-    std::unique_ptr<realtime::OwnedIngressMessagePoolV1> ingress_pool_;
-    std::array<std::unique_ptr<DecoderLane>,
-               realtime::kOwnedIngressSourceCountV1>
-        lanes_{};
+    std::vector<std::unique_ptr<TickWorker>> tick_workers_;
     std::array<std::uint64_t,
                realtime::kOwnedIngressSourceCountV1>
         source_sequences_{};
@@ -912,16 +1031,19 @@ public:
     std::atomic<bool> accepting_{false};
     std::atomic<bool> fatal_{false};
     std::atomic<bool> callback_gate_closed_{false};
-    std::atomic<bool> decoder_stop_requested_{false};
+    std::atomic<bool> tick_worker_stop_requested_{false};
+    std::atomic<bool> tick_worker_affinity_failed_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> stopped_{false};
     std::atomic<std::uint64_t> active_callbacks_{0U};
+    std::atomic<std::uint64_t> tick_workers_started_{0U};
     std::atomic<std::uint64_t> accepted_messages_{0U};
     std::atomic<std::uint64_t> ignored_messages_{0U};
     std::atomic<std::uint64_t> filtered_messages_{0U};
     std::atomic<std::uint64_t> rejected_messages_{0U};
     std::atomic<std::uint64_t> decoded_messages_{0U};
-    std::atomic<std::uint64_t> decoder_failures_{0U};
+    std::atomic<std::uint64_t> decode_failures_{0U};
+    std::atomic<std::uint64_t> raw_tick_queue_failures_{0U};
     std::array<std::atomic<std::uint64_t>,
                realtime::kOwnedIngressSourceCountV1>
         accepted_by_source_{};

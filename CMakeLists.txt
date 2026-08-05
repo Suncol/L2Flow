@@ -156,7 +156,7 @@ set_target_properties(l2flow_market PROPERTIES
 target_link_libraries(l2flow_market
     PUBLIC L2Flow::common Threads::Threads)
 
-# The single-copy ownership boundary for the two source decoder lanes.
+# The single-copy ownership boundary for source-by-Tick-worker raw shards.
 add_library(l2flow_realtime_ingress STATIC
     src/realtime/owned_ingress_message_v1.cpp)
 add_library(L2Flow::realtime_ingress ALIAS l2flow_realtime_ingress)
@@ -165,8 +165,9 @@ target_link_libraries(l2flow_realtime_ingress
     PUBLIC L2Flow::common L2Flow::sdk Threads::Threads)
 
 # The production composition: serialized callback admission gives each
-# immutable owned Tick to one of two source decoder FIFOs. Decoders then use a
-# FAST-first, non-blocking fan-out to independent Tick/Event/KLine planes.
+# immutable owned Tick directly to its fixed Tick-worker shard. That worker
+# decodes once, publishes FAST, then nonblockingly fans compact rows to the
+# independent Event and KLine planes.
 add_library(l2flow_realtime STATIC
     src/runtime/fast_tick_pipeline_v1.cpp
     src/runtime/realtime_planes_v1.cpp)

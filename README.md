@@ -12,24 +12,27 @@ Snapshot-derived state exists in the production data path.
 
 ## Runtime model
 
-The serialized SDK callback copies each accepted message into one of two
-source-owned decoder lanes: Shanghai Tick, or the shared Shenzhen Order and
-Transaction lane. A decoded Tick is routed FAST-first into three independent
-planes:
+The serialized SDK callback extracts the exact instrument key, resolves its
+daily-catalog ordinal, and copies each accepted message directly into the
+fixed Tick worker selected by `tick_routes[ordinal]`. Every Tick worker owns a
+Shanghai and a Shenzhen decoder. It performs the only full decode, publishes
+FAST synchronously, and then sends compact envelopes to the derived planes:
 
 ```text
-SDK callback -> two source decoder lanes
-                         |
-                         +-> Tick queues  -> Tick workers  -> FAST history
-                         +-> Event queues -> Event workers -> ordered Event root + CDC
-                         +-> KLine queues -> KLine workers -> mutable KLine root + CDC
+SDK callback
+  -> raw queues[source][Tick worker]
+  -> Tick worker: full decode -> FAST append/publish
+                               +-> compact -> Event worker -> ordered Event root + CDC
+                               +-> trade compact -> KLine worker -> mutable KLine root + CDC
 ```
 
-The planes have distinct immutable route tables, SPSC matrices, queue
-capacities, worker threads, CPU sets, stores, wakeups, and failure state. An
-Event or KLine queue failure marks only that instrument for repair. FAST does
-not wait for either derived plane. A known-instrument FAST loss fails coverage
-closed for that instrument while unrelated instruments continue.
+Raw ownership pools and queues are sharded by source and Tick worker. Derived
+SPSC matrices are sharded by producer Tick worker and destination derived
+worker. The planes retain distinct immutable route tables, queue capacities,
+worker threads, CPU sets, stores, wakeups, and failure state. An Event or KLine
+queue failure marks only that instrument for repair. FAST does not wait for
+either derived plane. A known-instrument FAST loss fails coverage closed for
+that instrument while unrelated instruments continue.
 
 FAST history is append-only in instrument arrival order. Event ordering uses
 only `(channel, BizIndex)` for Shanghai and `(channel, ApplSeqNum)` for

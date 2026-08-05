@@ -1164,10 +1164,10 @@ private:
     bool retired_ = false;
 
     // The acquisition and recycle counters occupy separate cache lines so a
-    // serialized callback does not write the cache line shared by decoder
-    // recyclers. Returned blocks cross that boundary only when the callback
-    // atomically detaches a whole size-class chain after its private list is
-    // empty.
+    // serialized callback does not write the cache line shared by its Tick
+    // worker recycler. Returned blocks cross that boundary only when the
+    // callback atomically detaches a whole size-class chain after its private
+    // list is empty.
     alignas(64) std::atomic<std::uint64_t>
         serialized_acquire_gate_{0U};
     std::atomic<std::uint64_t> serialized_acquired_messages_{0U};

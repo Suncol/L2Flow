@@ -81,9 +81,8 @@ runtime::RealtimePlanesConfigV1 Config() {
 
     // FAST can accept the complete test prefix. Tiny independent derived
     // queues make their overload path deterministic without slowing FAST.
-    result.tick_queue_capacity_per_source_worker = kHotRecords + 2U;
-    result.event_queue_capacity_per_source_worker = 1U;
-    result.kline_queue_capacity_per_source_worker = 1U;
+    result.event_queue_capacity_per_tick_worker = 1U;
+    result.kline_queue_capacity_per_tick_worker = 1U;
     result.live_batch_budget = 1U;
     return result;
 }
@@ -210,11 +209,11 @@ int main() {
             0U,
             10'000 + static_cast<std::int64_t>(index),
             arrival_id);
-        const auto routed = planes->RouteDecoded(
-            tick.compact, std::move(tick.owned));
+        const auto routed = planes->PublishDecoded(
+            0U, tick.compact, std::move(tick.owned));
         ok &= Expect(
-            routed.error == runtime::RealtimeRouteErrorV1::kNone &&
-                routed.fast_enqueued,
+            routed.error == runtime::RealtimePublishErrorV1::kNone &&
+                routed.fast_published,
             "derived overload never rejects the FAST route");
         event_repair_registrations +=
             routed.event_repair_registered ? 1U : 0U;
@@ -248,7 +247,7 @@ int main() {
 
     const auto overloaded = planes->Snapshot();
     ok &= Expect(
-        overloaded.fast_queue_failures == 0U &&
+        overloaded.fast_append_failures == 0U &&
             overloaded.fast_applied == kHotRecords &&
             overloaded.event_queue_failures > 0U &&
             overloaded.kline_queue_failures > 0U &&
@@ -269,11 +268,11 @@ int main() {
     ++arrival_id;
     const std::uint64_t late_arrival = arrival_id;
     TickPair late = Trade(1U, 0U, 1, late_arrival);
-    const auto late_route = planes->RouteDecoded(
-        late.compact, std::move(late.owned));
+    const auto late_route = planes->PublishDecoded(
+        0U, late.compact, std::move(late.owned));
     ok &= Expect(
-        late_route.error == runtime::RealtimeRouteErrorV1::kNone &&
-            late_route.fast_enqueued,
+        late_route.error == runtime::RealtimePublishErrorV1::kNone &&
+            late_route.fast_published,
         "an early late input is recorded by FAST immediately");
     ok &= Expect(
         planes->WaitFastPublished(
@@ -308,11 +307,11 @@ int main() {
     ++arrival_id;
     const std::uint64_t healthy_arrival = arrival_id;
     TickPair healthy = Trade(2U, 1U, 500, healthy_arrival);
-    const auto healthy_route = planes->RouteDecoded(
-        healthy.compact, std::move(healthy.owned));
+    const auto healthy_route = planes->PublishDecoded(
+        0U, healthy.compact, std::move(healthy.owned));
     ok &= Expect(
-        healthy_route.error == runtime::RealtimeRouteErrorV1::kNone &&
-            healthy_route.fast_enqueued && healthy_route.event_enqueued &&
+        healthy_route.error == runtime::RealtimePublishErrorV1::kNone &&
+            healthy_route.fast_published && healthy_route.event_enqueued &&
             healthy_route.kline_enqueued,
         "a healthy instrument on the same workers remains live during repair");
 

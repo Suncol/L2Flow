@@ -69,9 +69,8 @@ runtime::RealtimePlanesConfigV1 PlaneConfig() {
     result.kline.maximum_changes_per_read = 16U;
     result.kline.kline_routes = {0U};
 
-    result.tick_queue_capacity_per_source_worker = 8U;
-    result.event_queue_capacity_per_source_worker = 8U;
-    result.kline_queue_capacity_per_source_worker = 8U;
+    result.event_queue_capacity_per_tick_worker = 8U;
+    result.kline_queue_capacity_per_tick_worker = 8U;
     result.live_batch_budget = 4U;
     return result;
 }
@@ -278,12 +277,13 @@ int main() {
     market::CompactFastTickV1 compact{};
     market::DecodedFastTickV1 owned{};
     ok &= Expect(ProjectTrade(1U, &compact, &owned), "project FAST trade");
-    const auto routed = planes->RouteDecoded(compact, std::move(owned));
+    const auto routed = planes->PublishDecoded(
+        0U, compact, std::move(owned));
     ok &= Expect(
-        routed.error == runtime::RealtimeRouteErrorV1::kNone &&
-            routed.fast_enqueued && routed.event_enqueued &&
+        routed.error == runtime::RealtimePublishErrorV1::kNone &&
+            routed.fast_published && routed.event_enqueued &&
             routed.kline_enqueued,
-        "FAST-first fan-out accepts all three independent routes");
+        "FAST publish precedes both compact derived fan-outs");
     ok &= Expect(
         planes->WaitFastPublished(
             1U, 1U, std::chrono::seconds(3)),

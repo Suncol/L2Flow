@@ -3,8 +3,9 @@
 
 The benchmark bridge injects real binary 4.101.24 and 6.101.36 messages into
 ``FastTickPipelineV1.IngestForTest``. That seam calls the same admission,
-ownership, decoder, and independent worker implementation as the serialized
-SDK callback. The scope intentionally excludes vendor network/dispatch and a
+ownership, instrument-sharded Tick-worker decode, and independent derived
+worker implementation as the serialized SDK callback. The scope intentionally
+excludes vendor network/dispatch and a
 cross-process transport, neither of which the current V3 implementation can
 provide. It includes the native Event CDC copy, Python model construction,
 immutable Polars block update, cumulative DataFrame concat, and a tail read.
@@ -72,7 +73,7 @@ class NativeSnapshot(ctypes.Structure):
         ("attempted_messages", ctypes.c_uint64),
         ("accepted_messages", ctypes.c_uint64),
         ("ingress_errors", ctypes.c_uint64),
-        ("decoder_queue_full_errors", ctypes.c_uint64),
+        ("raw_tick_queue_full_errors", ctypes.c_uint64),
         ("owned_message_rejected_errors", ctypes.c_uint64),
         ("other_ingress_errors", ctypes.c_uint64),
         ("first_callback_start_ns", ctypes.c_uint64),
@@ -81,10 +82,9 @@ class NativeSnapshot(ctypes.Structure):
         ("accepted_shanghai", ctypes.c_uint64),
         ("accepted_shenzhen", ctypes.c_uint64),
         ("decoded_messages", ctypes.c_uint64),
-        ("decoder_failures", ctypes.c_uint64),
+        ("decode_failures", ctypes.c_uint64),
         ("rejected_messages", ctypes.c_uint64),
-        ("routed_ticks", ctypes.c_uint64),
-        ("fast_queue_failures", ctypes.c_uint64),
+        ("fast_append_failures", ctypes.c_uint64),
         ("fast_unrecoverable_drops", ctypes.c_uint64),
         ("event_queue_failures", ctypes.c_uint64),
         ("kline_queue_failures", ctypes.c_uint64),
@@ -674,7 +674,7 @@ def trial(
             and final_snapshot.attempted_messages == message_count
             and final_snapshot.accepted_messages == message_count
             and final_snapshot.ingress_errors == 0
-            and final_snapshot.decoder_failures == 0
+            and final_snapshot.decode_failures == 0
             and final_snapshot.fast_stable_rows == message_count
             and final_snapshot.event_stable_rows == message_count
             and final_snapshot.kline_applied == message_count
@@ -684,7 +684,7 @@ def trial(
         )
         normal_path_clean = (
             correctness_complete
-            and final_snapshot.fast_queue_failures == 0
+            and final_snapshot.fast_append_failures == 0
             and final_snapshot.fast_unrecoverable_drops == 0
             and final_snapshot.event_queue_failures == 0
             and final_snapshot.kline_queue_failures == 0
@@ -866,8 +866,8 @@ def main() -> int:
             ),
             "included": [
                 "binary MDL inspection and owned ingress copy",
-                "two decoder lanes",
-                "FAST-first Tick/Event/KLine fan-out",
+                "source-by-Tick-worker raw queues and sharded decoders",
+                "Tick-worker FAST publish before compact Event/KLine fan-out",
                 "Event stable root or INSERT CDC native copy",
                 "Python DerivedEvent model construction",
                 "Polars immutable block materialization and tail read",
@@ -883,7 +883,7 @@ def main() -> int:
             "duration_seconds": args.duration_seconds,
             "instruments": args.instruments,
             "workers_per_plane": args.workers,
-            "queue_capacity_per_source_worker": args.queue_capacity,
+            "queue_capacity_per_raw_or_derived_shard": args.queue_capacity,
             "event_change_batch": args.batch_size,
             "polars_rows_per_block": args.rows_per_block,
             "probe_instruments": args.probe_count,
@@ -896,7 +896,7 @@ def main() -> int:
             ),
             "native_affinity_policy": (
                 "one exclusive CPU per Tick/Event/KLine worker; remaining "
-                "taskset CPUs reserved for decoder/callback/Python"
+                "taskset CPUs reserved for callback/Python"
             ),
         },
         "environment": {

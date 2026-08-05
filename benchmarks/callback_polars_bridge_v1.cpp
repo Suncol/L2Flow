@@ -316,13 +316,11 @@ BuildCatalog(std::uint32_t instrument_count, std::string* detail) {
     result.daily_catalog = std::move(catalog);
     result.source_stream_ids = {101U, 202U};
     result.maximum_sdk_message_bytes = 512U;
-    result.decoder_queue_capacity_per_source = queue_capacity;
-    result.decoder_batch_budget = 256U;
-    const std::size_t inflight =
-        static_cast<std::size_t>(queue_capacity) * 2U + 1024U;
-    result.maximum_inflight_messages = inflight;
+    result.raw_tick_queue_capacity_per_source_worker = queue_capacity;
+    result.raw_tick_batch_budget = 256U;
     result.prewarm_message_bytes = 128U;
-    result.prewarm_message_count = std::min<std::size_t>(inflight, 65'536U);
+    result.prewarm_message_count_per_source_worker =
+        std::min<std::size_t>(queue_capacity, 65'536U);
     result.enforce_receive_trade_date = false;
 
     result.planes.fast.session_id = SessionId();
@@ -374,9 +372,8 @@ BuildCatalog(std::uint32_t instrument_count, std::string* detail) {
         result.planes.event.event_routes[ordinal] = worker;
         result.planes.kline.kline_routes[ordinal] = worker;
     }
-    result.planes.tick_queue_capacity_per_source_worker = queue_capacity;
-    result.planes.event_queue_capacity_per_source_worker = queue_capacity;
-    result.planes.kline_queue_capacity_per_source_worker = queue_capacity;
+    result.planes.event_queue_capacity_per_tick_worker = queue_capacity;
+    result.planes.kline_queue_capacity_per_tick_worker = queue_capacity;
     result.planes.live_batch_budget = 256U;
     result.planes.affinity.enforce = true;
     result.planes.affinity.tick_workers.resize(worker_count);
@@ -574,8 +571,8 @@ public:
             std::memory_order_acquire);
         output->ingress_errors = ingress_errors_.load(
             std::memory_order_acquire);
-        output->decoder_queue_full_errors =
-            decoder_queue_full_errors_.load(std::memory_order_acquire);
+        output->raw_tick_queue_full_errors =
+            raw_tick_queue_full_errors_.load(std::memory_order_acquire);
         output->owned_message_rejected_errors =
             owned_message_rejected_errors_.load(
                 std::memory_order_acquire);
@@ -599,12 +596,11 @@ public:
         output->accepted_shanghai = snapshot.accepted_by_source[0U];
         output->accepted_shenzhen = snapshot.accepted_by_source[1U];
         output->decoded_messages = snapshot.decoded_messages;
-        output->decoder_failures = snapshot.decoder_failures;
+        output->decode_failures = snapshot.decode_failures;
         output->rejected_messages = snapshot.rejected_messages;
         output->pipeline_fatal = snapshot.fatal ? 1U : 0U;
-        output->routed_ticks = snapshot.planes.routed_ticks;
-        output->fast_queue_failures =
-            snapshot.planes.fast_queue_failures;
+        output->fast_append_failures =
+            snapshot.planes.fast_append_failures;
         output->fast_unrecoverable_drops =
             snapshot.planes.fast_unrecoverable_drops;
         output->event_queue_failures =
@@ -898,8 +894,8 @@ private:
                 ingress_errors_.fetch_add(1U, std::memory_order_release);
                 if (result.error ==
                     runtime::FastTickPipelineIngressErrorV1::
-                        kDecoderQueueFull) {
-                    decoder_queue_full_errors_.fetch_add(
+                        kRawTickQueueFull) {
+                    raw_tick_queue_full_errors_.fetch_add(
                         1U, std::memory_order_release);
                 } else if (result.error ==
                            runtime::FastTickPipelineIngressErrorV1::
@@ -1027,7 +1023,7 @@ private:
     std::atomic<std::uint64_t> attempted_messages_{0U};
     std::atomic<std::uint64_t> accepted_messages_{0U};
     std::atomic<std::uint64_t> ingress_errors_{0U};
-    std::atomic<std::uint64_t> decoder_queue_full_errors_{0U};
+    std::atomic<std::uint64_t> raw_tick_queue_full_errors_{0U};
     std::atomic<std::uint64_t> owned_message_rejected_errors_{0U};
     std::atomic<std::uint64_t> other_ingress_errors_{0U};
     std::atomic<std::uint64_t> first_callback_start_ns_{0U};

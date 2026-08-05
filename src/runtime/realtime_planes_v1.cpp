@@ -1,11 +1,9 @@
 #include "l2flow/runtime/realtime_planes_v1.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <limits>
-#include <optional>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -61,11 +59,6 @@ private:
     std::unique_ptr<T[]> slots_;
     alignas(64) std::atomic<std::size_t> head_{0U};
     alignas(64) std::atomic<std::size_t> tail_{0U};
-};
-
-struct FastEnvelopeV1 final {
-    l2flow::market::CompactFastTickV1 compact{};
-    l2flow::market::DecodedFastTickV1 owned{};
 };
 
 struct WorkerSignalV1 final {
@@ -170,20 +163,22 @@ std::string_view RealtimePlanesCreateErrorNameV1(
     return "unknown";
 }
 
-std::string_view RealtimeRouteErrorNameV1(
-    RealtimeRouteErrorV1 error) noexcept {
+std::string_view RealtimePublishErrorNameV1(
+    RealtimePublishErrorV1 error) noexcept {
     switch (error) {
-        case RealtimeRouteErrorV1::kNone:
+        case RealtimePublishErrorV1::kNone:
             return "none";
-        case RealtimeRouteErrorV1::kInvalidInput:
+        case RealtimePublishErrorV1::kInvalidInput:
             return "invalid_input";
-        case RealtimeRouteErrorV1::kConcurrentSourceProducer:
-            return "concurrent_source_producer";
-        case RealtimeRouteErrorV1::kFastQueueFull:
-            return "fast_queue_full";
-        case RealtimeRouteErrorV1::kFastCoverageLost:
+        case RealtimePublishErrorV1::kWrongTickWorker:
+            return "wrong_tick_worker";
+        case RealtimePublishErrorV1::kConcurrentTickWorker:
+            return "concurrent_tick_worker";
+        case RealtimePublishErrorV1::kFastAppendFailed:
+            return "fast_append_failed";
+        case RealtimePublishErrorV1::kFastCoverageLost:
             return "fast_coverage_lost";
-        case RealtimeRouteErrorV1::kStopped:
+        case RealtimePublishErrorV1::kStopped:
             return "stopped";
     }
     return "unknown";
@@ -193,8 +188,6 @@ class RealtimePlanesV1::Impl final {
 public:
     explicit Impl(RealtimePlanesConfigV1 config)
         : config_(std::move(config)),
-          tick_signals_(std::make_unique<WorkerSignalV1[]>(
-              config_.fast.worker_count)),
           event_signals_(std::make_unique<WorkerSignalV1[]>(
               config_.event.worker_count)),
           kline_signals_(std::make_unique<WorkerSignalV1[]>(
@@ -204,7 +197,9 @@ public:
           kline_repair_signals_(std::make_unique<WorkerSignalV1[]>(
               config_.kline.worker_count)),
           fast_route_live_(std::make_unique<std::atomic<bool>[]>(
-              config_.fast.instrument_count)) {
+              config_.fast.instrument_count)),
+          tick_worker_guards_(std::make_unique<std::atomic_flag[]>(
+              config_.fast.worker_count)) {
         for (std::size_t ordinal = 0U;
              ordinal < config_.fast.instrument_count; ++ordinal) {
             fast_route_live_[ordinal].store(
@@ -215,10 +210,10 @@ public:
     ~Impl() { StopAndDrain(); }
 
     [[nodiscard]] std::size_t QueueIndex(
-        std::size_t source,
+        std::size_t tick_worker,
         std::uint32_t worker,
         std::uint32_t worker_count) const noexcept {
-        return source * worker_count + worker;
+        return tick_worker * worker_count + worker;
     }
 
     [[nodiscard]] bool ApplyAffinity(
@@ -241,128 +236,27 @@ public:
         started_threads_.notify_all();
     }
 
-    [[nodiscard]] bool QueuesEmpty(
-        const std::vector<std::unique_ptr<
-            SpscQueueV1<FastEnvelopeV1>>>& queues,
-        std::uint32_t worker,
-        std::uint32_t worker_count) const noexcept {
-        for (std::size_t source = 0U;
-             source < l2flow::market::kFastTickSourceCountV1;
-             ++source) {
-            if (!queues[QueueIndex(source, worker, worker_count)]->empty()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     [[nodiscard]] bool CompactQueuesEmpty(
         const std::vector<std::unique_ptr<
             SpscQueueV1<l2flow::market::CompactFastTickV1>>>& queues,
         std::uint32_t worker,
         std::uint32_t worker_count) const noexcept {
-        for (std::size_t source = 0U;
-             source < l2flow::market::kFastTickSourceCountV1;
-             ++source) {
-            if (!queues[QueueIndex(source, worker, worker_count)]->empty()) {
+        for (std::size_t tick_worker = 0U;
+             tick_worker < config_.fast.worker_count;
+             ++tick_worker) {
+            if (!queues[QueueIndex(
+                    tick_worker, worker, worker_count)]->empty()) {
                 return false;
             }
         }
         return true;
-    }
-
-    void TickLoop(std::uint32_t worker) noexcept {
-        const bool affinity_ok = ApplyAffinity(
-            config_.affinity.tick_workers, worker);
-        MarkStarted(affinity_ok);
-        std::size_t source_cursor = 0U;
-        while (affinity_ok) {
-            const std::uint64_t observed_epoch =
-                tick_signals_[worker].epoch.load(
-                    std::memory_order_acquire);
-            bool worked = false;
-            for (std::size_t count = 0U;
-                 count < config_.live_batch_budget; ++count) {
-                bool popped = false;
-                for (std::size_t offset = 0U;
-                     offset < l2flow::market::kFastTickSourceCountV1;
-                     ++offset) {
-                    const std::size_t source =
-                        (source_cursor + offset) %
-                        l2flow::market::kFastTickSourceCountV1;
-                    FastEnvelopeV1 envelope{};
-                    if (!tick_queues_[QueueIndex(
-                            source,
-                            worker,
-                            config_.fast.worker_count)]->TryPop(
-                            &envelope)) {
-                        continue;
-                    }
-                    source_cursor = (source + 1U) %
-                        l2flow::market::kFastTickSourceCountV1;
-                    popped = true;
-                    worked = true;
-                    const auto& route = tick_routes_[
-                        envelope.compact.ordinal];
-                    const auto error = fast_store_->Append(
-                        worker,
-                        route,
-                        envelope.compact,
-                        std::move(envelope.owned));
-                    if (error ==
-                        l2flow::market::FastTickStoreAppendErrorV1::kNone) {
-                        fast_applied_.fetch_add(
-                            1U, std::memory_order_relaxed);
-                        const auto& event_route = event_routes_[
-                            route.ordinal];
-                        const auto& kline_route = kline_routes_[
-                            route.ordinal];
-                        event_signals_[event_route.worker].Notify();
-                        kline_signals_[kline_route.worker].Notify();
-                        event_repair_signals_[
-                            event_route.worker].Notify();
-                        kline_repair_signals_[
-                            kline_route.worker].Notify();
-                    } else {
-                        fast_store_->MarkCoverageLost(
-                            route.instrument_id);
-                        fast_route_live_[route.ordinal].store(
-                            false, std::memory_order_release);
-                        event_history_->MarkUnrecoverable(
-                            route.instrument_id);
-                        kline_history_->MarkUnrecoverable(
-                            route.instrument_id);
-                        event_repair_signals_[
-                            event_routes_[route.ordinal].worker].Notify();
-                        kline_repair_signals_[
-                            kline_routes_[route.ordinal].worker].Notify();
-                    }
-                    break;
-                }
-                if (!popped) {
-                    break;
-                }
-            }
-            if (worker_stop_requested_.load(std::memory_order_acquire) &&
-                QueuesEmpty(
-                    tick_queues_, worker, config_.fast.worker_count)) {
-                break;
-            }
-            if (!worked) {
-                tick_signals_[worker].epoch.wait(
-                    observed_epoch, std::memory_order_acquire);
-            }
-        }
     }
 
     void EventLoop(std::uint32_t worker) noexcept {
         const bool affinity_ok = ApplyAffinity(
             config_.affinity.event_workers, worker);
         MarkStarted(affinity_ok);
-        std::array<std::optional<l2flow::market::CompactFastTickV1>,
-                   l2flow::market::kFastTickSourceCountV1>
-            pending;
-        std::size_t source_cursor = 0U;
+        std::size_t producer_cursor = 0U;
         while (affinity_ok) {
             const std::uint64_t observed_epoch =
                 event_signals_[worker].epoch.load(
@@ -372,40 +266,17 @@ public:
                  count < config_.live_batch_budget; ++count) {
                 bool consumed = false;
                 for (std::size_t offset = 0U;
-                     offset < l2flow::market::kFastTickSourceCountV1;
+                     offset < config_.fast.worker_count;
                      ++offset) {
-                    const std::size_t source =
-                        (source_cursor + offset) %
-                        l2flow::market::kFastTickSourceCountV1;
-                    if (!pending[source].has_value()) {
-                        l2flow::market::CompactFastTickV1 input{};
-                        if (!event_queues_[QueueIndex(
-                                source,
-                                worker,
-                                config_.event.worker_count)]->TryPop(
-                                &input)) {
-                            continue;
-                        }
-                        pending[source] = input;
-                    }
-                    const auto& input = *pending[source];
-                    if (!fast_store_->PublishedThrough(
-                            input.instrument_id, input.arrival_id)) {
-                        l2flow::market::FastTickInstrumentStatusV1 status{};
-                        if (fast_store_->Status(
-                                input.instrument_id, &status) !=
-                                l2flow::market::
-                                    FastTickStoreQueryErrorV1::kNone ||
-                            !status.coverage_complete) {
-                            event_history_->MarkUnrecoverable(
-                                input.instrument_id);
-                            pending[source].reset();
-                            source_cursor = (source + 1U) %
-                                l2flow::market::kFastTickSourceCountV1;
-                            worked = true;
-                            consumed = true;
-                            break;
-                        }
+                    const std::size_t tick_worker =
+                        (producer_cursor + offset) %
+                        config_.fast.worker_count;
+                    l2flow::market::CompactFastTickV1 input{};
+                    if (!event_queues_[QueueIndex(
+                            tick_worker,
+                            worker,
+                            config_.event.worker_count)]->TryPop(
+                            &input)) {
                         continue;
                     }
                     const auto& route = event_routes_[input.ordinal];
@@ -437,9 +308,8 @@ public:
                             input.instrument_id, input.arrival_id);
                         event_repair_signals_[worker].Notify();
                     }
-                    pending[source].reset();
-                    source_cursor = (source + 1U) %
-                        l2flow::market::kFastTickSourceCountV1;
+                    producer_cursor = (tick_worker + 1U) %
+                        config_.fast.worker_count;
                     worked = true;
                     consumed = true;
                     break;
@@ -448,13 +318,7 @@ public:
                     break;
                 }
             }
-            const bool no_pending = std::all_of(
-                pending.begin(), pending.end(),
-                [](const auto& value) noexcept {
-                    return !value.has_value();
-                });
             if (worker_stop_requested_.load(std::memory_order_acquire) &&
-                no_pending &&
                 CompactQueuesEmpty(
                     event_queues_, worker, config_.event.worker_count)) {
                 break;
@@ -470,10 +334,7 @@ public:
         const bool affinity_ok = ApplyAffinity(
             config_.affinity.kline_workers, worker);
         MarkStarted(affinity_ok);
-        std::array<std::optional<l2flow::market::CompactFastTickV1>,
-                   l2flow::market::kFastTickSourceCountV1>
-            pending;
-        std::size_t source_cursor = 0U;
+        std::size_t producer_cursor = 0U;
         while (affinity_ok) {
             const std::uint64_t observed_epoch =
                 kline_signals_[worker].epoch.load(
@@ -483,40 +344,17 @@ public:
                  count < config_.live_batch_budget; ++count) {
                 bool consumed = false;
                 for (std::size_t offset = 0U;
-                     offset < l2flow::market::kFastTickSourceCountV1;
+                     offset < config_.fast.worker_count;
                      ++offset) {
-                    const std::size_t source =
-                        (source_cursor + offset) %
-                        l2flow::market::kFastTickSourceCountV1;
-                    if (!pending[source].has_value()) {
-                        l2flow::market::CompactFastTickV1 input{};
-                        if (!kline_queues_[QueueIndex(
-                                source,
-                                worker,
-                                config_.kline.worker_count)]->TryPop(
-                                &input)) {
-                            continue;
-                        }
-                        pending[source] = input;
-                    }
-                    const auto& input = *pending[source];
-                    if (!fast_store_->PublishedThrough(
-                            input.instrument_id, input.arrival_id)) {
-                        l2flow::market::FastTickInstrumentStatusV1 status{};
-                        if (fast_store_->Status(
-                                input.instrument_id, &status) !=
-                                l2flow::market::
-                                    FastTickStoreQueryErrorV1::kNone ||
-                            !status.coverage_complete) {
-                            kline_history_->MarkUnrecoverable(
-                                input.instrument_id);
-                            pending[source].reset();
-                            source_cursor = (source + 1U) %
-                                l2flow::market::kFastTickSourceCountV1;
-                            worked = true;
-                            consumed = true;
-                            break;
-                        }
+                    const std::size_t tick_worker =
+                        (producer_cursor + offset) %
+                        config_.fast.worker_count;
+                    l2flow::market::CompactFastTickV1 input{};
+                    if (!kline_queues_[QueueIndex(
+                            tick_worker,
+                            worker,
+                            config_.kline.worker_count)]->TryPop(
+                            &input)) {
                         continue;
                     }
                     const auto& route = kline_routes_[input.ordinal];
@@ -544,9 +382,8 @@ public:
                             input.instrument_id, input.arrival_id);
                         kline_repair_signals_[worker].Notify();
                     }
-                    pending[source].reset();
-                    source_cursor = (source + 1U) %
-                        l2flow::market::kFastTickSourceCountV1;
+                    producer_cursor = (tick_worker + 1U) %
+                        config_.fast.worker_count;
                     worked = true;
                     consumed = true;
                     break;
@@ -555,13 +392,7 @@ public:
                     break;
                 }
             }
-            const bool no_pending = std::all_of(
-                pending.begin(), pending.end(),
-                [](const auto& value) noexcept {
-                    return !value.has_value();
-                });
             if (worker_stop_requested_.load(std::memory_order_acquire) &&
-                no_pending &&
                 CompactQueuesEmpty(
                     kline_queues_, worker, config_.kline.worker_count)) {
                 break;
@@ -769,10 +600,6 @@ public:
 
     void NotifyAllWorkers() noexcept {
         for (std::uint32_t worker = 0U;
-             worker < config_.fast.worker_count; ++worker) {
-            tick_signals_[worker].NotifyAll();
-        }
-        for (std::uint32_t worker = 0U;
              worker < config_.event.worker_count; ++worker) {
             event_signals_[worker].NotifyAll();
             event_repair_signals_[worker].NotifyAll();
@@ -796,11 +623,6 @@ public:
         accepting_.store(false, std::memory_order_release);
         worker_stop_requested_.store(true, std::memory_order_release);
         NotifyAllWorkers();
-        for (std::thread& thread : tick_threads_) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
         for (std::thread& thread : event_threads_) {
             if (thread.joinable()) {
                 thread.join();
@@ -835,28 +657,22 @@ public:
     std::vector<l2flow::market::FastTickRouteTokenV1> tick_routes_;
     std::vector<l2flow::market::EventRouteTokenV1> event_routes_;
     std::vector<l2flow::market::KLineRouteTokenV1> kline_routes_;
-    std::vector<std::unique_ptr<SpscQueueV1<FastEnvelopeV1>>>
-        tick_queues_;
     std::vector<std::unique_ptr<
         SpscQueueV1<l2flow::market::CompactFastTickV1>>>
         event_queues_;
     std::vector<std::unique_ptr<
         SpscQueueV1<l2flow::market::CompactFastTickV1>>>
         kline_queues_;
-    std::unique_ptr<WorkerSignalV1[]> tick_signals_;
     std::unique_ptr<WorkerSignalV1[]> event_signals_;
     std::unique_ptr<WorkerSignalV1[]> kline_signals_;
     std::unique_ptr<WorkerSignalV1[]> event_repair_signals_;
     std::unique_ptr<WorkerSignalV1[]> kline_repair_signals_;
-    std::vector<std::thread> tick_threads_;
     std::vector<std::thread> event_threads_;
     std::vector<std::thread> kline_threads_;
     std::vector<std::thread> event_repair_threads_;
     std::vector<std::thread> kline_repair_threads_;
     std::unique_ptr<std::atomic<bool>[]> fast_route_live_;
-    std::array<std::atomic_flag,
-               l2flow::market::kFastTickSourceCountV1>
-        producer_guards_{};
+    std::unique_ptr<std::atomic_flag[]> tick_worker_guards_;
     std::atomic<std::uint64_t> started_threads_{0U};
     std::atomic<bool> affinity_failed_{false};
     std::atomic<bool> accepting_{false};
@@ -864,8 +680,7 @@ public:
     std::atomic<bool> repair_stop_requested_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<bool> stopped_{false};
-    std::atomic<std::uint64_t> routed_ticks_{0U};
-    std::atomic<std::uint64_t> fast_queue_failures_{0U};
+    std::atomic<std::uint64_t> fast_append_failures_{0U};
     std::atomic<std::uint64_t> fast_unrecoverable_drops_{0U};
     std::atomic<std::uint64_t> event_queue_failures_{0U};
     std::atomic<std::uint64_t> kline_queue_failures_{0U};
@@ -903,14 +718,11 @@ RealtimePlanesCreateErrorV1 RealtimePlanesV1::Create(
         config.fast.trade_date != config.kline.trade_date ||
         config.fast.instrument_count != config.event.instrument_count ||
         config.fast.instrument_count != config.kline.instrument_count ||
-        config.tick_queue_capacity_per_source_worker == 0U ||
-        config.event_queue_capacity_per_source_worker == 0U ||
-        config.kline_queue_capacity_per_source_worker == 0U ||
-        config.tick_queue_capacity_per_source_worker ==
+        config.event_queue_capacity_per_tick_worker == 0U ||
+        config.kline_queue_capacity_per_tick_worker == 0U ||
+        config.event_queue_capacity_per_tick_worker ==
             std::numeric_limits<std::size_t>::max() ||
-        config.event_queue_capacity_per_source_worker ==
-            std::numeric_limits<std::size_t>::max() ||
-        config.kline_queue_capacity_per_source_worker ==
+        config.kline_queue_capacity_per_tick_worker ==
             std::numeric_limits<std::size_t>::max() ||
         config.live_batch_budget == 0U || !ValidAffinity(config)) {
         return RealtimePlanesCreateErrorV1::kInvalidConfiguration;
@@ -962,44 +774,31 @@ RealtimePlanesCreateErrorV1 RealtimePlanesV1::Create(
             }
         }
 
-        const std::size_t sources =
-            l2flow::market::kFastTickSourceCountV1;
-        for (std::size_t source = 0U; source < sources; ++source) {
-            for (std::uint32_t worker = 0U;
-                 worker < impl->config_.fast.worker_count; ++worker) {
-                impl->tick_queues_.push_back(
-                    std::make_unique<SpscQueueV1<FastEnvelopeV1>>(
-                        impl->config_
-                            .tick_queue_capacity_per_source_worker));
-            }
+        for (std::uint32_t tick_worker = 0U;
+             tick_worker < impl->config_.fast.worker_count;
+             ++tick_worker) {
             for (std::uint32_t worker = 0U;
                  worker < impl->config_.event.worker_count; ++worker) {
                 impl->event_queues_.push_back(std::make_unique<
                     SpscQueueV1<l2flow::market::CompactFastTickV1>>(
                     impl->config_
-                        .event_queue_capacity_per_source_worker));
+                        .event_queue_capacity_per_tick_worker));
             }
             for (std::uint32_t worker = 0U;
                  worker < impl->config_.kline.worker_count; ++worker) {
                 impl->kline_queues_.push_back(std::make_unique<
                     SpscQueueV1<l2flow::market::CompactFastTickV1>>(
                     impl->config_
-                        .kline_queue_capacity_per_source_worker));
+                        .kline_queue_capacity_per_tick_worker));
             }
         }
 
-        impl->tick_threads_.reserve(impl->config_.fast.worker_count);
         impl->event_threads_.reserve(impl->config_.event.worker_count);
         impl->kline_threads_.reserve(impl->config_.kline.worker_count);
         impl->event_repair_threads_.reserve(
             impl->config_.event.worker_count);
         impl->kline_repair_threads_.reserve(
             impl->config_.kline.worker_count);
-        for (std::uint32_t worker = 0U;
-             worker < impl->config_.fast.worker_count; ++worker) {
-            impl->tick_threads_.emplace_back(
-                [owner = impl.get(), worker] { owner->TickLoop(worker); });
-        }
         for (std::uint32_t worker = 0U;
              worker < impl->config_.event.worker_count; ++worker) {
             impl->event_threads_.emplace_back(
@@ -1019,8 +818,6 @@ RealtimePlanesCreateErrorV1 RealtimePlanesV1::Create(
                 });
         }
         const std::uint64_t expected_threads =
-            static_cast<std::uint64_t>(
-                impl->config_.fast.worker_count) +
             2ULL * static_cast<std::uint64_t>(
                 impl->config_.event.worker_count) +
             2ULL * static_cast<std::uint64_t>(
@@ -1056,29 +853,43 @@ RealtimePlanesCreateErrorV1 RealtimePlanesV1::Create(
     }
 }
 
-RealtimeRouteResultV1 RealtimePlanesV1::RouteDecoded(
+RealtimePublishResultV1 RealtimePlanesV1::PublishDecoded(
+    std::uint32_t tick_worker,
     l2flow::market::CompactFastTickV1 compact,
     l2flow::market::DecodedFastTickV1&& owned_tick) noexcept {
-    RealtimeRouteResultV1 result{};
+    RealtimePublishResultV1 result{};
     if (impl_ == nullptr || compact.instrument_id == 0U ||
+        tick_worker >= impl_->config_.fast.worker_count ||
         compact.ordinal >= static_cast<std::size_t>(
             std::numeric_limits<std::uint32_t>::max()) ||
         compact.ordinal >= impl_->config_.fast.instrument_count ||
         compact.instrument_id !=
             static_cast<std::uint32_t>(compact.ordinal + 1U)) {
-        result.error = RealtimeRouteErrorV1::kInvalidInput;
+        result.error = RealtimePublishErrorV1::kInvalidInput;
         return result;
     }
     if (!impl_->accepting_.load(std::memory_order_acquire)) {
-        result.error = RealtimeRouteErrorV1::kStopped;
+        result.error = RealtimePublishErrorV1::kStopped;
         return result;
     }
     const std::size_t source = static_cast<std::size_t>(compact.source);
     if (source >= l2flow::market::kFastTickSourceCountV1) {
-        result.error = RealtimeRouteErrorV1::kInvalidInput;
+        result.error = RealtimePublishErrorV1::kInvalidInput;
         return result;
     }
-    if (impl_->producer_guards_[source].test_and_set(
+    const auto& tick_route = impl_->tick_routes_[compact.ordinal];
+    if (tick_route.worker != tick_worker) {
+        impl_->fast_store_->MarkCoverageLost(compact.instrument_id);
+        impl_->event_history_->MarkUnrecoverable(compact.instrument_id);
+        impl_->kline_history_->MarkUnrecoverable(compact.instrument_id);
+        impl_->fast_route_live_[compact.ordinal].store(
+            false, std::memory_order_release);
+        impl_->fast_unrecoverable_drops_.fetch_add(
+            1U, std::memory_order_relaxed);
+        result.error = RealtimePublishErrorV1::kWrongTickWorker;
+        return result;
+    }
+    if (impl_->tick_worker_guards_[tick_worker].test_and_set(
             std::memory_order_acquire)) {
         impl_->fast_store_->MarkCoverageLost(compact.instrument_id);
         impl_->event_history_->MarkUnrecoverable(compact.instrument_id);
@@ -1087,50 +898,47 @@ RealtimeRouteResultV1 RealtimePlanesV1::RouteDecoded(
             false, std::memory_order_release);
         impl_->fast_unrecoverable_drops_.fetch_add(
             1U, std::memory_order_relaxed);
-        result.error = RealtimeRouteErrorV1::kConcurrentSourceProducer;
+        result.error = RealtimePublishErrorV1::kConcurrentTickWorker;
         return result;
     }
     struct Guard final {
         std::atomic_flag* flag = nullptr;
         ~Guard() { flag->clear(std::memory_order_release); }
-    } guard{&impl_->producer_guards_[source]};
+    } guard{&impl_->tick_worker_guards_[tick_worker]};
 
     if (!impl_->fast_route_live_[compact.ordinal].load(
             std::memory_order_acquire)) {
         impl_->fast_unrecoverable_drops_.fetch_add(
             1U, std::memory_order_relaxed);
-        result.error = RealtimeRouteErrorV1::kFastCoverageLost;
+        result.error = RealtimePublishErrorV1::kFastCoverageLost;
         return result;
     }
-    const auto& tick_route = impl_->tick_routes_[compact.ordinal];
     const auto& event_route = impl_->event_routes_[compact.ordinal];
     const auto& kline_route = impl_->kline_routes_[compact.ordinal];
-    FastEnvelopeV1 fast{};
-    fast.compact = compact;
-    fast.owned = std::move(owned_tick);
-    if (!impl_->tick_queues_[impl_->QueueIndex(
-            source,
-            tick_route.worker,
-            impl_->config_.fast.worker_count)]->TryPush(std::move(fast))) {
-        impl_->fast_queue_failures_.fetch_add(
+    const auto append_error = impl_->fast_store_->Append(
+        tick_worker, tick_route, compact, std::move(owned_tick));
+    if (append_error !=
+        l2flow::market::FastTickStoreAppendErrorV1::kNone) {
+        impl_->fast_append_failures_.fetch_add(
             1U, std::memory_order_relaxed);
         impl_->fast_store_->MarkCoverageLost(compact.instrument_id);
         impl_->event_history_->MarkUnrecoverable(compact.instrument_id);
         impl_->kline_history_->MarkUnrecoverable(compact.instrument_id);
         impl_->fast_route_live_[compact.ordinal].store(
             false, std::memory_order_release);
-        result.error = RealtimeRouteErrorV1::kFastQueueFull;
+        result.error = RealtimePublishErrorV1::kFastAppendFailed;
         return result;
     }
-    result.fast_enqueued = true;
-    impl_->tick_signals_[tick_route.worker].Notify();
-    impl_->routed_ticks_.fetch_add(1U, std::memory_order_relaxed);
+    result.fast_published = true;
+    impl_->fast_applied_.fetch_add(1U, std::memory_order_relaxed);
+    impl_->event_repair_signals_[event_route.worker].Notify();
+    impl_->kline_repair_signals_[kline_route.worker].Notify();
 
     if (impl_->event_history_->RepairState(compact.instrument_id) ==
         l2flow::market::EventRepairStateV1::kLive) {
         auto event_envelope = compact;
         if (impl_->event_queues_[impl_->QueueIndex(
-                source,
+                tick_worker,
                 event_route.worker,
                 impl_->config_.event.worker_count)]->TryPush(
                 std::move(event_envelope))) {
@@ -1156,7 +964,7 @@ RealtimeRouteResultV1 RealtimePlanesV1::RouteDecoded(
             l2flow::market::EventRepairStateV1::kLive) {
             auto kline_envelope = compact;
             if (impl_->kline_queues_[impl_->QueueIndex(
-                    source,
+                    tick_worker,
                     kline_route.worker,
                     impl_->config_.kline.worker_count)]->TryPush(
                     std::move(kline_envelope))) {
@@ -1219,9 +1027,7 @@ RealtimePlanesSnapshotV1 RealtimePlanesV1::Snapshot() const noexcept {
     if (impl_ == nullptr) {
         return result;
     }
-    result.routed_ticks = impl_->routed_ticks_.load(
-        std::memory_order_acquire);
-    result.fast_queue_failures = impl_->fast_queue_failures_.load(
+    result.fast_append_failures = impl_->fast_append_failures_.load(
         std::memory_order_acquire);
     result.fast_unrecoverable_drops =
         impl_->fast_unrecoverable_drops_.load(

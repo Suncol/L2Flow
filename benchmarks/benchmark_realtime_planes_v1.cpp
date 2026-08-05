@@ -119,9 +119,8 @@ runtime::RealtimePlanesConfigV1 Config(std::size_t records) {
     result.kline.maximum_changes_per_read = 64U * 1024U;
     result.kline.kline_routes = {0U};
 
-    result.tick_queue_capacity_per_source_worker = records + 1U;
-    result.event_queue_capacity_per_source_worker = records + 1U;
-    result.kline_queue_capacity_per_source_worker = records + 1U;
+    result.event_queue_capacity_per_tick_worker = records + 1U;
+    result.kline_queue_capacity_per_tick_worker = records + 1U;
     result.live_batch_budget = 256U;
     return result;
 }
@@ -259,28 +258,29 @@ int main(int argc, char** argv) {
     }
 
     const auto sequences = BusinessSequences(options);
-    std::vector<std::uint64_t> route_latency_ns;
-    route_latency_ns.reserve(options.records);
+    std::vector<std::uint64_t> publish_latency_ns;
+    publish_latency_ns.reserve(options.records);
     const auto begin = std::chrono::steady_clock::now();
     for (std::size_t index = 0U; index < sequences.size(); ++index) {
         TickPair tick = Trade(sequences[index], index + 1U);
-        const auto route_begin = std::chrono::steady_clock::now();
-        const auto routed = planes->RouteDecoded(
-            tick.compact, std::move(tick.owned));
-        const auto route_end = std::chrono::steady_clock::now();
-        if (routed.error != runtime::RealtimeRouteErrorV1::kNone) {
-            std::cerr << "route failed at " << index << ": "
-                      << runtime::RealtimeRouteErrorNameV1(routed.error)
+        const auto publish_begin = std::chrono::steady_clock::now();
+        const auto published = planes->PublishDecoded(
+            0U, tick.compact, std::move(tick.owned));
+        const auto publish_end = std::chrono::steady_clock::now();
+        if (published.error != runtime::RealtimePublishErrorV1::kNone) {
+            std::cerr << "publish failed at " << index << ": "
+                      << runtime::RealtimePublishErrorNameV1(
+                             published.error)
                       << '\n';
             planes->StopAndDrain();
             return 1;
         }
-        route_latency_ns.push_back(static_cast<std::uint64_t>(
+        publish_latency_ns.push_back(static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                route_end - route_begin)
+                publish_end - publish_begin)
                 .count()));
     }
-    const auto route_done = std::chrono::steady_clock::now();
+    const auto publish_done = std::chrono::steady_clock::now();
     if (!planes->WaitFastPublished(
             1U, options.records, std::chrono::seconds(30))) {
         std::cerr << "FAST did not publish the offered tail\n";
@@ -331,14 +331,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::sort(route_latency_ns.begin(), route_latency_ns.end());
+    std::sort(publish_latency_ns.begin(), publish_latency_ns.end());
     const double seconds = std::chrono::duration<double>(end - begin).count();
     const double throughput =
         static_cast<double>(options.records) / seconds;
-    const double route_seconds =
-        std::chrono::duration<double>(route_done - begin).count();
+    const double publish_seconds =
+        std::chrono::duration<double>(publish_done - begin).count();
     const double fast_wait_seconds =
-        std::chrono::duration<double>(fast_done - route_done).count();
+        std::chrono::duration<double>(fast_done - publish_done).count();
     const double derived_wait_seconds =
         std::chrono::duration<double>(end - fast_done).count();
     const auto snapshot = planes->Snapshot();
@@ -350,15 +350,15 @@ int main(int argc, char** argv) {
         << ",\"earliest_late\":"
         << (options.earliest_late ? "true" : "false")
         << ",\"throughput_records_per_second\":" << throughput
-        << ",\"route_seconds\":" << route_seconds
+        << ",\"publish_seconds\":" << publish_seconds
         << ",\"fast_wait_seconds\":" << fast_wait_seconds
         << ",\"derived_wait_seconds\":" << derived_wait_seconds
-        << ",\"route_p50_ns\":"
-        << Percentile(route_latency_ns, 50U, 100U)
-        << ",\"route_p99_ns\":"
-        << Percentile(route_latency_ns, 99U, 100U)
-        << ",\"route_p999_ns\":"
-        << Percentile(route_latency_ns, 999U, 1000U)
+        << ",\"publish_p50_ns\":"
+        << Percentile(publish_latency_ns, 50U, 100U)
+        << ",\"publish_p99_ns\":"
+        << Percentile(publish_latency_ns, 99U, 100U)
+        << ",\"publish_p999_ns\":"
+        << Percentile(publish_latency_ns, 999U, 1000U)
         << ",\"event_rebuild_attempts\":"
         << snapshot.event_rebuild_attempts
         << ",\"kline_rebuild_attempts\":"

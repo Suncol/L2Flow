@@ -2,39 +2,43 @@
 
 ## 结论
 
-在本机、本次固定配置和 3 秒持续负载下，当前代码不能通过
-400k–800k message/s 的完整链路吞吐验收。
+替换为 `source × TickWorker` raw SPSC matrix 后，同一套 3 秒
+400k–800k/s 矩阵不再出现集中 decoder lane overflow：5 个档位共
+9,000,000 条消息全部完成 callback admission、单次完整 decode、FAST
+publish、Event/KLine 追平和 Polars 追平。
 
-- 400k/s 重复 3 次，严格吞吐目标通过 0/3。一次保持完整但
-  all-plane 最终追平仅 387.2k/s；另外两次失去 FAST coverage。
-- 400k–800k 的归因矩阵中，首次失败均为 callback admission 返回的
-  `kDecoderQueueFull`。没有 owned-message pool 拒绝，也没有
-  FAST/Event/KLine plane queue failure。
-- FAST coverage 一旦因 ingress 缺口变为不完整，后续对应 instrument
-  按 fail-close 进入不可恢复状态。这些消息不能用 Event/KLine repair
-  “补回来”，所以 callback 接受速率不能当作系统吞吐。
-- 250k/s 重复 3 次全部通过；all-plane 追平速率中位数为
-  249.686k/s，Polars 追平速率中位数为 248.920k/s。
-- 300k/s 在多轮测试中接近边界且对共享主机抖动敏感；本报告不把它
-  声明为硬容量保证。
+- 所有档位的 raw queue full、owned pool rejection、decode failure、
+  FAST append failure/drop、Event/KLine queue failure 都为 0；32 个
+  instrument 的 FAST coverage 全部完整。
+- 实际 callback 速率为 388.0k–483.4k/s，native all-plane 为
+  387.5k–472.8k/s。旧实现高档位的大量 fail-close drop 已消失。
+- 严格“实际 callback 与 all-plane 均达到目标 98%”判据仍为 0/5；
+  400k 档实际 callback 为目标的 97.0%，其余高档位的 paced producer
+  也未能打到目标。因此这组结果证明替换路径能够完整排空已接受的
+  9M 消息，但不能声明 400k–800k/s 的持续容量保证。
+- 下文 250k/300k 延迟与 full-history 数据来自替换前基线，尚未用新
+  拓扑重测，只保留作历史比较。
 
-因此，本次证据支持“250k/s 在该配置下可重复稳定”，不支持
-“400k/s 或以上可持续”。这不是硬件无关的产品上限。
+这不是硬件无关的产品上限；共享主机抖动也很明显，同一代码的预跑
+实际 callback 仅为 329.9k–374.1k/s，而最终记录轮为
+388.0k–483.4k/s。
 
 ## 测试边界
 
 端到端起点是 `FastTickPipelineV1::IngestForTest` 的 callback-admission
 起点。它与生产 SDK callback 共用 message inspection、owned ingress、
-两条 decoder lane 和 FAST-first 三路 fan-out，但不包含 Vendor SDK 的
-网络、调度和 callback dispatch。
+instrument-key extraction、catalog lookup、raw shard admission、
+Tick-worker 单次完整 decode、同步 FAST publish 和 compact derived
+fan-out，但不包含 Vendor SDK 的网络、调度和 callback dispatch。
 
 Event 读取经过真实的进程内 `InstrumentDataServiceV3`：
 
 ```text
 binary MDL message
   -> callback admission / owned copy
-  -> decoder lane
-  -> FAST-first Tick/Event/KLine workers
+  -> raw queues[source][Tick worker]
+  -> Tick worker full decode / FAST append+publish
+  -> compact Event/KLine queues
   -> Event stable root / INSERT CDC
   -> InstrumentDataServiceV3
   -> Python DerivedEvent validation
@@ -55,12 +59,12 @@ INSERT CDC，不覆盖晚到数据的 RANGE_REPLACE 修复。
 - Polars：1.43.2
 - instrument：32（16 上海、16 深圳），静态 round-robin
 - worker：Tick/Event/KLine 各 8 个
-- affinity：24 个 route-worker slot 各占一个独立 CPU；Event/KLine 的
-  repair thread 与各自 live worker 共用该 slot（本测试中 repair thread
-  停驻）；剩余 8 个 CPU 供两条 decoder lane、paced producer 和
-  Python reader 使用
-- queue：每条 decoder source lane 65,536 条；每个 plane
-  source/worker queue 65,536 条
+- affinity：24 个 worker slot 各占一个独立 CPU；Tick worker 在自己的
+  slot 完整 decode 并发布 FAST；Event/KLine repair thread 与各自 live
+  worker 共用该 slot（本测试中 repair thread 停驻）；剩余 8 个 CPU
+  供 paced producer 和 Python reader 使用
+- queue：每个 raw `source × TickWorker` shard 65,536 条；每个 compact
+  `TickWorker × derived-worker` shard 65,536 条
 - Event CDC batch：1,024 条
 - Polars block：4,096 行
 - 持续时间：每档 3 秒
@@ -70,7 +74,30 @@ INSERT CDC，不覆盖晚到数据的 RANGE_REPLACE 修复。
 主机不是专用裸机，未隔离 IRQ 或其他系统进程，所以报告重复次数和
 观测范围，不把单次最好值当作容量。
 
-## 400k–800k/s 吞吐矩阵
+## 分片重构后的 400k–800k/s 验证
+
+最终记录轮使用替换后的 raw-shard 实现和 Ubuntu 22.04 兼容 GCC 13.4.0
+构建。每档均接受并最终发布全部计划消息：
+
+| 目标 msg/s | 实际 callback/s | native all-plane/s | Polars 追平/s | 消息数 | raw queue full | FAST/Event 行 | coverage | 98% 目标 |
+|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
+| 400,000 | 388,044 | 387,480 | 387,480 | 1,200,000 | 0 | 1,200,000 | 完整 | 失败 |
+| 500,000 | 438,302 | 437,431 | 436,789 | 1,500,000 | 0 | 1,500,000 | 完整 | 失败 |
+| 600,000 | 474,209 | 472,810 | 472,810 | 1,800,000 | 0 | 1,800,000 | 完整 | 失败 |
+| 700,000 | 483,413 | 462,663 | 460,165 | 2,100,000 | 0 | 2,100,000 | 完整 | 失败 |
+| 800,000 | 437,036 | 436,936 | 436,489 | 2,400,000 | 0 | 2,400,000 | 完整 | 失败 |
+
+五档的 ingress error、owned-message rejection、decode failure、FAST
+append failure、FAST unrecoverable drop、Event/KLine queue failure 和
+rebuild attempt 均为零。`correctness_complete` 与 `normal_path_clean`
+均为 true。
+
+这说明 raw 分片替换消除了本矩阵中原先最先出现的集中 decoder queue
+缺口，并且 FAST 发布后的 compact fan-out 能完整收敛。另一方面，实际
+负载没有达到各档目标的 98%，所以不能把“计划投递 800k/s 且最终排空”
+表述为“持续处理能力达到 800k/s”。
+
+## 替换前基线：400k–800k/s 吞吐矩阵
 
 下表计数取自终止状态被确认时。`FAST drop` 是 FAST coverage 已失效后
 的 fail-close drop，不是 FAST queue full。
@@ -110,7 +137,7 @@ instrument 的原始历史不完整；随后出现的大量 fail-close drop 是�
 一次短突发可以被 queue 吸收不代表可持续吞吐。判定使用最终追平速率，
 并要求 callback 和 native all-plane 均达到目标的 98%。
 
-## 稳定负载下的滚动 Event 延迟
+## 替换前基线：稳定负载下的滚动 Event 延迟
 
 延迟定义为每条 Event 的 callback-admission monotonic timestamp 到其所在
 CDC batch 已写入累计 immutable Polars block table，并能从 cumulative
@@ -134,7 +161,7 @@ DataFrame 读到 tail 的时刻。一个 batch 内的行共享同一个可见时
 - native all-plane：249.686k/s；
 - Polars reader 完整追平：248.920k/s。
 
-## Event 全历史读取延迟
+## 替换前基线：Event 全历史读取延迟
 
 全历史计时从 `AcquireEventStable` 的行数查询前开始，包含：
 
@@ -181,6 +208,7 @@ instrument 数、Event/s、batch 和累计 block 数。
 
 最终原始 JSON：
 
+- `artifacts/callback-polars-v3-raw-tick-shards-400k-800k.json`
 - `artifacts/callback-polars-v3-400k-800k-attributed-final.json`
 - `artifacts/callback-polars-v3-400k-final-rep3.json`
 - `artifacts/callback-polars-v3-250k-attach-final-rep3.json`
@@ -192,13 +220,16 @@ instrument 数、Event/s、batch 和累计 block 数。
 
 ## 后续性能工作建议
 
-本轮只测试，没有改变生产数据路径。按证据优先级，下一步应分别测量：
+按证据优先级，下一步应分别测量：
 
-1. 两条 decoder lane 的 service time、queue depth 和高水位；
-2. raw body inspection/copy、decode、catalog identity 和 `RouteDecoded`
-   的分段周期；
-3. Python model construction 与 Polars block construction 的分项 allocation；
-4. 不同 batch/block 大小下的 callback→Polars 尾延迟；
-5. 真实 4.24/6.33/6.36 消息比例和 instrument 热度分布；
-6. 将来跨进程 Wire V3 transport 完成后的新增传输成本；
-7. 晚到 Event RANGE_REPLACE 的独立延迟矩阵。
+1. 每个 raw `source × TickWorker` shard 的 service time、queue depth 和
+   高水位，以及 instrument 热点倾斜；
+2. callback key extraction/catalog/copy、Tick-worker decode、FAST publish
+   和 compact fan-out 的分段周期；
+3. 用能稳定达到目标 attempt rate 的独立负载发生器重跑 400k–800k
+   矩阵，并重复至少 3 次；
+4. Python model construction 与 Polars block construction 的分项 allocation；
+5. 不同 batch/block 大小下的 callback→Polars 尾延迟；
+6. 真实 4.24/6.33/6.36 消息比例和 instrument 热度分布；
+7. 将来跨进程 Wire V3 transport 完成后的新增传输成本；
+8. 晚到 Event RANGE_REPLACE 的独立延迟矩阵。

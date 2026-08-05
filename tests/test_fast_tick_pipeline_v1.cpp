@@ -217,21 +217,20 @@ runtime::FastTickPipelineConfigV1 Config(
     result.daily_catalog = std::move(catalog);
     result.source_stream_ids = {101U, 202U};
     result.maximum_sdk_message_bytes = 4096U;
-    result.decoder_queue_capacity_per_source = 16U;
-    result.decoder_batch_budget = 4U;
-    result.maximum_inflight_messages = 32U;
+    result.raw_tick_queue_capacity_per_source_worker = 16U;
+    result.raw_tick_batch_budget = 4U;
     result.prewarm_message_bytes = 512U;
-    result.prewarm_message_count = 32U;
+    result.prewarm_message_count_per_source_worker = 16U;
 
     result.planes.fast.session_id = SessionId();
     result.planes.fast.trade_date = kTradeDate;
     result.planes.fast.instrument_count = 2U;
-    result.planes.fast.worker_count = 1U;
+    result.planes.fast.worker_count = 2U;
     result.planes.fast.maximum_session_records = 128U;
     result.planes.fast.records_per_chunk = 4U;
     result.planes.fast.maximum_records_per_read = 16U;
     result.planes.fast.coverage_from_open = true;
-    result.planes.fast.tick_routes = {0U, 0U};
+    result.planes.fast.tick_routes = {0U, 1U};
 
     result.planes.event.session_id = SessionId();
     result.planes.event.trade_date = kTradeDate;
@@ -257,9 +256,8 @@ runtime::FastTickPipelineConfigV1 Config(
     result.planes.kline.maximum_change_records_per_instrument = 1024U;
     result.planes.kline.maximum_changes_per_read = 32U;
     result.planes.kline.kline_routes = {0U, 0U};
-    result.planes.tick_queue_capacity_per_source_worker = 16U;
-    result.planes.event_queue_capacity_per_source_worker = 16U;
-    result.planes.kline_queue_capacity_per_source_worker = 16U;
+    result.planes.event_queue_capacity_per_tick_worker = 16U;
+    result.planes.kline_queue_capacity_per_tick_worker = 16U;
     result.planes.live_batch_budget = 4U;
     return result;
 }
@@ -308,8 +306,35 @@ int main() {
     if (catalog == nullptr) {
         return 1;
     }
-    std::unique_ptr<runtime::FastTickPipelineV1> pipeline;
+    auto shard_capacity_config = Config(catalog);
+    shard_capacity_config.raw_tick_queue_capacity_per_source_worker = 1U;
+    shard_capacity_config.prewarm_message_count_per_source_worker = 3U;
+    std::unique_ptr<runtime::FastTickPipelineV1> shard_capacity_pipeline;
     std::string detail;
+    ok &= Expect(
+        runtime::FastTickPipelineV1::Create(
+            std::move(shard_capacity_config),
+            &shard_capacity_pipeline,
+            &detail) == runtime::FastTickPipelineCreateErrorV1::kNone &&
+            shard_capacity_pipeline != nullptr,
+        "raw shard pool reserves queue, consumer, and callback candidate");
+    if (shard_capacity_pipeline != nullptr) {
+        shard_capacity_pipeline->StopAndDrain();
+    }
+    auto excessive_prewarm = Config(catalog);
+    excessive_prewarm.raw_tick_queue_capacity_per_source_worker = 1U;
+    excessive_prewarm.prewarm_message_count_per_source_worker = 4U;
+    ok &= Expect(
+        runtime::FastTickPipelineV1::Create(
+            std::move(excessive_prewarm),
+            &shard_capacity_pipeline,
+            &detail) ==
+                runtime::FastTickPipelineCreateErrorV1::
+                    kInvalidConfiguration &&
+            shard_capacity_pipeline == nullptr,
+        "raw shard prewarm cannot exceed its complete pool capacity");
+
+    std::unique_ptr<runtime::FastTickPipelineV1> pipeline;
     ok &= Expect(
         runtime::FastTickPipelineV1::Create(
             Config(catalog), &pipeline, &detail) ==
@@ -342,6 +367,9 @@ int main() {
             sh_result.source_slot == 0U &&
             order_result.source_slot == 1U &&
             trade_result.source_slot == 1U &&
+            sh_result.tick_worker == 0U &&
+            order_result.tick_worker == 1U &&
+            trade_result.tick_worker == 1U &&
             order_result.source_sequence == 1U &&
             trade_result.source_sequence == 2U,
         "Shenzhen Order/Transaction retain one shared source order");
@@ -358,7 +386,7 @@ int main() {
                    snapshot.planes.event_applied >= 2U &&
                    snapshot.planes.kline_applied >= 2U;
         }),
-        "two decoders feed independent FAST/Event/KLine workers");
+        "instrument-sharded Tick workers decode once and feed all planes");
 
     market::FastTickInstrumentStatusV1 sh_status{};
     market::FastTickInstrumentStatusV1 sz_status{};

@@ -15,7 +15,7 @@ cmake --build build-bench -j --target benchmark_realtime_planes
   --output artifacts/reorder-matrix.json
 ```
 
-The executable reports FAST-first router p50/p99/p99.9, end-to-end catch-up
+The executable reports synchronous FAST-publish p50/p99/p99.9, end-to-end catch-up
 throughput, repair attempts, and the Event comparison-sort counter. Run the
 ordered case on the same pinned hardware as the current production baseline;
 the repository does not encode a hardware-independent latency threshold.
@@ -52,10 +52,10 @@ taskset -c 0-31 .venv/bin/python \
   --output artifacts/callback-polars-400k-800k.json
 ```
 
-The bridge assigns one exclusive CPU to every Tick/Event/KLine route-worker
-slot (the parked Event/KLine repair thread shares its plane slot) and reserves
-the remaining CPUs in the `taskset` mask for the two decoder lanes, the paced
-producer, and Python. A throughput trial passes only when callback
+The bridge assigns one exclusive CPU to every Tick/Event/KLine worker slot
+(the parked Event/KLine repair thread shares its plane slot). Tick workers own
+the full decoders. The remaining CPUs in the `taskset` mask are reserved for
+the paced producer and Python. A throughput trial passes only when callback
 and native all-plane catch-up rates are both at least 98% of the target, every
 message reaches the stable Event view, all instruments remain recoverable,
 and no queue repair occurs.

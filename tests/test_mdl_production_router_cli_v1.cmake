@@ -34,6 +34,12 @@ run_case(
     --help)
 
 run_case(
+    help_lists_raw_tick_shards
+    0
+    "--raw-tick-queue N --raw-tick-prewarm-per-shard N"
+    --help)
+
+run_case(
     help_lists_bounded_derived_cdc
     0
     "--event-changes-per-instrument N"
@@ -50,6 +56,24 @@ run_case(
     2
     "unknown option: --generation-interval-ms"
     --generation-interval-ms 1)
+
+run_case(
+    removed_decoder_lane_option_is_unknown
+    2
+    "unknown option: --decoder-queue"
+    --decoder-queue 1)
+
+run_case(
+    removed_decoded_tick_queue_option_is_unknown
+    2
+    "unknown option: --tick-queue"
+    --tick-queue 1)
+
+run_case(
+    removed_global_ingress_pool_option_is_unknown
+    2
+    "unknown option: --maximum-inflight-messages"
+    --maximum-inflight-messages 1)
 
 run_case(
     sdk_callback_is_serialized

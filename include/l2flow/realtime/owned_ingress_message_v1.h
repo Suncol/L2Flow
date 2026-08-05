@@ -59,9 +59,10 @@ enum class OwnedIngressKeyErrorV1 : std::uint8_t {
     OwnedIngressSourceV1* output) noexcept;
 
 // Sequence values are assigned by the single serialized subscription
-// callback. They describe the dense prefix committed directly to the two
-// source decoder FIFOs, not vendor event time. A source-lane admission
-// failure does not commit its candidate sequence and fails the session closed.
+// callback. They describe the dense prefix committed directly to the raw
+// source-by-Tick-worker queues, not vendor event time. A shard admission
+// failure does not commit its candidate sequence and fails that instrument
+// closed.
 // global_ingress_sequence is retained only as an arrival identity and repair
 // handshake; it is not a public live cursor or an Event/KLine ordering key.
 // UINT64_MAX is reserved as the exhaustion sentinel.
@@ -201,8 +202,8 @@ private:
     const OwnedIngressMessageV1* message_ = nullptr;
 };
 
-// Immutable ownership boundary between the vendor callback and the ordered
-// processing/decoder consumers. Object storage and body bytes occupy one
+// Immutable ownership boundary between the vendor callback and Tick-worker
+// consumers. Object storage and body bytes occupy one
 // size-class pool block; the body starts immediately after this object.
 class OwnedIngressMessageV1 final {
 public:

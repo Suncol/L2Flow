@@ -40,7 +40,7 @@ typedef struct L2FlowBenchmarkSnapshotV1 {
     uint64_t attempted_messages;
     uint64_t accepted_messages;
     uint64_t ingress_errors;
-    uint64_t decoder_queue_full_errors;
+    uint64_t raw_tick_queue_full_errors;
     uint64_t owned_message_rejected_errors;
     uint64_t other_ingress_errors;
     uint64_t first_callback_start_ns;
@@ -49,10 +49,9 @@ typedef struct L2FlowBenchmarkSnapshotV1 {
     uint64_t accepted_shanghai;
     uint64_t accepted_shenzhen;
     uint64_t decoded_messages;
-    uint64_t decoder_failures;
+    uint64_t decode_failures;
     uint64_t rejected_messages;
-    uint64_t routed_ticks;
-    uint64_t fast_queue_failures;
+    uint64_t fast_append_failures;
     uint64_t fast_unrecoverable_drops;
     uint64_t event_queue_failures;
     uint64_t kline_queue_failures;

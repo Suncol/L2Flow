@@ -49,21 +49,29 @@ instruments retain their own coverage state.
 
 ## Independent routing and failure isolation
 
-There are exactly `2 x worker_count` queues in each plane. Each queue has one
-source producer and one plane worker consumer. Routing performs FAST
-`TryPush` first. Only after success does it copy the compact Tick into the
-Event and, for a valid trade, KLine queue.
+The serialized callback resolves the catalog ordinal and routes the owned raw
+message into one of exactly `2 x TickWorkerCount` SPSC queues. Each Tick
+worker owns one Shanghai and one Shenzhen decoder, so the complete payload is
+decoded once. Shenzhen Order and Transaction share the same source queue and
+decoder state. The Tick worker then appends and release-publishes FAST
+synchronously before it copies the compact Tick into Event and, for a valid
+trade, KLine queues.
+
+Each derived plane uses a `TickWorkerCount x DerivedWorkerCount` SPSC matrix.
+The producer dimension must be the Tick worker, rather than the market
+source, because distinct Tick workers may concurrently target the same
+derived worker. An instrument's permanent Tick route keeps all of its messages
+on one producer queue, while no cross-instrument total order is claimed.
 
 Event/KLine `TryPush` is fixed-step and nonblocking. Failure sets the target
 instrument's `REPAIR_REQUIRED` state and advances `repair_through`; later
 messages for that instrument update the watermark instead of consuming a
-derived queue slot. The Tick plane continues.
+derived queue slot. FAST processing for unrelated instruments continues.
 
-The derived worker waits for `PublishedThrough(instrument, arrival_id)` before
-applying an envelope. If the FAST worker fails that append, the pending
-derived envelope is discarded and the instrument becomes unrecoverable,
-which also guarantees shutdown cannot wait forever on an arrival that will
-never publish.
+A derived envelope cannot exist before its corresponding FAST append has
+published, so Event and KLine workers do not retain a pending envelope or wait
+for `PublishedThrough` on the live path. If the FAST append fails, no compact
+envelope is emitted and that instrument becomes unrecoverable.
 
 ## Event normal path and repair
 
@@ -154,9 +162,10 @@ the stronger `UNRECOVERABLE` diagnosis.
 
 ## Deliberate bounds
 
-The normal FAST path contains no sort, mutex, blocking syscall, Event/KLine
-calculation, or global ring publication. Event and KLine data structures may
-allocate in their own workers; this cannot execute on a Tick worker.
+The Tick-worker path contains the one complete decode and FAST append, but no
+sort, mutex, blocking syscall, Event/KLine calculation, or global ring
+publication. Event and KLine data structures may allocate in their own
+workers; this cannot execute on a Tick worker.
 
 FAST records and both per-instrument CDC logs have explicit configuration
 bounds. A CDC log never reserves beyond

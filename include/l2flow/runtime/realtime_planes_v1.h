@@ -16,8 +16,10 @@ namespace l2flow::runtime {
 
 struct RealtimePlaneAffinityV1 final {
     // Production sets enforce=true and supplies exactly one nonempty mask per
-    // live worker. Tick/Event/KLine masks must be pairwise disjoint. Tests may
-    // disable affinity explicitly to remain portable across CI cpusets.
+    // live worker. Tick/Event/KLine masks must be pairwise disjoint. Tick
+    // masks are applied by FastTickPipelineV1, which owns decoding and FAST
+    // publication; the derived-plane masks are applied here. Tests may disable
+    // affinity explicitly to remain portable across CI cpusets.
     bool enforce = false;
     std::vector<l2flow::common::LinuxCpuSetV1> tick_workers;
     std::vector<l2flow::common::LinuxCpuSetV1> event_workers;
@@ -28,9 +30,10 @@ struct RealtimePlanesConfigV1 final {
     l2flow::market::FastTickStoreConfigV1 fast;
     l2flow::market::OrderedEventHistoryConfigV1 event;
     l2flow::market::MutableKLineHistoryConfigV1 kline;
-    std::size_t tick_queue_capacity_per_source_worker = 4096U;
-    std::size_t event_queue_capacity_per_source_worker = 4096U;
-    std::size_t kline_queue_capacity_per_source_worker = 4096U;
+    // Each queue has exactly one Tick-worker producer and one derived-worker
+    // consumer. There is no decoded Tick queue in front of FAST history.
+    std::size_t event_queue_capacity_per_tick_worker = 4096U;
+    std::size_t kline_queue_capacity_per_tick_worker = 4096U;
     std::size_t live_batch_budget = 256U;
     RealtimePlaneAffinityV1 affinity{};
 };
@@ -47,23 +50,24 @@ enum class RealtimePlanesCreateErrorV1 : std::uint8_t {
     kResourceExhausted,
 };
 
-enum class RealtimeRouteErrorV1 : std::uint8_t {
+enum class RealtimePublishErrorV1 : std::uint8_t {
     kNone = 0U,
     kInvalidInput,
-    kConcurrentSourceProducer,
-    kFastQueueFull,
+    kWrongTickWorker,
+    kConcurrentTickWorker,
+    kFastAppendFailed,
     kFastCoverageLost,
     kStopped,
 };
 
 [[nodiscard]] std::string_view RealtimePlanesCreateErrorNameV1(
     RealtimePlanesCreateErrorV1 error) noexcept;
-[[nodiscard]] std::string_view RealtimeRouteErrorNameV1(
-    RealtimeRouteErrorV1 error) noexcept;
+[[nodiscard]] std::string_view RealtimePublishErrorNameV1(
+    RealtimePublishErrorV1 error) noexcept;
 
-struct RealtimeRouteResultV1 final {
-    RealtimeRouteErrorV1 error = RealtimeRouteErrorV1::kNone;
-    bool fast_enqueued = false;
+struct RealtimePublishResultV1 final {
+    RealtimePublishErrorV1 error = RealtimePublishErrorV1::kNone;
+    bool fast_published = false;
     bool event_enqueued = false;
     bool event_repair_registered = false;
     bool kline_enqueued = false;
@@ -71,8 +75,7 @@ struct RealtimeRouteResultV1 final {
 };
 
 struct RealtimePlanesSnapshotV1 final {
-    std::uint64_t routed_ticks = 0U;
-    std::uint64_t fast_queue_failures = 0U;
+    std::uint64_t fast_append_failures = 0U;
     std::uint64_t fast_unrecoverable_drops = 0U;
     std::uint64_t event_queue_failures = 0U;
     std::uint64_t kline_queue_failures = 0U;
@@ -85,10 +88,12 @@ struct RealtimePlanesSnapshotV1 final {
     bool stopped = false;
 };
 
-// Two serialized decoder/source owners call RouteDecoded. The router always
-// performs the FAST TryPush first. Event and KLine use independent queue
+// A permanent Tick worker calls PublishDecoded after it has decoded and
+// projected one raw message. PublishDecoded appends and publishes FAST
+// synchronously on that same worker before attempting either compact derived
+// queue. Event and KLine use independent Tick-worker-by-derived-worker SPSC
 // matrices, worker threads, repair threads, route tables, stores, wakeups and
-// failure states; neither can wait in or backpressure the source callback.
+// failure states.
 class RealtimePlanesV1 final {
 public:
     RealtimePlanesV1(const RealtimePlanesV1&) = delete;
@@ -102,7 +107,8 @@ public:
         std::unique_ptr<RealtimePlanesV1>* output,
         std::string* detail = nullptr) noexcept;
 
-    [[nodiscard]] RealtimeRouteResultV1 RouteDecoded(
+    [[nodiscard]] RealtimePublishResultV1 PublishDecoded(
+        std::uint32_t tick_worker,
         l2flow::market::CompactFastTickV1 compact,
         l2flow::market::DecodedFastTickV1&& owned_tick) noexcept;
 

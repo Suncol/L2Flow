@@ -45,11 +45,14 @@ struct FastTickPipelineConfigV1 final {
     l2flow::market::MarketDecoderLimitsV1 decoder_limits{};
     std::uint32_t maximum_sdk_message_bytes =
         l2flow::realtime::kOwnedIngressMaximumMessageBytesV1;
-    std::size_t decoder_queue_capacity_per_source = 4096U;
-    std::size_t decoder_batch_budget = 256U;
-    std::size_t maximum_inflight_messages = 16'384U;
+    // One raw SPSC queue and one owned-message pool exist for every
+    // source-by-Tick-worker shard. The pool capacity is queue capacity + one
+    // message currently being decoded + one callback candidate, so a full
+    // queue is reported as such instead of being masked by pool exhaustion.
+    std::size_t raw_tick_queue_capacity_per_source_worker = 4096U;
+    std::size_t raw_tick_batch_budget = 256U;
     std::uint32_t prewarm_message_bytes = 4096U;
-    std::size_t prewarm_message_count = 8192U;
+    std::size_t prewarm_message_count_per_source_worker = 512U;
     bool enforce_receive_trade_date = false;
     RealtimePlanesConfigV1 planes{};
     FastTickPipelineSdkConfigV1 sdk{};
@@ -61,7 +64,8 @@ enum class FastTickPipelineCreateErrorV1 : std::uint8_t {
     kInvalidConfiguration,
     kPlaneCreateFailed,
     kIngressPoolCreateFailed,
-    kDecoderThreadStartFailed,
+    kTickWorkerThreadStartFailed,
+    kTickWorkerAffinityFailed,
     kSdkLoadFailed,
     kSdkManagerCreateFailed,
     kSdkSubscriberCreateFailed,
@@ -84,7 +88,7 @@ enum class FastTickPipelineIngressErrorV1 : std::uint8_t {
     kOwnedMessageRejected,
     kInstrumentKeyRejected,
     kCatalogMiss,
-    kDecoderQueueFull,
+    kRawTickQueueFull,
     kStopped,
     kFatal,
 };
@@ -101,6 +105,7 @@ struct FastTickPipelineIngressResultV1 final {
         l2flow::realtime::OwnedIngressMessageErrorV1::kNone;
     std::uint64_t arrival_id = 0U;
     std::uint64_t source_sequence = 0U;
+    std::uint32_t tick_worker = 0U;
     std::uint8_t source_slot = 0U;
 
     [[nodiscard]] bool accepted() const noexcept {
@@ -115,7 +120,8 @@ struct FastTickPipelineSnapshotV1 final {
     std::uint64_t filtered_messages = 0U;
     std::uint64_t rejected_messages = 0U;
     std::uint64_t decoded_messages = 0U;
-    std::uint64_t decoder_failures = 0U;
+    std::uint64_t decode_failures = 0U;
+    std::uint64_t raw_tick_queue_failures = 0U;
     std::array<std::uint64_t,
                l2flow::realtime::kOwnedIngressSourceCountV1>
         accepted_by_source{};
@@ -125,10 +131,11 @@ struct FastTickPipelineSnapshotV1 final {
     RealtimePlanesSnapshotV1 planes{};
 };
 
-// Production owner for the sole three-message subscription. The SDK callback
-// only inspects/copies into one of two source-owned queues. Shanghai Tick has
-// one decoder owner; Shenzhen Order and Transaction deliberately share the
-// other owner, preserving their callback-relative order.
+// Production owner for the sole three-message subscription. The serialized
+// SDK callback extracts and catalog-resolves the exact instrument key, then
+// copies into raw source-by-Tick-worker SPSC storage. Every Tick worker owns
+// one Shanghai and one Shenzhen decoder, performs the only complete decode,
+// publishes FAST, then nonblockingly fans out compact derived envelopes.
 class FastTickPipelineV1 final {
 public:
     FastTickPipelineV1(const FastTickPipelineV1&) = delete;

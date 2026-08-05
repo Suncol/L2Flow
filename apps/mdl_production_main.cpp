@@ -75,11 +75,10 @@ struct Options final {
     std::size_t maximum_kline_trades_per_instrument = 1'000'000U;
     std::size_t maximum_kline_bars_per_instrument = 100'000U;
     std::size_t maximum_kline_changes_per_instrument = 8'000'000U;
-    std::size_t decoder_queue_capacity = 65'536U;
-    std::size_t tick_queue_capacity = 32'768U;
+    std::size_t raw_tick_queue_capacity = 65'536U;
+    std::size_t raw_tick_prewarm_per_shard = 4096U;
     std::size_t event_queue_capacity = 32'768U;
     std::size_t kline_queue_capacity = 32'768U;
-    std::size_t maximum_inflight_messages = 131'072U;
     std::vector<std::uint32_t> kline_windows_ms{1000U};
     bool help = false;
 };
@@ -101,9 +100,8 @@ void PrintUsage(std::ostream& output) {
         << "  --kline-cpu-set LIST      repeat once per KLine worker\n"
         << "Worker and capacity options:\n"
         << "  --tick-workers N --event-workers N --kline-workers N\n"
-        << "  --decoder-queue N --tick-queue N --event-queue N"
-           " --kline-queue N\n"
-        << "  --maximum-inflight-messages N\n"
+        << "  --raw-tick-queue N --raw-tick-prewarm-per-shard N\n"
+        << "  --event-queue N --kline-queue N\n"
         << "  --event-order-states-per-instrument N\n"
         << "  --event-inputs-per-instrument N\n"
         << "  --event-rows-per-instrument N\n"
@@ -237,14 +235,15 @@ bool ParseOptions(
                 *error = "invalid --fast-max-records";
                 return false;
             }
-        } else if (argument == "--decoder-queue") {
-            if (!ParseUnsigned(value, &options->decoder_queue_capacity)) {
-                *error = "invalid --decoder-queue";
+        } else if (argument == "--raw-tick-queue") {
+            if (!ParseUnsigned(value, &options->raw_tick_queue_capacity)) {
+                *error = "invalid --raw-tick-queue";
                 return false;
             }
-        } else if (argument == "--tick-queue") {
-            if (!ParseUnsigned(value, &options->tick_queue_capacity)) {
-                *error = "invalid --tick-queue";
+        } else if (argument == "--raw-tick-prewarm-per-shard") {
+            if (!ParseUnsigned(
+                    value, &options->raw_tick_prewarm_per_shard)) {
+                *error = "invalid --raw-tick-prewarm-per-shard";
                 return false;
             }
         } else if (argument == "--event-queue") {
@@ -255,11 +254,6 @@ bool ParseOptions(
         } else if (argument == "--kline-queue") {
             if (!ParseUnsigned(value, &options->kline_queue_capacity)) {
                 *error = "invalid --kline-queue";
-                return false;
-            }
-        } else if (argument == "--maximum-inflight-messages") {
-            if (!ParseUnsigned(value, &options->maximum_inflight_messages)) {
-                *error = "invalid --maximum-inflight-messages";
                 return false;
             }
         } else if (argument ==
@@ -356,6 +350,15 @@ bool ParseOptions(
         *error = "supply exactly one CPU set per configured worker";
         return false;
     }
+    if (options->raw_tick_prewarm_per_shard >
+            options->raw_tick_queue_capacity &&
+        options->raw_tick_prewarm_per_shard -
+                options->raw_tick_queue_capacity >
+            2U) {
+        *error =
+            "raw Tick prewarm exceeds queue plus active shard slots";
+        return false;
+    }
     return true;
 }
 
@@ -402,12 +405,11 @@ runtime::FastTickPipelineConfigV1 MakePipelineConfig(
     config.daily_catalog = std::move(catalog);
     config.source_stream_ids = {1U, 2U};
     config.maximum_sdk_message_bytes = 4096U;
-    config.decoder_queue_capacity_per_source =
-        options.decoder_queue_capacity;
-    config.maximum_inflight_messages = options.maximum_inflight_messages;
+    config.raw_tick_queue_capacity_per_source_worker =
+        options.raw_tick_queue_capacity;
     config.prewarm_message_bytes = 4096U;
-    config.prewarm_message_count = std::min<std::size_t>(
-        options.maximum_inflight_messages, 65'536U);
+    config.prewarm_message_count_per_source_worker =
+        options.raw_tick_prewarm_per_shard;
     config.enforce_receive_trade_date = true;
     config.sdk.enabled = true;
     config.sdk.library_path = options.sdk_library;
@@ -461,11 +463,9 @@ runtime::FastTickPipelineConfigV1 MakePipelineConfig(
     config.planes.kline.kline_routes = RoundRobinRoutes(
         instruments, options.kline_workers);
 
-    config.planes.tick_queue_capacity_per_source_worker =
-        options.tick_queue_capacity;
-    config.planes.event_queue_capacity_per_source_worker =
+    config.planes.event_queue_capacity_per_tick_worker =
         options.event_queue_capacity;
-    config.planes.kline_queue_capacity_per_source_worker =
+    config.planes.kline_queue_capacity_per_tick_worker =
         options.kline_queue_capacity;
     config.planes.affinity.enforce = true;
     config.planes.affinity.tick_workers = options.tick_cpu_sets;

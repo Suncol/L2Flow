@@ -15,7 +15,7 @@ namespace l2flow::market {
 // bodies. The spans point into MarketMessageViewV1::body and are valid only
 // while that body remains alive. Extraction performs no allocation and is
 // used by callback admission for immutable daily-catalog lookup before the
-// pooled message is published to its source decoder lane.
+// pooled message is published to its fixed Tick-worker raw shard.
 struct ExactInstrumentKeyViewV2 final {
     MarketV1 market = MarketV1::kUnknown;
     std::span<const std::byte> security_id_source{};
@@ -71,13 +71,16 @@ struct MarketDecoderConfigV1 final {
     MarketDecoderLimitsV1 limits{};
 };
 
-// Stateful only for the documented SH 4.24 product-phase attribution.  One
-// decoder instance represents exactly one trade-date/source session.
+// Stateful only for the documented SH 4.24 product-phase attribution. One
+// decoder instance represents one fixed Tick-worker shard of a
+// trade-date/source session. All messages for a security_id must route to the
+// same instance.
 // DecodeStateless may be called concurrently on the same instance because it
 // neither reads nor writes the phase map.  FinalizeInSourceOrder and Decode
 // are single-writer operations: the caller must invoke them in authoritative,
-// strictly increasing owned-ingress source_sequence order.  This object
-// neither reorders nor validates sequence monotonicity on its own. Decoded
+// strictly increasing owned-ingress source_sequence order within the fixed
+// shard; gaps belonging to other shards are valid. This object neither
+// reorders nor validates sequence monotonicity on its own. Decoded
 // events own every published string/array and never retain
 // MarketMessageViewV1::body.
 class MarketDecoderV1 final {
@@ -108,8 +111,8 @@ public:
         DecodedMarketEventV1* output) const noexcept;
 
     // Applies the documented Shanghai product-phase lookup/update.  Calls for
-    // one source session must be serialized in strictly increasing
-    // source_sequence order.  Other event kinds are passed through unchanged.
+    // one fixed source shard must be serialized in strictly increasing
+    // source_sequence order. Other event kinds are passed through unchanged.
     // Failures leave event and phase state unchanged.
     [[nodiscard]] MarketDecodeErrorV1 FinalizeInSourceOrder(
         DecodedMarketEventV1* event) noexcept;
@@ -133,8 +136,8 @@ private:
 
 // This parses only the exact security key descriptors. It deliberately does
 // not perform a second full market decode and therefore keeps callback
-// admission bounded. The source decoder remains the single authority for the
-// complete body/schema validation.
+// admission bounded. The selected Tick-worker decoder remains the single
+// authority for complete body/schema validation.
 [[nodiscard]] MarketDecodeErrorV1 ExtractExactInstrumentKeyV2(
     const MarketMessageViewV1& input,
     std::size_t maximum_text_bytes,
@@ -142,7 +145,7 @@ private:
 
 // Applies the immutable daily-catalog identity selected by callback admission
 // to the decoded event. It verifies that full decode produced the same exact
-// key; no second catalog lookup occurs on a decoder lane.
+// key; no second catalog lookup occurs on a Tick worker.
 [[nodiscard]] bool ApplyDailyInstrumentIdentityV2(
     const DailyInstrumentIdentityViewV2& identity,
     DecodedMarketEventV1* event) noexcept;
