@@ -123,7 +123,7 @@ SDK callback
 - `highest_observed_sequence`；
 - `certified_sequence`：已经提交到 CERTIFIED 下游的原生前缀；
 - pending entry：原生 key、tuple、record class、到达次数、应用次数、
-  canonical payload、Store cookie；
+  fixed-slab canonical payload、完整 Wire payload lease cookie；
 - 有界 duplicate retention。
 
 主要状态为：
@@ -173,7 +173,8 @@ CERTIFIED 私有区；所以公开历史始终是不可变的正确前缀。
 
 对一个已就绪的 target Tick，单 worker 依次执行：
 
-1. 构造并校验 envelope，预检 Tick ring/latest 槽；
+1. 直接读取 `HandleApplied()` 唯一一次投影得到的完整 payload lease，构造并
+   校验 envelope，预检 Tick ring/latest 槽；
 2. 提交 recovery 内部 token；
 3. 在 `AppendCertifiedTick()` 内先预检 Event 容量与物理 backing，再更新
    order projector 并向 canonical Event journal 追加 Event；
@@ -181,6 +182,15 @@ CERTIFIED 私有区；所以公开历史始终是不可变的正确前缀。
 5. 发布 CERTIFIED Tick ring 与 per-instrument latest 槽；
 6. 推进进程级 `canonical_apply_frontier` 和对应 channel 状态；
 7. 以 aggregate header 的稳定 even tag 一次性提交公开可见 cut。
+
+coordinator 只把严格 canonical bytes 复制到启动期 fixed slab；完整 336-byte
+Wire payload 保留在 generation-tagged lease 中，ready 路径不再从 Store record
+二次投影。池容量为 `maximum_pending_entries + 1`：前者覆盖全部 pending
+canonical lease，额外一格用于满 pending 状态下比较已有 entry 的重复
+application。lease 所有权按生命周期精确回收：成功 commit 归还 canonical
+lease，duplicate 归还本次比较用的 transient lease，channel freeze/seal 通过
+coordinator 回调归还尚未提交的 canonical lease；服务析构最终回收任何终止
+路径仍持有的 entry。
 
 所有可能报告普通资源失败的 Event backing 预留均在 Event 有状态投影之前
 完成，但发生在 recovery token 的内部提交之后。如果 Event 预检或投影仍
@@ -235,6 +245,14 @@ Event 是 append-only journal，不受有限 Tick ring 回绕影响；其 V1.3 h
 - channel table：4,096；
 - Event backing：按 64 MiB chunk 预留；
 - Event 逻辑容量：生产配置按 Store 最大记录数的四倍保守推导。
+
+进程内 `RealtimeCertifiedServiceSnapshotV1` 另公开 payload lease 的 capacity、
+in-use、high-water 与 failed-acquire；这些字段不进入共享内存 Wire header。
+History 高频 Tick handoff 使用启动期完整预分配的紧凑 source-specific slot，
+Snapshot 使用独立的大 slot pool 并只冷扩展到已见 high-water；
+`HandoffPoolSnapshot()` 用于验证预热与复用。Intraday Store 的 append-only
+segment 则从启动期有界 backing 以原子 bump 划分，不再在新 segment 时调用
+系统 allocator；对应 capacity/used/failed-acquire 位于 Store snapshot。
 
 Tick memfd 在 sidecar Create 阶段先 `fallocate` 全部有界 backing，再
 `mmap/memset`；普通 `ENOSPC/EDQUOT` 因而成为可捕获的 Create 失败。常规

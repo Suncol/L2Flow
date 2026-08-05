@@ -241,6 +241,12 @@ gap、重复与乱序回补，再把严格 canonical apply 顺序同时提交给
 和 append-only Event journal。因此晚到的 `3,1,2` 会按 `1,2,3` 进入 projector，
 但 Event row 中的 source、ingress 和 tick identity 保持原始 arrival 身份。
 
+沪深订单状态在启动期建立固定容量 robin-hood hash、连续稳定 state slab 与
+确定性的 OrderKey 有序索引；热路径不 rehash、不为新订单调用系统 allocator。
+上海 END 通过同一索引只遍历精确 `(trade_date, instrument, channel)` range，
+深圳 finalization 与上海 revision 仍按 ascending OrderKey 输出，因此容器替换不
+改变公开 Event 顺序或 digest。
+
 partial 模式下，每个深圳 `ChannelNo` 的 6.33/6.36 共用同一
 `ApplSeqNum` domain。未知起点使用声明的最大向后位移 `D` 做 bounded bootstrap：
 仅当 `highest_seen - provisional_min >= D` 时确认 origin；origin 建立后，只有
