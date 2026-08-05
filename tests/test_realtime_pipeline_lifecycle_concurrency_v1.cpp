@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -474,19 +475,31 @@ public:
     int ReleaseRef() override { return 1; }
 
     mdl::MDLMessageHead* GetHead() const override {
+        head_calls_.fetch_add(1U, std::memory_order_relaxed);
         return const_cast<mdl::MDLMessageHead*>(&head_);
     }
 
     char* GetBody() const override {
+        body_calls_.fetch_add(1U, std::memory_order_relaxed);
         return reinterpret_cast<char*>(
             const_cast<std::byte*>(body_.data()));
     }
 
     mdl::MDLMessage* _Copy() const override { return nullptr; }
 
+    [[nodiscard]] std::uint64_t head_calls() const noexcept {
+        return head_calls_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::uint64_t body_calls() const noexcept {
+        return body_calls_.load(std::memory_order_relaxed);
+    }
+
 private:
     mdl::MDLMessageHead head_{};
     std::vector<std::byte> body_;
+    mutable std::atomic<std::uint64_t> head_calls_{0U};
+    mutable std::atomic<std::uint64_t> body_calls_{0U};
 };
 
 class CaptureProbe final
@@ -921,6 +934,8 @@ void RunOnlineIngressSeamTests(TestContext* test) {
                 capture->key() == sdk::MessageKey{6U, 101U, 36U} &&
                 capture->source_slot() == 3U &&
                 capture->vendor_sequence() == 800U &&
+                message->head_calls() == 1U &&
+                message->body_calls() == 1U &&
                 capture->realtime_ns() != 0U &&
                 capture->monotonic_ns() != 0U &&
                 std::equal(
@@ -930,7 +945,7 @@ void RunOnlineIngressSeamTests(TestContext* test) {
                     capture->body().end()) &&
                 generation.published() &&
                 pipeline->Snapshot().accepted_messages == 1U,
-            "Connect callback is independently deep-copied before the same message advances preview: " +
+            "Connect callback is inspected once, captured, and then advances preview from the same view: " +
                 detail);
         if (pipeline != nullptr) {
             pipeline->StopAndDrain();

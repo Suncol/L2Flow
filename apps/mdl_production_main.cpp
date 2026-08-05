@@ -169,6 +169,12 @@ struct Options final {
     std::uint64_t decoder_queue_records_per_source = 65'536U;
     std::uint64_t store_queue_records_per_source_worker = 32'768U;
     std::uint64_t certified_handoff_queue_records = 4'194'304U;
+    // Zero preserves the historical derivation from the Store record cap.
+    // Explicit values independently size the three different CERTIFIED
+    // resources instead of treating Store records as their shared unit.
+    std::uint64_t certified_maximum_live_orders = 0U;
+    std::uint64_t certified_maximum_events = 0U;
+    std::uint64_t certified_maximum_ticks = 0U;
     std::uint64_t intraday_store_maximum_records = 0U;
     std::uint64_t intraday_store_memory_bytes = 0U;
     std::uint32_t intraday_store_segment_kib = 64U;
@@ -223,6 +229,47 @@ struct Options final {
     std::filesystem::path certified_ipc_socket;
     bool certified_ipc_socket_set = false;
 };
+
+struct CertifiedCapacityLimits final {
+    std::size_t maximum_live_orders = 0U;
+    std::size_t maximum_events = 0U;
+    std::uint64_t maximum_ticks = 0U;
+};
+
+[[nodiscard]] bool ResolveCertifiedCapacityLimits(
+    const Options& options,
+    CertifiedCapacityLimits* output) noexcept {
+    if (output == nullptr) {
+        return false;
+    }
+    *output = {};
+    const std::uint64_t live_orders =
+        options.certified_maximum_live_orders == 0U
+            ? options.intraday_store_maximum_records
+            : options.certified_maximum_live_orders;
+    std::uint64_t events = options.certified_maximum_events;
+    if (events == 0U) {
+        if (live_orders >
+            std::numeric_limits<std::uint64_t>::max() / 4U) {
+            return false;
+        }
+        events = live_orders * 4U;
+    }
+    const std::uint64_t ticks =
+        options.certified_maximum_ticks == 0U
+            ? options.intraday_store_maximum_records
+            : options.certified_maximum_ticks;
+    if (live_orders == 0U || events == 0U || ticks == 0U ||
+        live_orders > std::numeric_limits<std::size_t>::max() ||
+        events > std::numeric_limits<std::size_t>::max()) {
+        return false;
+    }
+    output->maximum_live_orders =
+        static_cast<std::size_t>(live_orders);
+    output->maximum_events = static_cast<std::size_t>(events);
+    output->maximum_ticks = ticks;
+    return true;
+}
 
 void PrintUsage(std::ostream& output) {
     output
@@ -285,6 +332,13 @@ void PrintUsage(std::ostream& output) {
         << "                                positive u64, default 32768\n"
         << "  --certified-handoff-queue-records N\n"
         << "                                power of two, default 4194304\n"
+        << "  --certified-maximum-live-orders N\n"
+        << "                                positive per-market order-state cap; "
+           "default store record cap\n"
+        << "  --certified-maximum-events N positive derived Event row cap; "
+           "default 4x live orders\n"
+        << "  --certified-maximum-ticks N  positive canonical Tick history cap; "
+           "default store record cap\n"
         << "  --intraday-store-segment-kib N\n"
         << "                                4..16384, default 64\n"
         << "  --intraday-store-batch-records N\n"
@@ -498,6 +552,9 @@ bool ParseOptions(
             option != "--decoder-queue-records-per-source" &&
             option != "--store-queue-records-per-source-worker" &&
             option != "--certified-handoff-queue-records" &&
+            option != "--certified-maximum-live-orders" &&
+            option != "--certified-maximum-events" &&
+            option != "--certified-maximum-ticks" &&
             option != "--intraday-store-max-records" &&
             option != "--intraday-store-memory-gib" &&
             option != "--intraday-store-segment-kib" &&
@@ -626,6 +683,40 @@ bool ParseOptions(
                 *error =
                     "--certified-handoff-queue-records must be a "
                     "power of two that fits size_t";
+                return false;
+            }
+        } else if (option ==
+                   "--certified-maximum-live-orders") {
+            if (!ParseU64(
+                    value,
+                    &parsed.certified_maximum_live_orders) ||
+                parsed.certified_maximum_live_orders == 0U ||
+                parsed.certified_maximum_live_orders >
+                    std::numeric_limits<std::size_t>::max()) {
+                *error =
+                    "--certified-maximum-live-orders must fit a "
+                    "positive size_t";
+                return false;
+            }
+        } else if (option == "--certified-maximum-events") {
+            if (!ParseU64(
+                    value,
+                    &parsed.certified_maximum_events) ||
+                parsed.certified_maximum_events == 0U ||
+                parsed.certified_maximum_events >
+                    std::numeric_limits<std::size_t>::max()) {
+                *error =
+                    "--certified-maximum-events must fit a positive "
+                    "size_t";
+                return false;
+            }
+        } else if (option == "--certified-maximum-ticks") {
+            if (!ParseU64(
+                    value,
+                    &parsed.certified_maximum_ticks) ||
+                parsed.certified_maximum_ticks == 0U) {
+                *error =
+                    "--certified-maximum-ticks must be positive u64";
                 return false;
             }
         } else if (option == "--intraday-store-max-records") {
@@ -1334,19 +1425,14 @@ int RunLivePartial(
         certified_service;
     bool event_available = false;
     if (options.native_gap_recovery_enabled) {
-        constexpr std::size_t maximum_size =
-            std::numeric_limits<std::size_t>::max();
-        if (options.intraday_store_maximum_records > maximum_size ||
-            options.intraday_store_maximum_records >
-                maximum_size / 4U) {
+        CertifiedCapacityLimits certified_capacities{};
+        if (!ResolveCertifiedCapacityLimits(
+                options, &certified_capacities)) {
             std::cerr
                 << "mdl-production-router: partial canonical Event "
                    "unavailable: capacity is not representable; "
                    "FAST remains available\n";
         } else {
-            const std::size_t maximum_order_states =
-                static_cast<std::size_t>(
-                    options.intraday_store_maximum_records);
             ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
             certified_config.run_id = run_id;
             certified_config.session_epoch = options.session_epoch;
@@ -1360,11 +1446,11 @@ int RunLivePartial(
             certified_config.maximum_mapping_bytes =
                 options.ipc_maximum_mapping_bytes;
             certified_config.maximum_order_states =
-                maximum_order_states;
+                certified_capacities.maximum_live_orders;
             certified_config.maximum_derived_events =
-                maximum_order_states * 4U;
+                certified_capacities.maximum_events;
             certified_config.maximum_certified_ticks =
-                options.intraday_store_maximum_records;
+                certified_capacities.maximum_ticks;
             certified_config.worker_cpu_set = options.event_cpu_set;
             certified_config.control_cpu_set = options.event_cpu_set;
             certified_config.tick_history_worker_cpu_set =
@@ -1931,11 +2017,9 @@ int RunOnlineRecovery(
     std::shared_ptr<ipc::RealtimeCertifiedMarketServiceV1>
         certified_service;
     if (options.native_gap_recovery_enabled) {
-        constexpr std::size_t maximum_size =
-            std::numeric_limits<std::size_t>::max();
-        if (options.intraday_store_maximum_records > maximum_size ||
-            options.intraday_store_maximum_records >
-                maximum_size / 4U) {
+        CertifiedCapacityLimits certified_capacities{};
+        if (!ResolveCertifiedCapacityLimits(
+                options, &certified_capacities)) {
             std::cerr
                 << "mdl-production-router: online CERTIFIED capacity "
                    "is not representable\n";
@@ -1945,9 +2029,6 @@ int RunOnlineRecovery(
             static_cast<void>(live_journal->StopAndFlush());
             return 1;
         }
-        const std::size_t maximum_order_states =
-            static_cast<std::size_t>(
-                options.intraday_store_maximum_records);
         ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
         certified_config.run_id = recovered_run_id;
         certified_config.session_epoch = options.session_epoch;
@@ -1960,16 +2041,12 @@ int RunOnlineRecovery(
             options.certified_handoff_queue_records;
         certified_config.maximum_mapping_bytes =
             options.ipc_maximum_mapping_bytes;
-        certified_config.maximum_order_states = maximum_order_states;
+        certified_config.maximum_order_states =
+            certified_capacities.maximum_live_orders;
         certified_config.maximum_derived_events =
-            maximum_order_states * 4U;
-        // The Store bound covers every applied record and is therefore a
-        // conservative upper bound for the Tick-only canonical journal. Do
-        // not silently fall back to the library's smaller convenience
-        // default: exhausting Tick History must not freeze an otherwise
-        // correctly sized recovered session.
+            certified_capacities.maximum_events;
         certified_config.maximum_certified_ticks =
-            options.intraday_store_maximum_records;
+            certified_capacities.maximum_ticks;
         certified_config.worker_cpu_set = options.event_cpu_set;
         certified_config.control_cpu_set = options.event_cpu_set;
         certified_config.tick_history_worker_cpu_set =
@@ -3878,24 +3955,14 @@ int Run(const Options& options) {
     // FAST session unavailable.
     pipeline_config.applied_record_sink = ipc_service;
     if (options.native_gap_recovery_enabled) {
-        constexpr std::size_t maximum_size =
-            std::numeric_limits<std::size_t>::max();
-        const bool certified_capacity_representable =
-            options.intraday_store_maximum_records <= maximum_size &&
-            options.intraday_store_maximum_records <=
-                maximum_size / 4U;
-        if (!certified_capacity_representable) {
+        CertifiedCapacityLimits certified_capacities{};
+        if (!ResolveCertifiedCapacityLimits(
+                options, &certified_capacities)) {
             std::cerr
                 << "mdl-production-router: CERTIFIED V1 DEGRADED: "
-                   "capacity cannot represent four derived events per "
-                   "stored record; the required FAST path remains\n";
+                   "configured capacity is not representable; the "
+                   "required FAST path remains\n";
         } else {
-            const std::size_t maximum_order_states =
-                static_cast<std::size_t>(
-                    options.intraday_store_maximum_records);
-            const std::size_t maximum_derived_events =
-                maximum_order_states * 4U;
-
             ipc::RealtimeCertifiedServiceConfigV1 certified_config{};
             certified_config.run_id = run_id;
             certified_config.session_epoch = options.session_epoch;
@@ -3909,11 +3976,11 @@ int Run(const Options& options) {
             certified_config.maximum_mapping_bytes =
                 options.ipc_maximum_mapping_bytes;
             certified_config.maximum_order_states =
-                maximum_order_states;
+                certified_capacities.maximum_live_orders;
             certified_config.maximum_derived_events =
-                maximum_derived_events;
+                certified_capacities.maximum_events;
             certified_config.maximum_certified_ticks =
-                options.intraday_store_maximum_records;
+                certified_capacities.maximum_ticks;
             certified_config.worker_cpu_set =
                 options.event_cpu_set;
             certified_config.control_cpu_set =

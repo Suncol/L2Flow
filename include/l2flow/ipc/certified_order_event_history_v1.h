@@ -161,6 +161,17 @@ public:
         const RealtimeWireTickPayloadV2& input,
         std::uint64_t canonical_apply_sequence) noexcept;
 
+    // Serial-writer overload. On success output_generation is the exact
+    // immutable generation published by this append; obtaining it does not
+    // reacquire the reader publication mutex. The two-argument overload is
+    // retained for source and binary compatibility.
+    [[nodiscard]] CertifiedOrderEventHistoryErrorV1
+    AppendCertifiedTick(
+        const RealtimeWireTickPayloadV2& input,
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistorySnapshotV1* output_generation)
+        noexcept;
+
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1
     AcquireGeneration(
         CertifiedOrderEventHistorySnapshotV1* output) const noexcept;

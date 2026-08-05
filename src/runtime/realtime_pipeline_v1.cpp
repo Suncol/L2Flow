@@ -2606,7 +2606,9 @@ public:
                     CLOCK_MONOTONIC, &capture_clock.monotonic_ns);
         }
         if (!capture_clock.valid) {
-            return Ingest(message, &capture_clock).error;
+            return IngestInspected(
+                       message, inspection, &capture_clock)
+                .error;
         }
 
         realtime::RealtimeIngressCaptureInputV1 capture{};
@@ -2626,7 +2628,9 @@ public:
             }
             return RealtimePipelineIngressErrorV1::kCaptureFailed;
         }
-        return Ingest(message, &capture_clock).error;
+        return IngestInspected(
+                   message, inspection, &capture_clock)
+            .error;
     }
 
     [[nodiscard]] RealtimePipelineIngressResultV1 Ingest(
@@ -2636,6 +2640,36 @@ public:
         bool wait_for_decoder_capacity = false,
         std::chrono::steady_clock::time_point admission_deadline =
             std::chrono::steady_clock::time_point::max()) noexcept {
+        return IngestImpl(
+            message,
+            callback_entry,
+            additional_market_notices,
+            wait_for_decoder_capacity,
+            admission_deadline,
+            nullptr);
+    }
+
+    [[nodiscard]] RealtimePipelineIngressResultV1 IngestInspected(
+        const mdl::MDLMessage* message,
+        const realtime::OwnedIngressMessageInspectionV1& inspection,
+        const CallbackClockObservation* callback_entry) noexcept {
+        return IngestImpl(
+            message,
+            callback_entry,
+            0U,
+            false,
+            std::chrono::steady_clock::time_point::max(),
+            &inspection);
+    }
+
+    [[nodiscard]] RealtimePipelineIngressResultV1 IngestImpl(
+        const mdl::MDLMessage* message,
+        const CallbackClockObservation* callback_entry,
+        std::uint64_t additional_market_notices,
+        bool wait_for_decoder_capacity,
+        std::chrono::steady_clock::time_point admission_deadline,
+        const realtime::OwnedIngressMessageInspectionV1*
+            inspected) noexcept {
         RealtimePipelineIngressResultV1 result{};
         std::unique_lock<std::mutex> admission(admission_mutex_);
         if (fatal_.load(std::memory_order_acquire) ||
@@ -2660,8 +2694,20 @@ public:
         }
 
         realtime::OwnedIngressMessageInspectionV1 inspection{};
-        result.owned_error = realtime::InspectOwnedIngressMessageV1(
-            message, config_.maximum_sdk_message_bytes, &inspection);
+        if (inspected == nullptr) {
+            result.owned_error =
+                realtime::InspectOwnedIngressMessageV1(
+                    message,
+                    config_.maximum_sdk_message_bytes,
+                    &inspection);
+        } else {
+            inspection = *inspected;
+            result.owned_error =
+                inspection
+                    ? realtime::OwnedIngressMessageErrorV1::kNone
+                    : realtime::OwnedIngressMessageErrorV1::
+                          kInvalidInspection;
+        }
         if (result.owned_error ==
             realtime::OwnedIngressMessageErrorV1::
                 kForbiddenCombinedTick) {

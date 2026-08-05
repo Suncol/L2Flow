@@ -931,5 +931,128 @@ int main() {
             "cancel without A is conflict-audited and never treated as a clean T-only finalization");
     }
 
+    {
+        std::unique_ptr<market::ShanghaiOrderEventAggregatorV1>
+            aggregator = Aggregator(8U, &ok);
+        market::ShanghaiOrderEventInputV1 other_instrument = Add(
+            100,
+            900,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            10'000'000,
+            10,
+            0);
+        other_instrument.instrument_id = 18U;
+        market::ShanghaiOrderEventInputV1 target_high = Add(
+            101,
+            300,
+            market::SideV1::kSell,
+            market::TradingPhaseV1::kContinuous,
+            10'100'000,
+            20,
+            0);
+        market::ShanghaiOrderEventInputV1 target_low = Add(
+            102,
+            100,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            9'900'000,
+            30,
+            0);
+        market::ShanghaiOrderEventInputV1 other_channel = Add(
+            103,
+            50,
+            market::SideV1::kBuy,
+            market::TradingPhaseV1::kContinuous,
+            9'800'000,
+            40,
+            0);
+        other_channel.channel = 4;
+        ok &= Consume(
+            aggregator.get(),
+            other_instrument,
+            &events,
+            "consume END-range other instrument");
+        ok &= Consume(
+            aggregator.get(),
+            target_high,
+            &events,
+            "consume END-range high target order");
+        ok &= Consume(
+            aggregator.get(),
+            target_low,
+            &events,
+            "consume END-range low target order");
+        ok &= Consume(
+            aggregator.get(),
+            other_channel,
+            &events,
+            "consume END-range other channel");
+
+        const market::ShanghaiOrderEventInputV1 end =
+            Status(104, market::TradingPhaseV1::kEnd);
+        std::size_t maximum_output = 0U;
+        ok &= Expect(
+            aggregator->MaximumOutputForInput(
+                end, &maximum_output) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kNone &&
+                maximum_output == 3U,
+            "END maximum output counts only unfinished orders in the exact instrument/channel range");
+        ok &= Consume(
+            aggregator.get(),
+            end,
+            &events,
+            "consume exact instrument-range END");
+        const auto* first_revision =
+            events.size() > 1U
+                ? std::get_if<
+                      market::ShanghaiOrderRevisionEventV1>(
+                      &events[1U])
+                : nullptr;
+        const auto* second_revision =
+            events.size() > 2U
+                ? std::get_if<
+                      market::ShanghaiOrderRevisionEventV1>(
+                      &events[2U])
+                : nullptr;
+        ok &= Expect(
+            events.size() == 3U &&
+                std::holds_alternative<
+                    market::ShanghaiStatusEventV1>(events[0U]) &&
+                first_revision != nullptr &&
+                second_revision != nullptr &&
+                first_revision->order.key.order_id == 100 &&
+                second_revision->order.key.order_id == 300,
+            "END finalizes only its range in ascending OrderKey order");
+
+        market::ShanghaiOrderSnapshotV1 untouched{};
+        ok &= Expect(
+            aggregator->GetOrder(
+                {20260730U, 18U, 3, 900}, &untouched) ==
+                    market::ShanghaiOrderAggregatorQueryErrorV1::
+                        kNone &&
+                untouched.finality ==
+                    market::ShanghaiOrderFinalityV1::kProvisional &&
+                aggregator->GetOrder(
+                    {20260730U, 17U, 4, 50}, &untouched) ==
+                    market::ShanghaiOrderAggregatorQueryErrorV1::
+                        kNone &&
+                untouched.finality ==
+                    market::ShanghaiOrderFinalityV1::kProvisional,
+            "END leaves other instruments and channels provisional");
+
+        const market::ShanghaiOrderEventInputV1 repeated_end =
+            Status(105, market::TradingPhaseV1::kEnd);
+        maximum_output = 0U;
+        ok &= Expect(
+            aggregator->MaximumOutputForInput(
+                repeated_end, &maximum_output) ==
+                    market::ShanghaiOrderAggregatorConsumeErrorV1::
+                        kNone &&
+                maximum_output == 1U,
+            "repeated END upper bound excludes already-finalized revisions");
+    }
+
     return ok ? 0 : 1;
 }

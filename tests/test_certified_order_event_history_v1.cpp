@@ -229,6 +229,42 @@ ipc::RealtimeWireTickPayloadV2 ShanghaiAdd(
     return payload;
 }
 
+ipc::RealtimeWireTickPayloadV2 ShanghaiEndStatus(
+    std::int64_t native_sequence,
+    std::uint64_t arrival_tick_sequence,
+    std::uint32_t instrument_id = 17U) {
+    ipc::RealtimeWireTickPayloadV2 payload{};
+    FillCommon(
+        &payload,
+        arrival_tick_sequence,
+        market::MarketEventKindV1::kShanghaiTick,
+        market::MarketV1::kShanghai,
+        1U,
+        instrument_id);
+    payload.channel = 3;
+    payload.native_event_sequence = native_sequence;
+    payload.action = static_cast<std::uint8_t>(
+        market::TickActionV1::kStatus);
+    payload.phase = static_cast<std::uint8_t>(
+        market::TradingPhaseV1::kEnd);
+    SetDecimal(&payload.price, 0, 3U, false);
+    SetQuantity(&payload.quantity, 0, false);
+    SetDecimal(&payload.trade_amount, 0, 3U, false);
+    SetQuantity(&payload.matched_quantity, 0, false);
+    payload.validity_bitmap =
+        market::kTickExchangeTimeValidV1 |
+        market::kTickPhaseValidV1;
+    SetRaw(
+        &payload.raw_type,
+        &payload.raw_type_length,
+        "S");
+    SetRaw(
+        &payload.raw_tick_flag,
+        &payload.raw_tick_flag_length,
+        "ENDTR");
+    return payload;
+}
+
 ipc::RealtimeWireTickPayloadV2 ShenzhenOrder(
     std::int64_t native_sequence,
     std::uint64_t arrival_tick_sequence,
@@ -790,11 +826,14 @@ void TestShenzhenLifecycleAndImmutableGeneration(bool* ok) {
     const auto trade = ShenzhenTrade(1'001, 21U);
     const auto cancel = ShenzhenCancel(1'002, 22U);
 
+    ipc::CertifiedOrderEventHistorySnapshotV1 order_generation;
     *ok &= Expect(
-        history->AppendCertifiedTick(order, 1U) ==
-            ipc::CertifiedOrderEventHistoryErrorV1::kNone,
-        "append certified Shenzhen order");
-    const auto order_generation = Acquire(
+        history->AppendCertifiedTick(
+            order, 1U, &order_generation) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            order_generation.valid(),
+        "append certified Shenzhen order and return its generation");
+    const auto acquired_order_generation = Acquire(
         *history,
         ok,
         "acquire immutable Shenzhen order generation");
@@ -807,6 +846,10 @@ void TestShenzhenLifecycleAndImmutableGeneration(bool* ok) {
                   &order_events.front().payload);
     *ok &= Expect(
         order_generation.generation().generation == 1U &&
+            acquired_order_generation.generation().generation ==
+                order_generation.generation().generation &&
+            acquired_order_generation.events().size() ==
+                order_generation.events().size() &&
             initial_revision != nullptr &&
             initial_revision->order.first_anchor
                     .source_sequence ==
@@ -1055,6 +1098,58 @@ void TestFilteredSkipAndFailureBoundaries(bool* ok) {
     }
 }
 
+void TestShanghaiEndUsesInstrumentCapacity(bool* ok) {
+    auto history = History(ok, 5U, 8U);
+    if (history == nullptr) {
+        return;
+    }
+    auto target = ShanghaiAdd(900, 70U, 9'000);
+    auto other_one = ShanghaiAdd(901, 71U, 9'001);
+    other_one.common.instrument_id = 18U;
+    other_one.common.ordinal = 17U;
+    auto other_two = ShanghaiAdd(902, 72U, 9'002);
+    other_two.common.instrument_id = 19U;
+    other_two.common.ordinal = 18U;
+    const auto end = ShanghaiEndStatus(903, 73U);
+
+    *ok &= Expect(
+        history->AppendCertifiedTick(target, 1U) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            history->AppendCertifiedTick(other_one, 2U) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            history->AppendCertifiedTick(other_two, 3U) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone,
+        "append multiple Shanghai instruments before exact-capacity END");
+    *ok &= Expect(
+        history->AppendCertifiedTick(end, 4U) ==
+                ipc::CertifiedOrderEventHistoryErrorV1::kNone &&
+            !history->failed(),
+        "END succeeds when capacity fits its instrument but not all market orders");
+
+    const auto snapshot = Acquire(
+        *history,
+        ok,
+        "acquire exact-capacity Shanghai END generation");
+    const auto events = snapshot.events();
+    const auto* finalized =
+        events.size() == 5U
+            ? std::get_if<market::ShanghaiOrderRevisionEventV1>(
+                  &events[4U].payload)
+            : nullptr;
+    *ok &= Expect(
+        snapshot.generation().input_frontier
+                .canonical_apply_sequence == 4U &&
+            events.size() == 5U &&
+            std::holds_alternative<market::ShanghaiStatusEventV1>(
+                events[3U].payload) &&
+            finalized != nullptr &&
+            finalized->order.key.instrument_id == 17U &&
+            finalized->order.key.order_id == 9'000 &&
+            finalized->operation ==
+                market::ShanghaiOrderDeltaOperationV1::kFinalize,
+        "exact-capacity END publishes only the target instrument finalization");
+}
+
 void TestSparseLargeJournalReservation(bool* ok) {
     constexpr std::size_t kProductionEventCapacity =
         16'000'000U;
@@ -1215,6 +1310,7 @@ int main() {
     TestShanghaiExternalRepair(&ok);
     TestShenzhenLifecycleAndImmutableGeneration(&ok);
     TestFilteredSkipAndFailureBoundaries(&ok);
+    TestShanghaiEndUsesInstrumentCapacity(&ok);
     TestSparseLargeJournalReservation(&ok);
     TestConfigurationOverflowAndConcurrentAcquire(&ok);
     return ok ? 0 : 1;

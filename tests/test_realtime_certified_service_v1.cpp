@@ -1213,6 +1213,10 @@ void RunPrefixProbeTimeoutLateAckScenario(TestContext* test) {
             !fixture.service->StartupPrefixRecoveredForTest(),
         "timed-out probe leaves one unacknowledged side-effect-free marker");
 
+    const std::uint64_t header_tag_before_live =
+        fixture.service->HeaderPublishTagForTest();
+    const std::uint64_t wake_epoch_before_live =
+        fixture.service->WorkerWakeEpochForTest();
     test->Expect(
         Inject(fixture.pipeline.get(), 1U, 61U).accepted() &&
             WaitUntil([&] {
@@ -1221,6 +1225,12 @@ void RunPrefixProbeTimeoutLateAckScenario(TestContext* test) {
                        snapshot.enqueued_applied_records >= 1U;
             }),
         "enqueue later live data behind the timed-out probe marker");
+    test->Expect(
+        wake_epoch_before_live !=
+                std::numeric_limits<std::uint64_t>::max() &&
+            fixture.service->WorkerWakeEpochForTest() ==
+                wake_epoch_before_live + 1U,
+        "multiple handoffs queued behind a paused worker coalesce into one empty-to-nonempty wake");
     ipc::RealtimeCertifiedPrefixFenceResultV1 second{};
     int second_system_error = 0;
     auto second_error =
@@ -1252,8 +1262,14 @@ void RunPrefixProbeTimeoutLateAckScenario(TestContext* test) {
             second.event_journal_frontier == 1U &&
             second.event_history.generation()
                     .input_frontier.canonical_apply_sequence == 1U &&
+            header_tag_before_live != 0U &&
+            (header_tag_before_live & 1U) == 0U &&
+            header_tag_before_live <=
+                std::numeric_limits<std::uint64_t>::max() - 4U &&
+            second.header_publish_tag ==
+                header_tag_before_live + 4U &&
             !fixture.service->StartupPrefixRecoveredForTest(),
-        "next probe waits for late ack then captures a distinct newer FIFO cut");
+        "next probe captures the newer FIFO cut with one Tick commit and one mandatory fence header publication");
 }
 
 void RunPrefixCommitTimeoutCancellationScenario(TestContext* test) {

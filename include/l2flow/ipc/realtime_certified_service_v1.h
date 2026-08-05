@@ -434,6 +434,10 @@ public:
         RealtimeCertifiedTickEnvelopeV1* output) const noexcept;
     [[nodiscard]] bool DuplicateReadOnlyDescriptorForTest(
         int* output_fd) const noexcept;
+    [[nodiscard]] std::uint64_t HeaderPublishTagForTest()
+        const noexcept;
+    [[nodiscard]] std::uint64_t WorkerWakeEpochForTest()
+        const noexcept;
     [[nodiscard]] bool WaitUntilIdleForTest(
         std::chrono::milliseconds timeout) const noexcept;
     // Injects an asynchronous control-loop wakeup without requesting a normal

@@ -347,6 +347,16 @@ public:
         std::uint64_t canonical_apply_sequence,
         std::vector<ShanghaiOrderEventV1>* output) noexcept;
 
+    // Returns the authoritative upper bound for the events which Consume or
+    // ConsumeCanonical can emit for this input against the current state.
+    // For an END status this is exact: the status row plus only unfinished
+    // orders in the input's (trade_date, instrument_id, channel) range.
+    // The query does not advance ordering frontiers or mutate order state.
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    MaximumOutputForInput(
+        const ShanghaiOrderEventInputV1& input,
+        std::size_t* output) const noexcept;
+
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeDecoded(
         const DecodedMarketEventV1& event,
         std::uint64_t ingress_sequence,

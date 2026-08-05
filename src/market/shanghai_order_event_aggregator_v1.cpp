@@ -463,14 +463,6 @@ void ApplyCancel(
     RefreshDerivedState(state);
 }
 
-[[nodiscard]] bool SameInstrument(
-    const ShanghaiOrderKeyV1& key,
-    const ShanghaiOrderEventInputV1& input) noexcept {
-    return key.trade_date == input.trade_date &&
-           key.instrument_id == input.instrument_id &&
-           key.channel == input.channel;
-}
-
 }  // namespace
 
 bool operator<(
@@ -718,6 +710,46 @@ public:
         return orders_.size();
     }
 
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    MaximumOutputForInput(
+        const ShanghaiOrderEventInputV1& input,
+        std::size_t* output) const noexcept {
+        if (output == nullptr) {
+            return ShanghaiOrderAggregatorConsumeErrorV1::kNullOutput;
+        }
+        *output = 0U;
+        if (failed_) {
+            return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
+        }
+        if (finalized_) {
+            return ShanghaiOrderAggregatorConsumeErrorV1::
+                kAlreadyFinalized;
+        }
+        if (!ValidInput(input)) {
+            return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
+        }
+        if (input.trade_date != config_.trade_date) {
+            return ShanghaiOrderAggregatorConsumeErrorV1::kWrongTradeDate;
+        }
+        switch (input.action) {
+            case TickActionV1::kAdd:
+                *output = 1U;
+                return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
+            case TickActionV1::kCancel:
+                *output = 2U;
+                return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
+            case TickActionV1::kTrade:
+                *output = 3U;
+                return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
+            case TickActionV1::kStatus:
+                return StatusOutputCount(input, output);
+            case TickActionV1::kUnknown:
+                return ShanghaiOrderAggregatorConsumeErrorV1::
+                    kInvalidInput;
+        }
+        return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
+    }
+
     [[nodiscard]] bool finalized() const noexcept {
         return finalized_;
     }
@@ -732,6 +764,67 @@ public:
     }
 
 private:
+    using OrderMap = std::map<ShanghaiOrderKeyV1, OrderState>;
+
+    [[nodiscard]] std::pair<
+        OrderMap::iterator,
+        OrderMap::iterator>
+    InstrumentRange(
+        const ShanghaiOrderEventInputV1& input) noexcept {
+        const ShanghaiOrderKeyV1 lower{
+            input.trade_date,
+            input.instrument_id,
+            input.channel,
+            std::numeric_limits<std::int64_t>::min()};
+        const ShanghaiOrderKeyV1 upper{
+            input.trade_date,
+            input.instrument_id,
+            input.channel,
+            std::numeric_limits<std::int64_t>::max()};
+        return {orders_.lower_bound(lower), orders_.upper_bound(upper)};
+    }
+
+    [[nodiscard]] std::pair<
+        OrderMap::const_iterator,
+        OrderMap::const_iterator>
+    InstrumentRange(
+        const ShanghaiOrderEventInputV1& input) const noexcept {
+        const ShanghaiOrderKeyV1 lower{
+            input.trade_date,
+            input.instrument_id,
+            input.channel,
+            std::numeric_limits<std::int64_t>::min()};
+        const ShanghaiOrderKeyV1 upper{
+            input.trade_date,
+            input.instrument_id,
+            input.channel,
+            std::numeric_limits<std::int64_t>::max()};
+        return {orders_.lower_bound(lower), orders_.upper_bound(upper)};
+    }
+
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    StatusOutputCount(
+        const ShanghaiOrderEventInputV1& input,
+        std::size_t* output) const noexcept {
+        *output = 1U;
+        if (!input.phase_valid ||
+            input.phase != TradingPhaseV1::kEnd) {
+            return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
+        }
+        const auto [first, last] = InstrumentRange(input);
+        for (auto position = first; position != last; ++position) {
+            if (position->second.finalization_emitted) {
+                continue;
+            }
+            if (*output == std::numeric_limits<std::size_t>::max()) {
+                return ShanghaiOrderAggregatorConsumeErrorV1::
+                    kNumericOverflow;
+            }
+            ++(*output);
+        }
+        return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
+    }
+
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 EnsureCapacity()
         const noexcept {
         return orders_.size() >= config_.maximum_order_states
@@ -1119,11 +1212,14 @@ private:
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 ConsumeStatus(
         const ShanghaiOrderEventInputV1& input,
         std::vector<ShanghaiOrderEventV1>* output) {
-        output->reserve(
-            input.phase_valid &&
-                    input.phase == TradingPhaseV1::kEnd
-                ? 1U + orders_.size()
-                : 1U);
+        std::size_t output_count = 0U;
+        const ShanghaiOrderAggregatorConsumeErrorV1 count_error =
+            StatusOutputCount(input, &output_count);
+        if (count_error !=
+            ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
+            return count_error;
+        }
+        output->reserve(output_count);
         ShanghaiStatusEventV1 status{};
         status.trade_date = input.trade_date;
         status.instrument_id = input.instrument_id;
@@ -1147,14 +1243,14 @@ private:
             input.phase != TradingPhaseV1::kEnd) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
         }
-        for (auto& [key, state] : orders_) {
-            if (SameInstrument(key, input)) {
-                const ShanghaiOrderAggregatorConsumeErrorV1 error =
-                    FinalizeState(input.anchor, &state, output);
-                if (error !=
-                    ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
-                    return error;
-                }
+        const auto [first, last] = InstrumentRange(input);
+        for (auto position = first; position != last; ++position) {
+            const ShanghaiOrderAggregatorConsumeErrorV1 error =
+                FinalizeState(
+                    input.anchor, &position->second, output);
+            if (error !=
+                ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
+                return error;
             }
         }
         return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
@@ -1181,7 +1277,7 @@ private:
     }
 
     ShanghaiOrderEventAggregatorConfigV1 config_{};
-    std::map<ShanghaiOrderKeyV1, OrderState> orders_;
+    OrderMap orders_;
     std::map<std::int32_t, std::int64_t>
         last_native_sequence_by_channel_;
     std::uint64_t last_ordering_sequence_ = 0U;
@@ -1319,6 +1415,19 @@ ShanghaiOrderEventAggregatorV1::ConsumeCanonical(
         impl_->MarkFailed();
         return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
     }
+}
+
+ShanghaiOrderAggregatorConsumeErrorV1
+ShanghaiOrderEventAggregatorV1::MaximumOutputForInput(
+    const ShanghaiOrderEventInputV1& input,
+    std::size_t* output) const noexcept {
+    if (impl_ == nullptr) {
+        if (output != nullptr) {
+            *output = 0U;
+        }
+        return ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
+    }
+    return impl_->MaximumOutputForInput(input, output);
 }
 
 ShanghaiOrderAggregatorConsumeErrorV1

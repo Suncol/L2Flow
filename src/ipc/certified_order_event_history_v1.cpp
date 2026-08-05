@@ -392,7 +392,12 @@ public:
 
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1 Consume(
         const RealtimeWireTickPayloadV2& input,
-        std::uint64_t canonical_apply_sequence) noexcept {
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryGenerationV1* output_generation)
+        noexcept {
+        if (output_generation != nullptr) {
+            *output_generation = {};
+        }
         if (failed_.load(std::memory_order_acquire)) {
             return CertifiedOrderEventHistoryErrorV1::kFailed;
         }
@@ -420,7 +425,9 @@ public:
             if (kind ==
                 market::MarketEventKindV1::kShanghaiTick) {
                 return ConsumeShanghai(
-                    input, canonical_apply_sequence);
+                    input,
+                    canonical_apply_sequence,
+                    output_generation);
             }
             if (kind ==
                     market::MarketEventKindV1::kShenzhenOrder ||
@@ -428,7 +435,9 @@ public:
                     market::MarketEventKindV1::
                         kShenzhenTransaction) {
                 return ConsumeShenzhen(
-                    input, canonical_apply_sequence);
+                    input,
+                    canonical_apply_sequence,
+                    output_generation);
             }
             last_wire_projection_ =
                 WireOrderEventProjectionResultV2::
@@ -499,7 +508,8 @@ private:
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1
     ConsumeShanghai(
         const RealtimeWireTickPayloadV2& wire,
-        std::uint64_t canonical_apply_sequence) {
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryGenerationV1* output_generation) {
         market::ShanghaiOrderEventInputV1 input{};
         last_wire_projection_ =
             ProjectShanghaiOrderEventInputFromWireV2(
@@ -524,37 +534,14 @@ private:
         }
 
         std::size_t maximum_output = 0U;
-        switch (input.action) {
-            case market::TickActionV1::kAdd:
-                maximum_output = 1U;
-                break;
-            case market::TickActionV1::kCancel:
-                maximum_output = 2U;
-                break;
-            case market::TickActionV1::kTrade:
-                maximum_output = 3U;
-                break;
-            case market::TickActionV1::kStatus:
-                if (input.phase_valid &&
-                    input.phase ==
-                        market::TradingPhaseV1::kEnd) {
-                    if (shanghai_->order_count() ==
-                        std::numeric_limits<
-                            std::size_t>::max()) {
-                        return Fail(
-                            CertifiedOrderEventHistoryErrorV1::
-                                kEventCapacity);
-                    }
-                    maximum_output =
-                        shanghai_->order_count() + 1U;
-                } else {
-                    maximum_output = 1U;
-                }
-                break;
-            case market::TickActionV1::kUnknown:
-                return Fail(
-                    CertifiedOrderEventHistoryErrorV1::
-                        kWireProjectionError);
+        last_shanghai_error_ =
+            shanghai_->MaximumOutputForInput(
+                input, &maximum_output);
+        if (last_shanghai_error_ !=
+            market::ShanghaiOrderAggregatorConsumeErrorV1::kNone) {
+            return Fail(
+                CertifiedOrderEventHistoryErrorV1::
+                    kAggregationError);
         }
         if (!RemainingCapacity(
                 event_count_,
@@ -639,13 +626,15 @@ private:
             market::MarketV1::kShanghai,
             static_cast<std::int64_t>(input.channel),
             input.anchor,
-            canonical_apply_sequence);
+            canonical_apply_sequence,
+            output_generation);
     }
 
     [[nodiscard]] CertifiedOrderEventHistoryErrorV1
     ConsumeShenzhen(
         const RealtimeWireTickPayloadV2& wire,
-        std::uint64_t canonical_apply_sequence) {
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryGenerationV1* output_generation) {
         market::ShenzhenOrderEventInputV1 input{};
         last_wire_projection_ =
             ProjectShenzhenOrderEventInputFromWireV2(
@@ -769,7 +758,8 @@ private:
             market::MarketV1::kShenzhen,
             static_cast<std::int64_t>(input.channel),
             input.anchor,
-            canonical_apply_sequence);
+            canonical_apply_sequence,
+            output_generation);
     }
 
     template <typename Map>
@@ -793,7 +783,9 @@ private:
         market::MarketV1 market_value,
         std::int64_t channel,
         const Anchor& anchor,
-        std::uint64_t canonical_apply_sequence) noexcept {
+        std::uint64_t canonical_apply_sequence,
+        CertifiedOrderEventHistoryGenerationV1* output_generation)
+        noexcept {
         ++published_generation_;
         last_canonical_apply_sequence_ =
             canonical_apply_sequence;
@@ -822,6 +814,9 @@ private:
             const std::lock_guard<std::mutex> lock(
                 publication_mutex_);
             visible_generation_ = publication;
+        }
+        if (output_generation != nullptr) {
+            *output_generation = publication;
         }
         last_error_.store(
             CertifiedOrderEventHistoryErrorV1::kNone,
@@ -987,7 +982,37 @@ CertifiedOrderEventHistoryV1::AppendCertifiedTick(
     return impl_ == nullptr
                ? CertifiedOrderEventHistoryErrorV1::kFailed
                : impl_->Consume(
-                     input, canonical_apply_sequence);
+                     input, canonical_apply_sequence, nullptr);
+}
+
+CertifiedOrderEventHistoryErrorV1
+CertifiedOrderEventHistoryV1::AppendCertifiedTick(
+    const RealtimeWireTickPayloadV2& input,
+    std::uint64_t canonical_apply_sequence,
+    CertifiedOrderEventHistorySnapshotV1* output_generation)
+    noexcept {
+    if (output_generation == nullptr) {
+        return CertifiedOrderEventHistoryErrorV1::kNullOutput;
+    }
+    output_generation->storage_.reset();
+    output_generation->generation_ = {};
+    if (impl_ == nullptr) {
+        return CertifiedOrderEventHistoryErrorV1::kFailed;
+    }
+    CertifiedOrderEventHistoryGenerationV1 generation{};
+    const CertifiedOrderEventHistoryErrorV1 error =
+        impl_->Consume(
+            input,
+            canonical_apply_sequence,
+            &generation);
+    if (error != CertifiedOrderEventHistoryErrorV1::kNone) {
+        return error;
+    }
+    output_generation->storage_ = impl_->AcquireStorage();
+    output_generation->generation_ = generation;
+    return output_generation->storage_ == nullptr
+               ? CertifiedOrderEventHistoryErrorV1::kFailed
+               : CertifiedOrderEventHistoryErrorV1::kNone;
 }
 
 CertifiedOrderEventHistoryErrorV1

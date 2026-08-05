@@ -34,6 +34,12 @@ run_case(
     --help)
 
 run_case(
+    help_lists_independent_certified_capacities
+    0
+    "--certified-maximum-live-orders N"
+    --help)
+
+run_case(
     help_lists_online_as_only_csv_recovery_mode
     0
     "online (the only supported mode)"
@@ -135,6 +141,27 @@ run_case(
     --intraday-live-partial
     --native-maximum-backward-displacement 2
     --parallel-decoder-workers 4)
+
+run_case(
+    independent_certified_capacities_reach_runtime
+    1
+    "--trade-date must equal the current"
+    ${base}
+    --intraday-live-partial
+    --native-maximum-backward-displacement 2
+    --certified-handoff-queue-records 128
+    --certified-maximum-live-orders 17
+    --certified-maximum-events 31
+    --certified-maximum-ticks 23)
+
+run_case(
+    zero_certified_live_orders_is_rejected
+    2
+    "--certified-maximum-live-orders must fit a positive size_t"
+    ${base}
+    --intraday-live-partial
+    --native-maximum-backward-displacement 2
+    --certified-maximum-live-orders 0)
 
 run_case(
     parallel_decoder_above_bound_is_rejected

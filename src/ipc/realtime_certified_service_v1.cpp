@@ -261,7 +261,12 @@ public:
     BoundedMpmcQueue(const BoundedMpmcQueue&) = delete;
     BoundedMpmcQueue& operator=(const BoundedMpmcQueue&) = delete;
 
-    [[nodiscard]] bool TryPush(const Value& value) noexcept {
+    [[nodiscard]] bool TryPush(
+        const Value& value,
+        bool* became_nonempty = nullptr) noexcept {
+        if (became_nonempty != nullptr) {
+            *became_nonempty = false;
+        }
         std::size_t position =
             enqueue_position_.load(std::memory_order_relaxed);
         for (;;) {
@@ -280,6 +285,16 @@ public:
                     cell.value = value;
                     cell.sequence.store(
                         position + 1U, std::memory_order_release);
+                    if (became_nonempty != nullptr) {
+                        // Evaluate after publishing the cell. If the consumer
+                        // already advanced through it, it is active and needs
+                        // no notification; otherwise this cell is the current
+                        // queue head and transitions consumable work from
+                        // empty to non-empty.
+                        *became_nonempty =
+                            dequeue_position_.load(
+                                std::memory_order_acquire) == position;
+                    }
                     return true;
                 }
             } else if (difference < 0) {
@@ -580,6 +595,19 @@ private:
         bool conflict_freeze_counted = false;
     };
 
+    struct DrainCertifiedResult final {
+        bool made_progress = false;
+        bool published_header = false;
+        bool state_dirty_after_last_publish = false;
+    };
+
+    enum class ChannelAggregateClass : std::uint8_t {
+        kHealthy = 0U,
+        kGap,
+        kCatchingUp,
+        kFrozen,
+    };
+
 public:
     explicit Impl(RealtimeCertifiedServiceConfigV1 config)
         : config_(std::move(config)) {}
@@ -678,6 +706,10 @@ public:
             return RealtimeCertifiedServiceCreateErrorV1::
                 kInvalidConfiguration;
         }
+
+        // A runtime can occur at most once in the dirty set. Reserving the
+        // configured channel bound keeps UpdateChannel allocation-free.
+        dirty_channels_.reserve(config_.channel_capacity);
 
         worker_cpu_set_.Clear();
         control_cpu_set_.Clear();
@@ -1356,9 +1388,13 @@ public:
         fence.kind = HandoffKind::kPrefixProbe;
         fence.barrier_id = fence_id;
         for (;;) {
-            if (queue_ != nullptr && queue_->TryPush(fence)) {
+            bool became_nonempty = false;
+            if (queue_ != nullptr &&
+                queue_->TryPush(fence, &became_nonempty)) {
                 outstanding_probe_fence_id_ = fence_id;
-                WakeWorker();
+                if (became_nonempty) {
+                    WakeWorker();
+                }
                 break;
             }
             if (!worker_running_.load(std::memory_order_acquire) ||
@@ -1519,8 +1555,12 @@ public:
         const auto deadline =
             std::chrono::steady_clock::now() + timeout;
         for (;;) {
-            if (queue_ != nullptr && queue_->TryPush(fence)) {
-                WakeWorker();
+            bool became_nonempty = false;
+            if (queue_ != nullptr &&
+                queue_->TryPush(fence, &became_nonempty)) {
+                if (became_nonempty) {
+                    WakeWorker();
+                }
                 break;
             }
             if (!worker_running_.load(std::memory_order_acquire) ||
@@ -1763,8 +1803,12 @@ public:
         const auto deadline =
             std::chrono::steady_clock::now() + timeout;
         for (;;) {
-            if (queue_ != nullptr && queue_->TryPush(barrier)) {
-                WakeWorker();
+            bool became_nonempty = false;
+            if (queue_ != nullptr &&
+                queue_->TryPush(barrier, &became_nonempty)) {
+                if (became_nonempty) {
+                    WakeWorker();
+                }
                 break;
             }
             if (!worker_running_.load(std::memory_order_acquire) ||
@@ -1866,14 +1910,17 @@ public:
         event.kind = HandoffKind::kApplied;
         event.ordinal = ordinal;
         event.record = &record;
-        if (!queue_->TryPush(event)) {
+        bool became_nonempty = false;
+        if (!queue_->TryPush(event, &became_nonempty)) {
             FreezeGlobalResource();
             return true;
         }
         if (!IncrementSaturating(&enqueued_applied_records_)) {
             FreezeGlobalResource();
         }
-        WakeWorker();
+        if (became_nonempty) {
+            WakeWorker();
+        }
         return true;
     }
 
@@ -1928,14 +1975,17 @@ public:
         HandoffEvent event{};
         event.kind = HandoffKind::kObservation;
         event.observation = observation;
-        if (!queue_->TryPush(event)) {
+        bool became_nonempty = false;
+        if (!queue_->TryPush(event, &became_nonempty)) {
             FreezeGlobalResource();
             return;
         }
         if (!IncrementSaturating(&enqueued_observations_)) {
             FreezeGlobalResource();
         }
-        WakeWorker();
+        if (became_nonempty) {
+            WakeWorker();
+        }
     }
 
     void MarkNativeSequenceObservationFailure(
@@ -2169,6 +2219,19 @@ public:
         }
         *output = duplicate;
         return true;
+    }
+
+    [[nodiscard]] std::uint64_t HeaderPublishTagForTest()
+        const noexcept {
+        return header_ == nullptr
+                   ? 0U
+                   : Atomic(header_->status_publish_tag)
+                         .load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::uint64_t WorkerWakeEpochForTest()
+        const noexcept {
+        return wake_epoch_.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] bool WaitUntilIdle(
@@ -2746,7 +2809,14 @@ private:
     void WorkerLoop() noexcept {
         try {
             for (;;) {
+                // Sample before doing work. A state-only producer wake which
+                // races this iteration then changes the value and makes the
+                // final atomic wait return immediately; queue emptiness alone
+                // is not enough to protect those notifications.
+                const std::uint64_t iteration_wake_epoch =
+                    wake_epoch_.load(std::memory_order_acquire);
                 std::size_t batch = 0U;
+                bool seal_state_changed = false;
                 HandoffEvent completed_fence{};
                 HandoffEvent event{};
                 while (batch < 1024U && queue_->TryPop(&event)) {
@@ -2787,6 +2857,7 @@ private:
                     seal_input_requested_.load(
                         std::memory_order_acquire) &&
                     queue_->Empty()) {
+                    seal_state_changed = true;
                     const auto seal_error = recovery_->SealInput();
                     if (seal_error !=
                         realtime::NativeSequenceRecoverySealErrorV1::
@@ -2800,148 +2871,51 @@ private:
                         }
                     }
                 }
+                DrainCertifiedResult drain{};
                 if (!globally_frozen_resource_.load(
                         std::memory_order_acquire)) {
-                    DrainCertified();
+                    drain = DrainCertified();
                 }
                 const RealtimeCertifiedStateV1 barrier_state =
                     DeriveAggregateState();
+                const bool header_has_current_state =
+                    Atomic(header_->aggregate_state)
+                            .load(std::memory_order_acquire) ==
+                        static_cast<std::uint32_t>(barrier_state);
+                const bool drain_committed_current_state =
+                    completed_fence.barrier_id == 0U &&
+                    drain.made_progress &&
+                    drain.published_header &&
+                    !drain.state_dirty_after_last_publish &&
+                    header_has_current_state;
+                const bool outer_header_required =
+                    completed_fence.barrier_id != 0U || batch != 0U ||
+                    seal_state_changed ||
+                    drain.state_dirty_after_last_publish ||
+                    !dirty_channels_.empty() ||
+                    !header_has_current_state;
                 const bool header_committed =
+                    drain_committed_current_state ||
+                    !outer_header_required ||
                     PublishHeader(barrier_state);
                 if (completed_fence.barrier_id != 0U) {
-                    if (completed_fence.kind ==
-                        HandoffKind::kPrefixProbe) {
-                        prefix_probe_reached_for_test_.store(
-                            true, std::memory_order_release);
-                        while (prefix_probe_paused_for_test_.load(
-                                   std::memory_order_acquire) &&
-                               !worker_stop_requested_.load(
-                                   std::memory_order_acquire)) {
-                            std::this_thread::yield();
-                        }
-                    } else if (completed_fence.kind ==
-                               HandoffKind::kPrefixCommit) {
-                        prefix_commit_reached_for_test_.store(
-                            true, std::memory_order_release);
-                        while (prefix_commit_paused_for_test_.load(
-                                   std::memory_order_acquire) &&
-                               !worker_stop_requested_.load(
-                                   std::memory_order_acquire)) {
-                            std::this_thread::yield();
-                        }
-                    }
-                    // A prefix fence is a cold control operation. Let the
-                    // independent writer catch the exact public Tick cut here
-                    // so temporary asynchronous lag cannot make an otherwise
-                    // valid recovery probe/promotion fail. Ordinary Tick
-                    // publication never takes this mutex or waits for History.
-                    const std::uint64_t fence_frontier =
-                        Atomic(header_->canonical_apply_frontier)
-                            .load(std::memory_order_acquire);
-                    const bool terminal_barrier_state =
-                        barrier_state ==
-                            RealtimeCertifiedStateV1::kFrozenConflict ||
-                        barrier_state ==
-                            RealtimeCertifiedStateV1::kFrozenResource ||
-                        globally_frozen_resource_.load(
-                            std::memory_order_acquire);
-                    const bool tick_history_committed =
-                        header_committed &&
-                        (terminal_barrier_state ||
-                         DrainTickHistoryThrough(fence_frontier) ==
-                             TickHistoryDrainResult::kOk);
-                    RealtimeCertifiedPrefixFenceResultV1 result =
-                        CapturePrefixFenceResult(
-                            completed_fence.barrier_id,
-                            tick_history_committed);
-                    if (completed_fence.kind ==
-                        HandoffKind::kPrefixProbe) {
-                        // Probe completion deliberately has no coverage or
-                        // control-lifecycle side effect.
-                        PublishCompletedPrefixFence(std::move(result));
-                    } else {
-                        // Acquire every potentially-throwing resource before
-                        // claiming irreversible commit ownership. Once the
-                        // Pending->Completing CAS wins, only noexcept Event
-                        // metadata and atomic publications remain.
-                        std::unique_lock<std::mutex> result_lock(
-                            prefix_fence_result_mutex_);
-                        // Capture already checks the monotonic global freeze,
-                        // but it can race immediately after capture. Recheck
-                        // at the final Pending->Completing linearization point
-                        // so an already-published resource loss can never be
-                        // promoted as recovered coverage.
-                        ApplyGlobalResourceFreezeToFence(&result);
-                        if (worker_stop_requested_.load(
-                                std::memory_order_acquire)) {
-                            result.operation_error =
-                                RealtimeCertifiedPrefixFenceOperationErrorV1::
-                                    kWorkerFailed;
-                            result.state =
-                                RealtimeCertifiedStateV1::kFrozenResource;
-                        }
-                        auto pending = PrefixCommitPhase::kPending;
-                        if (prefix_commit_phase_
-                                .compare_exchange_strong(
-                                    pending,
-                                    PrefixCommitPhase::kCompleting,
-                                    std::memory_order_acq_rel,
-                                    std::memory_order_acquire)) {
-                            const bool coverage_published =
-                                result.ready() &&
-                                event_journal_
-                                    ->MarkStartupPrefixRecovered();
-                            if (result.ready() && !coverage_published) {
-                                result.operation_error =
-                                    RealtimeCertifiedPrefixFenceOperationErrorV1::
-                                        kInternalFailure;
-                                result.state =
-                                    RealtimeCertifiedStateV1::
-                                        kFrozenResource;
-                            }
-                            completed_prefix_fence_result_ =
-                                std::move(result);
-                            result_lock.unlock();
-                            completed_prefix_fence_id_.store(
-                                completed_fence.barrier_id,
-                                std::memory_order_release);
-                            completed_prefix_fence_id_.notify_all();
-                            if (coverage_published) {
-                                prefix_barrier_completed_.store(
-                                    true,
-                                    std::memory_order_release);
-                                prefix_commit_phase_.store(
-                                    PrefixCommitPhase::kSucceeded,
-                                    std::memory_order_release);
-                            } else {
-                                prefix_commit_phase_.store(
-                                    PrefixCommitPhase::kFailed,
-                                    std::memory_order_release);
-                            }
-                            prefix_commit_phase_.notify_all();
-                        } else {
-                            result_lock.unlock();
-                        }
-                        prefix_commit_finished_for_test_.store(
-                            true, std::memory_order_release);
-                        prefix_commit_finished_for_test_.notify_all();
-                        // If timeout cancellation won Pending->Cancelled, the
-                        // worker must not publish recovered coverage later.
-                    }
+                    HandleCompletedFence(
+                        completed_fence,
+                        barrier_state,
+                        header_committed);
                 }
                 if (worker_stop_requested_.load(
                         std::memory_order_acquire) &&
                     queue_->Empty()) {
                     break;
                 }
-                if (batch == 0U) {
-                    const std::uint64_t epoch =
-                        wake_epoch_.load(std::memory_order_acquire);
+                if (batch == 0U && header_committed) {
                     if (!worker_stop_requested_.load(
                             std::memory_order_acquire) &&
                         queue_->Empty()) {
                         wake_epoch_.wait(
-                            epoch, std::memory_order_acquire);
+                            iteration_wake_epoch,
+                            std::memory_order_acquire);
                     }
                 }
             }
@@ -2966,6 +2940,117 @@ private:
                                   std::memory_order_acquire));
         process_start_coverage_phase_.notify_all();
         worker_running_.store(false, std::memory_order_release);
+    }
+
+    void HandleCompletedFence(
+        const HandoffEvent& completed_fence,
+        RealtimeCertifiedStateV1 barrier_state,
+        bool header_committed) {
+        if (completed_fence.kind == HandoffKind::kPrefixProbe) {
+            prefix_probe_reached_for_test_.store(
+                true, std::memory_order_release);
+            while (prefix_probe_paused_for_test_.load(
+                       std::memory_order_acquire) &&
+                   !worker_stop_requested_.load(
+                       std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        } else if (completed_fence.kind == HandoffKind::kPrefixCommit) {
+            prefix_commit_reached_for_test_.store(
+                true, std::memory_order_release);
+            while (prefix_commit_paused_for_test_.load(
+                       std::memory_order_acquire) &&
+                   !worker_stop_requested_.load(
+                       std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
+        // A prefix fence is a cold control operation. Let the independent
+        // writer catch the exact public Tick cut here so temporary
+        // asynchronous lag cannot make an otherwise valid recovery
+        // probe/promotion fail. Ordinary Tick publication never takes this
+        // mutex or waits for History.
+        const std::uint64_t fence_frontier =
+            Atomic(header_->canonical_apply_frontier)
+                .load(std::memory_order_acquire);
+        const bool terminal_barrier_state =
+            barrier_state == RealtimeCertifiedStateV1::kFrozenConflict ||
+            barrier_state == RealtimeCertifiedStateV1::kFrozenResource ||
+            globally_frozen_resource_.load(std::memory_order_acquire);
+        const bool tick_history_committed =
+            header_committed &&
+            (terminal_barrier_state ||
+             DrainTickHistoryThrough(fence_frontier) ==
+                 TickHistoryDrainResult::kOk);
+        RealtimeCertifiedPrefixFenceResultV1 result =
+            CapturePrefixFenceResult(
+                completed_fence.barrier_id,
+                tick_history_committed);
+        if (completed_fence.kind == HandoffKind::kPrefixProbe) {
+            // Probe completion deliberately has no coverage or
+            // control-lifecycle side effect.
+            PublishCompletedPrefixFence(std::move(result));
+            return;
+        }
+
+        // Acquire every potentially-throwing resource before claiming
+        // irreversible commit ownership. Once the Pending->Completing CAS
+        // wins, only noexcept Event metadata and atomic publications remain.
+        std::unique_lock<std::mutex> result_lock(
+            prefix_fence_result_mutex_);
+        // Capture already checks the monotonic global freeze, but it can race
+        // immediately after capture. Recheck at the final Pending->Completing
+        // linearization point so an already-published resource loss can never
+        // be promoted as recovered coverage.
+        ApplyGlobalResourceFreezeToFence(&result);
+        if (worker_stop_requested_.load(std::memory_order_acquire)) {
+            result.operation_error =
+                RealtimeCertifiedPrefixFenceOperationErrorV1::
+                    kWorkerFailed;
+            result.state = RealtimeCertifiedStateV1::kFrozenResource;
+        }
+        auto pending = PrefixCommitPhase::kPending;
+        if (prefix_commit_phase_.compare_exchange_strong(
+                pending,
+                PrefixCommitPhase::kCompleting,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            const bool coverage_published =
+                result.ready() &&
+                event_journal_->MarkStartupPrefixRecovered();
+            if (result.ready() && !coverage_published) {
+                result.operation_error =
+                    RealtimeCertifiedPrefixFenceOperationErrorV1::
+                        kInternalFailure;
+                result.state =
+                    RealtimeCertifiedStateV1::kFrozenResource;
+            }
+            completed_prefix_fence_result_ = std::move(result);
+            result_lock.unlock();
+            completed_prefix_fence_id_.store(
+                completed_fence.barrier_id,
+                std::memory_order_release);
+            completed_prefix_fence_id_.notify_all();
+            if (coverage_published) {
+                prefix_barrier_completed_.store(
+                    true, std::memory_order_release);
+                prefix_commit_phase_.store(
+                    PrefixCommitPhase::kSucceeded,
+                    std::memory_order_release);
+            } else {
+                prefix_commit_phase_.store(
+                    PrefixCommitPhase::kFailed,
+                    std::memory_order_release);
+            }
+            prefix_commit_phase_.notify_all();
+        } else {
+            result_lock.unlock();
+        }
+        prefix_commit_finished_for_test_.store(
+            true, std::memory_order_release);
+        prefix_commit_finished_for_test_.notify_all();
+        // If timeout cancellation won Pending->Cancelled, the worker must not
+        // publish recovered coverage later.
     }
 
     void HandleHandoff(const HandoffEvent& event) {
@@ -3093,7 +3178,8 @@ private:
         UpdateChannel(descriptor.domain);
     }
 
-    void DrainCertified() {
+    [[nodiscard]] DrainCertifiedResult DrainCertified() {
+        DrainCertifiedResult result{};
         for (;;) {
             realtime::NativeSequenceCertifiedReadyV1 ready{};
             const realtime::NativeSequenceRecoveryPollErrorV1 error =
@@ -3101,13 +3187,15 @@ private:
             if (error ==
                 realtime::NativeSequenceRecoveryPollErrorV1::
                     kNotReady) {
-                return;
+                return result;
             }
             if (error !=
                 realtime::NativeSequenceRecoveryPollErrorV1::kNone) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
+            result.made_progress = true;
             if (ready.record_class ==
                 realtime::NativeSequenceRecoveryRecordClassV1::
                     kFiltered) {
@@ -3117,18 +3205,24 @@ private:
                     realtime::
                         NativeSequenceRecoveryCommitErrorV1::kNone) {
                     FreezeGlobalResource();
-                    return;
+                    result.state_dirty_after_last_publish = true;
+                    return result;
                 }
                 EnsureChannel(ready.descriptor.domain);
                 UpdateChannel(ready.descriptor.domain);
-                PublishHeader(DeriveAggregateState());
+                result.state_dirty_after_last_publish = true;
+                if (PublishHeader(DeriveAggregateState())) {
+                    result.published_header = true;
+                    result.state_dirty_after_last_publish = false;
+                }
                 continue;
             }
             if (ready.record_class !=
                 realtime::NativeSequenceRecoveryRecordClassV1::
                     kTarget) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             const auto pointer_value = static_cast<std::uintptr_t>(
                 ready.applied_cookie);
@@ -3139,7 +3233,8 @@ private:
             if (record == nullptr ||
                 record->instrument_id() == 0U) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             const std::size_t ordinal =
                 static_cast<std::size_t>(
@@ -3156,14 +3251,16 @@ private:
                 canonical_apply_frontier_ ==
                     std::numeric_limits<std::uint64_t>::max()) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             const std::uint64_t next =
                 canonical_apply_frontier_ + 1U;
             std::uint64_t certified_ns = 0U;
             if (!ReadMonotonicNs(&certified_ns)) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             RealtimeCertifiedTickEnvelopeV1 envelope{};
             envelope.canonical_apply_sequence = next;
@@ -3184,7 +3281,8 @@ private:
                 !RealtimeCertifiedTickEnvelopeCanonicalV1(
                     envelope)) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             // PollCertified returned the exact next ready token and this
             // serialized worker has not touched the coordinator since. Commit
@@ -3197,20 +3295,18 @@ private:
                 realtime::NativeSequenceRecoveryCommitErrorV1::
                     kNone) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             // Event projection/storage is the final resource-fallible part of
             // the transaction. Run it before touching a previously published
             // latest/ring slot. On failure both public Tick and Event views
             // therefore retain their same last-good canonical frontier; the
             // coordinator is internal and the service freezes terminally.
-            if (event_history_->AppendCertifiedTick(payload, next) !=
-                CertifiedOrderEventHistoryErrorV1::kNone) {
-                FreezeGlobalResource();
-                return;
-            }
             CertifiedOrderEventHistorySnapshotV1 next_event_generation{};
-            if (event_history_->AcquireGeneration(
+            if (event_history_->AppendCertifiedTick(
+                    payload,
+                    next,
                     &next_event_generation) !=
                     CertifiedOrderEventHistoryErrorV1::kNone ||
                 !next_event_generation.valid() ||
@@ -3219,7 +3315,8 @@ private:
                         .canonical_apply_sequence !=
                     next) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             // Both bounded slots were preflighted above and this is their sole
             // writer, so readers cannot make either publish fail. The header
@@ -3232,7 +3329,8 @@ private:
                     &latest_[payload.common.ordinal],
                     envelope)) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             canonical_apply_frontier_ = next;
             EnsureChannel(ready.descriptor.domain);
@@ -3241,13 +3339,18 @@ private:
                 ++channel->second.certified_tick_count;
                 channel->second.last_canonical_apply_sequence =
                     next;
+                MarkChannelWireDirty(&channel->second);
             }
             UpdateChannel(ready.descriptor.domain);
             // Commit each recovered Tick as one externally visible prefix
             // step. Besides lowering reader catch-up latency, this prevents a
             // long drain from overwriting multiple ring positions while the
             // public retention frontier still describes the old window.
-            PublishHeader(DeriveAggregateState());
+            result.state_dirty_after_last_publish = true;
+            if (PublishHeader(DeriveAggregateState())) {
+                result.published_header = true;
+                result.state_dirty_after_last_publish = false;
+            }
             // PublishHeader is the external Tick visibility commit. Only
             // after its stable even tag reaches `next` may the legacy
             // process-local Event mirror expose the matching generation.
@@ -3260,7 +3363,8 @@ private:
             if (public_tag == 0U || (public_tag & 1U) != 0U ||
                 public_frontier != next) {
                 FreezeGlobalResource();
-                return;
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
             {
                 const std::lock_guard<std::mutex> lock(
@@ -3288,6 +3392,163 @@ private:
         channels_.emplace(domain, value);
     }
 
+    [[nodiscard]] static ChannelAggregateClass AggregateClass(
+        realtime::NativeSequenceRecoveryChannelStateV1 state)
+        noexcept {
+        switch (state) {
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kHealthy:
+                return ChannelAggregateClass::kHealthy;
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kBootstrapping:
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kRepairing:
+                return ChannelAggregateClass::kGap;
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kCatchingUp:
+                return ChannelAggregateClass::kCatchingUp;
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kFrozenConflict:
+            case realtime::NativeSequenceRecoveryChannelStateV1::
+                kFrozenResource:
+                return ChannelAggregateClass::kFrozen;
+        }
+        return ChannelAggregateClass::kFrozen;
+    }
+
+    [[nodiscard]] static bool PublishedSnapshotEqual(
+        const realtime::NativeSequenceRecoveryChannelSnapshotV1& left,
+        const realtime::NativeSequenceRecoveryChannelSnapshotV1& right)
+        noexcept {
+        return left.domain == right.domain &&
+               left.state == right.state &&
+               left.origin_sequence == right.origin_sequence &&
+               left.certified_sequence == right.certified_sequence &&
+               left.observed_contiguous_sequence ==
+                   right.observed_contiguous_sequence &&
+               left.highest_observed_sequence ==
+                   right.highest_observed_sequence &&
+               left.unique_sequences == right.unique_sequences &&
+               left.duplicate_arrivals == right.duplicate_arrivals &&
+               left.exact_duplicate_applications ==
+                   right.exact_duplicate_applications &&
+               left.pending_entries == right.pending_entries &&
+               left.channel_correction_epoch ==
+                   right.channel_correction_epoch &&
+               (left.missing_sequences != 0U) ==
+                   (right.missing_sequences != 0U);
+    }
+
+    void MarkChannelWireDirty(ChannelRuntime* runtime) {
+        if (runtime == nullptr || runtime->wire_dirty) {
+            return;
+        }
+        runtime->wire_dirty = true;
+        dirty_channels_.push_back(runtime);
+    }
+
+    [[nodiscard]] bool ReplaceChannelAggregate(
+        const ChannelRuntime& runtime,
+        const realtime::NativeSequenceRecoveryChannelSnapshotV1& snapshot)
+        noexcept {
+        std::uint32_t healthy = healthy_channel_count_;
+        std::uint32_t gap = gap_channel_count_;
+        std::uint32_t catching = catching_up_channel_count_;
+        std::uint32_t frozen = frozen_channel_count_;
+        const auto adjust = [](
+                                ChannelAggregateClass aggregate_class,
+                                bool increment,
+                                std::uint32_t* healthy_count,
+                                std::uint32_t* gap_count,
+                                std::uint32_t* catching_count,
+                                std::uint32_t* frozen_count) noexcept {
+            std::uint32_t* value = nullptr;
+            switch (aggregate_class) {
+                case ChannelAggregateClass::kHealthy:
+                    value = healthy_count;
+                    break;
+                case ChannelAggregateClass::kGap:
+                    value = gap_count;
+                    break;
+                case ChannelAggregateClass::kCatchingUp:
+                    value = catching_count;
+                    break;
+                case ChannelAggregateClass::kFrozen:
+                    value = frozen_count;
+                    break;
+            }
+            if (value == nullptr ||
+                (increment &&
+                 *value == std::numeric_limits<std::uint32_t>::max()) ||
+                (!increment && *value == 0U)) {
+                return false;
+            }
+            if (increment) {
+                ++(*value);
+            } else {
+                --(*value);
+            }
+            return true;
+        };
+        if (runtime.initialized &&
+            !adjust(
+                AggregateClass(runtime.snapshot.state),
+                false,
+                &healthy,
+                &gap,
+                &catching,
+                &frozen)) {
+            return false;
+        }
+        if (!adjust(
+                AggregateClass(snapshot.state),
+                true,
+                &healthy,
+                &gap,
+                &catching,
+                &frozen)) {
+            return false;
+        }
+
+        const std::uint64_t old_duplicates =
+            runtime.initialized
+                ? runtime.snapshot.exact_duplicate_applications
+                : 0U;
+        const std::uint64_t old_pending =
+            runtime.initialized
+                ? static_cast<std::uint64_t>(
+                      runtime.snapshot.pending_entries)
+                : 0U;
+        const std::uint64_t new_pending =
+            static_cast<std::uint64_t>(snapshot.pending_entries);
+        if (exact_duplicate_message_count_ < old_duplicates ||
+            pending_token_count_ < old_pending) {
+            return false;
+        }
+        const std::uint64_t duplicate_base =
+            exact_duplicate_message_count_ - old_duplicates;
+        const std::uint64_t pending_base =
+            pending_token_count_ - old_pending;
+        if (snapshot.exact_duplicate_applications >
+                std::numeric_limits<std::uint64_t>::max() -
+                    duplicate_base ||
+            new_pending >
+                std::numeric_limits<std::uint64_t>::max() -
+                    pending_base) {
+            return false;
+        }
+
+        healthy_channel_count_ = healthy;
+        gap_channel_count_ = gap;
+        catching_up_channel_count_ = catching;
+        frozen_channel_count_ = frozen;
+        exact_duplicate_message_count_ =
+            duplicate_base +
+            snapshot.exact_duplicate_applications;
+        pending_token_count_ = pending_base + new_pending;
+        return true;
+    }
+
     void UpdateChannel(
         const realtime::NativeSequenceChannelV1& domain) noexcept {
         auto position = channels_.find(domain);
@@ -3300,26 +3561,41 @@ private:
         }
         ChannelRuntime& runtime = position->second;
         const bool new_gap = snapshot.missing_sequences != 0U;
-        if (!runtime.gap_active && new_gap) {
-            if (gap_opened_count_ ==
-                    std::numeric_limits<std::uint64_t>::max() ||
-                runtime.gap_opened_count ==
-                    std::numeric_limits<std::uint64_t>::max()) {
-                FreezeGlobalResource();
-                return;
-            }
+        if (runtime.initialized &&
+            PublishedSnapshotEqual(runtime.snapshot, snapshot)) {
+            // Retain non-Wire diagnostic fields as the latest local view
+            // without turning an identical public row into dirty work.
+            runtime.snapshot = snapshot;
+            return;
+        }
+        const bool opens_gap = !runtime.gap_active && new_gap;
+        const bool recovers_gap = runtime.gap_active && !new_gap;
+        // Preflight every worker-owned monotonic counter before replacing
+        // cached aggregate totals. A terminal numeric failure must leave the
+        // last published/cacheable channel cut internally self-consistent.
+        if ((opens_gap &&
+             (gap_opened_count_ ==
+                  std::numeric_limits<std::uint64_t>::max() ||
+              runtime.gap_opened_count ==
+                  std::numeric_limits<std::uint64_t>::max())) ||
+            (recovers_gap &&
+             (gap_recovered_count_ ==
+                  std::numeric_limits<std::uint64_t>::max() ||
+              runtime.gap_recovered_count ==
+                  std::numeric_limits<std::uint64_t>::max() ||
+              correction_epoch_ ==
+                  std::numeric_limits<std::uint64_t>::max()))) {
+            FreezeGlobalResource();
+            return;
+        }
+        if (!ReplaceChannelAggregate(runtime, snapshot)) {
+            FreezeGlobalResource();
+            return;
+        }
+        if (opens_gap) {
             ++gap_opened_count_;
             ++runtime.gap_opened_count;
-        } else if (runtime.gap_active && !new_gap) {
-            if (gap_recovered_count_ ==
-                    std::numeric_limits<std::uint64_t>::max() ||
-                runtime.gap_recovered_count ==
-                    std::numeric_limits<std::uint64_t>::max() ||
-                correction_epoch_ ==
-                    std::numeric_limits<std::uint64_t>::max()) {
-                FreezeGlobalResource();
-                return;
-            }
+        } else if (recovers_gap) {
             ++gap_recovered_count_;
             ++runtime.gap_recovered_count;
             ++correction_epoch_;
@@ -3329,27 +3605,27 @@ private:
             snapshot.state ==
                 realtime::NativeSequenceRecoveryChannelStateV1::
                     kFrozenConflict) {
-            runtime.conflict_freeze_counted = true;
             if (!IncrementSaturating(
                     &conflicting_duplicate_count_)) {
                 FreezeGlobalResource();
                 return;
             }
+            runtime.conflict_freeze_counted = true;
         }
         if (!runtime.resource_freeze_counted &&
             snapshot.state ==
                 realtime::NativeSequenceRecoveryChannelStateV1::
                     kFrozenResource) {
-            runtime.resource_freeze_counted = true;
             if (!IncrementSaturating(
                     &resource_exhaustion_count_)) {
                 FreezeGlobalResource();
                 return;
             }
+            runtime.resource_freeze_counted = true;
         }
         runtime.snapshot = snapshot;
         runtime.initialized = true;
-        runtime.wire_dirty = true;
+        MarkChannelWireDirty(&runtime);
     }
 
     [[nodiscard]] static RealtimeCertifiedStateV1 WireState(
@@ -3485,50 +3761,13 @@ private:
             unrepresented_resource_failure_) {
             return RealtimeCertifiedStateV1::kFrozenResource;
         }
-        bool degraded = false;
-        bool gap = false;
-        bool catching_up = false;
-        for (const auto& [domain, runtime] : channels_) {
-            static_cast<void>(domain);
-            switch (runtime.snapshot.state) {
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kFrozenConflict:
-                    degraded = true;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kFrozenResource:
-                    degraded = true;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kRepairing:
-                    gap = true;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kCatchingUp:
-                    catching_up = true;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kBootstrapping:
-                    gap = true;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kHealthy:
-                    break;
-            }
-        }
-        if (degraded) {
+        if (frozen_channel_count_ != 0U) {
             return RealtimeCertifiedStateV1::kDegraded;
         }
-        if (gap) {
+        if (gap_channel_count_ != 0U) {
             return RealtimeCertifiedStateV1::kGapOpen;
         }
-        if (catching_up) {
+        if (catching_up_channel_count_ != 0U) {
             return RealtimeCertifiedStateV1::kCatchingUp;
         }
         return channels_.empty()
@@ -3545,56 +3784,6 @@ private:
         if (!ReadMonotonicNs(&heartbeat)) {
             heartbeat = Atomic(header_->heartbeat_monotonic_ns)
                             .load(std::memory_order_relaxed);
-        }
-        const realtime::NativeSequenceRecoverySnapshotV1 recovery =
-            recovery_ == nullptr
-                ? realtime::NativeSequenceRecoverySnapshotV1{}
-                : recovery_->Snapshot();
-        std::uint32_t gap_count = 0U;
-        std::uint32_t catching_count = 0U;
-        std::uint32_t frozen_count = 0U;
-        std::uint64_t duplicate_count = 0U;
-        bool duplicate_count_overflow = false;
-        std::uint64_t pending_count =
-            static_cast<std::uint64_t>(recovery.pending_entries);
-        for (const auto& [domain, runtime] : channels_) {
-            static_cast<void>(domain);
-            if (!CheckedAdd(
-                    duplicate_count,
-                    runtime.snapshot.exact_duplicate_applications,
-                    &duplicate_count)) {
-                duplicate_count_overflow = true;
-                break;
-            }
-            switch (runtime.snapshot.state) {
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kRepairing:
-                    ++gap_count;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kCatchingUp:
-                    ++catching_count;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kFrozenConflict:
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kFrozenResource:
-                    ++frozen_count;
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kHealthy:
-                    break;
-                case realtime::
-                    NativeSequenceRecoveryChannelStateV1::
-                        kBootstrapping:
-                    ++gap_count;
-                    break;
-            }
         }
         std::atomic_ref<std::uint64_t> tag =
             Atomic(header_->status_publish_tag);
@@ -3615,23 +3804,9 @@ private:
         }
         std::atomic_thread_fence(std::memory_order_release);
         const std::uint64_t aggregate_commit_tag = stable + 2U;
-        if (duplicate_count_overflow) {
-            // Preserve the previously canonical counter rather than
-            // publishing a wrapped value. The terminal resource state makes
-            // the exhausted diagnostic range explicit.
-            duplicate_count =
-                Atomic(header_->exact_duplicate_message_count)
-                    .load(std::memory_order_relaxed);
-            FreezeGlobalResource();
-            requested_state =
-                RealtimeCertifiedStateV1::kFrozenResource;
-        }
-        for (auto& [domain, runtime] : channels_) {
-            static_cast<void>(domain);
-            if (!runtime.wire_dirty) {
-                continue;
-            }
-            if (!PublishChannel(runtime, aggregate_commit_tag)) {
+        for (ChannelRuntime* runtime : dirty_channels_) {
+            if (runtime == nullptr || !runtime->wire_dirty ||
+                !PublishChannel(*runtime, aggregate_commit_tag)) {
                 // The header is already in its private odd epoch. Preserve a
                 // coherent external cut by committing a terminal resource
                 // state; no partially prepared row is visible until the
@@ -3641,8 +3816,17 @@ private:
                     RealtimeCertifiedStateV1::kFrozenResource;
                 break;
             }
-            runtime.wire_dirty = false;
+            runtime->wire_dirty = false;
         }
+        dirty_channels_.erase(
+            std::remove_if(
+                dirty_channels_.begin(),
+                dirty_channels_.end(),
+                [](const ChannelRuntime* runtime) noexcept {
+                    return runtime != nullptr &&
+                           !runtime->wire_dirty;
+                }),
+            dirty_channels_.end());
         // Freeze is monotonic. Re-evaluate it inside this acquired write epoch
         // rather than trusting DeriveAggregateState() evaluated by the caller.
         // The counter and state below are taken from the same local decision,
@@ -3673,7 +3857,8 @@ private:
             canonical_apply_frontier_,
             std::memory_order_relaxed);
         Atomic(header_->exact_duplicate_message_count).store(
-            duplicate_count, std::memory_order_relaxed);
+            exact_duplicate_message_count_,
+            std::memory_order_relaxed);
         Atomic(header_->gap_opened_count).store(
             gap_opened_count_, std::memory_order_relaxed);
         Atomic(header_->gap_recovered_count).store(
@@ -3686,7 +3871,7 @@ private:
             resource_exhaustion_count,
             std::memory_order_relaxed);
         Atomic(header_->pending_token_count).store(
-            pending_count, std::memory_order_relaxed);
+            pending_token_count_, std::memory_order_relaxed);
         Atomic(header_->aggregate_state).store(
             static_cast<std::uint32_t>(requested_state),
             std::memory_order_relaxed);
@@ -3694,11 +3879,12 @@ private:
             static_cast<std::uint32_t>(channels_.size()),
             std::memory_order_relaxed);
         Atomic(header_->gap_open_channel_count).store(
-            gap_count, std::memory_order_relaxed);
+            gap_channel_count_, std::memory_order_relaxed);
         Atomic(header_->catching_up_channel_count).store(
-            catching_count, std::memory_order_relaxed);
+            catching_up_channel_count_,
+            std::memory_order_relaxed);
         Atomic(header_->frozen_channel_count).store(
-            frozen_count, std::memory_order_relaxed);
+            frozen_channel_count_, std::memory_order_relaxed);
         tag.store(aggregate_commit_tag, std::memory_order_release);
         return true;
     }
@@ -4286,10 +4472,17 @@ private:
         ChannelRuntime,
         ChannelLess>
         channels_;
+    std::vector<ChannelRuntime*> dirty_channels_;
     std::uint64_t canonical_apply_frontier_ = 0U;
     std::uint64_t correction_epoch_ = 1U;
     std::uint64_t gap_opened_count_ = 0U;
     std::uint64_t gap_recovered_count_ = 0U;
+    std::uint64_t exact_duplicate_message_count_ = 0U;
+    std::uint64_t pending_token_count_ = 0U;
+    std::uint32_t healthy_channel_count_ = 0U;
+    std::uint32_t gap_channel_count_ = 0U;
+    std::uint32_t catching_up_channel_count_ = 0U;
+    std::uint32_t frozen_channel_count_ = 0U;
     bool unrepresented_resource_failure_ = false;
 
     std::atomic<bool> started_{false};
@@ -4562,6 +4755,16 @@ bool RealtimeCertifiedMarketServiceV1::
     DuplicateReadOnlyDescriptorForTest(int* output) const noexcept {
     return impl_ != nullptr &&
            impl_->DuplicateReadOnlyDescriptorForTest(output);
+}
+
+std::uint64_t RealtimeCertifiedMarketServiceV1::
+    HeaderPublishTagForTest() const noexcept {
+    return impl_ == nullptr ? 0U : impl_->HeaderPublishTagForTest();
+}
+
+std::uint64_t RealtimeCertifiedMarketServiceV1::
+    WorkerWakeEpochForTest() const noexcept {
+    return impl_ == nullptr ? 0U : impl_->WorkerWakeEpochForTest();
 }
 
 bool RealtimeCertifiedMarketServiceV1::WaitUntilIdleForTest(

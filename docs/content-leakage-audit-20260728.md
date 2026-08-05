@@ -51,7 +51,8 @@
 
 - 当前 `HEAD` 的 C++、Python、工具、测试、文档和已跟踪 artifacts；
 - 初始工作树中已有的未跟踪文件
-  `.tmp_instrument_full_read_probe.cpp`（只读扫描，未构建、未修改）；
+  `.tmp_instrument_full_read_probe.cpp`（审计时只读扫描、未构建、未修改；
+  后续阶段 1 性能清理已将该临时 probe 删除）；
 - `git rev-list --all` 可达的 22 个本地提交及本地 remote-tracking refs；
 - WAL、SDK、stderr/log、诊断输出、Git、构建目录和 Linux memfd/UDS IPC；
 - generation、event time、跨标的、跨日、重放等金融数据语义泄漏；
@@ -86,6 +87,9 @@
 ```
 
 本次没有修改该文件。除本报告外，没有修改生产代码或测试。
+
+后续记录：该 probe 不属于任何 CMake target，也没有生产源码引用，已在阶段 1
+性能清理中删除；上述状态仅描述 2026-07-28 审计开始时的历史工作区事实。
 
 ## 3. 发现汇总
 

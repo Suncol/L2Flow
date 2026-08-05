@@ -231,6 +231,14 @@ admission, while CERTIFIED exhaustion freezes only its last proven prefix.
 The online recovery coordinator additionally treats that frozen/dropped
 CERTIFIED state as terminal for promotion and the recovered session.
 
+CERTIFIED live order state, derived Event rows, and canonical Tick history
+have separate capacity units. Operators may set
+`--certified-maximum-live-orders`, `--certified-maximum-events`, and
+`--certified-maximum-ticks` independently. For backward-compatible defaults,
+live orders and Tick history use `--intraday-store-max-records`, while Event
+rows use four times the live-order cap. The live-order limit applies to each
+market projector; none of these settings increases queue drain throughput.
+
 Control socket paths must not already exist. Production requires exactly one
 startup mode:
 
