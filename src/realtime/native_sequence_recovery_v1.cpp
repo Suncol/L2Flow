@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -449,6 +450,160 @@ std::string_view NativeSequenceRecoveryApplyDispositionNameV1(
 
 class NativeSequenceRecoveryCoordinatorV1::Impl final {
 public:
+    class CanonicalPayloadSlab final {
+    public:
+        struct FreeRange final {
+            std::size_t offset = 0U;
+            std::size_t size = 0U;
+        };
+
+        CanonicalPayloadSlab(
+            std::size_t capacity_bytes,
+            std::size_t maximum_allocations)
+            : storage_(
+                  std::make_unique_for_overwrite<std::byte[]>(
+                      capacity_bytes)),
+              capacity_bytes_(capacity_bytes),
+              free_ranges_(maximum_allocations + 1U) {
+            free_ranges_[0] = FreeRange{0U, capacity_bytes_};
+            free_range_count_ = 1U;
+        }
+
+        CanonicalPayloadSlab(const CanonicalPayloadSlab&) = delete;
+        CanonicalPayloadSlab& operator=(
+            const CanonicalPayloadSlab&) = delete;
+
+        [[nodiscard]] bool Allocate(
+            std::size_t size,
+            std::size_t* output_offset) noexcept {
+            if (output_offset == nullptr || size == 0U ||
+                size > capacity_bytes_) {
+                return false;
+            }
+            for (std::size_t index = 0U;
+                 index < free_range_count_;
+                 ++index) {
+                FreeRange& range = free_ranges_[index];
+                if (range.size < size) {
+                    continue;
+                }
+                *output_offset = range.offset;
+                range.offset += size;
+                range.size -= size;
+                if (range.size == 0U) {
+                    EraseRange(index);
+                }
+                return true;
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool Release(
+            std::size_t offset,
+            std::size_t size) noexcept {
+            if (size == 0U || offset > capacity_bytes_ ||
+                size > capacity_bytes_ - offset) {
+                return false;
+            }
+            std::size_t position = 0U;
+            while (position < free_range_count_ &&
+                   free_ranges_[position].offset < offset) {
+                ++position;
+            }
+            if ((position != 0U &&
+                 free_ranges_[position - 1U].offset +
+                         free_ranges_[position - 1U].size >
+                     offset) ||
+                (position < free_range_count_ &&
+                 offset + size > free_ranges_[position].offset)) {
+                return false;
+            }
+            const bool joins_prior =
+                position != 0U &&
+                free_ranges_[position - 1U].offset +
+                        free_ranges_[position - 1U].size ==
+                    offset;
+            const bool joins_next =
+                position < free_range_count_ &&
+                offset + size == free_ranges_[position].offset;
+            if (joins_prior && joins_next) {
+                FreeRange& prior = free_ranges_[position - 1U];
+                prior.size += size + free_ranges_[position].size;
+                EraseRange(position);
+                return true;
+            }
+            if (joins_prior) {
+                free_ranges_[position - 1U].size += size;
+                return true;
+            }
+            if (joins_next) {
+                free_ranges_[position].offset = offset;
+                free_ranges_[position].size += size;
+                return true;
+            }
+            if (free_range_count_ >= free_ranges_.size()) {
+                return false;
+            }
+            for (std::size_t index = free_range_count_;
+                 index > position;
+                 --index) {
+                free_ranges_[index] = free_ranges_[index - 1U];
+            }
+            free_ranges_[position] = FreeRange{offset, size};
+            ++free_range_count_;
+            return true;
+        }
+
+        [[nodiscard]] std::span<std::byte> MutableBytes(
+            std::size_t offset,
+            std::size_t size) noexcept {
+            if (offset > capacity_bytes_ ||
+                size > capacity_bytes_ - offset) {
+                return {};
+            }
+            return {storage_.get() + offset, size};
+        }
+
+        [[nodiscard]] std::span<const std::byte> Bytes(
+            std::size_t offset,
+            std::size_t size) const noexcept {
+            if (offset > capacity_bytes_ ||
+                size > capacity_bytes_ - offset) {
+                return {};
+            }
+            return {storage_.get() + offset, size};
+        }
+
+        void ResetFreeTail(std::size_t used_bytes) noexcept {
+            if (used_bytes >= capacity_bytes_) {
+                free_range_count_ = 0U;
+                return;
+            }
+            free_ranges_[0] = FreeRange{
+                used_bytes, capacity_bytes_ - used_bytes};
+            free_range_count_ = 1U;
+        }
+
+        [[nodiscard]] std::size_t capacity_bytes() const noexcept {
+            return capacity_bytes_;
+        }
+
+    private:
+        void EraseRange(std::size_t position) noexcept {
+            for (std::size_t index = position + 1U;
+                 index < free_range_count_;
+                 ++index) {
+                free_ranges_[index - 1U] = free_ranges_[index];
+            }
+            --free_range_count_;
+        }
+
+        std::unique_ptr<std::byte[]> storage_;
+        std::size_t capacity_bytes_ = 0U;
+        std::vector<FreeRange> free_ranges_;
+        std::size_t free_range_count_ = 0U;
+    };
+
     struct Channel final {
         bool occupied = false;
         bool initialized = false;
@@ -494,7 +649,9 @@ public:
         std::uint64_t observe_calls = 0U;
         std::uint64_t apply_calls = 0U;
         std::uint64_t applied_cookie = 0U;
-        std::vector<std::byte> canonical_payload;
+        bool applied_cookie_owned = false;
+        std::size_t canonical_payload_offset = 0U;
+        std::size_t canonical_payload_size = 0U;
     };
 
     struct RetentionReference final {
@@ -511,6 +668,9 @@ public:
           channels_(channel_table_capacity),
           entry_buckets_(entry_bucket_capacity, kInvalidIndex),
           entries_(entry_capacity),
+          canonical_payload_slab_(
+              config.maximum_total_canonical_payload_bytes,
+              entry_capacity),
           retention_queue_(
               config.certified_duplicate_retention_entries),
           occupied_channel_slots_(
@@ -523,6 +683,21 @@ public:
         }
         if (!entries_.empty()) {
             free_entry_head_ = 0U;
+        }
+    }
+
+    ~Impl() {
+        for (Entry& entry : entries_) {
+            if (!entry.applied_cookie_owned) {
+                continue;
+            }
+            if (config_.release_applied_cookie != nullptr) {
+                config_.release_applied_cookie(
+                    config_.release_applied_cookie_context,
+                    entry.applied_cookie);
+            }
+            entry.applied_cookie_owned = false;
+            entry.applied_cookie = 0U;
         }
     }
 
@@ -712,6 +887,15 @@ public:
         if (!entry.occupied) {
             return;
         }
+        if (entry.applied_cookie_owned) {
+            if (config_.release_applied_cookie != nullptr) {
+                config_.release_applied_cookie(
+                    config_.release_applied_cookie_context,
+                    entry.applied_cookie);
+            }
+            entry.applied_cookie_owned = false;
+            entry.applied_cookie = 0U;
+        }
         const std::uint32_t channel_slot = entry.channel_slot;
         if (entry.pending) {
             if (pending_entries_ > 0U) {
@@ -725,16 +909,22 @@ public:
         if (entry.retained && retained_entries_ > 0U) {
             --retained_entries_;
         }
-        if (entry.canonical_payload.size() <=
+        if (entry.canonical_payload_size <=
             canonical_payload_bytes_) {
             canonical_payload_bytes_ -=
-                entry.canonical_payload.size();
+                entry.canonical_payload_size;
         } else {
             canonical_payload_bytes_ = 0U;
+            canonical_payload_storage_corrupt_ = true;
+        }
+        if (entry.canonical_payload_size != 0U &&
+            !canonical_payload_slab_.Release(
+                entry.canonical_payload_offset,
+                entry.canonical_payload_size)) {
+            canonical_payload_storage_corrupt_ = true;
         }
         const std::uint32_t generation = entry.generation;
         static_cast<void>(RemoveEntryFromHash(entry_index));
-        std::vector<std::byte>().swap(entry.canonical_payload);
         entry = Entry{};
         entry.generation = generation;
         entry.free_next = free_entry_head_;
@@ -1243,15 +1433,17 @@ public:
                     output);
                 return NativeSequenceRecoveryApplyErrorV1::kNone;
             }
-            try {
-                entry.canonical_payload.assign(
-                    canonical_payload.begin(),
-                    canonical_payload.end());
-            } catch (const std::bad_alloc&) {
+            std::size_t payload_offset = 0U;
+            if (canonical_payload_storage_corrupt_ ||
+                !AllocateCanonicalPayload(
+                    canonical_payload.size(), &payload_offset)) {
                 FreezeChannel(
                     channel_slot,
-                    NativeSequenceRecoveryFreezeReasonV1::
-                        kPayloadCapacity);
+                    canonical_payload_storage_corrupt_
+                        ? NativeSequenceRecoveryFreezeReasonV1::
+                              kInternalInvariant
+                        : NativeSequenceRecoveryFreezeReasonV1::
+                              kPayloadCapacity);
                 FillApplyResult(
                     channel,
                     nullptr,
@@ -1259,7 +1451,12 @@ public:
                         kResourceFrozen,
                     output);
                 return NativeSequenceRecoveryApplyErrorV1::kNone;
-            } catch (...) {
+            }
+            std::span<std::byte> destination =
+                canonical_payload_slab_.MutableBytes(
+                    payload_offset, canonical_payload.size());
+            if (destination.size() != canonical_payload.size()) {
+                canonical_payload_storage_corrupt_ = true;
                 FreezeChannel(
                     channel_slot,
                     NativeSequenceRecoveryFreezeReasonV1::
@@ -1272,8 +1469,15 @@ public:
                     output);
                 return NativeSequenceRecoveryApplyErrorV1::kNone;
             }
+            std::copy(
+                canonical_payload.begin(),
+                canonical_payload.end(),
+                destination.begin());
+            entry.canonical_payload_offset = payload_offset;
+            entry.canonical_payload_size = canonical_payload.size();
             canonical_payload_bytes_ += canonical_payload.size();
             entry.applied_cookie = applied_cookie;
+            entry.applied_cookie_owned = true;
             const std::uint64_t gap_before =
                 DuplicateVerificationGap(entry);
             ++entry.apply_calls;
@@ -1305,12 +1509,15 @@ public:
             return NativeSequenceRecoveryApplyErrorV1::kNone;
         }
 
+        const std::span<const std::byte> stored_payload =
+            canonical_payload_slab_.Bytes(
+                entry.canonical_payload_offset,
+                entry.canonical_payload_size);
         const bool exact =
-            entry.canonical_payload.size() ==
-                canonical_payload.size() &&
+            stored_payload.size() == canonical_payload.size() &&
             std::equal(
-                entry.canonical_payload.begin(),
-                entry.canonical_payload.end(),
+                stored_payload.begin(),
+                stored_payload.end(),
                 canonical_payload.begin());
         if (!exact) {
             IncrementCounter(&channel.conflicts);
@@ -1360,10 +1567,81 @@ public:
         return NativeSequenceRecoveryApplyErrorV1::kNone;
     }
 
+    [[nodiscard]] bool AllocateCanonicalPayload(
+        std::size_t size,
+        std::size_t* output_offset) noexcept {
+        if (canonical_payload_slab_.Allocate(size, output_offset)) {
+            return true;
+        }
+        if (size > canonical_payload_slab_.capacity_bytes() ||
+            canonical_payload_bytes_ >
+                canonical_payload_slab_.capacity_bytes() - size) {
+            return false;
+        }
+
+        // Variable-size generic payloads can fragment the fixed backing
+        // store. Compact only on that cold failure path. The coordinator is
+        // single-owner, so no reader can retain a payload span while offsets
+        // move. Production's fixed 336-byte payload never needs this path.
+        std::size_t next_offset = 0U;
+        std::size_t source_cursor = 0U;
+        for (;;) {
+            Entry* selected = nullptr;
+            std::size_t selected_offset =
+                canonical_payload_slab_.capacity_bytes();
+            for (Entry& candidate : entries_) {
+                if (!candidate.occupied ||
+                    candidate.canonical_payload_size == 0U ||
+                    candidate.canonical_payload_offset < source_cursor ||
+                    candidate.canonical_payload_offset >=
+                        selected_offset) {
+                    continue;
+                }
+                selected = &candidate;
+                selected_offset = candidate.canonical_payload_offset;
+            }
+            if (selected == nullptr) {
+                break;
+            }
+            Entry& candidate = *selected;
+            const std::span<const std::byte> source =
+                canonical_payload_slab_.Bytes(
+                    selected_offset,
+                    candidate.canonical_payload_size);
+            std::span<std::byte> destination =
+                canonical_payload_slab_.MutableBytes(
+                    next_offset,
+                    candidate.canonical_payload_size);
+            if (source.size() != candidate.canonical_payload_size ||
+                destination.size() !=
+                    candidate.canonical_payload_size) {
+                canonical_payload_storage_corrupt_ = true;
+                return false;
+            }
+            if (selected_offset != next_offset) {
+                std::memmove(
+                    destination.data(),
+                    source.data(),
+                    candidate.canonical_payload_size);
+                candidate.canonical_payload_offset = next_offset;
+            }
+            source_cursor = selected_offset +
+                            candidate.canonical_payload_size;
+            next_offset += candidate.canonical_payload_size;
+        }
+        if (next_offset != canonical_payload_bytes_) {
+            canonical_payload_storage_corrupt_ = true;
+            return false;
+        }
+        canonical_payload_slab_.ResetFreeTail(next_offset);
+        return canonical_payload_slab_.Allocate(size, output_offset);
+    }
+
     NativeSequenceRecoveryConfigV1 config_{};
     std::vector<Channel> channels_;
     std::vector<std::uint32_t> entry_buckets_;
     std::vector<Entry> entries_;
+    CanonicalPayloadSlab canonical_payload_slab_;
     std::vector<RetentionReference> retention_queue_;
     // Dense list of occupied open-addressing slots. Polling readiness over
     // actual channels, rather than the capacity-sized hash table, keeps the
@@ -1380,6 +1658,7 @@ public:
     std::size_t canonical_payload_bytes_ = 0U;
     std::uint64_t channel_capacity_failures_ = 0U;
     std::uint64_t invalid_observations_ = 0U;
+    bool canonical_payload_storage_corrupt_ = false;
     bool input_sealed_ = false;
 };
 
@@ -2129,6 +2408,11 @@ NativeSequenceRecoveryCoordinatorV1::CommitCertified(
         return NativeSequenceRecoveryCommitErrorV1::kNotApplied;
     }
     channel.certified_sequence = entry.sequence;
+    // A successful commit transfers the canonical cookie back to the caller
+    // that received it in the ready token. Retention keeps only canonical
+    // bytes, never the caller's full-payload lease.
+    entry.applied_cookie_owned = false;
+    entry.applied_cookie = 0U;
     impl_->FinishPendingAndRetain(token.entry_index);
     return NativeSequenceRecoveryCommitErrorV1::kNone;
 }

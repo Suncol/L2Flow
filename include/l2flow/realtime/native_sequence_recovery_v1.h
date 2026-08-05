@@ -101,6 +101,16 @@ struct NativeSequenceRecoveryConfigV1 final {
     // affected CERTIFIED channel and never rejects FAST.
     std::size_t maximum_canonical_payload_bytes_per_entry = 0U;
     std::size_t maximum_total_canonical_payload_bytes = 0U;
+    // Optional single-owner reclamation hook for applied_cookie. It is
+    // invoked exactly once when the coordinator discards a canonical target
+    // without transferring it through a successful CommitCertified. The
+    // caller still owns cookies supplied by exact/conflicting duplicate
+    // applications because those never become canonical.
+    // The context must remain valid through coordinator destruction, which
+    // also reclaims every still-owned canonical cookie.
+    void (*release_applied_cookie)(
+        void* context, std::uint64_t cookie) noexcept = nullptr;
+    void* release_applied_cookie_context = nullptr;
     // Bounds sequence - certified_frontier for an established channel. A
     // breach freezes only that channel's CERTIFIED state.
     std::uint64_t maximum_reorder_span = 0U;
@@ -366,9 +376,9 @@ NativeSequenceRecoveryApplyDispositionNameV1(
 
 // A single-thread coordinator. All methods except Create/destruction must be
 // called by one serialized owner. Construction preallocates its channel table,
-// native-key table, entry pool, and retention index. Canonical payload storage
-// is allocated only by MarkTargetApplied on the worker/CERTIFIED side and is
-// bounded by the configuration. No observation or application result
+// native-key table, entry pool, retention index, and bounded canonical-payload
+// slab. MarkTargetApplied only copies into that slab; it never allocates from
+// the system heap. No observation or application result
 // authorizes the caller to reject, stop, or mark coverage-lost on FAST:
 // conflict and resource outcomes freeze only the affected CERTIFIED channel.
 class NativeSequenceRecoveryCoordinatorV1 final {

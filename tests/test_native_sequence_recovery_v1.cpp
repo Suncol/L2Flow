@@ -55,6 +55,22 @@ bool Expect(bool condition, std::string_view message) {
     return condition;
 }
 
+struct CookieReleaseLog final {
+    std::array<std::uint64_t, 8U> cookies{};
+    std::size_t count = 0U;
+};
+
+void RecordReleasedCookie(
+    void* context,
+    std::uint64_t cookie) noexcept {
+    auto* const log = static_cast<CookieReleaseLog*>(context);
+    if (log == nullptr || log->count >= log->cookies.size()) {
+        return;
+    }
+    log->cookies[log->count] = cookie;
+    ++log->count;
+}
+
 template <typename Unsigned>
 void WriteLittleEndian(
     std::span<std::byte> bytes,
@@ -673,7 +689,11 @@ bool TestAppliedBeforeObserve() {
 
 bool TestDuplicateBarrierAndConflictIsolation() {
     bool ok = true;
-    auto coordinator = MakeCoordinator(StandardConfig(), &ok);
+    CookieReleaseLog released{};
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.release_applied_cookie = &RecordReleasedCookie;
+    config.release_applied_cookie_context = &released;
+    auto coordinator = MakeCoordinator(config, &ok);
     if (!coordinator) {
         return false;
     }
@@ -777,6 +797,9 @@ bool TestDuplicateBarrierAndConflictIsolation() {
         coordinator->CommitCertified(first_token) ==
             NativeSequenceRecoveryCommitErrorV1::kChannelFrozen,
         "stale work cannot mutate a frozen channel");
+    ok &= Expect(
+        released.count == 1U && released.cookies[0U] == 200U,
+        "channel freeze reclaims only its uncommitted canonical cookie");
 
     const auto other_payload = Payload(9U);
     ok &= Observe(
@@ -812,6 +835,175 @@ bool TestDuplicateBarrierAndConflictIsolation() {
                 NativeSequenceRecoveryChannelStateV1::kHealthy &&
             healthy.certified_sequence == 1U,
         "another exchange/channel continues through CERTIFIED");
+    return ok;
+}
+
+bool TestCanonicalPayloadSlabCompactionAndReuse() {
+    bool ok = true;
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.maximum_canonical_payload_bytes_per_entry = 4U;
+    config.maximum_total_canonical_payload_bytes = 10U;
+    auto coordinator = MakeCoordinator(config, &ok);
+    if (!coordinator) {
+        return false;
+    }
+
+    constexpr std::array<std::byte, 3U> kFirst{
+        std::byte{0x11}, std::byte{0x12}, std::byte{0x13}};
+    constexpr std::array<std::byte, 3U> kMiddle{
+        std::byte{0x21}, std::byte{0x22}, std::byte{0x23}};
+    constexpr std::array<std::byte, 3U> kLast{
+        std::byte{0x31}, std::byte{0x32}, std::byte{0x33}};
+    constexpr std::array<std::byte, 3U> kMiddleConflict{
+        std::byte{0x21}, std::byte{0x22}, std::byte{0x24}};
+    constexpr std::array<std::byte, 4U> kAfterCompaction{
+        std::byte{0x41},
+        std::byte{0x42},
+        std::byte{0x43},
+        std::byte{0x44}};
+    NativeSequenceRecoveryObserveResultV1 observed{};
+    NativeSequenceRecoveryApplyResultV1 applied{};
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(31U, 1U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(31U, 1U),
+        kShanghaiTick,
+        kFirst,
+        11U,
+        &applied);
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(32U, 1U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(32U, 1U),
+        kShanghaiTick,
+        kMiddle,
+        21U,
+        &applied);
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(31U, 2U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(31U, 2U),
+        kShanghaiTick,
+        kLast,
+        12U,
+        &applied);
+    ok &= Expect(
+        coordinator->Snapshot().canonical_payload_bytes == 9U,
+        "fixed slab accounts three variable-size canonical payloads");
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(32U, 1U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(32U, 1U),
+        kShanghaiTick,
+        kMiddleConflict,
+        22U,
+        &applied);
+    ok &= Expect(
+        applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::
+                    kPayloadConflict &&
+            coordinator->Snapshot().canonical_payload_bytes == 6U,
+        "isolated channel release creates a bounded slab hole");
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(31U, 3U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(31U, 3U),
+        kShanghaiTick,
+        kAfterCompaction,
+        13U,
+        &applied);
+    ok &= Expect(
+        applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::kApplied &&
+            coordinator->Snapshot().canonical_payload_bytes == 10U,
+        "cold compaction combines fragmented free ranges without exceeding the hard bound");
+
+    ok &= Observe(
+        coordinator.get(),
+        Shanghai(31U, 2U),
+        kShanghaiTick,
+        NativeSequenceRecoveryRecordClassV1::kTarget,
+        &observed);
+    ok &= Apply(
+        coordinator.get(),
+        Shanghai(31U, 2U),
+        kShanghaiTick,
+        kLast,
+        14U,
+        &applied);
+    ok &= Expect(
+        applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::
+                    kExactDuplicate &&
+            applied.canonical_applied_cookie == 12U,
+        "compaction preserves exact bytes and the first canonical cookie");
+    return ok;
+}
+
+bool TestCanonicalCookieReleasedOnDestruction() {
+    bool ok = true;
+    CookieReleaseLog released{};
+    NativeSequenceRecoveryConfigV1 config = StandardConfig();
+    config.release_applied_cookie = &RecordReleasedCookie;
+    config.release_applied_cookie_context = &released;
+    {
+        auto coordinator = MakeCoordinator(config, &ok);
+        if (!coordinator) {
+            return false;
+        }
+        NativeSequenceRecoveryObserveResultV1 observed{};
+        NativeSequenceRecoveryApplyResultV1 applied{};
+        const auto payload = Payload(17U);
+        ok &= Observe(
+            coordinator.get(),
+            Shanghai(41U, 2U),
+            kShanghaiTick,
+            NativeSequenceRecoveryRecordClassV1::kTarget,
+            &observed);
+        ok &= Apply(
+            coordinator.get(),
+            Shanghai(41U, 2U),
+            kShanghaiTick,
+            payload,
+            0U,
+            &applied);
+        ok &= Expect(
+            applied.disposition ==
+                NativeSequenceRecoveryApplyDispositionV1::kApplied &&
+                released.count == 0U,
+            "pending cookie zero remains coordinator-owned before destruction");
+    }
+    ok &= Expect(
+        released.count == 1U && released.cookies[0U] == 0U,
+        "coordinator destruction reclaims an owned zero-valued cookie exactly once");
     return ok;
 }
 
@@ -1508,6 +1700,8 @@ int main() {
     ok &= TestExplicitOriginRejectsFirstPacketInference();
     ok &= TestAppliedBeforeObserve();
     ok &= TestDuplicateBarrierAndConflictIsolation();
+    ok &= TestCanonicalPayloadSlabCompactionAndReuse();
+    ok &= TestCanonicalCookieReleasedOnDestruction();
     ok &= TestShenzhenSharedDomainAndTupleConflict();
     ok &= TestRetentionOutsideAndAbaToken();
     ok &= TestResourceBoundsAndChannelIsolation();

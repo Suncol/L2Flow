@@ -268,6 +268,14 @@ struct RealtimeCertifiedServiceSnapshotV1 final {
         kStopped,
         kFailed,
     } control_state = ControlState::kNotStarted;
+    // Process-local bounded-pool metrics; these are not part of the shared
+    // memory Wire header. Capacity includes one transient duplicate-
+    // comparison slot in addition to maximum_pending_entries canonical
+    // leases.
+    std::uint64_t payload_lease_capacity = 0U;
+    std::uint64_t payload_leases_in_use = 0U;
+    std::uint64_t payload_lease_high_water = 0U;
+    std::uint64_t payload_lease_failed_acquires = 0U;
 };
 
 enum class RealtimeCertifiedPrefixFenceOperationErrorV1

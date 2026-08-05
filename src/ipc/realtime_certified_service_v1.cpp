@@ -245,6 +245,219 @@ struct HandoffEvent final {
 };
 static_assert(std::is_trivially_copyable_v<HandoffEvent>);
 
+// One worker owns this pool. Atomics are used only for lock-free operational
+// snapshots; slot/free-list mutation remains serialized. A generation-tagged
+// cookie prevents a stale coordinator reference from resolving after reuse.
+class CertifiedPayloadLeasePool final {
+public:
+    struct Slot final {
+        RealtimeWireTickPayloadV2 payload{};
+        std::uint32_t generation = 0U;
+        std::uint32_t free_next =
+            std::numeric_limits<std::uint32_t>::max();
+        bool occupied = false;
+    };
+
+    explicit CertifiedPayloadLeasePool(std::size_t capacity)
+        : slots_(capacity) {
+        for (std::size_t index = 0U; index < slots_.size(); ++index) {
+            slots_[index].free_next =
+                index + 1U < slots_.size()
+                    ? static_cast<std::uint32_t>(index + 1U)
+                    : std::numeric_limits<std::uint32_t>::max();
+        }
+        if (!slots_.empty()) {
+            free_head_ = 0U;
+        }
+    }
+
+    CertifiedPayloadLeasePool(const CertifiedPayloadLeasePool&) = delete;
+    CertifiedPayloadLeasePool& operator=(
+        const CertifiedPayloadLeasePool&) = delete;
+
+    [[nodiscard]] bool Acquire(
+        RealtimeWireTickPayloadV2** output_payload,
+        std::uint64_t* output_cookie) noexcept {
+        if (output_payload == nullptr || output_cookie == nullptr ||
+            corrupt_.load(std::memory_order_relaxed) ||
+            free_head_ == std::numeric_limits<std::uint32_t>::max()) {
+            failed_acquires_.fetch_add(1U, std::memory_order_relaxed);
+            return false;
+        }
+        *output_payload = nullptr;
+        *output_cookie = 0U;
+        const std::uint32_t index = free_head_;
+        Slot& slot = slots_[index];
+        free_head_ = slot.free_next;
+        std::uint32_t generation = slot.generation + 1U;
+        if (generation == 0U) {
+            generation = 1U;
+        }
+        slot.generation = generation;
+        slot.free_next = std::numeric_limits<std::uint32_t>::max();
+        slot.occupied = true;
+        const std::uint64_t cookie =
+            (static_cast<std::uint64_t>(generation) << 32U) |
+            (static_cast<std::uint64_t>(index) + 1U);
+        *output_payload = &slot.payload;
+        *output_cookie = cookie;
+        const std::uint64_t in_use =
+            in_use_.fetch_add(1U, std::memory_order_relaxed) + 1U;
+        std::uint64_t high_water =
+            high_water_.load(std::memory_order_relaxed);
+        while (high_water < in_use &&
+               !high_water_.compare_exchange_weak(
+                   high_water,
+                   in_use,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+        return true;
+    }
+
+    [[nodiscard]] const RealtimeWireTickPayloadV2* Resolve(
+        std::uint64_t cookie) const noexcept {
+        std::uint32_t index = 0U;
+        std::uint32_t generation = 0U;
+        if (!Decode(cookie, &index, &generation)) {
+            return nullptr;
+        }
+        const Slot& slot = slots_[index];
+        return slot.occupied && slot.generation == generation
+                   ? &slot.payload
+                   : nullptr;
+    }
+
+    [[nodiscard]] bool Release(std::uint64_t cookie) noexcept {
+        std::uint32_t index = 0U;
+        std::uint32_t generation = 0U;
+        if (!Decode(cookie, &index, &generation)) {
+            MarkCorrupt();
+            return false;
+        }
+        Slot& slot = slots_[index];
+        if (!slot.occupied || slot.generation != generation ||
+            in_use_.load(std::memory_order_relaxed) == 0U) {
+            MarkCorrupt();
+            return false;
+        }
+        slot.occupied = false;
+        slot.free_next = free_head_;
+        free_head_ = index;
+        in_use_.fetch_sub(1U, std::memory_order_relaxed);
+        return true;
+    }
+
+    // A coordinator failure may have invoked the reclamation callback before
+    // MarkTargetApplied returns. In that one serialized interval, an
+    // unoccupied slot with the same generation is proof of prior release.
+    [[nodiscard]] bool ReleaseIfLive(std::uint64_t cookie) noexcept {
+        std::uint32_t index = 0U;
+        std::uint32_t generation = 0U;
+        if (!Decode(cookie, &index, &generation)) {
+            MarkCorrupt();
+            return false;
+        }
+        const Slot& slot = slots_[index];
+        if (!slot.occupied && slot.generation == generation) {
+            return true;
+        }
+        return Release(cookie);
+    }
+
+    [[nodiscard]] std::uint64_t capacity() const noexcept {
+        return static_cast<std::uint64_t>(slots_.size());
+    }
+    [[nodiscard]] std::uint64_t in_use() const noexcept {
+        return in_use_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t high_water() const noexcept {
+        return high_water_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t failed_acquires() const noexcept {
+        return failed_acquires_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool corrupt() const noexcept {
+        return corrupt_.load(std::memory_order_relaxed);
+    }
+
+private:
+    [[nodiscard]] bool Decode(
+        std::uint64_t cookie,
+        std::uint32_t* output_index,
+        std::uint32_t* output_generation) const noexcept {
+        if (output_index == nullptr || output_generation == nullptr) {
+            return false;
+        }
+        const std::uint32_t encoded_index =
+            static_cast<std::uint32_t>(cookie);
+        const std::uint32_t generation =
+            static_cast<std::uint32_t>(cookie >> 32U);
+        if (encoded_index == 0U || generation == 0U) {
+            return false;
+        }
+        const std::uint32_t index = encoded_index - 1U;
+        if (index >= slots_.size()) {
+            return false;
+        }
+        *output_index = index;
+        *output_generation = generation;
+        return true;
+    }
+
+    void MarkCorrupt() noexcept {
+        corrupt_.store(true, std::memory_order_relaxed);
+    }
+
+    std::vector<Slot> slots_;
+    std::uint32_t free_head_ =
+        std::numeric_limits<std::uint32_t>::max();
+    std::atomic<std::uint64_t> in_use_{0U};
+    std::atomic<std::uint64_t> high_water_{0U};
+    std::atomic<std::uint64_t> failed_acquires_{0U};
+    std::atomic<bool> corrupt_{false};
+};
+
+void ReleaseCertifiedPayloadLease(
+    void* context,
+    std::uint64_t cookie) noexcept {
+    auto* const pool =
+        static_cast<CertifiedPayloadLeasePool*>(context);
+    if (pool != nullptr) {
+        static_cast<void>(pool->Release(cookie));
+    }
+}
+
+class CertifiedPayloadLeaseGuard final {
+public:
+    CertifiedPayloadLeaseGuard(
+        CertifiedPayloadLeasePool* pool,
+        std::uint64_t cookie) noexcept
+        : pool_(pool), cookie_(cookie) {}
+
+    CertifiedPayloadLeaseGuard(const CertifiedPayloadLeaseGuard&) = delete;
+    CertifiedPayloadLeaseGuard& operator=(
+        const CertifiedPayloadLeaseGuard&) = delete;
+
+    ~CertifiedPayloadLeaseGuard() {
+        if (pool_ != nullptr) {
+            static_cast<void>(pool_->Release(cookie_));
+        }
+    }
+
+    [[nodiscard]] bool Release() noexcept {
+        if (pool_ == nullptr || !pool_->Release(cookie_)) {
+            return false;
+        }
+        pool_ = nullptr;
+        return true;
+    }
+
+private:
+    CertifiedPayloadLeasePool* pool_ = nullptr;
+    std::uint64_t cookie_ = 0U;
+};
+
 template <typename Value>
 class BoundedMpmcQueue final {
 public:
@@ -660,6 +873,8 @@ public:
             config_.maximum_pending_entries == 0U ||
             config_.maximum_pending_entries >
                 std::numeric_limits<std::size_t>::max() ||
+            config_.maximum_pending_entries >=
+                std::numeric_limits<std::uint32_t>::max() ||
             config_.maximum_pending_entries_per_channel == 0U ||
             config_.maximum_pending_entries_per_channel >
                 config_.maximum_pending_entries ||
@@ -779,6 +994,17 @@ public:
         }
         mapping_bytes_ = next_offset;
 
+        // At most maximum_pending_entries canonical payloads can be retained
+        // by pending coordinator entries. One additional transient slot is
+        // required to compare an application for an existing entry while all
+        // canonical slots are occupied. The configuration validation above
+        // deliberately keeps maximum_pending_entries below UINT32_MAX, so the
+        // generation-tagged 32-bit slot identity remains representable.
+        payload_leases_ =
+            std::make_unique<CertifiedPayloadLeasePool>(
+                static_cast<std::size_t>(
+                    config_.maximum_pending_entries) + 1U);
+
         realtime::NativeSequenceRecoveryConfigV1 recovery_config{};
         recovery_config.maximum_channels = config_.channel_capacity;
         recovery_config.maximum_pending_entries =
@@ -809,6 +1035,10 @@ public:
         }
         recovery_config.maximum_total_canonical_payload_bytes =
             static_cast<std::size_t>(payload_bytes);
+        recovery_config.release_applied_cookie =
+            &ReleaseCertifiedPayloadLease;
+        recovery_config.release_applied_cookie_context =
+            payload_leases_.get();
         recovery_config.maximum_reorder_span =
             config_.maximum_reorder_span;
         recovery_config.origin_policy = config_.origin_policy;
@@ -2170,6 +2400,16 @@ public:
         result.wire_snapshot_consistent = stable_snapshot;
         result.control_state =
             control_state_.load(std::memory_order_acquire);
+        if (payload_leases_ != nullptr) {
+            result.payload_lease_capacity =
+                payload_leases_->capacity();
+            result.payload_leases_in_use =
+                payload_leases_->in_use();
+            result.payload_lease_high_water =
+                payload_leases_->high_water();
+            result.payload_lease_failed_acquires =
+                payload_leases_->failed_acquires();
+        }
         return result;
     }
 
@@ -3128,42 +3368,70 @@ private:
             FreezeGlobalResource();
             return;
         }
-        RealtimeWireTickPayloadV2 payload{};
+        std::uint64_t payload_lease_cookie = 0U;
+        RealtimeWireTickPayloadV2* leased_payload = nullptr;
+        if (payload_leases_ == nullptr ||
+            !payload_leases_->Acquire(
+                &leased_payload, &payload_lease_cookie) ||
+            leased_payload == nullptr || payload_lease_cookie == 0U) {
+            FreezeGlobalResource();
+            return;
+        }
         if (!ProjectRealtimeWireTickPayloadV2(
-                *record, ordinal, &payload) ||
-            !RealtimeCertifiedTickPayloadCanonicalV1(payload) ||
-            payload.common.ingress_sequence == 0U) {
+                *record, ordinal, leased_payload) ||
+            !RealtimeCertifiedTickPayloadCanonicalV1(
+                *leased_payload) ||
+            leased_payload->common.ingress_sequence == 0U) {
+            static_cast<void>(
+                payload_leases_->ReleaseIfLive(
+                    payload_lease_cookie));
             FreezeGlobalResource();
             return;
         }
         const realtime::NativeSequenceDescriptorV1 descriptor =
-            DescriptorFromPayload(payload);
+            DescriptorFromPayload(*leased_payload);
         const sdk::MessageKey message_key =
-            MessageKeyFromPayload(payload);
-        static_assert(
-            sizeof(std::uintptr_t) <= sizeof(std::uint64_t));
-        const std::uint64_t cookie = static_cast<std::uint64_t>(
-            reinterpret_cast<std::uintptr_t>(record));
-        if (cookie == 0U) {
-            FreezeGlobalResource();
-            return;
-        }
-
+            MessageKeyFromPayload(*leased_payload);
         const RealtimeWireTickPayloadV2 canonical =
-            CanonicalBusinessPayload(payload);
+            CanonicalBusinessPayload(*leased_payload);
         realtime::NativeSequenceRecoveryApplyResultV1 result{};
         const realtime::NativeSequenceRecoveryApplyErrorV1 error =
             recovery_->MarkTargetApplied(
                 descriptor,
                 message_key,
                 std::as_bytes(std::span(&canonical, 1U)),
-                cookie,
+                payload_lease_cookie,
                 &result);
         if (error !=
                 realtime::NativeSequenceRecoveryApplyErrorV1::kNone &&
             error !=
                 realtime::NativeSequenceRecoveryApplyErrorV1::
                     kChannelFrozen) {
+            static_cast<void>(
+                payload_leases_->ReleaseIfLive(
+                    payload_lease_cookie));
+            FreezeGlobalResource();
+            return;
+        }
+        const bool lease_became_canonical =
+            error ==
+                realtime::NativeSequenceRecoveryApplyErrorV1::kNone &&
+            result.disposition ==
+                realtime::NativeSequenceRecoveryApplyDispositionV1::
+                    kApplied &&
+            result.canonical_applied_cookie == payload_lease_cookie;
+        if (!lease_became_canonical &&
+            !payload_leases_->ReleaseIfLive(
+                payload_lease_cookie)) {
+            FreezeGlobalResource();
+            return;
+        }
+        if (error ==
+                realtime::NativeSequenceRecoveryApplyErrorV1::kNone &&
+            result.disposition ==
+                realtime::NativeSequenceRecoveryApplyDispositionV1::
+                    kApplied &&
+            !lease_became_canonical) {
             FreezeGlobalResource();
             return;
         }
@@ -3224,26 +3492,25 @@ private:
                 result.state_dirty_after_last_publish = true;
                 return result;
             }
-            const auto pointer_value = static_cast<std::uintptr_t>(
-                ready.applied_cookie);
-            const auto* const record =
-                reinterpret_cast<
-                    const market::RealtimeHistoryRecordV1*>(
-                    pointer_value);
-            if (record == nullptr ||
-                record->instrument_id() == 0U) {
+            if (payload_leases_ == nullptr) {
                 FreezeGlobalResource();
                 result.state_dirty_after_last_publish = true;
                 return result;
             }
-            const std::size_t ordinal =
-                static_cast<std::size_t>(
-                    record->instrument_id() - 1U);
-            RealtimeWireTickPayloadV2 payload{};
-            if (!ProjectRealtimeWireTickPayloadV2(
-                    *record,
-                    ordinal,
-                    &payload) ||
+            const RealtimeWireTickPayloadV2* const leased_payload =
+                payload_leases_->Resolve(ready.applied_cookie);
+            if (leased_payload == nullptr) {
+                FreezeGlobalResource();
+                result.state_dirty_after_last_publish = true;
+                return result;
+            }
+            CertifiedPayloadLeaseGuard payload_lease(
+                payload_leases_.get(), ready.applied_cookie);
+            const RealtimeWireTickPayloadV2& payload =
+                *leased_payload;
+            if (payload.common.instrument_id == 0U ||
+                payload.common.ordinal !=
+                    payload.common.instrument_id - 1U ||
                 !RealtimeCertifiedTickPayloadCanonicalV1(payload) ||
                 DescriptorFromPayload(payload) != ready.descriptor ||
                 !(MessageKeyFromPayload(payload) ==
@@ -3371,6 +3638,11 @@ private:
                     committed_event_generation_mutex_);
                 committed_event_generation_ =
                     std::move(next_event_generation);
+            }
+            if (!payload_lease.Release()) {
+                FreezeGlobalResource();
+                result.state_dirty_after_last_publish = true;
+                return result;
             }
         }
     }
@@ -4431,6 +4703,7 @@ private:
     common::LinuxCpuSetV1 control_cpu_set_{};
     common::LinuxCpuSetV1 tick_history_worker_cpu_set_{};
     std::unique_ptr<BoundedMpmcQueue<HandoffEvent>> queue_;
+    std::unique_ptr<CertifiedPayloadLeasePool> payload_leases_;
     std::unique_ptr<
         realtime::NativeSequenceRecoveryCoordinatorV1>
         recovery_;

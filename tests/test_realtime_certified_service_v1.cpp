@@ -477,7 +477,8 @@ struct WorkerBarrierFixture final {
     std::uint64_t maximum_certified_ticks = 1024U,
     std::uint64_t certified_tick_ring_capacity = 64U,
     std::uint64_t maximum_derived_events = 1024U,
-    bool process_start_partial = false) {
+    bool process_start_partial = false,
+    std::uint64_t maximum_pending_entries = 64U) {
     if (test == nullptr || output == nullptr) {
         return false;
     }
@@ -506,8 +507,9 @@ struct WorkerBarrierFixture final {
     service_config.certified_tick_lazy_commit_chunk_bytes = 4096U;
     service_config.channel_capacity = 8U;
     service_config.handoff_queue_capacity = 128U;
-    service_config.maximum_pending_entries = 64U;
-    service_config.maximum_pending_entries_per_channel = 64U;
+    service_config.maximum_pending_entries = maximum_pending_entries;
+    service_config.maximum_pending_entries_per_channel =
+        maximum_pending_entries;
     service_config.certified_duplicate_retention_entries = 64U;
     service_config.maximum_reorder_span = 1024U;
     service_config.maximum_mapping_bytes = 8U * 1024U * 1024U;
@@ -607,6 +609,79 @@ struct WorkerBarrierFixture final {
         pipeline_ready,
         "create " + label + " worker-barrier pipeline: " + detail);
     return pipeline_ready;
+}
+
+void RunFullPayloadLeasePoolBoundaryScenario(TestContext* test) {
+    WorkerBarrierFixture fixture{};
+    const bool ready = BuildWorkerBarrierFixture(
+        test,
+        "full-payload-lease-boundary",
+        std::byte{0x5d},
+        &fixture,
+        true,
+        {},
+        {},
+        nullptr,
+        false,
+        1024U,
+        64U,
+        1024U,
+        false,
+        2U);
+    if (!ready || fixture.pipeline == nullptr ||
+        fixture.service == nullptr) {
+        return;
+    }
+
+    test->Expect(
+        fixture.service->Snapshot().payload_lease_capacity == 3U,
+        "payload lease pool reserves pending capacity plus one comparison slot");
+    test->Expect(
+        Inject(fixture.pipeline.get(), 2U, 42U).accepted(),
+        "inject first gap payload lease");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.pending_token_count == 1U &&
+                   snapshot.payload_leases_in_use == 1U &&
+                   !snapshot.globally_frozen_resource;
+        }),
+        "first out-of-order canonical payload retains one lease");
+
+    test->Expect(
+        Inject(fixture.pipeline.get(), 3U, 43U).accepted(),
+        "inject second gap payload lease");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.pending_token_count == 2U &&
+                   snapshot.payload_leases_in_use == 2U &&
+                   !snapshot.globally_frozen_resource;
+        }),
+        "configured pending bound can retain two canonical leases");
+
+    test->Expect(
+        Inject(fixture.pipeline.get(), 2U, 42U).accepted(),
+        "inject exact duplicate while canonical lease pool is full");
+    test->Expect(
+        WaitUntil([&] {
+            const auto snapshot = fixture.service->Snapshot();
+            return snapshot.exact_duplicate_message_count >= 1U &&
+                   snapshot.pending_token_count == 2U &&
+                   snapshot.payload_leases_in_use == 2U &&
+                   snapshot.payload_lease_high_water == 3U &&
+                   snapshot.payload_lease_failed_acquires == 0U &&
+                   !snapshot.globally_frozen_resource;
+        }),
+        "full pool uses and recycles the transient duplicate-comparison lease");
+
+    fixture.pipeline->StopAndDrain();
+    test->Expect(
+        WaitUntil([&] {
+            return fixture.service->Snapshot()
+                       .payload_leases_in_use == 0U;
+        }),
+        "terminal incomplete-gap seal reclaims every canonical payload lease");
 }
 
 void RunLinuxCpuSetParserScenario(TestContext* test) {
@@ -3430,6 +3505,10 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
             return fast->count() == 1U &&
                    snapshot.wire_snapshot_consistent &&
                    snapshot.canonical_apply_frontier == 1U &&
+                   snapshot.payload_lease_capacity == 9U &&
+                   snapshot.payload_leases_in_use == 0U &&
+                   snapshot.payload_lease_high_water >= 1U &&
+                   snapshot.payload_lease_failed_acquires == 0U &&
                    snapshot.state ==
                        ipc::RealtimeCertifiedStateV1::kContiguous;
         }),
@@ -3515,6 +3594,7 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
             return fast->count() == 2U &&
                    snapshot.wire_snapshot_consistent &&
                    snapshot.globally_frozen_resource &&
+                   snapshot.payload_leases_in_use == 0U &&
                    snapshot.state ==
                        ipc::RealtimeCertifiedStateV1::
                            kFrozenResource;
@@ -3615,6 +3695,7 @@ void RunEventCapacityFailOpenScenario(TestContext* test) {
 int main() {
     TestContext test;
     RunLinuxCpuSetParserScenario(&test);
+    RunFullPayloadLeasePoolBoundaryScenario(&test);
     RunCpuSetConfigurationValidationScenario(&test);
     RunTickHistoryReaderPathErrnoScenario(&test);
     RunConfiguredThreadAffinityScenario(&test);
