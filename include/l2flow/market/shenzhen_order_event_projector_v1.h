@@ -155,6 +155,16 @@ struct ShenzhenOrderRevisionEventV1 final {
     ShenzhenOrderSnapshotV1 order{};
 };
 
+// Exact projector checkpoint for one order.  The snapshot itself is already
+// carried by every order-revision Event; the two booleans are the only live
+// projector state which is not represented by that payload.  Ordered Event
+// history uses this image to seed a sparse shadow projector at dirty-1.
+struct ShenzhenOrderStateImageV1 final {
+    ShenzhenOrderSnapshotV1 snapshot{};
+    bool terminal = false;
+    bool finalization_emitted = false;
+};
+
 struct ShenzhenTradeEventV1 final {
     std::uint32_t trade_date = 0U;
     std::uint32_t instrument_id = 0U;
@@ -254,6 +264,17 @@ public:
         std::unique_ptr<ShenzhenOrderEventProjectorV1>* output)
         noexcept;
 
+    // A shadow projector stores only imported/touched orders while retaining
+    // the logical base order count for capacity checks.  It is intended for
+    // dirty-suffix replay and follows the exact same ConsumeBusinessOrdered
+    // transition implementation as a live projector.
+    [[nodiscard]] static ShenzhenOrderProjectorCreateErrorV1
+    CreateSparseShadow(
+        ShenzhenOrderEventProjectorConfigV1 config,
+        std::size_t logical_base_order_count,
+        std::unique_ptr<ShenzhenOrderEventProjectorV1>* output)
+        noexcept;
+
     // Ordering is established exclusively by
     // (channel, ApplSeqNum) before this call. Source/arrival IDs remain
     // diagnostic and are not ordering inputs. Numeric gaps are valid.
@@ -277,6 +298,23 @@ public:
     [[nodiscard]] ShenzhenOrderProjectorQueryErrorV1 GetOrder(
         const ShenzhenOrderKeyV1& key,
         ShenzhenOrderSnapshotV1* output) const noexcept;
+    [[nodiscard]] ShenzhenOrderProjectorQueryErrorV1 GetOrderState(
+        const ShenzhenOrderKeyV1& key,
+        ShenzhenOrderStateImageV1* output) const noexcept;
+
+    // ImportExisting is allocation-bearing and is used only while building a
+    // private sparse replay overlay. ReplaceOrInsert is allocation-free for a
+    // live projector because BoundedOrderTableV1 owns its complete slab.
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1
+    ImportExistingOrderState(
+        const ShenzhenOrderStateImageV1& image) noexcept;
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1
+    ReplaceOrInsertOrderState(
+        const ShenzhenOrderStateImageV1& image) noexcept;
+    [[nodiscard]] ShenzhenOrderProjectorConsumeErrorV1
+    SetPreviousBusinessSequence(
+        std::uint32_t channel,
+        std::int64_t sequence) noexcept;
     [[nodiscard]] std::size_t order_count() const noexcept;
     [[nodiscard]] bool finalized() const noexcept;
     [[nodiscard]] const ShenzhenOrderEventProjectorConfigV1& config()

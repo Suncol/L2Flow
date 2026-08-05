@@ -64,9 +64,11 @@ derived worker. An instrument's permanent Tick route keeps all of its messages
 on one producer queue, while no cross-instrument total order is claimed.
 
 Event/KLine `TryPush` is fixed-step and nonblocking. Failure sets the target
-instrument's `REPAIR_REQUIRED` state and advances `repair_through`; later
-messages for that instrument update the watermark instead of consuming a
-derived queue slot. FAST processing for unrelated instruments continues.
+instrument's `REPAIR_REQUIRED` state and advances `repair_through`. Event
+continues enqueueing later facts while a journal-backed suffix repair is in
+progress; a queue gap alone selects the exceptional FAST cold fallback.
+KLine retains its full-prefix rebuild behavior. FAST processing for unrelated
+instruments continues.
 
 A derived envelope cannot exist before its corresponding FAST append has
 published, so Event and KLine workers do not retain a pending envelope or wait
@@ -75,25 +77,44 @@ envelope is emitted and that instrument becomes unrecoverable.
 
 ## Event normal path and repair
 
-For each instrument and channel, ordered input is held in fixed-target-size
-blocks. A sequence greater than the channel maximum appends without calling a
-sorter. Duplicate native keys with the same business payload are idempotent;
-different payloads at one key enter `SOURCE_CONFLICT`. A smaller unseen key is
-inserted into its local block, records `dirty_from`, and requests repair while
-the prior stable root remains visible.
+The Event worker drains a bounded micro-batch and inserts every compact input
+into the permanent per-channel journal before projecting any of them. A
+sequence greater than the channel maximum appends without sorting; native
+numeric gaps are valid. Same-key/same-payload duplicates are idempotent and a
+different payload at one key enters `SOURCE_CONFLICT`. A trade/order inversion
+contained in one drain batch therefore has no incorrect intermediate stable
+publication.
 
-Recovery captures the FAST instrument tail, partitions by channel, and scans
-for inversions. Already ordered input is replayed linearly. Sparse natural
-runs use a stable k-way merge; highly disordered positive fixed-width business
-sequences use an eight-pass stable radix sort. The implementation never calls
-a full comparison sort for Event recovery.
+Each channel also retains a configurable bounded mutable tail (128 source
+records by default). A smaller unseen key records the earliest `dirty_from`.
+The same Event worker then slices a private shadow replay by both record and
+CPU-time budgets while the prior immutable root remains readable. New tail
+appends remain in the journal and are followed in place; a still-earlier
+insertion restarts the private replay from the new dirty key.
+Dirty instruments are scheduled through a preallocated, enqueue-once
+round-robin ring owned by that Event worker. The monotonic hot path therefore
+checks only instruments touched by the current micro-batch; it does not scan
+the worker's complete route table after every drain.
 
-The current correctness fallback rebuilds the complete instrument Event state
-from the captured FAST prefix. This is intentionally stronger, though more
-expensive, than a suffix/dependency replay. The rebuilt rows are private until
-one immutable root release-store. CDC then publishes one full-instrument
-RANGE_REPLACE transaction. Old roots remain alive while readers hold shared
-ownership.
+Replay starts from the journal's exact predecessor, not `dirty_from - 1`, and
+reads only `[dirty_from, current_tail]`. Order state is loaded lazily from an
+order-version index. Each version points to the immutable order-revision Event
+row that already owns the complete published snapshot and stores only hidden
+transition fields. Shenzhen needs `terminal` and `finalization_emitted`;
+Shanghai additionally checkpoints its pre-add active-fill accumulator and
+execution-price extrema. A Shanghai END message imports the complete
+pre-dirty channel range before finalization so untouched orders cannot vanish.
+Both live and shadow modes execute the same exchange projector transition
+implementation.
+
+On commit, unaffected channels and complete prefix blocks are structurally
+shared. At most one boundary block prefix is copied and newly built suffix
+blocks are attached. Order versions and live final states are patched before
+one stable-root release-store. CDC publishes `kChannelSuffix` BEGIN/CHUNK/
+COMMIT with `(channel, dirty_from)` and no artificial end sentinel. A complete
+FAST copy/sort/replay remains only for an Event-queue journal gap or damaged
+source journal; that cold fallback still uses the adaptive natural-run/radix
+sort implementation.
 
 ## KLine normal path and repair
 
@@ -126,11 +147,12 @@ stable attach acquires one root and derives the next change sequence from the
 sequence already included in that root. There is no periodic publication,
 global fence, source cut, or coordination with another instrument.
 
-Event point changes are INSERT/UPDATE/DELETE. Rebuild changes are
-RANGE_REPLACE_BEGIN, zero or more RANGE_REPLACE_CHUNK records, then
-RANGE_REPLACE_COMMIT. KLine uses UPSERT/DELETE for live changes and the same
-three-phase replacement for rebuilds. A transaction ID is nonzero only for a
-range transaction, and change sequences remain contiguous per instrument.
+Event point changes are INSERT/UPDATE/DELETE. Ordinary late data uses a
+channel-suffix RANGE_REPLACE_BEGIN, zero or more RANGE_REPLACE_CHUNK records,
+then RANGE_REPLACE_COMMIT. Only the cold fallback replaces the complete Event
+instrument. KLine uses UPSERT/DELETE for live changes and the same three-phase
+full replacement for rebuilds. A transaction ID is nonzero only for a range
+transaction, and change sequences remain contiguous per instrument.
 
 The Python CDC and Polars layers retain incomplete transaction chunks in
 private state. Polars publishes a replacement block directory only when the
@@ -144,14 +166,12 @@ LIVE -> REPAIR_REQUIRED -> REBUILDING -> CATCHING_UP -> LIVE
                          \-> UNRECOVERABLE
 ```
 
-During rebuild, new relevant arrivals only raise `repair_through`. After root
-publication, the worker samples FAST again. Event returns to LIVE only when
-the captured raw row tail is still current and the latest FAST arrival covers
-its repair watermark. KLine instead compares its trade-only watermark with the
-captured prefix's last arrival identity, so later non-trade FAST rows do not
-cause an identical bar rebuild. Otherwise the instrument returns to
-REPAIR_REQUIRED and repeats. No other instrument or plane participates in
-either decision.
+During Event suffix replay, later Event inputs continue into the permanent
+journal. The replay commits only after its cursor is at the journal tail and
+the observed journal generation is unchanged. During an exceptional Event
+cold rebuild, or a KLine rebuild, relevant arrivals raise `repair_through` and
+the captured FAST tail is checked before returning to LIVE. No other
+instrument or plane participates in either decision.
 
 `SOURCE_CONFLICT` and `UNRECOVERABLE` are terminal for the session. A
 concurrent coverage loss can move an instrument to a terminal state while a
@@ -173,10 +193,11 @@ bounds. A CDC log never reserves beyond
 root and moves only that derived instrument to `UNRECOVERABLE`. Operators must
 size this complete-session retention bound from expected mutation volume.
 
-An early late input may require replay proportional to the affected history.
-No implementation can promise a fixed O(1) completion time for that case
-while producing the exact derived result. The stable-root protocol guarantees
-consistent visibility, not data-independent repair latency.
+An early late input may require replay proportional to its channel suffix.
+No implementation can promise fixed O(1) completion while producing the exact
+derived result, but cooperative slicing bounds one Event-worker repair turn.
+The stable-root protocol guarantees consistent visibility, not
+data-independent repair completion latency.
 
 The V3 C++ service is currently a transport-neutral, process-local boundary.
 Its fixed-width cursor/status codecs are language-neutral, but this revision

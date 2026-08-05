@@ -52,6 +52,11 @@ class EventMutationKind(IntEnum):
     RANGE_REPLACE_COMMIT = 5
 
 
+class EventRangeReplaceScope(IntEnum):
+    INSTRUMENT_ALL = 0
+    CHANNEL_SUFFIX = 1
+
+
 class KLineMutationKind(IntEnum):
     UPSERT = 0
     DELETE = 1
@@ -375,10 +380,32 @@ class EventMutation:
     range_begin: Optional[EventOrderKey] = None
     range_end_exclusive: Optional[EventOrderKey] = None
     replacement_rows: tuple[DerivedEvent, ...] = ()
+    # Appended after the legacy fields so existing positional constructors
+    # retain their meaning. New code should normally pass these by keyword.
+    range_scope: EventRangeReplaceScope = (
+        EventRangeReplaceScope.INSTRUMENT_ALL
+    )
+    range_channel: int = 0
+    range_begin_business_sequence: int = 0
 
     def __post_init__(self) -> None:
         _uint64(self.change_sequence, "change_sequence", nonzero=True)
         _uint64(self.transaction_id, "transaction_id")
+        object.__setattr__(
+            self, "range_scope", EventRangeReplaceScope(self.range_scope)
+        )
+        _signed_integer(
+            self.range_channel,
+            "range_channel",
+            _INT32_MIN,
+            _INT32_MAX,
+        )
+        _signed_integer(
+            self.range_begin_business_sequence,
+            "range_begin_business_sequence",
+            _INT64_MIN,
+            _INT64_MAX,
+        )
         if not isinstance(self.replace_entire_instrument, bool):
             raise ValueError("replace_entire_instrument must be bool")
         object.__setattr__(self, "kind", EventMutationKind(self.kind))

@@ -163,15 +163,7 @@ constexpr std::uint64_t kConflictQualityMask =
     return false;
 }
 
-struct OrderState final {
-    ShanghaiOrderSnapshotV1 snapshot{};
-    std::int64_t pre_add_active_trade_quantity = 0;
-    std::int64_t minimum_execution_price_p6 = 0;
-    std::int64_t maximum_execution_price_p6 = 0;
-    bool execution_prices_seen = false;
-    bool terminal = false;
-    bool finalization_emitted = false;
-};
+using OrderState = ShanghaiOrderStateImageV1;
 
 [[nodiscard]] bool HasConflict(const OrderState& state) noexcept {
     return (state.snapshot.quality_flags &
@@ -483,8 +475,17 @@ bool operator<(
 class ShanghaiOrderEventAggregatorV1::Impl final {
 public:
     explicit Impl(
-        ShanghaiOrderEventAggregatorConfigV1 config)
-        : config_(config), orders_(config.maximum_order_states) {}
+        ShanghaiOrderEventAggregatorConfigV1 config,
+        bool sparse = false,
+        std::size_t logical_base_order_count = 0U)
+        : config_(config),
+          sparse_(sparse),
+          logical_order_count_(logical_base_order_count) {
+        if (!sparse_) {
+            live_orders_ = std::make_unique<OrderTable>(
+                config_.maximum_order_states);
+        }
+    }
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 Consume(
         const ShanghaiOrderEventInputV1& input,
@@ -561,10 +562,11 @@ public:
             return ShanghaiOrderAggregatorConsumeErrorV1::
                 kInvalidInput;
         }
-        output->reserve(orders_.size());
+        output->reserve(
+            sparse_ ? sparse_orders_.size() : OrderCount());
         ShanghaiOrderAggregatorConsumeErrorV1 finalization_error =
             ShanghaiOrderAggregatorConsumeErrorV1::kNone;
-        const bool finalized_all = orders_.VisitOrdered(
+        const bool finalized_all = VisitOrdered(
             [this, &source_anchor, output, &finalization_error](
                 const ShanghaiOrderKeyV1&,
                 OrderState& state) {
@@ -592,7 +594,7 @@ public:
             key.order_id <= 0) {
             return ShanghaiOrderAggregatorQueryErrorV1::kInvalidKey;
         }
-        const OrderState* const found = orders_.Find(key);
+        const OrderState* const found = FindOrder(key);
         if (found == nullptr) {
             return ShanghaiOrderAggregatorQueryErrorV1::kNotFound;
         }
@@ -601,7 +603,7 @@ public:
     }
 
     [[nodiscard]] std::size_t order_count() const noexcept {
-        return orders_.size();
+        return OrderCount();
     }
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
@@ -653,6 +655,16 @@ public:
         return config_;
     }
 
+    [[nodiscard]] bool sparse() const noexcept { return sparse_; }
+
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    SetPreviousSequence(
+        std::int32_t channel,
+        std::int64_t sequence) {
+        last_native_sequence_by_channel_[channel] = sequence;
+        return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
+    }
+
     void MarkFailed() noexcept {
         failed_ = true;
     }
@@ -660,6 +672,145 @@ public:
 private:
     using OrderTable = detail::BoundedOrderTableV1<
         ShanghaiOrderKeyV1, OrderState>;
+
+    struct InsertResult final {
+        OrderState* value = nullptr;
+        bool inserted = false;
+        bool capacity_exhausted = false;
+        bool invariant_failure = false;
+    };
+
+public:
+    [[nodiscard]] OrderState* FindOrder(
+        const ShanghaiOrderKeyV1& key) noexcept {
+        if (!sparse_) {
+            return live_orders_->Find(key);
+        }
+        const auto found = sparse_orders_.find(key);
+        return found == sparse_orders_.end() ? nullptr : &found->second;
+    }
+
+    [[nodiscard]] const OrderState* FindOrder(
+        const ShanghaiOrderKeyV1& key) const noexcept {
+        if (!sparse_) {
+            return live_orders_->Find(key);
+        }
+        const auto found = sparse_orders_.find(key);
+        return found == sparse_orders_.end() ? nullptr : &found->second;
+    }
+
+    [[nodiscard]] InsertResult InsertNew(
+        ShanghaiOrderKeyV1 key,
+        OrderState value) {
+        if (logical_order_count_ >= config_.maximum_order_states) {
+            return InsertResult{nullptr, false, true, false};
+        }
+        if (!sparse_) {
+            const OrderTable::InsertResult inserted =
+                live_orders_->Insert(std::move(key), std::move(value));
+            logical_order_count_ = live_orders_->size();
+            return InsertResult{
+                inserted.value,
+                inserted.inserted,
+                inserted.capacity_exhausted,
+                inserted.invariant_failure};
+        }
+        auto [position, inserted] = sparse_orders_.emplace(
+            std::move(key), std::move(value));
+        if (inserted) {
+            ++logical_order_count_;
+        }
+        return InsertResult{
+            &position->second, inserted, false, false};
+    }
+
+    [[nodiscard]] bool ImportExisting(const OrderState& state) {
+        if (!sparse_) {
+            return false;
+        }
+        const auto [position, inserted] = sparse_orders_.emplace(
+            state.snapshot.key, state);
+        if (!inserted) {
+            position->second = state;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ReplaceOrInsert(const OrderState& state) noexcept {
+        if (OrderState* const existing = FindOrder(state.snapshot.key);
+            existing != nullptr) {
+            *existing = state;
+            return true;
+        }
+        if (sparse_) {
+            try {
+                return InsertNew(state.snapshot.key, state).inserted;
+            } catch (...) {
+                return false;
+            }
+        }
+        return InsertNew(state.snapshot.key, state).inserted;
+    }
+
+    template <typename Visitor>
+    [[nodiscard]] bool VisitOrdered(Visitor&& visitor) {
+        if (!sparse_) {
+            return live_orders_->VisitOrdered(
+                std::forward<Visitor>(visitor));
+        }
+        for (auto& [key, value] : sparse_orders_) {
+            if (!visitor(key, value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template <typename Visitor>
+    [[nodiscard]] bool VisitRange(
+        const ShanghaiOrderKeyV1& lower,
+        const ShanghaiOrderKeyV1& upper,
+        Visitor&& visitor) {
+        if (!sparse_) {
+            return live_orders_->VisitOrderedRangeInclusive(
+                lower, upper, std::forward<Visitor>(visitor));
+        }
+        auto position = sparse_orders_.lower_bound(lower);
+        while (position != sparse_orders_.end() &&
+               !(upper < position->first)) {
+            if (!visitor(position->first, position->second)) {
+                return false;
+            }
+            ++position;
+        }
+        return true;
+    }
+
+    template <typename Visitor>
+    [[nodiscard]] bool VisitRange(
+        const ShanghaiOrderKeyV1& lower,
+        const ShanghaiOrderKeyV1& upper,
+        Visitor&& visitor) const {
+        if (!sparse_) {
+            return live_orders_->VisitOrderedRangeInclusive(
+                lower, upper, std::forward<Visitor>(visitor));
+        }
+        auto position = sparse_orders_.lower_bound(lower);
+        while (position != sparse_orders_.end() &&
+               !(upper < position->first)) {
+            if (!visitor(position->first, position->second)) {
+                return false;
+            }
+            ++position;
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::size_t OrderCount() const noexcept {
+        return logical_order_count_;
+    }
+
+private:
 
     [[nodiscard]] static std::pair<
         ShanghaiOrderKeyV1,
@@ -689,7 +840,7 @@ private:
             return ShanghaiOrderAggregatorConsumeErrorV1::kNone;
         }
         const auto [lower, upper] = InstrumentBounds(input);
-        const bool counted = orders_.VisitOrderedRangeInclusive(
+        const bool counted = VisitRange(
             lower,
             upper,
             [output](
@@ -713,7 +864,7 @@ private:
 
     [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1 EnsureCapacity()
         const noexcept {
-        return orders_.size() >= config_.maximum_order_states
+        return OrderCount() >= config_.maximum_order_states
                    ? ShanghaiOrderAggregatorConsumeErrorV1::kOrderCapacity
                    : ShanghaiOrderAggregatorConsumeErrorV1::kNone;
     }
@@ -725,8 +876,8 @@ private:
         const ShanghaiOrderEventInputV1& input) {
         OrderState initial{};
         InitializeState(key, side, side_source, input, &initial);
-        const OrderTable::InsertResult inserted =
-            orders_.Insert(key, std::move(initial));
+        const InsertResult inserted =
+            InsertNew(key, std::move(initial));
         if (!inserted.inserted || inserted.value == nullptr) {
             failed_ = true;
             return nullptr;
@@ -773,7 +924,7 @@ private:
             input.instrument_id,
             input.channel,
             input.primary_order_id};
-        OrderState* found = orders_.Find(key);
+        OrderState* found = FindOrder(key);
         if (found == nullptr) {
             const ShanghaiOrderAggregatorConsumeErrorV1 capacity =
                 EnsureCapacity();
@@ -976,7 +1127,7 @@ private:
 
         std::size_t required_new_states = 0U;
         for (Reference& reference : references) {
-            reference.state = orders_.Find(reference.key);
+            reference.state = FindOrder(reference.key);
             if (reference.state != nullptr) {
                 if (!CanApplyTrade(
                         *reference.state,
@@ -990,7 +1141,7 @@ private:
             }
         }
         if (required_new_states >
-            config_.maximum_order_states - orders_.size()) {
+            config_.maximum_order_states - OrderCount()) {
             return ShanghaiOrderAggregatorConsumeErrorV1::kOrderCapacity;
         }
 
@@ -1068,7 +1219,7 @@ private:
             input.instrument_id,
             input.channel,
             input.primary_order_id};
-        OrderState* const found = orders_.Find(key);
+        OrderState* const found = FindOrder(key);
         if (found != nullptr &&
             !CanApplyCancel(*found, input.quantity)) {
             return ShanghaiOrderAggregatorConsumeErrorV1::
@@ -1135,7 +1286,7 @@ private:
         ShanghaiOrderAggregatorConsumeErrorV1 finalization_error =
             ShanghaiOrderAggregatorConsumeErrorV1::kNone;
         const bool finalized_range =
-            orders_.VisitOrderedRangeInclusive(
+            VisitRange(
                 lower,
                 upper,
                 [this, &input, output, &finalization_error](
@@ -1172,7 +1323,10 @@ private:
     }
 
     ShanghaiOrderEventAggregatorConfigV1 config_{};
-    OrderTable orders_;
+    bool sparse_ = false;
+    std::size_t logical_order_count_ = 0U;
+    std::unique_ptr<OrderTable> live_orders_;
+    std::map<ShanghaiOrderKeyV1, OrderState> sparse_orders_;
     std::map<std::int32_t, std::int64_t>
         last_native_sequence_by_channel_;
     bool finalized_ = false;
@@ -1278,6 +1432,38 @@ ShanghaiOrderEventAggregatorV1::Create(
     }
 }
 
+ShanghaiOrderAggregatorCreateErrorV1
+ShanghaiOrderEventAggregatorV1::CreateSparseShadow(
+    ShanghaiOrderEventAggregatorConfigV1 config,
+    std::size_t logical_base_order_count,
+    std::unique_ptr<ShanghaiOrderEventAggregatorV1>* output) noexcept {
+    if (output == nullptr) {
+        return ShanghaiOrderAggregatorCreateErrorV1::kNullOutput;
+    }
+    output->reset();
+    if (!ValidTradeDate(config.trade_date) ||
+        config.maximum_order_states == 0U ||
+        logical_base_order_count > config.maximum_order_states ||
+        config.maximum_order_states >=
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max()) ||
+        config.maximum_order_states >
+            std::numeric_limits<std::size_t>::max() / 2U) {
+        return ShanghaiOrderAggregatorCreateErrorV1::
+            kInvalidConfiguration;
+    }
+    try {
+        auto impl = std::make_unique<Impl>(
+            config, true, logical_base_order_count);
+        output->reset(new ShanghaiOrderEventAggregatorV1(
+            std::move(impl)));
+        return ShanghaiOrderAggregatorCreateErrorV1::kNone;
+    } catch (...) {
+        return ShanghaiOrderAggregatorCreateErrorV1::
+            kResourceExhausted;
+    }
+}
+
 ShanghaiOrderAggregatorConsumeErrorV1
 ShanghaiOrderEventAggregatorV1::ConsumeBusinessOrdered(
     const ShanghaiOrderEventInputV1& input,
@@ -1358,6 +1544,81 @@ ShanghaiOrderEventAggregatorV1::GetOrder(
         return ShanghaiOrderAggregatorQueryErrorV1::kNotFound;
     }
     return impl_->GetOrder(key, output);
+}
+
+ShanghaiOrderAggregatorQueryErrorV1
+ShanghaiOrderEventAggregatorV1::GetOrderState(
+    const ShanghaiOrderKeyV1& key,
+    ShanghaiOrderStateImageV1* output) const noexcept {
+    if (output == nullptr) {
+        return ShanghaiOrderAggregatorQueryErrorV1::kNullOutput;
+    }
+    *output = {};
+    if (impl_ == nullptr || !ValidTradeDate(key.trade_date) ||
+        key.instrument_id == 0U || key.channel <= 0 ||
+        key.order_id <= 0) {
+        return ShanghaiOrderAggregatorQueryErrorV1::kInvalidKey;
+    }
+    const OrderState* const found = impl_->FindOrder(key);
+    if (found == nullptr) {
+        return ShanghaiOrderAggregatorQueryErrorV1::kNotFound;
+    }
+    *output = *found;
+    return ShanghaiOrderAggregatorQueryErrorV1::kNone;
+}
+
+ShanghaiOrderAggregatorConsumeErrorV1
+ShanghaiOrderEventAggregatorV1::ImportExistingOrderState(
+    const ShanghaiOrderStateImageV1& image) noexcept {
+    if (impl_ == nullptr || !impl_->sparse() ||
+        image.snapshot.key.trade_date != impl_->config().trade_date ||
+        image.snapshot.key.instrument_id == 0U ||
+        image.snapshot.key.channel <= 0 ||
+        image.snapshot.key.order_id <= 0) {
+        return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
+    }
+    try {
+        return impl_->ImportExisting(image)
+                   ? ShanghaiOrderAggregatorConsumeErrorV1::kNone
+                   : ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
+    } catch (...) {
+        return ShanghaiOrderAggregatorConsumeErrorV1::
+            kResourceExhausted;
+    }
+}
+
+ShanghaiOrderAggregatorConsumeErrorV1
+ShanghaiOrderEventAggregatorV1::ReplaceOrInsertOrderState(
+    const ShanghaiOrderStateImageV1& image) noexcept {
+    if (impl_ == nullptr ||
+        image.snapshot.key.trade_date != impl_->config().trade_date ||
+        image.snapshot.key.instrument_id == 0U ||
+        image.snapshot.key.channel <= 0 ||
+        image.snapshot.key.order_id <= 0) {
+        return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
+    }
+    if (impl_->FindOrder(image.snapshot.key) == nullptr &&
+        impl_->OrderCount() >= impl_->config().maximum_order_states) {
+        return ShanghaiOrderAggregatorConsumeErrorV1::kOrderCapacity;
+    }
+    return impl_->ReplaceOrInsert(image)
+               ? ShanghaiOrderAggregatorConsumeErrorV1::kNone
+               : ShanghaiOrderAggregatorConsumeErrorV1::kFailed;
+}
+
+ShanghaiOrderAggregatorConsumeErrorV1
+ShanghaiOrderEventAggregatorV1::SetPreviousBusinessSequence(
+    std::int32_t channel,
+    std::int64_t sequence) noexcept {
+    if (impl_ == nullptr || channel <= 0 || sequence < 0) {
+        return ShanghaiOrderAggregatorConsumeErrorV1::kInvalidInput;
+    }
+    try {
+        return impl_->SetPreviousSequence(channel, sequence);
+    } catch (...) {
+        return ShanghaiOrderAggregatorConsumeErrorV1::
+            kResourceExhausted;
+    }
 }
 
 std::size_t ShanghaiOrderEventAggregatorV1::order_count()

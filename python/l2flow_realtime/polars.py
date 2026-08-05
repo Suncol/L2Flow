@@ -13,6 +13,7 @@ from .models import (
     DerivedEvent,
     EventMutation,
     EventMutationKind,
+    EventRangeReplaceScope,
     FastTickRow,
     KLineBar,
     KLineMutation,
@@ -206,6 +207,62 @@ class ImmutablePolarsBlockTable:
             *self._blocks[last:],
         )
 
+    def replace_channel_suffix(
+        self,
+        channel: int,
+        begin_business_sequence: int,
+        rows: Iterable[Mapping[str, Any]],
+    ) -> None:
+        """Replace one channel's suffix without an artificial end key."""
+
+        if channel <= 0 or begin_business_sequence <= 0:
+            raise ValueError("channel suffix bounds must be positive")
+        if self._key_columns[:2] != (
+            "channel",
+            "business_sequence",
+        ):
+            raise ValueError("table key does not begin with Event channel order")
+        incoming = self._normalize(rows)
+
+        def in_suffix(row: Mapping[str, Any]) -> bool:
+            key = self._key(row)
+            return key[0] == channel and key[1] >= begin_business_sequence
+
+        if any(not in_suffix(row) for row in incoming):
+            raise PolarsBlockError(
+                "replacement row lies outside its channel suffix"
+            )
+        if not self._blocks:
+            self._blocks = self._build_blocks(incoming)
+            return
+
+        first = 0
+        while first < len(self._blocks):
+            maximum = self._blocks[first].maximum_key
+            if maximum[0] > channel or (
+                maximum[0] == channel
+                and maximum[1] >= begin_business_sequence
+            ):
+                break
+            first += 1
+        last = first
+        while (
+            last < len(self._blocks)
+            and self._blocks[last].minimum_key[0] <= channel
+        ):
+            last += 1
+        retained: list[dict[str, Any]] = []
+        for block in self._blocks[first:last]:
+            retained.extend(row for row in block.rows if not in_suffix(row))
+        replacement = self._build_blocks(
+            self._normalize((*retained, *incoming))
+        )
+        self._blocks = (
+            *self._blocks[:first],
+            *replacement,
+            *self._blocks[last:],
+        )
+
     def fork(self) -> "ImmutablePolarsBlockTable":
         result = ImmutablePolarsBlockTable(
             self._key_columns,
@@ -338,7 +395,16 @@ class EventPolarsHistory:
                 if pending_before is None:
                     raise CdcProtocolError("range commit has no pending transaction")
                 replacement = tuple(pending_before.rows)
-                if pending_before.replace_entire_instrument:
+                if (
+                    pending_before.range_scope
+                    is EventRangeReplaceScope.CHANNEL_SUFFIX
+                ):
+                    candidate_table.replace_channel_suffix(
+                        pending_before.range_channel,
+                        pending_before.range_begin_business_sequence,
+                        (row.as_dict() for row in replacement),
+                    )
+                elif pending_before.replace_entire_instrument:
                     candidate_table.replace_all(
                         row.as_dict() for row in replacement
                     )

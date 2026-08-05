@@ -19,12 +19,14 @@ namespace market = l2flow::market;
 namespace runtime = l2flow::runtime;
 
 constexpr std::uint32_t kTradeDate = 20260805U;
+constexpr std::int32_t kChannel = 3;
 constexpr std::uint64_t kSecond = 1'000'000'000U;
 
 struct Options final {
     std::size_t records = 100'000U;
     std::uint32_t disorder_basis_points = 0U;
     bool earliest_late = false;
+    std::string_view exchange = "shanghai";
 };
 
 template <typename Unsigned>
@@ -59,6 +61,8 @@ bool Parse(int argc, char** argv, Options* output) noexcept {
             if (!ParseUnsigned(value, &output->disorder_basis_points)) {
                 return false;
             }
+        } else if (argument == "--exchange") {
+            output->exchange = value;
         } else {
             return false;
         }
@@ -69,7 +73,9 @@ bool Parse(int argc, char** argv, Options* output) noexcept {
            output->records <
                static_cast<std::size_t>(
                    std::numeric_limits<std::int64_t>::max()) &&
-           output->disorder_basis_points <= 10'000U;
+           output->disorder_basis_points <= 10'000U &&
+           (output->exchange == "shanghai" ||
+            output->exchange == "shenzhen");
 }
 
 l2flow::common::Identity128 SessionId() {
@@ -154,7 +160,7 @@ struct TickPair final {
     market::DecodedFastTickV1 owned{};
 };
 
-TickPair Trade(
+TickPair ShanghaiTrade(
     std::int64_t business_sequence,
     std::uint64_t arrival_id) {
     market::ShanghaiTickV1 tick{};
@@ -179,7 +185,7 @@ TickPair Trade(
         1'785'859'200'000'000'000LL +
         static_cast<std::int64_t>(
             tick.common.exchange_time.nanoseconds_since_midnight);
-    tick.channel = 3;
+    tick.channel = kChannel;
     tick.business_index = business_sequence;
     tick.fields.action = market::TickActionV1::kTrade;
     tick.fields.aggressor = market::AggressorV1::kNeutral;
@@ -203,6 +209,60 @@ TickPair Trade(
     const auto projected = market::ProjectFastTickV1(
         std::move(decoded),
         market::FastTickSourceV1::kShanghaiTick,
+        arrival_id,
+        &result.owned,
+        &result.compact);
+    if (projected != market::FastTickProjectionErrorV1::kNone) {
+        std::terminate();
+    }
+    return result;
+}
+
+TickPair ShenzhenTrade(
+    std::int64_t business_sequence,
+    std::uint64_t arrival_id) {
+    market::ShenzhenTransactionV1 tick{};
+    tick.common.kind = market::MarketEventKindV1::kShenzhenTransaction;
+    tick.common.market = market::MarketV1::kShenzhen;
+    tick.common.origin.trade_date = kTradeDate;
+    tick.common.origin.source_stream_id = 1U;
+    tick.common.origin.source_sequence = arrival_id;
+    tick.common.origin.vendor_sequence_id =
+        static_cast<std::uint64_t>(business_sequence);
+    tick.common.origin.recv_realtime_ns =
+        static_cast<std::int64_t>(arrival_id);
+    tick.common.origin.recv_monotonic_ns =
+        static_cast<std::int64_t>(arrival_id);
+    tick.common.instrument_id = 1U;
+    tick.common.ordinal = 0U;
+    tick.common.exchange_time.valid = true;
+    tick.common.exchange_time.unix_nanoseconds_valid = true;
+    tick.common.exchange_time.nanoseconds_since_midnight =
+        34'200U * kSecond + arrival_id;
+    tick.common.exchange_time.unix_nanoseconds =
+        1'785'859'200'000'000'000LL +
+        static_cast<std::int64_t>(
+            tick.common.exchange_time.nanoseconds_since_midnight);
+    tick.channel = static_cast<std::uint32_t>(kChannel);
+    tick.application_sequence = business_sequence;
+    tick.fields.action = market::TickActionV1::kTrade;
+    tick.fields.price.valid = true;
+    tick.fields.price.normalized_p6 = 10'000'000;
+    tick.fields.quantity.valid = true;
+    tick.fields.quantity.raw = 1;
+    // Shenzhen 6.36 defines zero independently as no corresponding order.
+    tick.fields.buy_order_id = 0;
+    tick.fields.sell_order_id = 0;
+    tick.fields.validity_bitmap =
+        market::kTickPriceValidV1 |
+        market::kTickQuantityValidV1 |
+        market::kTickExchangeTimeValidV1;
+
+    TickPair result{};
+    market::DecodedMarketEventV1 decoded(std::move(tick));
+    const auto projected = market::ProjectFastTickV1(
+        std::move(decoded),
+        market::FastTickSourceV1::kShenzhenTick,
         arrival_id,
         &result.owned,
         &result.compact);
@@ -241,7 +301,8 @@ int main(int argc, char** argv) {
     Options options{};
     if (!Parse(argc, argv, &options)) {
         std::cerr << "usage: benchmark-realtime-planes [--records N] "
-                     "[--disorder-bps 0..10000] [--earliest-late]\n";
+                     "[--disorder-bps 0..10000] [--earliest-late] "
+                     "[--exchange shanghai|shenzhen]\n";
         return 2;
     }
 
@@ -262,7 +323,9 @@ int main(int argc, char** argv) {
     publish_latency_ns.reserve(options.records);
     const auto begin = std::chrono::steady_clock::now();
     for (std::size_t index = 0U; index < sequences.size(); ++index) {
-        TickPair tick = Trade(sequences[index], index + 1U);
+        TickPair tick = options.exchange == "shanghai"
+            ? ShanghaiTrade(sequences[index], index + 1U)
+            : ShenzhenTrade(sequences[index], index + 1U);
         const auto publish_begin = std::chrono::steady_clock::now();
         const auto published = planes->PublishDecoded(
             0U, tick.compact, std::move(tick.owned));
@@ -311,6 +374,7 @@ int main(int argc, char** argv) {
                    current_events.root != nullptr &&
                    current_bars.root != nullptr &&
                    current_events.root->row_count() == options.records &&
+                   current_events.root->strictly_ordered() &&
                    current_bars.root->bar_count() == 1U;
         },
         std::chrono::seconds(60));
@@ -323,15 +387,113 @@ int main(int argc, char** argv) {
             market::MutableKLineHistoryErrorV1::kNone &&
         events.root != nullptr && bars.root != nullptr &&
         events.root->row_count() == options.records &&
+        events.root->strictly_ordered() &&
         bars.root->bar_count() == 1U;
     const auto end = std::chrono::steady_clock::now();
-    planes->StopAndDrain();
     if (!roots_ready) {
-        std::cerr << "derived planes did not catch up\n";
+        const auto failed_progress = planes->Snapshot();
+        market::EventStableSnapshotV1 failed_events{};
+        market::KLineStableSnapshotV1 failed_bars{};
+        static_cast<void>(planes->event_history().AcquireStable(
+            1U, &failed_events));
+        static_cast<void>(planes->kline_history().AcquireStable(
+            1U, &failed_bars));
+        std::vector<market::OrderedDerivedEventV1> failed_rows;
+        if (failed_events.root != nullptr) {
+            static_cast<void>(failed_events.root->CopyRows(&failed_rows));
+        }
+        std::int64_t first_missing = 0;
+        std::int64_t expected_sequence = 1;
+        for (const auto& row : failed_rows) {
+            if (row.order_key.business_sequence != expected_sequence) {
+                first_missing = expected_sequence;
+                break;
+            }
+            ++expected_sequence;
+        }
+        if (first_missing == 0 &&
+            expected_sequence <= static_cast<std::int64_t>(options.records)) {
+            first_missing = expected_sequence;
+        }
+        std::cerr
+            << "derived planes did not catch up: event_state="
+            << static_cast<int>(planes->event_history().RepairState(1U))
+            << " event_rows="
+            << (failed_events.root == nullptr
+                    ? 0U
+                    : failed_events.root->row_count())
+            << " kline_state="
+            << static_cast<int>(planes->kline_history().RepairState(1U))
+            << " bars="
+            << (failed_bars.root == nullptr
+                    ? 0U
+                    : failed_bars.root->bar_count())
+            << " event_repairs="
+            << failed_progress.event_rebuild_attempts
+            << " kline_repairs="
+            << failed_progress.kline_rebuild_attempts
+            << " first_missing=" << first_missing << '\n';
+        planes->StopAndDrain();
         return 1;
     }
 
+    constexpr std::size_t kStableReadSamples = 10'000U;
+    constexpr std::size_t kFullReadSamples = 100U;
+    std::vector<std::uint64_t> stable_read_latency_ns;
+    stable_read_latency_ns.reserve(kStableReadSamples);
+    std::uint64_t observed_row_counts = 0U;
+    for (std::size_t sample = 0U; sample < kStableReadSamples; ++sample) {
+        market::EventStableSnapshotV1 read{};
+        const auto read_begin = std::chrono::steady_clock::now();
+        const auto read_error = planes->event_history().AcquireStable(
+            1U, &read);
+        const auto read_end = std::chrono::steady_clock::now();
+        if (read_error != market::OrderedEventHistoryErrorV1::kNone ||
+            read.root == nullptr) {
+            std::cerr << "stable Event read failed\n";
+            planes->StopAndDrain();
+            return 1;
+        }
+        observed_row_counts += read.root->row_count();
+        stable_read_latency_ns.push_back(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                read_end - read_begin)
+                .count()));
+    }
+    std::vector<std::uint64_t> full_read_latency_ns;
+    full_read_latency_ns.reserve(kFullReadSamples);
+    std::vector<market::OrderedDerivedEventV1> read_rows;
+    for (std::size_t sample = 0U; sample < kFullReadSamples; ++sample) {
+        const auto read_begin = std::chrono::steady_clock::now();
+        const bool copied = events.root->CopyRows(&read_rows);
+        const auto read_end = std::chrono::steady_clock::now();
+        if (!copied || read_rows.size() != options.records) {
+            std::cerr << "full Event read failed\n";
+            planes->StopAndDrain();
+            return 1;
+        }
+        full_read_latency_ns.push_back(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                read_end - read_begin)
+                .count()));
+    }
+    for (std::size_t index = 0U; index < read_rows.size(); ++index) {
+        if (read_rows[index].order_key.channel != kChannel ||
+            read_rows[index].order_key.business_sequence !=
+                static_cast<std::int64_t>(index + 1U)) {
+            std::cerr << "Event root contains a missing or unordered "
+                         "business sequence at row "
+                      << index << '\n';
+            planes->StopAndDrain();
+            return 1;
+        }
+    }
+    planes->StopAndDrain();
+
     std::sort(publish_latency_ns.begin(), publish_latency_ns.end());
+    std::sort(
+        stable_read_latency_ns.begin(), stable_read_latency_ns.end());
+    std::sort(full_read_latency_ns.begin(), full_read_latency_ns.end());
     const double seconds = std::chrono::duration<double>(end - begin).count();
     const double throughput =
         static_cast<double>(options.records) / seconds;
@@ -345,6 +507,7 @@ int main(int argc, char** argv) {
     const auto event_stats = planes->event_history().Stats();
     std::cout
         << "{\"records\":" << options.records
+        << ",\"exchange\":\"" << options.exchange << "\""
         << ",\"disorder_basis_points\":"
         << options.disorder_basis_points
         << ",\"earliest_late\":"
@@ -359,10 +522,30 @@ int main(int argc, char** argv) {
         << Percentile(publish_latency_ns, 99U, 100U)
         << ",\"publish_p999_ns\":"
         << Percentile(publish_latency_ns, 999U, 1000U)
+        << ",\"stable_read_samples\":" << kStableReadSamples
+        << ",\"stable_read_p50_ns\":"
+        << Percentile(stable_read_latency_ns, 50U, 100U)
+        << ",\"stable_read_p99_ns\":"
+        << Percentile(stable_read_latency_ns, 99U, 100U)
+        << ",\"full_read_samples\":" << kFullReadSamples
+        << ",\"full_read_p50_ns\":"
+        << Percentile(full_read_latency_ns, 50U, 100U)
+        << ",\"full_read_p99_ns\":"
+        << Percentile(full_read_latency_ns, 99U, 100U)
+        << ",\"observed_row_count_checksum\":"
+        << observed_row_counts
         << ",\"event_rebuild_attempts\":"
         << snapshot.event_rebuild_attempts
         << ",\"kline_rebuild_attempts\":"
         << snapshot.kline_rebuild_attempts
+        << ",\"event_mutable_tail_repairs\":"
+        << event_stats.mutable_tail_repairs
+        << ",\"event_deep_suffix_repairs\":"
+        << event_stats.deep_suffix_repairs
+        << ",\"event_dirty_replay_inputs\":"
+        << event_stats.dirty_replay_inputs
+        << ",\"event_cold_fast_rebuilds\":"
+        << event_stats.cold_fast_rebuilds
         << ",\"event_full_comparison_sort_calls\":"
         << event_stats.full_comparison_sort_calls
         << "}\n";

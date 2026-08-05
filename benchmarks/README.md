@@ -15,10 +15,13 @@ cmake --build build-bench -j --target benchmark_realtime_planes
   --output artifacts/reorder-matrix.json
 ```
 
-The executable reports synchronous FAST-publish p50/p99/p99.9, end-to-end catch-up
-throughput, repair attempts, and the Event comparison-sort counter. Run the
-ordered case on the same pinned hardware as the current production baseline;
-the repository does not encode a hardware-independent latency threshold.
+Use `--exchange shanghai|shenzhen`, `--disorder-bps N`, and
+`--earliest-late` to select the workload. The executable reports synchronous
+FAST-publish p50/p99/p99.9, end-to-end catch-up throughput, lock-free stable
+root acquire p50/p99, full-row materialization latency, suffix repair counters,
+and the Event cold-rebuild/comparison-sort counters. Run the ordered case on
+the same pinned hardware as the current production baseline; the repository
+does not encode a hardware-independent latency threshold.
 
 ## Callback to Event Polars benchmark
 
@@ -52,10 +55,11 @@ taskset -c 0-31 .venv/bin/python \
   --output artifacts/callback-polars-400k-800k.json
 ```
 
-The bridge assigns one exclusive CPU to every Tick/Event/KLine worker slot
-(the parked Event/KLine repair thread shares its plane slot). Tick workers own
-the full decoders. The remaining CPUs in the `taskset` mask are reserved for
-the paced producer and Python. A throughput trial passes only when callback
+The bridge assigns one exclusive CPU to every Tick/Event/KLine worker slot.
+Event repair is cooperatively sliced by the owning Event worker; the KLine
+repair thread shares its KLine plane slot. Tick workers own the full decoders.
+The remaining CPUs in the `taskset` mask are reserved for the paced producer
+and Python. A throughput trial passes only when callback
 and native all-plane catch-up rates are both at least 98% of the target, every
 message reaches the stable Event view, all instruments remain recoverable,
 and no queue repair occurs.
@@ -64,3 +68,6 @@ The measurement does not include Vendor SDK network/callback dispatch or a
 cross-process transport, because Wire V3 currently exposes only the
 process-local service boundary. The normal rolling latency test covers INSERT
 CDC; late-data range-repair latency is a separate workload.
+
+The current checkpointed dirty-suffix regression results are recorded in
+[`docs/event-dirty-suffix-benchmark-20260805.md`](../docs/event-dirty-suffix-benchmark-20260805.md).

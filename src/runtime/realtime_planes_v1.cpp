@@ -8,6 +8,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace l2flow::runtime {
 namespace {
@@ -192,10 +193,11 @@ public:
               config_.event.worker_count)),
           kline_signals_(std::make_unique<WorkerSignalV1[]>(
               config_.kline.worker_count)),
-          event_repair_signals_(std::make_unique<WorkerSignalV1[]>(
-              config_.event.worker_count)),
           kline_repair_signals_(std::make_unique<WorkerSignalV1[]>(
               config_.kline.worker_count)),
+          event_repair_scan_requested_(
+              std::make_unique<std::atomic<bool>[]>(
+                  config_.event.worker_count)),
           fast_route_live_(std::make_unique<std::atomic<bool>[]>(
               config_.fast.instrument_count)),
           tick_worker_guards_(std::make_unique<std::atomic_flag[]>(
@@ -204,6 +206,11 @@ public:
              ordinal < config_.fast.instrument_count; ++ordinal) {
             fast_route_live_[ordinal].store(
                 true, std::memory_order_relaxed);
+        }
+        for (std::uint32_t worker = 0U;
+             worker < config_.event.worker_count; ++worker) {
+            event_repair_scan_requested_[worker].store(
+                false, std::memory_order_relaxed);
         }
     }
 
@@ -257,11 +264,59 @@ public:
             config_.affinity.event_workers, worker);
         MarkStarted(affinity_ok);
         std::size_t producer_cursor = 0U;
+        std::vector<l2flow::market::CompactFastTickV1> batch;
+        batch.reserve(config_.live_batch_budget);
+        std::vector<std::size_t> assigned_ordinals;
+        for (std::size_t ordinal = 0U;
+             ordinal < config_.event.instrument_count; ++ordinal) {
+            if (config_.event.event_routes[ordinal] == worker) {
+                assigned_ordinals.push_back(ordinal);
+            }
+        }
+        // Fixed-capacity, worker-local dirty queue. Normal micro-batches only
+        // inspect the instruments they touched; the O(route-count) scan is
+        // reserved for the exceptional queue-overflow notification.
+        std::vector<std::size_t> repair_ring(assigned_ordinals.size());
+        std::vector<bool> repair_queued(
+            config_.event.instrument_count, false);
+        std::size_t repair_head = 0U;
+        std::size_t repair_tail = 0U;
+        std::size_t repair_count = 0U;
+        const auto repair_pending =
+            [this](std::uint32_t instrument_id) noexcept {
+            const auto state = event_history_->RepairState(instrument_id);
+            return state == l2flow::market::EventRepairStateV1::
+                                kRepairRequired ||
+                   state == l2flow::market::EventRepairStateV1::
+                                kRebuilding ||
+                   state == l2flow::market::EventRepairStateV1::
+                                kCatchingUp;
+        };
+        const auto enqueue_repair = [&](std::size_t ordinal) noexcept {
+            if (ordinal >= config_.event.instrument_count ||
+                config_.event.event_routes[ordinal] != worker ||
+                repair_queued[ordinal] ||
+                !repair_pending(
+                    static_cast<std::uint32_t>(ordinal + 1U)) ||
+                repair_count >= repair_ring.size()) {
+                return;
+            }
+            repair_ring[repair_tail] = ordinal;
+            repair_tail = (repair_tail + 1U) % repair_ring.size();
+            ++repair_count;
+            repair_queued[ordinal] = true;
+        };
+        const auto scan_repairs = [&]() noexcept {
+            for (std::size_t ordinal : assigned_ordinals) {
+                enqueue_repair(ordinal);
+            }
+        };
         while (affinity_ok) {
             const std::uint64_t observed_epoch =
                 event_signals_[worker].epoch.load(
                     std::memory_order_acquire);
             bool worked = false;
+            batch.clear();
             for (std::size_t count = 0U;
                  count < config_.live_batch_budget; ++count) {
                 bool consumed = false;
@@ -279,35 +334,7 @@ public:
                             &input)) {
                         continue;
                     }
-                    const auto& route = event_routes_[input.ordinal];
-                    if (event_history_->RepairState(input.instrument_id) ==
-                        l2flow::market::EventRepairStateV1::kLive) {
-                        const auto applied = event_history_->ApplyLive(
-                            worker, route, input);
-                        if (applied.error ==
-                                l2flow::market::
-                                    OrderedEventHistoryErrorV1::kNone &&
-                            applied.disposition ==
-                                l2flow::market::
-                                    EventInputDispositionV1::kPublished) {
-                            event_applied_.fetch_add(
-                                1U, std::memory_order_relaxed);
-                        }
-                        if (applied.disposition ==
-                                l2flow::market::
-                                    EventInputDispositionV1::
-                                        kRepairRegistered ||
-                            event_history_->RepairState(
-                                input.instrument_id) ==
-                                l2flow::market::
-                                    EventRepairStateV1::kRepairRequired) {
-                            event_repair_signals_[worker].Notify();
-                        }
-                    } else {
-                        event_history_->MarkRepairRequired(
-                            input.instrument_id, input.arrival_id);
-                        event_repair_signals_[worker].Notify();
-                    }
+                    batch.push_back(std::move(input));
                     producer_cursor = (tick_worker + 1U) %
                         config_.fast.worker_count;
                     worked = true;
@@ -318,14 +345,96 @@ public:
                     break;
                 }
             }
+            if (!batch.empty()) {
+                const auto applied = event_history_->ApplyBatch(
+                    worker, batch);
+                event_applied_.fetch_add(
+                    applied.published_inputs,
+                    std::memory_order_relaxed);
+                for (const auto& input : batch) {
+                    enqueue_repair(input.ordinal);
+                }
+            }
+            if (event_repair_scan_requested_[worker].exchange(
+                    false, std::memory_order_acq_rel)) {
+                scan_repairs();
+            }
+
+            if (repair_count != 0U) {
+                const std::size_t ordinal = repair_ring[repair_head];
+                repair_head = (repair_head + 1U) % repair_ring.size();
+                --repair_count;
+                repair_queued[ordinal] = false;
+                const std::uint32_t instrument_id =
+                    static_cast<std::uint32_t>(ordinal + 1U);
+                if (repair_pending(instrument_id)) {
+                    const auto advanced =
+                        event_history_->AdvanceDirtyReplay(
+                        worker,
+                        event_routes_[ordinal],
+                        config_.event.repair_replay_record_budget,
+                        config_.event.repair_cpu_budget_per_round);
+                    if (advanced.cold_fallback_required) {
+                        const std::uint64_t through =
+                            event_history_->RepairThrough(instrument_id);
+                        // A journal gap is exceptional. Coalesce it until
+                        // this drain round observes no queued Event input;
+                        // rebuilding a growing FAST prefix once per callback
+                        // would amplify overload and spend CDC capacity on
+                        // obsolete roots.
+                        if (batch.empty() &&
+                            (through == 0U ||
+                             fast_store_->PublishedThrough(
+                                 instrument_id, through))) {
+                            event_rebuild_attempts_.fetch_add(
+                                1U, std::memory_order_relaxed);
+                            const auto rebuilt =
+                                event_history_->RebuildFromFast(
+                                    worker,
+                                    event_routes_[ordinal],
+                                    *fast_store_);
+                            worked = worked || rebuilt.complete;
+                            if (worker_stop_requested_.load(
+                                    std::memory_order_acquire) &&
+                                rebuilt.error != l2flow::market::
+                                    OrderedEventHistoryErrorV1::kNone) {
+                                event_history_->MarkUnrecoverable(
+                                    instrument_id);
+                            }
+                        }
+                    } else if (advanced.worked || advanced.committed) {
+                        event_rebuild_attempts_.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        worked = true;
+                    }
+                    if (worker_stop_requested_.load(
+                            std::memory_order_acquire) &&
+                        advanced.error != l2flow::market::
+                            OrderedEventHistoryErrorV1::kNone) {
+                        event_history_->MarkUnrecoverable(instrument_id);
+                    }
+                    enqueue_repair(ordinal);
+                }
+            }
             if (worker_stop_requested_.load(std::memory_order_acquire) &&
                 CompactQueuesEmpty(
                     event_queues_, worker, config_.event.worker_count)) {
-                break;
+                if (repair_count == 0U) {
+                    scan_repairs();
+                }
+                if (repair_count == 0U) {
+                    break;
+                }
             }
             if (!worked) {
-                event_signals_[worker].epoch.wait(
-                    observed_epoch, std::memory_order_acquire);
+                if (repair_count != 0U ||
+                    event_repair_scan_requested_[worker].load(
+                        std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                } else {
+                    event_signals_[worker].epoch.wait(
+                        observed_epoch, std::memory_order_acquire);
+                }
             }
         }
     }
@@ -404,28 +513,6 @@ public:
         }
     }
 
-    [[nodiscard]] bool EventRepairPending(std::uint32_t worker) const
-        noexcept {
-        for (std::size_t ordinal = 0U;
-             ordinal < config_.event.instrument_count;
-             ++ordinal) {
-            if (config_.event.event_routes[ordinal] != worker) {
-                continue;
-            }
-            const auto state = event_history_->RepairState(
-                static_cast<std::uint32_t>(ordinal + 1U));
-            if (state == l2flow::market::EventRepairStateV1::
-                             kRepairRequired ||
-                state == l2flow::market::EventRepairStateV1::
-                             kRebuilding ||
-                state == l2flow::market::EventRepairStateV1::
-                             kCatchingUp) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     [[nodiscard]] bool KLineRepairPending(std::uint32_t worker) const
         noexcept {
         for (std::size_t ordinal = 0U;
@@ -446,81 +533,6 @@ public:
             }
         }
         return false;
-    }
-
-    void EventRepairLoop(std::uint32_t worker) noexcept {
-        const bool affinity_ok = ApplyAffinity(
-            config_.affinity.event_workers, worker);
-        MarkStarted(affinity_ok);
-        std::size_t next_ordinal = 0U;
-        while (affinity_ok) {
-            const std::uint64_t observed_epoch =
-                event_repair_signals_[worker].epoch.load(
-                    std::memory_order_acquire);
-            bool worked = false;
-            bool retry_backoff = false;
-            for (std::size_t offset = 0U;
-                 offset < config_.event.instrument_count; ++offset) {
-                const std::size_t ordinal =
-                    (next_ordinal + offset) %
-                    config_.event.instrument_count;
-                if (config_.event.event_routes[ordinal] != worker) {
-                    continue;
-                }
-                const std::uint32_t instrument_id =
-                    static_cast<std::uint32_t>(ordinal + 1U);
-                const auto state = event_history_->RepairState(
-                    instrument_id);
-                if (state != l2flow::market::EventRepairStateV1::
-                                 kRepairRequired &&
-                    state != l2flow::market::EventRepairStateV1::
-                                 kRebuilding &&
-                    state != l2flow::market::EventRepairStateV1::
-                                 kCatchingUp) {
-                    continue;
-                }
-                const std::uint64_t repair_through =
-                    event_history_->RepairThrough(instrument_id);
-                if (repair_through != 0U &&
-                    !fast_store_->PublishedThrough(
-                        instrument_id, repair_through)) {
-                    continue;
-                }
-                event_rebuild_attempts_.fetch_add(
-                    1U, std::memory_order_relaxed);
-                const auto rebuild = event_history_->RebuildFromFast(
-                    worker, event_routes_[ordinal], *fast_store_);
-                next_ordinal = (ordinal + 1U) %
-                    config_.event.instrument_count;
-                if (repair_stop_requested_.load(
-                        std::memory_order_acquire) &&
-                    rebuild.error !=
-                        l2flow::market::OrderedEventHistoryErrorV1::kNone) {
-                    event_history_->MarkUnrecoverable(instrument_id);
-                }
-                retry_backoff = rebuild.error ==
-                                    l2flow::market::
-                                        OrderedEventHistoryErrorV1::
-                                            kResourceExhausted ||
-                                rebuild.error ==
-                                    l2flow::market::
-                                        OrderedEventHistoryErrorV1::
-                                            kNotLive;
-                worked = true;
-                break;
-            }
-            if (repair_stop_requested_.load(std::memory_order_acquire) &&
-                !EventRepairPending(worker)) {
-                break;
-            }
-            if (retry_backoff) {
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(1));
-            } else if (!worked) {
-                event_repair_signals_[worker].epoch.wait(
-                    observed_epoch, std::memory_order_acquire);
-            }
-        }
     }
 
     void KLineRepairLoop(std::uint32_t worker) noexcept {
@@ -602,7 +614,6 @@ public:
         for (std::uint32_t worker = 0U;
              worker < config_.event.worker_count; ++worker) {
             event_signals_[worker].NotifyAll();
-            event_repair_signals_[worker].NotifyAll();
         }
         for (std::uint32_t worker = 0U;
              worker < config_.kline.worker_count; ++worker) {
@@ -635,11 +646,6 @@ public:
         }
         repair_stop_requested_.store(true, std::memory_order_release);
         NotifyAllWorkers();
-        for (std::thread& thread : event_repair_threads_) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
         for (std::thread& thread : kline_repair_threads_) {
             if (thread.joinable()) {
                 thread.join();
@@ -665,11 +671,11 @@ public:
         kline_queues_;
     std::unique_ptr<WorkerSignalV1[]> event_signals_;
     std::unique_ptr<WorkerSignalV1[]> kline_signals_;
-    std::unique_ptr<WorkerSignalV1[]> event_repair_signals_;
     std::unique_ptr<WorkerSignalV1[]> kline_repair_signals_;
+    std::unique_ptr<std::atomic<bool>[]>
+        event_repair_scan_requested_;
     std::vector<std::thread> event_threads_;
     std::vector<std::thread> kline_threads_;
-    std::vector<std::thread> event_repair_threads_;
     std::vector<std::thread> kline_repair_threads_;
     std::unique_ptr<std::atomic<bool>[]> fast_route_live_;
     std::unique_ptr<std::atomic_flag[]> tick_worker_guards_;
@@ -795,18 +801,12 @@ RealtimePlanesCreateErrorV1 RealtimePlanesV1::Create(
 
         impl->event_threads_.reserve(impl->config_.event.worker_count);
         impl->kline_threads_.reserve(impl->config_.kline.worker_count);
-        impl->event_repair_threads_.reserve(
-            impl->config_.event.worker_count);
         impl->kline_repair_threads_.reserve(
             impl->config_.kline.worker_count);
         for (std::uint32_t worker = 0U;
              worker < impl->config_.event.worker_count; ++worker) {
             impl->event_threads_.emplace_back(
                 [owner = impl.get(), worker] { owner->EventLoop(worker); });
-            impl->event_repair_threads_.emplace_back(
-                [owner = impl.get(), worker] {
-                    owner->EventRepairLoop(worker);
-                });
         }
         for (std::uint32_t worker = 0U;
              worker < impl->config_.kline.worker_count; ++worker) {
@@ -818,7 +818,7 @@ RealtimePlanesCreateErrorV1 RealtimePlanesV1::Create(
                 });
         }
         const std::uint64_t expected_threads =
-            2ULL * static_cast<std::uint64_t>(
+            static_cast<std::uint64_t>(
                 impl->config_.event.worker_count) +
             2ULL * static_cast<std::uint64_t>(
                 impl->config_.kline.worker_count);
@@ -931,32 +931,25 @@ RealtimePublishResultV1 RealtimePlanesV1::PublishDecoded(
     }
     result.fast_published = true;
     impl_->fast_applied_.fetch_add(1U, std::memory_order_relaxed);
-    impl_->event_repair_signals_[event_route.worker].Notify();
     impl_->kline_repair_signals_[kline_route.worker].Notify();
 
-    if (impl_->event_history_->RepairState(compact.instrument_id) ==
-        l2flow::market::EventRepairStateV1::kLive) {
-        auto event_envelope = compact;
-        if (impl_->event_queues_[impl_->QueueIndex(
-                tick_worker,
-                event_route.worker,
-                impl_->config_.event.worker_count)]->TryPush(
-                std::move(event_envelope))) {
-            result.event_enqueued = true;
-            impl_->event_signals_[event_route.worker].Notify();
-        } else {
-            impl_->event_queue_failures_.fetch_add(
-                1U, std::memory_order_relaxed);
-            impl_->event_history_->MarkRepairRequired(
-                compact.instrument_id, compact.arrival_id);
-            result.event_repair_registered = true;
-            impl_->event_repair_signals_[event_route.worker].Notify();
-        }
+    auto event_envelope = compact;
+    if (impl_->event_queues_[impl_->QueueIndex(
+            tick_worker,
+            event_route.worker,
+            impl_->config_.event.worker_count)]->TryPush(
+            std::move(event_envelope))) {
+        result.event_enqueued = true;
+        impl_->event_signals_[event_route.worker].Notify();
     } else {
+        impl_->event_queue_failures_.fetch_add(
+            1U, std::memory_order_relaxed);
         impl_->event_history_->MarkRepairRequired(
             compact.instrument_id, compact.arrival_id);
         result.event_repair_registered = true;
-        impl_->event_repair_signals_[event_route.worker].Notify();
+        impl_->event_repair_scan_requested_[event_route.worker].store(
+            true, std::memory_order_release);
+        impl_->event_signals_[event_route.worker].Notify();
     }
 
     if (l2flow::market::IsKLineTradeV1(compact)) {

@@ -5,6 +5,7 @@
 #include "l2flow/market/shanghai_order_event_aggregator_v1.h"
 #include "l2flow/market/shenzhen_order_event_projector_v1.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -93,19 +94,30 @@ enum class EventMutationKindV1 : std::uint8_t {
     kRangeReplaceCommit,
 };
 
+enum class EventRangeReplaceScopeV1 : std::uint8_t {
+    kInstrumentAll = 0U,
+    kChannelSuffix,
+};
+
 struct EventMutationV1 final {
     std::uint64_t change_sequence = 0U;
     std::uint64_t transaction_id = 0U;
     EventMutationKindV1 kind = EventMutationKindV1::kInsert;
     EventUidV1 uid{};
-    // A rebuild currently replaces the complete stable history for one
-    // instrument.  This explicit flag avoids inventing a sentinel key and,
-    // importantly, also removes rows that existed only in the old root.
+    // Retained for Wire/API compatibility with cold full rebuilds and the
+    // previous bounded-key range protocol. New late-data repair uses the
+    // explicit kChannelSuffix fields below and never fabricates an end key.
     bool replace_entire_instrument = false;
     EventOrderKeyV1 range_begin{};
     EventOrderKeyV1 range_end_exclusive{};
     OrderedDerivedEventV1 row{};
     std::vector<OrderedDerivedEventV1> replacement_rows;
+    // Appended after the legacy fields so source-level positional aggregate
+    // initialization retains its prior meaning.
+    EventRangeReplaceScopeV1 range_scope =
+        EventRangeReplaceScopeV1::kInstrumentAll;
+    std::int32_t range_channel = 0;
+    std::int64_t range_begin_business_sequence = 0;
 };
 
 struct EventChangeCursorV1 final {
@@ -167,10 +179,17 @@ struct OrderedEventHistoryConfigV1 final {
     // never permitted to grow past it.
     std::size_t maximum_change_records_per_instrument = 0U;
     std::size_t maximum_changes_per_read = 64U * 1024U;
-    // RebuildFromFast cooperatively yields its plane CPU after at most this
-    // many source-record scan/replay operations.
+    // A repair turn processes at most this many source records; the Event
+    // worker also applies the time bound below before returning to live work.
     std::size_t repair_replay_record_budget = 4096U;
     std::vector<std::uint32_t> event_routes;
+    // New suffix-replay controls are appended after the legacy aggregate
+    // fields so positional initialization keeps its prior meaning.
+    // Mutable tail is a bounded cache only; source inputs remain permanently
+    // present in the per-channel input journal.
+    std::size_t mutable_tail_records = 128U;
+    std::chrono::nanoseconds repair_cpu_budget_per_round =
+        std::chrono::microseconds(250);
 };
 
 enum class OrderedEventHistoryCreateErrorV1 : std::uint8_t {
@@ -230,6 +249,27 @@ struct EventRebuildResultV1 final {
     bool complete = false;
 };
 
+struct EventBatchApplyResultV1 final {
+    OrderedEventHistoryErrorV1 error =
+        OrderedEventHistoryErrorV1::kNone;
+    std::uint64_t accepted_inputs = 0U;
+    std::uint64_t published_inputs = 0U;
+    std::uint64_t published_rows = 0U;
+    std::uint64_t duplicate_inputs = 0U;
+    std::uint64_t dirty_channels = 0U;
+};
+
+struct EventDirtyReplayResultV1 final {
+    OrderedEventHistoryErrorV1 error =
+        OrderedEventHistoryErrorV1::kNone;
+    std::uint64_t replayed_inputs = 0U;
+    std::uint64_t rebuilt_rows = 0U;
+    std::uint64_t range_transaction_id = 0U;
+    bool worked = false;
+    bool committed = false;
+    bool cold_fallback_required = false;
+};
+
 struct OrderedEventHistoryStatsV1 final {
     std::uint64_t monotonic_fast_path_inputs = 0U;
     std::uint64_t duplicate_inputs = 0U;
@@ -240,13 +280,17 @@ struct OrderedEventHistoryStatsV1 final {
     std::uint64_t rebuild_radix_sort = 0U;
     std::uint64_t full_comparison_sort_calls = 0U;
     std::uint64_t published_range_transactions = 0U;
+    std::uint64_t mutable_tail_repairs = 0U;
+    std::uint64_t deep_suffix_repairs = 0U;
+    std::uint64_t dirty_replay_inputs = 0U;
+    std::uint64_t cold_fast_rebuilds = 0U;
 };
 
 // One Event worker is the sole writer for every instrument on its immutable
 // route. Normal monotonic input never invokes a sorter. Late input leaves the
-// prior immutable root visible and only registers repair; RebuildFromFast
-// constructs a private replacement and atomically swaps it before publishing
-// the committed CDC transaction.
+// prior immutable root visible while the worker builds and atomically commits
+// a checkpointed channel suffix. RebuildFromFast is the cold fallback for a
+// journal gap, not the ordinary out-of-order path.
 class OrderedEventHistoryV1 final {
 public:
     OrderedEventHistoryV1(const OrderedEventHistoryV1&) = delete;
@@ -269,6 +313,24 @@ public:
         std::uint32_t worker,
         const EventRouteTokenV1& route,
         const CompactFastTickV1& tick) noexcept;
+
+    // The Event worker drains a micro-batch, journals every source fact first,
+    // and only then publishes monotonic channels or marks a dirty suffix. This
+    // makes an order/trade inversion contained in one drain batch invisible
+    // to readers until its correct business-ordered bundle is available.
+    [[nodiscard]] EventBatchApplyResultV1 ApplyBatch(
+        std::uint32_t worker,
+        std::span<const CompactFastTickV1> ticks) noexcept;
+
+    // Advances at most one dirty channel for this route. New appends are
+    // followed in-place; an insertion behind the replay cursor restarts from
+    // the earliest dirty key. Allocation and projection happen before the
+    // suffix root/CDC transaction is atomically committed.
+    [[nodiscard]] EventDirtyReplayResultV1 AdvanceDirtyReplay(
+        std::uint32_t worker,
+        const EventRouteTokenV1& route,
+        std::size_t record_budget,
+        std::chrono::nanoseconds cpu_budget) noexcept;
 
     [[nodiscard]] EventRebuildResultV1 RebuildFromFast(
         std::uint32_t worker,

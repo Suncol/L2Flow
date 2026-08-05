@@ -199,6 +199,21 @@ struct ShanghaiOrderRevisionEventV1 final {
     ShanghaiOrderSnapshotV1 order{};
 };
 
+// Exact state checkpoint for Shanghai shadow replay.  Unlike Shenzhen, a
+// Shanghai order has a few transition accumulators which cannot be recovered
+// from the published snapshot alone (both execution-price extrema and the
+// pre-add active-side fill accumulator), so they are retained alongside the
+// Event-row reference in the order-version index.
+struct ShanghaiOrderStateImageV1 final {
+    ShanghaiOrderSnapshotV1 snapshot{};
+    std::int64_t pre_add_active_trade_quantity = 0;
+    std::int64_t minimum_execution_price_p6 = 0;
+    std::int64_t maximum_execution_price_p6 = 0;
+    bool execution_prices_seen = false;
+    bool terminal = false;
+    bool finalization_emitted = false;
+};
+
 struct ShanghaiTradeEventV1 final {
     std::uint32_t trade_date = 0U;
     std::uint32_t instrument_id = 0U;
@@ -307,6 +322,13 @@ public:
         std::unique_ptr<ShanghaiOrderEventAggregatorV1>* output)
         noexcept;
 
+    [[nodiscard]] static ShanghaiOrderAggregatorCreateErrorV1
+    CreateSparseShadow(
+        ShanghaiOrderEventAggregatorConfigV1 config,
+        std::size_t logical_base_order_count,
+        std::unique_ptr<ShanghaiOrderEventAggregatorV1>* output)
+        noexcept;
+
     // Ordering is established exclusively by
     // (channel, BizIndex) before this call. The source/arrival values retained
     // in the anchor are diagnostics and are deliberately not compared. Gaps
@@ -337,6 +359,19 @@ public:
     [[nodiscard]] ShanghaiOrderAggregatorQueryErrorV1 GetOrder(
         const ShanghaiOrderKeyV1& key,
         ShanghaiOrderSnapshotV1* output) const noexcept;
+    [[nodiscard]] ShanghaiOrderAggregatorQueryErrorV1 GetOrderState(
+        const ShanghaiOrderKeyV1& key,
+        ShanghaiOrderStateImageV1* output) const noexcept;
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    ImportExistingOrderState(
+        const ShanghaiOrderStateImageV1& image) noexcept;
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    ReplaceOrInsertOrderState(
+        const ShanghaiOrderStateImageV1& image) noexcept;
+    [[nodiscard]] ShanghaiOrderAggregatorConsumeErrorV1
+    SetPreviousBusinessSequence(
+        std::int32_t channel,
+        std::int64_t sequence) noexcept;
     [[nodiscard]] std::size_t order_count() const noexcept;
     [[nodiscard]] bool finalized() const noexcept;
     [[nodiscard]] const ShanghaiOrderEventAggregatorConfigV1& config()

@@ -11,6 +11,7 @@ from .models import (
     EventMutation,
     EventMutationKind,
     EventOrderKey,
+    EventRangeReplaceScope,
     EventUid,
     KLineBar,
     KLineBarKey,
@@ -36,6 +37,9 @@ def _validate_event_rows(rows: Iterable[DerivedEvent]) -> tuple[DerivedEvent, ..
 @dataclass(slots=True)
 class _PendingRange:
     transaction_id: int
+    range_scope: EventRangeReplaceScope
+    range_channel: int
+    range_begin_business_sequence: int
     replace_entire_instrument: bool
     range_begin: Optional[EventOrderKey]
     range_end_exclusive: Optional[EventOrderKey]
@@ -103,6 +107,9 @@ class EventCdcApplier:
             if pending is None
             else _PendingRange(
                 pending.transaction_id,
+                pending.range_scope,
+                pending.range_channel,
+                pending.range_begin_business_sequence,
                 pending.replace_entire_instrument,
                 pending.range_begin,
                 pending.range_end_exclusive,
@@ -127,7 +134,22 @@ class EventCdcApplier:
         if kind is EventMutationKind.RANGE_REPLACE_BEGIN:
             if self._pending is not None or mutation.transaction_id == 0:
                 raise CdcProtocolError("invalid RANGE_REPLACE_BEGIN")
-            if not mutation.replace_entire_instrument:
+            suffix = (
+                mutation.range_scope
+                is EventRangeReplaceScope.CHANNEL_SUFFIX
+            )
+            if suffix:
+                if (
+                    mutation.replace_entire_instrument
+                    or mutation.range_channel <= 0
+                    or mutation.range_begin_business_sequence <= 0
+                    or mutation.range_begin is not None
+                    or mutation.range_end_exclusive is not None
+                ):
+                    raise CdcProtocolError(
+                        "invalid channel-suffix replacement"
+                    )
+            elif not mutation.replace_entire_instrument:
                 if (
                     mutation.range_begin is None
                     or mutation.range_end_exclusive is None
@@ -136,6 +158,9 @@ class EventCdcApplier:
                     raise CdcProtocolError("invalid replacement key range")
             self._pending = _PendingRange(
                 mutation.transaction_id,
+                mutation.range_scope,
+                mutation.range_channel,
+                mutation.range_begin_business_sequence,
                 mutation.replace_entire_instrument,
                 mutation.range_begin,
                 mutation.range_end_exclusive,
@@ -153,7 +178,33 @@ class EventCdcApplier:
         if kind is EventMutationKind.RANGE_REPLACE_COMMIT:
             pending = self._require_transaction(mutation)
             replacement = _validate_event_rows(pending.rows)
-            if pending.replace_entire_instrument:
+            if (
+                pending.range_scope
+                is EventRangeReplaceScope.CHANNEL_SUFFIX
+            ):
+                if any(
+                    row.order_key.channel != pending.range_channel
+                    or row.order_key.business_sequence
+                    < pending.range_begin_business_sequence
+                    for row in replacement
+                ):
+                    raise CdcProtocolError(
+                        "replacement Event lies outside its channel suffix"
+                    )
+                retained = tuple(
+                    row
+                    for row in self._rows
+                    if row.order_key.channel != pending.range_channel
+                    or row.order_key.business_sequence
+                    < pending.range_begin_business_sequence
+                )
+                candidate = _validate_event_rows(
+                    sorted(
+                        (*retained, *replacement),
+                        key=lambda row: row.order_key,
+                    )
+                )
+            elif pending.replace_entire_instrument:
                 candidate = replacement
             else:
                 assert pending.range_begin is not None

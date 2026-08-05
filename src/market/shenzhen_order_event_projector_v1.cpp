@@ -176,11 +176,7 @@ constexpr std::uint64_t kOrderConflictMask =
     return false;
 }
 
-struct OrderState final {
-    ShenzhenOrderSnapshotV1 snapshot{};
-    bool terminal = false;
-    bool finalization_emitted = false;
-};
+using OrderState = ShenzhenOrderStateImageV1;
 
 void RefreshFinality(OrderState* state) noexcept {
     if (state == nullptr) {
@@ -527,13 +523,122 @@ ProjectShenzhenOrderEventInputV1(
 class ShenzhenOrderEventProjectorV1::Impl final {
 public:
     explicit Impl(
-        ShenzhenOrderEventProjectorConfigV1 config_value)
+        ShenzhenOrderEventProjectorConfigV1 config_value,
+        bool sparse_value = false,
+        std::size_t logical_base_order_count = 0U)
         : config(std::move(config_value)),
-          orders(config.maximum_order_states) {}
+          sparse(sparse_value),
+          logical_order_count(logical_base_order_count) {
+        if (!sparse) {
+            live_orders = std::make_unique<OrderTable>(
+                config.maximum_order_states);
+        }
+    }
+
+    using OrderTable = detail::BoundedOrderTableV1<
+        ShenzhenOrderKeyV1, OrderState>;
+
+    struct InsertResult final {
+        OrderState* value = nullptr;
+        bool inserted = false;
+        bool capacity_exhausted = false;
+        bool invariant_failure = false;
+    };
+
+    [[nodiscard]] OrderState* Find(
+        const ShenzhenOrderKeyV1& key) noexcept {
+        if (!sparse) {
+            return live_orders->Find(key);
+        }
+        const auto found = sparse_orders.find(key);
+        return found == sparse_orders.end() ? nullptr : &found->second;
+    }
+
+    [[nodiscard]] const OrderState* Find(
+        const ShenzhenOrderKeyV1& key) const noexcept {
+        if (!sparse) {
+            return live_orders->Find(key);
+        }
+        const auto found = sparse_orders.find(key);
+        return found == sparse_orders.end() ? nullptr : &found->second;
+    }
+
+    [[nodiscard]] InsertResult InsertNew(
+        ShenzhenOrderKeyV1 key,
+        OrderState value) {
+        if (logical_order_count >= config.maximum_order_states) {
+            return InsertResult{nullptr, false, true, false};
+        }
+        if (!sparse) {
+            const OrderTable::InsertResult inserted =
+                live_orders->Insert(std::move(key), std::move(value));
+            logical_order_count = live_orders->size();
+            return InsertResult{
+                inserted.value,
+                inserted.inserted,
+                inserted.capacity_exhausted,
+                inserted.invariant_failure};
+        }
+        auto [position, inserted] = sparse_orders.emplace(
+            std::move(key), std::move(value));
+        if (inserted) {
+            ++logical_order_count;
+        }
+        return InsertResult{
+            &position->second, inserted, false, false};
+    }
+
+    [[nodiscard]] bool ImportExisting(const OrderState& state) {
+        if (!sparse) {
+            return false;
+        }
+        const auto [position, inserted] = sparse_orders.emplace(
+            state.snapshot.key, state);
+        if (!inserted) {
+            position->second = state;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ReplaceOrInsert(const OrderState& state) noexcept {
+        if (OrderState* const existing = Find(state.snapshot.key);
+            existing != nullptr) {
+            *existing = state;
+            return true;
+        }
+        if (sparse) {
+            try {
+                return InsertNew(state.snapshot.key, state).inserted;
+            } catch (...) {
+                return false;
+            }
+        }
+        return InsertNew(state.snapshot.key, state).inserted;
+    }
+
+    template <typename Visitor>
+    [[nodiscard]] bool VisitOrdered(Visitor&& visitor) {
+        if (!sparse) {
+            return live_orders->VisitOrdered(
+                std::forward<Visitor>(visitor));
+        }
+        for (auto& [key, value] : sparse_orders) {
+            if (!visitor(key, value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept {
+        return logical_order_count;
+    }
 
     ShenzhenOrderEventProjectorConfigV1 config{};
-    detail::BoundedOrderTableV1<ShenzhenOrderKeyV1, OrderState>
-        orders;
+    bool sparse = false;
+    std::size_t logical_order_count = 0U;
+    std::unique_ptr<OrderTable> live_orders;
+    std::map<ShenzhenOrderKeyV1, OrderState> sparse_orders;
     std::map<std::uint32_t, std::int64_t>
         last_native_sequence_by_channel;
     bool finalized = false;
@@ -639,6 +744,38 @@ ShenzhenOrderEventProjectorV1::Create(
     }
 }
 
+ShenzhenOrderProjectorCreateErrorV1
+ShenzhenOrderEventProjectorV1::CreateSparseShadow(
+    ShenzhenOrderEventProjectorConfigV1 config,
+    std::size_t logical_base_order_count,
+    std::unique_ptr<ShenzhenOrderEventProjectorV1>* output) noexcept {
+    if (output == nullptr) {
+        return ShenzhenOrderProjectorCreateErrorV1::kNullOutput;
+    }
+    output->reset();
+    if (!ValidTradeDate(config.trade_date) ||
+        config.maximum_order_states == 0U ||
+        logical_base_order_count > config.maximum_order_states ||
+        config.maximum_order_states >=
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max()) ||
+        config.maximum_order_states >
+            std::numeric_limits<std::size_t>::max() / 2U) {
+        return ShenzhenOrderProjectorCreateErrorV1::
+            kInvalidConfiguration;
+    }
+    try {
+        auto impl = std::make_unique<Impl>(
+            std::move(config), true, logical_base_order_count);
+        output->reset(new ShenzhenOrderEventProjectorV1(
+            std::move(impl)));
+        return ShenzhenOrderProjectorCreateErrorV1::kNone;
+    } catch (...) {
+        return ShenzhenOrderProjectorCreateErrorV1::
+            kResourceExhausted;
+    }
+}
+
 ShenzhenOrderProjectorConsumeErrorV1
 ShenzhenOrderEventProjectorV1::ConsumeBusinessOrdered(
     const ShenzhenOrderEventInputV1& input,
@@ -685,9 +822,9 @@ ShenzhenOrderEventProjectorV1::ConsumeBusinessOrdered(
                 input.instrument_id,
                 input.channel,
                 input.primary_order_id};
-            OrderState* const existing = impl_->orders.Find(key);
+            OrderState* const existing = impl_->Find(key);
             if (existing == nullptr) {
-                if (impl_->orders.size() >=
+                if (impl_->size() >=
                     impl_->config.maximum_order_states) {
                     return ShenzhenOrderProjectorConsumeErrorV1::
                         kOrderCapacity;
@@ -712,7 +849,7 @@ ShenzhenOrderEventProjectorV1::ConsumeBusinessOrdered(
                 state.snapshot.source_market_notices =
                     input.source_market_notices;
                 const auto inserted =
-                    impl_->orders.Insert(key, std::move(state));
+                    impl_->InsertNew(key, std::move(state));
                 if (!inserted.inserted || inserted.value == nullptr) {
                     impl_->failed = true;
                     return ShenzhenOrderProjectorConsumeErrorV1::
@@ -768,11 +905,11 @@ ShenzhenOrderEventProjectorV1::ConsumeBusinessOrdered(
             OrderState* const buy =
                 ambiguous_references || input.buy_order_id == 0
                     ? nullptr
-                    : impl_->orders.Find(buy_key);
+                    : impl_->Find(buy_key);
             OrderState* const sell =
                 ambiguous_references || input.sell_order_id == 0
                     ? nullptr
-                    : impl_->orders.Find(sell_key);
+                    : impl_->Find(sell_key);
 
             ShenzhenTradeEventV1 trade{};
             trade.trade_date = input.trade_date;
@@ -853,7 +990,7 @@ ShenzhenOrderEventProjectorV1::ConsumeBusinessOrdered(
                 input.instrument_id,
                 input.channel,
                 input.primary_order_id};
-            OrderState* const existing = impl_->orders.Find(key);
+            OrderState* const existing = impl_->Find(key);
             ShenzhenCancelEventV1 cancel{};
             cancel.key = key;
             cancel.source_anchor = input.anchor;
@@ -951,8 +1088,10 @@ ShenzhenOrderEventProjectorV1::Finalize(
     }
 
     try {
-        output->reserve(impl_->orders.size());
-        static_cast<void>(impl_->orders.VisitOrdered(
+        output->reserve(impl_->sparse
+                            ? impl_->sparse_orders.size()
+                            : impl_->size());
+        static_cast<void>(impl_->VisitOrdered(
             [&source_anchor, output](
                 const ShenzhenOrderKeyV1&,
                 OrderState& state) {
@@ -1005,7 +1144,7 @@ ShenzhenOrderEventProjectorV1::GetOrder(
         key.order_id <= 0) {
         return ShenzhenOrderProjectorQueryErrorV1::kInvalidKey;
     }
-    const OrderState* const found = impl_->orders.Find(key);
+    const OrderState* const found = impl_->Find(key);
     if (found == nullptr) {
         return ShenzhenOrderProjectorQueryErrorV1::kNotFound;
     }
@@ -1013,9 +1152,85 @@ ShenzhenOrderEventProjectorV1::GetOrder(
     return ShenzhenOrderProjectorQueryErrorV1::kNone;
 }
 
+ShenzhenOrderProjectorQueryErrorV1
+ShenzhenOrderEventProjectorV1::GetOrderState(
+    const ShenzhenOrderKeyV1& key,
+    ShenzhenOrderStateImageV1* output) const noexcept {
+    if (output == nullptr) {
+        return ShenzhenOrderProjectorQueryErrorV1::kNullOutput;
+    }
+    *output = {};
+    if (impl_ == nullptr || !ValidTradeDate(key.trade_date) ||
+        key.instrument_id == 0U || key.channel == 0U ||
+        key.order_id <= 0) {
+        return ShenzhenOrderProjectorQueryErrorV1::kInvalidKey;
+    }
+    const OrderState* const found = impl_->Find(key);
+    if (found == nullptr) {
+        return ShenzhenOrderProjectorQueryErrorV1::kNotFound;
+    }
+    *output = *found;
+    return ShenzhenOrderProjectorQueryErrorV1::kNone;
+}
+
+ShenzhenOrderProjectorConsumeErrorV1
+ShenzhenOrderEventProjectorV1::ImportExistingOrderState(
+    const ShenzhenOrderStateImageV1& image) noexcept {
+    if (impl_ == nullptr || !impl_->sparse ||
+        image.snapshot.key.trade_date != impl_->config.trade_date ||
+        image.snapshot.key.instrument_id == 0U ||
+        image.snapshot.key.channel == 0U ||
+        image.snapshot.key.order_id <= 0) {
+        return ShenzhenOrderProjectorConsumeErrorV1::kInvalidInput;
+    }
+    try {
+        return impl_->ImportExisting(image)
+                   ? ShenzhenOrderProjectorConsumeErrorV1::kNone
+                   : ShenzhenOrderProjectorConsumeErrorV1::kFailed;
+    } catch (...) {
+        return ShenzhenOrderProjectorConsumeErrorV1::
+            kResourceExhausted;
+    }
+}
+
+ShenzhenOrderProjectorConsumeErrorV1
+ShenzhenOrderEventProjectorV1::ReplaceOrInsertOrderState(
+    const ShenzhenOrderStateImageV1& image) noexcept {
+    if (impl_ == nullptr ||
+        image.snapshot.key.trade_date != impl_->config.trade_date ||
+        image.snapshot.key.instrument_id == 0U ||
+        image.snapshot.key.channel == 0U ||
+        image.snapshot.key.order_id <= 0) {
+        return ShenzhenOrderProjectorConsumeErrorV1::kInvalidInput;
+    }
+    if (impl_->Find(image.snapshot.key) == nullptr &&
+        impl_->size() >= impl_->config.maximum_order_states) {
+        return ShenzhenOrderProjectorConsumeErrorV1::kOrderCapacity;
+    }
+    return impl_->ReplaceOrInsert(image)
+               ? ShenzhenOrderProjectorConsumeErrorV1::kNone
+               : ShenzhenOrderProjectorConsumeErrorV1::kFailed;
+}
+
+ShenzhenOrderProjectorConsumeErrorV1
+ShenzhenOrderEventProjectorV1::SetPreviousBusinessSequence(
+    std::uint32_t channel,
+    std::int64_t sequence) noexcept {
+    if (impl_ == nullptr || channel == 0U || sequence < 0) {
+        return ShenzhenOrderProjectorConsumeErrorV1::kInvalidInput;
+    }
+    try {
+        impl_->last_native_sequence_by_channel[channel] = sequence;
+        return ShenzhenOrderProjectorConsumeErrorV1::kNone;
+    } catch (...) {
+        return ShenzhenOrderProjectorConsumeErrorV1::
+            kResourceExhausted;
+    }
+}
+
 std::size_t ShenzhenOrderEventProjectorV1::order_count()
     const noexcept {
-    return impl_ == nullptr ? 0U : impl_->orders.size();
+    return impl_ == nullptr ? 0U : impl_->size();
 }
 
 bool ShenzhenOrderEventProjectorV1::finalized() const noexcept {

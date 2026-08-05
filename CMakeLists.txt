@@ -282,6 +282,8 @@ if(L2FLOW_BUILD_TESTS)
         tests/test_fast_source_derived_history_v1.cpp L2Flow::market)
     l2flow_add_test(test_business_order_event_rules
         tests/test_business_order_event_rules_v1.cpp L2Flow::market)
+    l2flow_add_test(test_event_dirty_suffix_replay
+        tests/test_event_dirty_suffix_replay_v1.cpp L2Flow::market)
     l2flow_add_test(test_fast_tick_pipeline
         tests/test_fast_tick_pipeline_v1.cpp L2Flow::realtime)
     l2flow_add_test(test_instrument_data_service_v3

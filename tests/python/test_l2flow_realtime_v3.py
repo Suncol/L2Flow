@@ -477,6 +477,57 @@ class PolarsV3Test(unittest.TestCase):
             [1, 2, 30, 40, 5, 6],
         )
 
+    def test_event_channel_suffix_has_no_end_sentinel(self):
+        from l2flow_realtime.polars import EventPolarsHistory
+
+        history = EventPolarsHistory(
+            tuple(event(sequence) for sequence in range(1, 7)),
+            rows_per_block=2,
+        )
+        before = history.blocks.block_identities
+        history.apply(
+            (
+                rt.EventMutation(
+                    1,
+                    rt.EventMutationKind.RANGE_REPLACE_BEGIN,
+                    transaction_id=23,
+                    range_scope=rt.EventRangeReplaceScope.CHANNEL_SUFFIX,
+                    range_channel=3,
+                    range_begin_business_sequence=4,
+                ),
+                rt.EventMutation(
+                    2,
+                    rt.EventMutationKind.RANGE_REPLACE_CHUNK,
+                    transaction_id=23,
+                    replacement_rows=(
+                        event(4, price=400),
+                        event(5, price=500),
+                    ),
+                ),
+            )
+        )
+        self.assertEqual(history.blocks.block_identities, before)
+        history.apply(
+            (
+                rt.EventMutation(
+                    3,
+                    rt.EventMutationKind.RANGE_REPLACE_COMMIT,
+                    transaction_id=23,
+                ),
+            )
+        )
+        after = history.blocks.block_identities
+        self.assertEqual(before[0], after[0])
+        self.assertNotEqual(before[1], after[1])
+        self.assertEqual(
+            history.blocks.frame()["business_sequence"].to_list(),
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            history.blocks.frame()["price_p6"].to_list(),
+            [1, 2, 3, 400, 500],
+        )
+
     def test_event_update_removes_the_previous_order_key(self):
         from l2flow_realtime.polars import EventPolarsHistory
 

@@ -92,8 +92,9 @@ struct RealtimePlanesSnapshotV1 final {
 // projected one raw message. PublishDecoded appends and publishes FAST
 // synchronously on that same worker before attempting either compact derived
 // queue. Event and KLine use independent Tick-worker-by-derived-worker SPSC
-// matrices, worker threads, repair threads, route tables, stores, wakeups and
-// failure states.
+// matrices, route tables, stores, wakeups and failure states. Event suffix
+// repair is cooperatively sliced on its owning Event worker; KLine retains a
+// separate cold-rebuild worker.
 class RealtimePlanesV1 final {
 public:
     RealtimePlanesV1(const RealtimePlanesV1&) = delete;

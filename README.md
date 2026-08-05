@@ -39,10 +39,11 @@ only `(channel, BizIndex)` for Shanghai and `(channel, ApplSeqNum)` for
 Shenzhen; numeric gaps are valid and channels are not compared with each
 other. KLine ordering uses exchange event time plus a stable trade tie-break.
 
-Late or skipped derived input is rebuilt from the captured FAST instrument
-history. Readers retain the previous immutable root during repair. Event and
-KLine replacement CDC uses BEGIN/CHUNK/COMMIT, so clients do not expose a
-partially rebuilt view.
+Late Event input is repaired from its exact per-channel `dirty_from` checkpoint
+and replays only that channel suffix; a complete FAST rebuild is reserved for
+an Event queue/journal gap. KLine retains its captured-FAST rebuild. Readers
+keep the previous immutable root during either repair, and replacement CDC
+uses BEGIN/CHUNK/COMMIT so clients never expose a partial view.
 
 The detailed contract is in
 [`docs/fast-source-derived-planes-v3.md`](docs/fast-source-derived-planes-v3.md).
