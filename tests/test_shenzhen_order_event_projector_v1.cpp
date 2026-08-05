@@ -1,5 +1,6 @@
 #include "l2flow/market/shenzhen_order_event_projector_v1.h"
 
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -690,7 +691,14 @@ void TestKeyIsolationAndFinalization(bool* ok) {
             projector->finalized(),
         "clean boundary finalizes residual orders");
     bool finalization_valid = true;
-    for (const auto& event : events) {
+    constexpr std::array<market::ShenzhenOrderKeyV1, 3U>
+        kExpectedFinalizationOrder{{
+            {20260730U, 1U, 7U, 700},
+            {20260730U, 1U, 8U, 700},
+            {20260730U, 2U, 7U, 701},
+        }};
+    for (std::size_t index = 0U; index < events.size(); ++index) {
+        const auto& event = events[index];
         const auto* revision = Revision(event);
         finalization_valid &=
             revision != nullptr &&
@@ -701,11 +709,13 @@ void TestKeyIsolationAndFinalization(bool* ok) {
             (revision->order.quality_flags &
              market::ShenzhenEventQualityBitV1(
                  market::ShenzhenEventQualityFlagV1::
-                     kEndedWithObservedBalance)) != 0U;
+                     kEndedWithObservedBalance)) != 0U &&
+            index < kExpectedFinalizationOrder.size() &&
+            revision->order.key == kExpectedFinalizationOrder[index];
     }
     *ok &= Expect(
         finalization_valid,
-        "finalization marks observed residual without treating it as numeric conflict");
+        "finalization is ascending by exact OrderKey and marks observed residual without numeric conflict");
 
     auto source_free = Projector(ok);
     if (source_free != nullptr) {
