@@ -451,6 +451,18 @@ int main() {
         return 1;
     }
     bool ok = true;
+    const auto initial_handoff_pools = runtime->HandoffPoolSnapshot();
+    ok &= Expect(
+        initial_handoff_pools.tick_pool_count == 4U &&
+            initial_handoff_pools.snapshot_pool_count == 4U &&
+            initial_handoff_pools.tick_slot_capacity == 128U &&
+            initial_handoff_pools.snapshot_slot_capacity == 128U &&
+            initial_handoff_pools.tick_allocated_slots == 128U &&
+            initial_handoff_pools.snapshot_allocated_slots == 0U &&
+            initial_handoff_pools.snapshot_runtime_slot_allocations == 0U &&
+            initial_handoff_pools.maximum_pool_high_water == 0U &&
+            initial_handoff_pools.failed_acquires == 0U,
+        "Tick handoff slots are fully preallocated while Snapshot slots start cold");
     ok &= Expect(runtime->WorkerForInstrument(1U) == 0U,
                  "instrument 1 ordinal has fixed worker 0");
     ok &= Expect(runtime->WorkerForInstrument(2U) == 1U,
@@ -561,6 +573,15 @@ int main() {
             live_tick.record->ingress_sequence() == 1U &&
             runtime->AcquireLatestGeneration() == nullptr,
         "latest snapshot/tick are visible after apply without waiting for a generation");
+    const auto warmed_handoff_pools = runtime->HandoffPoolSnapshot();
+    ok &= Expect(
+        warmed_handoff_pools.tick_allocated_slots ==
+                initial_handoff_pools.tick_allocated_slots &&
+            warmed_handoff_pools.snapshot_allocated_slots == 2U &&
+            warmed_handoff_pools.snapshot_runtime_slot_allocations == 2U &&
+            warmed_handoff_pools.maximum_pool_high_water == 1U &&
+            warmed_handoff_pools.failed_acquires == 0U,
+        "Tick traffic is allocation-free and Snapshot pools grow only to their per-worker high-water");
 
     const std::array<std::uint32_t, 6U> live_ids{
         1U, 2U, 3U, 4U, 5U, 0U};
@@ -675,6 +696,16 @@ int main() {
             2U, std::chrono::seconds(2), &second) ==
             market::RealtimeHistoryGenerationErrorV1::kNone,
         "wait generation 2");
+    const auto reused_handoff_pools = runtime->HandoffPoolSnapshot();
+    ok &= Expect(
+        reused_handoff_pools.tick_allocated_slots ==
+                warmed_handoff_pools.tick_allocated_slots &&
+            reused_handoff_pools.snapshot_allocated_slots ==
+                warmed_handoff_pools.snapshot_allocated_slots &&
+            reused_handoff_pools.snapshot_runtime_slot_allocations ==
+                warmed_handoff_pools.snapshot_runtime_slot_allocations &&
+            reused_handoff_pools.failed_acquires == 0U,
+        "warmed Tick and Snapshot handoff pools recycle without further allocation");
     if (second != nullptr) {
         market::IntradayInstrumentSummaryV1 second_summary{};
         ok &= Expect(

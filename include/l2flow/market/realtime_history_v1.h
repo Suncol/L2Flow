@@ -364,6 +364,18 @@ struct RealtimeHistoryRuntimeConfigV1 final {
     void* applied_observer_context = nullptr;
 };
 
+struct RealtimeHistoryHandoffPoolSnapshotV1 final {
+    std::uint64_t tick_pool_count = 0U;
+    std::uint64_t snapshot_pool_count = 0U;
+    std::uint64_t tick_slot_capacity = 0U;
+    std::uint64_t snapshot_slot_capacity = 0U;
+    std::uint64_t tick_allocated_slots = 0U;
+    std::uint64_t snapshot_allocated_slots = 0U;
+    std::uint64_t snapshot_runtime_slot_allocations = 0U;
+    std::uint64_t maximum_pool_high_water = 0U;
+    std::uint64_t failed_acquires = 0U;
+};
+
 enum class RealtimeHistoryCreateErrorV1 : std::uint8_t {
     kNone = 0U,
     kNullOutput,
@@ -536,6 +548,8 @@ public:
         std::span<RealtimeLatestRecordViewV1> output) const noexcept;
     [[nodiscard]] IntradayInstrumentStoreSnapshotV1
     StoreSnapshot() const noexcept;
+    [[nodiscard]] RealtimeHistoryHandoffPoolSnapshotV1
+    HandoffPoolSnapshot() const noexcept;
     [[nodiscard]] bool IsGenerationCurrentAndHealthy(
         const std::shared_ptr<
             const IntradayInstrumentStoreGenerationV1>& generation) const

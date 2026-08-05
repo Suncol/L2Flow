@@ -1147,10 +1147,13 @@ bool CheckCreationAndInvalidConfiguration(
                     valid.maximum_session_records &&
                 snapshot.maximum_session_accounted_bytes ==
                     valid.maximum_session_accounted_bytes &&
+                snapshot.segment_pool_capacity_bytes > 0U &&
+                snapshot.segment_pool_used_bytes == 0U &&
+                snapshot.segment_pool_failed_acquires == 0U &&
                 snapshot.coverage_from_open &&
                 !snapshot.coverage_lost &&
                 snapshot.appended_records == 0U,
-            "new store exposes configured healthy coverage");
+            "new store exposes healthy coverage and its startup segment pool");
         ok &= Expect(
             store->WorkerForInstrument(2U) == 1U &&
                 store->WorkerForInstrument(5U) == 0U,
@@ -1881,6 +1884,7 @@ bool CheckRolloverCapsAndWorkerOwnership(
     if (rollover == nullptr) {
         return false;
     }
+    const auto rollover_initial = rollover->Snapshot();
     std::uint64_t first_segment_record_count = 0U;
     for (std::uint64_t sequence = 1U;
          sequence <= kMaximumFixtureRecords;
@@ -1902,13 +1906,22 @@ bool CheckRolloverCapsAndWorkerOwnership(
             break;
         }
     }
+    const auto rollover_pool_snapshot = rollover->Snapshot();
     ok &= Expect(
         first_segment_record_count > 0U &&
             first_segment_record_count < kMaximumFixtureRecords &&
-            rollover->Snapshot().allocated_segments >= 2U,
+            rollover_pool_snapshot.allocated_segments >= 2U,
         "4 KiB lane arena rolls into a second segment at a measured boundary");
+    ok &= Expect(
+        rollover_pool_snapshot.segment_pool_capacity_bytes >=
+                rollover_pool_snapshot.segment_pool_used_bytes &&
+            rollover_pool_snapshot.segment_pool_used_bytes >=
+                rollover_pool_snapshot.allocated_index_bytes -
+                    rollover_initial.allocated_index_bytes &&
+            rollover_pool_snapshot.segment_pool_failed_acquires == 0U,
+        "segment rollover uses only startup-reserved backing and preserves exact quota accounting");
     const std::uint64_t rollover_record_count =
-        rollover->Snapshot().appended_records;
+        rollover_pool_snapshot.appended_records;
     const auto rollover_generation = BuildStoreGeneration(
         rollover.get(),
         registry,

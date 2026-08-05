@@ -190,6 +190,75 @@ std::atomic<std::uint64_t> g_next_session_epoch{1U};
 
 struct ArenaSegment;
 
+// The session is append-only, so segment storage never needs to return to a
+// freelist before session destruction. One startup allocation reserves a
+// record- and byte-bounded segment upper bound plus placement-alignment
+// headroom; concurrent owners carve aligned ranges with a CAS bump. Pages are
+// touched only when a segment is actually used.
+class ArenaSegmentPool final {
+public:
+    explicit ArenaSegmentPool(std::size_t capacity_bytes)
+        : storage_(
+              capacity_bytes == 0U
+                  ? nullptr
+                  : std::make_unique_for_overwrite<std::byte[]>(
+                        capacity_bytes)),
+          capacity_bytes_(capacity_bytes) {}
+
+    ArenaSegmentPool(const ArenaSegmentPool&) = delete;
+    ArenaSegmentPool& operator=(const ArenaSegmentPool&) = delete;
+
+    [[nodiscard]] void* Allocate(std::size_t bytes) noexcept {
+        if (bytes == 0U || storage_ == nullptr) {
+            failed_acquires_.fetch_add(1U, std::memory_order_relaxed);
+            return nullptr;
+        }
+        std::size_t current = next_offset_.load(std::memory_order_relaxed);
+        for (;;) {
+            if (current > capacity_bytes_ ||
+                current >
+                    std::numeric_limits<std::size_t>::max() -
+                        (kArenaStorageAlignment - 1U)) {
+                failed_acquires_.fetch_add(
+                    1U, std::memory_order_relaxed);
+                return nullptr;
+            }
+            const std::size_t aligned =
+                AlignUp(current, kArenaStorageAlignment);
+            if (aligned > capacity_bytes_ ||
+                bytes > capacity_bytes_ - aligned) {
+                failed_acquires_.fetch_add(
+                    1U, std::memory_order_relaxed);
+                return nullptr;
+            }
+            const std::size_t next = aligned + bytes;
+            if (next_offset_.compare_exchange_weak(
+                    current,
+                    next,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                return static_cast<void*>(storage_.get() + aligned);
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t capacity_bytes() const noexcept {
+        return capacity_bytes_;
+    }
+    [[nodiscard]] std::size_t used_bytes() const noexcept {
+        return next_offset_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t failed_acquires() const noexcept {
+        return failed_acquires_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::unique_ptr<std::byte[]> storage_;
+    std::size_t capacity_bytes_ = 0U;
+    std::atomic<std::size_t> next_offset_{0U};
+    std::atomic<std::uint64_t> failed_acquires_{0U};
+};
+
 struct ArenaSegmentDeleter final {
     void operator()(ArenaSegment* segment) const noexcept;
 };
@@ -256,18 +325,21 @@ void ArenaSegmentDeleter::operator()(
             std::destroy_at(SegmentRecord(segment, index));
         }
         segment->~ArenaSegment();
-        ::operator delete(static_cast<void*>(segment));
         segment = next;
     }
 }
 
 [[nodiscard]] ArenaSegmentOwner AllocateArenaSegment(
-    std::size_t allocation_bytes) {
+    ArenaSegmentPool* pool,
+    std::size_t allocation_bytes) noexcept {
     const std::size_t storage_offset = ArenaStorageOffset();
-    if (allocation_bytes <= storage_offset) {
-        throw std::bad_alloc();
+    if (pool == nullptr || allocation_bytes <= storage_offset) {
+        return {};
     }
-    void* const allocation = ::operator new(allocation_bytes);
+    void* const allocation = pool->Allocate(allocation_bytes);
+    if (allocation == nullptr) {
+        return {};
+    }
     return ArenaSegmentOwner(
         ::new (allocation) ArenaSegment(
             allocation_bytes,
@@ -504,6 +576,9 @@ struct SessionState final {
     std::uint64_t session_epoch = 0U;
     std::array<std::uint32_t, kIntradayInstrumentStoreSourceCountV1>
         source_stream_ids{};
+    // Declared before workers so their segment chains destroy every exact
+    // payload/header before the backing allocation is released.
+    std::unique_ptr<ArenaSegmentPool> segment_pool;
     std::vector<std::unique_ptr<WorkerState>> workers;
     // Exact daily-catalog ordinal order: instrument_id == ordinal + 1.
     std::vector<OrdinalEntry> ordinals;
@@ -1770,7 +1845,10 @@ IntradayInstrumentStoreV1::Create(
         config.maximum_records_per_batch >
             kIntradayInstrumentStoreMaximumBatchRecordsV1 ||
         config.maximum_session_records == 0U ||
-        config.maximum_session_accounted_bytes == 0U) {
+        config.maximum_session_accounted_bytes == 0U ||
+        config.maximum_session_accounted_bytes >
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max())) {
         return IntradayInstrumentStoreCreateErrorV1::
             kInvalidConfiguration;
     }
@@ -1827,7 +1905,12 @@ IntradayInstrumentStoreV1::Create(
             static_cast<std::uint64_t>(sizeof(SessionState));
         std::uint64_t term = 0U;
         std::uint64_t worker_bytes = 0U;
-        if (!CheckedMultiply(
+        if (!CheckedAdd(
+                base_bytes,
+                static_cast<std::uint64_t>(
+                    sizeof(ArenaSegmentPool)),
+                &base_bytes) ||
+            !CheckedMultiply(
                 static_cast<std::uint64_t>(worker_count),
                 static_cast<std::uint64_t>(
                     sizeof(std::unique_ptr<WorkerState>) +
@@ -1854,6 +1937,74 @@ IntradayInstrumentStoreV1::Create(
         session->base_index_bytes = base_bytes;
         session->issued_byte_quota.store(
             base_bytes, std::memory_order_relaxed);
+        const std::uint64_t remaining_session_bytes =
+            config.maximum_session_accounted_bytes - base_bytes;
+        std::size_t minimum_segment_allocation =
+            std::numeric_limits<std::size_t>::max();
+        std::size_t maximum_segment_allocation = 0U;
+        constexpr std::array<MarketEventKindV1, 5U> event_kinds{
+            MarketEventKindV1::kShanghaiSnapshot,
+            MarketEventKindV1::kShanghaiTick,
+            MarketEventKindV1::kShenzhenSnapshot,
+            MarketEventKindV1::kShenzhenOrder,
+            MarketEventKindV1::kShenzhenTransaction};
+        for (const MarketEventKindV1 kind : event_kinds) {
+            std::size_t allocation = 0U;
+            if (!RequiredSegmentAllocation(
+                    PayloadLayoutForKind(kind),
+                    config.segment_target_bytes,
+                    &allocation)) {
+                return IntradayInstrumentStoreCreateErrorV1::
+                    kInvalidConfiguration;
+            }
+            minimum_segment_allocation = std::min(
+                minimum_segment_allocation, allocation);
+            maximum_segment_allocation =
+                Maximum(maximum_segment_allocation, allocation);
+        }
+        std::uint64_t record_segment_upper_bound = 0U;
+        if (!CheckedMultiply(
+                config.maximum_session_records,
+                static_cast<std::uint64_t>(
+                    maximum_segment_allocation),
+                &record_segment_upper_bound)) {
+            record_segment_upper_bound = remaining_session_bytes;
+        }
+        const std::uint64_t segment_accounted_capacity = std::min(
+            remaining_session_bytes, record_segment_upper_bound);
+        // The hard byte quota accounts the same exact segment allocation
+        // sizes as before this pool existed. Consecutive placement-new
+        // addresses can additionally require at most alignment-1 backing
+        // bytes each. Reserve that non-accounted allocator overhead up front
+        // so a quota-valid append cannot fail merely because earlier segment
+        // sizes were not alignment multiples.
+        const std::uint64_t maximum_segment_count = std::min(
+            config.maximum_session_records,
+            minimum_segment_allocation == 0U
+                ? 0U
+                : remaining_session_bytes /
+                      static_cast<std::uint64_t>(
+                          minimum_segment_allocation));
+        std::uint64_t alignment_headroom = 0U;
+        std::uint64_t segment_pool_capacity = 0U;
+        if (!CheckedMultiply(
+                maximum_segment_count,
+                static_cast<std::uint64_t>(
+                    kArenaStorageAlignment - 1U),
+                &alignment_headroom) ||
+            !CheckedAdd(
+                segment_accounted_capacity,
+                alignment_headroom,
+                &segment_pool_capacity) ||
+            segment_pool_capacity >
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::size_t>::max())) {
+            return IntradayInstrumentStoreCreateErrorV1::
+                kInvalidConfiguration;
+        }
+        session->segment_pool =
+            std::make_unique<ArenaSegmentPool>(
+                static_cast<std::size_t>(segment_pool_capacity));
 
         auto impl = std::make_unique<Impl>(std::move(session));
         output->reset(new IntradayInstrumentStoreV1(std::move(impl)));
@@ -2029,10 +2180,9 @@ IntradayInstrumentStoreV1::Append(
 
     ArenaSegmentOwner candidate;
     if (needs_segment) {
-        try {
-            candidate =
-                AllocateArenaSegment(segment_allocation_bytes);
-        } catch (...) {
+        candidate = AllocateArenaSegment(
+            session.segment_pool.get(), segment_allocation_bytes);
+        if (candidate == nullptr) {
             ReturnQuota(
                 worker_state, QuotaKind::kBytes, byte_reservation);
             ReturnQuota(worker_state, QuotaKind::kRecords, 1U);
@@ -2559,6 +2709,16 @@ IntradayInstrumentStoreV1::Snapshot() const noexcept {
     result.maximum_session_accounted_bytes =
         session.config.maximum_session_accounted_bytes;
     result.allocated_index_bytes = session.base_index_bytes;
+    if (session.segment_pool != nullptr) {
+        result.segment_pool_capacity_bytes =
+            static_cast<std::uint64_t>(
+                session.segment_pool->capacity_bytes());
+        result.segment_pool_used_bytes =
+            static_cast<std::uint64_t>(
+                session.segment_pool->used_bytes());
+        result.segment_pool_failed_acquires =
+            session.segment_pool->failed_acquires();
+    }
     for (const std::unique_ptr<WorkerState>& worker : session.workers) {
         const WorkerAccounting& accounting = worker->accounting;
         const std::uint64_t records =

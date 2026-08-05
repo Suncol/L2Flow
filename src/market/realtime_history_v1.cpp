@@ -317,30 +317,92 @@ private:
     alignas(64) std::atomic<std::size_t> tail_{0U};
 };
 
-// The command ring deliberately carries only one pointer-sized lease, not the
-// multi-kilobyte decoded-event variant.  Slots are allocated lazily up to the
-// queue's hard bound and then recycled over a reverse SPSC ring.  The source
-// decoder is the sole allocator/acquirer and the instrument worker is the
-// sole releaser.
+using CompactTickEventV1 = std::variant<
+    ShanghaiTickV1,
+    ShenzhenOrderV1,
+    ShenzhenTransactionV1>;
+
+struct CompactTickHandoffV1 final {
+    std::uint8_t source_slot = 0U;
+    std::uint64_t ingress_sequence = 0U;
+    std::uint64_t tick_stream_sequence = 0U;
+    CompactTickEventV1 event;
+
+    template <typename Event>
+    CompactTickHandoffV1(
+        std::uint8_t source,
+        std::uint64_t ingress,
+        std::uint64_t tick_stream,
+        std::in_place_type_t<Event>,
+        Event&& value) noexcept
+        : source_slot(source),
+          ingress_sequence(ingress),
+          tick_stream_sequence(tick_stream),
+          event(
+              std::in_place_type<Event>,
+              std::forward<Event>(value)) {}
+};
+
+static_assert(
+    sizeof(CompactTickHandoffV1) <
+    sizeof(RealtimeHistoryEventInputV1));
+static_assert(
+    std::is_nothrow_move_constructible_v<CompactTickHandoffV1>);
+
+// The command ring carries one pointer-sized lease. High-frequency Tick
+// sources use a compact exact-alternative slot array allocated completely at
+// startup. Snapshot sources retain the large exact input and grow only to
+// their bounded cold-path high-water. Both kinds recycle over one reverse
+// SPSC ring; no Tick acquisition calls the system allocator after Create.
 class HistoryHandoffPool final {
 public:
-    struct Slot final {
+    struct Slot {
+        enum class Storage : std::uint8_t {
+            kTick = 0U,
+            kSnapshot,
+        } storage = Storage::kTick;
+        bool engaged = false;
+    };
+
+    struct TickSlot final : Slot {
+        alignas(CompactTickHandoffV1)
+            std::array<std::byte, sizeof(CompactTickHandoffV1)>
+                payload{};
+
+        [[nodiscard]] CompactTickHandoffV1* Input() noexcept {
+            return std::launder(
+                reinterpret_cast<CompactTickHandoffV1*>(
+                    payload.data()));
+        }
+    };
+
+    struct SnapshotSlot final : Slot {
         alignas(RealtimeHistoryEventInputV1)
             std::array<std::byte, sizeof(RealtimeHistoryEventInputV1)>
-                storage{};
-        bool engaged = false;
+                payload{};
 
         [[nodiscard]] RealtimeHistoryEventInputV1* Input() noexcept {
             return std::launder(
                 reinterpret_cast<RealtimeHistoryEventInputV1*>(
-                    storage.data()));
+                    payload.data()));
         }
     };
 
-    explicit HistoryHandoffPool(std::size_t capacity)
-        : capacity_(capacity), returned_(capacity) {
-        owned_.reserve(capacity);
+    HistoryHandoffPool(std::size_t capacity, bool tick_source)
+        : capacity_(capacity),
+          tick_source_(tick_source),
+          returned_(capacity) {
+        snapshot_owned_.reserve(capacity);
         producer_free_.reserve(capacity);
+        if (tick_source_) {
+            tick_owned_ = std::make_unique<TickSlot[]>(capacity_);
+            for (std::size_t index = 0U; index < capacity_; ++index) {
+                tick_owned_[index].storage = Slot::Storage::kTick;
+                producer_free_.push_back(&tick_owned_[index]);
+            }
+            allocated_slots_.store(
+                capacity_, std::memory_order_relaxed);
+        }
     }
 
     HistoryHandoffPool(const HistoryHandoffPool&) = delete;
@@ -351,10 +413,15 @@ public:
         while (returned_.TryPop(&returned)) {
             producer_free_.push_back(returned);
         }
-        for (const std::unique_ptr<Slot>& slot : owned_) {
-            if (slot->engaged) {
-                std::destroy_at(slot->Input());
-                slot->engaged = false;
+        if (tick_owned_ != nullptr) {
+            for (std::size_t index = 0U; index < capacity_; ++index) {
+                Destroy(&tick_owned_[index]);
+            }
+        }
+        for (const std::unique_ptr<SnapshotSlot>& slot :
+             snapshot_owned_) {
+            if (slot != nullptr) {
+                Destroy(slot.get());
             }
         }
     }
@@ -365,37 +432,123 @@ public:
         if (output == nullptr) {
             return false;
         }
+        const bool input_is_tick =
+            IsTickEventKindV1(input.kind());
+        if (input_is_tick != tick_source_) {
+            return false;
+        }
         DrainReturned();
         Slot* slot = nullptr;
         if (!producer_free_.empty()) {
             slot = producer_free_.back();
             producer_free_.pop_back();
         } else {
-            if (owned_.size() >= capacity_) {
+            if (tick_source_ ||
+                snapshot_owned_.size() >= capacity_) {
+                failed_acquires_.fetch_add(
+                    1U, std::memory_order_relaxed);
                 return false;
             }
-            std::unique_ptr<Slot> candidate(new (std::nothrow) Slot());
+            std::unique_ptr<SnapshotSlot> candidate(
+                new (std::nothrow) SnapshotSlot());
             if (candidate == nullptr) {
+                failed_acquires_.fetch_add(
+                    1U, std::memory_order_relaxed);
                 return false;
             }
+            candidate->storage = Slot::Storage::kSnapshot;
             slot = candidate.get();
             // reserve(capacity_) in the constructor makes this nonallocating.
-            owned_.push_back(std::move(candidate));
+            snapshot_owned_.push_back(std::move(candidate));
+            allocated_slots_.fetch_add(
+                1U, std::memory_order_relaxed);
         }
-        std::construct_at(slot->Input(), std::move(input));
-        slot->engaged = true;
+        if (!Construct(slot, std::move(input))) {
+            producer_free_.push_back(slot);
+            failed_acquires_.fetch_add(
+                1U, std::memory_order_relaxed);
+            return false;
+        }
+        // This SPSC producer owns producer_free_. After DrainReturned, the
+        // difference is the exact producer-visible outstanding pressure (a
+        // concurrently returned slot may conservatively count until the next
+        // drain). Keep that hot-path accounting owner-local; a shared
+        // fetch_add/fetch_sub here would bounce one cache line between the
+        // decoder and instrument worker on every Tick.
+        const std::size_t allocated =
+            allocated_slots_.load(std::memory_order_relaxed);
+        const std::size_t in_use =
+            allocated >= producer_free_.size()
+                ? allocated - producer_free_.size()
+                : allocated;
+        if (in_use > high_water_local_) {
+            high_water_local_ = in_use;
+            high_water_.store(in_use, std::memory_order_relaxed);
+        }
         *output = slot;
         return true;
     }
 
     void ReleaseFromProducer(Slot* slot) noexcept {
         Destroy(slot);
-        producer_free_.push_back(slot);
+        if (slot != nullptr) {
+            producer_free_.push_back(slot);
+        }
     }
 
-    [[nodiscard]] bool ReleaseFromConsumer(Slot* slot) noexcept {
+    [[nodiscard]] bool TakeAndReleaseFromConsumer(
+        Slot* slot,
+        std::optional<RealtimeHistoryEventInputV1>* output) noexcept {
+        if (slot == nullptr || output == nullptr || !slot->engaged) {
+            return false;
+        }
+        output->reset();
+        bool restored = false;
+        if (slot->storage == Slot::Storage::kSnapshot) {
+            auto* const snapshot = static_cast<SnapshotSlot*>(slot);
+            output->emplace(std::move(*snapshot->Input()));
+            restored = true;
+        } else {
+            auto* const tick_slot = static_cast<TickSlot*>(slot);
+            CompactTickHandoffV1* const compact =
+                tick_slot->Input();
+            DecodedMarketEventV1 decoded = std::visit(
+                [](auto&& value) -> DecodedMarketEventV1 {
+                    using Event = std::decay_t<decltype(value)>;
+                    return DecodedMarketEventV1{
+                        std::in_place_type<Event>,
+                        std::move(value)};
+                },
+                std::move(compact->event));
+            std::optional<RealtimeHistoryEventInputV1> rebuilt =
+                RealtimeHistoryEventInputV1::Create(
+                    compact->source_slot,
+                    compact->ingress_sequence,
+                    std::move(decoded),
+                    compact->tick_stream_sequence);
+            if (rebuilt.has_value()) {
+                output->emplace(std::move(*rebuilt));
+                restored = true;
+            }
+        }
         Destroy(slot);
-        return returned_.TryPush(slot);
+        return returned_.TryPush(slot) && restored;
+    }
+
+    [[nodiscard]] std::size_t allocated_slots() const noexcept {
+        return allocated_slots_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return capacity_;
+    }
+    [[nodiscard]] bool tick_source() const noexcept {
+        return tick_source_;
+    }
+    [[nodiscard]] std::size_t high_water() const noexcept {
+        return high_water_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t failed_acquires() const noexcept {
+        return failed_acquires_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -406,18 +559,78 @@ private:
         }
     }
 
+    [[nodiscard]] static bool Construct(
+        Slot* slot,
+        RealtimeHistoryEventInputV1&& input) noexcept {
+        if (slot == nullptr || slot->engaged) {
+            return false;
+        }
+        if (slot->storage == Slot::Storage::kSnapshot) {
+            auto* const snapshot = static_cast<SnapshotSlot*>(slot);
+            std::construct_at(snapshot->Input(), std::move(input));
+            slot->engaged = true;
+            return true;
+        }
+        auto* const tick_slot = static_cast<TickSlot*>(slot);
+        const std::uint8_t source_slot = input.source_slot();
+        const std::uint64_t ingress_sequence =
+            input.ingress_sequence();
+        const std::uint64_t tick_stream_sequence =
+            input.tick_stream_sequence();
+        bool exact_tick = false;
+        std::visit(
+            [tick_slot,
+             source_slot,
+             ingress_sequence,
+             tick_stream_sequence,
+             &exact_tick](auto&& value) noexcept {
+                using Event = std::decay_t<decltype(value)>;
+                if constexpr (
+                    std::is_same_v<Event, ShanghaiTickV1> ||
+                    std::is_same_v<Event, ShenzhenOrderV1> ||
+                    std::is_same_v<Event, ShenzhenTransactionV1>) {
+                    std::construct_at(
+                        tick_slot->Input(),
+                        source_slot,
+                        ingress_sequence,
+                        tick_stream_sequence,
+                        std::in_place_type<Event>,
+                        std::move(value));
+                    exact_tick = true;
+                }
+            },
+            std::move(input).TakeEvent());
+        if (!exact_tick) {
+            return false;
+        }
+        slot->engaged = true;
+        return true;
+    }
+
     static void Destroy(Slot* slot) noexcept {
         if (slot == nullptr || !slot->engaged) {
             return;
         }
-        std::destroy_at(slot->Input());
+        if (slot->storage == Slot::Storage::kSnapshot) {
+            std::destroy_at(
+                static_cast<SnapshotSlot*>(slot)->Input());
+        } else {
+            std::destroy_at(
+                static_cast<TickSlot*>(slot)->Input());
+        }
         slot->engaged = false;
     }
 
     std::size_t capacity_ = 0U;
+    bool tick_source_ = false;
     SpscQueue<Slot*> returned_;
-    std::vector<std::unique_ptr<Slot>> owned_;
+    std::unique_ptr<TickSlot[]> tick_owned_;
+    std::vector<std::unique_ptr<SnapshotSlot>> snapshot_owned_;
     std::vector<Slot*> producer_free_;
+    std::atomic<std::size_t> allocated_slots_{0U};
+    std::size_t high_water_local_ = 0U;
+    std::atomic<std::size_t> high_water_{0U};
+    std::atomic<std::size_t> failed_acquires_{0U};
 };
 
 }  // namespace
@@ -907,9 +1120,14 @@ public:
         for (std::size_t index = 0U; index < queues_.size(); ++index) {
             queues_[index] = std::make_unique<SpscQueue<Command>>(
                 config_.queue_capacity_per_source_worker + 1U);
+            const std::size_t source =
+                index / static_cast<std::size_t>(
+                            config_.worker_count);
+            const bool tick_source = source == 1U || source == 3U;
             handoff_pools_[index] =
                 std::make_unique<HistoryHandoffPool>(
-                    config_.queue_capacity_per_source_worker);
+                    config_.queue_capacity_per_source_worker,
+                    tick_source);
         }
         for (std::unique_ptr<WorkerSignal>& signal : worker_signals_) {
             signal = std::make_unique<WorkerSignal>();
@@ -1580,7 +1798,21 @@ public:
                 slot == nullptr ? 0U : 1U);
             return false;
         }
-        RealtimeHistoryEventInputV1* const input = slot->Input();
+        std::optional<RealtimeHistoryEventInputV1> restored_input;
+        if (!HandoffPool(source, worker).TakeAndReleaseFromConsumer(
+                slot, &restored_input) ||
+            !restored_input.has_value()) {
+            ReportAppendFailure(
+                "handoff_restore",
+                worker,
+                source,
+                route,
+                0U,
+                0U);
+            return false;
+        }
+        RealtimeHistoryEventInputV1* const input =
+            &*restored_input;
         const std::uint64_t ingress_sequence =
             input->ingress_sequence();
         KLineTradeV1 kline_trade{};
@@ -1663,20 +1895,6 @@ public:
                 MarkLatestCoverageLost();
                 kline_failed_.store(true, std::memory_order_release);
             }
-        }
-        const bool released =
-            HandoffPool(source, worker).ReleaseFromConsumer(slot);
-        if (!released) {
-            ReportAppendFailure(
-                "handoff_release",
-                worker,
-                source,
-                route,
-                ingress_sequence,
-                0U);
-            MarkStoreCoverageLost();
-            store_failed_.store(true, std::memory_order_release);
-            return false;
         }
         if (error != IntradayInstrumentStoreAppendErrorV1::kNone) {
             ReportAppendFailure(
@@ -2820,6 +3038,53 @@ RealtimeHistoryRuntimeV1::StoreSnapshot() const noexcept {
     // commit that already owns the lock.
     std::lock_guard<std::mutex> lock(impl_->generation_mutex_);
     return impl_->store_->Snapshot();
+}
+
+RealtimeHistoryHandoffPoolSnapshotV1
+RealtimeHistoryRuntimeV1::HandoffPoolSnapshot() const noexcept {
+    RealtimeHistoryHandoffPoolSnapshotV1 output{};
+    if (impl_ == nullptr) {
+        return output;
+    }
+    const auto add = [](std::uint64_t* destination,
+                        std::size_t value) noexcept {
+        const std::uint64_t converted =
+            value > static_cast<std::size_t>(
+                        std::numeric_limits<std::uint64_t>::max())
+                ? std::numeric_limits<std::uint64_t>::max()
+                : static_cast<std::uint64_t>(value);
+        *destination =
+            converted >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        *destination
+                ? std::numeric_limits<std::uint64_t>::max()
+                : *destination + converted;
+    };
+    for (const std::unique_ptr<HistoryHandoffPool>& pool :
+         impl_->handoff_pools_) {
+        if (pool == nullptr) {
+            continue;
+        }
+        if (pool->tick_source()) {
+            ++output.tick_pool_count;
+            add(&output.tick_slot_capacity, pool->capacity());
+            add(&output.tick_allocated_slots, pool->allocated_slots());
+        } else {
+            ++output.snapshot_pool_count;
+            add(&output.snapshot_slot_capacity, pool->capacity());
+            add(
+                &output.snapshot_allocated_slots,
+                pool->allocated_slots());
+            add(
+                &output.snapshot_runtime_slot_allocations,
+                pool->allocated_slots());
+        }
+        add(&output.failed_acquires, pool->failed_acquires());
+        output.maximum_pool_high_water = std::max(
+            output.maximum_pool_high_water,
+            static_cast<std::uint64_t>(pool->high_water()));
+    }
+    return output;
 }
 
 bool RealtimeHistoryRuntimeV1::IsGenerationCurrentAndHealthy(

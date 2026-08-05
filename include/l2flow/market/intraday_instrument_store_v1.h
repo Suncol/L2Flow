@@ -164,6 +164,12 @@ struct IntradayInstrumentStoreSnapshotV1 final {
     std::uint64_t accounted_record_bytes = 0U;
     std::uint64_t allocated_index_bytes = 0U;
     std::uint64_t allocated_segments = 0U;
+    // Startup-reserved monotonic segment arena. Capacity includes bounded
+    // placement-alignment headroom in addition to quota-accounted segment
+    // bytes; used bytes advance only when a new segment is constructed.
+    std::uint64_t segment_pool_capacity_bytes = 0U;
+    std::uint64_t segment_pool_used_bytes = 0U;
+    std::uint64_t segment_pool_failed_acquires = 0U;
     std::uint64_t failed_appends = 0U;
     std::uint64_t latest_generation = 0U;
     bool coverage_from_open = false;
